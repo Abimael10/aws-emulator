@@ -52,6 +52,12 @@ mod test_invoke_stage_grant_differential;
 // Logs at once.
 #[path = "all/stage_scoped_lambda_permission.rs"]
 mod stage_scoped_lambda_permission;
+// Declared here, at the head, for the reason the entry at the top of this file records: which
+// GRANTS on one function admit a deployed stage's request — every half of the method ARN a
+// grant may be narrowed by — spans API Gateway, AWS Lambda and Amazon CloudWatch Logs at once,
+// and reuses the suite above's wiring and per-leg check.
+#[path = "all/stage_lambda_permission_arn_halves.rs"]
+mod stage_lambda_permission_arn_halves;
 // Declared here, at the head, for the reason the entry at the top of this file records: what
 // ONE function's resource policy decides for the DEPLOYED stage's caller and for the simulated
 // one spans API Gateway, AWS Lambda and Amazon CloudWatch Logs at once.

@@ -27,6 +27,11 @@
 //! `SourceArn` — no grant at all, one named stage, the other named stage, one grant for each
 //! of them, every stage of the api, and a path the request does not address — each driven
 //! through BOTH stages of the same deployment.
+//!
+//! The harness is `pub(crate)` because the sibling suite that drives the REMAINING halves of
+//! the same method ARN ([`crate::stage_lambda_permission_arn_halves`]) wires the same api, the
+//! same function and the same two stages, and judges each leg by the same rule: one wiring and
+//! one per-leg check, so the two suites cannot disagree about either.
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -40,12 +45,12 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::stage_access_logging::traced_line;
 
 /// The Region every request below is signed for and every ARN names.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The two stages ONE deployment is released to, and the resource path of its one method.
-const FIRST_STAGE: &str = "allowed";
-const SECOND_STAGE: &str = "denied";
-const RESOURCE_PATH: &str = "echo";
+pub(crate) const FIRST_STAGE: &str = "allowed";
+pub(crate) const SECOND_STAGE: &str = "denied";
+pub(crate) const RESOURCE_PATH: &str = "echo";
 
 /// The verb the method is put on: `ANY`, the catch-all a method serves every verb through,
 /// which is what the request below is served by.
@@ -54,7 +59,7 @@ const METHOD_VERB: &str = "ANY";
 /// The function the method is integrated with, the group its runs log to, and the role the
 /// created function names. No IAM store is mounted here, so the role is a value the create
 /// carries rather than a record this suite relies on.
-const FUNCTION: &str = "stage-scoped-proxy";
+pub(crate) const FUNCTION: &str = "stage-scoped-proxy";
 const FUNCTION_GROUP: &str = "/aws/lambda/stage-scoped-proxy";
 const ROLE: &str = "arn:aws:iam::000000000000:role/lambda-exec";
 const HANDLER: &str = "lambda_function.lambda_handler";
@@ -122,7 +127,7 @@ impl Answered {
 
 /// The three services this rule spans, over ONE engine, as `core/router/src/lib.rs` mounts
 /// them.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite exercises the services, not SigV4: the control-plane calls carry a credential
@@ -184,7 +189,7 @@ async fn dispatch(
 }
 
 /// One API Gateway control-plane call that has to be accepted with `expected`.
-async fn apigw(
+pub(crate) async fn apigw(
     router: &MultiServiceRouter,
     case: &str,
     method: &str,
@@ -216,7 +221,7 @@ async fn apigw(
 }
 
 /// One AWS Lambda call over its `restJson1` wire, answering its status and parsed body.
-async fn lambda(
+pub(crate) async fn lambda(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -274,9 +279,23 @@ async fn invoke(router: &MultiServiceRouter, api: &str, stage: &str, marker: &st
 
 /// The messages `FilterLogEvents` reports for `group`, or `None` when the account holds no
 /// such group at all.
+///
+/// A refusal for any OTHER reason is this suite's own failure rather than an absent group, so
+/// it is raised rather than reported as `None`: `None` means exactly "CloudWatch Logs holds no
+/// such group".
 async fn delivered(router: &MultiServiceRouter, group: &str) -> Option<Vec<String>> {
     let (status, body) = logs(router, "FilterLogEvents", json!({ "logGroupName": group })).await;
     if status != 200 {
+        let reported = body
+            .get("__type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            reported.ends_with("ResourceNotFoundException"),
+            "FilterLogEvents({group:?}): expected the group's events or the refusal for a \
+             group that does not exist, got HTTP {status} with {body}"
+        );
         return None;
     }
     Some(
@@ -328,7 +347,7 @@ fn package(source: &str) -> Vec<u8> {
 }
 
 /// The member `name` of a JSON object, as text.
-fn member(case: &str, body: &Value, name: &str) -> String {
+pub(crate) fn member(case: &str, body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("setup {case:?}: no {name:?} in {body}"))
@@ -367,7 +386,7 @@ async fn wait_until_active(router: &MultiServiceRouter) {
 /// The whole setup: the function, the api with one `ANY` method proxying to it, ONE
 /// deployment released to both stages, the account's CloudWatch role and the method setting
 /// that turns each stage's execution log on. Answers the api id.
-async fn wired(router: &MultiServiceRouter) -> String {
+pub(crate) async fn wired(router: &MultiServiceRouter, method_verb: &str) -> String {
     let (status, function) = lambda(
         router,
         "POST",
@@ -430,7 +449,7 @@ async fn wired(router: &MultiServiceRouter) -> String {
         router,
         "PutMethod",
         "PUT",
-        &format!("/restapis/{api}/resources/{resource}/methods/{METHOD_VERB}"),
+        &format!("/restapis/{api}/resources/{resource}/methods/{method_verb}"),
         Some(json!({ "authorizationType": "NONE" })),
         201,
     )
@@ -439,7 +458,7 @@ async fn wired(router: &MultiServiceRouter) -> String {
         router,
         "PutIntegration",
         "PUT",
-        &format!("/restapis/{api}/resources/{resource}/methods/{METHOD_VERB}/integration"),
+        &format!("/restapis/{api}/resources/{resource}/methods/{method_verb}/integration"),
         Some(json!({
             "type": "AWS_PROXY",
             "httpMethod": "POST",
@@ -510,17 +529,41 @@ async fn wired(router: &MultiServiceRouter) -> String {
 
 /// Grant `apigateway.amazonaws.com` `lambda:InvokeFunction` on the function, narrowed to
 /// `source_arn`, under the statement id `statement`.
-async fn grant(router: &MultiServiceRouter, case: &str, statement: &str, source_arn: &str) {
+pub(crate) async fn grant(
+    router: &MultiServiceRouter,
+    case: &str,
+    statement: &str,
+    source_arn: &str,
+) {
+    grant_narrowed(router, case, statement, &[("SourceArn", source_arn)]).await;
+}
+
+/// The same grant, narrowed by the members `narrowing` names rather than by a source ARN
+/// alone: `AddPermission` narrows a grant to a service principal by the invoking resource
+/// (`SourceArn`), by the account that owns it (`SourceAccount`), or by both.
+///
+/// `pub(crate)` because the sibling suite over the halves of the method ARN narrows a grant
+/// the other way ([`crate::stage_lambda_permission_arn_halves`]): one creation of a grant, so
+/// the two suites cannot disagree about how one is written.
+pub(crate) async fn grant_narrowed(
+    router: &MultiServiceRouter,
+    case: &str,
+    statement: &str,
+    narrowing: &[(&str, &str)],
+) {
+    let mut request = serde_json::Map::from_iter([
+        ("StatementId".to_string(), json!(statement)),
+        ("Action".to_string(), json!("lambda:InvokeFunction")),
+        ("Principal".to_string(), json!("apigateway.amazonaws.com")),
+    ]);
+    for (member, value) in narrowing {
+        request.insert((*member).to_string(), json!(value));
+    }
     let (status, granted) = lambda(
         router,
         "POST",
         &format!("/2015-03-31/functions/{FUNCTION}/policy"),
-        Some(json!({
-            "StatementId": statement,
-            "Action": "lambda:InvokeFunction",
-            "Principal": "apigateway.amazonaws.com",
-            "SourceArn": source_arn,
-        })),
+        Some(Value::Object(request)),
     )
     .await;
     assert_eq!(
@@ -531,7 +574,7 @@ async fn grant(router: &MultiServiceRouter, case: &str, statement: &str, source_
 
 /// Take that statement off the function again, so the next row starts from a function that
 /// admits API Gateway nothing.
-async fn revoke(router: &MultiServiceRouter, case: &str, statement: &str) {
+pub(crate) async fn revoke(router: &MultiServiceRouter, case: &str, statement: &str) {
     let (status, removed) = lambda(
         router,
         "DELETE",
@@ -611,6 +654,109 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+/// Drive ONE request through `stage`, carrying `marker`, and assert the WHOLE outcome the
+/// rule requires of it: the status and body it is answered with, whether the function RAN,
+/// and what the stage's execution log recorded about it.
+///
+/// `invoked` is what the function's resource policy admits for this stage. A request it
+/// admits is answered by the function's own run; one it does not is answered through the api's
+/// configuration-error gateway response with the function never invoked, and the stage's
+/// execution log records the step that stopped it.
+///
+/// `pub(crate)` because the sibling suite over the remaining halves of the method ARN judges
+/// each leg by this same rule ([`crate::stage_lambda_permission_arn_halves`]): one check, so
+/// the two suites cannot disagree about what a refused leg looks like.
+pub(crate) async fn one_leg(
+    router: &MultiServiceRouter,
+    api: &str,
+    row_case: &str,
+    stage: &str,
+    marker: &str,
+    invoked: bool,
+) {
+    let case = &format!("{row_case} through {stage:?}");
+    // The runs the function's group already holds, which is what this request's own run is
+    // counted against.
+    let (runs_before, _) = runs_logged(router, marker).await;
+    let answered = invoke(router, api, stage, marker).await;
+    let request_id = answered
+        .request_id
+        .clone()
+        .unwrap_or_else(|| panic!("case {case:?}: the response named no request id"));
+    let expected = if invoked {
+        (200, json!({ "marker": marker }))
+    } else {
+        (500, json!({ "message": INTERNAL_SERVER_ERROR }))
+    };
+    assert_eq!(
+        (answered.status, answered.json()),
+        expected,
+        "case {case:?}: expected {expected:?}, got {} with {:?}",
+        answered.status,
+        answered.text()
+    );
+
+    // What a status alone cannot show: whether the function RAN. A request served by an
+    // invocation is one run's log, carrying that request's marker, in the function's own
+    // group; a request the policy refused leaves none.
+    let (runs_after, marked) = runs_logged(router, marker).await;
+    assert_eq!(
+        (runs_after - runs_before, marked),
+        (usize::from(invoked), invoked),
+        "case {case:?}: expected {} run(s) of the function logged by this request and \
+         its marker present={invoked}, got {} and {marked}",
+        usize::from(invoked),
+        runs_after - runs_before
+    );
+
+    // And what the STAGE logged about it, read back through CloudWatch Logs' own reader: the
+    // records of this request in the group API Gateway publishes for this stage, each naming
+    // the request they are about. At `ERROR` the stage traces the requests it answered with an
+    // error, which is the refused leg of this differential; the served leg leaves no trace of
+    // its own, and so names no configuration error either.
+    //
+    // A REFUSED leg has to find that group: its records are what the rule requires to be
+    // delivered. A SERVED leg traces nothing, so a stage that has delivered no record yet has
+    // no group of its own either — which is as much "no configuration error recorded" as an
+    // empty trace in a group is.
+    let group = format!("API-Gateway-Execution-Logs_{api}/{stage}");
+    let delivered_records = delivered(router, &group).await;
+    let trace = match (&delivered_records, invoked) {
+        (Some(records), _) => trace_of(records, &request_id),
+        (None, true) => Vec::new(),
+        (None, false) => {
+            panic!("case {case:?}: expected the group {group:?} to exist")
+        }
+    };
+    let refused = traced_line(
+        &request_id,
+        &format!("Execution failed due to configuration error: {INVALID_PERMISSIONS}"),
+    );
+    let answered_through = traced_line(
+        &request_id,
+        &format!("Answered through this API's {CONFIGURATION_ERROR_TYPE} gateway response"),
+    );
+    let status_line = traced_line(
+        &request_id,
+        &format!("Method completed with status: {}", expected.0),
+    );
+    if invoked {
+        assert!(
+            !trace.contains(&refused) && !trace.contains(&answered_through),
+            "case {case:?}: expected no configuration error recorded for a request the \
+             function served, got {trace:?}"
+        );
+    } else {
+        for line in [&status_line, &refused, &answered_through] {
+            assert!(
+                trace.contains(line),
+                "case {case:?}: expected the record {line:?} in this request's trace, \
+                 got {trace:?}"
+            );
+        }
+    }
+}
+
 /// Each stage of one deployment is admitted by the function's own resource policy against
 /// the ARN of the method THAT stage's request reached, and a request it does not admit is
 /// answered through the api's configuration-error gateway response with the refusal recorded
@@ -618,7 +764,7 @@ fn rows() -> Vec<Row> {
 #[tokio::test]
 async fn each_stage_is_admitted_by_the_functions_policy_against_its_own_method_arn() {
     let router = emulator();
-    let api = wired(&router).await;
+    let api = wired(&router, METHOD_VERB).await;
 
     for (index, row) in rows().into_iter().enumerate() {
         let case = row.case;
@@ -644,80 +790,10 @@ async fn each_stage_is_admitted_by_the_functions_policy_against_its_own_method_a
             (FIRST_STAGE, row.first_invoked),
             (SECOND_STAGE, row.second_invoked),
         ] {
-            let case = &format!("{case} through {stage:?}");
             // This request's own marker, which is how its run — if it was made at all — is
             // found among the runs the function's group already holds.
             let marker = format!("m{index}-{stage}");
-            let (runs_before, _) = runs_logged(&router, &marker).await;
-            let answered = invoke(&router, &api, stage, &marker).await;
-            let request_id = answered
-                .request_id
-                .clone()
-                .unwrap_or_else(|| panic!("case {case:?}: the response named no request id"));
-            let expected = if invoked {
-                (200, json!({ "marker": marker }))
-            } else {
-                (500, json!({ "message": INTERNAL_SERVER_ERROR }))
-            };
-            assert_eq!(
-                (answered.status, answered.json()),
-                expected,
-                "case {case:?}: expected {expected:?}, got {} with {:?}",
-                answered.status,
-                answered.text()
-            );
-
-            // What a status alone cannot show: whether the function RAN. A request served by
-            // an invocation is one run's log, carrying that request's marker, in the
-            // function's own group; a request the policy refused leaves none.
-            let (runs_after, marked) = runs_logged(&router, &marker).await;
-            assert_eq!(
-                (runs_after - runs_before, marked),
-                (usize::from(invoked), invoked),
-                "case {case:?}: expected {} run(s) of the function logged by this request and \
-                 its marker present={invoked}, got {} and {marked}",
-                usize::from(invoked),
-                runs_after - runs_before
-            );
-
-            // And what the STAGE logged about it, read back through CloudWatch Logs' own
-            // reader: the records of this request in the group API Gateway publishes for this
-            // stage, each naming the request they are about. At `ERROR` the stage traces the
-            // requests it answered with an error, which is the refused leg of this
-            // differential; the served leg leaves no trace of its own, and so names no
-            // configuration error either.
-            let group = format!("API-Gateway-Execution-Logs_{api}/{stage}");
-            let records = delivered(&router, &group)
-                .await
-                .unwrap_or_else(|| panic!("case {case:?}: expected the group {group:?} to exist"));
-            let trace = trace_of(&records, &request_id);
-            let refused = traced_line(
-                &request_id,
-                &format!("Execution failed due to configuration error: {INVALID_PERMISSIONS}"),
-            );
-            let answered_through = traced_line(
-                &request_id,
-                &format!("Answered through this API's {CONFIGURATION_ERROR_TYPE} gateway response"),
-            );
-            let status_line = traced_line(
-                &request_id,
-                &format!("Method completed with status: {}", expected.0),
-            );
-            if invoked {
-                assert!(
-                    !trace.contains(&refused) && !trace.contains(&answered_through),
-                    "case {case:?}: expected no configuration error recorded for a request the \
-                     function served, got {trace:?}"
-                );
-            } else {
-                for line in [&status_line, &refused, &answered_through] {
-                    assert!(
-                        trace.contains(line),
-                        "case {case:?}: expected the record {line:?} in this request's trace, \
-                         got {trace:?}"
-                    );
-                }
-            }
+            one_leg(&router, &api, case, stage, &marker, invoked).await;
         }
 
         for statement in 0..row.sources.len() {
