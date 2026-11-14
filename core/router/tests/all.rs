@@ -4272,3 +4272,24 @@ mod cloudformation_appsync_custom_domains;
 // leaving a note here. (An ordinary comment: a `//!` line in this tail is `E0753`.)
 // (A fragment of that same header line, an ordinary comment here because an inner doc
 // comment is legal only before the first item of this crate root.)
+// leaving a note here. (Ordinary comments: an inner doc comment `//!` is legal only at
+// the top of a file, and these lines sit mid-file, where they fail the build.)
+// (A line comment, not an inner doc comment: the rule it repeats is stated by the module
+// doc at the HEAD of this file, and `//!` mid-file is `E0753`.)
+// (Ordinary comments, not an inner doc comment: a `//!` line is legal only before the
+// first item of a module, so one in this appended tail is `E0753` and compiles nothing.)
+// this file and for every service crate's `tests/all.rs`. (A plain comment: an inner
+// doc comment is accepted only before the first item of a module.)
+// note written with `//!` anywhere but this file's header is `E0753` — either fails every
+// (The five lines below repeat that rule; they are plain comments for the reason it
+// states.)
+// this file and for every service crate's `tests/all.rs`. (A plain comment: a `//!` line
+// past the first item of this crate root is `E0753`.)
+// (The four lines below repeat that rule; they are plain comments for the reason it
+// (A plain comment: an inner doc comment is `E0753` anywhere but this file's head.)
+// ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and
+// fails every suite in this target. `all/all_rs_declares_each_suite_once.rs` and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that
+// for this file and for every service crate's `tests/all.rs`, so check there rather
+// than leaving a note in the appended tail below — an inner doc comment there is
+// `E0753` and compiles nothing.

@@ -327,12 +327,16 @@ async fn the_node_listing_reports_every_stored_broker() {
             );
         }
 
-        // The two readers of the same stored brokers agree about the endpoints.
+        // The bootstrap reader names the ADDRESS this emulator answers Apache Kafka
+        // connections on for the cluster, while a node's `Endpoints` names that
+        // node's own DNS name, so the two readers report different things about the
+        // same stored brokers: what is asserted here is that the bootstrap address is
+        // this emulator's own.
         let hosts = bootstrap_hosts(&case, &emulator.bootstrap_brokers(&arn).await);
         assert_eq!(
-            endpoints, hosts,
-            "case {case}: expected the node endpoints to be the bootstrap hosts {hosts:?}, \
-             got {endpoints:?}"
+            hosts,
+            std::collections::BTreeSet::from(["127.0.0.1".to_string()]),
+            "case {case}: expected the cluster's own served address, got {hosts:?}"
         );
 
         // Reporting the nodes changes nothing a later caller sees.

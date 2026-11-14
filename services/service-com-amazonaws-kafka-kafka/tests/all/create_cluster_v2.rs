@@ -26,11 +26,6 @@ use crate::kafka_harness::{
 /// `CreateClusterV2`'s URI, per the model's `http` binding on the operation.
 const CREATE_V2_URI: &str = "/api/v2/clusters";
 
-/// The SASL/IAM client-broker port, from "Port information for Amazon MSK" — the
-/// one port a serverless cluster's clients bootstrap on, IAM access control being
-/// the only authentication MSK Serverless offers.
-const PORT_SASL_IAM: u16 = 9098;
-
 /// Call `CreateClusterV2` with `body` in the suite's region.
 async fn create_v2(emulator: &Emulator, body: Value) -> Reply {
     emulator.call("POST", CREATE_V2_URI, Some(body)).await
@@ -492,8 +487,10 @@ async fn a_serverless_body_registers_a_serverless_cluster() {
         );
 
         // One access path: a serverless cluster's clients bootstrap through its
-        // own endpoint on the SASL/IAM port, so that is the one string reported
-        // and every broker-list member is absent.
+        // own endpoint on the SASL/IAM path, so that is the one string reported
+        // and every broker-list member is absent. The address it names is the one
+        // this emulator answers Apache Kafka connections on (the data plane itself is
+        // driven in `broker_data_plane`).
         let brokers = emulator.bootstrap_brokers(arn).await;
         assert_eq!(
             brokers.status, 200,
@@ -506,10 +503,12 @@ async fn a_serverless_body_registers_a_serverless_cluster() {
             .unwrap_or_default()
             .to_string();
         assert!(
-            iam_string.ends_with(&format!(
-                ".kafka-serverless.{REGION}.amazonaws.com:{PORT_SASL_IAM}"
-            )) && iam_string.starts_with("boot-"),
-            "case {row:?}: expected a serverless bootstrap endpoint in {REGION}, got {iam_string:?}"
+            iam_string.starts_with("127.0.0.1:")
+                && iam_string
+                    .rsplit_once(':')
+                    .is_some_and(|(_, port)| port.parse::<u16>().is_ok_and(|port| port > 0)),
+            "case {row:?}: expected a serverless bootstrap endpoint this emulator serves, got \
+             {iam_string:?}"
         );
         assert_eq!(
             brokers

@@ -300,16 +300,10 @@ impl Cluster {
         self.policy.take()
     }
 
-    /// The one bootstrap string a serverless cluster has, or `None` for a
-    /// provisioned one (whose strings come from [`Self::broker_endpoints`], one
-    /// per enabled access path).
-    pub fn serverless_bootstrap_brokers(&self) -> Option<String> {
-        self.serverless.as_ref().map(|config| {
-            join_endpoints(
-                std::iter::once(config.bootstrap_host.as_str()),
-                PORT_SASL_IAM,
-            )
-        })
+    /// Whether this cluster is a serverless one, whose clients bootstrap through one
+    /// access path (SASL/IAM over TLS) rather than through a broker list.
+    pub fn serverless_access_only(&self) -> bool {
+        self.serverless.is_some()
     }
 
     /// Apply the transitions the clock already owes this cluster: `CREATING` ->
@@ -977,17 +971,6 @@ impl Cluster {
         }
     }
 
-    /// Every broker's endpoint on `port`, comma-separated in broker-id order —
-    /// the form a Kafka client's `bootstrap.servers` takes.
-    pub fn broker_endpoints(&self, port: u16) -> String {
-        join_endpoints(
-            self.brokers
-                .iter()
-                .map(|broker| broker.endpoint_host.as_str()),
-            port,
-        )
-    }
-
     /// One stored broker node as the `NodeInfo` `ListNodes` reports.
     ///
     /// Every member is derived from the record: the node's own placement and
@@ -1085,7 +1068,21 @@ impl Cluster {
     }
 
     /// Whether SASL/IAM client authentication is turned on.
+    ///
+    /// Read from BOTH records a cluster can carry it in: a provisioned cluster's
+    /// `ClientAuthentication`, and a serverless one's `ServerlessClientAuthentication`
+    /// — IAM access control is the only client authentication Amazon MSK Serverless
+    /// offers, so a serverless cluster that names none is reached with it too.
     pub fn sasl_iam_enabled(&self) -> bool {
+        if let Some(serverless) = self.serverless.as_ref() {
+            return serverless
+                .client_authentication
+                .as_ref()
+                .and_then(|auth| auth.sasl.as_ref())
+                .and_then(|sasl| sasl.iam.as_ref())
+                .and_then(|iam| iam.enabled)
+                .unwrap_or(true);
+        }
         self.client_authentication
             .as_ref()
             .and_then(|auth| auth.sasl.as_ref())

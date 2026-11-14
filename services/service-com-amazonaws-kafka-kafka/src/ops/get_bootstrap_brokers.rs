@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBootstrapBrokers
-//! Renders the cluster's bootstrap-broker strings from its persisted brokers and
-//! access settings: one `<host>:<port>` entry per stored broker node, and one
-//! string per access path the cluster actually enables. A path the cluster does
-//! not enable has no string at all. A cluster the service is still provisioning
-//! has no brokers yet ([`crate::state::cluster_has_broker_nodes`]), so it is
-//! refused with `BadRequestException` rather than answered with endpoints nothing
+//! Renders the cluster's bootstrap-broker strings from its persisted access settings:
+//! one string per access path the cluster actually enables, each naming the address
+//! THIS emulator accepts an Apache Kafka connection on for that path. A path the
+//! cluster does not enable has no string at all. A cluster the service is still
+//! provisioning has no brokers yet ([`crate::state::cluster_has_broker_nodes`]), so it
+//! is refused with `BadRequestException` rather than answered with endpoints nothing
 //! serves on.
+//!
+//! The address is a socket the CORE owns, opened for the cluster on the first read of
+//! its endpoints and kept for as long as the store lives
+//! ([`crate::state::broker_plane::ensure_cluster_endpoint`]) — so every later read
+//! answers the same address, and the broker behind it serves the protocol a client
+//! takes the string to: the SASL exchange the path requires, the topic configuration
+//! the control plane stored, and the records a client produces and fetches.
 //!
 //! Authentication is NOT this handler's business: the emulator verifies every
 //! request signature centrally (see `AGENTS.md`), so the modelled
@@ -211,119 +218,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut state = state.lock();
-        // An ARN this endpoint's region holds no cluster for — absent, or
-        // belonging to another region — is refused the same way. Resolved
-        // through the settling lookup: every string below is derived from the
-        // cluster's connectivity configuration, which a completed
-        // `UpdateConnectivity` changes, so the endpoints this reader reports
-        // depend on a transition the clock may already owe the cluster.
-        let Some(cluster) = state.settled_cluster_in(
-            &region,
-            &input.cluster_arn,
-            std::time::SystemTime::now(),
-        ) else {
-            // This operation's model declares NO `NotFoundException`, yet the
-            // service answers one for a cluster reference it cannot resolve —
-            // the same 404 and the same fixed sentence every reader that DOES
-            // model it answers ([`crate::state::RESOURCE_NOT_FOUND_MESSAGE`]).
-            // A client branches on the code, so the code the service answers is
-            // the code that goes on the wire, through the unmodelled channel
-            // ([`crate::scaffolded::Scaffolded::unmodeled`]).
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::NOT_FOUND_CODE,
-                crate::state::NOT_FOUND_STATUS,
-                crate::state::RESOURCE_NOT_FOUND_MESSAGE,
-            ));
+        // Everything read off the cluster record is read under ONE guard, in a scope
+        // of its own: the endpoints below are opened asynchronously, and a lock held
+        // across an await would make this future non-`Send`.
+        let (serverless, plaintext, tls, scram, iam, public, dual_stack, vpc_tls, vpc_scram, vpc_iam) = {
+            let mut state = state.lock();
+            // An ARN this endpoint's region holds no cluster for — absent, or
+            // belonging to another region — is refused the same way. Resolved
+            // through the settling lookup: every string below is derived from the
+            // cluster's connectivity configuration, which a completed
+            // `UpdateConnectivity` changes, so the endpoints this reader reports
+            // depend on a transition the clock may already owe the cluster.
+            let Some(cluster) = state.settled_cluster_in(
+                &region,
+                &input.cluster_arn,
+                std::time::SystemTime::now(),
+            ) else {
+                // This operation's model declares NO `NotFoundException`, yet the
+                // service answers one for a cluster reference it cannot resolve —
+                // the same 404 and the same fixed sentence every reader that DOES
+                // model it answers ([`crate::state::RESOURCE_NOT_FOUND_MESSAGE`]).
+                // A client branches on the code, so the code the service answers is
+                // the code that goes on the wire, through the unmodelled channel
+                // ([`crate::scaffolded::Scaffolded::unmodeled`]).
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NOT_FOUND_CODE,
+                    crate::state::NOT_FOUND_STATUS,
+                    crate::state::RESOURCE_NOT_FOUND_MESSAGE,
+                ));
+            };
+
+            // The cluster's own resource-based policy is in force on this action too
+            // — it is one of the actions an MSK cluster policy governs — and an
+            // explicit deny in it refuses the read before any endpoint is reported.
+            // See [`crate::state::authorization::CLUSTER_POLICY_ACTIONS`].
+            crate::state::authorization::authorize_cluster_policy(Self::NAME, cluster)?;
+
+            // A cluster the service is still provisioning has no brokers yet, so
+            // there are no endpoints to bootstrap against: the reader refuses rather
+            // than reporting an address nothing is serving on. Checked for either
+            // kind of cluster, the serverless endpoint included.
+            if !crate::state::cluster_has_broker_nodes(&cluster.state) {
+                let cluster_state = cluster.state.clone();
+                return Err(GetBootstrapBrokersErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some("ClusterArn".to_string()),
+                        message: Some(crate::state::bootstrap_brokers_unavailable_message(
+                            &cluster_state,
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // MSK Serverless offers ONE access path: a client authenticates with IAM
+            // access control over TLS, on the SASL/IAM port. So a serverless cluster
+            // has exactly one bootstrap string — its own endpoint, not a broker list —
+            // and every other member is absent rather than empty.
+            (
+                cluster.serverless_access_only(),
+                cluster.plaintext_enabled(),
+                cluster.tls_enabled(),
+                cluster.sasl_scram_enabled(),
+                cluster.sasl_iam_enabled(),
+                cluster.public_access_enabled(),
+                cluster.dual_stack(),
+                cluster.vpc_connectivity_tls_enabled(),
+                cluster.vpc_connectivity_sasl_scram_enabled(),
+                cluster.vpc_connectivity_sasl_iam_enabled(),
+            )
         };
 
-        // The cluster's own resource-based policy is in force on this action too
-        // — it is one of the actions an MSK cluster policy governs — and an
-        // explicit deny in it refuses the read before any endpoint is reported.
-        // See [`crate::state::authorization::CLUSTER_POLICY_ACTIONS`].
-        crate::state::authorization::authorize_cluster_policy(Self::NAME, cluster)?;
-
-        // A cluster the service is still provisioning has no brokers yet, so
-        // there are no endpoints to bootstrap against: the reader refuses rather
-        // than reporting hostnames nothing is serving on. Checked for either
-        // kind of cluster, the serverless endpoint included.
-        if !crate::state::cluster_has_broker_nodes(&cluster.state) {
-            let state = cluster.state.clone();
-            return Err(GetBootstrapBrokersErrorModeled::BadRequestException(
-                BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(crate::state::bootstrap_brokers_unavailable_message(&state)),
-                },
+        // The ADDRESS each path is announced at is the one the emulator ANSWERS Apache
+        // Kafka connections on: the core binds a socket per path on this emulator's own
+        // interface and this service serves the Kafka wire protocol there
+        // ([`crate::state::broker_plane`]), so a client that takes a bootstrap string
+        // verbatim reaches a broker. A path whose socket could not be opened is
+        // reported as a server fault rather than announced as an address nothing
+        // serves.
+        let mut announced: Vec<(state::broker_plane::AccessPath, Option<String>)> = Vec::new();
+        for path in [
+            state::broker_plane::AccessPath::Plaintext,
+            state::broker_plane::AccessPath::Tls,
+            state::broker_plane::AccessPath::SaslScram,
+            state::broker_plane::AccessPath::SaslIam,
+        ] {
+            let wanted = match path {
+                state::broker_plane::AccessPath::Plaintext => plaintext && !serverless,
+                state::broker_plane::AccessPath::Tls => (tls || vpc_tls) && !serverless,
+                state::broker_plane::AccessPath::SaslScram => (scram || vpc_scram) && !serverless,
+                state::broker_plane::AccessPath::SaslIam => serverless || iam || vpc_iam,
+            };
+            if !wanted {
+                announced.push((path, None));
+                continue;
+            }
+            let Some(authority) = state::broker_plane::ensure_cluster_endpoint(
+                &*self.engine,
+                ctx,
+                &region,
+                &input.cluster_arn,
+                path,
             )
-            .into());
+            .await
+            else {
+                return Err(
+                    GetBootstrapBrokersErrorModeled::InternalServerErrorException(
+                        InternalServerErrorException {
+                            invalid_parameter: None,
+                            message: Some(
+                                "the cluster's Apache Kafka endpoint could not be opened"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            announced.push((path, Some(authority)));
         }
+        let endpoint = |path: state::broker_plane::AccessPath| -> Option<String> {
+            announced
+                .iter()
+                .find(|(served, _)| *served == path)
+                .and_then(|(_, authority)| authority.clone())
+        };
 
-        // MSK Serverless offers ONE access path: a client authenticates with IAM
-        // access control over TLS, on the SASL/IAM port. So a serverless cluster
-        // has exactly one bootstrap string — its own endpoint, not a broker list —
-        // and every other member is absent rather than empty.
-        if let Some(endpoint) = cluster.serverless_bootstrap_brokers() {
+        // MSK Serverless has exactly one bootstrap string: the SASL/IAM one.
+        if serverless {
             return Ok(GetBootstrapBrokersOutput {
-                bootstrap_broker_string_sasl_iam: Some(endpoint),
+                bootstrap_broker_string_sasl_iam: endpoint(
+                    state::broker_plane::AccessPath::SaslIam,
+                ),
                 ..GetBootstrapBrokersOutput::default()
             });
         }
 
-        // One string per access path the cluster enables, each listing every
-        // broker on that path's port. `when` keeps a path's member absent rather
-        // than empty when the cluster does not offer it.
-        let when = |enabled: bool, port: u16| {
-            enabled.then(|| cluster.broker_endpoints(port))
+        // One string per access path the cluster enables, each naming the address that
+        // path is served at. `when` keeps a path's member absent rather than empty when
+        // the cluster does not offer it.
+        let when = |enabled: bool, path: state::broker_plane::AccessPath| {
+            enabled.then(|| endpoint(path)).flatten()
         };
-        let plaintext = cluster.plaintext_enabled();
-        let tls = cluster.tls_enabled();
-        let scram = cluster.sasl_scram_enabled();
-        let iam = cluster.sasl_iam_enabled();
-        let public = cluster.public_access_enabled();
-        let dual_stack = cluster.dual_stack();
+        let plaintext_path = state::broker_plane::AccessPath::Plaintext;
+        let tls_path = state::broker_plane::AccessPath::Tls;
+        let scram_path = state::broker_plane::AccessPath::SaslScram;
+        let iam_path = state::broker_plane::AccessPath::SaslIam;
 
         Ok(GetBootstrapBrokersOutput {
-            bootstrap_broker_string: when(plaintext, state::PORT_PLAINTEXT),
-            bootstrap_broker_string_tls: when(tls, state::PORT_TLS),
-            bootstrap_broker_string_sasl_scram: when(scram, state::PORT_SASL_SCRAM),
-            bootstrap_broker_string_sasl_iam: when(iam, state::PORT_SASL_IAM),
+            bootstrap_broker_string: when(plaintext, plaintext_path),
+            bootstrap_broker_string_tls: when(tls, tls_path),
+            bootstrap_broker_string_sasl_scram: when(scram, scram_path),
+            bootstrap_broker_string_sasl_iam: when(iam, iam_path),
             // Public access carries no plaintext port: a public endpoint is
             // reachable only over TLS or SASL.
-            bootstrap_broker_string_public_tls: when(public && tls, state::PORT_PUBLIC_TLS),
-            bootstrap_broker_string_public_sasl_scram: when(
-                public && scram,
-                state::PORT_PUBLIC_SASL_SCRAM,
-            ),
-            bootstrap_broker_string_public_sasl_iam: when(
-                public && iam,
-                state::PORT_PUBLIC_SASL_IAM,
-            ),
-            bootstrap_broker_string_vpc_connectivity_tls: when(
-                cluster.vpc_connectivity_tls_enabled(),
-                state::PORT_VPC_TLS,
-            ),
-            bootstrap_broker_string_vpc_connectivity_sasl_scram: when(
-                cluster.vpc_connectivity_sasl_scram_enabled(),
-                state::PORT_VPC_SASL_SCRAM,
-            ),
-            bootstrap_broker_string_vpc_connectivity_sasl_iam: when(
-                cluster.vpc_connectivity_sasl_iam_enabled(),
-                state::PORT_VPC_SASL_IAM,
-            ),
+            bootstrap_broker_string_public_tls: when(public && tls, tls_path),
+            bootstrap_broker_string_public_sasl_scram: when(public && scram, scram_path),
+            bootstrap_broker_string_public_sasl_iam: when(public && iam, iam_path),
+            bootstrap_broker_string_vpc_connectivity_tls: when(vpc_tls, tls_path),
+            bootstrap_broker_string_vpc_connectivity_sasl_scram: when(vpc_scram, scram_path),
+            bootstrap_broker_string_vpc_connectivity_sasl_iam: when(vpc_iam, iam_path),
             // A dual-stack cluster answers on the same ports over IPv6, through
-            // the SAME broker hostnames: an MSK broker endpoint is one DNS name
-            // whose record set gains AAAA entries on a `DUAL` cluster, so these
-            // members repeat the IPv4 strings by design. Minting a different host
-            // label for the IPv6 path would be invented — neither the model nor
-            // the published endpoint format gives one. An IPv4-only cluster (the
-            // model's default `NetworkType`) has no IPv6 path at all.
-            bootstrap_broker_string_ipv6: when(dual_stack && plaintext, state::PORT_PLAINTEXT),
-            bootstrap_broker_string_tls_ipv6: when(dual_stack && tls, state::PORT_TLS),
-            bootstrap_broker_string_sasl_scram_ipv6: when(
-                dual_stack && scram,
-                state::PORT_SASL_SCRAM,
-            ),
-            bootstrap_broker_string_sasl_iam_ipv6: when(dual_stack && iam, state::PORT_SASL_IAM),
+            // the SAME broker endpoint: an MSK broker endpoint is one address whose
+            // record set gains AAAA entries on a `DUAL` cluster, so these members
+            // repeat the IPv4 strings by design. An IPv4-only cluster (the model's
+            // default `NetworkType`) has no IPv6 path at all.
+            bootstrap_broker_string_ipv6: when(dual_stack && plaintext, plaintext_path),
+            bootstrap_broker_string_tls_ipv6: when(dual_stack && tls, tls_path),
+            bootstrap_broker_string_sasl_scram_ipv6: when(dual_stack && scram, scram_path),
+            bootstrap_broker_string_sasl_iam_ipv6: when(dual_stack && iam, iam_path),
         })
     }
 }

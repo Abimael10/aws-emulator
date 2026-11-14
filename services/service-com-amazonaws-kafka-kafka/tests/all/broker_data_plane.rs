@@ -1,0 +1,1975 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The DATA PLANE of an Amazon MSK cluster: that every `host:port` the control plane
+//! announces is an address THIS emulator accepts an Apache Kafka connection on, and
+//! that a client taking the string verbatim reads the topic configuration the control
+//! plane stored, produces a record and fetches it back — and no longer fetches one the
+//! topic's retention has aged out.
+//!
+//! RULE under test: an address a service publishes for a caller to connect to is one
+//! the service itself answers on, speaking the protocol the published member is for.
+//! For `GetBootstrapBrokers` that is the Apache Kafka wire protocol, so each row below
+//! dials a published string and talks to it.
+//!
+//! The tables span what the rule generalises over — which ACCESS PATH the string names
+//! (plaintext, TLS, SASL/SCRAM, SASL/IAM, and their public and multi-VPC siblings),
+//! whether the wire is ENCRYPTED, which CONFIGURATION the topic carries, how many
+//! RECORDS are produced and how OLD they are against the topic's retention, and which
+//! CREDENTIAL the SASL exchange is offered. The recorded case (a SASL endpoint, a
+//! topic with `retention.ms` set, one record read from the earliest offset) is one row
+//! of it.
+//!
+//! Every assertion goes over a real socket the core opened for the cluster, dialled at
+//! the address `GetBootstrapBrokers` published; nothing here reaches into the
+//! service's state.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use ::bytes::{Bytes, BytesMut};
+use ::kafka_protocol::messages::{
+    describe_configs_request::DescribeConfigsResource,
+    fetch_request::{FetchPartition, FetchTopic},
+    list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
+    produce_request::{PartitionProduceData, TopicProduceData},
+    ApiKey, ApiVersionsRequest, ApiVersionsResponse, DescribeConfigsRequest,
+    DescribeConfigsResponse, FetchRequest, FetchResponse, ListOffsetsRequest, ListOffsetsResponse,
+    MetadataRequest, MetadataResponse, ProduceRequest, ProduceResponse, RequestHeader,
+    ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+    SaslHandshakeResponse, TopicName,
+};
+use ::kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
+use ::kafka_protocol::records::{
+    Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+};
+use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+use crate::kafka_harness::{pct, sleep_past_activation, ClusterRequest, Emulator, REGION};
+
+/// The interface the core binds a resource listener on by default, and so the only
+/// host a published bootstrap address may name on this machine.
+const LOOPBACK: &str = "127.0.0.1";
+
+/// The client id every connection below identifies itself with.
+const CLIENT_ID: &str = "sim2real-data-plane";
+
+/// The SASL mechanism names a client selects, as Amazon MSK's brokers offer them.
+const SCRAM_SHA_512: &str = "SCRAM-SHA-512";
+const AWS_MSK_IAM: &str = "AWS_MSK_IAM";
+const OAUTHBEARER: &str = "OAUTHBEARER";
+
+/// The username and password the SASL/SCRAM secret in this suite carries.
+const SCRAM_USER: &str = "scram-user";
+const SCRAM_PASSWORD: &str = "scram-Secret-99";
+
+/// A customer managed KMS key, which is the only kind of key a secret a cluster
+/// associates may be encrypted with.
+const CUSTOMER_KEY_ARN: &str =
+    "arn:aws:kms:us-west-2:000000000000:key/9b1dca1e-7c4f-4a6e-8f0a-5b2d7c3e1f40";
+
+/// A byte stream a Kafka session runs on: a plaintext socket, or the TLS stream over
+/// one.
+type Session = Box<dyn Stream>;
+
+/// What a session needs of its connection.
+trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
+
+/// One client on one published address.
+struct Client {
+    session: Session,
+    correlation: i32,
+}
+
+impl Client {
+    /// Dial `authority` in the clear, after asserting it is an address of this
+    /// machine: the core binds its listeners on the operator-chosen interface,
+    /// loopback by default, so a published bootstrap address is this machine's own —
+    /// and that is the address dialled.
+    async fn plaintext(case: &str, authority: &str) -> Self {
+        Self {
+            session: Box::new(dial(case, authority).await),
+            correlation: 0,
+        }
+    }
+
+    /// The same address over TLS, which is how a client reaches one of the encrypted
+    /// paths — the wire the core terminates.
+    async fn tls(case: &str, authority: &str) -> Self {
+        let conn = dial(case, authority).await;
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("the provider supports the default protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptTheEmulatorsCertificate(provider)))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+            .expect("localhost is a server name");
+        let stream = connector
+            .connect(server_name, conn)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case {case:?}: the cluster's socket must complete a TLS handshake, got {error}"
+                )
+            });
+        Self {
+            session: Box::new(stream),
+            correlation: 0,
+        }
+    }
+
+    /// Send one request and read its response, framed exactly as the protocol frames
+    /// them: a length, the request header for this API and version, and the body.
+    async fn call<Request: Encodable, Response: Decodable>(
+        &mut self,
+        case: &str,
+        key: ApiKey,
+        version: i16,
+        request: &Request,
+    ) -> Response {
+        self.correlation += 1;
+        let correlation = self.correlation;
+        let mut frame = BytesMut::new();
+        RequestHeader::default()
+            .with_request_api_key(key as i16)
+            .with_request_api_version(version)
+            .with_correlation_id(correlation)
+            .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)))
+            .encode(&mut frame, key.request_header_version(version))
+            .unwrap_or_else(|error| panic!("case {case:?}: the header must encode: {error}"));
+        request
+            .encode(&mut frame, version)
+            .unwrap_or_else(|error| panic!("case {case:?}: the request must encode: {error}"));
+        let length = u32::try_from(frame.len()).expect("a request frame fits in a u32");
+        self.session
+            .write_all(&length.to_be_bytes())
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the frame must be written: {error}"));
+        self.session
+            .write_all(&frame)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the frame must be written: {error}"));
+        let mut answered = self.read_frame(case).await.unwrap_or_else(|| {
+            panic!("case {case:?}: the broker must answer a {key:?} v{version} request")
+        });
+        ResponseHeader::decode(&mut answered, key.response_header_version(version))
+            .unwrap_or_else(|error| panic!("case {case:?}: the response header must decode: {error}"));
+        Response::decode(&mut answered, version)
+            .unwrap_or_else(|error| panic!("case {case:?}: the response must decode: {error}"))
+    }
+
+    /// The next response frame, or `None` when the broker closed the connection
+    /// instead of answering.
+    async fn read_frame(&mut self, case: &str) -> Option<Bytes> {
+        let mut length = [0u8; 4];
+        if self.session.read_exact(&mut length).await.is_err() {
+            return None;
+        }
+        let length = u32::from_be_bytes(length) as usize;
+        assert!(
+            length > 0 && length < 8 * 1024 * 1024,
+            "case {case:?}: the broker answered a frame of {length} bytes"
+        );
+        let mut frame = vec![0u8; length];
+        self.session
+            .read_exact(&mut frame)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the frame must be read: {error}"));
+        Some(Bytes::from(frame))
+    }
+
+    /// `ApiVersions`, the first call every Kafka client makes.
+    async fn api_versions(&mut self, case: &str) -> ApiVersionsResponse {
+        self.call(
+            case,
+            ApiKey::ApiVersions,
+            3,
+            &ApiVersionsRequest::default()
+                .with_client_software_name(StrBytes::from_static_str(CLIENT_ID))
+                .with_client_software_version(StrBytes::from_static_str("1")),
+        )
+        .await
+    }
+
+    /// `Metadata` for every topic of the cluster.
+    async fn metadata(&mut self, case: &str) -> MetadataResponse {
+        self.call(
+            case,
+            ApiKey::Metadata,
+            9,
+            &MetadataRequest::default().with_topics(None),
+        )
+        .await
+    }
+
+    /// Complete the SASL exchange `mechanism` defines, answering the error code of its
+    /// last leg: `0` for an authenticated connection.
+    async fn authenticate(&mut self, case: &str, mechanism: &str, password: &str) -> i16 {
+        let handshake: SaslHandshakeResponse = self
+            .call(
+                case,
+                ApiKey::SaslHandshake,
+                1,
+                &SaslHandshakeRequest::default()
+                    .with_mechanism(StrBytes::from_string(mechanism.to_string())),
+            )
+            .await;
+        if handshake.error_code != 0 {
+            return handshake.error_code;
+        }
+        match mechanism {
+            OAUTHBEARER => {
+                // RFC 7628 §3.1: the GS2 header, then `auth=Bearer <token>`. The token
+                // Amazon MSK's auth-token signer produces is the signed
+                // `kafka-cluster:Connect` request, base64url-encoded.
+                let signed = format!(
+                    "https://kafka.{REGION}.amazonaws.com/?Action=kafka-cluster%3AConnect\
+                     &X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                     &X-Amz-Credential=AKIDEXAMPLE%2F20261101%2F{REGION}%2Fkafka-cluster\
+                     %2Faws4_request&X-Amz-Date=20261101T000000Z&X-Amz-Expires=900\
+                     &X-Amz-SignedHeaders=host&X-Amz-Signature={password}"
+                );
+                let token = ::aws_smithy_types::base64::encode(&signed)
+                    .replace('+', "-")
+                    .replace('/', "_")
+                    .trim_end_matches('=')
+                    .to_string();
+                let answered: SaslAuthenticateResponse = self
+                    .call(
+                        case,
+                        ApiKey::SaslAuthenticate,
+                        2,
+                        &SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(
+                            format!("n,,\x01auth=Bearer {token}\x01\x01").into_bytes(),
+                        )),
+                    )
+                    .await;
+                answered.error_code
+            }
+            AWS_MSK_IAM => {
+                let payload = json!({
+                    "version": "2020_10_22",
+                    "host": LOOPBACK,
+                    "user-agent": CLIENT_ID,
+                    "action": "kafka-cluster:Connect",
+                    "x-amz-algorithm": "AWS4-HMAC-SHA256",
+                    "x-amz-credential":
+                        format!("AKIDEXAMPLE/20261101/{REGION}/kafka-cluster/aws4_request"),
+                    "x-amz-date": "20261101T000000Z",
+                    "x-amz-signedheaders": "host",
+                    "x-amz-signature": password,
+                });
+                let answered: SaslAuthenticateResponse = self
+                    .call(
+                        case,
+                        ApiKey::SaslAuthenticate,
+                        2,
+                        &SaslAuthenticateRequest::default()
+                            .with_auth_bytes(Bytes::from(payload.to_string().into_bytes())),
+                    )
+                    .await;
+                answered.error_code
+            }
+            _ => self.scram(case, password).await,
+        }
+    }
+
+    /// The SCRAM-SHA-512 exchange of RFC 5802, client side.
+    async fn scram(&mut self, case: &str, password: &str) -> i16 {
+        let client_nonce = "fyko+d2lbbFgONRv9qkxdawL";
+        let client_first_bare = format!("n={SCRAM_USER},r={client_nonce}");
+        let first: SaslAuthenticateResponse = self
+            .call(
+                case,
+                ApiKey::SaslAuthenticate,
+                2,
+                &SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(
+                    format!("n,,{client_first_bare}").into_bytes(),
+                )),
+            )
+            .await;
+        if first.error_code != 0 {
+            return first.error_code;
+        }
+        let server_first = String::from_utf8(first.auth_bytes.to_vec())
+            .unwrap_or_else(|_| panic!("case {case:?}: the server-first message must be text"));
+        let mut combined_nonce = String::new();
+        let mut salt = Vec::new();
+        let mut iterations = 0u32;
+        for attribute in server_first.split(',') {
+            match attribute.split_once('=') {
+                Some(("r", value)) => combined_nonce = value.to_string(),
+                Some(("s", value)) => {
+                    salt = ::aws_smithy_types::base64::decode(value).unwrap_or_else(|error| {
+                        panic!("case {case:?}: the salt must be base64: {error}")
+                    })
+                }
+                Some(("i", value)) => iterations = value.parse().unwrap_or_default(),
+                _ => {}
+            }
+        }
+        assert!(
+            combined_nonce.starts_with(client_nonce),
+            "case {case:?}: the server nonce must extend the client's, got {combined_nonce:?}"
+        );
+        assert!(
+            iterations >= 4096,
+            "case {case:?}: RFC 5802 requires at least 4096 iterations, got {iterations}"
+        );
+        let without_proof = format!("c=biws,r={combined_nonce}");
+        let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
+        let mut salted = [0u8; 64];
+        ::pbkdf2::pbkdf2_hmac::<::sha2::Sha512>(
+            password.as_bytes(),
+            &salt,
+            iterations,
+            &mut salted,
+        );
+        let client_key = hmac_sha512(&salted, b"Client Key");
+        let stored_key = {
+            use ::sha2::Digest;
+            ::sha2::Sha512::digest(&client_key).to_vec()
+        };
+        let client_signature = hmac_sha512(&stored_key, auth_message.as_bytes());
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(client_signature.iter())
+            .map(|(key, signature)| key ^ signature)
+            .collect();
+        let client_final = format!(
+            "{without_proof},p={}",
+            ::aws_smithy_types::base64::encode(&proof)
+        );
+        let last: SaslAuthenticateResponse = self
+            .call(
+                case,
+                ApiKey::SaslAuthenticate,
+                2,
+                &SaslAuthenticateRequest::default()
+                    .with_auth_bytes(Bytes::from(client_final.into_bytes())),
+            )
+            .await;
+        if last.error_code == 0 {
+            let server_final = String::from_utf8(last.auth_bytes.to_vec()).unwrap_or_default();
+            let server_key = hmac_sha512(&salted, b"Server Key");
+            let expected = ::aws_smithy_types::base64::encode(hmac_sha512(
+                &server_key,
+                auth_message.as_bytes(),
+            ));
+            assert_eq!(
+                server_final,
+                format!("v={expected}"),
+                "case {case:?}: the server must prove it holds the same credential"
+            );
+        }
+        last.error_code
+    }
+}
+
+/// `HMAC(key, data)` over SHA-512, the client half of the SCRAM computation.
+fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use ::hmac::digest::KeyInit;
+    use ::hmac::Mac;
+
+    let mut mac = <::hmac::Hmac<::sha2::Sha512> as KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts a key of any length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Open a TCP connection to a published authority, asserting first that the address is
+/// one of this emulator's own.
+async fn dial(case: &str, authority: &str) -> TcpStream {
+    let (host, port) = authority
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("case {case:?}: {authority:?} is not a host:port pair"));
+    assert_eq!(
+        host, LOOPBACK,
+        "case {case:?}: a published bootstrap address must be this emulator's own, got \
+         {authority:?}"
+    );
+    let port: u16 = port
+        .parse()
+        .unwrap_or_else(|_| panic!("case {case:?}: {port:?} is not a port"));
+    TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: {authority} must accept a connection, got {error}")
+        })
+}
+
+/// The verifier a client of the emulator's OWN socket uses: the certificate is the one
+/// the core generated for its listeners, self-signed and naming loopback, and this
+/// client is the emulator's own test connecting to a port the same process opened — so
+/// there is no authority to check it against.
+#[derive(Debug)]
+struct AcceptTheEmulatorsCertificate(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptTheEmulatorsCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Create a topic on `cluster`, with `configs` as the Base64 topic-configuration
+/// string the API takes, and wait out its `CREATING` span.
+async fn given_topic(
+    emulator: &Emulator,
+    cluster: &str,
+    name: &str,
+    partitions: i64,
+    configs: Option<Value>,
+) {
+    let mut body = json!({
+        "topicName": name,
+        "partitionCount": partitions,
+        "replicationFactor": 1,
+    });
+    if let Some(configs) = configs {
+        body["configs"] = json!(::aws_smithy_types::base64::encode(configs.to_string()));
+    }
+    let reply = emulator
+        .call(
+            "POST",
+            &format!("/v1/clusters/{}/topics", pct(cluster)),
+            Some(body),
+        )
+        .await;
+    assert_eq!(
+        reply.status, 200,
+        "setup: CreateTopic({name}) must be accepted, got {} {}",
+        reply.status, reply.body
+    );
+    std::thread::sleep(Duration::from_millis(750));
+}
+
+/// The bootstrap strings a cluster publishes, member by member.
+async fn published(emulator: &Emulator, cluster: &str, case: &str) -> BTreeMap<String, String> {
+    let reply = emulator.bootstrap_brokers(cluster).await;
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: GetBootstrapBrokers must answer, got {} {}",
+        reply.status, reply.body
+    );
+    reply
+        .body
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(member, value)| {
+            value
+                .as_str()
+                .map(|address| (member, address.to_string()))
+        })
+        .collect()
+}
+
+/// RULE: every `host:port` `GetBootstrapBrokers` publishes is an address this emulator
+/// accepts an Apache Kafka connection on, and the broker it reports in `Metadata` is
+/// that same address — so a client that re-resolves the cluster from its metadata
+/// keeps talking to the emulator.
+#[tokio::test]
+async fn every_published_bootstrap_address_answers_the_kafka_protocol() {
+    // The rows differ along the access paths the cluster enables, which is what
+    // decides WHICH members are published and what each one requires of a client.
+    let rows: &[(&str, ClusterRequest)] = &[
+        (
+            "a cluster reached in the clear and over TLS",
+            ClusterRequest::named("plane-plaintext"),
+        ),
+        (
+            "a TLS-only cluster",
+            ClusterRequest {
+                client_broker: Some("TLS"),
+                ..ClusterRequest::named("plane-tls")
+            },
+        ),
+        (
+            "a cluster authenticating clients with SASL/SCRAM",
+            ClusterRequest {
+                client_broker: Some("TLS"),
+                sasl_scram: Some(true),
+                ..ClusterRequest::named("plane-scram")
+            },
+        ),
+        (
+            "a cluster authenticating clients with IAM access control",
+            ClusterRequest {
+                client_broker: Some("TLS"),
+                sasl_iam: Some(true),
+                ..ClusterRequest::named("plane-iam")
+            },
+        ),
+        (
+            "a public, dual-stack cluster with both SASL schemes",
+            ClusterRequest {
+                client_broker: Some("TLS"),
+                sasl_scram: Some(true),
+                sasl_iam: Some(true),
+                public_access: Some("SERVICE_PROVIDED_EIPS"),
+                network_type: Some("DUAL"),
+                vpc_tls: Some(true),
+                vpc_iam: Some(true),
+                ..ClusterRequest::named("plane-public")
+            },
+        ),
+    ];
+    for (case, request) in rows {
+        let emulator = Emulator::with_secrets_manager();
+        let cluster = emulator.create_ok(request).await;
+        sleep_past_activation();
+        if request.sasl_scram == Some(true) {
+            given_secret_associated(&emulator, &cluster, "plane-secret", case).await;
+        }
+        given_topic(&emulator, &cluster, "orders", 1, None).await;
+
+        let addresses = published(&emulator, &cluster, case).await;
+        assert!(
+            !addresses.is_empty(),
+            "case {case:?}: a cluster with brokers must publish a bootstrap string"
+        );
+        for (member, authority) in &addresses {
+            let probe = format!("{case} / {member}");
+            // Every published member is dialled, and the ones a client of AWS reaches
+            // over TLS are dialled over TLS.
+            let mut client = match member.contains("Tls") || member.contains("Sasl") {
+                true => Client::tls(&probe, authority).await,
+                false => Client::plaintext(&probe, authority).await,
+            };
+            let negotiated = client.api_versions(&probe).await;
+            assert_eq!(
+                negotiated.error_code, 0,
+                "case {probe:?}: ApiVersions must be answered, got error {}",
+                negotiated.error_code
+            );
+            assert!(
+                !negotiated.api_keys.is_empty(),
+                "case {probe:?}: the broker must advertise the APIs it serves"
+            );
+            if member.contains("Sasl") {
+                // Which mechanism is the member's own: a SASL/SCRAM endpoint
+                // authenticates with the cluster's secret, a SASL/IAM one with a
+                // signed IAM payload.
+                let mechanism = match member.contains("SaslScram") {
+                    true => SCRAM_SHA_512,
+                    false => AWS_MSK_IAM,
+                };
+                let code = client.authenticate(&probe, mechanism, SCRAM_PASSWORD).await;
+                assert_eq!(
+                    code, 0,
+                    "case {probe:?}: the {mechanism} exchange must authenticate the connection"
+                );
+            }
+            let metadata = client.metadata(&probe).await;
+            let brokers: Vec<String> = metadata
+                .brokers
+                .iter()
+                .map(|broker| format!("{}:{}", broker.host.as_str(), broker.port))
+                .collect();
+            assert!(
+                brokers.contains(authority),
+                "case {probe:?}: Metadata must report the address the client dialled \
+                 ({authority}), got {brokers:?}"
+            );
+            let topics: Vec<String> = metadata
+                .topics
+                .iter()
+                .filter_map(|topic| topic.name.as_ref().map(|name| name.0.to_string()))
+                .collect();
+            assert_eq!(
+                topics,
+                vec!["orders".to_string()],
+                "case {probe:?}: Metadata must report the cluster's topics, got {topics:?}"
+            );
+        }
+    }
+
+    // And the one access path an MSK SERVERLESS cluster has: its clients authenticate
+    // with IAM access control over TLS, and the single string it publishes names the
+    // socket this emulator serves that path on. A serverless cluster keeps its client
+    // authentication in its own `Serverless` record, which is where the mechanisms
+    // offered on that socket come from.
+    let case = "a serverless cluster's one access path";
+    let emulator = Emulator::new();
+    let cluster = emulator
+        .create_serverless_ok("plane-serverless", &[vec!["subnet-0a1b2c3d"]], Some(true))
+        .await;
+    sleep_past_activation();
+    let addresses = published(&emulator, &cluster, case).await;
+    assert_eq!(
+        addresses.keys().cloned().collect::<Vec<_>>(),
+        vec!["bootstrapBrokerStringSaslIam".to_string()],
+        "case {case:?}: a serverless cluster publishes exactly the SASL/IAM string, got \
+         {addresses:?}"
+    );
+    let authority = addresses
+        .values()
+        .next()
+        .expect("the serverless cluster published its one address")
+        .clone();
+    // The mechanisms that socket offers are the ones the SERVERLESS record's own client
+    // authentication turns on — IAM access control, as the Java exchange and as the
+    // `OAUTHBEARER` token a non-Java client uses — and nothing else.
+    for (mechanism, expected) in [
+        (AWS_MSK_IAM, 0),
+        (OAUTHBEARER, 0),
+        (
+            SCRAM_SHA_512,
+            ::kafka_protocol::ResponseError::UnsupportedSaslMechanism.code(),
+        ),
+    ] {
+        let mut client = Client::tls(case, &authority).await;
+        client.api_versions(case).await;
+        let code = client.authenticate(case, mechanism, "a-signature").await;
+        assert_eq!(
+            code, expected,
+            "case {case:?}: expected the {mechanism} exchange to answer {expected}, got {code}"
+        );
+    }
+    // And an authenticated connection on it is served: the metadata reports the address
+    // the client dialled.
+    let mut client = Client::tls(case, &authority).await;
+    client.api_versions(case).await;
+    assert_eq!(
+        client.authenticate(case, AWS_MSK_IAM, "a-signature").await,
+        0,
+        "case {case:?}: the IAM exchange must authenticate the connection"
+    );
+    let metadata = client.metadata(case).await;
+    let brokers: Vec<String> = metadata
+        .brokers
+        .iter()
+        .map(|broker| format!("{}:{}", broker.host.as_str(), broker.port))
+        .collect();
+    assert!(
+        brokers.contains(&authority),
+        "case {case:?}: Metadata must report the address the client dialled ({authority}), got \
+         {brokers:?}"
+    );
+}
+
+/// The `ConfigResource.Type` a `DescribeConfigs` request names a topic by, and the one
+/// it names a broker by (Apache Kafka protocol).
+const RESOURCE_TYPE_TOPIC: i8 = 2;
+const RESOURCE_TYPE_BROKER: i8 = 4;
+
+/// The timestamps a `ListOffsets` request asks the earliest and the latest offset with.
+const OFFSET_EARLIEST: i64 = -2;
+const OFFSET_LATEST: i64 = -1;
+
+impl Client {
+    /// `DescribeConfigs` for one resource, answering the entries it reports as
+    /// `name -> value`.
+    async fn configs(
+        &mut self,
+        case: &str,
+        resource_type: i8,
+        resource_name: &str,
+        keys: Option<Vec<&str>>,
+    ) -> BTreeMap<String, String> {
+        let answered: DescribeConfigsResponse = self
+            .call(
+                case,
+                ApiKey::DescribeConfigs,
+                4,
+                &DescribeConfigsRequest::default().with_resources(vec![
+                    DescribeConfigsResource::default()
+                        .with_resource_type(resource_type)
+                        .with_resource_name(StrBytes::from_string(resource_name.to_string()))
+                        .with_configuration_keys(keys.map(|keys| {
+                            keys.into_iter()
+                                .map(|key| StrBytes::from_string(key.to_string()))
+                                .collect()
+                        })),
+                ]),
+            )
+            .await;
+        let result = answered
+            .results
+            .first()
+            .unwrap_or_else(|| panic!("case {case:?}: DescribeConfigs reported no result"))
+            .clone();
+        assert_eq!(
+            result.error_code, 0,
+            "case {case:?}: DescribeConfigs({resource_name}) must be answered, got error {} {:?}",
+            result.error_code, result.error_message
+        );
+        result
+            .configs
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.to_string(),
+                    entry
+                        .value
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// `Produce` one record batch to one partition, answering the base offset the
+    /// broker assigned.
+    ///
+    /// Each record carries the timestamp the row gives it, which is what a producer
+    /// sets and what the broker's retention ages a record out by.
+    async fn produce(
+        &mut self,
+        case: &str,
+        topic: &str,
+        partition: i32,
+        records: &[(i64, Option<&str>, &str)],
+    ) -> i64 {
+        let batch: Vec<Record> = records
+            .iter()
+            .enumerate()
+            .map(|(index, (timestamp, key, value))| Record {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                timestamp_type: TimestampType::Creation,
+                offset: index as i64,
+                sequence: index as i32,
+                timestamp: *timestamp,
+                key: key.map(|key| Bytes::from(key.as_bytes().to_vec())),
+                value: Some(Bytes::from(value.as_bytes().to_vec())),
+                headers: Default::default(),
+                delete_horizon: false,
+            })
+            .collect();
+        let mut encoded = BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut encoded,
+            batch.iter(),
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("case {case:?}: the batch must encode: {error}"));
+        let answered: ProduceResponse = self
+            .call(
+                case,
+                ApiKey::Produce,
+                9,
+                &ProduceRequest::default()
+                    .with_acks(1)
+                    .with_timeout_ms(1_000)
+                    .with_topic_data(vec![TopicProduceData::default()
+                        .with_name(TopicName(StrBytes::from_string(topic.to_string())))
+                        .with_partition_data(vec![PartitionProduceData::default()
+                            .with_index(partition)
+                            .with_records(Some(encoded.freeze()))])]),
+            )
+            .await;
+        let partition_response = answered
+            .responses
+            .first()
+            .and_then(|topic| topic.partition_responses.first())
+            .unwrap_or_else(|| panic!("case {case:?}: Produce reported no partition"))
+            .clone();
+        assert_eq!(
+            partition_response.error_code, 0,
+            "case {case:?}: Produce must be accepted, got error {}",
+            partition_response.error_code
+        );
+        partition_response.base_offset
+    }
+
+    /// `Fetch` one partition from `offset`, answering the records it read as
+    /// `(offset, key, value)`.
+    async fn fetch(
+        &mut self,
+        case: &str,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> Vec<(i64, Option<String>, String)> {
+        let answered: FetchResponse = self
+            .call(
+                case,
+                ApiKey::Fetch,
+                11,
+                &FetchRequest::default()
+                    .with_max_wait_ms(100)
+                    .with_min_bytes(0)
+                    .with_max_bytes(1_048_576)
+                    .with_topics(vec![FetchTopic::default()
+                        .with_topic(TopicName(StrBytes::from_string(topic.to_string())))
+                        .with_partitions(vec![FetchPartition::default()
+                            .with_partition(partition)
+                            .with_fetch_offset(offset)
+                            .with_partition_max_bytes(1_048_576)])]),
+            )
+            .await;
+        let partition_data = answered
+            .responses
+            .first()
+            .and_then(|topic| topic.partitions.first())
+            .unwrap_or_else(|| panic!("case {case:?}: Fetch reported no partition"))
+            .clone();
+        assert_eq!(
+            partition_data.error_code, 0,
+            "case {case:?}: Fetch must be answered, got error {}",
+            partition_data.error_code
+        );
+        let Some(mut records) = partition_data.records.clone() else {
+            return Vec::new();
+        };
+        // A fetch that read nothing answers an EMPTY record set, which decodes to no
+        // records rather than to a batch.
+        if records.is_empty() {
+            return Vec::new();
+        }
+        RecordBatchDecoder::decode(&mut records)
+            .unwrap_or_else(|error| panic!("case {case:?}: the batch must decode: {error}"))
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.offset,
+                    record
+                        .key
+                        .as_ref()
+                        .map(|key| String::from_utf8_lossy(key).to_string()),
+                    record
+                        .value
+                        .as_ref()
+                        .map(|value| String::from_utf8_lossy(value).to_string())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// `ListOffsets` for one partition at `timestamp`.
+    async fn offset(&mut self, case: &str, topic: &str, partition: i32, timestamp: i64) -> i64 {
+        let answered: ListOffsetsResponse = self
+            .call(
+                case,
+                ApiKey::ListOffsets,
+                5,
+                &ListOffsetsRequest::default()
+                    .with_replica_id(::kafka_protocol::messages::BrokerId(-1))
+                    .with_topics(vec![ListOffsetsTopic::default()
+                        .with_name(TopicName(StrBytes::from_string(topic.to_string())))
+                        .with_partitions(vec![ListOffsetsPartition::default()
+                            .with_partition_index(partition)
+                            .with_timestamp(timestamp)])]),
+            )
+            .await;
+        let partition_response = answered
+            .topics
+            .first()
+            .and_then(|topic| topic.partitions.first())
+            .unwrap_or_else(|| panic!("case {case:?}: ListOffsets reported no partition"))
+            .clone();
+        assert_eq!(
+            partition_response.error_code, 0,
+            "case {case:?}: ListOffsets must be answered, got error {}",
+            partition_response.error_code
+        );
+        partition_response.offset
+    }
+}
+
+/// A cluster whose brokers are reached in the clear, so a suite about the PROTOCOL
+/// dials one socket without a credential, and the address its plaintext path is
+/// published at.
+async fn given_plaintext_cluster(emulator: &Emulator, name: &str) -> String {
+    let cluster = emulator
+        .create_ok(&ClusterRequest {
+            client_broker: Some("PLAINTEXT"),
+            ..ClusterRequest::named(name)
+        })
+        .await;
+    sleep_past_activation();
+    cluster
+}
+
+/// The address a cluster publishes for its plaintext path.
+async fn plaintext_address(emulator: &Emulator, cluster: &str, case: &str) -> String {
+    published(emulator, cluster, case)
+        .await
+        .get("bootstrapBrokerString")
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: the cluster published no plaintext address"))
+}
+
+/// One row of the configuration table: the case, the topic, the `Configs` the topic is
+/// created with, and the entries the broker must report for it.
+type ConfigRow<'a> = (&'a str, &'a str, Option<Value>, &'a [(&'a str, &'a str)]);
+
+/// One row of the record table: the case, the topic, and the records produced to it as
+/// `(key, value)` pairs.
+type RecordRow<'a> = (&'a str, &'a str, &'a [(Option<&'a str>, &'a str)]);
+
+/// RULE: the topic configuration the control plane stored is what the broker reports
+/// over the published endpoint, over Apache Kafka's documented defaults — so a client
+/// reads back the `retention.ms`, `segment.ms` and `cleanup.policy` it set through
+/// `CreateTopic`, and the broker's own retention-sweep period for what it did not set.
+#[tokio::test]
+async fn a_topics_configuration_is_readable_over_the_published_endpoint() {
+    let emulator = Emulator::new();
+    let cluster = given_plaintext_cluster(&emulator, "plane-configs").await;
+    // The rows differ along WHICH entries the topic sets: the whole retention set a
+    // time-to-live test configures, one entry on its own, and none at all (so every
+    // value reported is a documented default).
+    let rows: &[ConfigRow] = &[
+        (
+            "the retention set a time-to-live client configures",
+            "ttl-full",
+            Some(json!({
+                "retention.ms": "5000",
+                "segment.bytes": "1048576",
+                "segment.ms": "1000",
+                "cleanup.policy": "delete",
+                "file.delete.delay.ms": "0",
+            })),
+            &[
+                ("retention.ms", "5000"),
+                ("segment.bytes", "1048576"),
+                ("segment.ms", "1000"),
+                ("cleanup.policy", "delete"),
+                ("file.delete.delay.ms", "0"),
+            ],
+        ),
+        (
+            "a longer retention on its own",
+            "ttl-retention",
+            Some(json!({ "retention.ms": "30000" })),
+            // The entries the topic did not set are Apache Kafka's documented
+            // topic-level defaults.
+            &[
+                ("retention.ms", "30000"),
+                ("cleanup.policy", "delete"),
+                ("segment.ms", "604800000"),
+                ("file.delete.delay.ms", "60000"),
+            ],
+        ),
+        (
+            "a topic that sets nothing",
+            "ttl-default",
+            None,
+            &[
+                ("retention.ms", "604800000"),
+                ("cleanup.policy", "delete"),
+                ("max.message.bytes", "1048588"),
+            ],
+        ),
+    ];
+    for (case, topic, configs, expected) in rows {
+        given_topic(&emulator, &cluster, topic, 1, configs.clone()).await;
+        let authority = plaintext_address(&emulator, &cluster, case).await;
+        let mut client = Client::plaintext(case, &authority).await;
+        client.api_versions(case).await;
+        let reported = client
+            .configs(case, RESOURCE_TYPE_TOPIC, topic, None)
+            .await;
+        for (name, value) in *expected {
+            assert_eq!(
+                reported.get(*name).map(String::as_str),
+                Some(*value),
+                "case {case:?}: the broker must report {name}={value}, got {:?}",
+                reported.get(*name)
+            );
+        }
+        // The topic's own configuration is read back whichever entries the request
+        // asked about, so a client that names one key gets that key.
+        let narrowed = client
+            .configs(case, RESOURCE_TYPE_TOPIC, topic, Some(vec!["retention.ms"]))
+            .await;
+        assert_eq!(
+            narrowed.keys().cloned().collect::<Vec<_>>(),
+            vec!["retention.ms".to_string()],
+            "case {case:?}: a request naming one key must be answered about that key alone"
+        );
+    }
+
+    // The broker's own configuration, which is where the retention sweep's period
+    // lives: Apache Kafka's documented default for `log.retention.check.interval.ms`.
+    let authority = plaintext_address(&emulator, &cluster, "broker configs").await;
+    let mut client = Client::plaintext("broker configs", &authority).await;
+    client.api_versions("broker configs").await;
+    let reported = client
+        .configs("broker configs", RESOURCE_TYPE_BROKER, "1", None)
+        .await;
+    assert_eq!(
+        reported
+            .get("log.retention.check.interval.ms")
+            .map(String::as_str),
+        Some("300000"),
+        "the broker must report its retention-sweep period, got {reported:?}"
+    );
+}
+
+/// RULE: a record produced to a topic is readable from the earliest offset the
+/// partition still holds, in the order it was produced — so a client that produces and
+/// then consumes from the beginning reads what it wrote.
+#[tokio::test]
+async fn a_produced_record_is_readable_from_the_earliest_offset() {
+    let emulator = Emulator::new();
+    let cluster = given_plaintext_cluster(&emulator, "plane-records").await;
+    // The rows differ along how many records are produced and whether they carry a
+    // key, which is what the rule generalises over.
+    let rows: &[RecordRow] = &[
+        ("one record with no key", "records-one", &[(None, "first")]),
+        (
+            "three keyed records",
+            "records-three",
+            &[
+                (Some("a"), "alpha"),
+                (Some("b"), "beta"),
+                (Some("c"), "gamma"),
+            ],
+        ),
+        (
+            "a record whose value is empty",
+            "records-empty",
+            &[(Some("k"), "")],
+        ),
+    ];
+    for (case, topic, records) in rows {
+        given_topic(&emulator, &cluster, topic, 1, None).await;
+        let authority = plaintext_address(&emulator, &cluster, case).await;
+        let mut client = Client::plaintext(case, &authority).await;
+        client.api_versions(case).await;
+
+        let now = epoch_millis();
+        let batch: Vec<(i64, Option<&str>, &str)> = records
+            .iter()
+            .map(|(key, value)| (now, *key, *value))
+            .collect();
+        let base = client.produce(case, topic, 0, &batch).await;
+        assert_eq!(
+            base, 0,
+            "case {case:?}: the first batch of an empty partition starts at offset 0"
+        );
+        assert_eq!(
+            client.offset(case, topic, 0, OFFSET_EARLIEST).await,
+            0,
+            "case {case:?}: the earliest offset of a partition nothing aged out is 0"
+        );
+        assert_eq!(
+            client.offset(case, topic, 0, OFFSET_LATEST).await,
+            records.len() as i64,
+            "case {case:?}: the latest offset is the number of records produced"
+        );
+        let read = client.fetch(case, topic, 0, 0).await;
+        let expected: Vec<(i64, Option<String>, String)> = records
+            .iter()
+            .enumerate()
+            .map(|(index, (key, value))| {
+                (
+                    index as i64,
+                    key.map(ToString::to_string),
+                    (*value).to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read, expected,
+            "case {case:?}: a fetch from the earliest offset must read what was produced"
+        );
+    }
+}
+
+/// RULE: a record older than its topic's `retention.ms` is no longer served, and the
+/// partition's earliest readable offset moves past it — while a record inside the
+/// window, and every record of a topic whose retention is unlimited, stays readable.
+#[tokio::test]
+async fn records_past_the_topics_retention_are_no_longer_fetched() {
+    let emulator = Emulator::new();
+    let cluster = given_plaintext_cluster(&emulator, "plane-retention").await;
+    // The rows differ along the topic's retention and the AGE of the record against
+    // it: the age is the record's own timestamp, which is what a producer sets and
+    // what the broker ages a record out by, so no row waits for a clock.
+    // (case, topic, retention.ms as the topic sets it, the record's age, still readable)
+    let rows: &[(&str, &str, Option<&str>, Duration, bool)] = &[
+        (
+            "a record inside a five-second retention",
+            "retention-fresh",
+            Some("5000"),
+            Duration::from_millis(0),
+            true,
+        ),
+        (
+            "a record older than a five-second retention",
+            "retention-aged",
+            Some("5000"),
+            Duration::from_secs(60),
+            false,
+        ),
+        (
+            "a record older than a thirty-second retention",
+            "retention-aged-longer",
+            Some("30000"),
+            Duration::from_secs(3_600),
+            false,
+        ),
+        (
+            "a record far inside the default week",
+            "retention-default",
+            None,
+            Duration::from_secs(3_600),
+            true,
+        ),
+        (
+            "a record of a topic that keeps everything",
+            "retention-unlimited",
+            Some("-1"),
+            Duration::from_secs(90_000),
+            true,
+        ),
+    ];
+    for (case, topic, retention, age, readable) in rows {
+        let configs = retention.map(|retention| json!({ "retention.ms": retention }));
+        given_topic(&emulator, &cluster, topic, 1, configs).await;
+        let authority = plaintext_address(&emulator, &cluster, case).await;
+        let mut client = Client::plaintext(case, &authority).await;
+        client.api_versions(case).await;
+
+        let stamped = epoch_millis() - i64::try_from(age.as_millis()).unwrap_or_default();
+        client
+            .produce(case, topic, 0, &[(stamped, Some("key"), "payload")])
+            .await;
+        let read = client.fetch(case, topic, 0, 0).await;
+        assert_eq!(
+            !read.is_empty(),
+            *readable,
+            "case {case:?}: expected the record to be {}, got {read:?}",
+            match readable {
+                true => "readable",
+                false => "aged out",
+            }
+        );
+        let earliest = client.offset(case, topic, 0, OFFSET_EARLIEST).await;
+        let latest = client.offset(case, topic, 0, OFFSET_LATEST).await;
+        assert_eq!(
+            latest, 1,
+            "case {case:?}: retention moves the log's start, never its end"
+        );
+        assert_eq!(
+            earliest,
+            match readable {
+                true => 0,
+                false => 1,
+            },
+            "case {case:?}: the earliest readable offset must move past an aged-out record"
+        );
+    }
+}
+
+/// RULE: a SASL path serves only a connection that completes ITS exchange with a
+/// credential the cluster holds — so a wrong password, a secret the cluster no longer
+/// has associated and a payload that is not a signed IAM one are each refused, and a
+/// request made before the exchange gets no answer at all.
+#[tokio::test]
+async fn only_a_credential_the_cluster_holds_is_served_on_a_sasl_path() {
+    let emulator = Emulator::with_secrets_manager();
+    let cluster = emulator
+        .create_ok(&ClusterRequest {
+            client_broker: Some("TLS"),
+            sasl_scram: Some(true),
+            sasl_iam: Some(true),
+            ..ClusterRequest::named("plane-credentials")
+        })
+        .await;
+    sleep_past_activation();
+    let secret = given_secret_associated(&emulator, &cluster, "plane-credential", "setup").await;
+    given_topic(&emulator, &cluster, "orders", 1, None).await;
+    let addresses = published(&emulator, &cluster, "credentials").await;
+    let scram_address = addresses
+        .get("bootstrapBrokerStringSaslScram")
+        .cloned()
+        .expect("a SASL/SCRAM cluster publishes a SASL/SCRAM address");
+    let iam_address = addresses
+        .get("bootstrapBrokerStringSaslIam")
+        .cloned()
+        .expect("a SASL/IAM cluster publishes a SASL/IAM address");
+
+    // The protocol's own codes: 58 is `SASL_AUTHENTICATION_FAILED` and 34 is
+    // `ILLEGAL_SASL_STATE`, which is what a client that offers the wrong mechanism for
+    // a path is told.
+    let authentication_failed = ::kafka_protocol::ResponseError::SaslAuthenticationFailed.code();
+    let illegal_state = ::kafka_protocol::ResponseError::IllegalSaslState.code();
+    let unsupported_mechanism =
+        ::kafka_protocol::ResponseError::UnsupportedSaslMechanism.code();
+
+    // The rows differ along which credential is offered on which path.
+    // (case, address, mechanism, secret the connection offers, expected code)
+    let rows: &[(&str, &str, &str, &str, i16)] = &[
+        (
+            "the password the cluster's secret holds",
+            &scram_address,
+            SCRAM_SHA_512,
+            SCRAM_PASSWORD,
+            0,
+        ),
+        (
+            "a password no secret of the cluster holds",
+            &scram_address,
+            SCRAM_SHA_512,
+            "not-the-password",
+            authentication_failed,
+        ),
+        (
+            "a signed IAM payload",
+            &iam_address,
+            AWS_MSK_IAM,
+            "a-signature",
+            0,
+        ),
+        (
+            "the OAUTHBEARER token a non-Java client authenticates with IAM through",
+            &iam_address,
+            OAUTHBEARER,
+            "a-signature",
+            0,
+        ),
+        (
+            "an OAUTHBEARER token carrying no signature",
+            &iam_address,
+            OAUTHBEARER,
+            "",
+            authentication_failed,
+        ),
+        (
+            "an IAM payload carrying no signature",
+            &iam_address,
+            AWS_MSK_IAM,
+            "",
+            authentication_failed,
+        ),
+        (
+            "the SCRAM mechanism offered on the IAM path",
+            &iam_address,
+            SCRAM_SHA_512,
+            SCRAM_PASSWORD,
+            unsupported_mechanism,
+        ),
+    ];
+    for (case, address, mechanism, password, expected) in rows {
+        let mut client = Client::tls(case, address).await;
+        client.api_versions(case).await;
+        let code = client.authenticate(case, mechanism, password).await;
+        assert_eq!(
+            code, *expected,
+            "case {case:?}: expected the exchange to answer code {expected}, got {code}"
+        );
+    }
+
+    // A `SaslAuthenticate` sent before any handshake is in no state to be
+    // authenticated, which is what `ILLEGAL_SASL_STATE` says.
+    let mut unnegotiated = Client::tls("before the handshake", &scram_address).await;
+    unnegotiated.api_versions("before the handshake").await;
+    let answered: SaslAuthenticateResponse = unnegotiated
+        .call(
+            "before the handshake",
+            ApiKey::SaslAuthenticate,
+            2,
+            &SaslAuthenticateRequest::default()
+                .with_auth_bytes(Bytes::from_static(b"n,,n=scram-user,r=nonce")),
+        )
+        .await;
+    assert_eq!(
+        answered.error_code, illegal_state,
+        "a credential offered before a mechanism is chosen must answer ILLEGAL_SASL_STATE, got {}",
+        answered.error_code
+    );
+
+    // A request on a SASL path before the exchange is not served at all, which is
+    // where a broker closes the connection.
+    let mut unauthenticated = Client::tls("before the exchange", &scram_address).await;
+    unauthenticated.api_versions("before the exchange").await;
+    let answered = unauthenticated.metadata_or_closed("before the exchange").await;
+    assert!(
+        answered.is_none(),
+        "an unauthenticated connection must not be served, got {answered:?}"
+    );
+
+    // And once the cluster no longer holds the secret, the credential in it stops
+    // authenticating: the broker reads the credential from the secrets the cluster HAS
+    // associated.
+    let disassociated = emulator
+        .call(
+            "PATCH",
+            &format!("/v1/clusters/{}/scram-secrets", pct(&cluster)),
+            Some(json!({ "secretArnList": [secret] })),
+        )
+        .await;
+    assert_eq!(
+        disassociated.status, 200,
+        "BatchDisassociateScramSecret must be accepted, got {} {}",
+        disassociated.status, disassociated.body
+    );
+    let mut revoked = Client::tls("a disassociated secret", &scram_address).await;
+    revoked.api_versions("a disassociated secret").await;
+    let code = revoked
+        .authenticate("a disassociated secret", SCRAM_SHA_512, SCRAM_PASSWORD)
+        .await;
+    assert_eq!(
+        code, authentication_failed,
+        "a credential the cluster no longer holds must not authenticate, got code {code}"
+    );
+}
+
+/// The Apache Kafka ACL values these rows use: the resource type a topic binding
+/// names, the pattern type a binding that names it exactly carries, the two operations
+/// a client of a topic needs, and the two permissions a binding can carry.
+const ACL_RESOURCE_TYPE_TOPIC: i8 = 2;
+const ACL_PATTERN_TYPE_LITERAL: i8 = 3;
+const ACL_PATTERN_TYPE_ANY: i8 = 1;
+const ACL_OPERATION_READ: i8 = 3;
+const ACL_OPERATION_WRITE: i8 = 4;
+const ACL_OPERATION_ANY: i8 = 1;
+const ACL_PERMISSION_DENY: i8 = 2;
+const ACL_PERMISSION_ALLOW: i8 = 3;
+const ACL_PERMISSION_ANY: i8 = 1;
+const ACL_RESOURCE_TYPE_ANY: i8 = 1;
+
+/// One ACL binding a row creates: the resource it is about, the principal, the
+/// operation and whether it allows or denies.
+type AclRow<'a> = (&'a str, &'a str, i8, i8);
+
+impl Client {
+    /// `CreateAcls` for each binding, answering the error code of each creation.
+    async fn create_acls(&mut self, case: &str, bindings: &[AclRow<'_>]) -> Vec<i16> {
+        let answered: ::kafka_protocol::messages::CreateAclsResponse = self
+            .call(
+                case,
+                ApiKey::CreateAcls,
+                1,
+                &::kafka_protocol::messages::CreateAclsRequest::default().with_creations(
+                    bindings
+                        .iter()
+                        .map(|(topic, principal, operation, permission)| {
+                            ::kafka_protocol::messages::create_acls_request::AclCreation::default()
+                                .with_resource_type(ACL_RESOURCE_TYPE_TOPIC)
+                                .with_resource_name(StrBytes::from_string((*topic).to_string()))
+                                .with_resource_pattern_type(ACL_PATTERN_TYPE_LITERAL)
+                                .with_principal(StrBytes::from_string((*principal).to_string()))
+                                .with_host(StrBytes::from_static_str("*"))
+                                .with_operation(*operation)
+                                .with_permission_type(*permission)
+                        })
+                        .collect(),
+                ),
+            )
+            .await;
+        answered
+            .results
+            .iter()
+            .map(|result| result.error_code)
+            .collect()
+    }
+
+    /// `DescribeAcls` over every binding the cluster holds, as
+    /// `(resource name, principal, operation, permission)`.
+    async fn describe_acls(&mut self, case: &str) -> Vec<(String, String, i8, i8)> {
+        let answered: ::kafka_protocol::messages::DescribeAclsResponse = self
+            .call(
+                case,
+                ApiKey::DescribeAcls,
+                1,
+                &::kafka_protocol::messages::DescribeAclsRequest::default()
+                    .with_resource_type_filter(ACL_RESOURCE_TYPE_ANY)
+                    // A null filter is the protocol's "any": a filter naming the empty
+                    // string would select a binding about the empty name.
+                    .with_resource_name_filter(None)
+                    .with_pattern_type_filter(ACL_PATTERN_TYPE_ANY)
+                    .with_principal_filter(None)
+                    .with_host_filter(None)
+                    .with_operation(ACL_OPERATION_ANY)
+                    .with_permission_type(ACL_PERMISSION_ANY),
+            )
+            .await;
+        assert_eq!(
+            answered.error_code, 0,
+            "case {case:?}: DescribeAcls must be answered, got error {}",
+            answered.error_code
+        );
+        answered
+            .resources
+            .iter()
+            .flat_map(|resource| {
+                resource.acls.iter().map(|acl| {
+                    (
+                        resource.resource_name.to_string(),
+                        acl.principal.to_string(),
+                        acl.operation,
+                        acl.permission_type,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// `DeleteAcls` for the bindings on one topic with one permission, answering how
+    /// many were removed.
+    async fn delete_acls(&mut self, case: &str, topic: &str, permission: i8) -> usize {
+        let answered: ::kafka_protocol::messages::DeleteAclsResponse = self
+            .call(
+                case,
+                ApiKey::DeleteAcls,
+                1,
+                &::kafka_protocol::messages::DeleteAclsRequest::default().with_filters(vec![
+                    ::kafka_protocol::messages::delete_acls_request::DeleteAclsFilter::default()
+                        .with_resource_type_filter(ACL_RESOURCE_TYPE_TOPIC)
+                        .with_resource_name_filter(Some(StrBytes::from_string(topic.to_string())))
+                        .with_pattern_type_filter(ACL_PATTERN_TYPE_ANY)
+                        .with_principal_filter(None)
+                        .with_host_filter(None)
+                        .with_operation(ACL_OPERATION_ANY)
+                        .with_permission_type(permission),
+                ]),
+            )
+            .await;
+        answered
+            .filter_results
+            .iter()
+            .map(|result| result.matching_acls.len())
+            .sum()
+    }
+
+    /// `Produce` one record, answering the error code the broker reported for the
+    /// partition rather than asserting it succeeded.
+    async fn produce_outcome(&mut self, case: &str, topic: &str, value: &str) -> i16 {
+        let record = Record {
+            transactional: false,
+            control: false,
+            partition_leader_epoch: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            timestamp_type: TimestampType::Creation,
+            offset: 0,
+            sequence: 0,
+            timestamp: epoch_millis(),
+            key: None,
+            value: Some(Bytes::from(value.as_bytes().to_vec())),
+            headers: Default::default(),
+            delete_horizon: false,
+        };
+        let mut encoded = BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut encoded,
+            [record].iter(),
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("case {case:?}: the batch must encode: {error}"));
+        let answered: ProduceResponse = self
+            .call(
+                case,
+                ApiKey::Produce,
+                9,
+                &ProduceRequest::default()
+                    .with_acks(1)
+                    .with_timeout_ms(1_000)
+                    .with_topic_data(vec![TopicProduceData::default()
+                        .with_name(TopicName(StrBytes::from_string(topic.to_string())))
+                        .with_partition_data(vec![PartitionProduceData::default()
+                            .with_index(0)
+                            .with_records(Some(encoded.freeze()))])]),
+            )
+            .await;
+        answered
+            .responses
+            .first()
+            .and_then(|topic| topic.partition_responses.first())
+            .map(|partition| partition.error_code)
+            .unwrap_or_default()
+    }
+}
+
+/// RULE: the ACL bindings a client creates over the published endpoint are held by the
+/// cluster's brokers — `DescribeAcls` reports what was created and `DeleteAcls` removes
+/// it — and a binding that WITHHOLDS a topic from a principal is what the brokers then
+/// refuse that principal's produce with, while a cluster holding no such binding serves
+/// every authenticated client (Apache Kafka's `allow.everyone.if.no.acl.found`, which
+/// an Amazon MSK cluster runs with).
+#[tokio::test]
+async fn the_acl_bindings_a_client_creates_are_held_and_decide_a_refusal() {
+    let case = "acl bindings over the published endpoint";
+    let emulator = Emulator::new();
+    let cluster = given_plaintext_cluster(&emulator, "plane-acls").await;
+    given_topic(&emulator, &cluster, "orders", 1, None).await;
+    let authority = plaintext_address(&emulator, &cluster, case).await;
+    let mut client = Client::plaintext(case, &authority).await;
+    client.api_versions(case).await;
+
+    // Nothing is withheld from a cluster that holds no binding.
+    assert!(
+        client.describe_acls(case).await.is_empty(),
+        "case {case:?}: a new cluster holds no ACL binding"
+    );
+    assert_eq!(
+        client.produce_outcome(case, "orders", "before").await,
+        0,
+        "case {case:?}: a cluster holding no binding serves the produce"
+    );
+
+    // The bindings a client creates are the bindings it reads back.
+    let created: &[AclRow] = &[
+        ("orders", "User:*", ACL_OPERATION_READ, ACL_PERMISSION_ALLOW),
+        ("orders", "User:*", ACL_OPERATION_WRITE, ACL_PERMISSION_DENY),
+    ];
+    assert_eq!(
+        client.create_acls(case, created).await,
+        vec![0, 0],
+        "case {case:?}: both creations must be accepted"
+    );
+    let mut held = client.describe_acls(case).await;
+    held.sort();
+    assert_eq!(
+        held,
+        vec![
+            (
+                "orders".to_string(),
+                "User:*".to_string(),
+                ACL_OPERATION_READ,
+                ACL_PERMISSION_ALLOW
+            ),
+            (
+                "orders".to_string(),
+                "User:*".to_string(),
+                ACL_OPERATION_WRITE,
+                ACL_PERMISSION_DENY
+            ),
+        ],
+        "case {case:?}: DescribeAcls must report the bindings that were created"
+    );
+
+    // And the DENY is what the produce is refused with.
+    assert_eq!(
+        client.produce_outcome(case, "orders", "withheld").await,
+        ::kafka_protocol::ResponseError::TopicAuthorizationFailed.code(),
+        "case {case:?}: a binding that withholds the topic must refuse the produce"
+    );
+    assert_eq!(
+        client.produce_outcome(case, "other", "unrelated").await,
+        ::kafka_protocol::ResponseError::UnknownTopicOrPartition.code(),
+        "case {case:?}: a topic the cluster does not hold is unknown, not withheld"
+    );
+
+    // Removing it serves the principal again, and the removal is reported.
+    assert_eq!(
+        client.delete_acls(case, "orders", ACL_PERMISSION_DENY).await,
+        1,
+        "case {case:?}: DeleteAcls must report the binding it removed"
+    );
+    assert_eq!(
+        client.produce_outcome(case, "orders", "after").await,
+        0,
+        "case {case:?}: a produce is served once nothing withholds the topic"
+    );
+    assert_eq!(
+        client.describe_acls(case).await.len(),
+        1,
+        "case {case:?}: the binding the delete did not select must still be held"
+    );
+}
+
+/// RULE: the group a consuming client joins is coordinated by the broker it was sent
+/// to — the member is admitted with an id and a generation, told the assignment the
+/// group's leader computed for it, and the offset it commits is the offset a later
+/// `OffsetFetch` reports — so a client that consumes as part of a group makes progress
+/// and resumes where it left off.
+#[tokio::test]
+async fn the_group_a_consumer_joins_is_coordinated_by_the_broker() {
+    let case = "a consumer group over the published endpoint";
+    let emulator = Emulator::new();
+    let cluster = given_plaintext_cluster(&emulator, "plane-groups").await;
+    given_topic(&emulator, &cluster, "orders", 1, None).await;
+    let authority = plaintext_address(&emulator, &cluster, case).await;
+    let mut client = Client::plaintext(case, &authority).await;
+    client.api_versions(case).await;
+
+    // The coordinator of a group is the broker that answers for it, at the address the
+    // client dialled.
+    let coordinator: ::kafka_protocol::messages::FindCoordinatorResponse = client
+        .call(
+            case,
+            ApiKey::FindCoordinator,
+            2,
+            &::kafka_protocol::messages::FindCoordinatorRequest::default()
+                .with_key(StrBytes::from_static_str("readers"))
+                .with_key_type(0),
+        )
+        .await;
+    assert_eq!(
+        format!("{}:{}", coordinator.host.as_str(), coordinator.port),
+        authority,
+        "case {case:?}: the coordinator must be the broker the client dialled"
+    );
+
+    // Joining admits the member, names it and hands it the group's generation.
+    let joined: ::kafka_protocol::messages::JoinGroupResponse = client
+        .call(
+            case,
+            ApiKey::JoinGroup,
+            5,
+            &::kafka_protocol::messages::JoinGroupRequest::default()
+                .with_group_id(::kafka_protocol::messages::GroupId(
+                    StrBytes::from_static_str("readers"),
+                ))
+                .with_session_timeout_ms(30_000)
+                .with_rebalance_timeout_ms(30_000)
+                .with_member_id(StrBytes::from_static_str(""))
+                .with_protocol_type(StrBytes::from_static_str("consumer"))
+                .with_protocols(vec![
+                    ::kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+                        .with_name(StrBytes::from_static_str("range"))
+                        .with_metadata(Bytes::from_static(b"subscription")),
+                ]),
+        )
+        .await;
+    assert_eq!(
+        joined.error_code, 0,
+        "case {case:?}: the join must be admitted, got error {}",
+        joined.error_code
+    );
+    assert!(
+        !joined.member_id.is_empty() && joined.generation_id > 0,
+        "case {case:?}: a joined member must carry an id and a generation, got {:?} / {}",
+        joined.member_id,
+        joined.generation_id
+    );
+    assert_eq!(
+        joined.leader, joined.member_id,
+        "case {case:?}: the only member of a group is its leader"
+    );
+    assert_eq!(
+        joined
+            .members
+            .iter()
+            .map(|member| member.metadata.clone())
+            .collect::<Vec<_>>(),
+        vec![Bytes::from_static(b"subscription")],
+        "case {case:?}: the leader must be told the subscription every member joined with"
+    );
+
+    // And syncing hands the member the assignment the leader computed for it.
+    let synced: ::kafka_protocol::messages::SyncGroupResponse = client
+        .call(
+            case,
+            ApiKey::SyncGroup,
+            3,
+            &::kafka_protocol::messages::SyncGroupRequest::default()
+                .with_group_id(::kafka_protocol::messages::GroupId(
+                    StrBytes::from_static_str("readers"),
+                ))
+                .with_generation_id(joined.generation_id)
+                .with_member_id(joined.member_id.clone())
+                .with_assignments(vec![
+                    ::kafka_protocol::messages::sync_group_request::SyncGroupRequestAssignment::default()
+                        .with_member_id(joined.member_id.clone())
+                        .with_assignment(Bytes::from_static(b"orders-0")),
+                ]),
+        )
+        .await;
+    assert_eq!(
+        (synced.error_code, synced.assignment.clone()),
+        (0, Bytes::from_static(b"orders-0")),
+        "case {case:?}: the member must be handed its own assignment"
+    );
+
+    // A heartbeat on the group's generation keeps it; one on an older generation is
+    // told to rejoin.
+    for (generation, expected) in [
+        (joined.generation_id, 0),
+        (
+            joined.generation_id - 1,
+            ::kafka_protocol::ResponseError::IllegalGeneration.code(),
+        ),
+    ] {
+        let beat: ::kafka_protocol::messages::HeartbeatResponse = client
+            .call(
+                case,
+                ApiKey::Heartbeat,
+                3,
+                &::kafka_protocol::messages::HeartbeatRequest::default()
+                    .with_group_id(::kafka_protocol::messages::GroupId(
+                        StrBytes::from_static_str("readers"),
+                    ))
+                    .with_generation_id(generation)
+                    .with_member_id(joined.member_id.clone()),
+            )
+            .await;
+        assert_eq!(
+            beat.error_code, expected,
+            "case {case:?}: a heartbeat at generation {generation} must answer {expected}"
+        );
+    }
+
+    // Nothing is committed until the group commits, and then the commit is what a
+    // later fetch of the group's offsets reports.
+    assert_eq!(
+        group_offset(&mut client, case).await,
+        -1,
+        "case {case:?}: a group that has committed nothing reports no offset"
+    );
+    let committed: ::kafka_protocol::messages::OffsetCommitResponse = client
+        .call(
+            case,
+            ApiKey::OffsetCommit,
+            4,
+            &::kafka_protocol::messages::OffsetCommitRequest::default()
+                .with_group_id(::kafka_protocol::messages::GroupId(
+                    StrBytes::from_static_str("readers"),
+                ))
+                .with_generation_id_or_member_epoch(joined.generation_id)
+                .with_member_id(joined.member_id.clone())
+                .with_topics(vec![
+                    ::kafka_protocol::messages::offset_commit_request::OffsetCommitRequestTopic::default()
+                        .with_name(TopicName(StrBytes::from_static_str("orders")))
+                        .with_partitions(vec![
+                            ::kafka_protocol::messages::offset_commit_request::OffsetCommitRequestPartition::default()
+                                .with_partition_index(0)
+                                .with_committed_offset(7),
+                        ]),
+                ]),
+        )
+        .await;
+    assert_eq!(
+        committed
+            .topics
+            .first()
+            .and_then(|topic| topic.partitions.first())
+            .map(|partition| partition.error_code),
+        Some(0),
+        "case {case:?}: the commit must be accepted"
+    );
+    assert_eq!(
+        group_offset(&mut client, case).await,
+        7,
+        "case {case:?}: the offset a group committed is the one it reads back"
+    );
+}
+
+/// RULE: the data plane a cluster is served by belongs to that cluster, so a cluster
+/// that is gone serves nothing: the socket its access path was answered on is closed,
+/// and nothing of its log, its ACL bindings or its groups is kept.
+#[tokio::test]
+async fn a_deleted_clusters_endpoint_stops_answering() {
+    let case = "a deleted cluster's endpoint";
+    let emulator = Emulator::new();
+    let cluster = given_plaintext_cluster(&emulator, "plane-teardown").await;
+    given_topic(&emulator, &cluster, "orders", 1, None).await;
+    let authority = plaintext_address(&emulator, &cluster, case).await;
+
+    // It answers while the cluster is there.
+    let mut client = Client::plaintext(case, &authority).await;
+    assert_eq!(
+        client.api_versions(case).await.error_code,
+        0,
+        "case {case:?}: the endpoint answers while the cluster is registered"
+    );
+    client
+        .produce(case, "orders", 0, &[(epoch_millis(), None, "kept")])
+        .await;
+
+    let deleted = emulator
+        .call("DELETE", &format!("/v1/clusters/{}", pct(&cluster)), None)
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case {case:?}: DeleteCluster must be accepted, got {} {}",
+        deleted.status, deleted.body
+    );
+
+    // Once the removal the clock owes the cluster is materialised, the socket it was
+    // served on is closed: a client dialling the address it published is refused.
+    // Polled for the condition rather than waited out, with a generous deadline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let port: u16 = authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .unwrap_or_else(|| panic!("case {case:?}: {authority} is not a host:port pair"));
+    loop {
+        let described = emulator.describe(&cluster).await;
+        let refused = TcpStream::connect(("127.0.0.1", port)).await.is_err();
+        if described.status == 404 && refused {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: a deleted cluster's endpoint must stop answering; DescribeCluster \
+             answered {} and the port was {}",
+            described.status,
+            match refused {
+                true => "refused",
+                false => "still accepting",
+            }
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The offset the group `readers` has committed for partition 0 of `orders`, as
+/// `OffsetFetch` reports it.
+async fn group_offset(client: &mut Client, case: &str) -> i64 {
+    let fetched: ::kafka_protocol::messages::OffsetFetchResponse = client
+        .call(
+            case,
+            ApiKey::OffsetFetch,
+            5,
+            &::kafka_protocol::messages::OffsetFetchRequest::default()
+                .with_group_id(::kafka_protocol::messages::GroupId(
+                    StrBytes::from_static_str("readers"),
+                ))
+                .with_topics(Some(vec![
+                    ::kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic::default()
+                        .with_name(TopicName(StrBytes::from_static_str("orders")))
+                        .with_partition_indexes(vec![0]),
+                ])),
+        )
+        .await;
+    fetched
+        .topics
+        .first()
+        .and_then(|topic| topic.partitions.first())
+        .map(|partition| partition.committed_offset)
+        .unwrap_or_default()
+}
+
+/// Epoch milliseconds now, the unit a record's timestamp is in.
+fn epoch_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or_default())
+        .unwrap_or_default()
+}
+
+impl Client {
+    /// `Metadata`, or `None` when the broker closed the connection rather than
+    /// answering — which is what an unauthenticated connection to a SASL path gets.
+    async fn metadata_or_closed(&mut self, case: &str) -> Option<String> {
+        self.correlation += 1;
+        let key = ApiKey::Metadata;
+        let version = 9;
+        let mut frame = BytesMut::new();
+        RequestHeader::default()
+            .with_request_api_key(key as i16)
+            .with_request_api_version(version)
+            .with_correlation_id(self.correlation)
+            .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)))
+            .encode(&mut frame, key.request_header_version(version))
+            .expect("the header encodes");
+        MetadataRequest::default()
+            .with_topics(None)
+            .encode(&mut frame, version)
+            .expect("the request encodes");
+        let length = u32::try_from(frame.len()).expect("a request frame fits in a u32");
+        if self.session.write_all(&length.to_be_bytes()).await.is_err()
+            || self.session.write_all(&frame).await.is_err()
+        {
+            return None;
+        }
+        self.read_frame(case).await.map(|frame| format!("{frame:?}"))
+    }
+}
+
+/// A SASL/SCRAM secret, minted through Secrets Manager's own `CreateSecret` and
+/// associated with the cluster, which is where a broker reads the credential from.
+async fn given_secret_associated(
+    emulator: &Emulator,
+    cluster: &str,
+    name: &str,
+    case: &str,
+) -> String {
+    let created = emulator
+        .secrets_manager(
+            REGION,
+            "CreateSecret",
+            json!({
+                "Name": name,
+                "ClientRequestToken": format!("00000000-0000-4000-8000-{:012x}", name.len() * 7919),
+                "KmsKeyId": CUSTOMER_KEY_ARN,
+                "SecretString":
+                    format!("{{\"username\":\"{SCRAM_USER}\",\"password\":\"{SCRAM_PASSWORD}\"}}"),
+            }),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: Secrets Manager must create the secret, got {} {}",
+        created.status, created.body
+    );
+    let arn = created
+        .at("/ARN")
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: Secrets Manager reported no ARN"))
+        .to_string();
+    let associated = emulator
+        .call(
+            "POST",
+            &format!("/v1/clusters/{}/scram-secrets", pct(cluster)),
+            Some(json!({ "secretArnList": [arn.clone()] })),
+        )
+        .await;
+    assert_eq!(
+        associated.status, 200,
+        "case {case:?}: BatchAssociateScramSecret must be accepted, got {} {}",
+        associated.status, associated.body
+    );
+    assert_eq!(
+        associated.at("/unprocessedScramSecrets").as_array().map(Vec::len),
+        Some(0),
+        "case {case:?}: the secret must be associated, got {}",
+        associated.body
+    );
+    arn
+}

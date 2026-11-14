@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/broker_count_update.rs"]
 mod broker_count_update;
+#[path = "all/broker_data_plane.rs"]
+mod broker_data_plane;
 #[path = "all/broker_reboot.rs"]
 mod broker_reboot;
 #[path = "all/broker_reboot_window.rs"]
@@ -93,6 +95,8 @@ mod current_version_parameter;
 mod delete_version_precondition_attribution;
 #[path = "all/describe_cluster_v2.rs"]
 mod describe_cluster_v2;
+#[path = "all/guarded_update_sequences.rs"]
+mod guarded_update_sequences;
 #[path = "all/identity_policy_gate.rs"]
 mod identity_policy_gate;
 #[path = "all/iso8601_timestamps.rs"]

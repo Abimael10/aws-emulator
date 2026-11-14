@@ -71,6 +71,11 @@ impl ComAmazonawsKafkaKafkaState {
     /// channels: every channel registered under `arn` is dropped here too, which
     /// is why this is also the one place that can orphan a channel — and does
     /// not.
+    ///
+    /// The cluster's DATA plane goes with it as well: the socket each of its access
+    /// paths was served on is dropped (which closes the port and severs every
+    /// connection on it), and the records, ACL bindings and consumer groups its
+    /// brokers held are released — nothing of a cluster nobody can reach is kept.
     pub fn unregister_cluster(&mut self, arn: &str) -> Option<Cluster> {
         let cluster = self.clusters.remove(arn)?;
         self.cluster_arn_by_name
@@ -79,6 +84,13 @@ impl ComAmazonawsKafkaKafkaState {
             self.cluster_operations.remove(operation_arn);
         }
         self.topics.retain(|(topic_cluster, _), _| topic_cluster != arn);
+        self.cluster_endpoints
+            .retain(|(endpoint_cluster, _), _| endpoint_cluster != arn);
+        self.partition_logs
+            .retain(|(log_cluster, _, _), _| log_cluster != arn);
+        self.broker_acls.remove(arn);
+        self.consumer_groups
+            .retain(|(group_cluster, _), _| group_cluster != arn);
         if let Some(count) = self.clusters_per_region.get_mut(&cluster.region) {
             *count = count.saturating_sub(1);
             if *count == 0 {

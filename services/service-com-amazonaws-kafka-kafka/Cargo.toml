@@ -16,7 +16,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -30,6 +30,21 @@ java-properties = "2.0"
 # Matches a replication flow's TopicsToReplicate / TopicsToExclude patterns, which
 # the model documents as regular expressions, against a source cluster's topics.
 regex = "1.13"
+# Encodes and decodes the Apache Kafka wire protocol (request/response frames, their
+# per-API versions and the record batch format), which is what the cluster's broker
+# endpoint SPEAKS (`src/state/broker_plane/`): the messages are the protocol's, so they
+# are read with the protocol's own implementation rather than hand-rolled. No
+# compression codec is taken: the broker reads and writes uncompressed batches.
+kafka-protocol = { version = "0.18", default-features = false, features = ["broker", "client"] }
+# The SASL/SCRAM-SHA-512 exchange a Kafka client completes against that endpoint:
+# PBKDF2-HMAC-SHA-512 over the credential, and the HMAC/hash the proof and the server
+# signature are computed with (RFC 5802).
+hmac = "0.13"
+sha2 = "0.11"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+# The salt and the server nonce of that exchange, which RFC 5802 requires to be
+# unpredictable per connection.
+rand = "0.9"
 # The AWS SDK for EC2, driven over the in-process callback
 # (`OperationContext::callback`): the account's subnets are EC2's resources, so every
 # create that places a resource in a client VPC resolves the subnets it is given against
@@ -64,6 +79,14 @@ service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The data-plane suite drives a real Apache Kafka client against a cluster's own socket
+# in ONE process: `rustls` / `tokio-rustls` run the client side of the TLS the encrypted
+# access paths are served over, which the core terminates. Both are the versions this
+# workspace already builds.
+rustls = { workspace = true }
+tokio-rustls = "0.26"
 
 [lints]
 workspace = true

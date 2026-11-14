@@ -6,8 +6,9 @@
 //! reporting operations derive from it: `DescribeCluster` / `ListClusters` build a
 //! [`ClusterInfo`] with [`Cluster::to_cluster_info`], `DescribeClusterV2` /
 //! `ListClustersV2` build the v2 `Cluster` with [`Cluster::to_cluster_v2`], and
-//! `GetBootstrapBrokers` builds its endpoint strings with
-//! [`Cluster::broker_endpoints`] plus the access predicates beside it, and
+//! `GetBootstrapBrokers` builds its endpoint strings from the access predicates on
+//! that record and the socket each enabled path is served on
+//! ([`broker_plane`]), and
 //! `ListNodes` renders one stored broker node with [`Cluster::to_node_info`].
 //! Keeping them
 //! next to the record is what makes the readers agree: they render the same stored
@@ -184,6 +185,10 @@ pub mod server_properties;
 /// It is a function of the accepted-state set and nothing this module holds, which
 /// is why it sits beside this one.
 pub mod state_gate;
+
+/// The cluster's DATA plane: the socket its brokers are reached on and the log they
+/// keep, which is what `GetBootstrapBrokers` announces an address for.
+pub mod broker_plane;
 
 /// The registry's own operations — every lookup, insertion and removal over the
 /// maps the state struct below holds. Its own file so this module keeps to the
@@ -2920,6 +2925,31 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// Monotonic counter feeding each VPC connection's ARN, so each one gets a
     /// distinct identity.
     pub next_vpc_connection_suffix: u64,
+    /// The socket each cluster's brokers are reached on, keyed by (cluster ARN, access
+    /// path), and the address `GetBootstrapBrokers` announces for it
+    /// ([`broker_plane::ClusterEndpoint`]). Opened on the first bootstrap read of a
+    /// cluster and held for as long as that cluster is in the registry, so an announced
+    /// address never moves under a client; dropped when the cluster is unregistered,
+    /// which closes the port.
+    pub cluster_endpoints: HashMap<(String, broker_plane::AccessPath), broker_plane::ClusterEndpoint>,
+    /// The records each partition of each topic holds, keyed by (cluster ARN, topic
+    /// name, partition index): what a `Produce` on that cluster's endpoint appends
+    /// and a `Fetch` reads, with the records the topic's `retention.ms` has aged out
+    /// already gone ([`broker_plane::PartitionLog`]). Released with the cluster.
+    pub partition_logs: HashMap<(String, String, i32), broker_plane::PartitionLog>,
+    /// The ACL bindings each cluster's brokers hold, keyed by cluster ARN: what a
+    /// client created with the protocol's `CreateAcls` on that cluster's endpoint and
+    /// what `DescribeAcls` reports back ([`broker_plane::acls`]). Released with the
+    /// cluster.
+    pub broker_acls: HashMap<String, broker_plane::acls::Acls>,
+    /// Monotonic counter feeding the producer id an `InitProducerId` on any cluster's
+    /// endpoint assigns, so no two idempotent producers of this emulator write under
+    /// the same one.
+    pub next_producer_id: i64,
+    /// The consumer groups each cluster's endpoint coordinates, keyed by (cluster ARN,
+    /// group id): the members a group holds and the offsets it has committed
+    /// ([`broker_plane::groups`]). Released with the cluster.
+    pub consumer_groups: HashMap<(String, String), broker_plane::groups::ConsumerGroup>,
 }
 
 impl VpcConnection {

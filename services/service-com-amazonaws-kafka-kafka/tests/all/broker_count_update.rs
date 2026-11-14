@@ -362,7 +362,9 @@ async fn an_accepted_update_lands_the_broker_nodes_once_the_clock_owes_it() {
         );
 
         // The NODES moved with the count: the listing reports one per broker the
-        // cluster now holds, and the bootstrap endpoints name exactly those nodes.
+        // cluster now holds. The bootstrap endpoints name the ADDRESS the emulator
+        // answers Apache Kafka connections on for this cluster rather than one
+        // synthesised name per node, so what they are asserted on is that address.
         let nodes_after = listed_broker_ids(&emulator, &arn, case).await;
         assert_eq!(
             nodes_after,
@@ -371,16 +373,10 @@ async fn an_accepted_update_lands_the_broker_nodes_once_the_clock_owes_it() {
         );
         let hosts = bootstrap_hosts(&emulator, &arn, case).await;
         assert_eq!(
-            hosts.len(),
-            usize::try_from(*target).expect("a broker count fits a usize"),
-            "case {case}: expected one bootstrap host per broker node, got {hosts:?}"
+            hosts,
+            std::collections::BTreeSet::from(["127.0.0.1".to_string()]),
+            "case {case}: expected the cluster's own served address, got {hosts:?}"
         );
-        for id in 1..=*target {
-            assert!(
-                hosts.iter().any(|host| host.starts_with(&format!("b-{id}."))),
-                "case {case}: expected a bootstrap endpoint for broker {id}, got {hosts:?}"
-            );
-        }
 
         let new_version = after
             .at("/clusterInfo/currentVersion")
