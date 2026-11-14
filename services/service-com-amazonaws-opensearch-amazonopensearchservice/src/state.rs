@@ -85,6 +85,10 @@ pub mod encryption_grant;
 /// the slow-log records its own data plane produces, and the cluster's application log.
 pub mod log_publishing;
 
+/// The `AWS/ES` metrics a provisioned domain's cluster publishes about itself: what each
+/// gauge reads, and the cadence they are observed on.
+pub mod cluster_metrics;
+
 /// The ALERTING plugin's records a domain holds: the monitors a client writes, the legacy
 /// destinations their actions can address, and the alerts their triggers left behind.
 pub mod alerting;

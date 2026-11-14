@@ -841,6 +841,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &arn,
             encryption.as_ref(),
         );
+        // This create is also the write that gives the service a CLUSTER to measure, so it
+        // starts the sampler publishing the domain's own `AWS/ES` gauges — from here, with
+        // this store released, for the same reason the grant is taken here. At most one
+        // sampler runs per store, so a later create joins the one already running
+        // ([`crate::state::cluster_metrics`]).
+        crate::state::cluster_metrics::drive_metric_sampling(&self.engine);
         Ok(CreateDomainOutput {
             domain_status: Some(domain_status),
         })

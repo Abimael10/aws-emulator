@@ -131,6 +131,13 @@ service-com-amazonaws-servicequotas-servicequotasv20190624 = { workspace = true 
 # rendering rather than code written here.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The Amazon CloudWatch store the `AWS/ES` series a domain's cluster publishes about itself
+# go into (`state::cluster_metrics`): a service's own metric never travels over
+# `PutMetricData`, which reserves the `AWS/` namespaces for the services that own them, so
+# the datapoints are appended to the very store `ListMetrics`, `GetMetricStatistics` and the
+# alarm evaluation read — the way the IAM, Cognito, S3, CloudWatch Logs, KMS, Certificate
+# Manager and Service Quotas stores above are reached.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

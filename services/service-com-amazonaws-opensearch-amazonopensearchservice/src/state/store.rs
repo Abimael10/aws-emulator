@@ -110,6 +110,12 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Drives
     /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_migration_id`].
     pub migration_seq: u64,
+    /// The claim on the ONE cluster-metric sampler of this store: the task that observes
+    /// every provisioned domain's `AWS/ES` gauges on a cadence
+    /// ([`cluster_metrics::drive_metric_sampling`]). It holds no reading of its own — the
+    /// readings are the records above — only whether a sampler runs and which claim it
+    /// holds.
+    pub metric_sampling: cluster_metrics::MetricSampling,
 }
 
 impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
@@ -138,6 +144,7 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
             direct_query_data_sources: BTreeMap::new(),
             migrations: BTreeMap::new(),
             migration_seq: 0,
+            metric_sampling: cluster_metrics::MetricSampling::default(),
         }
     }
 }

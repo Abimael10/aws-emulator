@@ -47,6 +47,8 @@ mod clock_owed_readiness;
 mod cluster_apis;
 #[path = "all/cluster_config_round_trip.rs"]
 mod cluster_config_round_trip;
+#[path = "all/cluster_metrics.rs"]
+mod cluster_metrics;
 #[path = "all/cognito_dashboards_authentication.rs"]
 mod cognito_dashboards_authentication;
 #[path = "all/collection_element_refusals.rs"]

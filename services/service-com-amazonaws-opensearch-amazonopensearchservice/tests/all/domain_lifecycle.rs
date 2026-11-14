@@ -96,6 +96,48 @@ impl Emulator {
         emulator
     }
 
+    /// The same emulator with Amazon CloudWatch mounted on the SAME shared engine, so a
+    /// suite can read the `AWS/ES` series a domain's cluster publishes about itself through
+    /// CloudWatch's OWN `ListMetrics` and `GetMetricStatistics`, and alarm on it through
+    /// `PutMetricAlarm` — the store those operations answer from and an alarm is evaluated
+    /// against.
+    pub(crate) fn with_metrics() -> Self {
+        let mut emulator = Self::new();
+        emulator.router.register_service(
+            service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+                std::sync::Arc::clone(&emulator.engine),
+            ),
+        );
+        emulator
+    }
+
+    /// Call `operation` of the Amazon CloudWatch service mounted on the same router
+    /// ([`Emulator::with_metrics`]), the way an SDK drives it: `POST /` with
+    /// `X-Amz-Target: GraniteServiceVersion20100801.<Op>`, signed for that service's own
+    /// signing name so the router can name it.
+    pub(crate) async fn metrics_call(&self, operation: &str, body: Value) -> Answer {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("monitoring.{REGION}.amazonaws.com"))
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "x-amz-target",
+                format!("GraniteServiceVersion20100801.{operation}"),
+            )
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential={DEFAULT_ACCESS_KEY_ID}/20260101/{REGION}/monitoring/\
+                     aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
+                ),
+            )
+            .body(Bytes::from(body.to_string()))
+            .expect("the test request is well formed");
+        self.dispatch(request).await
+    }
+
     /// The same emulator with the Amazon CloudWatch Logs service mounted on the SAME
     /// shared engine, so a suite can create the log group a domain's logs are published
     /// to through that service's own `CreateLogGroup` — the store this service resolves
