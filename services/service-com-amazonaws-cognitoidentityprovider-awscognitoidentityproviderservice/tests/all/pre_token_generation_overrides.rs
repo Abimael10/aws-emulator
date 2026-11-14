@@ -12,8 +12,9 @@
 //! identity token, and `response.claimsAndScopeOverrideDetails` customises both tokens
 //! (`idTokenGeneration`, `accessTokenGeneration`) and the access token's scopes. A
 //! `groupOverrideDetails` REPLACES the group configuration the event reported — the groups,
-//! the roles and the preferred role — while a claim Amazon Cognito reserves is never the
-//! function's to rewrite.
+//! the roles and the preferred role — and `claimsToSuppress` takes every claim it names out
+//! of its token, the ones this service generated from the pool's own state included, while a
+//! claim Amazon Cognito reserves is never the function's to rewrite.
 //!
 //! Both suites run a REAL deployment package: Cognito and Lambda are mounted on one engine,
 //! as the assembled emulator mounts them, and the pool's trigger names a `python3.12`
@@ -23,8 +24,9 @@
 //!
 //! The first suite is the table of contracts and members: one row per thing the rule
 //! generalises over — which contract member the answer uses, which token it customises,
-//! whether the groups are replaced, emptied or left alone, whether a scope is added or
-//! suppressed, and a reserved claim the answer tries to write. The second is the set of
+//! whether the groups are replaced, emptied or left alone, which generated claim a
+//! suppression names, whether a scope is added or suppressed, and a reserved claim the
+//! answer tries to write. The second is the set of
 //! operations: every operation of this service that mints a sign-in's tokens applies what
 //! the trigger answered for ITS generation.
 //!
@@ -549,6 +551,83 @@ async fn a_pre_token_generation_answer_decides_the_minted_tokens_claims() {
                 ("tenant", Expect::Absent),
                 ("cognito:groups", Expect::Is(json!([STORED_GROUP]))),
             ],
+        },
+        Row {
+            case: "the second contract suppressing the access token's generated group claim",
+            lambda_config: json!({
+                "PreTokenGenerationConfig": { "LambdaVersion": "V2_0", "LambdaArn": function },
+            }),
+            answered: json!({
+                "claimsAndScopeOverrideDetails": {
+                    "accessTokenGeneration": {
+                        "claimsToAddOrOverride": {
+                            "custom_tier": "gold",
+                            // A value for a group claim is the group member's to state, so
+                            // this one is not read — and the suppression beside it stands.
+                            "cognito:groups": ["sneaked-in"],
+                        },
+                        "claimsToSuppress": ["cognito:groups"],
+                        "scopesToAdd": ["reports/read"],
+                    },
+                },
+            }),
+            id_token: vec![
+                // Each token's claims are suppressed on their own, so the token the answer
+                // said nothing about keeps the claim the membership put there.
+                ("cognito:groups", Expect::Is(json!([STORED_GROUP]))),
+                ("custom_tier", Expect::Absent),
+            ],
+            access_token: vec![
+                ("cognito:groups", Expect::Absent),
+                ("custom_tier", Expect::Is(json!("gold"))),
+                (
+                    "scope",
+                    Expect::Is(json!(format!("{GRANTED_SCOPE} reports/read"))),
+                ),
+            ],
+        },
+        Row {
+            case: "the second contract suppressing the identity token's generated claims",
+            lambda_config: json!({
+                "PreTokenGenerationConfig": { "LambdaVersion": "V2_0", "LambdaArn": function },
+            }),
+            answered: json!({
+                "claimsAndScopeOverrideDetails": {
+                    "idTokenGeneration": {
+                        "claimsToSuppress": [
+                            "cognito:groups",
+                            "cognito:roles",
+                            "cognito:preferred_role",
+                            "email",
+                        ],
+                    },
+                },
+            }),
+            id_token: vec![
+                ("cognito:groups", Expect::Absent),
+                ("cognito:roles", Expect::Absent),
+                ("cognito:preferred_role", Expect::Absent),
+                ("email", Expect::Absent),
+                // A claim naming a token's own identity is still not the function's.
+                ("sub", Expect::Present),
+            ],
+            access_token: vec![
+                ("cognito:groups", Expect::Is(json!([STORED_GROUP]))),
+                ("scope", Expect::Is(json!(GRANTED_SCOPE))),
+            ],
+        },
+        Row {
+            case: "the first contract suppressing the identity token's generated group claim",
+            lambda_config: json!({
+                "PreTokenGenerationConfig": { "LambdaVersion": "V1_0", "LambdaArn": function },
+            }),
+            answered: json!({
+                "claimsOverrideDetails": { "claimsToSuppress": ["cognito:groups"] },
+            }),
+            // The first contract customises the identity token alone, so the access token
+            // of the same generation keeps the claim.
+            id_token: vec![("cognito:groups", Expect::Absent)],
+            access_token: vec![("cognito:groups", Expect::Is(json!([STORED_GROUP])))],
         },
         Row {
             case: "the first contract, which customises the identity token alone",

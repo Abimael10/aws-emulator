@@ -30,13 +30,21 @@
 //! `cognito:roles` and `cognito:preferred_role` claims it also replaces exist in the identity
 //! token alone.
 //!
-//! Three rules the whole contract follows, whichever member carried it:
+//! Four rules the whole contract follows, whichever member carried it:
 //!
-//! * the claims that identify a token, its subject and its lifetime are RESERVED
-//!   ([`RESERVED_CLAIMS`]): a function cannot override or suppress one, so a token's
-//!   identity is never the function's to rewrite;
+//! * the claims that identify a token, its subject, its lifetime and its scopes are
+//!   RESERVED ([`RESERVED_CLAIMS`]): a function cannot override or suppress one, so a
+//!   token's identity is never the function's to rewrite;
+//! * `claimsToSuppress` takes every OTHER claim it names out of its token entirely — a
+//!   claim the user's profile contributed and one this service generated from the pool's
+//!   own state alike, the group claims included ([`GROUP_CONFIGURATION_CLAIMS`]), since a
+//!   function suppresses a claim precisely to keep it out of a token it does not trust
+//!   with it;
 //! * a claim named in both `claimsToAddOrOverride` and `claimsToSuppress` is ADDED, so a
-//!   suppression that the same answer also gives a value for is ignored;
+//!   suppression that the same answer also gives a value for is ignored — and a group
+//!   claim, whose value is [`GROUP_OVERRIDE_DETAILS`]'s to state and not
+//!   `claimsToAddOrOverride`'s, is therefore suppressed even by an answer that also lists
+//!   it there;
 //! * `groupOverrideDetails` REPLACES the group configuration the event reported: the
 //!   groups, the roles and the preferred role become the ones it names, a member it does
 //!   not name is suppressed, and an answer carrying no such object at all leaves the stored
@@ -94,17 +102,17 @@ const IAM_ROLES_TO_OVERRIDE: &str = "iamRolesToOverride";
 /// The role that replaces the identity token's `cognito:preferred_role`.
 const PREFERRED_ROLE: &str = "preferredRole";
 
-/// The claims a pre-token-generation function may NOT give a value for or suppress, so an
-/// answer naming one leaves the claim the minting computed standing. Two kinds, marked
+/// The claims a pre-token-generation function may NEITHER give a value for NOR suppress, so
+/// an answer naming one leaves the claim the minting computed standing. Two kinds, marked
 /// below:
 ///
 /// * the claims Amazon Cognito reserves for itself, which state a token's issuer, audience,
 ///   subject, lifetime and use, and which a verifier reads to tell one token of a sign-in
 ///   from another;
-/// * the claims another member of the same contract OWNS, which is why they are not these
-///   members' to write: the three group claims are [`GROUP_OVERRIDE_DETAILS`]'s
-///   ([`TokenOverrides::group_claims`]) and `scope` is [`SCOPES_TO_ADD`] /
-///   [`SCOPES_TO_SUPPRESS`]'s ([`TokenOverrides::access_scopes`]).
+/// * `scope`, whose own members of the contract state what the access token is authorized
+///   for — [`SCOPES_TO_ADD`] and [`SCOPES_TO_SUPPRESS`]
+///   ([`TokenOverrides::access_scopes`]) — so the claim that renders them is not a claim
+///   member's to write or to remove.
 const RESERVED_CLAIMS: &[&str] = &[
     // Reserved by the service.
     "acr",
@@ -126,16 +134,34 @@ const RESERVED_CLAIMS: &[&str] = &[
     "sub",
     "token_use",
     "username",
-    // Owned by another member of the contract.
-    "cognito:groups",
-    "cognito:preferred_role",
-    "cognito:roles",
+    // Owned by the answer's own scope members.
     "scope",
 ];
 
-/// Whether `claim` is one Amazon Cognito reserves ([`RESERVED_CLAIMS`]).
-fn is_reserved(claim: &str) -> bool {
-    RESERVED_CLAIMS.contains(&claim)
+/// The claims whose VALUES [`GROUP_OVERRIDE_DETAILS`] states
+/// ([`TokenOverrides::group_claims`]): the group configuration is answered through that
+/// member, so a value `claimsToAddOrOverride` gives one of them is not read.
+///
+/// Their presence is a different question from their value: a claim this service generated
+/// from the pool's own state is still a claim of the token, so an answer that names one for
+/// SUPPRESSION takes it out of that token like any other.
+const GROUP_CONFIGURATION_CLAIMS: &[&str] = &[
+    "cognito:groups",
+    "cognito:preferred_role",
+    "cognito:roles",
+];
+
+/// Whether a function may give `claim` a value: every claim but the reserved ones
+/// ([`RESERVED_CLAIMS`]) and the ones another member states the value of
+/// ([`GROUP_CONFIGURATION_CLAIMS`]).
+fn is_overridable(claim: &str) -> bool {
+    !RESERVED_CLAIMS.contains(&claim) && !GROUP_CONFIGURATION_CLAIMS.contains(&claim)
+}
+
+/// Whether a function may take `claim` out of its token: every claim but the reserved ones
+/// ([`RESERVED_CLAIMS`]).
+fn is_suppressible(claim: &str) -> bool {
+    !RESERVED_CLAIMS.contains(&claim)
 }
 
 /// The most entries this service reads from ONE member of an answer — a claim map, a claim
@@ -170,11 +196,11 @@ fn claim_value_bytes(value: &Value) -> usize {
 /// gives values for, and the claims it takes out.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct ClaimOverrides {
-    /// The claims the function gave values for, reserved names dropped. The value is the
-    /// JSON the function answered with, so a claim it stated as a list or a number is
-    /// carried as one.
+    /// The claims the function gave values for, the names that are not a claim member's to
+    /// write dropped ([`is_overridable`]). The value is the JSON the function answered with,
+    /// so a claim it stated as a list or a number is carried as one.
     add_or_override: Map<String, Value>,
-    /// The claims the function took out, reserved names dropped.
+    /// The claims the function took out, reserved names dropped ([`is_suppressible`]).
     suppress: Vec<String>,
 }
 
@@ -191,7 +217,7 @@ impl ClaimOverrides {
                 members
                     .iter()
                     .filter(|(name, _)| {
-                        !is_reserved(name) && name.len() <= MAX_OVERRIDE_TEXT_BYTES
+                        is_overridable(name) && name.len() <= MAX_OVERRIDE_TEXT_BYTES
                     })
                     .filter(|(_, value)| claim_value_bytes(value) <= MAX_CLAIM_VALUE_BYTES)
                     .take(MAX_OVERRIDE_ENTRIES)
@@ -201,7 +227,7 @@ impl ClaimOverrides {
             .unwrap_or_default();
         let suppress = read_text_list(details.get(CLAIMS_TO_SUPPRESS))
             .into_iter()
-            .filter(|name| !is_reserved(name))
+            .filter(|name| is_suppressible(name))
             .collect();
         Self {
             add_or_override,
@@ -511,12 +537,40 @@ mod tests {
                 },
             ),
             (
+                "an answer suppressing claims this service generated from the pool's state",
+                ::serde_json::json!({
+                    "claimsAndScopeOverrideDetails": {
+                        "idTokenGeneration": {
+                            "claimsToSuppress": ["cognito:roles", "cognito:preferred_role"],
+                        },
+                        "accessTokenGeneration": {
+                            // A group claim named for a value as well is still suppressed:
+                            // its value is the group member's to state, so the answer gives
+                            // it none here.
+                            "claimsToAddOrOverride": { "cognito:groups": ["sneaked-in"] },
+                            "claimsToSuppress": ["cognito:groups"],
+                        },
+                    },
+                }),
+                TokenOverrides {
+                    id_claims: ClaimOverrides {
+                        add_or_override: Map::new(),
+                        suppress: texts(&["cognito:roles", "cognito:preferred_role"]),
+                    },
+                    access_claims: ClaimOverrides {
+                        add_or_override: Map::new(),
+                        suppress: texts(&["cognito:groups"]),
+                    },
+                    ..TokenOverrides::none()
+                },
+            ),
+            (
                 "an answer naming reserved claims, which are not a function's to write",
                 ::serde_json::json!({
                     "claimsAndScopeOverrideDetails": {
                         "idTokenGeneration": {
                             "claimsToAddOrOverride": { "sub": "someone-else", "cognito:groups": ["x"] },
-                            "claimsToSuppress": ["exp", "token_use"],
+                            "claimsToSuppress": ["exp", "token_use", "scope"],
                         },
                     },
                 }),
