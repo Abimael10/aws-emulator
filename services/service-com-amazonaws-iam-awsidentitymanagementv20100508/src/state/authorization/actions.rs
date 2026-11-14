@@ -187,6 +187,9 @@ pub const REJECT_DELEGATION_REQUEST: &str = "iam:RejectDelegationRequest";
 /// `iam:AssociateDelegationRequest`.
 pub const ASSOCIATE_DELEGATION_REQUEST: &str = "iam:AssociateDelegationRequest";
 
+/// `iam:SendDelegationToken`.
+pub const SEND_DELEGATION_TOKEN: &str = "iam:SendDelegationToken";
+
 /// `iam:AcquireRole`.
 pub const ACQUIRE_ROLE: &str = "iam:AcquireRole";
 
@@ -454,6 +457,18 @@ pub const CREATE_VIRTUAL_MFA_DEVICE: &str = "iam:CreateVirtualMFADevice";
 
 /// `iam:EnableMFADevice`.
 pub const ENABLE_MFA_DEVICE: &str = "iam:EnableMFADevice";
+
+/// `iam:DeactivateMFADevice`.
+pub const DEACTIVATE_MFA_DEVICE: &str = "iam:DeactivateMFADevice";
+
+/// `iam:ListMFADevices`.
+pub const LIST_MFA_DEVICES: &str = "iam:ListMFADevices";
+
+/// `iam:ResyncMFADevice`.
+pub const RESYNC_MFA_DEVICE: &str = "iam:ResyncMFADevice";
+
+/// `iam:DeleteVirtualMFADevice`.
+pub const DELETE_VIRTUAL_MFA_DEVICE: &str = "iam:DeleteVirtualMFADevice";
 
 /// `iam:ListVirtualMFADevices`.
 pub const LIST_VIRTUAL_MFA_DEVICES: &str = "iam:ListVirtualMFADevices";

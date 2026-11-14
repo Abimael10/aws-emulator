@@ -116,7 +116,7 @@ async fn get(
 /// row names one, and answer the identifier IAM minted for it: the fixture every round-trip
 /// row starts from, driven through the implemented `CreateDelegationRequest` rather than
 /// seeded, so what is accepted is a record this emulator wrote.
-async fn file(
+pub(crate) async fn file(
     router: &MultiServiceRouter,
     case: &str,
     workflow: &str,

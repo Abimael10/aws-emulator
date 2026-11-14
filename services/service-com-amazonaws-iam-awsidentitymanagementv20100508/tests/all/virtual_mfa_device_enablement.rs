@@ -40,21 +40,21 @@ const USER: &str = "mfa-operator";
 
 /// How long one time step of a TOTP pass code lasts: RFC 6238's recommended default, which is
 /// what an authenticator app provisioned from an `otpauth://totp/` URI naming no period uses.
-const TIME_STEP: Duration = Duration::from_secs(30);
+pub(crate) const TIME_STEP: Duration = Duration::from_secs(30);
 
 /// How many digits one pass code carries: "the format for this parameter is a string of six
 /// digits" (`EnableMFADeviceRequest$AuthenticationCode1`).
 const CODE_DIGITS: usize = 6;
 
 /// Create the IAM user every row names.
-async fn given_user(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn given_user(router: &MultiServiceRouter, name: &str) {
     let (status, body) = call(router, "CreateUser", &[("UserName", name)]).await;
     assert_eq!(status, 200, "the user {name:?} must be created, got {body}");
 }
 
 /// Provision a virtual MFA device, and answer its serial number and the base32 seed the
 /// create reported — the two values a holder of the device needs.
-async fn given_device(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn given_device(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let (status, body) = call(
         router,
         "CreateVirtualMFADevice",
@@ -80,7 +80,7 @@ async fn given_device(router: &MultiServiceRouter, name: &str) -> (String, Strin
 /// The pass code a device provisioned with `seed` emits in the time step `step`, computed here
 /// rather than asked of the service (see the module docs): RFC 6238's TOTP over RFC 4226's
 /// HOTP, HMAC-SHA-1 of the counter, dynamically truncated and taken to six digits.
-fn pass_code(seed: &str, step: u64) -> String {
+pub(crate) fn pass_code(seed: &str, step: u64) -> String {
     use hmac::Mac;
 
     let key = data_encoding::BASE32_NOPAD
@@ -101,7 +101,7 @@ fn pass_code(seed: &str, step: u64) -> String {
 }
 
 /// The time step the instant `now` falls in.
-fn current_step(now: SystemTime) -> u64 {
+pub(crate) fn current_step(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH)
         .expect("the clock is past the epoch")
         .as_secs()

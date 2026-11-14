@@ -35,22 +35,22 @@ const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
 /// One device a row provisions: the path it is created under, the name it is spelled with,
 /// and the tags it carries.
-struct Provisioned {
+pub(crate) struct Provisioned {
     /// The case this row stands for, named in every assertion it makes.
-    case: &'static str,
+    pub(crate) case: &'static str,
     /// The `Path` the request carries, or `None` for a request that names none — which
     /// "defaults to a slash (/)".
-    path: Option<&'static str>,
+    pub(crate) path: Option<&'static str>,
     /// The `VirtualMFADeviceName` the request carries.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// The tags the request attaches, as key/value pairs.
-    tags: &'static [(&'static str, &'static str)],
+    pub(crate) tags: &'static [(&'static str, &'static str)],
 }
 
 /// The table every suite below spans: the path, the name's character classes (the
 /// `^[\w+=,.@-]+$` pattern `virtualMFADeviceName` declares) and the number of tags all
 /// vary, and no single row is the specification.
-const PROVISIONED: &[Provisioned] = &[
+pub(crate) const PROVISIONED: &[Provisioned] = &[
     Provisioned {
         case: "the default path, a plain name, no tags",
         path: None,
@@ -98,7 +98,7 @@ impl Provisioned {
 
     /// The serial number — the `mfa` ARN of the path and the name — the device created by
     /// this row must carry.
-    fn serial_number(&self) -> String {
+    pub(crate) fn serial_number(&self) -> String {
         format!(
             "arn:aws:iam::{}:mfa{}{}",
             account_id(),
@@ -108,7 +108,7 @@ impl Provisioned {
     }
 
     /// This row's create as awsQuery form parameters.
-    fn params(&self) -> Vec<(String, String)> {
+    pub(crate) fn params(&self) -> Vec<(String, String)> {
         let mut params = vec![(
             "VirtualMFADeviceName".to_string(),
             self.name.to_string(),
@@ -126,7 +126,7 @@ impl Provisioned {
 }
 
 /// `params` as the borrowed pairs the harness takes.
-fn borrowed(params: &[(String, String)]) -> Vec<(&str, &str)> {
+pub(crate) fn borrowed(params: &[(String, String)]) -> Vec<(&str, &str)> {
     params
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
@@ -143,7 +143,7 @@ fn blob(case: &str, encoded: &str) -> Vec<u8> {
 
 /// What a create answers: the serial number, the seed as the caller reads it, and the
 /// QR code image's bytes.
-async fn provision(
+pub(crate) async fn provision(
     router: &smithy_server_runtime::MultiServiceRouter,
     row: &Provisioned,
 ) -> (String, String, Vec<u8>) {

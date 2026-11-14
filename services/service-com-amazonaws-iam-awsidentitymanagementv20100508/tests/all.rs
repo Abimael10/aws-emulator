@@ -83,6 +83,8 @@ mod delegation_request_reads;
 mod delegation_request_rejection;
 #[path = "all/delegation_request_updates.rs"]
 mod delegation_request_updates;
+#[path = "all/delegation_token_dispatch.rs"]
+mod delegation_token_dispatch;
 #[path = "all/entities_for_policy.rs"]
 mod entities_for_policy;
 #[path = "all/entity_name_path_prefix_refusal.rs"]
@@ -167,6 +169,8 @@ mod managed_policy_statement_grammar;
 mod management_event_recording;
 #[path = "all/member_format_refusal_wording.rs"]
 mod member_format_refusal_wording;
+#[path = "all/mfa_device_listing.rs"]
+mod mfa_device_listing;
 #[path = "all/mfa_device_reads.rs"]
 mod mfa_device_reads;
 #[path = "all/missing_entity_message_wording.rs"]
@@ -419,7 +423,11 @@ mod user_tag_removal;
 mod user_tags;
 #[path = "all/validation_error_clauses.rs"]
 mod validation_error_clauses;
+#[path = "all/virtual_mfa_device_deletion.rs"]
+mod virtual_mfa_device_deletion;
 #[path = "all/virtual_mfa_device_enablement.rs"]
 mod virtual_mfa_device_enablement;
+#[path = "all/virtual_mfa_device_resynchronization.rs"]
+mod virtual_mfa_device_resynchronization;
 #[path = "all/virtual_mfa_devices.rs"]
 mod virtual_mfa_devices;

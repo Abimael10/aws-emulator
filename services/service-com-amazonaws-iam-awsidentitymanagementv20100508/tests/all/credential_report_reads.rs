@@ -685,6 +685,8 @@ fn enable_virtual_mfa_device(engine: &engine::InMemoryEngine, user_name: &str) {
             user_key: Some(state::name_key(user_name)),
             enable_date: Some(DateTime::from_secs(0)),
             tags: None,
+            // No resynchronisation has been made for the seeded device.
+            synchronized_step: None,
         },
     );
 }

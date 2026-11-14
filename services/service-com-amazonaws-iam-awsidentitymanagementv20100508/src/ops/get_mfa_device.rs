@@ -194,9 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if crate::state::name_key(addressed) != device.user_key {
                 return Err(GetMFADeviceErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        message: Some(format!(
-                            "MFA Device {} cannot be found for user {addressed}.",
-                            input.serial_number
+                        message: Some(crate::state::mfa_device_not_found_for_user_message(
+                            &input.serial_number,
+                            addressed,
                         )),
                     },
                 )

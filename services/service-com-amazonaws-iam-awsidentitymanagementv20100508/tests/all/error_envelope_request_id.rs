@@ -104,8 +104,11 @@ async fn every_error_document_names_the_request_it_answers() {
         },
         ErrorCase {
             case: "an operation the emulator has not implemented",
-            action: "ListMFADevices",
-            params: vec![param("UserName", "no-such-user")],
+            action: "ListMFADeviceTags",
+            params: vec![param(
+                "SerialNumber",
+                "arn:aws:iam::123456789012:mfa/no-such-device",
+            )],
             status: 501,
             code: "NotImplemented",
         },

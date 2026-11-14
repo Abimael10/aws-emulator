@@ -318,6 +318,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             user_key: None,
             enable_date: None,
             tags: tags.clone(),
+            // No resynchronisation has been made for a device this call just provisioned,
+            // so the account knows no step its clock was synchronised at.
+            synchronized_step: None,
         };
 
         // The response is the record that was stored, plus the two secrets this response

@@ -51,7 +51,7 @@ const VALIDATION_ERROR: &str = "ValidationError";
 
 /// An instant a seeded device was enabled at, fixed so what the read reports is the stored
 /// value rather than the clock.
-const ENABLED_MILLIS: i64 = 1_738_368_000_000;
+pub(crate) const ENABLED_MILLIS: i64 = 1_738_368_000_000;
 
 /// One `GetMFADevice` call: the serial it addresses, and the user it names when it names
 /// one.
@@ -80,7 +80,7 @@ async fn create_user(router: &MultiServiceRouter, case: &str, user_name: &str) {
 ///
 /// No operation of this service enrolls one (see the module docs), so the fact is written
 /// into the store the handler reads rather than into a second copy of it.
-fn record_fido_security_key(
+pub(crate) fn record_fido_security_key(
     engine: &engine::InMemoryEngine,
     serial_number: &str,
     user_name: &str,

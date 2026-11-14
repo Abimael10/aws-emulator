@@ -7,7 +7,10 @@
 //! ([`virtual_mfa_device_arn`]), the seed and the QR code a create mints for it
 //! ([`mint_virtual_mfa_device_seed`], [`virtual_mfa_device_qr_code`]), the one-time pass codes
 //! a device provisioned with that seed emits ([`virtual_mfa_device_answers`],
-//! [`virtual_mfa_device_answers_in_sequence`]) and the report every reader of a device makes
+//! [`virtual_mfa_device_answers_in_sequence`], [`virtual_mfa_device_resync_step`]), the
+//! sentences every operation on a device refuses one with
+//! ([`INVALID_AUTHENTICATION_CODE`], [`mfa_device_not_found_message`],
+//! [`mfa_device_not_found_for_user_message`]) and the report every reader of a device makes
 //! ([`ComAmazonawsIamAwsidentitymanagementv20100508State::virtual_mfa_device_report`]).
 
 #[allow(unused_imports)]
@@ -119,6 +122,17 @@ pub struct VirtualMfaDeviceRecord {
     /// none. The tag READS of this device are what sort them by key; the record holds the
     /// pairs rather than an order.
     pub tags: Option<Vec<Tag>>,
+    /// The time step the device's clock was last SYNCHRONISED at — the step the pair of
+    /// pass codes `ResyncMFADevice` accepted was emitted in — or `None` for a device no
+    /// resynchronisation has been made for.
+    ///
+    /// "Synchronizes the specified MFA device with its IAM resource object"
+    /// (`ResyncMFADevice`): what that synchronisation records is where the device's clock
+    /// stood, which is the step its codes were emitted in. A pass code is a ONE-TIME
+    /// password, so a later resynchronisation has to present codes the device emits AFTER
+    /// that step; a pair at or before it re-presents codes this device has already been
+    /// synchronised by and authenticates nothing.
+    pub synchronized_step: Option<u64>,
 }
 
 /// What a device's record shows when the account's state is formatted: which device it
@@ -133,6 +147,7 @@ impl ::std::fmt::Debug for VirtualMfaDeviceRecord {
             .field("user_key", &self.user_key)
             .field("enable_date", &self.enable_date)
             .field("tags", &self.tags)
+            .field("synchronized_step", &self.synchronized_step)
             .finish_non_exhaustive()
     }
 }
@@ -282,6 +297,49 @@ const PASS_CODE_DIGITS: u32 = 6;
 /// before the step rolled over from being rejected.
 const PASS_CODE_DRIFT_STEPS: u64 = 1;
 
+/// How many time steps either side of the current one a RESYNCHRONISATION pair is looked for
+/// at.
+///
+/// A device is resynchronised exactly because its clock has drifted out of the allowance a
+/// normal authentication is decided within ([`PASS_CODE_DRIFT_STEPS`]), so the pair
+/// `ResyncMFADevice` presents is looked for over a wider span — RFC 6238 states no figure for
+/// it ("the validation system should typically set a larger acceptable window"), and AWS
+/// publishes none, so the span is the emulator's own: wide enough to find a device a couple of
+/// minutes out of step, and narrow enough that a code of an unrelated instant synchronises
+/// nothing.
+const PASS_CODE_RESYNC_DRIFT_STEPS: u64 = 4;
+
+/// The sentence IAM refuses a pair of codes a device's seed does not answer with — the
+/// `InvalidAuthenticationCodeException` of every operation that authenticates a pass code
+/// pair (`EnableMFADevice`, `ResyncMFADevice`).
+///
+/// Entirely fixed text: it quotes neither code back and names neither the device nor the
+/// user, because what it reports is that the codes were not the device's.
+pub const INVALID_AUTHENTICATION_CODE: &str = "Authentication code for device is not valid.";
+
+/// How IAM refuses a `SerialNumber` the account holds NO MFA device under: the fixed text
+/// `MFA Device with serial number ` … ` does not exist.` carrying the serial the request
+/// supplied, and nothing else of the request — a not-found message about the device names no
+/// user.
+///
+/// One wording for that class, shared by every operation addressing a device by serial, for
+/// the same reason the delete-conflict sentences are shared
+/// ([`crate::state::DELETE_CONFLICT_DETACH_POLICIES`]): the class of missing entity is what
+/// IAM's text reports, so a client matching it sees one sentence whichever operation it
+/// called.
+pub fn mfa_device_not_found_message(serial_number: &str) -> String {
+    format!("MFA Device with serial number {serial_number} does not exist.")
+}
+
+/// How IAM refuses a serial that names a device the account DOES hold but the named user
+/// does not: the device is not that user's, which is what naming both reports.
+///
+/// A different class from [`mfa_device_not_found_message`], and so a different sentence: the
+/// entity that does not exist is the pair, not the device.
+pub fn mfa_device_not_found_for_user_message(serial_number: &str, user_name: &str) -> String {
+    format!("MFA Device {serial_number} cannot be found for user {user_name}.")
+}
+
 /// The time step `at` falls in: the TOTP counter, `floor(unix seconds / time step)`.
 ///
 /// `None` for an instant before the UNIX epoch, which no counter counts from.
@@ -353,18 +411,60 @@ pub fn virtual_mfa_device_answers_in_sequence(
     second: &str,
     at: ::std::time::SystemTime,
 ) -> bool {
-    let Some(key) = pass_code_key(base32_string_seed) else {
-        return false;
-    };
-    let Some(step) = pass_code_time_step(at) else {
-        return false;
-    };
-    (step.saturating_sub(PASS_CODE_DRIFT_STEPS)..=step.saturating_add(PASS_CODE_DRIFT_STEPS)).any(
-        |step| {
-            time_based_pass_code(&key, step) == first
-                && time_based_pass_code(&key, step.saturating_add(1)) == second
-        },
+    pass_code_sequence_step(
+        base32_string_seed,
+        first,
+        second,
+        at,
+        PASS_CODE_DRIFT_STEPS,
     )
+    .is_some()
+}
+
+/// The time step a device provisioned with `base32_string_seed` emitted `first` in, when
+/// `first` and `second` are the codes it emits in two consecutive steps within the
+/// RESYNCHRONISATION span ([`PASS_CODE_RESYNC_DRIFT_STEPS`]) of `at` — and `None` when no step
+/// in that span emits the pair.
+///
+/// What `ResyncMFADevice` synchronises a device by: the step the pair was emitted in is where
+/// the device's clock stands, which is the fact the resynchronisation records
+/// ([`VirtualMfaDeviceRecord::synchronized_step`]). The span is wider than the one an
+/// authentication is decided within, because a device is resynchronised exactly because its
+/// clock has drifted out of that one.
+#[must_use]
+pub fn virtual_mfa_device_resync_step(
+    base32_string_seed: &str,
+    first: &str,
+    second: &str,
+    at: ::std::time::SystemTime,
+) -> Option<u64> {
+    pass_code_sequence_step(
+        base32_string_seed,
+        first,
+        second,
+        at,
+        PASS_CODE_RESYNC_DRIFT_STEPS,
+    )
+}
+
+/// The step within `drift` steps of the one `at` falls in whose pass code is `first` and whose
+/// successor's is `second`, or `None` when no step in that span emits the pair.
+///
+/// The one place a PAIR of codes is decided, so the authentication the enable makes and the
+/// synchronisation the resync makes differ only in how wide a span they look over.
+fn pass_code_sequence_step(
+    base32_string_seed: &str,
+    first: &str,
+    second: &str,
+    at: ::std::time::SystemTime,
+    drift: u64,
+) -> Option<u64> {
+    let key = pass_code_key(base32_string_seed)?;
+    let step = pass_code_time_step(at)?;
+    (step.saturating_sub(drift)..=step.saturating_add(drift)).find(|step| {
+        time_based_pass_code(&key, *step) == first
+            && time_based_pass_code(&key, step.saturating_add(1)) == second
+    })
 }
 
 impl ComAmazonawsIamAwsidentitymanagementv20100508State {
@@ -502,6 +602,50 @@ mod tests {
             assert!(
                 !answered,
                 "case {case:?}: expected no code to be answered, got answered={answered}"
+            );
+        }
+    }
+
+    /// RULE: a resynchronisation finds the pair over a WIDER span than an authentication —
+    /// it reports the step the pair was emitted in, for a device whose clock stands up to
+    /// [`PASS_CODE_RESYNC_DRIFT_STEPS`] steps either side of this one — and finds nothing
+    /// past that span.
+    #[test]
+    fn a_resynchronisation_finds_the_pair_over_the_wider_span() {
+        // The instant every row is decided at, and the step it falls in.
+        let now = at(1_111_111_109);
+        let here: u64 = 1_111_111_109 / 30;
+        let key = pass_code_key(RFC_6238_SEED).expect("the published seed is base32");
+        // Rows: the offset of the step the pair is taken from, and whether that step is
+        // inside the resynchronisation span. Both published bounds of the span and one step
+        // past each of them.
+        let offsets: [(i64, bool); 7] = [
+            (0, true),
+            (1, true),
+            (-1, true),
+            (4, true),
+            (-4, true),
+            (5, false),
+            (-5, false),
+        ];
+        for (offset, inside) in offsets {
+            let step = here.saturating_add_signed(offset);
+            let first = time_based_pass_code(&key, step);
+            let second = time_based_pass_code(&key, step + 1);
+            let found = virtual_mfa_device_resync_step(RFC_6238_SEED, &first, &second, now);
+            let expected = inside.then_some(step);
+            assert_eq!(
+                found, expected,
+                "case {offset}: expected the resynchronisation step {expected:?}, got {found:?}"
+            );
+            // The same pair, decided as an AUTHENTICATION: only the narrow allowance.
+            let authenticated =
+                virtual_mfa_device_answers_in_sequence(RFC_6238_SEED, &first, &second, now);
+            assert_eq!(
+                authenticated,
+                offset.abs() <= 1,
+                "case {offset}: expected authenticated={}, got {authenticated}",
+                offset.abs() <= 1
             );
         }
     }

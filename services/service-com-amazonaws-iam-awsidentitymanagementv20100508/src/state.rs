@@ -29,6 +29,7 @@ pub mod entity_path;
 pub mod entity_references;
 pub mod input_formats;
 pub mod member_forms;
+pub mod mfa_devices;
 pub mod outbound_web_identity_federation;
 pub mod outbound_web_identity_keys;
 pub mod policy_document_reports;
@@ -52,6 +53,7 @@ pub use entity_path::*;
 pub use entity_references::*;
 pub use input_formats::*;
 pub use member_forms::*;
+pub use mfa_devices::*;
 pub use outbound_web_identity_federation::*;
 pub use outbound_web_identity_keys::*;
 pub use policy_document_reports::*;
@@ -3482,6 +3484,18 @@ pub const DELETE_CONFLICT_DELETE_SIGNING_CERTIFICATES: &str =
 /// How IAM refuses a delete whose user still has a console password.
 pub const DELETE_CONFLICT_DELETE_LOGIN_PROFILE: &str =
     "Cannot delete entity, must delete login profile first.";
+
+/// How IAM refuses a delete blocked by an MFA device still ENABLED for a user: "you must
+/// deactivate a user's virtual MFA device before you can delete it"
+/// (`DeleteVirtualMFADevice`), so what has to change is the association
+/// `DeactivateMFADevice` clears.
+///
+/// This class carries its OWN wording rather than the `Cannot delete entity, must … first.`
+/// sentence the entity deletes answer — recorded behaviour for a virtual MFA device a user
+/// still holds — because what it reports is the device being in use rather than an entity
+/// with subordinates: IAM words each class of blocking dependent its own way.
+pub const DELETE_CONFLICT_DEACTIVATE_MFA_DEVICE: &str =
+    "MFA VirtualDevice in use. Must deactivate first.";
 
 /// How IAM refuses a `DeletePolicy` whose managed policy still carries a version other
 /// than its default: three sentences of entirely fixed text, which state the condition,

@@ -225,13 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the device ARN" (`$SerialNumber`), so the account's virtual devices are where a
         // serial is resolved; a serial naming none of them references an entity that does not
         // exist, which is what the refusal reports — naming the serial the request supplied
-        // and the user it named.
+        // and nothing else, because the entity the account holds nothing under is the DEVICE
+        // ([`crate::state::mfa_device_not_found_message`]).
         let Some(device) = store.virtual_mfa_device(&input.serial_number).cloned() else {
             return Err(EnableMFADeviceErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!(
-                        "MFA Device {} cannot be found for user {}.",
-                        input.serial_number, input.user_name
+                    message: Some(crate::state::mfa_device_not_found_message(
+                        &input.serial_number,
                     )),
                 },
             )
@@ -272,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 EnableMFADeviceErrorModeled::InvalidAuthenticationCodeException(
                     InvalidAuthenticationCodeException {
-                        message: Some(INVALID_AUTHENTICATION_CODE.to_string()),
+                        message: Some(crate::state::INVALID_AUTHENTICATION_CODE.to_string()),
                     },
                 )
                 .into(),
@@ -291,10 +291,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The sentence IAM refuses a pair of codes the device's seed does not answer with.
-///
-/// Fixed text: it quotes neither code back, because what it reports is that the codes were not
-/// recognized rather than what either of them was.
-const INVALID_AUTHENTICATION_CODE: &str =
-    "The authentication code was not recognized or has expired. Please try again with a new \
-     code.";

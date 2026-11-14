@@ -7099,3 +7099,17 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // where `all/all_rs_declares_each_suite_once.rs` and
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of them, so
 // the fragments are gone rather than re-typed. Append a DECLARATION here, not a note.)
+// (`sfn_relayed_dynamodb_request_id` and `cloudformation_provisions_cloudfront_resources` are
+// each declared ONCE above — the first further up this tail, the second in the sorted
+// CloudFormation span — so the second declaration two concurrent landings appended here is
+// gone rather than re-typed: a module declared twice is `E0428` and compiles neither copy.)
+// The notes that stood here repeated, over and over, the two rules the module doc at the
+// HEAD of this file states — each suite is declared exactly ONCE, and an inner doc comment
+// belongs only to that header — one copy per landing that merged two appended tails. They
+// are gone rather than re-typed: the rules stand in that header, and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` are what check them, for this
+// file and for every service crate's `tests/all.rs`.
+// (The notes removed from this tail are summarised above.)
+// Below this line the tail held nothing but those same notes, repeated once per landing.
+// They are gone: the rules stand in the module doc at the HEAD of this file, and
+// (One note, in place of the repetitions this tail collected.)
