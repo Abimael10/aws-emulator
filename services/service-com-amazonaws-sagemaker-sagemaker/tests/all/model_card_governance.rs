@@ -204,8 +204,8 @@ async fn created_model_cards_round_trip_through_describe() {
             described.get("CreatedBy").is_some_and(Value::is_object),
             "case {case}: expected the required CreatedBy member, got {described:?}"
         );
-        // `CreatedBy` names the IAM identity the create signed with, replayed from what
-        // the create stored rather than rebuilt per read.
+        // `CreatedBy` names the identity whose credentials signed the create, replayed
+        // from what the create stored rather than rebuilt per read.
         let created_by = described
             .get("CreatedBy")
             .unwrap_or_else(|| panic!("case {case}: CreatedBy, got {described:?}"));
@@ -214,7 +214,7 @@ async fn created_model_cards_round_trip_through_describe() {
                 .get("IamIdentity")
                 .and_then(|identity| identity.get("Arn"))
                 .and_then(Value::as_str),
-            Some(format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE").as_str()),
+            Some(service_common::caller_principal::ambient_user_arn().as_str()),
             "case {case}: CreatedBy.IamIdentity.Arn, got {created_by:?}"
         );
         // Nothing has modified the card, so there is no identity to report for a

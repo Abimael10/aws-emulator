@@ -32,17 +32,18 @@ const SETTLE_DEADLINE: Duration = Duration::from_secs(120);
 /// How often such a poll looks again. Only the loop's condition decides when it stops.
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The type prefix an IAM user's unique id carries, from IAM's documented "unique
-/// identifier prefixes" table (`AIDA` for a user).
-const IAM_USER_ID_PREFIX: &str = "AIDA";
-
-/// The `UserContext` every read reports for a resource created through this harness,
-/// which signs with `Credential=AKIDEXAMPLE/...`: the IAM identity behind the call, as
-/// its ARN plus the unique id AWS gives that identity.
+/// The `UserContext` every read reports for a resource created through this harness, which
+/// signs with a credential no record of this account names (`Credential=AKIDEXAMPLE/...`):
+/// such a credential speaks for the identity this emulator publishes its own long-term key
+/// as, reported as that identity's ARN plus the unique id AWS gives it. An access key id is
+/// a credential id rather than a user name, so none appears in the ARN.
 pub(crate) fn expected_caller_identity() -> Value {
-    let arn = format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE");
-    let principal_id = service_common::caller_principal::aws_unique_id(IAM_USER_ID_PREFIX, &arn);
-    json!({ "IamIdentity": { "Arn": arn, "PrincipalId": principal_id } })
+    json!({
+        "IamIdentity": {
+            "Arn": service_common::caller_principal::ambient_user_arn(),
+            "PrincipalId": service_common::caller_principal::ambient_user_id(),
+        }
+    })
 }
 
 /// `specification` with the members the service resolves for an algorithm's training

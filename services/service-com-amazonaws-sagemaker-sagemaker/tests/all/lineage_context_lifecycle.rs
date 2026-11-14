@@ -212,8 +212,8 @@ async fn describe_context_replays_exactly_what_create_context_stored() {
              {modified_at} equal to CreationTime {created_at}"
         );
 
-        // `CreatedBy`/`LastModifiedBy` name the IAM identity the request signed with; an
-        // untouched context reports the creator in both.
+        // `CreatedBy`/`LastModifiedBy` name the identity whose credentials signed the
+        // request; an untouched context reports the creator in both.
         for member in ["CreatedBy", "LastModifiedBy"] {
             let identity = described
                 .get(member)
@@ -223,7 +223,7 @@ async fn describe_context_replays_exactly_what_create_context_stored() {
                     .get("IamIdentity")
                     .and_then(|iam| iam.get("Arn"))
                     .and_then(Value::as_str),
-                Some(format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE").as_str()),
+                Some(service_common::caller_principal::ambient_user_arn().as_str()),
                 "case {case}: {member}.IamIdentity.Arn, got {identity:?}"
             );
         }

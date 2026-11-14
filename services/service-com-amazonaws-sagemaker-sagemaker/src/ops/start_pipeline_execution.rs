@@ -253,6 +253,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // Read from STS's and IAM's own records — other services' stores on the same engine
+        // — BEFORE this service's store is reached again below.
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
+
         let mut store = state.lock();
 
         let Some(pipeline) = store.pipelines.get(&name) else {
@@ -420,7 +424,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 pipeline_version_id: version,
                 mlflow_experiment_name: input.mlflow_experiment_name,
                 client_request_token: input.client_request_token,
-                created_by: crate::state::caller_user_context(ctx),
+                created_by,
                 creation_time: now,
                 last_modified_time: now,
                 ends_at: now + crate::state::PIPELINE_EXECUTION_ENDS_AFTER,

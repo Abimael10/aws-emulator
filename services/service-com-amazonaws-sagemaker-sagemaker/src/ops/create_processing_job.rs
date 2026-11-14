@@ -208,6 +208,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::resource_arn(&region, "processing-job", &input.processing_job_name);
 
         let now = ::std::time::SystemTime::now();
+        // Read from STS's and IAM's own records — other services' stores on the same engine
+        // — BEFORE this service's store is reached.
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
         let mut store = state.lock();
         // `ProcessingJobName`'s doc: "The name must be unique within an Amazon Web
         // Services Region in the Amazon Web Services account." A name already in use is
@@ -280,7 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     arn: &arn,
                 },
                 config,
-                crate::state::caller_user_context(ctx),
+                created_by,
                 now,
             )
         });

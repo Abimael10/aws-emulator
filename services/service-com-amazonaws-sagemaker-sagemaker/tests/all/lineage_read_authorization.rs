@@ -230,8 +230,9 @@ fn form_encode(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-/// The text of the first `<name>` element of an XML body.
-fn element<'body>(body: &'body str, name: &str) -> Option<&'body str> {
+/// The text of the first `<name>` element of an XML body. Shared with the suites that read
+/// an `awsQuery` answer of IAM or STS back (`image_digest_from_registry`).
+pub(crate) fn element<'body>(body: &'body str, name: &str) -> Option<&'body str> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let start = body.find(&open)? + open.len();

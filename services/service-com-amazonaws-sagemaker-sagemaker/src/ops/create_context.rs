@@ -153,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         // The identity behind this call, stored once so a later read reports the caller
         // that created the context rather than the one reading it.
-        let created_by = crate::state::caller_user_context(ctx);
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
 
         let mut store = state.lock();
         // `ContextName` must be unique to the account in the Region (the member's own

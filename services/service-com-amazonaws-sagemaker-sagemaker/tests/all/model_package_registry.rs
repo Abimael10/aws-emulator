@@ -438,17 +438,17 @@ async fn unversioned_create_describe_round_trip_over_optional_members_and_region
             "case {case:?}: expected a freshly registered package to be \
              {expected_status}, got {described}"
         );
-        // `CreatedBy` names the IAM identity the registering request signed with; an
-        // unsigned request presents no access-key id, so `extract_akid`'s fallback
-        // principal is recorded instead.
-        let principal = if row.region.is_some() { "AKIDEXAMPLE" } else { "default" };
+        // `CreatedBy` names the identity whose credentials signed the registering request.
+        // Neither the credential this harness signs with nor an unsigned request names a
+        // record of the account, so both speak for the identity this emulator publishes
+        // its own long-term key as.
         assert_eq!(
             described
                 .get("CreatedBy")
                 .and_then(|created_by| created_by.get("IamIdentity"))
                 .and_then(|identity| identity.get("Arn"))
                 .and_then(Value::as_str),
-            Some(format!("arn:aws:iam::{ACCOUNT}:user/{principal}").as_str()),
+            Some(service_common::caller_principal::ambient_user_arn().as_str()),
             "case {case:?}: expected CreatedBy to name the signing identity, got {described}"
         );
         assert!(

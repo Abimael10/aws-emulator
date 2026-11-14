@@ -219,7 +219,7 @@ async fn a_start_records_an_execution_the_reader_replays() {
             described
                 .pointer("/CreatedBy/IamIdentity/Arn")
                 .and_then(Value::as_str),
-            Some(format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE").as_str()),
+            Some(service_common::caller_principal::ambient_user_arn().as_str()),
             "case {case}: the run records the identity that started it, got {described:?}"
         );
 

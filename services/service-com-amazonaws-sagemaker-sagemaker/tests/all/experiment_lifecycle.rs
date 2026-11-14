@@ -176,17 +176,14 @@ async fn describe_experiment_replays_exactly_what_create_experiment_stored() {
         );
 
         // The identity the create was signed with, stored then and replayed now. The
-        // harness signs with `Credential=AKIDEXAMPLE/...`, and the identity carries both
-        // its ARN and the unique id AWS gives that identity, which is a function of the
-        // ARN (`service_common::caller_principal::aws_unique_id`).
-        let identity_arn = format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE");
+        // harness signs with a credential no record of this account names
+        // (`Credential=AKIDEXAMPLE/...`), which speaks for the identity this emulator
+        // publishes its own long-term key as, carried as both that identity's ARN and the
+        // unique id AWS gives it.
         let expected_identity = Some(json!({
             "IamIdentity": {
-                "Arn": identity_arn,
-                "PrincipalId": service_common::caller_principal::aws_unique_id(
-                    "AIDA",
-                    &identity_arn,
-                ),
+                "Arn": service_common::caller_principal::ambient_user_arn(),
+                "PrincipalId": service_common::caller_principal::ambient_user_id(),
             },
         }));
         assert_eq!(

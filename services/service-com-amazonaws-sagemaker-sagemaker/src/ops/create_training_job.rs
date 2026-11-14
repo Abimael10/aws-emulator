@@ -447,6 +447,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The component the job's `ExperimentConfig` brings into being, set inside the
         // store block below and recorded once the guard is released.
         let tracked_component: Option<String>;
+        // The identity this request speaks for, read from STS's and IAM's own records
+        // BEFORE this service's store is reached: those are other services' stores on the
+        // same engine, and no store guard of this service is held while one is asked.
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
         // The store guard lives in a BLOCK of its own: the job's run is awaited below, and
         // no state guard is ever held across an await.
         {
@@ -630,7 +634,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         arn: &arn,
                     },
                     config,
-                    crate::state::caller_user_context(ctx),
+                    created_by,
                     now,
                 )
             });

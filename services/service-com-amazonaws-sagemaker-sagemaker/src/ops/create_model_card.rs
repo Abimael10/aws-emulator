@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let now = ::std::time::SystemTime::now();
         // Who the card records as its creator: the identity this request signed with.
-        let creator = crate::state::caller_user_context(ctx);
+        let creator = crate::state::caller_user_context(&*self.engine, ctx);
 
         let mut store = state.lock();
         // The store is bounded, so a caller varying `ModelCardName` cannot grow it

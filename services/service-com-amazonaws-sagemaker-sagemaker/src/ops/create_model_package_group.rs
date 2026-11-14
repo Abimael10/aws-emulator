@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::MODEL_PACKAGE_GROUP_ARN_KIND,
             &input.model_package_group_name,
         );
-        let created_by = crate::state::caller_user_context(ctx);
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
 
         let mut store = state.lock();
         // The store is bounded, so a caller varying `ModelPackageGroupName` cannot grow it

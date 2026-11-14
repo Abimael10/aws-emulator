@@ -170,6 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.trial_component_name,
         );
 
+        // Read from STS's and IAM's own records — other services' stores on the same
+        // engine — BEFORE this service's store is reached.
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
+
         let mut store = state.lock();
         // `TrialComponentName`'s model doc requires the name to be unique in the account
         // and says it "is not case-sensitive", so the store is keyed by the case-folded
@@ -241,8 +245,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // read reports who actually created the component. The creation IS the
                 // last modification until `UpdateTrialComponent` records its own caller,
                 // so both identities start out as this one.
-                created_by: crate::state::caller_user_context(ctx),
-                last_modified_by: crate::state::caller_user_context(ctx),
+                created_by: created_by.clone(),
+                last_modified_by: created_by,
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 // Nothing has modified the component yet, so it was last modified when

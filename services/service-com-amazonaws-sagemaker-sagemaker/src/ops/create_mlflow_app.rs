@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The identity this request signed with, built the way every other creator
         // attribution in this crate is (`CreateModelPackageGroup`): the IAM identity
         // only, and never the credential itself.
-        let created_by = crate::state::caller_user_context(ctx);
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
 
         let mut store = state.lock();
         // The store is bounded, so a caller repeating this create cannot grow it

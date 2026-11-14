@@ -184,6 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // both ARNs, rather than a refusal.
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
+        // Resolved BEFORE this service's store is reached: the identity a write records is
+        // read from STS's and IAM's own records, which are other services' stores on the
+        // same engine.
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
 
         let mut store = state.lock();
 
@@ -241,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // The identity that created the edge, stored by the call that
                         // created it rather than rebuilt per read, so a later reader
                         // reports who really added this association.
-                        created_by: crate::state::caller_user_context(ctx),
+                        created_by,
                         creation_time: now,
                     },
                 );

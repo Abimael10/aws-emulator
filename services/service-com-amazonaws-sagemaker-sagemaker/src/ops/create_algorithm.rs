@@ -180,10 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which a request has to state, plus the same digest resolution over the
         // inference containers.
         let mut training_specification = input.training_specification;
-        crate::state::materialise_training_specification(&mut training_specification);
+        crate::state::materialise_training_specification(
+            &*self.engine,
+            ctx,
+            &mut training_specification,
+        );
         let mut inference_specification = input.inference_specification;
         if let Some(specification) = inference_specification.as_mut() {
-            crate::state::materialise_inference_specification(specification);
+            crate::state::materialise_inference_specification(&*self.engine, ctx, specification);
         }
         // "Whether to certify the algorithm so that it can be listed in Amazon Web
         // Services Marketplace": an algorithm nothing asked to certify is not certified.

@@ -220,6 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.pipeline_name,
         );
         let now = ::std::time::SystemTime::now();
+        // Read from STS's and IAM's own records — other services' stores on the same engine
+        // — BEFORE this service's store is reached.
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
 
         let mut store = state.lock();
 
@@ -285,8 +288,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The identity this call signed with is the pipeline's creator, and —
                 // nothing having modified it yet — also the last identity to have
                 // changed it.
-                created_by: crate::state::caller_user_context(ctx),
-                last_modified_by: crate::state::caller_user_context(ctx),
+                created_by: created_by.clone(),
+                last_modified_by: created_by,
                 creation_time: now,
                 last_modified_time: now,
                 last_run_time: None,

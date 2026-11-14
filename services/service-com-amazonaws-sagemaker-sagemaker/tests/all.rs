@@ -107,6 +107,8 @@ mod hyperparameter_tuning_job;
 mod hyperpod_cluster_audit_record;
 #[path = "all/hyperpod_cluster_listing.rs"]
 mod hyperpod_cluster_listing;
+#[path = "all/image_digest_from_registry.rs"]
+mod image_digest_from_registry;
 #[path = "all/image_digest_probe.rs"]
 mod image_digest_probe;
 #[path = "all/image_digest_round_trip.rs"]

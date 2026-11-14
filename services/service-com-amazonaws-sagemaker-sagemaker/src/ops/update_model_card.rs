@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         // Who the update records as the modifier: the identity this request signed with.
-        let modifier = crate::state::caller_user_context(ctx);
+        let modifier = crate::state::caller_user_context(&*self.engine, ctx);
 
         let mut store = state.lock();
         // `ModelCardName` is a `ModelCardNameOrArn`: both forms name one stored card.

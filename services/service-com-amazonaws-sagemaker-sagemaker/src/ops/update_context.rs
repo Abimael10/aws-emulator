@@ -154,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this request signed for.
         let key = crate::state::context_key(ctx, &input.context_name);
         // The identity behind this call, read before the store is borrowed.
-        let last_modified_by = crate::state::caller_user_context(ctx);
+        let last_modified_by = crate::state::caller_user_context(&*self.engine, ctx);
 
         let mut store = state.lock();
         let Some(context) = store.contexts.get_mut(&key) else {

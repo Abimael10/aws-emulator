@@ -199,6 +199,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::model_package_lookup_key(&input.model_package_arn).to_string();
         let now = ::std::time::SystemTime::now();
 
+        // Both of these ask ANOTHER service's store on the same engine — Amazon ECR's
+        // registry for the digest of each container's image, and STS's and IAM's records
+        // for the identity this request signed with — so both are resolved BEFORE this
+        // service's own store is reached, the way `CreateModelPackage` resolves them: no
+        // cross-service lookup is made while this service's store is locked.
+        let mut requested_inference_specification = input.inference_specification;
+        if let Some(specification) = requested_inference_specification.as_mut() {
+            crate::state::materialise_inference_specification(&*self.engine, ctx, specification);
+        }
+        let mut requested_additional = input
+            .additional_inference_specifications_to_add
+            .unwrap_or_default();
+        crate::state::materialise_additional_inference_specifications(
+            &*self.engine,
+            ctx,
+            &mut requested_additional,
+        );
+        let modified_by = crate::state::caller_user_context(&*self.engine, ctx);
+
         let mut store = state.lock();
         let Some(package) = store.model_packages.get_mut(&key) else {
             // The sentence every operation over a model package answers for this fact: the
@@ -298,11 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .additional_inference_specifications
             .clone()
             .unwrap_or_default();
-        for added in input
-            .additional_inference_specifications_to_add
-            .iter()
-            .flatten()
-        {
+        for added in requested_additional.iter() {
             // "The name must be unique within the list of your additional inference
             // specifications for a particular model package"
             // (`AdditionalInferenceSpecificationDefinition$Name`'s model doc) — so a name
@@ -363,7 +378,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The modelled structure shapes carry no `PartialEq` (they are generated from
             // the model), so one the request carries is taken as a replacement without
             // comparing it against the stored value.
-            || input.inference_specification.is_some()
+            || requested_inference_specification.is_some()
             || input.model_card.is_some()
             || input.model_life_cycle.is_some()
             || metadata != stored_metadata
@@ -400,10 +415,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(registration_type) = input.model_package_registration_type {
             package.registration_type = Some(registration_type);
         }
-        if let Some(mut specification) = input.inference_specification {
-            // The same digests and checkpoint flags the create resolves: a specification
-            // this update puts on the package is materialised the way a created one is.
-            crate::state::materialise_inference_specification(&mut specification);
+        if let Some(specification) = requested_inference_specification {
+            // The same digests and checkpoint flags the create resolves, settled above
+            // against the registry that holds each image: a specification this update puts
+            // on the package is materialised the way a created one is.
             package.inference_specification = Some(specification);
         }
         if let Some(source_uri) = input.source_uri {
@@ -419,13 +434,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with a minimum length of one, so a package whose last property was removed
         // carries no map at all.
         package.customer_metadata_properties = (!metadata.is_empty()).then_some(metadata);
-        // The same digests and checkpoint flags the create resolves, over the whole list
-        // the package ends up holding.
-        crate::state::materialise_additional_inference_specifications(&mut additional);
         package.additional_inference_specifications =
             (!additional.is_empty()).then_some(additional);
         package.last_modified_time = now;
-        package.last_modified_by = Some(crate::state::caller_user_context(ctx));
+        package.last_modified_by = Some(modified_by);
         if let Some(token) = input.client_token {
             package.remember_update_token(token);
         }

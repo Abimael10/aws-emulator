@@ -281,7 +281,7 @@ async fn update_experiment_applies_the_members_the_request_carries() {
                 .and_then(|identity| identity.get("IamIdentity"))
                 .and_then(|iam| iam.get("Arn"))
                 .and_then(Value::as_str),
-            Some(format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE").as_str()),
+            Some(service_common::caller_principal::ambient_user_arn().as_str()),
             "case {case:?}: LastModifiedBy, got {described:?}"
         );
     }
@@ -393,7 +393,7 @@ async fn update_trial_applies_the_display_name_and_leaves_the_rest() {
                 .and_then(|identity| identity.get("IamIdentity"))
                 .and_then(|iam| iam.get("Arn"))
                 .and_then(Value::as_str),
-            Some(format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE").as_str()),
+            Some(service_common::caller_principal::ambient_user_arn().as_str()),
             "case {case:?}: LastModifiedBy names the identity behind the update, \
              got {described:?}"
         );

@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         // The identity behind this call, read before the store is borrowed.
-        let last_modified_by = crate::state::caller_user_context(ctx);
+        let last_modified_by = crate::state::caller_user_context(&*self.engine, ctx);
         // `TrialComponentName` is not case-sensitive, so the record is reached through the
         // same folded key the create stored it under and every reader resolves it by.
         let key = crate::state::entity_key(&input.trial_component_name);

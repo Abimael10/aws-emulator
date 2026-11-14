@@ -83,7 +83,7 @@ use crate::ops::types::{
     InferenceSpecification, JupyterLabAppImageConfig, KernelGatewayImageConfig,
     ManagedConfiguration, MetadataProperties, MetricsConfig, ModelCardExportOutputConfig,
     ModelCardSecurityConfig, ModelClientConfig, ModelDeployConfig, ModelLifeCycle, ModelMetrics,
-    ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageContainerDefinition,
+    ModelPackageModelCard, ModelPackageSecurityConfig,
     ModelPackageStatusDetails,
     ModelPackageStatusItem, ModelPackageValidationSpecification, NetworkConfig,
     ParallelismConfiguration, Parameter, ProcessingInput, ProcessingOutputConfig,
@@ -91,7 +91,7 @@ use crate::ops::types::{
     RecommendationJobInputConfig, RecommendationJobOutputConfig,
     RecommendationJobStoppingConditions, ResourceSpec, SecondaryStatusTransition,
     SelectiveExecutionConfig,
-    SourceAlgorithmSpecification, Tag, TrainingSpecification, TransformInput, TransformOutput,
+    SourceAlgorithmSpecification, Tag, TransformInput, TransformOutput,
     TransformResources,
     UserContext, VpcConfig,
 };
@@ -156,7 +156,19 @@ pub use s3_access::{
 pub mod container_image;
 pub use container_image::{
     first_image_outside_the_documented_formats, first_malformed_container_image,
-    image_names_no_registry, malformed_container_image, pinned_image_digest, INVALID_IMAGE_PATH,
+    image_names_no_registry, malformed_container_image, pinned_image_digest,
+    reportable_image_digest, INVALID_IMAGE_PATH,
+};
+
+/// The IMAGE DIGEST slice: the digest of the container image a registration references,
+/// resolved against the registry that holds that image, and the defaulting step every write
+/// that records such a reference runs. Re-exported below, so a handler names them as
+/// `crate::state::…` like every other slice.
+pub mod image_digest;
+pub use image_digest::{
+    derived_image_digest, materialise_additional_inference_specifications,
+    materialise_inference_specification, materialise_training_specification,
+    registry_image_digest, resolved_image_digest,
 };
 
 /// The cluster-policy slice of this state: HyperPod clusters and the cluster policies
@@ -3901,68 +3913,6 @@ pub fn mint_opaque_resource_id() -> String {
     ::hex::encode(&hashed[..16])
 }
 
-/// The digest this emulator reports for a container image, in the form `ImageDigest`
-/// carries (`len 0..72`, pattern `^[Ss][Hh][Aa]256:[0-9a-fA-F]{64}$`).
-///
-/// It is the emulator's OWN identifier for the image reference, not a digest any registry
-/// resolved: nothing here pulls an image, so there is no manifest to hash and the value
-/// cannot match what ECR would report for that reference. What it does keep is every
-/// property a caller can check without a registry — the modelled form, one digest per
-/// reference, the same digest on every read of it, and practically never a collision
-/// between two references — because it is a SHA-256 over the reference itself and over
-/// nothing else, so it depends on neither the clock nor the request that asked for it.
-pub fn derived_image_digest(image: &str) -> String {
-    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(image.as_bytes());
-    format!("sha256:{}", ::hex::encode(digest))
-}
-
-/// The digest of the image `image` names, as a reader of the resource reports it.
-///
-/// A reference in the `registry/repository[@digest]` format the image member documents
-/// already NAMES the image by its content digest, so that digest is the digest of the image
-/// the resource was registered against, carried through unchanged ([`pinned_image_digest`]).
-/// A reference in the `registry/repository[:tag]` format pins nothing, and nothing here pulls
-/// an image, so for one of those the emulator reports its own identifier for the reference
-/// ([`derived_image_digest`]).
-pub fn resolved_image_digest(image: &str) -> String {
-    pinned_image_digest(image)
-        .map(str::to_string)
-        .unwrap_or_else(|| derived_image_digest(image))
-}
-
-/// Fill in what SageMaker itself resolves for one container of an inference
-/// specification: the digest of the image the container names ([`resolved_image_digest`],
-/// which leaves a digest the request itself carried alone), and whether its model data
-/// is a training checkpoint — which a request that says nothing leaves `false`.
-///
-/// Called on the WRITE path, so the stored record is the materialised container every
-/// reader of it replays, rather than each reader defaulting again.
-fn materialise_container(container: &mut ModelPackageContainerDefinition) {
-    if container.image_digest.is_none() {
-        container.image_digest = container.image.as_deref().map(resolved_image_digest);
-    }
-    container.is_checkpoint = Some(container.is_checkpoint.unwrap_or(false));
-}
-
-/// [`materialise_container`] for every container of an inference specification.
-pub fn materialise_inference_specification(specification: &mut InferenceSpecification) {
-    for container in &mut specification.containers {
-        materialise_container(container);
-    }
-}
-
-/// [`materialise_container`] for every container of an ADDITIONAL inference
-/// specification, whose containers are the same shape and are resolved the same way.
-pub fn materialise_additional_inference_specifications(
-    specifications: &mut [AdditionalInferenceSpecificationDefinition],
-) {
-    for specification in specifications {
-        for container in &mut specification.containers {
-            materialise_container(container);
-        }
-    }
-}
-
 /// The `ContainerMode` a model's container hosts its models in when the request named
 /// none: one model per container, as the model's `ContainerMode` enum spells it.
 pub const CONTAINER_MODE_SINGLE_MODEL: &str = "SingleModel";
@@ -3973,20 +3923,6 @@ pub const CONTAINER_MODE_SINGLE_MODEL: &str = "SingleModel";
 pub fn materialise_container_mode(container: &mut ContainerDefinition) {
     if container.mode.is_none() {
         container.mode = Some(CONTAINER_MODE_SINGLE_MODEL.to_string());
-    }
-}
-
-/// Fill in what SageMaker itself resolves for an algorithm's training specification: the
-/// digest of the training image ([`resolved_image_digest`], which leaves a digest the
-/// request itself carried alone), and each training channel's `IsRequired` — which a
-/// request that says nothing leaves `false`.
-pub fn materialise_training_specification(specification: &mut TrainingSpecification) {
-    if specification.training_image_digest.is_none() {
-        specification.training_image_digest =
-            Some(resolved_image_digest(&specification.training_image));
-    }
-    for channel in &mut specification.training_channels {
-        channel.is_required = Some(channel.is_required.unwrap_or(false));
     }
 }
 
@@ -4015,57 +3951,45 @@ pub fn name_from_arn_or_name(value: &str) -> &str {
     }
 }
 
-/// The IAM user name the request's SigV4 credential names, or a fixed `emulator`
-/// principal when the request carries no usable access key id.
-///
-/// The access key id is request text and the value is spliced into an ARN, whose segments
-/// are positional, so anything not shaped like an access key id is replaced rather than
-/// interpolated. `extract_akid` performs no verification — the emulator verifies signatures
-/// at its boundary.
-fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
-    let shaped_like_an_access_key_id = !akid.is_empty()
-        && akid.len() <= 128
-        && akid.chars().all(|character| character.is_ascii_alphanumeric());
-    if shaped_like_an_access_key_id {
-        akid
-    } else {
-        "emulator".to_string()
-    }
-}
-
-/// The `UserContext` SageMaker records as the creator of a resource.
+/// The `UserContext` SageMaker records as the creator or last modifier of a resource —
+/// "information about the user who created or modified a SageMaker resource".
 ///
 /// The emulator serves no Studio domain, so the Studio members (`UserProfileArn`,
 /// `UserProfileName`, `DomainId`) are ABSENT rather than empty: a caller cannot tell an
-/// empty profile name from a missing one. The IAM identity is the one the request signed
-/// with, reported as both the ARN of that identity and the unique id AWS gives it — the id
-/// is a function of the ARN ([`service_common::caller_principal::aws_unique_id`]), so it is
-/// stable across reads and across restarts and two identities practically never share one.
+/// empty profile name from a missing one.
+///
+/// The IAM identity is the one whose credentials SIGNED this request, resolved from the
+/// records the account holds through the service's one reading of that
+/// ([`crate::service::authorization::signing_identity`]) — the same identity
+/// `sts:GetCallerIdentity` reports back for those credentials, and the one an authorization
+/// refusal blames. `Arn` is that identity's ARN and `PrincipalId` the unique id AWS gives
+/// it, so two resources one principal created report ONE creator, and a client comparing
+/// the creator with its own identity matches. An access key id is a credential id rather
+/// than a user name, so none is ever rendered into the ARN.
+///
 /// `SourceIdentity` stays absent: it is set only when a role session carries one, and no
 /// call here does.
-pub fn caller_user_context(ctx: &smithy_server_runtime::OperationContext<'_>) -> UserContext {
-    let principal = caller_principal(ctx);
-    // IAM is global, so the region segment is empty.
-    let arn = ::emulator_server::emulator_arn("iam", "", &format!("user/{principal}"));
+pub fn caller_user_context<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) -> UserContext {
+    // A credential that speaks for nobody — an expired session — never reaches a handler in
+    // the assembled emulator: the layer that authenticates a request refuses it first. So
+    // the identity a write records falls back to the one this emulator's own published
+    // credential speaks for rather than to an ARN no identity answers to.
+    let identity = crate::service::authorization::signing_identity(engine, ctx)
+        .unwrap_or_else(crate::service::authorization::SigningIdentity::ambient);
     UserContext {
         user_profile_arn: None,
         user_profile_name: None,
         domain_id: None,
         iam_identity: Some(IamIdentity {
-            principal_id: Some(::service_common::caller_principal::aws_unique_id(
-                IAM_USER_ID_PREFIX,
-                &arn,
-            )),
-            arn: Some(arn),
+            principal_id: Some(identity.principal_id),
+            arn: Some(identity.arn),
             source_identity: None,
         }),
     }
 }
-
-/// The type prefix an IAM USER's unique id carries, from IAM's "unique identifier
-/// prefixes" table — the identity kind this emulator's long-term credential speaks for.
-const IAM_USER_ID_PREFIX: &str = "AIDA";
 
 /// A stored `SystemTime` as the modelled `Timestamp` the wire carries.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {

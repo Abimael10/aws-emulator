@@ -310,6 +310,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Read from STS's and IAM's own records — other services' stores on the same engine
+        // — BEFORE this service's store is reached again.
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
+
         let mut store = state.lock();
         // The guard was released for the question above, so the name is resolved again: a
         // call that took it in the meantime keeps it, and this one is the duplicate.
@@ -366,7 +370,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     arn: &arn,
                 },
                 config,
-                crate::state::caller_user_context(ctx),
+                created_by,
                 now,
             )
         });

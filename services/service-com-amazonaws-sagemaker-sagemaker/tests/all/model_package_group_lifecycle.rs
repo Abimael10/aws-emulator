@@ -325,8 +325,8 @@ async fn describe_replays_every_member_create_stored() {
                 creation_time > 0.0,
                 "case {case}: expected an epoch CreationTime after 1970, got {creation_time}"
             );
-            // `CreatedBy` is modelled **required**, so it is always present, and it names the
-            // IAM identity the request signed with.
+            // `CreatedBy` is modelled **required**, so it is always present, and it names
+            // the identity whose credentials signed the request.
             let created_by = described
                 .get("CreatedBy")
                 .unwrap_or_else(|| panic!("case {case}: CreatedBy, got {described:?}"));
@@ -335,7 +335,7 @@ async fn describe_replays_every_member_create_stored() {
                     .get("IamIdentity")
                     .and_then(|identity| identity.get("Arn"))
                     .and_then(Value::as_str),
-                Some(format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE").as_str()),
+                Some(service_common::caller_principal::ambient_user_arn().as_str()),
                 "case {case}: CreatedBy.IamIdentity.Arn, got {created_by:?}"
             );
         }

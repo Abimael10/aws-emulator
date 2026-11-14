@@ -204,13 +204,60 @@ impl Caller {
     }
 }
 
-/// The principal this request speaks for, with the identity-based policies in force on it.
-fn caller<Eng: Send + Sync + 'static>(
+/// Who a request's SigV4 credential speaks for: the IAM identity `sts:GetCallerIdentity`
+/// answers for that credential, as the ARN the identity is addressed by and the unique id
+/// AWS gives it.
+///
+/// An access key id is a CREDENTIAL id, never a user name, so it is nowhere spliced into
+/// this ARN: that is a principal no AWS rule produces. The spelling is resolved from the
+/// records the account holds — STS's sessions and IAM's access keys — so the identity a
+/// refusal blames and the identity a write records as the creator are one value, and the
+/// one `sts:GetCallerIdentity` reports back to the caller for the same credential.
+#[derive(Debug, Clone)]
+pub struct SigningIdentity {
+    /// The principal's ARN, as `sts:GetCallerIdentity` reports it.
+    pub arn: String,
+    /// The unique id AWS gives that identity — `GetCallerIdentity`'s `UserId`, and what a
+    /// member carrying "the ID of the principal" reports.
+    pub principal_id: String,
+    /// Set when this request presents the account's own published credential, which holds no
+    /// IAM policies (see the module docs).
+    account_credential: bool,
+}
+
+impl SigningIdentity {
+    /// The identity this emulator's own published long-term credential speaks for: the IAM
+    /// user of the account, as STS and IAM both state it
+    /// (`sts_store::ambient_identity`).
+    #[must_use]
+    pub fn ambient() -> Self {
+        let identity = sts_store::ambient_identity();
+        Self {
+            arn: identity.arn,
+            principal_id: identity.user_id,
+            account_credential: true,
+        }
+    }
+}
+
+/// The identity the request's credential speaks for, and `None` for a credential that
+/// speaks for NOBODY — a session that has already expired.
+///
+/// The ONE resolution of who a request to this service is: the session STS minted the
+/// access key id for, else the IAM user that owns the long-term key, else the account's own
+/// published credential. `extract_akid` performs no verification — the emulator verifies
+/// signatures at its boundary, and in the assembled emulator an expired credential is
+/// refused before any handler runs.
+///
+/// Resolving a session goes through STS's own `resolve_caller`, which first materialises the
+/// session expiries the clock has already made due; that write is owed at the same instant
+/// whether or not anybody called.
+pub fn signing_identity<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
-) -> Caller {
+) -> Option<SigningIdentity> {
     let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
-    let identity = match sts_store::service_state(engine) {
+    let resolved = match sts_store::service_state(engine) {
         Some(sts) => sts_store::resolve_caller(
             &mut sts.lock(),
             &access_key_id,
@@ -221,28 +268,56 @@ fn caller<Eng: Send + Sync + 'static>(
         // account's own published credential.
         None => Ok(sts_store::ambient_identity()),
     };
-    let identity = match identity {
-        Ok(identity) => identity,
-        // The session credential has expired, so it speaks for nobody: no documents, no
-        // principal spelling, and every action it asks for falls to the default deny. The key
-        // id it presented is NOT quoted back — this module echoes no value of the request —
-        // and in the assembled emulator the layer that authenticates a request refuses an
-        // expired credential before any handler runs.
-        Err(expired) => {
-            let _ = expired;
-            return Caller {
-                arn: EXPIRED_CREDENTIAL_PRINCIPAL.to_string(),
-                principals: Vec::new(),
-                documents: Vec::new(),
-                boundary: None,
-                account_credential: false,
-                unreadable_attachment: false,
-            };
+    // An expired session credential speaks for nobody. The key id it presented is NOT
+    // quoted back — this module echoes no value of the request.
+    let identity = resolved.ok()?;
+    let mut signing = SigningIdentity {
+        account_credential: identity.arn == sts_store::ambient_identity().arn,
+        arn: identity.arn,
+        principal_id: identity.user_id,
+    };
+    // A LONG-TERM access key: STS's store holds SESSIONS, so its answer for a key it never
+    // minted is the account's ambient identity — but IAM's store maps an access key id to the
+    // user that owns it (`access_keys`, the map IAM's own `GetUser` resolves a caller
+    // through), so a request signed with one speaks for THAT user. A key the IAM store does
+    // not hold either really is the account's own published credential.
+    if signing.account_credential {
+        if let Some(iam) = iam_store::service_state(engine) {
+            let store = iam.lock();
+            if let Some(user) = store
+                .access_keys
+                .get(&access_key_id)
+                .and_then(|record| store.users.get(&record.user_key))
+            {
+                signing.account_credential = false;
+                signing.arn = user.arn.clone();
+                signing.principal_id = user.user_id.clone();
+            }
         }
+    }
+    Some(signing)
+}
+
+/// The principal this request speaks for, with the identity-based policies in force on it.
+fn caller<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> Caller {
+    // The session credential has expired, so it speaks for nobody: no documents, no
+    // principal spelling, and every action it asks for falls to the default deny.
+    let Some(identity) = signing_identity(engine, ctx) else {
+        return Caller {
+            arn: EXPIRED_CREDENTIAL_PRINCIPAL.to_string(),
+            principals: Vec::new(),
+            documents: Vec::new(),
+            boundary: None,
+            account_credential: false,
+            unreadable_attachment: false,
+        };
     };
 
     let mut caller = Caller {
-        account_credential: identity.arn == sts_store::ambient_identity().arn,
+        account_credential: identity.account_credential,
         principals: vec![identity.arn.clone()],
         arn: identity.arn,
         documents: Vec::new(),
@@ -253,23 +328,6 @@ fn caller<Eng: Send + Sync + 'static>(
         return caller;
     };
     let store = iam.lock();
-    // A LONG-TERM access key: STS's store holds SESSIONS, so its answer for a key it never
-    // minted is the account's ambient identity — but IAM's store maps an access key id to the
-    // user that owns it (`access_keys`, the map IAM's own `GetUser` resolves a caller
-    // through), so a request signed with one speaks for THAT user and is judged on the user's
-    // policies rather than served as the account. A key the IAM store does not hold either
-    // really is the account's own published credential.
-    if caller.account_credential {
-        if let Some(user) = store
-            .access_keys
-            .get(&access_key_id)
-            .and_then(|record| store.users.get(&record.user_key))
-        {
-            caller.account_credential = false;
-            caller.arn = user.arn.clone();
-            caller.principals = vec![user.arn.clone()];
-        }
-    }
     if let Some(role_name) = ::service_common::iam_role::assumed_role_session_role_name(&caller.arn)
     {
         // An assumed-role session's permissions are the ROLE's, and the role is addressed by

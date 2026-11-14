@@ -515,7 +515,7 @@ async fn a_created_trial_reads_back_through_describe_trial() {
                 .and_then(|context| context.get("IamIdentity"))
                 .and_then(|identity| identity.get("Arn"))
                 .and_then(Value::as_str),
-            Some("arn:aws:iam::000000000000:user/AKIDEXAMPLE"),
+            Some(service_common::caller_principal::ambient_user_arn().as_str()),
             "case {trial}: the creating identity must be recorded, got {described}"
         );
     }
@@ -647,7 +647,7 @@ async fn update_model_card_applies_one_change_at_a_time() {
                 .and_then(|context| context.get("IamIdentity"))
                 .and_then(|identity| identity.get("Arn"))
                 .and_then(Value::as_str),
-            Some("arn:aws:iam::000000000000:user/AKIDEXAMPLE"),
+            Some(service_common::caller_principal::ambient_user_arn().as_str()),
             "case {label}: the updating identity must be recorded, got {described}"
         );
         // The version the card was on before this call still answers its own content.
@@ -689,7 +689,7 @@ async fn update_model_card_applies_one_change_at_a_time() {
             .and_then(|context| context.get("IamIdentity"))
             .and_then(|identity| identity.get("Arn"))
             .and_then(Value::as_str),
-        Some("arn:aws:iam::000000000000:user/AKIDEXAMPLE"),
+        Some(service_common::caller_principal::ambient_user_arn().as_str()),
         "a status-only update records the modifying identity, got {described}"
     );
     // Content that is not a model card JSON document is refused.

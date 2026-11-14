@@ -303,6 +303,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The service's own defaulting step, applied ONCE here so the stored package is
+        // the one every reader replays: the digest SageMaker resolves for each inference
+        // container's image (from the registry that holds the image — see
+        // `crate::state::image_digest`) and whether that container's model data is a
+        // checkpoint. Resolved BEFORE this service's store is reached, because the registry
+        // it reads is another service's store on the same engine.
+        let mut inference_specification = input.inference_specification;
+        if let Some(specification) = inference_specification.as_mut() {
+            crate::state::materialise_inference_specification(&*self.engine, ctx, specification);
+        }
+        let mut additional_inference_specifications = input.additional_inference_specifications;
+        if let Some(specifications) = additional_inference_specifications.as_mut() {
+            crate::state::materialise_additional_inference_specifications(
+                &*self.engine,
+                ctx,
+                specifications,
+            );
+        }
+        // Read from STS's and IAM's own records, so it too is resolved before this
+        // service's store is reached.
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
+
         let mut store = state.lock();
 
         // `ClientToken` is this operation's idempotency token, and the recorded service
@@ -404,18 +426,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let arn = crate::state::resource_arn(&region, crate::state::MODEL_PACKAGE_KIND, &key);
 
-        // The service's own defaulting step, applied ONCE here so the stored package is
-        // the one every reader replays: the digest SageMaker resolves for each inference
-        // container's image and whether that container's model data is a checkpoint.
-        let mut inference_specification = input.inference_specification;
-        if let Some(specification) = inference_specification.as_mut() {
-            crate::state::materialise_inference_specification(specification);
-        }
-        let mut additional_inference_specifications = input.additional_inference_specifications;
-        if let Some(specifications) = additional_inference_specifications.as_mut() {
-            crate::state::materialise_additional_inference_specifications(specifications);
-        }
-
         // Registration is asynchronous only while there is validation work outstanding:
         // `ValidationSpecification` names batch transform jobs SageMaker runs after this
         // call answers, so a package that asks for one is `Pending` until the instant the
@@ -499,7 +509,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 model_life_cycle: input.model_life_cycle,
                 managed_storage_type: input.managed_storage_type,
                 tags,
-                created_by: crate::state::caller_user_context(ctx),
+                created_by,
                 // No call has modified the package yet, so there is no modifying
                 // identity to report; `UpdateModelPackage` records one.
                 last_modified_by: None,

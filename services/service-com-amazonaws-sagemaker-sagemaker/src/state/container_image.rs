@@ -79,6 +79,21 @@ const IMAGE_REFERENCE_PATTERN: &str = concat!(
 /// this pattern is one no `ImageDigest`-typed member can carry, so it is not reported as one.
 const REPORTABLE_IMAGE_DIGEST_PATTERN: &str = r"^[Ss][Hh][Aa]256:[0-9a-fA-F]{64}$";
 
+/// Whether `digest` is a digest an `ImageDigest`-typed member can CARRY, which is that
+/// shape's own modelled pattern ([`REPORTABLE_IMAGE_DIGEST_PATTERN`]).
+///
+/// The expression is compiled ONCE for the process, on first use: it is a constant, so
+/// compiling it per request would be work repeated for every container of every create.
+#[must_use]
+pub fn reportable_image_digest(digest: &str) -> bool {
+    static DIGEST: ::std::sync::OnceLock<::regex::Regex> = ::std::sync::OnceLock::new();
+    let reportable = DIGEST.get_or_init(|| {
+        ::regex::Regex::new(REPORTABLE_IMAGE_DIGEST_PATTERN)
+            .expect("the modelled pattern compiles")
+    });
+    reportable.is_match(digest)
+}
+
 /// The content digest an image reference PINS, and `None` for a reference that pins none or
 /// pins one outside [`REPORTABLE_IMAGE_DIGEST_PATTERN`].
 ///
@@ -88,13 +103,8 @@ const REPORTABLE_IMAGE_DIGEST_PATTERN: &str = r"^[Ss][Hh][Aa]256:[0-9a-fA-F]{64}
 /// the `registry/repository[:tag]` format pins nothing, so it names no digest.
 #[must_use]
 pub fn pinned_image_digest(image: &str) -> Option<&str> {
-    static DIGEST: ::std::sync::OnceLock<::regex::Regex> = ::std::sync::OnceLock::new();
-    let reportable = DIGEST.get_or_init(|| {
-        ::regex::Regex::new(REPORTABLE_IMAGE_DIGEST_PATTERN)
-            .expect("the modelled pattern compiles")
-    });
     let (_, digest) = image.rsplit_once('@')?;
-    reportable.is_match(digest).then_some(digest)
+    reportable_image_digest(digest).then_some(digest)
 }
 
 /// Whether `image` is NOT a reference an image registry can resolve: a value outside the

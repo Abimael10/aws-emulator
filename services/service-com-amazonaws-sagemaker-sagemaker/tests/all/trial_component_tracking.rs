@@ -397,8 +397,10 @@ async fn describe_trial_component_replays_exactly_what_create_stored() {
             "case {case}: LineageGroupArn, got {described:?}"
         );
 
-        // `CreatedBy` and `LastModifiedBy` name the IAM identity the request signed with;
-        // nothing has modified the component, so the two agree.
+        // `CreatedBy` and `LastModifiedBy` name the identity whose credentials signed the
+        // request — this harness signs with a credential no record of the account names, so
+        // that is the identity the emulator publishes its own key as. Nothing has modified
+        // the component, so the two agree.
         for member in ["CreatedBy", "LastModifiedBy"] {
             let identity = described
                 .get(member)
@@ -408,7 +410,7 @@ async fn describe_trial_component_replays_exactly_what_create_stored() {
                     .get("IamIdentity")
                     .and_then(|iam| iam.get("Arn"))
                     .and_then(Value::as_str),
-                Some(format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE").as_str()),
+                Some(service_common::caller_principal::ambient_user_arn().as_str()),
                 "case {case}: {member}.IamIdentity.Arn, got {identity:?}"
             );
         }

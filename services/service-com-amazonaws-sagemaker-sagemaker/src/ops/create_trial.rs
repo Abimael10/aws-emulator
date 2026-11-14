@@ -158,6 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let arn = crate::state::resource_arn(&region, crate::state::TRIAL_KIND, &input.trial_name);
+        // Read from STS's and IAM's own records — other services' stores on the same engine
+        // — BEFORE this service's store is reached.
+        let created_by = crate::state::caller_user_context(&*self.engine, ctx);
 
         let mut store = state.lock();
         // The experiment is the trial's PARENT — a trial cannot exist outside one — so an
@@ -218,10 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 experiment_name,
                 metadata_properties: input.metadata_properties,
                 tags: input.tags.unwrap_or_default(),
-                created_by: crate::state::caller_user_context(ctx),
+                created_by: created_by.clone(),
                 // The creation IS the last modification until `UpdateTrial` records its
                 // own caller, so both identities start out as this one.
-                last_modified_by: crate::state::caller_user_context(ctx),
+                last_modified_by: created_by,
                 creation_time: now,
                 last_modified_time: now,
             },

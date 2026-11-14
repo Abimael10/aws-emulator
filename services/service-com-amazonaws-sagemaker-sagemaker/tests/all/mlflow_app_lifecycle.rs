@@ -42,11 +42,12 @@ const OPTIONAL_MEMBERS_WITHOUT_A_DEFAULT: [&str; 4] = [
     "DefaultDomainIdList",
 ];
 
-/// The IAM identity ARN `state::caller_user_context` builds for the harness's signed
-/// requests (`Credential=AKIDEXAMPLE/...`) and for an unsigned one, where
-/// `emulator_server::extract_akid` answers `"default"`.
-fn signed_identity_arn(principal: &str) -> String {
-    format!("arn:aws:iam::{ACCOUNT}:user/{principal}")
+/// The IAM identity ARN a read reports as the creator for every request this harness
+/// makes: neither the credential it signs with (`Credential=AKIDEXAMPLE/...`) nor an
+/// unsigned request names a record of this account, so both speak for the identity this
+/// emulator publishes its own long-term key as.
+fn signed_identity_arn() -> String {
+    service_common::caller_principal::ambient_user_arn()
 }
 
 /// A minimal create body: the three required members only.
@@ -180,14 +181,14 @@ async fn the_minted_arn_takes_its_region_from_the_signed_credential_scope() {
         "case unsigned: the ARN must fall back to the emulator's default region, got {arn:?}"
     );
 
-    // An unsigned request presents no access key id, so the creator attribution names
-    // the principal `extract_akid` falls back to rather than a signed one.
+    // An unsigned request presents no access key id, so it speaks for the same account
+    // identity a credential no record names does.
     let described = emulator
         .call_unsigned("DescribeMlflowApp", &json!({ "Arn": arn }))
         .await;
     assert_eq!(
         described.1["CreatedBy"]["IamIdentity"]["Arn"].as_str(),
-        Some(signed_identity_arn("default").as_str()),
+        Some(signed_identity_arn().as_str()),
         "case unsigned: CreatedBy, got {:?}",
         described.1
     );
@@ -284,7 +285,7 @@ async fn describe_mlflow_app_replays_exactly_what_create_mlflow_app_stored() {
         // modification so far is that create, so both members carry it.
         assert_eq!(
             described["CreatedBy"]["IamIdentity"]["Arn"].as_str(),
-            Some(signed_identity_arn("AKIDEXAMPLE").as_str()),
+            Some(signed_identity_arn().as_str()),
             "case {case:?}: CreatedBy must name the signing identity, got {described:?}"
         );
         assert_eq!(

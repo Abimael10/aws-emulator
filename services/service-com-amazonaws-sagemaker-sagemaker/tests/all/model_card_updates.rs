@@ -92,15 +92,15 @@ async fn a_status_update_moves_the_latest_version_in_place_and_adds_no_version()
                 "case {case}: expected LastModifiedTime at or after CreationTime, got \
                  {described:?}"
             );
-            // The update was modified by an identity, so one is reported — the IAM
-            // identity the updating request signed with.
+            // The update was modified by an identity, so one is reported — the identity
+            // whose credentials signed the updating request.
             assert_eq!(
                 described
                     .get("LastModifiedBy")
                     .and_then(|identity| identity.get("IamIdentity"))
                     .and_then(|identity| identity.get("Arn"))
                     .and_then(Value::as_str),
-                Some(format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE").as_str()),
+                Some(service_common::caller_principal::ambient_user_arn().as_str()),
                 "case {case}: expected LastModifiedBy to name the updater, got {described:?}"
             );
 
