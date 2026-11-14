@@ -32,11 +32,11 @@ use crate::source_api_association::{call, router, Answer};
 
 /// `CreateDomainName`'s and `ListDomainNames`' shared path. Source: the `http` binding of
 /// `CreateDomainName`, `smithy_query(query="operation", operation="CreateDomainName")`.
-const DOMAIN_NAMES_PATH: &str = "/v1/domainnames";
+pub(crate) const DOMAIN_NAMES_PATH: &str = "/v1/domainnames";
 
 /// The largest `domainName` the model admits: `DomainName` is `@length` 1..253. Source:
 /// `smithy_query(query="operation", operation="UpdateDomainName")`.
-const DOMAIN_NAME_MAX_LEN: usize = 253;
+pub(crate) const DOMAIN_NAME_MAX_LEN: usize = 253;
 
 /// The largest `description` the model admits: `Description` is `@length` 0..255. Source:
 /// the `description` member of `UpdateDomainNameRequest`
@@ -45,7 +45,7 @@ const DESCRIPTION_MAX_LEN: usize = 255;
 
 /// A domain name of the modelled maximum length whose first label absorbs the padding,
 /// which the modelled pattern admits.
-fn max_length_domain(tail: &str) -> String {
+pub(crate) fn max_length_domain(tail: &str) -> String {
     let label_len = DOMAIN_NAME_MAX_LEN - tail.len() - 1;
     format!("{}.{tail}", "a".repeat(label_len))
 }
@@ -78,7 +78,7 @@ async fn update_domain(router: &MultiServiceRouter, domain: &str, body: Value) -
 }
 
 /// `DELETE /v1/domainnames/{domainName}`.
-async fn delete_domain(router: &MultiServiceRouter, domain: &str) -> Answer {
+pub(crate) async fn delete_domain(router: &MultiServiceRouter, domain: &str) -> Answer {
     call(
         router,
         "DELETE",

@@ -93,7 +93,7 @@ const RACERS: usize = 3;
 
 /// The AppSync service quota for custom domain names an account holds in one Region;
 /// `ops::create_domain_name::DOMAIN_NAMES_PER_REGION` is the service's own copy of it.
-const DOMAIN_NAMES_PER_REGION: usize = 25;
+pub(crate) const DOMAIN_NAMES_PER_REGION: usize = 25;
 
 /// `CreateDomainName`'s path.
 const DOMAIN_NAMES_PATH: &str = "/v1/domainnames";

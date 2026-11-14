@@ -67,6 +67,8 @@ mod disassociation_reference_refusals;
 mod domain_certificate_and_api_gates;
 #[path = "all/domain_certificate_coverage.rs"]
 mod domain_certificate_coverage;
+#[path = "all/domain_name_delete_releases_the_name.rs"]
+mod domain_name_delete_releases_the_name;
 #[path = "all/domain_name_list.rs"]
 mod domain_name_list;
 #[path = "all/domain_name_update_delete.rs"]

@@ -4816,3 +4816,8 @@ mod bedrock_agentcore_gateway_mcp_transport_path;
 // it scales. (Declared ONCE, in the sorted span at the head of this file: two landings in
 // (`cloudwatch_cfn_alarm_action_topic_policy` is declared ONCE, further up this file: a
 // module may be declared only once, and two landings each kept a copy of this line.)
+// ONCE: this is one crate root, so a second `mod` for the same name is `E0428`, and a
+// declarations and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks the
+// notes, for this file and for every service crate's `tests/all.rs`, so check there
+// rather than leaving a note in this file's tail, where an inner doc comment is `E0753`
+// and compiles nothing.
