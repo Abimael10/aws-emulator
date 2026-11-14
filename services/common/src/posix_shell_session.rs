@@ -117,6 +117,28 @@
 //! work is to carry a file somewhere reads and writes — still the one tree above, where a
 //! path is a key and no host path is reachable.
 //!
+//! # Pipelines, and the filters that read what one wrote
+//!
+//! A pipeline CONNECTS its commands: "the standard output of the first command shall be
+//! connected to the standard input of the second command", so what the last command of a
+//! pipeline wrote is what the pipeline wrote, and every stage before it wrote to the stage
+//! after it rather than to the session. That is what makes a program's own computation
+//! observable: the bytes one command produced are the bytes the next one counts, digests or
+//! selects from. A stage that redirects its own standard output sends it to the file instead,
+//! as the shell does, and so passes nothing on; what one stage may pass to the next is bounded
+//! by [`Bounds::substitution_bytes`], and a stage past that bound ends the pipeline rather than
+//! leaving the stage after it to answer for a stream nothing produced.
+//!
+//! The commands that READ that input are the text filters ([`TEXT_FILTER_COMMANDS`], whose
+//! catalog, options and output forms are stated in
+//! [`super::posix_shell_text_filters`]) and `cat` with no file operand: each answers out of ONE
+//! input — the file it was given, the stage before it, or the file standard input was
+//! redirected from — and writes what it computed over it. A caller whose own ENVIRONMENT
+//! provides a program of that name keeps it: the environment is asked first, and the filter is
+//! only what a session whose environment provides none falls back to. Nothing else here reads
+//! standard input: there is no terminal behind it, so a filter with no input at all is a
+//! command that could not run.
+//!
 //! # Command substitution
 //!
 //! `$(…)` is a command whose OUTPUT is a word of another command, so EVERY session performs
@@ -173,6 +195,7 @@
 use std::collections::BTreeMap;
 
 use super::posix_shell_arithmetic::{self, ArithmeticVariables};
+use super::posix_shell_text_filters::{Filter, STANDARD_INPUT_LABEL, TEXT_FILTER_COMMANDS};
 use super::posix_shell_volume::ShellVolume;
 
 /// Where one command's standard output, standard error and standard input were REDIRECTED
@@ -202,10 +225,11 @@ struct Redirections {
 /// Each one's whole effect is inside the session, which is why it can be performed in
 /// process: `echo` writes a line of the program's output, `cat` writes a file this session
 /// holds, `true`, `false` and `:` answer a status, `exit` ends the session, and
-/// `export`/`unset` change its variables. A command that is not one of these needs a
-/// program, which is the environment's to provide ([`EnvironmentPrograms`]) and not the
-/// shell's, and is answered as a command that could not be run when the environment provides
-/// none of that name.
+/// `export`/`unset` change its variables. A command that is not one of these is either a
+/// TEXT FILTER ([`TEXT_FILTER_COMMANDS`]) or a file utility ([`VOLUME_COMMANDS`]) this
+/// session performs, or it needs a program, which is the environment's to provide
+/// ([`EnvironmentPrograms`]) and not the shell's, and is answered as a command that could not
+/// be run when the environment provides none of that name.
 pub const BUILT_IN_COMMANDS: &[&str] = &[
     "echo", "cat", "true", "false", ":", "exit", "export", "unset",
 ];
@@ -366,7 +390,8 @@ pub struct Bounds {
     /// How deeply those substitutions and nested `sh -c` programs may nest, which is what
     /// keeps this module's own recursion in range.
     pub substitution_depth: usize,
-    /// How many bytes ONE substitution may capture before it has no value at all.
+    /// How many bytes ONE substitution may capture before it has no value at all, which is
+    /// also what ONE stage of a pipeline may pass to the stage after it.
     pub substitution_bytes: usize,
     /// How many files one session's own tree holds at once.
     pub files: usize,
@@ -574,6 +599,11 @@ pub struct ShellSession {
     /// Set when a write to the file a redirection named did not happen, which is what makes
     /// the command carrying it answer as one that could not be run.
     redirect_failed: bool,
+    /// What the stage BEFORE the command being performed wrote, which is that command's
+    /// standard input — `None` for a command that is not reading one stage of a pipeline.
+    /// Held by [`ShellSession::run_pipeline`] for the one command it belongs to, and taken by
+    /// the first command that reads it, the way a stream is consumed by whoever reads it.
+    piped_input: Option<String>,
     /// How long this session's `sleep` commands have stated the program took.
     slept: ::std::time::Duration,
 }
@@ -634,6 +664,7 @@ impl ShellSession {
             working_tree: false,
             tree_bytes: 0,
             redirect_failed: false,
+            piped_input: None,
             slept: ::std::time::Duration::ZERO,
             config,
         };
@@ -861,12 +892,45 @@ impl ShellSession {
     /// exit status of the last command", negated when the pipeline is written with `!`.
     ///
     /// Every command of the pipeline is performed, in order, because each answers its own
-    /// status; this session passes no bytes from one command to the next, so a pipeline's
-    /// commands each read nothing.
+    /// status, and each is CONNECTED to the one after it: what a stage writes to standard
+    /// output is the standard input of the next stage ([`Self::standard_input`]) rather than
+    /// what the session keeps, so only the LAST stage's output is the pipeline's. A stage
+    /// whose own standard output is redirected writes to that file and passes nothing on, the
+    /// way the shell's redirection takes precedence over the pipe.
+    ///
+    /// A stage that wrote more than [`Bounds::substitution_bytes`] ends the pipeline: the bytes
+    /// the pipe could not carry are bytes the stage after it would have read, so the pipeline
+    /// answers the failure of the write that did not happen rather than running the rest of it
+    /// over an empty stream — a stage past the bound must not be able to make a later stage
+    /// answer for input nothing produced.
     fn run_pipeline(&mut self, pipeline: &::brush_parser::ast::Pipeline) -> i32 {
         let mut status = self.config.statuses.success;
-        for command in &pipeline.seq {
+        let last = pipeline.seq.len().saturating_sub(1);
+        // What the stage before the one being performed wrote.
+        let mut upstream: Option<String> = None;
+        for (index, command) in pipeline.seq.iter().enumerate() {
+            // Every stage but the last writes to the stage after it, which is what collects
+            // its output here instead of the session.
+            let connected = index < last;
+            if connected {
+                self.captures.push(Capture {
+                    limit: self.config.bounds.substitution_bytes,
+                    ..Capture::default()
+                });
+            }
+            // The input belongs to this one command: whatever the command around this
+            // pipeline was reading is put back after it.
+            let held_input = ::std::mem::replace(&mut self.piped_input, upstream.take());
             status = self.run_command(command);
+            self.piped_input = held_input;
+            if connected {
+                let captured = self.captures.pop().unwrap_or_default();
+                if captured.overflowed {
+                    // Not a pipeline that ran, so not one a `!` negates either.
+                    return self.config.statuses.failure;
+                }
+                upstream = Some(captured.text);
+            }
             if self.exit_status.is_some() {
                 break;
             }
@@ -1236,6 +1300,47 @@ impl ShellSession {
         }
     }
 
+    /// What the command being performed reads from STANDARD INPUT, and `None` when there is
+    /// none to read.
+    ///
+    /// The file an input redirection names, when the command carries one (a session given a
+    /// MACHINE's tree is the one that performs that form), and otherwise what the stage before
+    /// it in a pipeline wrote. It is TAKEN: a stream is consumed by whoever reads it, so the
+    /// command after it in the same pipeline reads nothing rather than the same bytes twice.
+    /// There is no terminal behind this: a command with neither reads nothing at all.
+    fn standard_input(&mut self, redirections: &Redirections) -> Option<String> {
+        if let Some(path) = redirections.input.clone() {
+            return self.read_path(&path);
+        }
+        self.piped_input.take()
+    }
+
+    /// [`Self::standard_input`] for the utilities that READ it, with the status to answer when
+    /// there is nothing to read: the utility's own failure for a file standard input was
+    /// redirected from that the tree holds nothing at — reported on standard error in the
+    /// utility's own wording, as a named file is — and a command that could not run when there
+    /// was no input at all, since there is no terminal behind it here.
+    fn read_standard_input(
+        &mut self,
+        name: &str,
+        redirections: &Redirections,
+    ) -> Result<String, i32> {
+        let redirected = redirections.input.clone();
+        match self.standard_input(redirections) {
+            Some(input) => Ok(input),
+            None => match redirected {
+                Some(path) => {
+                    let _ = self.write_stderr(
+                        &format!("{name}: {path}: No such file or directory\n"),
+                        redirections,
+                    );
+                    Err(self.config.statuses.failure)
+                }
+                None => Err(self.config.statuses.could_not_run),
+            },
+        }
+    }
+
     /// Write `text` at `path` in the tree this session writes, replacing what is there or
     /// ADDING to it.
     ///
@@ -1392,23 +1497,32 @@ impl ShellSession {
         arguments: &[String],
         redirections: &Redirections,
     ) -> i32 {
-        let Some(programs) = self.programs.take() else {
-            return self.config.statuses.could_not_run;
-        };
+        self.performed_environment_program(name, arguments, redirections)
+            .unwrap_or(self.config.statuses.could_not_run)
+    }
+
+    /// [`Self::run_environment_program`], answering `None` when this environment provides no
+    /// program of that name at all — which is what lets a caller fall back to a utility this
+    /// session performs itself, rather than shadowing the environment's own program with it.
+    fn performed_environment_program(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        redirections: &Redirections,
+    ) -> Option<i32> {
+        let programs = self.programs.take()?;
         let answered = {
             let mut files = SessionFiles { session: self };
             programs.run(name, arguments, &mut files)
         };
         self.programs = Some(programs);
-        let Some(outcome) = answered else {
-            return self.config.statuses.could_not_run;
-        };
+        let outcome = answered?;
         for line in outcome.output {
             if !self.write_stdout(&format!("{line}\n"), redirections) {
-                return self.config.statuses.failure;
+                return Some(self.config.statuses.failure);
             }
         }
-        outcome.status
+        Some(outcome.status)
     }
 
     /// One assignment of a simple command as the name and value it sets, or `None` when it
@@ -1633,6 +1747,19 @@ impl ShellSession {
         // The catalogs are what this session provides: a command outside them needs a
         // program, which is the environment's to provide and not the shell's.
         if !BUILT_IN_COMMANDS.contains(&name) {
+            // The text filters answer out of ONE input — a file, or what the stage before them
+            // wrote — so they need no tree of the environment's and every session performs
+            // them. The ENVIRONMENT's own program for that name comes FIRST: a caller whose
+            // environment provides `wc` has its own catalog for it, and this must not shadow
+            // it; the filter is what a session whose environment provides none falls back to.
+            if TEXT_FILTER_COMMANDS.contains(&name) {
+                if let Some(status) =
+                    self.performed_environment_program(name, arguments, redirections)
+                {
+                    return status;
+                }
+                return self.run_text_filter(name, arguments, redirections);
+            }
             if (self.volume.is_some() || self.working_tree) && VOLUME_COMMANDS.contains(&name) {
                 return self.run_volume_command(name, arguments, redirections);
             }
@@ -1728,6 +1855,48 @@ impl ShellSession {
         }
     }
 
+    /// Perform one of the TEXT FILTERS ([`TEXT_FILTER_COMMANDS`]) over its one input: the file
+    /// it names, or standard input.
+    ///
+    /// What it writes is what [`super::posix_shell_text_filters`] computed over those bytes —
+    /// a digest, a count, a selection — and nothing of the invocation is interpreted here. An
+    /// option or operand form that module does not perform is a command this session could not
+    /// run, a file the tree holds none of is reported the way the file utilities report one,
+    /// and a filter with no input at all could not run either: there is no terminal behind
+    /// standard input here.
+    fn run_text_filter(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        redirections: &Redirections,
+    ) -> i32 {
+        let Some(filter) = Filter::read(name, arguments) else {
+            return self.config.statuses.could_not_run;
+        };
+        let (label, input) = match filter.file() {
+            Some(path) => match self.read_path(path) {
+                Some(held) => (path.to_string(), held),
+                None => {
+                    let _ = self.write_stderr(
+                        &format!("{name}: {path}: No such file or directory\n"),
+                        redirections,
+                    );
+                    return self.config.statuses.failure;
+                }
+            },
+            None => match self.read_standard_input(name, redirections) {
+                Ok(input) => (STANDARD_INPUT_LABEL.to_string(), input),
+                Err(status) => return status,
+            },
+        };
+        let written = filter.perform(&label, &input);
+        if self.write_stdout(&written, redirections) {
+            self.config.statuses.success
+        } else {
+            self.config.statuses.failure
+        }
+    }
+
     /// `sleep`: the time the program asked to take, added to what this session has slept
     /// ([`Self::slept`]).
     ///
@@ -1789,19 +1958,25 @@ impl ShellSession {
     /// utility's own wording and the command answers failure, without stopping the files
     /// after it.
     ///
-    /// With no file named it reads what standard input was redirected from; a session with
-    /// no such redirection has no terminal to read, so that form is one it does not perform.
+    /// With no file named it reads STANDARD INPUT: the file one was redirected from, or what
+    /// the stage before it in a pipeline wrote ([`Self::standard_input`]). A session with
+    /// neither has no terminal to read, so that form is one it does not perform.
     fn run_cat(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
-        let mut paths: Vec<String> = arguments
+        let paths: Vec<String> = arguments
             .iter()
             .filter(|argument| !argument.starts_with('-'))
             .cloned()
             .collect();
         if paths.is_empty() {
-            paths.extend(redirections.input.clone());
-        }
-        if paths.is_empty() {
-            return self.config.statuses.could_not_run;
+            let input = match self.read_standard_input("cat", redirections) {
+                Ok(input) => input,
+                Err(status) => return status,
+            };
+            return if self.write_stdout(&input, redirections) {
+                self.config.statuses.success
+            } else {
+                self.config.statuses.failure
+            };
         }
         let mut status = self.config.statuses.success;
         for path in paths {
@@ -2444,6 +2619,172 @@ mod tests {
             8,
             "case the catalog: expected the eight session-local utilities, got {BUILT_IN_COMMANDS:?}"
         );
+    }
+
+    /// RULE: a pipeline connects its stages — what one stage writes to standard output is the
+    /// standard input of the next — so only the last stage's output is the pipeline's, and a
+    /// filter computes over the bytes the stage before it produced.
+    ///
+    /// The rows differ along what the rule generalises over: how many stages the pipeline has,
+    /// which filter reads the stage before it, whether a stage redirects its own output away
+    /// from the pipe, and whether a stage writes anything at all.
+    #[test]
+    fn a_pipeline_connects_what_one_stage_wrote_to_the_next() {
+        let statuses = Statuses::default();
+        // (case, the program, the status its last line answered, the lines it wrote)
+        let rows: [(&str, &str, i32, &[&str]); 8] = [
+            (
+                "one stage reads what the stage before it wrote",
+                "echo abc | cat",
+                statuses.success,
+                &["abc"],
+            ),
+            (
+                "the stage before the last one writes nothing to the session",
+                "echo abc | wc -c",
+                statuses.success,
+                // `echo` ends its line with a newline, so four bytes reach the filter.
+                &["4"],
+            ),
+            (
+                "three stages, each over what the one before it produced",
+                "echo abcdef | wc -c | cut -c1",
+                statuses.success,
+                &["7"],
+            ),
+            (
+                // The session this test drives keeps lines of at most 64 bytes, so the digest
+                // is read back through the selection the recorded buildspec writes.
+                "a digest over the bytes the stage before it wrote",
+                "echo -n abc | sha256sum | cut -c1-64",
+                statuses.success,
+                &["ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"],
+            ),
+            (
+                "a filter with nothing piped into it could not run",
+                "wc -c",
+                statuses.could_not_run,
+                &[],
+            ),
+            (
+                "a stage that redirects its own output passes an empty stream on",
+                "echo abc > kept.txt | wc -c",
+                statuses.success,
+                &["0"],
+            ),
+            (
+                "the pipeline's status is its last stage's",
+                "echo abc | false",
+                statuses.failure,
+                &[],
+            ),
+            (
+                "a stage this session has no utility for wrote nothing to pass on",
+                "mvn package | wc -c",
+                statuses.success,
+                &["0"],
+            ),
+        ];
+        for (case, program, expected_status, expected_output) in rows {
+            let mut held = session();
+            let mut status = statuses.success;
+            for line in program.lines() {
+                status = held.run(line);
+            }
+            assert_eq!(
+                status, expected_status,
+                "case {case:?}: expected status {expected_status}, got {status}"
+            );
+            assert_eq!(
+                held.output(),
+                expected_output,
+                "case {case:?}: expected {expected_output:?}, got {:?}",
+                held.output()
+            );
+        }
+    }
+
+    /// RULE: a stage whose output is past what a pipe may carry ends the pipeline: the stage
+    /// after it is not run over a stream nothing produced.
+    #[test]
+    fn a_stage_past_the_pipe_bound_ends_the_pipeline() {
+        let statuses = Statuses::default();
+        let mut held = ShellSession::new(
+            BTreeMap::new(),
+            SessionConfig {
+                bounds: Bounds {
+                    // Smaller than the bytes the first stage writes, which is what puts that
+                    // stage past the bound.
+                    substitution_bytes: 4,
+                    ..Bounds::default()
+                },
+                output: Some(OutputLimits {
+                    lines: 8,
+                    line_bytes: 64,
+                }),
+                ..SessionConfig::default()
+            },
+        );
+        let status = held.run("echo abcdefgh | wc -c");
+        assert_eq!(
+            status, statuses.failure,
+            "case a stage past the pipe bound: expected the failure of the write that did not \
+             happen, got {status}"
+        );
+        assert!(
+            held.output().is_empty(),
+            "case a stage past the pipe bound: the stage after it must not have run, got {:?}",
+            held.output()
+        );
+    }
+
+    /// RULE: a command substitution over a pipeline is worth what the LAST stage wrote, with    /// its trailing newlines removed — so a program's own computation is the word it
+    /// substituted.
+    #[test]
+    fn a_substituted_pipeline_is_worth_its_last_stage() {
+        // (case, the program, the value the variable ends holding)
+        let rows: [(&str, &str, &str); 4] = [
+            (
+                "a digest of a variable's value",
+                "SECRET=abc\nDIGEST=$(printf '%s' \"$SECRET\" | sha256sum | cut -c1-64)",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                "the byte count of a variable's value",
+                "SECRET=abcdef\nLENGTH=$(printf '%s' \"$SECRET\" | wc -c)",
+                "6",
+            ),
+            (
+                "a count over a value with multi-byte characters",
+                "SECRET=h\u{e9}llo\nLENGTH=$(printf '%s' \"$SECRET\" | wc -c)",
+                "6",
+            ),
+            (
+                "a selection out of what the stage before it wrote",
+                "SECRET=one:two\nFIELD=$(printf '%s' \"$SECRET\" | cut -d: -f2)",
+                "two",
+            ),
+        ];
+        for (case, program, expected) in rows {
+            // The file utilities are what `printf` is one of, so the session is the one an
+            // environment with storage of its own drives.
+            let mut held = session().with_file_utilities();
+            for line in program.lines() {
+                held.run(line);
+            }
+            let assigned = program
+                .lines()
+                .next_back()
+                .and_then(|line| line.split_once('='))
+                .map(|(name, _)| name)
+                .unwrap_or_default();
+            let value = held.variable(assigned);
+            assert_eq!(
+                value,
+                Some(expected),
+                "case {case:?}: expected {assigned} to hold {expected:?}, got {value:?}"
+            );
+        }
     }
 
     /// RULE: a program's commands write FILES in the session's own tree — an output

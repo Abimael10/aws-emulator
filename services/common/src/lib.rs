@@ -516,6 +516,10 @@ pub mod posix_shell_session;
 /// The value of one ARITHMETIC expansion of that session (`$((…))`), evaluated over the
 /// session's own variables and nothing else.
 pub mod posix_shell_arithmetic;
+/// The TEXT FILTERS that session performs — the utilities that write what they computed over
+/// ONE input (a digest, a count, a selection) — so what a pipeline of them comes to follows
+/// from the bytes that went in.
+pub mod posix_shell_text_filters;
 /// The in-memory TREE that session reads and writes when the caller-supplied program is the
 /// program of a MACHINE the emulator holds — its files, its sealed values and its devices,
 /// all bounded, with no host path behind any of them.

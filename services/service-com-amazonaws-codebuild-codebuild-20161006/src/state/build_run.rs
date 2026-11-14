@@ -14,12 +14,15 @@
 //!
 //! What this module adds is only WHERE the steps happen; the order is the build's own:
 //!
-//! 1. the source archive is downloaded and unpacked into the working tree, and the cached
+//! 1. the variables the build environment is given are resolved, which for a variable naming
+//!    a value another service holds is a call to that service ([`super::build_secrets`]) — a
+//!    build whose environment cannot be given them runs nothing at all;
+//! 2. the source archive is downloaded and unpacked into the working tree, and the cached
 //!    paths are restored into it ([`super::build_source`], [`super::build_cache`]);
-//! 2. the buildspec's phases run over that tree ([`super::run_commands`]);
-//! 3. what the commands produced is put where the build's artifacts say
+//! 3. the buildspec's phases run over that tree ([`super::run_commands`]);
+//! 4. what the commands produced is put where the build's artifacts say
 //!    ([`super::artifact_upload`]), and the declared cache paths are saved;
-//! 4. the build records what every step answered ([`super::finish_build`]).
+//! 5. the build records what every step answered ([`super::finish_build`]).
 //!
 //! # Why a reporting operation drives it
 //!
@@ -42,7 +45,7 @@
 use ::smithy_server_runtime::EmbeddedEmulator;
 
 use super::{
-    artifact_upload, build_cache, build_source, now_millis, BuildRun, BuildSeed,
+    artifact_upload, build_cache, build_secrets, build_source, now_millis, BuildRun, BuildSeed,
     ComAmazonawsCodebuildCodebuild20161006State,
 };
 use crate::ops::types::{Build, BuildArtifacts, ProjectArtifacts};
@@ -77,15 +80,18 @@ pub struct ClaimedRun {
 ///
 /// Called from an operation that is about to READ or decide on a build, with no guard of
 /// the store held: it takes the lock itself, once to claim the runs and once per run to
-/// record it, and the steps between them are calls to another emulated service.
-pub async fn settle_due_builds(
+/// record it, and the steps between them are calls to another emulated service. `engine` is
+/// the shared engine those services' own stores live in, which is what the verdicts a build's
+/// environment turns on are asked of ([`super::build_secrets`]).
+pub async fn settle_due_builds<Eng: Send + Sync + 'static>(
     callback: &EmbeddedEmulator,
+    engine: &Eng,
     state: &::engine::ServiceState<ComAmazonawsCodebuildCodebuild20161006State>,
     region: &str,
 ) {
     let claimed = state.lock().claim_due_build_runs(now_millis());
     for run in claimed {
-        let recorded = perform(callback, region, &run).await;
+        let recorded = perform(callback, engine, region, &run).await;
         state.lock().record_build_run(&run, recorded);
     }
 }
@@ -107,9 +113,31 @@ pub struct RecordedRun {
 }
 
 /// Perform one claimed build's run: its input, its commands, and its output.
-async fn perform(callback: &EmbeddedEmulator, region: &str, claimed: &ClaimedRun) -> RecordedRun {
+async fn perform<Eng: Send + Sync + 'static>(
+    callback: &EmbeddedEmulator,
+    engine: &Eng,
+    region: &str,
+    claimed: &ClaimedRun,
+) -> RecordedRun {
     let project_name = claimed.project_name.as_str();
     let mut seed = BuildSeed::default();
+    // The variables the build environment is given come first: they are in place before the
+    // first command of any phase runs, and one that names a value another service holds is
+    // substituted with that value. An environment that could not be given them is a build
+    // that runs nothing — no source is fetched, no command runs and nothing is put anywhere.
+    match build_secrets::resolve_environment(callback, engine, region, &claimed.build).await {
+        build_secrets::ResolvedEnvironment::Resolved(resolved) => {
+            seed.resolved_variables = resolved;
+        }
+        build_secrets::ResolvedEnvironment::Refused(context) => {
+            return RecordedRun {
+                run: super::environment_failure(claimed.start_millis, claimed.due_millis, context),
+                artifacts: None,
+                secondary_artifacts: Vec::new(),
+                cache_saved_millis: None,
+            };
+        }
+    }
     // The build's own source, at the version the build was started with: the pinned
     // object when it names one, whatever the object holds now.
     if let Some(source) = claimed.build.source.as_ref() {

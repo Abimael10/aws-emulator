@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller-sized. The runs the clock owes are performed BEFORE it, from here,
         // where the object store those runs reach can be reached, so the record this
         // retry is derived from is the one the clock already owes.
-        crate::state::settle_due_builds(ctx.callback(), &state, &region).await;
+        crate::state::settle_due_builds(ctx.callback(), &*self.engine, &state, &region).await;
         let mut guard = state.lock();
 
         // A build id is `<projectName>:<uuid>`, so it names the PROJECT the build

@@ -141,6 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // object store those runs reach can be reached.
         crate::state::settle_due_builds(
             ctx.callback(),
+            &*self.engine,
             &state,
             &crate::state::request_region(ctx.parts()),
         )

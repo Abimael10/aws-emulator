@@ -33,6 +33,8 @@ mod build_image;
 mod buildspec_execution;
 #[path = "all/buildspec_file_tree.rs"]
 mod buildspec_file_tree;
+#[path = "all/buildspec_pipeline_filters.rs"]
+mod buildspec_pipeline_filters;
 #[path = "all/buildspec_control_flow.rs"]
 mod buildspec_control_flow;
 #[path = "all/command_execution_lifecycle.rs"]

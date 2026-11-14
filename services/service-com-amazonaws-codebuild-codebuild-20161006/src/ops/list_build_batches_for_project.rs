@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The runs the clock owes this project's builds are performed before the listing
         // reads them, from here, where the object store those runs reach can be reached,
         // so a status this call filters on is the current one.
-        crate::state::settle_due_builds(ctx.callback(), &state, &region).await;
+        crate::state::settle_due_builds(ctx.callback(), &*self.engine, &state, &region).await;
         let mut guard = state.lock();
 
         // `projectName` carries no `@required` in the model, so the boundary walk lets

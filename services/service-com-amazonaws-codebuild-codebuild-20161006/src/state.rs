@@ -58,6 +58,9 @@ mod build_cache;
 mod build_image;
 /// Running the builds the clock owes a run, where the object store can be reached.
 mod build_run;
+/// The variables a build's environment is given whose value another service holds — a
+/// secret the build's own role reads before its first command runs.
+mod build_secrets;
 /// What ONE command line of a buildspec does, in the build environment's shell — the
 /// shared bounded session, configured as a build's.
 mod build_shell;
@@ -85,6 +88,7 @@ pub use batchspec::*;
 pub use build_cache::*;
 pub use build_image::*;
 pub use build_run::*;
+pub use build_secrets::*;
 pub use build_source::*;
 pub use buildspec::*;
 pub use identifiers::*;

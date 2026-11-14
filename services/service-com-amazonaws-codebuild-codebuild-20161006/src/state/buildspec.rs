@@ -414,6 +414,10 @@ pub struct BuildSeed {
     /// What the source-download phase reports instead of running the build — `None` when
     /// there was a source to obtain, or none to obtain at all.
     pub source_failure: Option<PhaseContext>,
+    /// The value the environment resolved for each variable that names a value another
+    /// service holds ([`super::build_secrets`]), by the variable's own name: substituted for
+    /// the reference when the session is given its variables.
+    pub resolved_variables: BTreeMap<String, String>,
 }
 
 /// What running one build's COMMANDS answered, before what they produced is put where the
@@ -449,20 +453,10 @@ pub struct CommandRun {
     pub exported_variables: Option<Vec<ExportedEnvironmentVariable>>,
 }
 
-/// Run `build`'s buildspec over the environment `seed` describes and answer what its
-/// commands did.
-///
-/// `start_millis` is the instant the build was submitted and `due_millis` the instant the
-/// clock owed its terminal transition at, so the queue closes at `due_millis` and every
-/// phase that then ran is reported inside the same instant: this session runs the whole
-/// buildspec at once rather than over wall-clock time.
-pub fn run_commands(
-    build: &Build,
-    start_millis: i64,
-    due_millis: i64,
-    seed: BuildSeed,
-) -> CommandRun {
-    let mut phases = vec![
+/// The phases every build reports before its environment is provisioned: it was submitted,
+/// and it waited in the queue until the instant the clock owed its run at.
+fn leading_phases(start_millis: i64, due_millis: i64) -> Vec<BuildPhase> {
+    vec![
         finished_phase(
             PHASE_SUBMITTED,
             BUILD_STATUS_SUCCEEDED,
@@ -477,16 +471,58 @@ pub fn run_commands(
             due_millis,
             None,
         ),
-        // The build environment this emulator provides is created in process, which is
-        // what this phase is: see `super::build_shell`.
-        finished_phase(
-            PHASE_PROVISIONING,
-            BUILD_STATUS_SUCCEEDED,
-            due_millis,
-            due_millis,
-            None,
-        ),
-    ];
+    ]
+}
+
+/// What a build whose ENVIRONMENT could not be provisioned reports: the phase that provisions
+/// it FAILED, carrying `context`, and no phase after it ran.
+///
+/// A build environment is provisioned before the build's source is fetched and before any
+/// command of any phase runs, so a build that never got one has no `DOWNLOAD_SOURCE` phase, no
+/// command phase and no finishing work: it reports the phases it reached and the terminal
+/// marker, exports nothing, and puts nothing anywhere. What the variables its environment
+/// could not be given are is [`super::build_secrets`]'s to answer.
+pub fn environment_failure(start_millis: i64, due_millis: i64, context: PhaseContext) -> BuildRun {
+    let mut phases = leading_phases(start_millis, due_millis);
+    phases.push(finished_phase(
+        PHASE_PROVISIONING,
+        BUILD_STATUS_FAILED,
+        due_millis,
+        due_millis,
+        Some(vec![context]),
+    ));
+    phases.push(open_phase(PHASE_COMPLETED, due_millis));
+    BuildRun {
+        status: BUILD_STATUS_FAILED.to_string(),
+        phases,
+        exported_variables: None,
+    }
+}
+
+/// Run `build`'s buildspec over the environment `seed` describes and answer what its
+/// commands did.
+///
+/// `start_millis` is the instant the build was submitted and `due_millis` the instant the
+/// clock owed its terminal transition at, so the queue closes at `due_millis` and every
+/// phase that then ran is reported inside the same instant: this session runs the whole
+/// buildspec at once rather than over wall-clock time.
+pub fn run_commands(
+    build: &Build,
+    start_millis: i64,
+    due_millis: i64,
+    seed: BuildSeed,
+) -> CommandRun {
+    let mut phases = leading_phases(start_millis, due_millis);
+    // The build environment this emulator provides is created in process, which is what the
+    // provisioning phase is (see `super::build_shell`), and it was created: a build whose
+    // environment could not be is not run at all ([`environment_failure`]).
+    phases.push(finished_phase(
+        PHASE_PROVISIONING,
+        BUILD_STATUS_SUCCEEDED,
+        due_millis,
+        due_millis,
+        None,
+    ));
 
     let buildspec = build
         .source
@@ -565,7 +601,7 @@ pub fn run_commands(
     ));
 
     let mut shell = BuildShell::new(
-        session_variables(build, &read, start_millis),
+        session_variables(build, &read, start_millis, &seed.resolved_variables),
         installed,
         // The build runs INSIDE its effective environment's image, so what that image
         // presents is in the environment's filesystem before the first command runs.
@@ -751,12 +787,15 @@ fn effective_image(build: &Build) -> &str {
 /// applied to.
 ///
 /// A variable whose type is not [`PLAINTEXT_VARIABLE_TYPE`] names a parameter or a
-/// secret held by another service, which this session does not resolve, so it sets
-/// nothing rather than setting the reference as if it were the value.
+/// secret held by another service, so what it is worth is the value the ENVIRONMENT
+/// resolved for it before the build ran (`resolved`, [`super::build_secrets`]): a type
+/// nothing was resolved for sets nothing rather than setting the reference as if it were
+/// the value.
 fn session_variables(
     build: &Build,
     read: &Buildspec,
     start_millis: i64,
+    resolved: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut variables = BTreeMap::new();
     let image = effective_image(build);
@@ -795,8 +834,13 @@ fn session_variables(
             .r#type
             .as_deref()
             .is_none_or(|kind| kind == PLAINTEXT_VARIABLE_TYPE);
-        if plaintext {
-            variables.insert(variable.name.clone(), variable.value.clone());
+        let value = if plaintext {
+            Some(variable.value.clone())
+        } else {
+            resolved.get(&variable.name).cloned()
+        };
+        if let Some(value) = value {
+            variables.insert(variable.name.clone(), value);
         }
     }
     variables

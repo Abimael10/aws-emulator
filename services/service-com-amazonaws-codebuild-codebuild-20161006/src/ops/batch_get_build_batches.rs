@@ -142,7 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock owes them are performed before this read reports anything — from here,
         // where the object store those runs reach can be reached
         // (`crate::state::build_run::settle_due_builds`).
-        crate::state::settle_due_builds(ctx.callback(), &state, &region).await;
+        crate::state::settle_due_builds(ctx.callback(), &*self.engine, &state, &region).await;
         let mut guard = state.lock();
         let mut build_batches = Vec::new();
         let mut not_found = Vec::new();

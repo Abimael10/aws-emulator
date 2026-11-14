@@ -56,6 +56,21 @@ globset = "0.4"
 # `md-5`: the checksums a build reports for an artifact whose packaging is ZIP are of the
 # archive's own bytes (`BuildArtifacts$md5sum`, `$sha256sum`).
 md-5 = "0.10"
+# The AWS Secrets Manager service, for the two verdicts a build environment's
+# `SECRETS_MANAGER` variable turns on: whether the project's SERVICE ROLE may retrieve the
+# secret the variable references, and whether that account holds a value to retrieve at all,
+# which together decide whether the build environment can be provisioned at all
+# (`crate::state::build_secrets`). The secret, the policies on it and its deletion state are
+# that service's own records, held in its own store in the shared engine, so the decision is
+# answered by the service that owns them rather than by a copy kept here. No cycle: that
+# crate does not depend on this one.
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
+# The AWS SDK for Secrets Manager, driven over the in-process callback: the VALUE a
+# `SECRETS_MANAGER` variable is substituted with is read through that service's own
+# `GetSecretValue` before the build's first command runs, so what the build's shell sees is
+# the value a client reads back from the service that holds it. Only the generated client is
+# needed — the emulator supplies the transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-secretsmanager = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

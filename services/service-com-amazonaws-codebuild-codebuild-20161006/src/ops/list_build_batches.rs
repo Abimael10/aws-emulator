@@ -162,6 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same batch build.
         crate::state::settle_due_builds(
             ctx.callback(),
+            &*self.engine,
             &state,
             &crate::state::request_region(ctx.parts()),
         )

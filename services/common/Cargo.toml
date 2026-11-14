@@ -94,8 +94,12 @@ aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
 # `stable_hex_id`'s mixing function: a maintained digest, so a derived id that travels on
 # the wire is reproducible across builds rather than tied to the algorithm `std`'s default
-# hasher happens to use.
+# hasher happens to use. `posix_shell_text_filters`: the digest the `sha256sum`/`sha512sum`
+# utilities of a shell session answer with.
 sha2 = { workspace = true }
+# ... and the lowercase hexadecimal those utilities write that digest as, from the maintained
+# encoder this workspace already encodes one with rather than a loop here.
+hex = { workspace = true }
 # `iam_trust_policy`: an IAM trust policy IS a JSON document, so it is read with a
 # maintained JSON parser rather than by hand.
 serde_json = { workspace = true }

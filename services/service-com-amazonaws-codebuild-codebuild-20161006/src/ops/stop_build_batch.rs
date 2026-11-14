@@ -140,6 +140,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // they reach can be reached (`crate::state::build_run::settle_due_builds`).
         crate::state::settle_due_builds(
             ctx.callback(),
+            &*self.engine,
             &state,
             &crate::state::request_region(ctx.parts()),
         )
