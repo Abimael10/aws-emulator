@@ -17,7 +17,38 @@ pub struct GetDataAutomationStatusInput {
     pub invocation_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockdataautomationruntime#GetDataAutomationStatusResponse")]
+/// `GetDataAutomationStatusResponse`, with its schema written out instead of derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the input beside it: both
+/// timestamp members carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="GetDataAutomationStatusResponse")` reports
+/// `jobSubmissionTime` and `jobCompletionTime` as `{"target": "Timestamp",
+/// "timestampFormat": "date-time"}`), and the derive does not carry that trait onto the
+/// member schemas it emits. The JSON codec decides a timestamp's rendering per member,
+/// from the member schema's own format
+/// (`vendor/smithy-schema-server/src/json.rs::write_timestamp` ->
+/// `Schema::timestamp_format()`), and falls back to the protocol default — epoch seconds,
+/// a JSON NUMBER — when the member schema reports none. So both instants went onto the
+/// wire in a type no client generated from this model can deserialize.
+///
+/// The seven member schemas below are the model's, member for member: the same shape ids,
+/// the same order and the same member indices (no member of this shape declares a
+/// `@jsonName`, so each one's wire name IS its Smithy member name), plus the `date-time`
+/// format the model declares for the two timestamps and for nothing else.
+///
+/// This is a PER-SHAPE workaround and has to be kept in step with the model by hand. The
+/// generator gap it works around is filed as
+/// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`
+/// — the fix belongs in `vendor/smithy-macros` (chain `.with_timestamp_format(..)` when
+/// building a member schema), which is read-only from a service crate. This is the only
+/// shape of this service that needs it: these two are the only `Timestamp` members the
+/// whole model declares. `tests/all/job_timestamp_wire_form.rs` pins both the wire form
+/// and these member schemas, so it fails if this shape goes back to the derive.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape is
+/// an operation OUTPUT, which the server only ever serializes
+/// (`smithy_server_runtime::Operation::Output` requires `SerializableStruct`; only
+/// `Input` is deserialized), so a hand-written read path would be code with no caller.
 #[derive(Debug, Clone, Default)]
 pub struct GetDataAutomationStatusOutput {
     pub status: Option<String>,
@@ -27,5 +58,158 @@ pub struct GetDataAutomationStatusOutput {
     pub job_submission_time: Option<::aws_smithy_types::DateTime>,
     pub job_completion_time: Option<::aws_smithy_types::DateTime>,
     pub job_duration_in_seconds: Option<i32>,
+}
+
+/// The shape id of the response, which every member schema below is named under.
+const GET_DATA_AUTOMATION_STATUS_RESPONSE: &str =
+    "com.amazonaws.bedrockdataautomationruntime#GetDataAutomationStatusResponse";
+
+#[allow(non_upper_case_globals)]
+impl GetDataAutomationStatusOutput {
+    /// `status`, an `AutomationJobStatus` enum — string-encoded, as every Smithy `enum`
+    /// is.
+    pub const M_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.bedrockdataautomationruntime#GetDataAutomationStatusResponse$status",
+            "com.amazonaws.bedrockdataautomationruntime",
+            "status",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "status",
+        0,
+    );
+
+    /// `errorType`, a `String`.
+    pub const M_ERROR_TYPE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.bedrockdataautomationruntime#GetDataAutomationStatusResponse$errorType",
+            "com.amazonaws.bedrockdataautomationruntime",
+            "errorType",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "errorType",
+        1,
+    );
+
+    /// `errorMessage`, a `String`.
+    pub const M_ERROR_MESSAGE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.bedrockdataautomationruntime#GetDataAutomationStatusResponse$errorMessage",
+                "com.amazonaws.bedrockdataautomationruntime",
+                "errorMessage",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "errorMessage",
+            2,
+        );
+
+    /// `outputConfiguration`, the `OutputConfiguration` structure.
+    pub const M_OUTPUT_CONFIGURATION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.bedrockdataautomationruntime#GetDataAutomationStatusResponse$outputConfiguration",
+                "com.amazonaws.bedrockdataautomationruntime",
+                "outputConfiguration",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "outputConfiguration",
+            3,
+        );
+
+    /// `jobSubmissionTime`, a `Timestamp` the model marks
+    /// `@timestampFormat("date-time")`.
+    pub const M_JOB_SUBMISSION_TIME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.bedrockdataautomationruntime#GetDataAutomationStatusResponse$jobSubmissionTime",
+                "com.amazonaws.bedrockdataautomationruntime",
+                "jobSubmissionTime",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "jobSubmissionTime",
+            4,
+        )
+        // The one chain call the vendored codegen omits; see the note on the struct.
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    /// `jobCompletionTime`, a `Timestamp` the model marks
+    /// `@timestampFormat("date-time")`.
+    pub const M_JOB_COMPLETION_TIME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.bedrockdataautomationruntime#GetDataAutomationStatusResponse$jobCompletionTime",
+                "com.amazonaws.bedrockdataautomationruntime",
+                "jobCompletionTime",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "jobCompletionTime",
+            5,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    /// `jobDurationInSeconds`, an `Integer`.
+    pub const M_JOB_DURATION_IN_SECONDS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.bedrockdataautomationruntime#GetDataAutomationStatusResponse$jobDurationInSeconds",
+                "com.amazonaws.bedrockdataautomationruntime",
+                "jobDurationInSeconds",
+            ),
+            ::aws_smithy_schema::ShapeType::Integer,
+            "jobDurationInSeconds",
+            6,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            GET_DATA_AUTOMATION_STATUS_RESPONSE,
+            "com.amazonaws.bedrockdataautomationruntime",
+            "GetDataAutomationStatusResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_STATUS,
+            &Self::M_ERROR_TYPE,
+            &Self::M_ERROR_MESSAGE,
+            &Self::M_OUTPUT_CONFIGURATION,
+            &Self::M_JOB_SUBMISSION_TIME,
+            &Self::M_JOB_COMPLETION_TIME,
+            &Self::M_JOB_DURATION_IN_SECONDS,
+        ],
+    );
+}
+
+pub static GET_DATA_AUTOMATION_STATUS_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetDataAutomationStatusOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetDataAutomationStatusOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.status.as_ref() {
+            serializer.write_string(&Self::M_STATUS, value.as_str())?;
+        }
+        if let Some(value) = self.error_type.as_ref() {
+            serializer.write_string(&Self::M_ERROR_TYPE, value.as_str())?;
+        }
+        if let Some(value) = self.error_message.as_ref() {
+            serializer.write_string(&Self::M_ERROR_MESSAGE, value.as_str())?;
+        }
+        if let Some(value) = self.output_configuration.as_ref() {
+            serializer.write_struct(&Self::M_OUTPUT_CONFIGURATION, value)?;
+        }
+        if let Some(value) = self.job_submission_time.as_ref() {
+            serializer.write_timestamp(&Self::M_JOB_SUBMISSION_TIME, value)?;
+        }
+        if let Some(value) = self.job_completion_time.as_ref() {
+            serializer.write_timestamp(&Self::M_JOB_COMPLETION_TIME, value)?;
+        }
+        if let Some(value) = self.job_duration_in_seconds.as_ref() {
+            serializer.write_integer(&Self::M_JOB_DURATION_IN_SECONDS, *value)?;
+        }
+        Ok(())
+    }
 }
 

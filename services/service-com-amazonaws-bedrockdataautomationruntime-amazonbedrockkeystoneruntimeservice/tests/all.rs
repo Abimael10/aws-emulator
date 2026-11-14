@@ -29,6 +29,8 @@ mod job_event_region_scope;
 mod job_output_location_and_outcome;
 #[path = "all/job_standard_output_objects.rs"]
 mod job_standard_output_objects;
+#[path = "all/job_timestamp_wire_form.rs"]
+mod job_timestamp_wire_form;
 #[path = "all/minted_arn_region_segment.rs"]
 mod minted_arn_region_segment;
 #[path = "all/minted_invocation_id_form.rs"]
