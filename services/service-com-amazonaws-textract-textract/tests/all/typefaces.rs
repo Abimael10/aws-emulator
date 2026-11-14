@@ -1,0 +1,513 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! Reading a document set in the TYPEFACES ordinary documents are set in, end to end.
+//!
+//! The rule under test, over a table of inputs rather than one recorded page: the `Text` a
+//! raster operation reports for a block is the characters that were DRAWN on the page it
+//! read, whatever typeface and whatever size drew them, and the words it separates them
+//! into are the words the page sets — including a NUMBER, whose figures a face sets on one
+//! advance of its own, so the empty part of a narrow figure's cell is not a space.
+//!
+//! Two families of page are drawn here, because a document is set in one or the other and
+//! the recogniser has to read both:
+//!
+//! * a PIXEL face — a page drawn a dozen pixels to the line, every stroke one pixel, which
+//!   is what a small scanned or screen-rendered document carries. The rows span the rasters
+//!   the X11 fixed faces are cut at from 6x9 to 10x20 (`embedded_graphics::mono_font::ascii`,
+//!   the source of the list below). The two smallest cuts those faces come in, 4x6 and 5x7,
+//!   and the 5x8 between them, are deliberately NOT here: a page whose capitals stand six
+//!   pixels tall sets neighbouring letters a pixel apart, which no recogniser reads
+//!   character for character, so asserting a round trip at those rasters would assert
+//!   something this module does not promise;
+//! * a PROPORTIONAL OUTLINE face — Noto Sans, rasterised here at the size each row asks
+//!   for, where every letter takes the width of its own ink rather than one cell. These
+//!   rows are drawn at sizes the recogniser holds NO template at, so what they pin is
+//!   recognition rather than identity: an outline rasterised at 26 pixels is a different
+//!   bitmap on a different pixel grid from the same outline rasterised at 18.
+//!
+//! The rows differ along what the rule generalises over: the family, the raster or pixel
+//! size, the weight, the polarity of the ink, and the format the page is submitted in.
+
+use embedded_graphics::draw_target::DrawTarget;
+use embedded_graphics::geometry::{Dimensions, Point, Size};
+use embedded_graphics::mono_font::{ascii, MonoFont, MonoTextStyle};
+use embedded_graphics::pixelcolor::BinaryColor;
+use embedded_graphics::primitives::Rectangle;
+use embedded_graphics::text::Text;
+use embedded_graphics::{Drawable, Pixel};
+use image::{GrayImage, ImageFormat, Luma};
+use serde_json::{json, Value};
+
+use crate::document_extraction::{assert_block_graph, blocks_of, call, harness, of_type};
+use crate::raster_documents::{raster_document, texts_of};
+
+/// The lines every page here is drawn from: capitals, small letters, figures, a labelled
+/// field and the punctuation a statement is set with, so more than one glyph class is read.
+const LINES: &[&str] = &[
+    "SIMPARITY LEDGER",
+    "Account Number: 48213",
+    "Total Due 1250.00",
+    "Status: Settled in full",
+];
+
+/// The numbers `LINES` draws, each of which is ONE word of the page: a face sets its
+/// figures on one advance, so the gap a narrow figure leaves inside its own cell is as wide
+/// as a space's and a number read by its gaps alone falls apart into several words.
+const NUMBERS: &[&str] = &["48213", "1250.00"];
+
+/// How the ink and the ground of a page are drawn.
+///
+/// The polarity axis itself is `crate::raster_documents::Paper`'s — "one renderer serves
+/// both rather than each suite growing its own" — so the levels come from there and only the
+/// blending an ANTI-ALIASED stroke needs is added here: a bitmap face turns a pixel on or
+/// off, while an outline rasteriser hands out how much of a stroke each pixel carries.
+type Polarity = crate::raster_documents::Paper;
+
+/// A page of dark ink on a light ground.
+const fn dark_on_light() -> Polarity {
+    Polarity {
+        background: 245,
+        ink: 0,
+        ..Polarity::plain()
+    }
+}
+
+/// A page of light ink on a dark ground, which Textract reads just as well.
+const fn light_on_dark() -> Polarity {
+    Polarity {
+        background: 12,
+        ink: 255,
+        ..Polarity::plain()
+    }
+}
+
+/// The page level for a pixel that already carries `ground` and takes `coverage` of a
+/// stroke's ink, drawn at `polarity`.
+fn level(polarity: Polarity, ground: u8, coverage: u8) -> u8 {
+    if polarity.ink >= polarity.background {
+        ground.max(polarity.background.saturating_add(coverage))
+    } else {
+        ground.min(polarity.background.saturating_sub(coverage))
+    }
+}
+
+/// The smallest draw target there is: it records which of its pixels a face turned on.
+///
+/// `embedded_graphics` draws a bitmap face's glyphs rather than handing out their bits, so
+/// a page set in one is drawn into this and read off it.
+struct Canvas {
+    width: usize,
+    height: usize,
+    lit: Vec<bool>,
+}
+
+impl Dimensions for Canvas {
+    fn bounding_box(&self) -> Rectangle {
+        Rectangle::new(
+            Point::zero(),
+            Size::new(self.width as u32, self.height as u32),
+        )
+    }
+}
+
+impl DrawTarget for Canvas {
+    type Color = BinaryColor;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(point, colour) in pixels {
+            let inside = point.x >= 0
+                && point.y >= 0
+                && (point.x as usize) < self.width
+                && (point.y as usize) < self.height;
+            if inside && colour == BinaryColor::On {
+                self.lit[point.y as usize * self.width + point.x as usize] = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Draw `lines` with one of the X11 fixed bitmap faces, at that face's own raster.
+fn pixel_page(lines: &[&str], font: &MonoFont<'static>, polarity: Polarity) -> GrayImage {
+    let cell = font.character_size;
+    let pitch = cell.height as usize + 5;
+    let margin = 12usize;
+    let columns = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let width = margin * 2 + columns * cell.width.max(1) as usize;
+    let height = margin * 2 + lines.len() * pitch;
+    let mut canvas = Canvas {
+        width,
+        height,
+        lit: vec![false; width * height],
+    };
+    let style = MonoTextStyle::new(font, BinaryColor::On);
+    for (row, line) in lines.iter().enumerate() {
+        let at = Point::new(
+            margin as i32,
+            (margin + row * pitch + cell.height as usize) as i32,
+        );
+        // `Infallible`: the target above cannot fail, so this cannot.
+        let _ = Text::new(line, at, style).draw(&mut canvas);
+    }
+    let mut page = GrayImage::from_pixel(width as u32, height as u32, Luma([polarity.background]));
+    for y in 0..height {
+        for x in 0..width {
+            if canvas.lit[y * width + x] {
+                page.put_pixel(x as u32, y as u32, Luma([polarity.ink]));
+            }
+        }
+    }
+    page
+}
+
+/// Draw `lines` with the PROPORTIONAL outline face `face`, rasterised at `size` pixels.
+///
+/// `fontdue` rasterises an outline into one byte of ink per pixel of the glyph's own ink
+/// box, with the metrics that place that box against the line's baseline and advance the
+/// pen by the glyph's own width — so the page carries anti-aliased strokes set
+/// proportionally, which is what a document rendered from an outline face looks like.
+fn outline_page(lines: &[&str], face: &'static [u8], size: f32, polarity: Polarity) -> GrayImage {
+    let font = fontdue::Font::from_bytes(face, fontdue::FontSettings::default())
+        .expect("the embedded outline face parses");
+    let metrics = font
+        .horizontal_line_metrics(size)
+        .expect("the outline face sets its lines");
+    let pitch = metrics.new_line_size.ceil() as usize;
+    let margin = (size * 1.5).ceil() as usize;
+    let width = margin * 2
+        + lines
+            .iter()
+            .map(|line| {
+                line.chars()
+                    .map(|ch| font.metrics(ch, size).advance_width.ceil() as usize)
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0);
+    let height = margin * 2 + lines.len() * pitch;
+    let mut page = GrayImage::from_pixel(width as u32, height as u32, Luma([polarity.background]));
+    for (row, line) in lines.iter().enumerate() {
+        let baseline = margin + row * pitch + metrics.ascent.ceil() as usize;
+        let mut pen = margin as f32;
+        for ch in line.chars() {
+            let (glyph, bitmap) = font.rasterize(ch, size);
+            for y in 0..glyph.height {
+                for x in 0..glyph.width {
+                    let coverage = bitmap[y * glyph.width + x];
+                    if coverage == 0 {
+                        continue;
+                    }
+                    // `ymin` is how far the foot of the glyph's ink box stands above the
+                    // baseline, so its top row is that much more than its height above it.
+                    let at_x = pen as isize + glyph.xmin as isize + x as isize;
+                    let above = glyph.height as isize + glyph.ymin as isize;
+                    let at_y = baseline as isize - above + y as isize;
+                    if at_x < 0 || at_y < 0 || at_x >= width as isize || at_y >= height as isize {
+                        continue;
+                    }
+                    let (at_x, at_y) = (at_x as u32, at_y as u32);
+                    let ground = page.get_pixel(at_x, at_y).0[0];
+                    page.put_pixel(at_x, at_y, Luma([level(polarity, ground, coverage)]));
+                }
+            }
+            pen += font.metrics(ch, size).advance_width;
+        }
+    }
+    page
+}
+
+/// The words of `lines`, line by line, as they were drawn.
+fn drawn_words(lines: &[&str]) -> Vec<Vec<String>> {
+    lines
+        .iter()
+        .map(|line| line.split_whitespace().map(ToString::to_string).collect())
+        .collect()
+}
+
+/// The LINE blocks' texts, as words.
+fn read_words(blocks: &[Value]) -> Vec<Vec<String>> {
+    texts_of(blocks, "LINE")
+        .iter()
+        .map(|line| line.split_whitespace().map(ToString::to_string).collect())
+        .collect()
+}
+
+/// Read `page` through `DetectDocumentText` and hand back its blocks.
+async fn read_page(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    page: &GrayImage,
+    format: ImageFormat,
+) -> Vec<Value> {
+    let request = json!({ "Document": raster_document(page, format) });
+    let (status, body) = call(router, "DetectDocumentText", &request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: a page in a format Textract reads must be read, got {status} with \
+         {body}"
+    );
+    let blocks = blocks_of(&body);
+    assert_block_graph(case, &body, &blocks, None);
+    assert!(
+        !of_type(&blocks, "PAGE").is_empty(),
+        "case {case:?}: a page that was read reports a PAGE block, got {body}"
+    );
+    blocks
+}
+
+/// A page set in a PIXEL face is read character for character, at every raster those faces
+/// are cut at and whichever way its ink is drawn.
+///
+/// The rasters are the X11 fixed faces' own (`embedded_graphics::mono_font::ascii`): a page
+/// set in one of them is what a document rendered at a dozen pixels to the line carries.
+#[tokio::test]
+async fn a_page_set_in_a_pixel_face_reads_the_characters_it_was_drawn_with() {
+    let router = harness();
+    let cases: Vec<(&str, &MonoFont<'static>, Polarity, ImageFormat)> = vec![
+        ("6x9", &ascii::FONT_6X9, dark_on_light(), ImageFormat::Png),
+        ("6x10", &ascii::FONT_6X10, dark_on_light(), ImageFormat::Png),
+        ("6x12", &ascii::FONT_6X12, dark_on_light(), ImageFormat::Png),
+        ("6x13", &ascii::FONT_6X13, dark_on_light(), ImageFormat::Png),
+        ("7x13", &ascii::FONT_7X13, dark_on_light(), ImageFormat::Png),
+        ("7x14", &ascii::FONT_7X14, dark_on_light(), ImageFormat::Png),
+        ("8x13", &ascii::FONT_8X13, dark_on_light(), ImageFormat::Png),
+        ("9x15", &ascii::FONT_9X15, dark_on_light(), ImageFormat::Png),
+        ("9x18", &ascii::FONT_9X18, dark_on_light(), ImageFormat::Png),
+        ("10x20", &ascii::FONT_10X20, dark_on_light(), ImageFormat::Png),
+        (
+            "9x18, light ink on a dark page",
+            &ascii::FONT_9X18,
+            light_on_dark(),
+            ImageFormat::Png,
+        ),
+        (
+            "9x18, submitted as a JPEG",
+            &ascii::FONT_9X18,
+            dark_on_light(),
+            ImageFormat::Jpeg,
+        ),
+    ];
+
+    for (case, font, polarity, format) in cases {
+        let page = pixel_page(LINES, font, polarity);
+        let blocks = read_page(&router, case, &page, format).await;
+        assert_eq!(
+            texts_of(&blocks, "LINE"),
+            LINES.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "case {case:?}: the LINE blocks must report the lines the page was drawn from"
+        );
+        assert_eq!(
+            texts_of(&blocks, "WORD"),
+            drawn_words(LINES).concat(),
+            "case {case:?}: the WORD blocks must report the words the page was drawn from"
+        );
+    }
+}
+
+/// A page set in a PROPORTIONAL outline face, at a size the recogniser holds no template
+/// at, is read as the text it was drawn with: one line per line of ink, the words the page
+/// sets, and nearly every word character for character.
+///
+/// The glyph identities are not all asserted: ink drawn by an outline rasteriser is no copy
+/// of any template, so what the rule asks for is that the page's own text comes back, not
+/// that two faces' ink agrees exactly.
+#[tokio::test]
+async fn a_page_set_in_a_proportional_outline_face_reads_the_text_it_was_drawn_with() {
+    let router = harness();
+    let cases: Vec<(&str, &'static [u8], f32, Polarity, ImageFormat)> = vec![
+        (
+            "regular, 22 pixels",
+            ttf_noto_sans::REGULAR,
+            22.0,
+            dark_on_light(),
+            ImageFormat::Png,
+        ),
+        (
+            "regular, 26 pixels",
+            ttf_noto_sans::REGULAR,
+            26.0,
+            dark_on_light(),
+            ImageFormat::Png,
+        ),
+        (
+            "regular, 32 pixels",
+            ttf_noto_sans::REGULAR,
+            32.0,
+            dark_on_light(),
+            ImageFormat::Png,
+        ),
+        (
+            "regular, 36 pixels",
+            ttf_noto_sans::REGULAR,
+            36.0,
+            dark_on_light(),
+            ImageFormat::Png,
+        ),
+        (
+            "bold, 24 pixels",
+            ttf_noto_sans::BOLD,
+            24.0,
+            dark_on_light(),
+            ImageFormat::Png,
+        ),
+        (
+            "bold, 32 pixels",
+            ttf_noto_sans::BOLD,
+            32.0,
+            dark_on_light(),
+            ImageFormat::Png,
+        ),
+        (
+            "regular, 26 pixels, light ink on a dark page",
+            ttf_noto_sans::REGULAR,
+            26.0,
+            light_on_dark(),
+            ImageFormat::Png,
+        ),
+        (
+            "regular, 26 pixels, submitted as a JPEG",
+            ttf_noto_sans::REGULAR,
+            26.0,
+            dark_on_light(),
+            ImageFormat::Jpeg,
+        ),
+    ];
+
+    for (case, face, size, polarity, format) in cases {
+        let page = outline_page(LINES, face, size, polarity);
+        let blocks = read_page(&router, case, &page, format).await;
+        let read = read_words(&blocks);
+        let drawn = drawn_words(LINES);
+        assert_eq!(
+            read.len(),
+            drawn.len(),
+            "case {case:?}: a page of {} lines of ink is read as that many lines, got {:?}",
+            drawn.len(),
+            texts_of(&blocks, "LINE")
+        );
+        for (line, (read_line, drawn_line)) in read.iter().zip(drawn.iter()).enumerate() {
+            assert_eq!(
+                read_line.len(),
+                drawn_line.len(),
+                "case {case:?}: line {line} sets {} words, got {read_line:?} against \
+                 {drawn_line:?}",
+                drawn_line.len()
+            );
+        }
+        // How many of the words drawn came back character for character. A page in a face
+        // no template is a copy of is measured rather than matched by identity, so what the
+        // rule asks for is that most of its words are the words drawn.
+        let right = read
+            .concat()
+            .iter()
+            .zip(drawn.concat().iter())
+            .filter(|(read, drawn)| read == drawn)
+            .count();
+        let drawn_count = drawn.concat().len();
+        assert!(
+            right * 4 >= drawn_count * 3,
+            "case {case:?}: the words read must be the words drawn, got {right} of \
+             {drawn_count} in {:?}",
+            texts_of(&blocks, "LINE")
+        );
+        // Every block that reports a confidence reports one inside `Percent`'s range: each
+        // is the score measured over the characters THAT block was read from.
+        for block in &blocks {
+            let Some(confidence) = block.get("Confidence").and_then(Value::as_f64) else {
+                continue;
+            };
+            assert!(
+                confidence > 0.0 && confidence <= 100.0,
+                "case {case:?}: a recognised block reports the confidence it was recognised \
+                 with, got {confidence} on {block}"
+            );
+        }
+        // The same pixels answer the same way: the blocks come from what was read, not
+        // from a roll.
+        let again = read_page(&router, case, &page, format).await;
+        assert_eq!(
+            again, blocks,
+            "case {case:?}: the same page must answer with the same blocks"
+        );
+    }
+}
+
+/// The figures of a NUMBER are one word, however narrow a figure is and whatever advance
+/// the face sets its figures on — and two numbers the page really does separate stay two.
+///
+/// A proportional face sets every figure on the same advance, so a `1` inks a fraction of
+/// its own cell and leaves a gap as wide as a space's either side of it. A number separated
+/// by those gaps alone falls into several words, which no page drew.
+#[tokio::test]
+async fn the_figures_of_a_number_are_read_as_one_word() {
+    let router = harness();
+    let cases: Vec<(&str, &'static [u8], f32)> = vec![
+        ("regular, 22 pixels", ttf_noto_sans::REGULAR, 22.0),
+        ("regular, 26 pixels", ttf_noto_sans::REGULAR, 26.0),
+        ("regular, 32 pixels", ttf_noto_sans::REGULAR, 32.0),
+        ("regular, 36 pixels", ttf_noto_sans::REGULAR, 36.0),
+        ("bold, 24 pixels", ttf_noto_sans::BOLD, 24.0),
+    ];
+
+    for (case, face, size) in cases {
+        let page = outline_page(LINES, face, size, dark_on_light());
+        let blocks = read_page(&router, case, &page, ImageFormat::Png).await;
+        let words = texts_of(&blocks, "WORD");
+        for number in NUMBERS {
+            assert!(
+                words.iter().any(|word| word == number),
+                "case {case:?}: the figures of {number:?} are one word, got {words:?}"
+            );
+        }
+        // The rule does not swallow the spaces a page really sets between two numbers: a
+        // line of two separated numbers is read as two words of the lengths drawn.
+        let separated = ["Invoice 4821 3307"];
+        let page = outline_page(&separated, face, size, dark_on_light());
+        let blocks = read_page(&router, case, &page, ImageFormat::Png).await;
+        let read: Vec<usize> = texts_of(&blocks, "WORD")
+            .iter()
+            .map(|word| word.chars().count())
+            .collect();
+        assert_eq!(
+            read,
+            vec![7, 4, 4],
+            "case {case:?}: {separated:?} sets three words, got {:?}",
+            texts_of(&blocks, "WORD")
+        );
+    }
+}
+
+/// The analysis path reads the same page the same way: the words a number is read as are
+/// the words every read path over that document reports.
+#[tokio::test]
+async fn the_analysis_path_reads_a_numbers_figures_as_one_word() {
+    let router = harness();
+    let page = outline_page(LINES, ttf_noto_sans::REGULAR, 32.0, dark_on_light());
+    let request = json!({
+        "Document": raster_document(&page, ImageFormat::Png),
+        "FeatureTypes": ["FORMS"],
+    });
+    let (status, body) = call(&router, "AnalyzeDocument", &request).await;
+    assert_eq!(
+        status, 200,
+        "case analysis of an outline page: a readable page must be analysed, got {status} \
+         with {body}"
+    );
+    let blocks = blocks_of(&body);
+    let words = texts_of(&blocks, "WORD");
+    for number in NUMBERS {
+        assert!(
+            words.iter().any(|word| word == number),
+            "case analysis of an outline page: the figures of {number:?} are one word, got \
+             {words:?}"
+        );
+    }
+}

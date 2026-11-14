@@ -53,3 +53,5 @@ mod resource_tags;
 mod s3_sourced_documents;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/typefaces.rs"]
+mod typefaces;

@@ -27,14 +27,18 @@
 //!    lines; a vertical profile within one line gives its marks, and the way those marks
 //!    are spaced — against the cell a monospaced line sets them in, or against the pitch a
 //!    proportional one advances by — gives the word and column breaks ([`Separators`]).
+//!    Where a line sets its FIGURES on one advance, as a proportional face does, two of them
+//!    are separated by what their step covers past that advance rather than by the gap a
+//!    narrow figure leaves inside its own cell ([`figure_advance`]).
 //!    A run of inked columns is a candidate for ONE character, but at the size a page is
 //!    drawn at it can hold two whose strokes touch, or be what is left of one whose thin
 //!    stroke broke: which it is, is settled by NAMING ([`settle`]).
 //! 4. **Recognise** — each mark is resampled into a frame anchored on the line it sits in
 //!    and scored against every printable ASCII character of a bank of typefaces — the
-//!    embedded 8x8 font, a pre-rasterised sans-serif face at several weights and sizes,
-//!    and the X11 fixed bitmap faces — by how much of its ink and the character's is the
-//!    same ink ([`glyphs`]). The best match above [`glyphs::MIN_MATCH`] is the character;
+//!    embedded 8x8 font, a pre-rasterised sans-serif face at several weights and sizes, the
+//!    X11 fixed bitmap faces, and a proportional outline face rasterised at the sizes a page
+//!    is set at — by how much of its ink and the character's is the same ink ([`glyphs`]).
+//!    The best match above [`glyphs::MIN_MATCH`] is the character;
 //!    the mean winning score is the `Confidence` the blocks report, because it is the only
 //!    confidence anything here actually measured — per word, per line and per page, each
 //!    over the characters that block was read from.
@@ -59,8 +63,9 @@
 //! No maintained Rust crate performs offline OCR: the ones that exist either bind to a
 //! C library or load neural-network weights from a file this emulator may not fetch, so
 //! the recogniser itself is in-crate while the decoding (a format job) is the `image`
-//! crate's and the typefaces it holds templates for are the font crates' (`font8x8`,
-//! `noto-sans-mono-bitmap`, `embedded-graphics`).
+//! crate's, the typefaces it holds templates for are the font crates' (`font8x8`,
+//! `noto-sans-mono-bitmap`, `embedded-graphics`, `ttf-noto-sans`) and the rasterising of the
+//! outline face is `fontdue`'s.
 //!
 //! ## What it does not read
 //!
@@ -193,6 +198,16 @@ const WORD_GAP_PITCH: f32 = 0.4;
 /// is what keeps the boundary between two clusters of BEARINGS from being read as one
 /// between bearings and spaces.
 const MIN_SPACE_PITCH: f32 = 0.25;
+
+/// How much of the line's own character pitch the step from one FIGURE to the next must
+/// cover PAST the advance the face sets its figures on for a space to stand between them.
+///
+/// A figure's own cell is the advance, so two figures of one number step by the advance
+/// give or take where each inks inside it, while two figures with a space between them step
+/// by the advance plus the space's own width — about a quarter of an em, where a figure's
+/// advance is well over half of one. This sits between the two: above what inking a cell
+/// differently moves a figure by, and below the narrowest space a face sets.
+const FIGURE_SPACE_PITCH: f32 = 0.2;
 
 /// How many of the line's own character pitches a gap must cover to separate two COLUMNS
 /// rather than two words on a PROPORTIONAL line.
@@ -1449,7 +1464,10 @@ impl Ink {
         band: &InkLine,
         line: glyphs::Line,
     ) -> Vec<usize> {
-        let margin = (MIN_PIECE_WIDTH * line.cap).ceil() as usize;
+        // At least one column either side: what a cut separates is two characters, so the
+        // narrowest piece there can be is a column, and the column before the first of them
+        // is the one a valley is measured against.
+        let margin = (MIN_PIECE_WIDTH * line.cap).ceil().max(1.0) as usize;
         let from = run.x0 + margin;
         let Some(to) = run.x1.checked_sub(margin) else {
             return Vec::new();
@@ -1588,6 +1606,13 @@ impl GlyphBox {
 
     fn height(&self) -> usize {
         self.y1 + 1 - self.y0
+    }
+
+    /// How far this mark's left edge stands past `before`'s: the STEP from one mark to the
+    /// next, which is what a line that sets its characters on one advance separates them
+    /// by.
+    fn glyph_step_from(&self, before: &Self) -> f32 {
+        self.x0.saturating_sub(before.x0) as f32
     }
 }
 
@@ -1953,6 +1978,142 @@ fn settle_stems(marks: &[Settled], separated: &[(usize, Separation)]) -> Vec<(ch
     named
 }
 
+/// Whether the line's `step`-th named mark was read as a FIGURE.
+fn is_figure(named: &[(char, f32)], step: usize) -> bool {
+    named
+        .get(step)
+        .is_some_and(|(ch, _)| ch.is_ascii_digit())
+}
+
+/// The advance this line sets its FIGURES on, in pixels, or `None` for a line that sets no
+/// two figures side by side.
+///
+/// The median step from one figure to the next over the pairs of neighbouring figures the
+/// line's own gaps do not separate: those are figures of ONE number, so their step is the
+/// advance the face sets every figure on, whatever each of them inks inside it.
+///
+/// A line whose every pair of figures its gaps DO separate still sets them on that advance —
+/// a number of nothing but narrow figures leaves a gap like a space's at every one of its
+/// own steps — and there the smallest step two of its figures stand apart by is the estimate,
+/// since no two figures of one face stand closer together than its advance.
+fn figure_advance(
+    marks: &[Settled],
+    separated: &[(usize, Separation)],
+    named: &[(char, f32)],
+) -> Option<f32> {
+    let step_between = |step: usize| {
+        let before = marks[separated[step - 1].0].glyph;
+        let after = marks[separated[step].0].glyph;
+        after.glyph_step_from(&before)
+    };
+    let figures: Vec<usize> = (1..separated.len())
+        .filter(|step| is_figure(named, *step) && is_figure(named, step - 1))
+        .collect();
+    let together: Vec<f32> = figures
+        .iter()
+        .filter(|step| separated[**step].1 == Separation::None)
+        .map(|step| step_between(*step))
+        .collect();
+    median_of(&together).or_else(|| {
+        figures
+            .iter()
+            .map(|step| step_between(*step))
+            .reduce(f32::min)
+    })
+}
+
+/// How one line's named marks fall into WORDS: the separator rule the line's own marks set,
+/// what separates each named mark from the one before it, and the character each was read
+/// as.
+///
+/// [`Separated::marks`] and [`Separated::named`] are index-aligned, and both hold one entry
+/// per NAMED mark of the line in reading order: a mark that matched no glyph contributes no
+/// character and separates nothing.
+struct Separated {
+    separators: Separators,
+    marks: Vec<(usize, Separation)>,
+    named: Vec<(char, f32)>,
+}
+
+/// Separate one line's `marks` into its words, measured off THAT line's own marks.
+///
+/// The ONE place a line's word and column breaks are decided, so the text, the measured
+/// words and the reading of its bare stems cannot disagree about where its words are.
+fn separate(marks: &[Settled]) -> Separated {
+    let boxes: Vec<GlyphBox> = marks.iter().map(|mark| mark.glyph).collect();
+    let median_width = median(boxes.iter().map(GlyphBox::width)).unwrap_or(1.0);
+    let gaps: Vec<usize> = boxes
+        .windows(2)
+        .map(|pair| pair[1].x0.saturating_sub(pair[0].x1 + 1))
+        .collect();
+    // The STEP from each mark to the next: the pitch the line's characters are set at,
+    // which is what its word and column separators are measured against.
+    let steps: Vec<usize> = boxes
+        .windows(2)
+        .map(|pair| pair[1].x0.saturating_sub(pair[0].x0))
+        .collect();
+    // Which marks a line separates into words, and which into COLUMNS, is a property of
+    // THIS line's own marks: see [`Separators`].
+    let separators = Separators::of(&boxes, &gaps, &steps, median_width);
+    let mut separated: Vec<(usize, Separation)> = Vec::new();
+    let mut previous: Option<&GlyphBox> = None;
+    for (at, mark) in marks.iter().enumerate() {
+        if mark.named.is_none() {
+            continue;
+        }
+        let separation = match previous {
+            None => Separation::Word,
+            Some(before) => separators.between(before, &mark.glyph),
+        };
+        separated.push((at, separation));
+        previous = Some(&mark.glyph);
+    }
+    let named = settle_stems(marks, &separated);
+    // A face sets its FIGURES on one advance, so the gap a narrow figure leaves inside its
+    // own cell is as wide as a space's: where the line shows that advance, a mark that
+    // FOLLOWS a figure is separated by what its step covers past that advance rather than by
+    // the gap the figure's empty cell left (see [`Separators::between_set_on`]). It is the
+    // left mark that has to be the figure, since what the step covers is the advance of the
+    // mark it starts from — which is why the point of an amount stays part of it. The stems
+    // are then read again, since what a bare stem is depends on the word it stands in.
+    let named = match figure_advance(marks, &separated, &named) {
+        None => named,
+        Some(advance) => {
+            for step in 1..separated.len() {
+                if !is_figure(&named, step - 1) {
+                    continue;
+                }
+                let before = marks[separated[step - 1].0].glyph;
+                let after = marks[separated[step].0].glyph;
+                separated[step].1 = separators.between_set_on(&before, &after, advance);
+            }
+            settle_stems(marks, &separated)
+        }
+    };
+    Separated {
+        separators,
+        marks: separated,
+        named,
+    }
+}
+
+impl Separated {
+    /// The words this line was separated into, in reading order: a word is a run of named
+    /// marks nothing separates.
+    #[cfg(test)]
+    fn words(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (step, (_, separation)) in self.marks.iter().enumerate() {
+            let ch = self.named[step].0;
+            match out.last_mut() {
+                Some(word) if *separation == Separation::None => word.push(ch),
+                _ => out.push(String::from(ch)),
+            }
+        }
+        out
+    }
+}
+
 impl InkLine {
     /// Recognise this line: its characters, and the word and column breaks between them.
     /// `Ok(None)` when nothing in the line matched a glyph, so the line carries no text.
@@ -1963,21 +2124,12 @@ impl InkLine {
         // What its marks ARE: a run of inked columns is one mark only until the naming
         // says otherwise (see [`settle`]).
         let marks = settle(ink, self, line, budget)?;
-        let boxes: Vec<GlyphBox> = marks.iter().map(|mark| mark.glyph).collect();
-        let median_width = median(boxes.iter().map(GlyphBox::width)).unwrap_or(1.0);
-        let gaps: Vec<usize> = boxes
-            .windows(2)
-            .map(|pair| pair[1].x0.saturating_sub(pair[0].x1 + 1))
-            .collect();
-        // The STEP from each mark to the next: the pitch the line's characters are set at,
-        // which is what its word and column separators are measured against.
-        let steps: Vec<usize> = boxes
-            .windows(2)
-            .map(|pair| pair[1].x0.saturating_sub(pair[0].x0))
-            .collect();
-        // Which marks a line separates into words, and which into COLUMNS, is a property
-        // of THIS line's own marks: see [`Separators`].
-        let separators = Separators::of(&boxes, &gaps, &steps, median_width);
+        // Where this line's words are, and what each of its marks was read as.
+        let Separated {
+            separators,
+            marks: separated,
+            named,
+        } = separate(&marks);
         // The character cell the line's left margin is reported in, so a line that
         // starts half way across the page is laid out half way across its text.
         let cell = separators.cell();
@@ -1986,23 +2138,6 @@ impl InkLine {
         let mut score_total = 0.0f32;
         let mut score_count = 0usize;
         let mut words: Vec<WordRun> = Vec::new();
-        // What separates each named mark from the one before it, as this line's own marks
-        // separate them: the one list the text, the words and the ambiguity below all read,
-        // so they cannot disagree on where this line's words are.
-        let mut separated: Vec<(usize, Separation)> = Vec::new();
-        let mut previous: Option<&GlyphBox> = None;
-        for (at, mark) in marks.iter().enumerate() {
-            if mark.named.is_none() {
-                continue;
-            }
-            let separation = match previous {
-                None => Separation::Word,
-                Some(before) => separators.between(before, &mark.glyph),
-            };
-            separated.push((at, separation));
-            previous = Some(&mark.glyph);
-        }
-        let named = settle_stems(&marks, &separated);
 
         for (step, (at, separation)) in separated.iter().enumerate() {
             let glyph = &marks[*at].glyph;
@@ -2107,10 +2242,14 @@ enum Separation {
 ///   bearings and a cluster of spaces, and the boundary between the two is where the line
 ///   separates its words ([`Separators::clustered_gap`]). A line that shows no such
 ///   boundary is separated at a fixed part of its pitch ([`WORD_GAP_PITCH`]), which is
-///   what a line of one word needs so that nothing inside it is read as a space.
+///   what a line of one word needs so that nothing inside it is read as a space. Its
+///   FIGURES are the exception, since a proportional face sets those on one advance all the
+///   same: they are separated by their STEP past that advance
+///   ([`Separators::between_set_on`]).
 ///
 /// Measuring against the line's pitch rather than against an absolute width is what reads
 /// text drawn small and text drawn large by the one rule.
+#[derive(Debug)]
 enum Separators {
     /// The line is set on a lattice of this cell, in pixels.
     Monospaced { cell: f32 },
@@ -2217,7 +2356,7 @@ impl Separators {
     fn between(&self, before: &GlyphBox, after: &GlyphBox) -> Separation {
         let (measured, word, column) = match *self {
             Self::Monospaced { cell } => (
-                after.x0.saturating_sub(before.x0) as f32,
+                after.glyph_step_from(before),
                 LATTICE_WORD_CELLS * cell,
                 LATTICE_COLUMN_CELLS * cell,
             ),
@@ -2227,6 +2366,37 @@ impl Separators {
                 COLUMN_GAP_PITCH * pitch,
             ),
         };
+        Self::verdict(measured, word, column)
+    }
+
+    /// What separates two marks the line sets on ONE ADVANCE of `advance` pixels, whatever
+    /// each of them inks inside it: the step past that advance, rather than the gap their
+    /// own shapes leave.
+    ///
+    /// This is how a line separates its FIGURES. A face sets its figures on a single
+    /// advance — tabular figures, so columns of them line up — so a narrow figure leaves
+    /// the gap of its own empty cell either side of it, as wide as a space's, while the
+    /// step from one figure to the next is the advance whether the figure is a `1` or an
+    /// `8`. Measuring the gap there reads a number as several words; measuring the step
+    /// past the advance reads a space between two figures only where the line really left
+    /// one.
+    ///
+    /// A MONOSPACED line already measures every separation by the step it skips, so there
+    /// is nothing of its own for a figure to be measured by.
+    fn between_set_on(&self, before: &GlyphBox, after: &GlyphBox, advance: f32) -> Separation {
+        match *self {
+            Self::Monospaced { .. } => self.between(before, after),
+            Self::Proportional { pitch, .. } => Self::verdict(
+                after.glyph_step_from(before) - advance,
+                FIGURE_SPACE_PITCH * pitch,
+                COLUMN_GAP_PITCH * pitch,
+            ),
+        }
+    }
+
+    /// What a separation of `measured` pixels is, against the widths this line separates
+    /// its words and its columns at.
+    fn verdict(measured: f32, word: f32, column: f32) -> Separation {
         if measured >= column {
             Separation::Column
         } else if measured >= word {
@@ -2250,6 +2420,11 @@ impl Separators {
 
 #[cfg(test)]
 mod probe;
+
+/// How a line that sets its characters on one advance is separated into words.
+#[cfg(test)]
+#[path = "ocr/scratch.rs"]
+mod figures;
 
 #[cfg(test)]
 mod tests {

@@ -50,6 +50,16 @@ noto-sans-mono-bitmap = { version = "0.4", default-features = false, features = 
 # are a few strokes wide and are no outline face scaled down. Used for the embedded font
 # data alone — nothing here draws to a display.
 embedded-graphics = "0.8"
+# The Noto Sans OUTLINE face, the recogniser's fourth family of match templates: the
+# PROPORTIONAL sans-serif an ordinary document is set in, whose letters take the width of
+# their own ink rather than one cell. Font data only.
+ttf-noto-sans = { version = "0.1", default-features = false, features = [
+    "regular",
+    "bold",
+] }
+# Rasterises that outline face at the small pixel sizes documents are set at, so a
+# template is the glyph as it is really drawn at that size, anti-aliasing included.
+fontdue = { version = "0.9", default-features = false, features = ["std"] }
 # The Amazon S3 client this service reads a `Document.S3Object` / `DocumentLocation`
 # through, over the in-process callback into this same emulator (no network client
 # feature: the transport is the emulator's own).

@@ -4,11 +4,20 @@
 //! [`super::read_raster`].
 //!
 //! A mark is named by comparing it against a BANK of templates — every printable ASCII
-//! glyph of two typeface families, at several sizes and weights — and taking the character
+//! glyph of four typeface families, at several sizes and weights — and taking the character
 //! of the template whose ink it shares most of ([`Mark::agreement`], the Sørensen-Dice
 //! coefficient of the two). Nothing here looks at the request, at a digest or at the text
 //! of anything: a character is reported only because the ink the page carries is shaped
 //! like that character's.
+//!
+//! The families are what a document is really set in, because a mark is named after the
+//! template it is shaped most like and nothing else: an 8x8 bitmap font, a pre-rasterised
+//! sans-serif face at several weights and rasters, the X11 fixed faces at every raster they
+//! are cut at — and a PROPORTIONAL outline face, rasterised here at the sizes a page is set
+//! at. The first three are monospaced, and a monospaced cut is not the same letterform as a
+//! proportional one: it grows serifs on the narrow letters and takes the shoulders off the
+//! wide ones, which is exactly the ink that reads as another character when nothing shaped
+//! like a proportional letter is there to match it.
 //!
 //! ## One frame for both sides
 //!
@@ -95,6 +104,26 @@ pub(super) const FONT_CELL: usize = 8;
 /// metrics are measured off it: an anti-aliased edge carries less.
 const EXTENT_FLOOR: f32 = 0.4;
 
+/// The most pixels ONE CELL of the grid is measured over on a side. NOT an AWS limit: a cell
+/// of the frame covers a fraction of a capital height, so on a page whose capitals stand a
+/// few dozen pixels tall every pixel of a cell is measured, while on one whose marks are as
+/// tall as the page itself — a rule, a border, a stroke the length of a side — the cell's own
+/// mean is taken over this many of them instead. It is what keeps the work of measuring one
+/// mark a fixed amount rather than one that grows with the square of the page's own size.
+const MAX_CELL_SAMPLES: usize = 8;
+
+/// The most pixels ONE MARK's own ink is measured over on a side, for the same reason and in
+/// the same way ([`MAX_CELL_SAMPLES`]): a mark of any ordinary size is measured pixel by
+/// pixel, and one as large as a page is measured over this many of them.
+const MAX_MARK_SAMPLES: usize = 64;
+
+/// The step, in pixels, that measuring `span` pixels takes: every pixel of a span no longer
+/// than `samples`, and one in every few of a longer one, so the measurement always costs at
+/// most `samples` of them. Never zero.
+fn stride_over(span: f32, samples: usize) -> usize {
+    (span / samples as f32).ceil().max(1.0) as usize
+}
+
 /// The sizes and weights of the pre-rasterised typeface the bank's second family is taken
 /// from: every weight the face is cut in, since a light stroke and a bold one fill a frame
 /// differently, at a small and a large raster, since what anti-aliasing does to a glyph
@@ -108,16 +137,43 @@ const FACES: &[(FontWeight, RasterHeight)] = &[
     (FontWeight::Bold, RasterHeight::Size32),
 ];
 
+/// The weights and pixel sizes the PROPORTIONAL outline face the bank's fourth family is
+/// taken from is rasterised at.
+///
+/// A proportional face sets every letter in the width of its own ink — a narrow `l`, a wide
+/// `m` — so its letterforms are not the monospaced families' letterforms squeezed into one
+/// cell: in a monospaced cut the narrow letters grow serifs and the wide ones lose their
+/// shoulders, which is exactly the ink a comparison against a monospaced template alone
+/// reads as another character. The REGULAR cut is held at the small, middling and large
+/// rasters a document's own text is set at, because what anti-aliasing and hinting do to an
+/// outline a dozen pixels tall is part of that glyph's shape at that size; the BOLD cut is
+/// held at the small and middling ones, where its heavier stroke fills a glyph's counters
+/// and changes its shape, and not at the large raster, where a bold outline's own shape is
+/// what the regular templates at that size already carry.
+const OUTLINE_FACES: &[(&[u8], f32)] = &[
+    (ttf_noto_sans::REGULAR, 12.0),
+    (ttf_noto_sans::REGULAR, 18.0),
+    (ttf_noto_sans::REGULAR, 28.0),
+    (ttf_noto_sans::BOLD, 12.0),
+    (ttf_noto_sans::BOLD, 18.0),
+];
+
 /// The X11 fixed bitmap faces the bank's third family is taken from: small, middling and
 /// large, in regular and in bold, so a page set in a pixel font is matched against glyphs
 /// drawn the way that font draws them.
 const PIXEL_FACES: &[&MonoFont<'static>] = &[
     &ascii::FONT_4X6,
     &ascii::FONT_5X7,
+    &ascii::FONT_6X9,
     &ascii::FONT_6X10,
+    &ascii::FONT_6X12,
     &ascii::FONT_6X13,
     &ascii::FONT_6X13_BOLD,
+    &ascii::FONT_7X13,
+    &ascii::FONT_7X14,
+    &ascii::FONT_8X13,
     &ascii::FONT_9X15,
+    &ascii::FONT_9X18,
     &ascii::FONT_10X20,
 ];
 
@@ -202,18 +258,30 @@ impl Mark {
         // The proportions are measured off the PIXELS rather than off the grid: a grid cell
         // covers a tenth of a capital height, and rounding a mark's extent to whole cells
         // of it would leave two marks of the same proportions a cell apart as often as not.
+        //
+        // How much ink a mark carries is a mean over its own rectangle, so a mark larger
+        // than [`MAX_MARK_SAMPLES`] on a side is measured at one pixel in every few
+        // ([`stride_over`]): what the mean is taken over is bounded, and the pixels of a
+        // mark of any ordinary size are every one of them.
+        let (stride_x, stride_y) = (
+            stride_over((x1 + 1 - x0) as f32, MAX_MARK_SAMPLES),
+            stride_over((y1 + 1 - y0) as f32, MAX_MARK_SAMPLES),
+        );
         let mut ink = 0f32;
-        for y in y0..=y1 {
-            for x in x0..=x1 {
+        for y in (y0..=y1).step_by(stride_y) {
+            for x in (x0..=x1).step_by(stride_x) {
                 ink += stroke(coverage(x as isize, y as isize));
             }
         }
+        let sampled = (stride_x * stride_y) as f32;
         Self {
             fine_ink: fine.iter().sum(),
-            width: (x1 + 1 - x0) as f32 / line.cap,
-            height: (y1 + 1 - y0) as f32 / line.cap,
+            // Saturating: a mark is the rectangle its own ink occupies, so the narrowest and
+            // the shortest one there can be is a single pixel.
+            width: (x1.saturating_sub(x0) + 1) as f32 / line.cap,
+            height: (y1.saturating_sub(y0) + 1) as f32 / line.cap,
             top: (line.baseline - y0 as f32) / line.cap,
-            mass: ink / (line.cap * line.cap),
+            mass: ink * sampled / (line.cap * line.cap),
             fine,
         }
     }
@@ -333,6 +401,12 @@ fn dice(left: &[f32], left_ink: f32, right: &[f32], right_ink: f32) -> f32 {
 /// small that halo is a large part of the ink and on one drawn large a small part, and
 /// taking it at face value would read the small one as the bolder letter — its counters
 /// filled, its strokes run together.
+///
+/// A cell wider or taller than [`MAX_CELL_SAMPLES`] pixels is measured at one pixel in every
+/// few of it ([`stride_over`]), each standing for the pixels it starts: the cell's mean is
+/// then taken over a bounded number of them whatever the page's own size, and a cell of the
+/// size a page's glyphs set — a fraction of a capital height — is measured pixel by pixel as
+/// before.
 fn sample(
     coverage: &impl Fn(isize, isize) -> f32,
     centre: f32,
@@ -343,11 +417,13 @@ fn sample(
     let (left, top, width, height) = line.frame(centre);
     let step_x = width / grid as f32;
     let step_y = height / grid as f32;
-    // How much of `from..to` the pixel at `at` covers, where a pixel covers the square
-    // `at..at + 1` of the page.
-    let share = |at: isize, from: f32, to: f32| {
+    let stride_x = stride_over(step_x, MAX_CELL_SAMPLES);
+    let stride_y = stride_over(step_y, MAX_CELL_SAMPLES);
+    // How much of `from..to` the pixels at `at..at + stride` cover, where a pixel covers the
+    // square `at..at + 1` of the page.
+    let share = |at: isize, stride: usize, from: f32, to: f32| {
         let start = (at as f32).max(from);
-        let end = ((at + 1) as f32).min(to);
+        let end = ((at + stride as isize) as f32).min(to);
         (end - start).max(0.0)
     };
     for row in 0..grid {
@@ -357,18 +433,22 @@ fn sample(
             let from_x = left + column as f32 * step_x;
             let to_x = from_x + step_x;
             let mut total = 0f32;
-            for y in from_y.floor() as isize..to_y.ceil() as isize {
-                let down = share(y, from_y, to_y);
+            let mut y = from_y.floor() as isize;
+            while y < to_y.ceil() as isize {
+                let down = share(y, stride_y, from_y, to_y);
                 if down <= 0.0 {
+                    y += stride_y as isize;
                     continue;
                 }
-                for x in from_x.floor() as isize..to_x.ceil() as isize {
-                    let across = share(x, from_x, to_x);
-                    if across <= 0.0 {
-                        continue;
+                let mut x = from_x.floor() as isize;
+                while x < to_x.ceil() as isize {
+                    let across = share(x, stride_x, from_x, to_x);
+                    if across > 0.0 {
+                        total += down * across * stroke(coverage(x, y));
                     }
-                    total += down * across * stroke(coverage(x, y));
+                    x += stride_x as isize;
                 }
+                y += stride_y as isize;
             }
             out[row * grid + column] = total / (step_x * step_y);
         }
@@ -432,6 +512,11 @@ fn bank() -> &'static [Glyph] {
             .iter()
             .map(|(weight, height)| rastered_face(*weight, *height))
             .chain(PIXEL_FACES.iter().map(|font| pixel_face(font)))
+            .chain(
+                OUTLINE_FACES
+                    .iter()
+                    .map(|(face, size)| outline_face(face, *size)),
+            )
             .collect();
         (b'!'..=b'~')
             .filter_map(|code| {
@@ -571,6 +656,60 @@ fn pixel_face(font: &'static MonoFont<'static>) -> Box<dyn Fn(char) -> Option<Ma
         let own = extent(&ink, width, height)?;
         let mark = Mark::measure(&ink, own, line);
         Some(mark)
+    })
+}
+
+/// How one weight and pixel size of the PROPORTIONAL outline face draws one character,
+/// measured in the frame of its own line.
+///
+/// The face is an outline rather than a bitmap, so each glyph is rasterised here at the size
+/// asked for: `fontdue` hands back one byte of ink per pixel of the glyph's own ink box,
+/// with the metrics that place that box against the line's baseline. Every glyph of one
+/// size is therefore measured on ONE line, exactly as the bitmap families' are.
+///
+/// A face this emulator cannot parse contributes no template rather than a wrong one.
+fn outline_face(bytes: &'static [u8], size: f32) -> Box<dyn Fn(char) -> Option<Mark>> {
+    let settings = fontdue::FontSettings {
+        scale: size,
+        ..fontdue::FontSettings::default()
+    };
+    let Ok(font) = fontdue::Font::from_bytes(bytes, settings) else {
+        return Box::new(|_| None);
+    };
+    let ascent = font
+        .horizontal_line_metrics(size)
+        .map_or(size, |line| line.ascent);
+    // Where the foot of a capital falls in the frame below, and the room left above it for
+    // an accent and below it for a descender: a glyph's own raster is placed against this,
+    // so two glyphs of one face stand on the same row whatever each inks.
+    let pad = size.ceil().max(1.0) as isize;
+    let baseline = pad + ascent.round() as isize;
+    let placed = move |ch: char| {
+        let (metrics, bitmap) = font.rasterize(ch, size);
+        if metrics.width == 0 || metrics.height == 0 {
+            return None;
+        }
+        let (width, height) = (metrics.width, metrics.height);
+        // `ymin` is how far the foot of the glyph's ink box stands above the baseline, so
+        // its top row is that much more than its own height above it.
+        let top = baseline - (height as isize + metrics.ymin as isize);
+        let coverage = move |x: isize, y: isize| {
+            let row = y - top;
+            if x < 0 || row < 0 || x >= width as isize || row >= height as isize {
+                return 0.0;
+            }
+            bitmap
+                .get(row as usize * width + x as usize)
+                .map_or(0.0, |ink| f32::from(*ink) / 255.0)
+        };
+        Some((coverage, width, (top.max(0) as usize) + height))
+    };
+    let line = placed('H').and_then(|(ink, width, rows)| font_line(&ink, width, rows));
+    Box::new(move |ch: char| {
+        let line = line?;
+        let (ink, width, rows) = placed(ch)?;
+        let own = extent(&ink, width, rows)?;
+        Some(Mark::measure(&ink, own, line))
     })
 }
 
@@ -784,9 +923,11 @@ impl<const N: usize> Ranking<N> {
 /// through — is left out of both. A line no mark of that kind was found on is framed by the
 /// band of rows it inks.
 pub(super) fn line_of(glyphs: &[GlyphBox], top: usize, bottom: usize) -> Line {
+    // Saturating: the band's own rows are what this is measured over, so a band with
+    // nothing between its bounds is one row rather than a height no page has.
     let band = Line {
         baseline: (bottom + 1) as f32,
-        cap: (bottom + 1 - top).max(1) as f32,
+        cap: (bottom.saturating_sub(top) + 1) as f32,
     };
     let heights: Vec<f32> = glyphs.iter().map(|glyph| glyph.height() as f32).collect();
     let Some(middle) = super::quantile(&heights, 0.5) else {
@@ -834,7 +975,7 @@ mod tests {
         for candidate in &named {
             assert_eq!(
                 candidate.faces.len(),
-                FACES.len() + PIXEL_FACES.len() + 1,
+                FACES.len() + PIXEL_FACES.len() + OUTLINE_FACES.len() + 1,
                 "case {:?}: every face must draw it",
                 candidate.ch
             );
