@@ -111,8 +111,8 @@ fn assert_not_found_envelope(case: &str, reply: &Reply, arn: &str) -> String {
     let request_id = text(&reply.body, REQUEST_ID_KEY);
     assert!(
         is_request_id_shaped(&request_id),
-        "case {case:?}: expected the document's {REQUEST_ID_KEY} to take the 8-4-4-4-12 \
-         lowercase-hex form, got {request_id:?} in {}",
+        "case {case:?}: expected the document's {REQUEST_ID_KEY} to take the \
+         16-character base64 token form, got {request_id:?} in {}",
         reply.body
     );
     // The model's own detail member is not what a client reads: the text travels under

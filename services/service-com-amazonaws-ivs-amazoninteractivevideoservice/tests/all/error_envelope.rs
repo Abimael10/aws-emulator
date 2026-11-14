@@ -190,18 +190,14 @@ fn pattern_refusal(operation: &str, path: &str, pattern: &str) -> String {
     format!("{operation}.{path} does not match the required pattern {pattern}")
 }
 
-/// Whether `id` takes the 8-4-4-4-12 lowercase-hex form of the version-4 UUID an AWS
-/// request id is.
+/// Whether `id` takes the fixed-width base64 token form every response of this endpoint
+/// names the request it answers by.
+///
+/// The form itself is read by `request_id_token_form`'s `token_form_violation`, the one
+/// place this crate's suites state it, so this reader and that suite cannot disagree about
+/// what the wire contract is.
 pub(crate) fn is_request_id_shaped(id: &str) -> bool {
-    let groups: Vec<&str> = id.split('-').collect();
-    groups.iter().map(|group| group.len()).collect::<Vec<usize>>() == vec![8, 4, 4, 4, 12]
-        && groups.iter().all(|group| {
-            group
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        })
-        && groups[2].starts_with('4')
-        && groups[3].starts_with(['8', '9', 'a', 'b'])
+    crate::request_id_token_form::token_form_violation(id).is_none()
 }
 
 /// Rule 1 over ONE refusal: the document's three members, the three headers carrying the
@@ -251,8 +247,8 @@ fn assert_stated_failure(
     let request_id = answer.member(REQUEST_ID_KEY);
     assert!(
         is_request_id_shaped(request_id),
-        "case {case:?}: expected the document's {REQUEST_ID_KEY} to take the 8-4-4-4-12 \
-         lowercase-hex form, got {request_id:?} in {}",
+        "case {case:?}: expected the document's {REQUEST_ID_KEY} to take the \
+         16-character base64 token form, got {request_id:?} in {}",
         answer.body
     );
     assert_eq!(
@@ -493,8 +489,8 @@ async fn every_response_names_one_request_and_no_two_name_the_same() {
             let id = answer.header(REQUEST_ID_HEADER).to_string();
             assert!(
                 is_request_id_shaped(&id),
-                "round {round} {kind}: expected {REQUEST_ID_HEADER} to take the 8-4-4-4-12 \
-                 lowercase-hex form, got {id:?} in {:?}",
+                "round {round} {kind}: expected {REQUEST_ID_HEADER} to take the \
+                 16-character base64 token form, got {id:?} in {:?}",
                 answer.headers
             );
             named.push((format!("round {round} {kind}"), id));

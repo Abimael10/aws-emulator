@@ -56,7 +56,8 @@
 //! declares it, so no handler can carry it, and a failure must carry one exactly as a
 //! success does. Hence [`with_response_envelope`], applied at the one place every
 //! response an operation of this service answers passes through — [`StatedEnvelope`],
-//! the per-operation wrapper.
+//! the per-operation wrapper. What FORM that id takes is this endpoint's own, and is
+//! stated once in [`response_id`].
 //!
 //! # How this service words a refusal
 //!
@@ -107,6 +108,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 mod channel_projection;
+mod response_id;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::serde::SerdeError;
@@ -119,6 +121,7 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 use channel_projection::ChannelProjection;
+use response_id::new_request_id;
 
 /// The wire error code for a request this service refuses as invalid: the shape
 /// `com.amazonaws.ivs#ValidationException`, which every operation of this service lists.
@@ -163,25 +166,6 @@ const DOCUMENT_REQUEST_ID_KEY: &str = "RequestID";
 /// The lowest status that makes a response a failure, and so the responses the error
 /// document belongs on.
 const FIRST_ERROR_STATUS: u16 = 400;
-
-/// Mint the id ONE response names the request it answers with.
-///
-/// The canonical hyphenated form of a version-4 UUID, which is the form an AWS request id
-/// takes. The VALUE is per-response and is not a requirement: nothing can predict it and
-/// no caller may depend on a particular one. What it must do is name ONE response, which
-/// is what the randomness gives it. It is an identifier for correlation, never a secret:
-/// nothing authenticates with it, and nothing the REQUEST carried goes into it.
-///
-/// The randomness is the `uuid` crate's v4 generator, reached through
-/// `emulator_telemetry`'s uuid-backed id newtype (`BatchId::random()` is
-/// `uuid::Uuid::new_v4()` rendered canonically) — a crate this service ALREADY depends
-/// on — rather than by declaring a second path to the same crate or hand-rolling one.
-///
-/// A free function rather than a mint on the store: a failure the request boundary refused
-/// never reaches a handler, so the envelope that answers it has no state to reach.
-fn new_request_id() -> String {
-    ::emulator_telemetry::BatchId::random().as_str().to_string()
-}
 
 /// The error document this service answers `resp` with, when `resp` is a failure carrying
 /// a JSON body: the document the renderer already wrote, with the code, the text and the
@@ -255,8 +239,17 @@ struct RestatedError {
 /// first. Every header insert is FALLIBLE: a header the HTTP layer cannot represent is
 /// dropped rather than turned into a transport failure, which on the error path would
 /// replace a modelled 4xx with a 500 an SDK retries.
+///
+/// ONE id names one response: an id a renderer already put in [`REQUEST_ID_HEADER`] is the
+/// one the document states too, and a fresh one ([`new_request_id`]) is minted only when
+/// the response names no request yet — so the header and the document can never carry two
+/// different ids for the same response.
 fn with_response_envelope(mut resp: RtResponse) -> RtResponse {
-    let request_id = new_request_id();
+    let request_id = resp
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .map(str::to_string)
+        .unwrap_or_else(new_request_id);
     if let Some(restated) = error_document(&resp, &request_id) {
         // Only a renderer that advertised a length needs it corrected; the framework's
         // error renderers set `content-type` alone and leave framing to the transport.

@@ -53,6 +53,8 @@ mod recording_configuration_delete;
 mod recording_configuration_lifecycle;
 #[path = "all/recording_configuration_list.rs"]
 mod recording_configuration_list;
+#[path = "all/request_id_token_form.rs"]
+mod request_id_token_form;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/stated_failures.rs"]
