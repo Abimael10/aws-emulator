@@ -371,8 +371,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         };
-        if let Some(reason) = parameters_refusal {
-            return Err(invalid_argument(reason));
+        if let Some(refusal) = parameters_refusal {
+            return Err(UpdateDistributionTenantErrorModeled::InvalidArgument(refusal).into());
         }
 
         // "The ID of the target connection group": a connection group this emulator does

@@ -619,9 +619,9 @@ pub fn customizations_refusal(customizations: &Customizations) -> Option<String>
     None
 }
 
-/// Why `parameters` does not satisfy the `TenantConfig$ParameterDefinitions` of the
-/// multi-tenant distribution a tenant is created or updated under, or `None` when it
-/// does.
+/// The refusal `parameters` earns against the `TenantConfig$ParameterDefinitions` of the
+/// multi-tenant distribution a tenant is created or updated under, or `None` when the list
+/// satisfies them.
 ///
 /// "A parameter is specified as a key-value pair. A valid parameter value must exist for
 /// any parameter that is marked as required in the multi-tenant distribution" — so three
@@ -635,13 +635,17 @@ pub fn customizations_refusal(customizations: &Customizations) -> Option<String>
 /// (`ParameterDefinitionSchema`'s only member is optional), so there is nothing to require
 /// of the request for it.
 ///
-/// ONE rule for every operation that supplies a tenant's parameter values. The reason
-/// carries no error wording of its own, for the same reason [`domain_name_refusal`]'s
-/// does not.
+/// ONE rule for every operation that supplies a tenant's parameter values, and ONE producer
+/// of the refusal each half of it is reported with: the two halves that describe no parameter
+/// LIST state the constraint the request broke after the error shape's own sentence
+/// ([`invalid_tenant_parameters`]), while a required parameter left without a value is the
+/// condition this service has a fixed sentence of its own for
+/// ([`missing_tenant_parameter`]) — so the whole message is that sentence, and no operation
+/// prefixes anything onto it.
 pub fn parameter_refusal(
     definitions: &[ParameterDefinition],
     parameters: &[Parameter],
-) -> Option<String> {
+) -> Option<crate::ops::types::InvalidArgument> {
     // The definitions are INDEXED once, so the check costs one logarithmic lookup per
     // submitted value rather than a scan of the definitions per value: its cost is the
     // SUM of the two lengths, never their product.
@@ -660,16 +664,16 @@ pub fn parameter_refusal(
             .insert(parameter.name.as_str(), parameter.value.as_str())
             .is_some()
         {
-            return Some(format!(
+            return Some(invalid_tenant_parameters(format!(
                 "the parameter {} is named more than once",
                 parameter.name
-            ));
+            )));
         }
         if !defined.contains_key(parameter.name.as_str()) {
-            return Some(format!(
+            return Some(invalid_tenant_parameters(format!(
                 "the distribution defines no parameter named {}",
                 parameter.name
-            ));
+            )));
         }
     }
     for (name, schema) in &defined {
@@ -682,13 +686,45 @@ pub fn parameter_refusal(
                 .as_deref()
                 .is_some_and(|value| !value.is_empty());
         if schema.required && !supplied {
-            return Some(format!(
-                "the parameter {name} is required by the distribution and the request supplies \
-                 no value for it"
-            ));
+            return Some(missing_tenant_parameter());
         }
     }
     None
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) for a tenant request that supplies no value for
+/// a parameter the multi-tenant distribution requires.
+///
+/// The sentence is this service's fixed text for the condition
+/// ([`MISSING_TENANT_PARAMETER_MESSAGE`]): WHICH parameter a request has to supply is a
+/// property of the distribution's own `TenantConfig$ParameterDefinitions`, which the caller
+/// reads from the distribution, so the refusal states the condition and takes nothing from
+/// the request — every refusal of it reads the same, exactly as
+/// [`missing_certificate_for_domain`]'s does.
+pub fn missing_tenant_parameter() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(MISSING_TENANT_PARAMETER_MESSAGE.to_string()),
+    }
+}
+
+/// The message a tenant request that leaves a parameter the distribution requires without a
+/// value is refused with, on the wire.
+///
+/// Fixed text: it interpolates nothing, and in particular never names the parameter or the
+/// distribution.
+pub const MISSING_TENANT_PARAMETER_MESSAGE: &str =
+    "A parameter referenced in the multi-tenant distribution configuration is missing. \
+     Specify the parameter and try again.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a submitted parameter list that describes no
+/// list of values at all — one name twice, or a name the distribution defines nothing for —
+/// worded as the model documents the shape ("An argument is invalid.") followed by the
+/// constraint the request broke, which is how this crate words that family of refusal
+/// ([`invalid_realtime_log_config`] words its own the same way).
+fn invalid_tenant_parameters(reason: String) -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(format!("An argument is invalid: {reason}")),
+    }
 }
 
 /// The path of one origin access identity under this service's API version — the route

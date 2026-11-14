@@ -327,8 +327,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .and_then(|config| config.parameter_definitions.as_deref())
             .unwrap_or_default();
-        if let Some(reason) = crate::state::parameter_refusal(definitions, &parameters) {
-            return Err(invalid_argument(reason));
+        if let Some(refusal) = crate::state::parameter_refusal(definitions, &parameters) {
+            return Err(CreateDistributionTenantErrorModeled::InvalidArgument(refusal).into());
         }
 
         // "The ID of the connection group to associate with the distribution tenant." A

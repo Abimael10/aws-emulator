@@ -11,10 +11,10 @@
 //!
 //! The rows span what the rule generalises over:
 //!
-//! * the ENUM, which is what the order belongs to: `FunctionStage` and `CachePolicyType`,
-//!   whose published orders are not the orders the schema declares, and `IpAddressType` and
-//!   `OriginAccessControlSigningProtocols`, which this API publishes in the order it
-//!   declares them;
+//! * the ENUM, which is what the order belongs to: `FunctionStage`, `CachePolicyType` and
+//!   `OriginAccessControlSigningBehaviors`, whose published orders are not the orders the
+//!   schema declares, and `IpAddressType` and `OriginAccessControlSigningProtocols`, which
+//!   this API publishes in the order it declares them;
 //! * the OPERATION and the BINDING the value travelled in — a member of a request document,
 //!   a member nested inside a payload, a query parameter on a collection route and one
 //!   beside a path label — which say nothing about the value set, so the same enum is listed
@@ -50,6 +50,13 @@ const IP_ADDRESS_TYPE_SET: &str = "ipv4, ipv6, dualstack";
 /// (`smithy_query(query="shape",shape="OriginAccessControlSigningProtocols")`).
 const SIGNING_PROTOCOL_SET: &str = "sigv4, sigv4a";
 
+/// `OriginAccessControlSigningBehaviors` admits never, always, no-override and
+/// always-amz-auth, in that order
+/// (`smithy_query(query="shape",shape="OriginAccessControlSigningBehaviors")`), and is
+/// listed with the behaviour that signs and overrides an existing `Authorization` header
+/// first.
+const SIGNING_BEHAVIOR_SET: &str = "always-amz-auth, never, always, no-override";
+
 /// One case: an operation, the binding its enum-constrained member travels in, and what the
 /// refusal must say about it.
 struct Case {
@@ -82,6 +89,9 @@ enum Binding {
     CreateAnycastIpListAddressType,
     /// `CreateOriginAccessControl`: a member NESTED inside the request's payload.
     CreateOriginAccessControlSigningProtocol,
+    /// `CreateOriginAccessControl`: a second member nested inside that same payload, whose
+    /// enum this API publishes in an order of its own.
+    CreateOriginAccessControlSigningBehavior,
 }
 
 /// Every case the rule is asserted over.
@@ -128,6 +138,13 @@ fn cases() -> Vec<Case> {
             member: "originAccessControlConfig.signingProtocol",
             values: SIGNING_PROTOCOL_SET,
             binding: Binding::CreateOriginAccessControlSigningProtocol,
+        },
+        Case {
+            case: "a signing behaviour nested in a payload",
+            admitted: "no-override",
+            member: "originAccessControlConfig.signingBehavior",
+            values: SIGNING_BEHAVIOR_SET,
+            binding: Binding::CreateOriginAccessControlSigningBehavior,
         },
     ]
 }
@@ -222,6 +239,23 @@ async fn refuse(router: &MultiServiceRouter, binding: &Binding, value: &str) -> 
                  xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
                  <Name>enum-value-set-message</Name><SigningProtocol>{value}</SigningProtocol>\
                  <SigningBehavior>always</SigningBehavior><OriginAccessControlOriginType>s3\
+                 </OriginAccessControlOriginType></OriginAccessControlConfig>"
+            );
+            call(
+                router,
+                "POST",
+                &format!("/{API_VERSION}/origin-access-control"),
+                Some(&body),
+                None,
+            )
+            .await
+        }
+        Binding::CreateOriginAccessControlSigningBehavior => {
+            let body = format!(
+                "<OriginAccessControlConfig \
+                 xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
+                 <Name>enum-value-set-behavior</Name><SigningProtocol>sigv4</SigningProtocol>\
+                 <SigningBehavior>{value}</SigningBehavior><OriginAccessControlOriginType>s3\
                  </OriginAccessControlOriginType></OriginAccessControlConfig>"
             );
             call(

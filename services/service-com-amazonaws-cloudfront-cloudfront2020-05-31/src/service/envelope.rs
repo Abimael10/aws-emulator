@@ -401,6 +401,12 @@ const STATED_VALUE_ORDERS: &[&[&str]] = &[
     // caller-owned kind first, which is not the order the schema declares
     // (`smithy_query(query="shape",shape="CachePolicyType")` -> managed, custom).
     &["custom", "managed"],
+    // `OriginAccessControlSigningBehaviors`, the signing behaviour an origin access control
+    // states: the service lists the behaviour that signs and overrides an existing
+    // `Authorization` header first, which is not the order the schema declares
+    // (`smithy_query(query="shape",shape="OriginAccessControlSigningBehaviors")` -> never,
+    // always, no-override, always-amz-auth).
+    &["always-amz-auth", "never", "always", "no-override"],
 ];
 
 /// `refusal` with the enum's admitted values listed in the order this service publishes that
@@ -747,9 +753,10 @@ mod tests {
     fn an_enum_refusals_value_set_is_listed_in_the_services_order() {
         // (case, the set as the boundary listed it, the set as this service lists it). The
         // value sets come from `smithy_query(query="shape",shape="…")`: FunctionStage
-        // (DEVELOPMENT, LIVE), CachePolicyType (managed, custom) and IpAddressType (ipv4,
-        // ipv6, dualstack).
-        let rows: [(&str, &str, &str); 5] = [
+        // (DEVELOPMENT, LIVE), CachePolicyType (managed, custom), IpAddressType (ipv4,
+        // ipv6, dualstack) and OriginAccessControlSigningBehaviors (never, always,
+        // no-override, always-amz-auth).
+        let rows: [(&str, &str, &str); 7] = [
             (
                 "the stage set as the schema declares it",
                 "[DEVELOPMENT, LIVE]",
@@ -774,6 +781,16 @@ mod tests {
                 "a one-value set holding a stage",
                 "[DEVELOPMENT]",
                 "[DEVELOPMENT]",
+            ),
+            (
+                "the signing-behaviour set as the schema declares it",
+                "[never, always, no-override, always-amz-auth]",
+                "[always-amz-auth, never, always, no-override]",
+            ),
+            (
+                "the signing-behaviour set already in the order the service lists it",
+                "[always-amz-auth, never, always, no-override]",
+                "[always-amz-auth, never, always, no-override]",
             ),
         ];
 

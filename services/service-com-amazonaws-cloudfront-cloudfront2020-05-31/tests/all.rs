@@ -364,6 +364,8 @@ mod tenant_invalidation_batch_quantity;
 mod tenant_invalidations;
 #[path = "all/tenant_parameter_references.rs"]
 mod tenant_parameter_references;
+#[path = "all/tenant_parameter_values.rs"]
+mod tenant_parameter_values;
 #[path = "all/tenant_unvalidated_domain_claim.rs"]
 mod tenant_unvalidated_domain_claim;
 #[path = "all/tenant_web_acl_association.rs"]
