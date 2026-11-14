@@ -4561,3 +4561,8 @@ mod apigateway_lambda_ddb_s3_trace_tree;
 // ordinary comments: declare each suite ONCE, since this is one crate root and a second
 // `mod` for the same name is `E0428`, and a note written with `//!` anywhere but the header
 // is `E0753` — either fails every suite in this target.)
+// line past the first item of this crate root is `E0753` and compiles no suite.)
+// leaving a note in the tail. (These six lines landed here as `//!`, which is exactly the
+// `E0753` they describe, so they stand as ordinary comments.)
+// leaving a note here. (Ordinary comments: an inner doc comment mid-file is `E0753`.)
+// comments here, for the reason they themselves record.)

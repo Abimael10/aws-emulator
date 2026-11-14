@@ -49,6 +49,8 @@ mod state_roundtrip;
 mod storage_profile;
 #[path = "all/update_fleet.rs"]
 mod update_fleet;
+#[path = "all/update_queue_fleet_association.rs"]
+mod update_queue_fleet_association;
 #[path = "all/update_worker.rs"]
 mod update_worker;
 #[path = "all/worker.rs"]

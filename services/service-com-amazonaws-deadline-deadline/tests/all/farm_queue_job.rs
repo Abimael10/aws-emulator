@@ -158,6 +158,13 @@ impl Emulator {
     }
 }
 
+/// The principal every call of this harness is made by: [`Emulator::call`] signs with the
+/// access key id `AKIDEXAMPLE`, and the service reports a caller as an IAM user ARN of it.
+///
+/// `pub(crate)` so every suite in this test target expects the one principal from the one
+/// place rather than spelling it out again.
+pub(crate) const CALLER: &str = "arn:aws:iam::000000000000:user/AKIDEXAMPLE";
+
 pub(crate) fn id_of(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)

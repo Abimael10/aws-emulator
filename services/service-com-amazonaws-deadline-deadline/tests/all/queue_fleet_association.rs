@@ -34,13 +34,18 @@ const PAST_THE_DRAIN: Duration = Duration::from_millis(3_400);
 
 /// `PUT /2023-10-12/farms/{farmId}/queue-fleet-associations` — where an association is
 /// created.
-fn create_association_path(farm_id: &str) -> String {
+///
+/// `pub(crate)` so every suite in this test target reaches an association through the one
+/// path the model lays out rather than spelling it again.
+pub(crate) fn create_association_path(farm_id: &str) -> String {
     format!("/2023-10-12/farms/{farm_id}/queue-fleet-associations")
 }
 
 /// `GET|PATCH|DELETE /2023-10-12/farms/{farmId}/queue-fleet-associations/{queueId}/{fleetId}`
 /// — where one association is read, updated and deleted.
-fn association_path(farm_id: &str, queue_id: &str, fleet_id: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`create_association_path`].
+pub(crate) fn association_path(farm_id: &str, queue_id: &str, fleet_id: &str) -> String {
     format!("/2023-10-12/farms/{farm_id}/queue-fleet-associations/{queue_id}/{fleet_id}")
 }
 
@@ -53,7 +58,9 @@ pub(crate) fn association_id(farm_id: &str, queue_id: &str, fleet_id: &str) -> S
 }
 
 /// Associate `queue_id` with `fleet_id` under `farm_id`.
-async fn associate(emulator: &Emulator, farm_id: &str, queue_id: &str, fleet_id: &str) {
+///
+/// `pub(crate)` so every suite in this test target sets an association up the same way.
+pub(crate) async fn associate(emulator: &Emulator, farm_id: &str, queue_id: &str, fleet_id: &str) {
     let (status, body) = emulator
         .call(
             "PUT",
@@ -69,7 +76,10 @@ async fn associate(emulator: &Emulator, farm_id: &str, queue_id: &str, fleet_id:
 }
 
 /// Ask the association of `queue_id` and `fleet_id` for `status`.
-async fn ask_for_status(
+///
+/// `pub(crate)` so every suite in this test target drives `UpdateQueueFleetAssociation`
+/// through the one request shape the model lays out.
+pub(crate) async fn ask_for_status(
     emulator: &Emulator,
     farm_id: &str,
     queue_id: &str,

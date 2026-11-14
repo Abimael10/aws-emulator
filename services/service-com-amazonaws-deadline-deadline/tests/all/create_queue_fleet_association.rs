@@ -26,12 +26,8 @@
 
 use serde_json::{json, Value};
 
-use crate::farm_queue_job::{absent_id, error_code, string_at, Emulator};
+use crate::farm_queue_job::{absent_id, error_code, string_at, Emulator, CALLER};
 use crate::fleet::create_fleet;
-
-/// The principal the harness signs with: `extract_akid` reads `AKIDEXAMPLE` out of its
-/// `authorization` header, and the service reports a caller as an IAM user ARN of it.
-const CALLER: &str = "arn:aws:iam::000000000000:user/AKIDEXAMPLE";
 
 /// `PUT /2023-10-12/farms/{farmId}/queue-fleet-associations` — where an association is
 /// created, with `queueId` and `fleetId` in the body.
