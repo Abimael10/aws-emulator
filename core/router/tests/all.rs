@@ -4270,3 +4270,5 @@ mod cloudformation_appsync_custom_domains;
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that,
 // which is why this note stands as an ordinary comment rather than a doc comment.
 // leaving a note here. (An ordinary comment: a `//!` line in this tail is `E0753`.)
+// (A fragment of that same header line, an ordinary comment here because an inner doc
+// comment is legal only before the first item of this crate root.)

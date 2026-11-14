@@ -233,6 +233,9 @@ pub struct PublishedInstanceTypeFacts {
     /// type whose cores sit on more than one processor socket takes them one per socket, so
     /// its counts are multiples of the sockets rather than every count up to its default.
     pub valid_core_step: Option<i32>,
+    /// The smallest core count AWS publishes for the type, where its published list starts
+    /// above its step rather than at it.
+    pub valid_core_minimum: Option<i32>,
     /// Its EBS-optimized performance.
     pub ebs_performance: Option<PublishedEbsPerformance>,
     /// How many Amazon EBS volumes it can hold attached.
@@ -323,6 +326,7 @@ impl PublishedInstanceTypeFacts {
             memory_mib: None,
             default_vcpus: None,
             valid_core_step: None,
+            valid_core_minimum: None,
             ebs_performance: None,
             maximum_ebs_attachments: None,
             attachment_limit_type: None,
@@ -381,6 +385,13 @@ impl PublishedInstanceTypeFacts {
     /// sit on that many processor sockets and are taken one per socket.
     const fn cores_in_steps_of(mut self, sockets: i32) -> Self {
         self.valid_core_step = Some(sockets);
+        self
+    }
+
+    /// The smallest core count AWS's published list for the type starts at, where that is
+    /// above the step the counts go up in.
+    const fn cores_from(mut self, minimum: i32) -> Self {
+        self.valid_core_minimum = Some(minimum);
         self
     }
 
@@ -1095,6 +1106,97 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .processor("AMD", 3.3)
         .dedicated_hosts(false)
         .hibernation(false),
+    // C5d — the C5 family's hardware with local NVMe SSD devices, on the same Intel Xeon
+    // Platinum processors: the 8124M (Skylake) at a sustained 3.4 GHz on most of the ladder,
+    // and the 8275CL (Cascade Lake) at a sustained 3.6 GHz on the sizes built on it
+    // (`12xlarge`, `24xlarge` and the bare metal size). Its EBS figures are the family's own
+    // rows of "Amazon EBS optimized instance types" — the three smallest sizes publish a
+    // baseline they burst above, up to 4,750 Mbps and 20,000 IOPS, and the bandwidth is
+    // dedicated from the `4xlarge` up, two sizes sharing each of the figures above that one —
+    // and its local devices are the ones its specification page publishes per size: ONE device
+    // that doubles with the size up to 900 GB, then two and four of that device, which is a
+    // step of its own rather than a share of the size. Those devices come out of the shared
+    // Nitro attachment pool on every virtualized size, so the EBS volume limit each of those
+    // reports is what the pool leaves once they are counted and those rows leave it unset; the
+    // BARE METAL size publishes the limit of a bare metal instance instead — its local devices
+    // are the host's own hardware rather than attachments a hypervisor presents, so they take
+    // nothing from it — which is the 31 volumes "Instance volume limits" publishes for one.
+    // Reboot migration moves a running instance to another host, which cannot carry the local
+    // devices' data, so no size of the family is offered it, and a PTP hardware clock is not on
+    // this hardware generation. The published core counts go up in twos from the `xlarge` and
+    // start at four on the `18xlarge`, whose published list begins above that step, while the
+    // bare metal size publishes every count. Dedicated Hosts are offered on the family except
+    // on the bare metal size, which holds the whole host; that size is offered the legacy BIOS
+    // boot mode alone, and the packets of a session CAN be mirrored on it.
+    PublishedInstanceTypeFacts::of("c5d.large")
+        .ebs(650, 4_000, 4_750, 20_000)
+        .instance_store(1, 50)
+        .network("Up to 10 Gigabit")
+        .processor("Intel", 3.4)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c5d.xlarge")
+        .cores_in_steps_of(2)
+        .ebs(1_150, 6_000, 4_750, 20_000)
+        .instance_store(1, 100)
+        .network("Up to 10 Gigabit")
+        .processor("Intel", 3.4)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c5d.2xlarge")
+        .cores_in_steps_of(2)
+        .ebs(2_300, 10_000, 4_750, 20_000)
+        .instance_store(1, 200)
+        .network("Up to 10 Gigabit")
+        .processor("Intel", 3.4)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c5d.4xlarge")
+        .cores_in_steps_of(2)
+        .ebs(4_750, 20_000, 4_750, 20_000)
+        .instance_store(1, 400)
+        .network("Up to 10 Gigabit")
+        .processor("Intel", 3.4)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c5d.9xlarge")
+        .cores_in_steps_of(2)
+        .ebs(9_500, 40_000, 9_500, 40_000)
+        .instance_store(1, 900)
+        // The two sizes carved out of the same half of the host report the same figure, which
+        // is the one the API publishes for them rather than the round number of the family's
+        // specification page.
+        .network("12 Gigabit")
+        .processor("Intel", 3.4)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c5d.12xlarge")
+        .cores_in_steps_of(2)
+        .ebs(9_500, 40_000, 9_500, 40_000)
+        .instance_store(2, 900)
+        .network("12 Gigabit")
+        .processor("Intel", 3.6)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c5d.18xlarge")
+        .cores_in_steps_of(2)
+        .cores_from(4)
+        .ebs(19_000, 80_000, 19_000, 80_000)
+        .instance_store(2, 900)
+        .network("25 Gigabit")
+        .processor("Intel", 3.4)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c5d.24xlarge")
+        .cores_in_steps_of(2)
+        .ebs(19_000, 80_000, 19_000, 80_000)
+        .instance_store(4, 900)
+        .network("25 Gigabit")
+        .processor("Intel", 3.6)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c5d.metal")
+        .ebs(19_000, 80_000, 19_000, 80_000)
+        .ebs_attachments(31)
+        .instance_store(4, 900)
+        .network("25 Gigabit")
+        .processor("Intel", 3.6)
+        .dedicated_hosts(false)
+        .traffic_mirroring(true)
+        .host_features(false, false)
+        .boot_modes(&["legacy-bios"]),
     // C9gd — compute optimized with local NVMe on the newest AWS Graviton hardware. The
     // family's network and EBS bandwidth is CONFIGURABLE: it publishes the bandwidth
     // weightings a launch may ask for, which the families whose split is fixed publish none

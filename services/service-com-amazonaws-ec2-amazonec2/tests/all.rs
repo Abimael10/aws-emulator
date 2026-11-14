@@ -15,6 +15,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// Every size of a compute optimized family whose sizes carry local NVMe devices: the EBS
+// figures, the attachment limit, the local devices, the network performance, the processor's
+// sustained frequency, the core counts and the host features of each one, served from that
+// type's own published catalog row rather than scaled from the size multiplier in its name.
+// Declared beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood
+// and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/published_nvme_compute_catalog_rows.rs"]
+mod published_nvme_compute_catalog_rows;
 // `ModifyInstanceAttribute`: the one attribute a modify writes onto the stored instance, read
 // back through the attribute read, the instance report and the interface or volume that
 // carries it, plus what it refuses. Declared beside `prefix_lists` for the reason the note

@@ -1967,6 +1967,10 @@ pub struct InstanceTypeRecord {
     /// count up to its default can be configured, and the processor sockets its cores sit on
     /// where AWS publishes the counts one per socket.
     pub valid_core_step: i32,
+    /// The SMALLEST core count a caller may ask this type for, where AWS's published list for
+    /// it starts above its step: the counts below that floor are not offered on the type's
+    /// hardware, so neither the report nor a request may name one.
+    pub valid_core_minimum: i32,
     /// Does it run on the AWS Nitro System?
     pub nitro: bool,
     /// The processor architecture, one value of the modelled `ArchitectureValues`.
@@ -1985,11 +1989,13 @@ impl InstanceTypeRecord {
     /// The core counts a caller may ask this instance type for: "the number of cores
     /// that can be configured for the instance type"
     /// (`VCpuInfo$ValidCores`) — up to the type's own default, in the steps its cores are
-    /// configured in ([`InstanceTypeRecord::valid_core_step`]).
+    /// configured in ([`InstanceTypeRecord::valid_core_step`]) and from the smallest count
+    /// its hardware is offered with ([`InstanceTypeRecord::valid_core_minimum`]).
     pub fn valid_cores(&self) -> Vec<i32> {
         let step = self.valid_core_step.max(EVERY_CORE_COUNT);
+        let minimum = self.valid_core_minimum.max(EVERY_CORE_COUNT);
         let counts: Vec<i32> = (1..=self.default_cores)
-            .filter(|cores| cores % step == 0)
+            .filter(|cores| cores % step == 0 && *cores >= minimum)
             .collect();
         // A type with fewer cores than its own step takes them all or none, so the one count
         // it can be configured with is its default.
@@ -2109,6 +2115,9 @@ pub fn instance_type_record(instance_type: &str) -> Option<InstanceTypeRecord> {
             .unwrap_or_else(|| name.current_generation()),
         valid_core_step: facts
             .and_then(|facts| facts.valid_core_step)
+            .unwrap_or(EVERY_CORE_COUNT),
+        valid_core_minimum: facts
+            .and_then(|facts| facts.valid_core_minimum)
             .unwrap_or(EVERY_CORE_COUNT),
         nitro: name.nitro(),
         architecture,
