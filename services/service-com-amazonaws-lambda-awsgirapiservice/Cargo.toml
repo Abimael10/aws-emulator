@@ -353,6 +353,12 @@ service-com-amazonaws-pipes-pipes = { workspace = true }
 # submitted is asserted where a client reads it, through that service's own BatchGetTraces and
 # GetTraceSummaries.
 service-com-amazonaws-xray-awsxray = { workspace = true }
+# The Bedrock Agent runtime plane a handler's own agent invocation and knowledge-base retrieval
+# reach, and the serverless search plane its collection create reaches, mounted beside lambda on
+# ONE engine: each refusal a handler reports is the one that service itself answered, and the
+# collection it created is read back through that service's own API.
+service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice = { workspace = true }
+service-com-amazonaws-opensearchserverless-opensearchserverless = { workspace = true }
 
 [lints]
 workspace = true

@@ -277,6 +277,8 @@ mod handler_appconfig_execution_role;
 mod handler_appconfig_sdk;
 #[path = "all/handler_aws_sdk.rs"]
 mod handler_aws_sdk;
+#[path = "all/handler_bedrock_agent_sdk.rs"]
+mod handler_bedrock_agent_sdk;
 #[path = "all/handler_bucket_administration_sdk.rs"]
 mod handler_bucket_administration_sdk;
 #[path = "all/handler_customer_key_access.rs"]

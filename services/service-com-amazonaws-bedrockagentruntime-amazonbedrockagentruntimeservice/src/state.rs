@@ -105,6 +105,15 @@ pub const ARN_NAMESPACE: &str = "bedrock";
 /// "The number of requests exceeds the service quota") instead of allocating. They
 /// are the emulator's own limits, deliberately not presented as the real service's
 /// published quotas, and each is far above any plausible test or demo workload.
+///
+/// The guards of the two CONVERSATION stores below are declared beside the records they
+/// bound rather than here, and are the same kind of limit enforced the same way:
+/// [`knowledge_base_session::MAX_KNOWLEDGE_BASE_SESSIONS`] and
+/// [`knowledge_base_session::MAX_TURNS_PER_KNOWLEDGE_BASE_SESSION`] bound what
+/// `RetrieveAndGenerate` writes, and [`inline_agent::MAX_INLINE_AGENT_SESSIONS`] and
+/// [`inline_agent::MAX_TURNS_PER_INLINE_AGENT_SESSION`] what `InvokeInlineAgent` writes.
+/// So every growable collection of this store has a declared ceiling, and the writer past
+/// it answers the modelled `ServiceQuotaExceededException` instead of allocating.
 pub const MAX_SESSIONS: usize = 1_000;
 
 /// Resource guard: the most invocations one session holds. See [`MAX_SESSIONS`].
@@ -237,11 +246,27 @@ pub struct ComAmazonawsBedrockagentruntimeAmazonbedrockagentruntimeserviceState 
     /// Every conversational session a `RetrieveAndGenerate` has opened, keyed by the
     /// `sessionId` this service minted for it. See [`knowledge_base_session`] for what a
     /// session holds and why a caller can only continue one it was handed.
+    ///
+    /// BOUNDED like every other growable collection here (see [`MAX_SESSIONS`]): a call that
+    /// would open one past [`knowledge_base_session::MAX_KNOWLEDGE_BASE_SESSIONS`], or record
+    /// a turn past [`knowledge_base_session::MAX_TURNS_PER_KNOWLEDGE_BASE_SESSION`], answers
+    /// the modelled `ServiceQuotaExceededException` instead of growing this map
+    /// (`ops/retrieve_and_generate.rs`).
     pub knowledge_base_sessions: BTreeMap<String, knowledge_base_session::KnowledgeBaseSession>,
     /// Every conversation an `InvokeInlineAgent` has opened, keyed by the `sessionId` the
     /// CALLER chose for it — an inline agent is composed by the request, so the id is the
     /// caller's. See [`inline_agent`] for what a conversation holds, and for the three rules
     /// that open, continue and release one.
+    ///
+    /// The key is the caller's, so this map is BOUNDED both ways: a request whose id this
+    /// store holds none of opens a conversation only while the map is under
+    /// [`inline_agent::MAX_INLINE_AGENT_SESSIONS`], a turn is recorded only while the
+    /// conversation is under [`inline_agent::MAX_TURNS_PER_INLINE_AGENT_SESSION`], and past
+    /// either the call answers the modelled `ServiceQuotaExceededException` rather than
+    /// allocating (`ops/invoke_inline_agent.rs`). It is also RELEASED without a delete: every
+    /// such call first materialises the idle expiry the clock already owes
+    /// ([`inline_agent::expire_idle_conversations`]), so a conversation nobody continues
+    /// stops holding memory.
     pub inline_agent_sessions: BTreeMap<String, inline_agent::InlineAgentSession>,
     /// Monotonic counter handing out [`InvocationStepRecord::order`] values.
     pub order_counter: u64,
@@ -530,9 +555,11 @@ pub const ACTION_PREFIX: &str = ARN_NAMESPACE;
 ///
 /// * the account's own published credential (the long-term key this emulator hands out),
 ///   which is the position AWS account root credentials are in: allowed;
-/// * a principal with an AWS-MANAGED policy attached, whose document the IAM store
-///   deliberately does not hold (`iam_state::AWS_MANAGED_POLICY_ACCOUNT`): allowed,
-///   because refusing on a grant this emulator cannot read would deny access AWS permits;
+/// * a principal carrying an attachment this emulator holds NO document for anywhere —
+///   an AWS-managed policy (`iam_state::AWS_MANAGED_POLICY_ACCOUNT`) outside the catalog
+///   IAM publishes documents for: allowed, because refusing on a grant this emulator
+///   cannot read would deny access AWS permits. An AWS-managed policy that catalog DOES
+///   carry is read like any other attachment, so what it grants is what it grants;
 /// * an expired session credential, which speaks for nobody: refused.
 pub fn authorize<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -640,14 +667,19 @@ pub fn caller<Eng: Send + Sync + 'static>(
             .into_iter()
             .flatten()
         {
-            match store
-                .policy_by_arn(attached)
-                .and_then(default_version_document)
-            {
+            // Read through IAM's OWN resolution of what an attached policy grants
+            // (`iam_state::…State::default_version_document`): the document of the
+            // policy's DEFAULT version, from the account's own store for a policy it
+            // created and from AWS's published catalog for a policy AWS owns. So this
+            // decision reads an attachment exactly as every other reader of one does,
+            // and an identity carrying one is decided on what that policy really grants.
+            match store.default_version_document(attached) {
                 Some(document) => caller.documents.push(document),
-                // Only an AWS-MANAGED policy is a grant this emulator cannot read; an
-                // attachment naming a customer-managed policy the account does not hold
-                // grants nothing, because the account IS the authority on its own.
+                // Only an attachment NO document is held for anywhere is a grant this
+                // emulator cannot read, and that is an AWS-managed policy outside the
+                // catalog above; an attachment naming a customer-managed policy the
+                // account does not hold grants nothing, because the account IS the
+                // authority on its own.
                 None if is_aws_managed_policy(attached) => caller.unbounded = true,
                 None => {}
             }
@@ -662,9 +694,8 @@ pub fn caller<Eng: Send + Sync + 'static>(
 }
 
 /// Whether `arn` names an AWS-MANAGED policy: one whose account segment is IAM's `aws`,
-/// so it belongs to AWS rather than to this account and the IAM store holds no document
-/// for it. Read through IAM's own ARN parser, so this service and IAM agree on what an
-/// AWS-managed policy ARN is.
+/// so it belongs to AWS rather than to this account. Read through IAM's own ARN parser, so
+/// this service and IAM agree on what an AWS-managed policy ARN is.
 fn is_aws_managed_policy(arn: &str) -> bool {
     iam_state::parse_policy_arn(arn)
         .is_some_and(|policy| policy.account == iam_state::AWS_MANAGED_POLICY_ACCOUNT)
@@ -737,21 +768,4 @@ fn inline_documents(
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// The document of a managed policy's DEFAULT version — the one in force on every entity
-/// it is attached to. `None` when the store holds no document for it.
-fn default_version_document(managed: &iam_state::ManagedPolicy) -> Option<String> {
-    let default = managed.policy.default_version_id.as_deref();
-    managed
-        .versions
-        .values()
-        .find(|version| default.is_some() && version.version_id.as_deref() == default)
-        .or_else(|| {
-            managed
-                .versions
-                .values()
-                .find(|version| version.is_default_version)
-        })
-        .and_then(|version| version.document.clone())
 }

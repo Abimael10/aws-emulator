@@ -248,6 +248,26 @@ impl Emulator {
         )
     }
 
+    /// Attach the managed policy `policy_arn` to `role_name`, with IAM's own operation —
+    /// which is how a role carries a grant it did not write itself.
+    pub(crate) async fn attach_role_policy(&self, role_name: &str, policy_arn: &str) {
+        let (status, body) = self
+            .query(
+                "iam",
+                "2010-05-08",
+                "AttachRolePolicy",
+                &[
+                    ("RoleName", role_name.to_string()),
+                    ("PolicyArn", policy_arn.to_string()),
+                ],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "setup: attaching {policy_arn:?} to {role_name:?} must succeed, got {status} {body}"
+        );
+    }
+
     /// Create an IAM role, give it `policy` as an inline policy when one is supplied,
     /// assume it through STS, and answer the access key id of the session — the credential
     /// a caller then signs its Bedrock requests with.

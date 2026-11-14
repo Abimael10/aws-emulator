@@ -31,6 +31,8 @@ mod invocations;
 mod knowledge_base_retrieval;
 #[path = "all/list_sessions.rs"]
 mod list_sessions;
+#[path = "all/managed_policy_attachment_authorization.rs"]
+mod managed_policy_attachment_authorization;
 #[path = "all/pattern_constraint_messages.rs"]
 mod pattern_constraint_messages;
 #[path = "all/prompt_optimization.rs"]

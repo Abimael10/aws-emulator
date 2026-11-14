@@ -782,6 +782,49 @@ pub const APIS: &[Api] = &[
         },
         answer_model: None,
     },
+    // `services/service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice/
+    // smithy-model/com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice.json`:
+    // restJson1, sigv4Name `bedrock`, endpointPrefix `bedrock-agent-runtime`, sdkId
+    // `Bedrock Agent Runtime`. Its requests are bound per operation out of that same model
+    // ([`BEDROCK_AGENT_RUNTIME`]).
+    //
+    // THE GLUE OF AN AGENT is the shape that reaches this service: a function invoked by a
+    // user-facing surface asks an agent alias to answer the turn (`InvokeAgent`) or queries a
+    // knowledge base for the passages behind an answer (`Retrieve`), and reports what came
+    // back. A handler that cannot reach it can neither invoke an agent nor cite a source — and
+    // the two faults an operator has to tell apart there, a missing GRANT
+    // (`AccessDeniedException`) and a wrong IDENTIFIER (`ResourceNotFoundException` for a
+    // well-formed one, `ValidationException` for a malformed one), are this service's own
+    // answers, observable from inside a function only once the call is made.
+    Api {
+        sdk_token: "bedrock-agent-runtime",
+        signing_name: "bedrock",
+        endpoint_prefix: "bedrock-agent-runtime",
+        model: Some(BEDROCK_AGENT_RUNTIME_MODEL),
+        protocol: Protocol::RestJson(&BEDROCK_AGENT_RUNTIME),
+        answer_model: Some(&BEDROCK_AGENT_RUNTIME_ANSWERS),
+    },
+    // `services/service-com-amazonaws-opensearchserverless-opensearchserverless/smithy-model/
+    // com-amazonaws-opensearchserverless-opensearchserverless.json`: awsJson1_0, sigv4Name
+    // `aoss`, endpointPrefix `aoss`, sdkId `OpenSearchServerless`, service shape
+    // `OpenSearchServerless`.
+    //
+    // A handler that stands up or inspects the VECTOR STORE behind a knowledge base reaches
+    // this control plane: the collection the vectors live in, the policies that admit a reader
+    // and the collection's own endpoint are read and written here, and the collection's data
+    // plane is then reached over HTTP ([`super::guest_http`]).
+    Api {
+        sdk_token: "opensearchserverless",
+        signing_name: "aoss",
+        endpoint_prefix: "aoss",
+        model: Some(OPENSEARCHSERVERLESS_MODEL),
+        protocol: Protocol::AwsJson {
+            target_prefix: "OpenSearchServerless",
+            json_version: "1.0",
+            query_compatible: false,
+        },
+        answer_model: Some(&OPENSEARCHSERVERLESS_ANSWERS),
+    },
 ];
 
 /// Whether `named` and `asked` name the ONE service.
@@ -941,6 +984,15 @@ pub(super) const REKOGNITION_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-rekognition-rekognitionservice/smithy-model/\
      com-amazonaws-rekognition-rekognitionservice.json"
 );
+pub(super) const BEDROCK_AGENT_RUNTIME_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice/\
+     smithy-model/\
+     com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice.json"
+);
+pub(super) const OPENSEARCHSERVERLESS_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-opensearchserverless-opensearchserverless/smithy-model/\
+     com-amazonaws-opensearchserverless-opensearchserverless.json"
+);
 /// THIS service's own model, read the same way as every other entry's: a call a handler makes
 /// to Lambda is bound by the model this crate is generated from, so the surface a running
 /// function reaches is the surface this emulator serves.
@@ -1073,6 +1125,25 @@ static REKOGNITION_ANSWERS: super::blob_members::ServiceModel = super::blob_memb
 static LAMBDA_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
     source: LAMBDA_MODEL,
     plan: ::std::sync::OnceLock::new(),
+};
+static BEDROCK_AGENT_RUNTIME_ANSWERS: super::blob_members::ServiceModel =
+    super::blob_members::ServiceModel {
+        source: BEDROCK_AGENT_RUNTIME_MODEL,
+        plan: ::std::sync::OnceLock::new(),
+    };
+static OPENSEARCHSERVERLESS_ANSWERS: super::blob_members::ServiceModel =
+    super::blob_members::ServiceModel {
+        source: OPENSEARCHSERVERLESS_MODEL,
+        plan: ::std::sync::OnceLock::new(),
+    };
+
+/// The Bedrock Agent runtime plane's own model, which a call to it is bound by — embedded
+/// exactly as [`APIGATEWAY`] is, and for the same reason: the wire facts of each operation are
+/// that model's, so this seam states none of them.
+static BEDROCK_AGENT_RUNTIME: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: BEDROCK_AGENT_RUNTIME_MODEL,
+    namespace: "com.amazonaws.bedrockagentruntime",
+    parsed: ::std::sync::OnceLock::new(),
 };
 
 /// THIS service's own model, which a call a handler makes to Lambda is bound by — embedded
