@@ -20,6 +20,11 @@
 //! property of WHERE the offending value sits and of WHICH operation was served, not of
 //! the service as a whole.
 //!
+//! The Studio/notebook surface is served by its OWN backend, which words every refusal it
+//! raises its own way, so the rejected value of one of its enum members is stated there
+//! rather than in the validator's envelope — `tests/all/editors_plane_enum_refusals.rs`
+//! is that plane's own table, and the two rows here pin which plane each operation is on.
+//!
 //! The rows span what the rule generalises over: how deep the offending value sits
 //! (a member of the input shape, an element of one of its collections, and two, three
 //! and five structure steps down), whether the served operation's model declares EMR's
@@ -83,6 +88,9 @@ enum Says {
     Exactly(String),
     /// The generic validator's envelope, which must name this member path.
     Names(&'static str),
+    /// The Studio/notebook backend's sentence for the member, inside the service detail
+    /// every refusal that backend raises carries.
+    Editors(String),
 }
 
 /// One row: a request, the error code it must carry, and what its message must say.
@@ -116,6 +124,19 @@ fn own_envelope(case: &str, operation: &'static str, body: Value, path: &'static
         body,
         code: SELF_CHECKED,
         says: Says::Names(path),
+    }
+}
+
+/// A refusal the Studio/notebook plane owns: EMR's own code, with the backend's sentence
+/// for the member inside its service detail — `tests/all/editors_plane_enum_refusals.rs`
+/// states that rule over the whole plane.
+fn editors_sentence(case: &str, operation: &'static str, body: Value, sentence: &str) -> Case {
+    Case {
+        case: case.to_string(),
+        operation,
+        body,
+        code: SELF_CHECKED,
+        says: Says::Editors(sentence.to_string()),
     }
 }
 
@@ -276,17 +297,20 @@ fn refused_cases(cluster: &str) -> Vec<Case> {
             "Session states [NOPE] are not valid.",
         ),
         // ---- EMR's own check, on a single-valued member of the input shape ------
-        own_envelope(
+        // The Studio/notebook plane's two filters: the backend fronting that plane words
+        // the refusal itself, so neither the member path nor the enum's value set is what
+        // the caller reads.
+        editors_sentence(
             "a Status outside NotebookExecutionStatus",
             "ListNotebookExecutions",
             json!({ "Status": "NOT_A_REAL_STATUS" }),
-            "status",
+            "Invalid Execution Status: NOT_A_REAL_STATUS",
         ),
-        own_envelope(
+        editors_sentence(
             "an IdentityType outside IdentityType",
             "ListStudioSessionMappings",
             json!({ "IdentityType": "PERSON" }),
-            "identityType",
+            "IdentityType is not valid.",
         ),
         own_envelope(
             "an InstanceFleetType outside InstanceFleetType",
@@ -520,6 +544,17 @@ async fn an_out_of_enum_value_is_refused_by_the_layer_that_reaches_it() {
                 message.contains(path),
                 "case {label:?}: the refusal must name the member {path:?}, got {message:?}"
             ),
+            Says::Editors(sentence) => {
+                let request_id = crate::refusal_messages::wrapped_request_id(label, &message);
+                let expected = format!(
+                    "{sentence} (Service: AWSEditors; Status Code: 400; Error Code: \
+                     InvalidRequestException; Request ID: {request_id}; Proxy: null)"
+                );
+                assert_eq!(
+                    message, expected,
+                    "case {label:?}: expected {expected:?}, got {message:?}"
+                );
+            }
         }
     }
 }

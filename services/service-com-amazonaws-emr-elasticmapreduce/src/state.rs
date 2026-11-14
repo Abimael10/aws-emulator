@@ -495,14 +495,29 @@ pub fn security_configuration_exists_message(name: &str) -> String {
     format!("SecurityConfiguration with name '{name}' already exists.")
 }
 
+/// The prefix Amazon EMR states every DOCUMENT-level rejection of a security
+/// configuration with: the clause saying what is wrong with the document follows it.
+///
+/// Recorded behavior for the text, on the malformed-document class and on a field whose
+/// value is outside the set the document schema defines. It is the one part of those
+/// sentences a caller groups the whole class by, so the clause is never stated without
+/// it ([`invalid_security_configuration_message`]).
+pub const INVALID_SECURITY_CONFIGURATION_PREFIX: &str = "Invalid security configuration; ";
+
 /// How `CreateSecurityConfiguration` refuses a `SecurityConfiguration` document that is
-/// not JSON: Amazon EMR's own CONSTANT sentence for that refusal.
+/// not JSON: Amazon EMR's own CONSTANT clause for that refusal.
 ///
 /// Recorded behavior for the text. It is constant by design — it names neither the
 /// parser, nor the position it stopped at, nor anything the document carried — so a
 /// caller matching it recognises every malformed document the same way.
-pub const MALFORMED_SECURITY_CONFIGURATION_MESSAGE: &str =
-    "Invalid security configuration; Malformed Json string.";
+pub const MALFORMED_SECURITY_CONFIGURATION_CLAUSE: &str = "Malformed Json string.";
+
+/// `clause` as Amazon EMR states a document-level rejection of a security configuration:
+/// the prefix that groups the class ([`INVALID_SECURITY_CONFIGURATION_PREFIX`]), then the
+/// clause saying what is wrong with the document.
+pub fn invalid_security_configuration_message(clause: &str) -> String {
+    format!("{INVALID_SECURITY_CONFIGURATION_PREFIX}{clause}")
+}
 
 /// The refusal `CreateSecurityConfiguration` answers a document it will not store with:
 /// the sentence for what is wrong with the document, under the discriminator Amazon EMR

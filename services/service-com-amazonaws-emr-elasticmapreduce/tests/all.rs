@@ -35,6 +35,8 @@ mod cluster_self_termination;
 mod cluster_step_execution;
 #[path = "all/created_window.rs"]
 mod created_window;
+#[path = "all/editors_plane_enum_refusals.rs"]
+mod editors_plane_enum_refusals;
 #[path = "all/emr_control_plane.rs"]
 mod emr_control_plane;
 #[path = "all/enum_refusal_identity.rs"]
@@ -101,6 +103,8 @@ mod resource_not_found_code;
 mod resource_tag_removal;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/security_configuration_document_message.rs"]
+mod security_configuration_document_message;
 #[path = "all/security_configuration_listing.rs"]
 mod security_configuration_listing;
 #[path = "all/security_configurations.rs"]

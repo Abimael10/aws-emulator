@@ -67,8 +67,11 @@
 //! framework's envelope otherwise: the rejected values of ONE collection-valued filter
 //! member are enumerated in the request's own order (`rejected_values_message`), an
 //! absent member is stated by the sentence an unusable value of it gets
-//! (`absent_member_refusal`), and an undeclared value of a CloudWatch metric alarm's
-//! enum member is stated in EMR's prose for that member (`cloud_watch_alarm_message`).
+//! (`absent_member_refusal`), an undeclared value of a CloudWatch metric alarm's
+//! enum member is stated in EMR's prose for that member (`cloud_watch_alarm_message`),
+//! and an undeclared value on the Studio/notebook plane is stated by the backend that
+//! plane is fronted by, inside the service detail every refusal it raises carries
+//! ([`editors_plane`]).
 //!
 //! `Refused`, the framework's answer type, carries a code and a sentence. EMR's own
 //! error carries its sentence in `Message` BESIDE the `ErrorCode` that tells one refusal
@@ -92,6 +95,7 @@ use std::sync::Arc;
 
 use crate::ops::types::InvalidRequestException;
 
+pub mod editors_plane;
 pub mod request_layer;
 
 /// The wire error code of `com.amazonaws.emr#InvalidRequestException`, this
@@ -286,6 +290,9 @@ struct ServedOperation {
     resolves_cluster_id: bool,
     /// How it refuses a `ClusterId` it cannot use.
     cluster_id_refusal: fn(&str) -> InvalidRequestException,
+    /// Whether it is served by the Studio/notebook backend, which words every refusal it
+    /// raises its own way ([`editors_plane`]).
+    editors_plane: bool,
 }
 
 impl ServedOperation {
@@ -295,6 +302,7 @@ impl ServedOperation {
             models_client_error: models_invalid_request_exception(operation),
             resolves_cluster_id: resolves_cluster_id(operation),
             cluster_id_refusal: cluster_id_refusal_of(operation),
+            editors_plane: editors_plane::on_editors_plane(operation),
         }
     }
 }
@@ -944,6 +952,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //   are enumerated, in the order the request spelled them: that sentence is
         //   the only part of the refusal telling a caller WHICH of several submitted
         //   values was rejected;
+        // - a rejected value on the Studio/notebook plane is stated by the backend that
+        //   plane is fronted by, in that backend's sentence for the member and inside
+        //   the service detail every refusal it raises carries;
         // - an absent member is stated by the sentence an unusable value of it gets, in
         //   EITHER envelope — an operation that cannot answer EMR's own error still
         //   answers EMR's sentence, under the generic code;
@@ -974,9 +985,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let chosen = served
             .models_client_error
             .then(|| {
-                absent
-                    .clone()
-                    .or_else(|| rejected_enum_values_refusal(violations))
+                absent.clone().or_else(|| {
+                    // The Studio/notebook plane words the refusal of a value outside a
+                    // modelled enum itself, in the backend's own sentence for the member
+                    // and inside that backend's service detail; the cluster plane states
+                    // the rejected values of one filter member instead.
+                    if served.editors_plane {
+                        editors_plane::enum_value_refusal(violations)
+                    } else {
+                        rejected_enum_values_refusal(violations)
+                    }
+                })
             })
             .flatten();
         // What was refused travels to `OperationScopedRefusal::run`, which answers it:

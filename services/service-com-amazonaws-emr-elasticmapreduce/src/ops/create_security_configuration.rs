@@ -157,14 +157,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_SECURITY_CONFIGURATION_BYTES
             )));
         }
-        if let Err(reason) = validate_security_configuration(&input.security_configuration) {
+        if let Err(clause) = validate_security_configuration(&input.security_configuration) {
             crate::state::audit(
                 Self::NAME,
                 &input.name,
                 ctx,
                 AuditOutcome::ValidationRefused,
             );
-            return Err(invalid_document(reason));
+            return Err(invalid_document(
+                crate::state::invalid_security_configuration_message(&clause),
+            ));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -270,6 +272,16 @@ fn invalid_document(message: String) -> CreateSecurityConfigurationError {
 /// JSON reference.)
 const S3_ENCRYPTION_MODES: [&str; 4] = ["SSE-S3", "SSE-KMS", "CSE-KMS", "CSE-Custom"];
 
+/// The `EncryptionMode` values that encrypt with a KMS key, and so need one named
+/// (same reference).
+const KMS_ENCRYPTION_MODES: [&str; 2] = ["SSE-KMS", "CSE-KMS"];
+
+/// The document fields whose value decides which companions the section must carry, as a
+/// refusal naming them states them ([`required_for_message`]).
+const ENCRYPTION_MODE: &str = "EncryptionMode";
+const KEY_PROVIDER_TYPE: &str = "EncryptionKeyProviderType";
+const CERTIFICATE_PROVIDER: &str = "CertificateProviderType";
+
 /// `LocalDiskEncryptionConfiguration.EncryptionKeyProviderType`, every value EMR
 /// accepts (same reference): a KMS key, or a custom key provider supplied as a jar.
 const LOCAL_DISK_KEY_PROVIDER_TYPES: [&str; 2] = ["AwsKms", "Custom"];
@@ -278,7 +290,10 @@ const LOCAL_DISK_KEY_PROVIDER_TYPES: [&str; 2] = ["AwsKms", "Custom"];
 /// (same reference): a zip of PEM artifacts, or a custom provider supplied as a jar.
 const CERTIFICATE_PROVIDER_TYPES: [&str; 2] = ["PEM", "Custom"];
 
-/// Whether `document` is a security configuration EMR would store, answering why not.
+/// Whether `document` is a security configuration EMR would store, answering the CLAUSE
+/// saying why not — which the caller of this function states under the prefix every
+/// document-level rejection carries
+/// ([`crate::state::invalid_security_configuration_message`]).
 ///
 /// A security configuration is "the security configuration details in JSON format"
 /// (`CreateSecurityConfiguration$SecurityConfiguration` doc), and its
@@ -288,11 +303,11 @@ const CERTIFICATE_PROVIDER_TYPES: [&str; 2] = ["PEM", "Custom"];
 /// encryption mode it names must be one EMR defines. Anything else is a client error,
 /// not something to store.
 fn validate_security_configuration(document: &str) -> Result<(), String> {
-    // A document that does not parse is refused with Amazon EMR's constant sentence for
+    // A document that does not parse is refused with Amazon EMR's constant clause for
     // that class: the parser's own diagnostic varies with the input and names internals
     // no caller can act on, so none of it reaches the wire.
     let parsed: ::serde_json::Value = ::serde_json::from_str(document).map_err(|_| {
-        crate::state::MALFORMED_SECURITY_CONFIGURATION_MESSAGE.to_string()
+        crate::state::MALFORMED_SECURITY_CONFIGURATION_CLAUSE.to_string()
     })?;
     let root = parsed
         .as_object()
@@ -361,20 +376,17 @@ fn validate_tls_certificate(
 ) -> Result<(), String> {
     let provider = required_string(tls, "CertificateProviderType")?;
     match provider {
-        "PEM" => require_present(tls, "S3Object", "CertificateProviderType is PEM"),
+        "PEM" => require_for(tls, "S3Object", &CERTIFICATE_PROVIDER_TYPES, CERTIFICATE_PROVIDER),
         "Custom" => {
-            require_present(tls, "S3Object", "CertificateProviderType is Custom")?;
-            require_present(
+            require_for(tls, "S3Object", &CERTIFICATE_PROVIDER_TYPES, CERTIFICATE_PROVIDER)?;
+            require_for(
                 tls,
                 "CertificateProviderClass",
-                "CertificateProviderType is Custom",
+                &["Custom"],
+                CERTIFICATE_PROVIDER,
             )
         }
-        other => Err(one_of_message(
-            "CertificateProviderType",
-            other,
-            &CERTIFICATE_PROVIDER_TYPES,
-        )),
+        other => Err(one_of_message(other, &CERTIFICATE_PROVIDER_TYPES)),
     }
 }
 
@@ -384,15 +396,20 @@ fn validate_tls_certificate(
 fn validate_s3_encryption(s3: &::serde_json::Map<String, ::serde_json::Value>) -> Result<(), String> {
     let mode = required_string(s3, "EncryptionMode")?;
     if !S3_ENCRYPTION_MODES.contains(&mode) {
-        return Err(one_of_message("EncryptionMode", mode, &S3_ENCRYPTION_MODES));
+        return Err(one_of_message(mode, &S3_ENCRYPTION_MODES));
     }
     match mode {
         "SSE-KMS" | "CSE-KMS" => {
-            require_present(s3, "AwsKmsKey", &format!("EncryptionMode is {mode}"))?;
+            require_for(s3, "AwsKmsKey", &KMS_ENCRYPTION_MODES, ENCRYPTION_MODE)?;
         }
         "CSE-Custom" => {
-            require_present(s3, "EncryptionKeyProviderClass", "EncryptionMode is CSE-Custom")?;
-            require_present(s3, "S3Object", "EncryptionMode is CSE-Custom")?;
+            require_for(
+                s3,
+                "EncryptionKeyProviderClass",
+                &["CSE-Custom"],
+                ENCRYPTION_MODE,
+            )?;
+            require_for(s3, "S3Object", &["CSE-Custom"], ENCRYPTION_MODE)?;
         }
         // SSE-S3 is managed by Amazon S3: it needs no key and no provider.
         _ => {}
@@ -407,21 +424,18 @@ fn validate_local_disk_encryption(
 ) -> Result<(), String> {
     let provider = required_string(local, "EncryptionKeyProviderType")?;
     if !LOCAL_DISK_KEY_PROVIDER_TYPES.contains(&provider) {
-        return Err(one_of_message(
-            "EncryptionKeyProviderType",
-            provider,
-            &LOCAL_DISK_KEY_PROVIDER_TYPES,
-        ));
+        return Err(one_of_message(provider, &LOCAL_DISK_KEY_PROVIDER_TYPES));
     }
     if provider == "AwsKms" {
-        require_present(local, "AwsKmsKey", "EncryptionKeyProviderType is AwsKms")?;
+        require_for(local, "AwsKmsKey", &["AwsKms"], KEY_PROVIDER_TYPE)?;
     } else {
-        require_present(
+        require_for(
             local,
             "EncryptionKeyProviderClass",
-            "EncryptionKeyProviderType is Custom",
+            &["Custom"],
+            KEY_PROVIDER_TYPE,
         )?;
-        require_present(local, "S3Object", "EncryptionKeyProviderType is Custom")?;
+        require_for(local, "S3Object", &["Custom"], KEY_PROVIDER_TYPE)?;
     }
     // `EnableEbsEncryption` is optional, but it is a flag when it is there.
     flag(local, "EnableEbsEncryption")?;
@@ -477,11 +491,13 @@ fn flag(
     }
 }
 
-/// `member` must be there, and non-empty, because `because`.
-fn require_present(
+/// `member` must be there, and non-empty, because the field `field` names one of
+/// `requiring` — the clause saying so is Amazon EMR's own ([`required_for_message`]).
+fn require_for(
     parent: &::serde_json::Map<String, ::serde_json::Value>,
     member: &str,
-    because: &str,
+    requiring: &[&str],
+    field: &str,
 ) -> Result<(), String> {
     let present = parent
         .get(member)
@@ -489,16 +505,36 @@ fn require_present(
     if present {
         Ok(())
     } else {
-        Err(format!(
-            "{member} is required, as a non-empty string, when {because}."
-        ))
+        Err(required_for_message(member, requiring, field))
     }
 }
 
-/// Why `actual` is not one of the values EMR defines for `member`.
-fn one_of_message(member: &str, actual: &str, allowed: &[&str]) -> String {
+/// Why the document has to carry `member`: the field `field` names one of `requiring`,
+/// each of which needs it.
+///
+/// Recorded behavior for the text, on the KMS key the two KMS encryption modes need: the
+/// member, then the values of the deciding field that require it, single-quoted and
+/// joined with `or`, then that field. One template for every companion a value of a
+/// document field makes mandatory, so what a caller reads off the clause is the member to
+/// add and the values that ask for it.
+fn required_for_message(member: &str, requiring: &[&str], field: &str) -> String {
+    let values: Vec<String> = requiring.iter().map(|value| format!("'{value}'")).collect();
+    format!("{member} are required for {} {field}.", values.join(" or "))
+}
+
+/// Why `actual` is not one of the values EMR defines for the document field it was
+/// submitted on.
+///
+/// Recorded behavior for the text: the document is judged against a schema, and a value
+/// outside the set a field defines is stated by that judgement — the rejected value in
+/// parentheses, then the values the field allows, in a bracketed list in the order the
+/// catalog declares them. The field is no part of the clause, so every field EMR defines
+/// a value set for is refused by this one template, and the prefix the caller adds
+/// ([`crate::state::invalid_security_configuration_message`]) groups it with every other
+/// document-level rejection.
+fn one_of_message(actual: &str, allowed: &[&str]) -> String {
     format!(
-        "{member} '{actual}' is not valid; it must be one of {}.",
+        "instance value ({actual}) is not allowed; allowed values: [{}].",
         allowed.join(", ")
     )
 }
