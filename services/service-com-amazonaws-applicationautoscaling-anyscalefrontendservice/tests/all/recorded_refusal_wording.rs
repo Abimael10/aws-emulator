@@ -19,8 +19,8 @@
 //!   `ObjectNotFoundException` template naming the triple for an identity nothing registered,
 //!   and the one naming the TARGET's own identifier for a scheduled action a registered target
 //!   does not hold; and, for an ARN, the `ResourceNotFoundException` body at the client-error
-//!   status on the tag READ, where each tag MUTATION refuses the write it was asked to make
-//!   with the recorded `ValidationException`.
+//!   status where this Region MINTED that ARN for a target it no longer holds, and the recorded
+//!   `ValidationException` with the fixed access-denied sentence where it never minted it.
 
 use serde_json::{json, Value};
 
@@ -380,8 +380,8 @@ async fn an_identity_nothing_registered_is_reported_as_not_registered() {
 
 #[tokio::test]
 async fn a_tag_operation_on_an_arn_naming_no_target_answers_the_recorded_refusal() {
-    /// The sentence every operation of the tagging family carries for an ARN that resolves to
-    /// no registered scalable target.
+    /// The sentence every operation of the tagging family carries for an ARN this Region minted
+    /// for a scalable target it no longer holds.
     const TARGET_NOT_FOUND: &str = "Scalable Target not found";
 
     let emulator = Emulator::empty();
@@ -447,9 +447,12 @@ async fn a_tag_operation_on_an_arn_naming_no_target_answers_the_recorded_refusal
         );
     }
 
-    // An ARN this service never minted resolves to no registered scalable target either, so
-    // each operation gives the SAME answer it gives for the deregistered one. Over several
-    // ways an ARN can be one it never minted.
+    // An ARN this service never minted resolves to no registered scalable target either, but
+    // names no resource this endpoint holds any record of, so each operation refuses the
+    // tagging call itself rather than reporting on a resource: the recorded answer for that
+    // class is HTTP 400 `ValidationException` with the fixed sentence "Access Denied". Over
+    // several ways an ARN can be one it never minted.
+    const ACCESS_DENIED: &str = "Access Denied";
     let never_minted: &[(&str, String)] = &[
         (
             "an id this service never minted",
@@ -486,13 +489,17 @@ async fn a_tag_operation_on_an_arn_naming_no_target_answers_the_recorded_refusal
             );
             assert_eq!(
                 error_code(&body),
-                "ResourceNotFoundException",
-                "case {case:?} on {operation}: expected a ResourceNotFoundException, got {body:?}"
+                "ValidationException",
+                "case {case:?} on {operation}: expected a ValidationException, got {body:?}"
             );
             let message = error_message(&body);
             assert_eq!(
-                message, TARGET_NOT_FOUND,
-                "case {case:?} on {operation}: expected {TARGET_NOT_FOUND:?}, got {message:?}"
+                message, ACCESS_DENIED,
+                "case {case:?} on {operation}: expected {ACCESS_DENIED:?}, got {message:?}"
+            );
+            assert!(
+                body.get("ResourceName").is_none(),
+                "case {case:?} on {operation}: expected no resource to be named, got {body:?}"
             );
         }
     }

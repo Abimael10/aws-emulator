@@ -145,6 +145,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        use crate::state::tag_target_arns::TaggedTargetArn;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServiceException(
                 InternalServiceException {
@@ -162,18 +164,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // target is a regional resource, so another Region's ARN names nothing here.
         let region = crate::state::request_region(ctx.parts());
         let state = state.lock();
-        let record = state
-            .arn_index
-            .get(&input.resource_arn)
-            .filter(|key| key.region == region)
-            .and_then(|key| state.targets.get(key));
+        let resolved = state.resolve_tagged_target_arn(&input.resource_arn, &region);
 
         // "Returns all the tags on the specified Application Auto Scaling scalable
         // target" — so an ARN no registered target carries is refused rather than answered
         // with an empty tag set: the two are different answers and a client tells them
-        // apart. The resource the ARN names is reported ABSENT —
-        // `ResourceNotFoundException` ("the specified resource doesn't exist") — exactly as
-        // the two tag MUTATIONS report it (`crate::state::SCALABLE_TARGET_NOT_FOUND_MESSAGE`).
+        // apart. WHICH refusal is decided by the ARN's PROVENANCE, by the one resolution the
+        // whole tagging family shares (see `tag_resource`): an ARN this service minted for a
+        // target it has since stopped holding is the resource reported ABSENT —
+        // `ResourceNotFoundException` ("the specified resource doesn't exist") with
+        // `crate::state::SCALABLE_TARGET_NOT_FOUND_MESSAGE` — and an ARN it never minted names
+        // no resource it holds any record of, so the call is refused without the service
+        // disclosing whether one exists. Both are what the two tag MUTATIONS answer the same
+        // conditions with.
+        let record = match resolved {
+            TaggedTargetArn::Registered(key) => state.targets.get(&key),
+            TaggedTargetArn::Retired => None,
+            TaggedTargetArn::NeverMinted => {
+                return Err(crate::state::wire_refusals::WireRefusal::target_arn_never_minted()
+                    .into())
+            }
+        };
         let Some(record) = record else {
             return Err(crate::state::wire_refusals::WireRefusal::scalable_target_not_found(
                 &input.resource_arn,

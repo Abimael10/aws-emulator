@@ -13,11 +13,11 @@
 //!   dimension belonging to another namespace is one such triple: nothing could have
 //!   registered it, so it names no target either.
 //! * the ARN-addressed tag operations answer an ARN that resolves to no registered scalable
-//!   target at the client-error status, all three alike: the ARN names the resource the call
-//!   addresses, so one that identifies no registered target is the resource reported ABSENT
+//!   target at the client-error status, all three alike, by that ARN's PROVENANCE: an ARN this
+//!   Region MINTED for a target it no longer holds is the resource reported ABSENT
 //!   (`ResourceNotFoundException`, the fixed sentence "Scalable Target not found" and the ARN
-//!   asked about in `ResourceName`) — by the READ and by the two MUTATIONS, whichever way the
-//!   ARN fails to resolve.
+//!   asked about in `ResourceName`), and an ARN it never minted is refused without a report
+//!   about the resource at all (`ValidationException` and the fixed sentence "Access Denied").
 //! * an operation this service does not offer for the namespace addressed is refused
 //!   outright, with `AccessDeniedException` and the fixed sentence naming the operation,
 //!   whatever is or is not registered. Predictive scaling is offered in one namespace: the
@@ -31,9 +31,12 @@ use service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::ops::t
 
 use crate::emulator::{error_code, error_message, resource_id_for, Emulator, ACCOUNT, REGION};
 
-/// The sentence every operation of the tagging family carries for an ARN that resolves to no
-/// registered scalable target, spelled out here rather than read from the implementation.
+/// The sentence every operation of the tagging family carries for an ARN this Region minted for
+/// a target it no longer holds, spelled out here rather than read from the implementation.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
+
+/// The whole sentence they carry for an ARN this Region never minted.
+const ACCESS_DENIED: &str = "Access Denied";
 
 /// The status a refusal of this class answers with. Both rules below answer the client-error
 /// status: a client, and any proxy in front of it, branches on the status CLASS before it
@@ -222,17 +225,19 @@ fn tag_requests(resource_arn: &str) -> [(&'static str, Value); 3] {
 }
 
 /// RULE: every tag operation answers an ARN that resolves to no registered scalable target at
-/// the client-error status, according to what it was asked to do — the READ reports the
-/// resource as absent with the fixed sentence and the ARN asked about in `ResourceName`, each
-/// MUTATION refuses the write with `ValidationException` and the fixed sentence that carries
-/// nothing of the request.
+/// the client-error status, by that ARN's PROVENANCE in the Region serving the request — an ARN
+/// this Region minted for a target it no longer holds is the resource reported absent
+/// (`ResourceNotFoundException`, the fixed sentence and the ARN asked about in `ResourceName`),
+/// and an ARN it never minted is a tagging call it refuses without reporting on the resource
+/// (`ValidationException` and the fixed access-denied sentence, which carries nothing of the
+/// request).
 ///
 /// Rows differ along HOW the ARN fails to resolve — an id this service never minted, an id of
 /// another form, another account, another Region, and the ARN of a target that WAS registered
 /// and has been deregistered — and along the operation, including both writes, so the two
 /// writes do not word the condition differently from each other.
 #[tokio::test]
-async fn every_tag_operation_answers_an_unresolvable_arn_in_its_own_terms() {
+async fn every_tag_operation_answers_an_unresolvable_arn_by_its_provenance() {
     let emulator = Emulator::empty();
     let target = emulator
         .given_target("dynamodb:table:ReadCapacityUnits", 1, 10)
@@ -259,11 +264,13 @@ async fn every_tag_operation_answers_an_unresolvable_arn_in_its_own_terms() {
 
     // Every ARN below satisfies the modelled `@pattern` on `ResourceARN`
     // (^arn:.+:application-autoscaling:.+:[0-9]+:scalable-target\/[a-zA-Z0-9-]+$), so each
-    // reaches the handler rather than the boundary validator.
-    let unresolvable: &[(&str, String)] = &[
+    // reaches the handler rather than the boundary validator. The flag is whether this Region
+    // MINTED it, which is what decides which refusal it earns.
+    let unresolvable: &[(&str, String, bool)] = &[
         (
             "the ARN of a target that has been deregistered",
             registered.clone(),
+            true,
         ),
         (
             "an id this service never minted",
@@ -271,10 +278,12 @@ async fn every_tag_operation_answers_an_unresolvable_arn_in_its_own_terms() {
                 "arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            false,
         ),
         (
             "an id of another form",
             format!("arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/nothing"),
+            false,
         ),
         (
             "an ARN of another account",
@@ -282,6 +291,7 @@ async fn every_tag_operation_answers_an_unresolvable_arn_in_its_own_terms() {
                 "arn:aws:application-autoscaling:{REGION}:111122223333:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            false,
         ),
         (
             "an ARN of another Region",
@@ -289,10 +299,11 @@ async fn every_tag_operation_answers_an_unresolvable_arn_in_its_own_terms() {
                 "arn:aws:application-autoscaling:eu-west-1:{ACCOUNT}:scalable-target/\
                  0123456789abcdef0123456789abcdef0123"
             ),
+            false,
         ),
     ];
 
-    for (row, arn) in unresolvable {
+    for (row, arn, minted_here) in unresolvable {
         for (operation, request) in tag_requests(arn) {
             let case = format!("{row} on {operation}");
             let (status, body) = emulator.call(operation, request).await;
@@ -302,19 +313,34 @@ async fn every_tag_operation_answers_an_unresolvable_arn_in_its_own_terms() {
             );
             let code = error_code(&body);
             let message = error_message(&body);
-            assert_eq!(
-                code, "ResourceNotFoundException",
-                "case {case:?}: expected a ResourceNotFoundException, got {code:?} in {body:?}"
-            );
-            assert_eq!(
-                message, TARGET_NOT_FOUND,
-                "case {case:?}: expected the message {TARGET_NOT_FOUND:?}, got {message:?}"
-            );
-            assert_eq!(
-                body["ResourceName"],
-                json!(arn),
-                "case {case:?}: expected the ARN asked about in ResourceName, got {body:?}"
-            );
+            if *minted_here {
+                assert_eq!(
+                    code, "ResourceNotFoundException",
+                    "case {case:?}: expected a ResourceNotFoundException, got {code:?} in {body:?}"
+                );
+                assert_eq!(
+                    message, TARGET_NOT_FOUND,
+                    "case {case:?}: expected the message {TARGET_NOT_FOUND:?}, got {message:?}"
+                );
+                assert_eq!(
+                    body["ResourceName"],
+                    json!(arn),
+                    "case {case:?}: expected the ARN asked about in ResourceName, got {body:?}"
+                );
+            } else {
+                assert_eq!(
+                    code, "ValidationException",
+                    "case {case:?}: expected a ValidationException, got {code:?} in {body:?}"
+                );
+                assert_eq!(
+                    message, ACCESS_DENIED,
+                    "case {case:?}: expected the message {ACCESS_DENIED:?}, got {message:?}"
+                );
+                assert!(
+                    body.get("ResourceName").is_none(),
+                    "case {case:?}: expected no resource to be named, got {body:?}"
+                );
+            }
         }
     }
 }

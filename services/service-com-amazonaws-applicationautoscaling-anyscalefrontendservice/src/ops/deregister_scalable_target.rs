@@ -229,10 +229,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|(policy_key, _)| policy_key.target == key)
                 .map(|(policy_key, record)| (policy_key.clone(), record.policy_type.clone()))
                 .collect();
-            // The ARN this service minted for the target stops resolving with it: an
-            // operation addressed to that ARN now names no registered scalable target, which
-            // is the one answer every ARN-addressed operation has for such an ARN.
-            state.arn_index.remove(&removed.arn);
+            // The ARN this service minted for the target stops resolving to it: an operation
+            // addressed to that ARN now names no registered scalable target. The ARN itself is
+            // kept as one this Region MINTED, so such an operation reports the resource it
+            // names as absent rather than as one the caller never held
+            // (`crate::state::tag_target_arns`).
+            state.retire_target_arn(&removed.arn, &key);
             state.policies.retain(|policy_key, _| policy_key.target != key);
             state
                 .scheduled_actions

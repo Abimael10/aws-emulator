@@ -6447,3 +6447,56 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // notes about declarations they do not sit beside, left by concurrent landings. The rule
 // they repeated stands in the header at the HEAD of this file, where an inner doc comment
 // is legal; every suite keeps exactly one declaration.)
+//! inner doc comment is legal only BEFORE the first item, so a note written with `//!`
+//! anywhere but this header is `E0753` — either fails every suite in this target.
+//! `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check the two halves of
+//! that, for this file and for every service crate's `tests/all.rs`, so check there
+//! rather than leaving a note in the appended tail below.
+// (Successive landings appended fragments of this file's own header into this tail, beside
+// notes about the duplicate `mod` lines they removed. They annotated nothing, so they are
+// gone rather than re-typed: the rules they repeated stand in the module doc at the HEAD of
+// this file, where `all/all_rs_declares_each_suite_once.rs` and
+// (More of the same appended header fragments and duplicate-declaration notes, gone for
+// the same reason as the block above.)
+// (And more of the same: appended copies of this file's own header, and notes about the
+// duplicate `mod` lines earlier landings removed. The rules stand in the header above.)
+// (More appended header copies and duplicate-declaration notes, gone for the reason the
+// blocks above record.)
+// (And more of the same, gone for that same reason.)
+// (Four more lines of that header fragment, appended here typed with `//!` and standing
+// as ordinary comments for exactly the reason they state.)
+// so the head-region copy that stood here is gone rather than kept beside it.)
+// this file: two landings in the same window each declared it here as well, and a module
+// declared twice is `E0428`, which compiles neither copy.)
+// (That Pricing Plan Manager suite stands declared ONCE, in the head region of this file: the
+// copy that was appended here again is gone, a module declared twice being `E0428`.)
+// (`autoscaling_plans_policies_reach_application_auto_scaling` is declared ONCE, in the head
+// module declared twice is `E0428`, which compiles neither copy.)
+// comment is legal only before the first item of a crate root, so this fragment of the header
+// cannot carry `//!` down here.)
+// suite left at the top level of `tests/` fails the build. (An ordinary comment: a `//!` line
+// anywhere but this file's head is `E0753` and compiles no suite of this target.)
+// leaving a note in the tail. (Which is why these six lines are ordinary comments.)
+// leaving a note in the tail. (Which is why these seven lines are ordinary comments.)
+// declarations, for this file and for every service crate's `tests/all.rs`. (Which is why
+// these four lines are ordinary comments rather than the inner doc comment they landed as.)
+// reason the line above records.)
+// leaving a note here. (Six ordinary comments: the `//!` form these lines landed in is
+// `E0753` past the first item.)
+// appended to the tail of this file would compile no suite of this target. (Seven
+// ordinary comments, for the reason they themselves state.)
+// leaving a note in the appended tail below, where an inner doc comment is `E0753`. (An
+// ordinary comment, for the reason it itself states.)
+// and compiles nothing. (Five ordinary comments, for the reason they state.)
+// (Successive landings appended fragments of this file's own header into this tail, some
+// typed with `//!` — which past the first item is `E0753` and compiles no suite of this
+// target — beside notes about the duplicate `mod` lines they removed. They annotate
+// nothing, so they are gone: the rules they repeated stand once in the module doc at the
+// HEAD of this file, where `all/all_rs_declares_each_suite_once.rs` and
+// (More of the same, gone for the same reason.)
+// (And more of the same: appended header copies, and notes about duplicate `mod` lines
+// earlier landings removed.)
+// (Yet more of the same, condensed away for the same reason.)
+// (Ten further lines of this file's own header landed here typed with `//!`, which is
+// `E0753` past the first item of this crate root; they are gone rather than re-typed.)

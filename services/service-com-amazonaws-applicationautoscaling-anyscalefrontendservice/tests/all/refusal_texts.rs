@@ -37,8 +37,11 @@ const DIMENSION_WITHOUT_RESOURCE_ID: &str =
     "Scalable dimension cannot be provided without a resource ID.";
 /// A `NextToken` this service did not issue.
 const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid";
-/// A tag operation addressed to an ARN that resolves to no registered scalable target.
+/// A tag operation addressed to an ARN this Region minted for a scalable target it no longer
+/// holds.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
+/// A tag operation addressed to an ARN this Region never minted.
+const ACCESS_DENIED: &str = "Access Denied";
 /// A write to the reserved tag namespace.
 const SYSTEM_TAG_KEY_REFUSED: &str = "Caller is an end user and not allowed to mutate system tags";
 /// A tag set over the per-resource maximum.
@@ -820,10 +823,11 @@ fn generated_tags(count: usize) -> Value {
     Value::Object(tags)
 }
 
-/// RULE: the tagging refusals each carry their own sentence — an ARN that resolves to no
-/// registered scalable target is reported absent by the READ and refuses the WRITE, a tag set
-/// over the per-resource maximum states that maximum, and a key in the reserved namespace is
-/// refused as a system tag — so a client can tell them apart by text as well as by code.
+/// RULE: the tagging refusals each carry their own sentence — an ARN this Region minted for a
+/// target it no longer holds is reported absent, an ARN it never minted is refused as a call
+/// about a resource the caller does not reach, a tag set over the per-resource maximum states
+/// that maximum, and a key in the reserved namespace is refused as a system tag — so a client
+/// can tell them apart by text as well as by code.
 ///
 /// Rows differ along the operation (all three tag operations), along how the ARN fails
 /// to resolve, along the batch size either side of the maximum, and along how the reserved
@@ -846,8 +850,10 @@ async fn the_tagging_refusals_are_distinct_sentences() {
         .expect("a ScalableTargetARN")
         .to_string();
 
-    // Every ARN below satisfies the modelled `@pattern`, so each reaches the handler.
-    let unresolvable: &[(&str, String)] = &[
+    // Every ARN below satisfies the modelled `@pattern`, so each reaches the handler. None of
+    // them is one this Region minted, so each is refused as a call about a resource the service
+    // holds no record of.
+    let never_minted: &[(&str, String)] = &[
         (
             "an ARN of a target that was never registered",
             format!(
@@ -863,9 +869,9 @@ async fn the_tagging_refusals_are_distinct_sentences() {
             ),
         ),
     ];
-    for (case, unknown) in unresolvable {
-        // Every operation of the family reports the resource as absent for an ARN that
-        // resolves to none, at the same client-error status.
+    for (case, unknown) in never_minted {
+        // Every operation of the family refuses an ARN this Region never minted alike, at the
+        // same client-error status.
         for (operation, request) in [
             (
                 "TagResource",
@@ -883,11 +889,47 @@ async fn the_tagging_refusals_are_distinct_sentences() {
                 operation,
                 request,
                 400,
-                "ResourceNotFoundException",
-                TARGET_NOT_FOUND,
+                "ValidationException",
+                ACCESS_DENIED,
             )
             .await;
         }
+    }
+
+    // The ARN of a target this Region DID mint and has since stopped holding carries the other
+    // sentence: the resource it names is reported absent.
+    let withdrawn = emulator
+        .given_target("dynamodb:table:WriteCapacityUnits", 1, 10)
+        .await;
+    let withdrawn_arn = emulator.target_arn(&withdrawn).await;
+    accepted(
+        &emulator,
+        "the withdrawn target",
+        "DeregisterScalableTarget",
+        withdrawn.clone(),
+    )
+    .await;
+    for (operation, request) in [
+        (
+            "TagResource",
+            json!({"ResourceARN": withdrawn_arn, "Tags": {"team": "search"}}),
+        ),
+        (
+            "UntagResource",
+            json!({"ResourceARN": withdrawn_arn, "TagKeys": ["team"]}),
+        ),
+        ("ListTagsForResource", json!({"ResourceARN": withdrawn_arn})),
+    ] {
+        refused_with_status(
+            &emulator,
+            &format!("{operation} on a deregistered target's ARN"),
+            operation,
+            request,
+            400,
+            "ResourceNotFoundException",
+            TARGET_NOT_FOUND,
+        )
+        .await;
     }
 
     // One batch past the per-resource maximum: the sentence states the maximum, and the

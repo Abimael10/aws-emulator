@@ -5,8 +5,9 @@
 //!
 //! The rule under test: for the ARN of a registered scalable target the operation answers
 //! exactly the tag set persisted on that target — no more, no fewer, and unchanged by the
-//! read — and for an ARN no registered target carries it answers
-//! `ResourceNotFoundException`.
+//! read — and for an ARN no registered target carries it answers by that ARN's PROVENANCE:
+//! `ResourceNotFoundException` where this Region minted it for a target it no longer holds,
+//! and `ValidationException` where it never minted it.
 //!
 //! The suite is a table, not a single call: its rows differ along what the rule
 //! generalises over — how many tags the target carries (zero, one, several) and the form
@@ -254,24 +255,28 @@ async fn list_tags_refuses_an_arn_no_registered_target_carries() {
     );
 
     // Every ARN below satisfies the modelled `ResourceARN` pattern, so each reaches the
-    // handler; none of them names a registered target.
-    let unknown: Vec<(&str, String)> = vec![
+    // handler; none of them names a registered target. The flag is whether this Region MINTED
+    // it, which is what decides which refusal it earns.
+    let unknown: Vec<(&str, String, bool)> = vec![
         (
             "an ARN this emulator never minted",
             format!("arn:aws:application-autoscaling:{REGION}:{ACCOUNT}:scalable-target/0123456789abcdef"),
+            false,
         ),
-        ("a deregistered target's ARN", removed),
+        ("a deregistered target's ARN", removed, true),
         (
             "a resident target's ARN in another region",
             resident.replace(REGION, "eu-west-1"),
+            false,
         ),
         (
             "a resident target's ARN under another account",
             resident.replace(ACCOUNT, "123456789012"),
+            false,
         ),
     ];
 
-    for (case, arn) in &unknown {
+    for (case, arn, minted_here) in &unknown {
         let (status, body) = emulator
             .call("ListTagsForResource", json!({"ResourceARN": arn}))
             .await;
@@ -279,15 +284,26 @@ async fn list_tags_refuses_an_arn_no_registered_target_carries() {
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} {body:?}"
         );
-        assert!(
-            error_code(&body).contains("ResourceNotFoundException"),
-            "case {case:?}: expected a ResourceNotFoundException, got {body:?}"
-        );
-        assert_eq!(
-            body["ResourceName"],
-            json!(arn),
-            "case {case:?}: expected the refusal to name the ARN asked about, got {body:?}"
-        );
+        if *minted_here {
+            assert!(
+                error_code(&body).contains("ResourceNotFoundException"),
+                "case {case:?}: expected a ResourceNotFoundException, got {body:?}"
+            );
+            assert_eq!(
+                body["ResourceName"],
+                json!(arn),
+                "case {case:?}: expected the refusal to name the ARN asked about, got {body:?}"
+            );
+        } else {
+            assert!(
+                error_code(&body).contains("ValidationException"),
+                "case {case:?}: expected a ValidationException, got {body:?}"
+            );
+            assert!(
+                body.get("ResourceName").is_none(),
+                "case {case:?}: expected the refusal to name no resource, got {body:?}"
+            );
+        }
     }
 
     // The refusals changed nothing: the resident target still answers with its tags.

@@ -11,11 +11,15 @@
 //! * the ARN-addressed tag operations answer an unresolvable `ResourceARN` with
 //!   `ResourceNotFoundException`'s own body at the 400 of a client error, not at the 404 its
 //!   `@httpError` declares ([`WireRefusal::ScalableTargetNotFound`]);
+//! * the same operations answer a `ResourceARN` this service never minted with
+//!   `ValidationException`'s body and the access-denied sentence
+//!   ([`WireRefusal::TargetArnNeverMinted`]) — which the tag READ does not model at all, and
+//!   which states nothing about the request's own shape;
 //! * an operation this service does not offer for the namespace addressed is refused
 //!   outright, as an action that is not available rather than as a problem with the request
 //!   ([`WireRefusal::NotSupported`]) — a shape no operation of this service lists.
 //!
-//! Both live here, once, rather than in each operation's file: what a refusal looks like on
+//! Each lives here, once, rather than in each operation's file: what a refusal looks like on
 //! the wire is a property of the service, and the operations that answer one must not word
 //! the same condition two ways. An operation carries them by declaring its error channel
 //! [`Refusable`], which widens the operation's own modelled channel without changing how any
@@ -25,7 +29,7 @@ use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType};
 use ::smithy_server_runtime::OperationError;
 
-use crate::ops::types::ResourceNotFoundException;
+use crate::ops::types::{ResourceNotFoundException, ValidationException};
 
 /// The status a tag operation answers an unresolvable `ResourceARN` with: the 4xx of a client
 /// error rather than the 404 the modelled shape's `@httpError` declares. Clients and the
@@ -51,6 +55,22 @@ pub const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 
 /// The status of such a refusal, as the same table publishes it: "HTTP Status Code: 400".
 pub const ACCESS_DENIED_STATUS: u16 = 400;
+
+/// The `__type` a `ResourceARN` this service never minted is refused under: the modelled
+/// `ValidationException`, which the two tag MUTATIONS declare
+/// (`smithy_query(query="operation",operation="TagResource,UntagResource")`) and the tag READ
+/// does not — recorded behaviour, which answers that condition as a refusal of the tagging
+/// call rather than as a report about the resource.
+const TARGET_ARN_NEVER_MINTED_CODE: &str = "ValidationException";
+
+/// The status it is served on: the modelled `ValidationException`'s own `@httpError`, which is
+/// also the status the recorded refusal of such an ARN carries.
+const TARGET_ARN_NEVER_MINTED_STATUS: u16 = 400;
+
+/// The whole sentence that refusal states: fixed text, which takes nothing from the request or
+/// from state — no ARN, no account, no member name — because the service discloses nothing
+/// about a resource the caller does not reach.
+pub const TARGET_ARN_NEVER_MINTED_MESSAGE: &str = "Access Denied";
 
 /// How this service states that one of its operations is not offered for the resource
 /// addressed: the operation's own name, and nothing else from the request.
@@ -110,12 +130,16 @@ impl SerializableStruct for NotSupported {
 /// the wire code, the HTTP status and the body it answers with.
 #[derive(Debug)]
 pub enum WireRefusal {
-    /// A `ResourceARN` a tag operation cannot resolve to a registered scalable target, whether
-    /// or not this service ever minted that ARN: either the target is registered or it is not,
-    /// and the refusal says so. The READ and the two MUTATIONS answer that condition alike —
-    /// the ARN names the resource the call addresses, so one that identifies no target is the
-    /// resource reported absent.
+    /// A `ResourceARN` a tag operation cannot resolve to a registered scalable target, which
+    /// this service DID mint for a target it has since stopped holding: the ARN names a
+    /// resource the service knows about and no longer has, so it is the resource reported
+    /// absent. The READ and the two MUTATIONS answer that condition alike.
     ScalableTargetNotFound(ResourceNotFoundException),
+    /// A `ResourceARN` of the tagging family this service never minted, so it names no resource
+    /// this endpoint holds any record of: the call is refused without the service disclosing
+    /// whether such a resource exists ([`TARGET_ARN_NEVER_MINTED_MESSAGE`]). The READ and the
+    /// two MUTATIONS answer that condition alike too.
+    TargetArnNeverMinted(ValidationException),
     /// An operation this service does not offer for the resource addressed.
     NotSupported(NotSupported),
 }
@@ -132,6 +156,14 @@ impl WireRefusal {
         })
     }
 
+    /// The refusal of a `resource_arn` this service never minted, which states the one fixed
+    /// sentence and nothing of the ARN it was asked about.
+    pub fn target_arn_never_minted() -> Self {
+        Self::TargetArnNeverMinted(ValidationException {
+            message: Some(TARGET_ARN_NEVER_MINTED_MESSAGE.to_string()),
+        })
+    }
+
     /// The refusal of `operation`, which this service does not offer for the resource the
     /// request addressed.
     pub fn not_supported(operation: &str) -> Self {
@@ -145,6 +177,7 @@ impl WireRefusal {
     fn as_serializable(&self) -> &dyn SerializableStruct {
         match self {
             Self::ScalableTargetNotFound(e) => e,
+            Self::TargetArnNeverMinted(e) => e,
             Self::NotSupported(e) => e,
         }
     }
@@ -155,6 +188,7 @@ impl WireRefusal {
             Self::ScalableTargetNotFound(_) => {
                 &crate::ops::types::SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION
             }
+            Self::TargetArnNeverMinted(_) => &crate::ops::types::SCHEMA_VALIDATION_EXCEPTION,
             Self::NotSupported(_) => &NOT_SUPPORTED_SCHEMA,
         }
     }
@@ -164,6 +198,7 @@ impl WireRefusal {
     fn error_code(&self) -> &'static str {
         match self {
             Self::ScalableTargetNotFound(_) => RESOURCE_NOT_FOUND_CODE,
+            Self::TargetArnNeverMinted(_) => TARGET_ARN_NEVER_MINTED_CODE,
             Self::NotSupported(_) => ACCESS_DENIED_CODE,
         }
     }
@@ -172,6 +207,9 @@ impl WireRefusal {
     fn http_status(&self) -> u16 {
         match self {
             Self::ScalableTargetNotFound(_) => TARGET_NOT_FOUND_STATUS,
+            // The modelled `ValidationException`'s own `@httpError`, which is the status the
+            // recorded refusal of such an ARN carries.
+            Self::TargetArnNeverMinted(_) => TARGET_ARN_NEVER_MINTED_STATUS,
             Self::NotSupported(_) => ACCESS_DENIED_STATUS,
         }
     }
@@ -180,6 +218,7 @@ impl WireRefusal {
     fn message(&self) -> &str {
         match self {
             Self::ScalableTargetNotFound(e) => e.message.as_deref().unwrap_or_default(),
+            Self::TargetArnNeverMinted(e) => e.message.as_deref().unwrap_or_default(),
             Self::NotSupported(e) => &e.message,
         }
     }
@@ -276,8 +315,9 @@ impl<E: OperationError> OperationError for Refusable<E> {
         match self {
             Self::Channel(e) => e.query_error_code(),
             // Neither refusal's shape carries an `awsQueryError` trait to honour: the
-            // modelled `ResourceNotFoundException` declares none, and the not-supported
-            // shape is in no model.
+            // modelled `ResourceNotFoundException` declares none, the modelled
+            // `ValidationException`'s own is inert under this service's `awsJson1_1`
+            // protocol, and the not-supported shape is in no model.
             Self::Refused(_) => None,
         }
     }

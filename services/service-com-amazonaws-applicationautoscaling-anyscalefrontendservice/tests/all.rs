@@ -95,6 +95,8 @@ mod step_scaling_execution;
 mod step_scaling_window_reread;
 #[path = "all/superseded_scaling_activities.rs"]
 mod superseded_scaling_activities;
+#[path = "all/tag_arn_provenance.rs"]
+mod tag_arn_provenance;
 #[path = "all/tag_family_absent_target.rs"]
 mod tag_family_absent_target;
 #[path = "all/tag_mutation_refusal.rs"]

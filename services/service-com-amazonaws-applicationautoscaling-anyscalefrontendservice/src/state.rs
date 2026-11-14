@@ -60,6 +60,10 @@ pub mod in_process_calls;
 /// error channel that carries them.
 pub mod wire_refusals;
 
+/// What a `ResourceARN` the tagging family addresses resolves to, and the provenance record of
+/// the ARNs this service has minted.
+pub mod tag_target_arns;
+
 /// The natural AWS identity of a scalable target, and the prefix of a scaling policy's
 /// and a scheduled action's identity.
 ///
@@ -338,11 +342,18 @@ pub struct ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     /// `ScalableTargetARN` -> the target it names, so an ARN-addressed operation
     /// (`TagResource` and friends) can resolve a `ResourceARN` back to a target.
     ///
-    /// `DeregisterScalableTarget` takes an ARN out of this index as it removes the target, so
-    /// an ARN whose target is no longer registered resolves to nothing here — which is the
-    /// one answer an ARN-addressed operation has for every ARN that names no registered
-    /// scalable target (`wire_refusals::WireRefusal::ScalableTargetNotFound`).
+    /// `DeregisterScalableTarget` takes an ARN out of this index as it removes the target
+    /// (`Self::retire_target_arn`), so an ARN whose target is no longer registered resolves to
+    /// nothing here — and is kept in [`Self::retired_target_arns`] as one this service DID
+    /// mint, which is what an ARN-addressed operation tells it apart from an ARN this service
+    /// never minted by (`tag_target_arns::TaggedTargetArn`).
     pub arn_index: BTreeMap<String, TargetKey>,
+    /// The ARNs this service minted for scalable targets it no longer holds: an ARN's
+    /// PROVENANCE, which outlives the target it was minted for.
+    ///
+    /// Written by `Self::retire_target_arn` and read through `Self::resolve_tagged_target_arn`;
+    /// bounded by `tag_target_arns::MAX_RETIRED_TARGET_ARNS`.
+    pub retired_target_arns: tag_target_arns::RetiredTargetArns,
     /// Scheduled actions, ordered by (target, action name). `DeregisterScalableTarget`
     /// cascades into this map, so a deregistered target leaves none behind.
     ///
@@ -1695,21 +1706,21 @@ pub fn take_page<T>(
 pub const CAPACITY_RANGE_INVERTED_MESSAGE: &str =
     "Maximum capacity cannot be less than minimum capacity";
 
-/// The message every operation of the tagging family carries for a `ResourceARN` that
-/// resolves to no registered scalable target.
+/// The message every operation of the tagging family carries for a `ResourceARN` this service
+/// MINTED for a scalable target it no longer holds.
 ///
-/// The resource a tag operation addresses is the scalable target its `ResourceARN` names,
-/// and either that target is registered or it is not: the refusal states exactly that, and
-/// the ARN asked about is reported in the modelled `ResourceName` member rather than spliced
-/// into the sentence. Entirely fixed text — no ARN, Region, account or tag key is
-/// interpolated. It is answered for every ARN that resolves to no registered target — one
-/// this service never minted and one whose target has since been deregistered alike, since
-/// neither identifies a scalable target now — by the READ and by the two MUTATIONS alike,
-/// with the client-error status rather than with the 404 the shape's `@httpError` declares
-/// (`wire_refusals::WireRefusal::ScalableTargetNotFound`). A tag write to an absent target is
-/// the resource reported absent, not a permission failure: `ResourceNotFoundException` is
-/// modelled on all three operations, and a client branches on the code to tell "the target is
-/// gone" from "your request may not be made".
+/// The resource a tag operation addresses is the scalable target its `ResourceARN` names, and
+/// an ARN this service minted names a target it either still holds or has lost: the refusal
+/// states exactly that, and the ARN asked about is reported in the modelled `ResourceName`
+/// member rather than spliced into the sentence. Entirely fixed text — no ARN, Region, account
+/// or tag key is interpolated. It is answered by the READ and by the two MUTATIONS alike, with
+/// the client-error status rather than with the 404 the shape's `@httpError` declares
+/// (`wire_refusals::WireRefusal::ScalableTargetNotFound`). A tag write to a target this service
+/// minted and lost is the resource reported absent, not a permission failure:
+/// `ResourceNotFoundException` is modelled on all three operations, and a client branches on
+/// the code to tell "the target is gone" from "your request may not be made". An ARN this
+/// service never minted earns the other refusal instead, since it names no resource this
+/// endpoint holds any record of (`tag_target_arns::TaggedTargetArn`).
 pub const SCALABLE_TARGET_NOT_FOUND_MESSAGE: &str = "Scalable Target not found";
 
 // ---------------------------------------------------------------------------
@@ -3799,7 +3810,7 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
             // this is the same resource going away.
             None => {
                 if let Some(removed) = store.targets.remove(key) {
-                    store.arn_index.remove(&removed.arn);
+                    store.retire_target_arn(&removed.arn, key);
                     retired = store
                         .policies
                         .iter()

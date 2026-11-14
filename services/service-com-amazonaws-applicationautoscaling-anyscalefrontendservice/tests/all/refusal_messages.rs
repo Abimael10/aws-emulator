@@ -729,9 +729,12 @@ async fn a_policy_configuration_that_cannot_be_evaluated_states_the_documented_r
     }
 }
 
-/// The sentence every operation of the tagging family carries for an ARN that resolves to no
-/// registered scalable target.
+/// The sentence every operation of the tagging family carries for an ARN this Region minted for
+/// a scalable target it no longer holds.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
+
+/// The whole sentence they carry for an ARN this Region never minted.
+const ACCESS_DENIED: &str = "Access Denied";
 
 #[tokio::test]
 async fn a_tag_operation_on_an_unregistered_target_answers_in_its_own_terms() {
@@ -774,16 +777,22 @@ async fn a_tag_operation_on_an_unregistered_target_answers_in_its_own_terms() {
         "case \"deregister\": expected 200, got {status} {body:?}"
     );
 
-    // Every ARN that names no registered target now, whether it was minted and retired or
-    // never minted at all, is answered alike by each operation.
+    // Every ARN that names no registered target now is answered by its PROVENANCE: the one this
+    // Region minted and retired reports the resource absent, and the one it never minted is
+    // refused without a report about the resource at all.
     let never_minted =
         format!("arn:aws:application-autoscaling:{REGION}:000000000000:scalable-target/0123456789abcdef");
-    for (case, resource_arn) in [
-        ("a deregistered target's ARN", arn.clone()),
-        ("an ARN this emulator never minted", never_minted),
+    for (case, resource_arn, minted_here) in [
+        ("a deregistered target's ARN", arn.clone(), true),
+        ("an ARN this emulator never minted", never_minted, false),
     ] {
-        // `ResourceNotFoundException` ("the specified resource doesn't exist"), answered at
-        // the client-error status rather than at the 404 the shape's `@httpError` declares.
+        let (expected_code, expected_message) = if minted_here {
+            // `ResourceNotFoundException` ("the specified resource doesn't exist"), answered at
+            // the client-error status rather than at the 404 the shape's `@httpError` declares.
+            ("ResourceNotFoundException", TARGET_NOT_FOUND)
+        } else {
+            ("ValidationException", ACCESS_DENIED)
+        };
         let (status, body) = emulator
             .call(
                 "ListTagsForResource",
@@ -796,28 +805,33 @@ async fn a_tag_operation_on_an_unregistered_target_answers_in_its_own_terms() {
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?} on ListTagsForResource: expected a ResourceNotFoundException, got \
-             {body:?}"
+            expected_code,
+            "case {case:?} on ListTagsForResource: expected {expected_code}, got {body:?}"
         );
         let message = error_message(&body);
         assert_eq!(
-            message, TARGET_NOT_FOUND,
-            "case {case:?} on ListTagsForResource: expected {TARGET_NOT_FOUND:?}, got {message:?}"
+            message, expected_message,
+            "case {case:?} on ListTagsForResource: expected {expected_message:?}, got {message:?}"
         );
-        assert_eq!(
-            body["ResourceName"],
-            json!(resource_arn),
-            "case {case:?}: expected the ARN asked about to be reported in ResourceName, got \
-             {body:?}"
-        );
+        if minted_here {
+            assert_eq!(
+                body["ResourceName"],
+                json!(resource_arn),
+                "case {case:?}: expected the ARN asked about to be reported in ResourceName, got \
+                 {body:?}"
+            );
+        } else {
+            assert!(
+                body.get("ResourceName").is_none(),
+                "case {case:?}: expected no resource to be named, got {body:?}"
+            );
+        }
         assert_service_text(case, &message);
 
         // The two writes answer the same condition the same way the read does: `ResourceARN`
-        // names the resource the call addresses, so an ARN that resolves to no registered
-        // target is the resource reported absent, whether this service minted it for a target
-        // that has since been deregistered or never minted it at all. None of the three is the
-        // boundary validator's template.
+        // names the resource the call addresses, so whether the service reports that resource
+        // absent or refuses to speak about it at all is the ARN's provenance and not the
+        // operation's. None of the three is the boundary validator's template.
         for (operation, request) in [
             (
                 "TagResource",
@@ -835,20 +849,27 @@ async fn a_tag_operation_on_an_unregistered_target_answers_in_its_own_terms() {
             );
             assert_eq!(
                 error_code(&body),
-                "ResourceNotFoundException",
-                "case {case:?} on {operation}: expected a ResourceNotFoundException, got {body:?}"
+                expected_code,
+                "case {case:?} on {operation}: expected {expected_code}, got {body:?}"
             );
             let message = error_message(&body);
             assert_eq!(
-                message, TARGET_NOT_FOUND,
-                "case {case:?} on {operation}: expected {TARGET_NOT_FOUND:?}, got {message:?}"
+                message, expected_message,
+                "case {case:?} on {operation}: expected {expected_message:?}, got {message:?}"
             );
-            assert_eq!(
-                body["ResourceName"],
-                json!(resource_arn),
-                "case {case:?} on {operation}: expected the ARN asked about in ResourceName, got \
-                 {body:?}"
-            );
+            if minted_here {
+                assert_eq!(
+                    body["ResourceName"],
+                    json!(resource_arn),
+                    "case {case:?} on {operation}: expected the ARN asked about in ResourceName, \
+                     got {body:?}"
+                );
+            } else {
+                assert!(
+                    body.get("ResourceName").is_none(),
+                    "case {case:?} on {operation}: expected no resource to be named, got {body:?}"
+                );
+            }
             assert_service_text(case, &message);
         }
     }

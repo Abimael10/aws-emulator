@@ -669,7 +669,7 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
             status, 400,
             "case {case:?}: expected {operation} to refuse with HTTP 400, got {status} {body:?}"
         );
-        let expected = expected_code(operation);
+        let expected = retired_arn_code(operation);
         assert_eq!(
             error_code(&body),
             expected,
@@ -712,9 +712,8 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
     ];
 
     for (case, arn) in unresolvable {
-        // None of these ARNs resolves to a registered scalable target, so each operation
-        // answers the same way it answers the ARN of a deregistered target: there is no
-        // scalable target to report tags of, and none to write tags on.
+        // None of these ARNs is one this Region minted, so each operation refuses the tagging
+        // call itself rather than reporting on a resource it holds no record of.
         for (operation, request) in [
             ("TagResource", json!({"ResourceARN": arn, "Tags": {"a": "1"}})),
             (
@@ -728,7 +727,7 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
                 status, 400,
                 "case {case:?}: expected {operation} to refuse with HTTP 400, got {status} {body:?}"
             );
-            let expected = expected_code(operation);
+            let expected = never_minted_arn_code(operation);
             assert_eq!(
                 error_code(&body),
                 expected,
@@ -738,11 +737,18 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
     }
 }
 
-/// The error code every operation of the tagging family answers an ARN that resolves to no
-/// registered scalable target with: `ResourceARN` names the resource the call addresses, so an
-/// ARN that identifies no registered target is the resource reported absent.
-fn expected_code(_operation: &str) -> &'static str {
+/// The error code every operation of the tagging family answers an ARN this Region MINTED for a
+/// scalable target it no longer holds with: `ResourceARN` names the resource the call addresses,
+/// so an ARN whose target the service knows about and has lost is the resource reported absent.
+fn retired_arn_code(_operation: &str) -> &'static str {
     "ResourceNotFoundException"
+}
+
+/// The error code they answer an ARN this Region NEVER minted with: it names no resource this
+/// endpoint holds any record of, so the tagging call is refused without a report about the
+/// resource (recorded behaviour).
+fn never_minted_arn_code(_operation: &str) -> &'static str {
+    "ValidationException"
 }
 
 #[tokio::test]
