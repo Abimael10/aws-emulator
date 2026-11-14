@@ -12,7 +12,11 @@
 //!
 //! A function, version or alias that has no policy at all is a
 //! `ResourceNotFoundException`: there is no document to report, and an empty one would
-//! claim a policy exists. That refusal carries
+//! claim a policy exists. The unpublished version named EXPLICITLY — in the `FunctionName`
+//! or in the `Qualifier` — is always in that state: it is an identity of its own, and
+//! `AddPermission` attaches no policy to it, so this read answers for a document that does
+//! not exist rather than for the unqualified function's
+//! (`crate::state::policy_bearing_version`). That refusal carries
 //! [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] — the fixed sentence naming no resource —
 //! and so does a `FunctionName`/`Qualifier` pair that resolves to nothing: this READ is
 //! answered for the document it was asked for, which does not exist in either case, so one
@@ -223,7 +227,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The function, version or alias resolved, so what is missing is the POLICY — and
         // it is reported with that same fixed sentence: whether the resource or its policy
         // is what this read could not find, the document it was asked for does not exist.
-        let Some(policy) = record.policies.get(&version) else {
+        //
+        // Which document that is comes from the identity the REQUEST addressed: the
+        // unpublished version spelled out is an identity of its own, and one no grant can
+        // be attached to, so it holds no document however the function itself is granted
+        // (`crate::state::policy_bearing_version`).
+        let held = crate::state::policy_bearing_version(
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &version,
+        )
+        .and_then(|identity| record.policies.get(identity));
+        let Some(policy) = held else {
             return Err(GetPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,

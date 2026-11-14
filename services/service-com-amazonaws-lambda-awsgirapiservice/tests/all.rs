@@ -457,6 +457,8 @@ mod permission_and_policy_refusals;
 mod permission_principal_and_qualifier_rules;
 #[path = "all/policy_size_accounting.rs"]
 mod policy_size_accounting;
+#[path = "all/policy_unpublished_version_identity.rs"]
+mod policy_unpublished_version_identity;
 #[path = "all/policy_versions_and_resources.rs"]
 mod policy_versions_and_resources;
 #[path = "all/pre_lookup_request_validation.rs"]

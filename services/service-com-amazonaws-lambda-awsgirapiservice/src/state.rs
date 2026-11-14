@@ -27,7 +27,9 @@
 //! policy is attached to the ARN the permission names, so [`FunctionRecord::policies`]
 //! holds one [`PolicyRecord`] per qualifier a statement was added to — the
 //! function-level policy under [`VERSION_LATEST`], and one per published version or
-//! alias. `AddPermission` appends exactly the statement its request described and
+//! alias. The unpublished version named EXPLICITLY is not one of those identities and
+//! holds no policy of its own ([`policy_identity`]). `AddPermission` appends exactly the
+//! statement its request described and
 //! `GetPolicy` reports the document those statements make up, so a statement is never
 //! echoed back out of a request body. `PutResourcePolicy` addresses the same policy by
 //! ARN and supplies the WHOLE document instead ("This operation replaces any existing
@@ -4737,6 +4739,14 @@ pub use request_form::*;
 /// names; see the module's own header.
 pub mod download_location;
 pub use download_location::*;
+
+/// WHICH identity a function's resource-based policy belongs to — the function, a published
+/// version or an alias — and why the unpublished version named explicitly holds none; see
+/// the module's own header.
+pub mod policy_identity;
+pub use policy_identity::{
+    names_unpublished_version, policy_bearing_version, unpublished_version_grant_message,
+};
 
 /// What the code-signing configuration a function is attached to does to a DEPLOYMENT of a
 /// package to it; see the module's own header.

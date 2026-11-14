@@ -227,7 +227,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // POLICY itself, and that is what it reports: a READ of the policy answers for the
         // resource it was asked about, a removal answers for the policy it was asked to
         // change.
-        let Some(policy) = record.policies.get_mut(&version) else {
+        //
+        // Which policy that is comes from the identity the REQUEST addressed: the
+        // unpublished version spelled out is an identity of its own, and one no grant can
+        // be attached to, so there is no document of it to take a statement out of
+        // (`crate::state::policy_bearing_version`).
+        let identity = crate::state::policy_bearing_version(
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &version,
+        );
+        let held = identity.and_then(|identity| record.policies.get_mut(identity));
+        let Some(policy) = held else {
             return Err(RemovePermissionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,

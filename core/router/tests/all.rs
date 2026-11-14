@@ -7274,3 +7274,30 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // gone rather than re-typed: the rules they repeated — declare each suite exactly ONCE,
 // since a second `mod` for one name is `E0428`, and keep every `//!` note in the header,
 // since an inner doc comment past the first item is `E0753` — stand in the module doc at
+// second declaration two landings appended here is gone, a module declared twice being
+// `E0428` and compiling neither copy.)
+// (One more line of that header fragment, appended into this tail as `//!` by a landing:
+// an inner doc comment is legal only before the first item, so it stands as an ordinary
+// comment.)
+// declaration appended here is a second one, and a module declared twice is `E0428`.)
+// (Six more lines of this file's own header, appended into this tail as `//!` by a
+// landing: Declare each suite exactly ONCE, since this is one crate root and a second
+// first item, so one appended here is `E0753` and compiles nothing — which is why these
+// lines are ordinary comments. `all/all_rs_declares_each_suite_once.rs` and
+// (Two more lines of that header fragment, as ordinary comments for the same reason: the
+// checks cover this file and every service crate's `tests/all.rs`, so check there rather
+// than leaving a note here.)
+// (Four more lines of that header, as ordinary comments for the same reason: declare each
+// `E0428`, and a note written with `//!` anywhere but the head of this file is `E0753` —
+// (One more line of that header fragment, an ordinary comment for the same reason: a
+// (Six more lines of that header landed here typed with `//!`, and stand as ordinary
+// comments for the reason they state: declare each suite ONCE, since this is one crate
+// root and a second `mod` for the same name is `E0428`, and a note written with `//!`
+// anywhere but the head of this file is `E0753` — either fails every suite in this target.
+// (Seven more lines of that header landed here typed with `//!`, and stand as ordinary
+// comments for the same reason: declare each suite ONCE, since a second `mod` for the same
+// name is `E0428` and fails every suite in this target;
+// first item is `E0753` and would compile no suite of this target.)
+// there rather than leaving a note in the appended tail below, where an inner doc comment
+// is `E0753`.)
+// What a stack does when its Lambda-backed custom resource's provider answers FAILED is only

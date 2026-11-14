@@ -270,18 +270,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The qualifier the request named, as opposed to the `$LATEST` an unqualified
-        // request resolves to: it may come from the `FunctionName` or from the
-        // `Qualifier` parameter, and `resolve_function` below refuses a pair that names
-        // two different ones.
-        let named_qualifier = crate::state::parse_function_reference(&input.function_name)
-            .and_then(|reference| reference.qualifier);
-        let requested_qualifier = input
-            .qualifier
-            .clone()
-            .or(named_qualifier)
-            .filter(|qualifier| !qualifier.is_empty());
-
         let mut store = state.lock();
         let (record, version) = crate::state::resolve_function(
             &mut store,
@@ -309,15 +297,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Lambda does not support adding policies to version $LATEST", so a request
         // that names the unpublished version as its qualifier is refused rather than
-        // silently attached to the function.
-        if requested_qualifier.as_deref() == Some(crate::state::VERSION_LATEST) {
+        // silently attached to the function — the same reading that leaves that identity
+        // holding no policy for `GetPolicy` to report (`crate::state::policy_identity`).
+        if crate::state::names_unpublished_version(&input.function_name, input.qualifier.as_deref())
+        {
             return Err(AddPermissionErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     r#type: None,
-                    message: Some(format!(
-                        "We currently do not support adding policies for {}.",
-                        crate::state::VERSION_LATEST
-                    )),
+                    message: Some(crate::state::unpublished_version_grant_message()),
                 },
             )
             .into());
