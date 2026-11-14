@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataCatalog
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataCatalog`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataCatalog::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies `Type`, `Description` and `Parameters` to the data catalog
+//! registered under the requested name in this service's state, so the next
+//! `GetDataCatalog` reports what this call wrote; refuses a name the registry does not
+//! hold and writes nothing for it.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +145,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataCatalog` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataCatalogErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Check the request on its own terms FIRST, before any lock is taken: a request
+        // that is going to be refused never walks the registry, and no other Athena
+        // request waits behind the work of measuring it. The same checks the create path
+        // makes of the same members, through the same helpers, so an update cannot leave
+        // the registry holding a catalog a create would have refused.
+        let catalog_type = input.r#type;
+        if let Some(message) = crate::state::data_catalog_type_error(&catalog_type) {
+            return Err(invalid_request(message));
+        }
+        // The name's documented length and character set, neither of which the model's
+        // `CatalogNameString` carries.
+        if let Some(message) = crate::state::data_catalog_name_error(&input.name, &catalog_type) {
+            return Err(invalid_request(message));
+        }
+        if let Some(parameters) = input.parameters.as_ref() {
+            if let Some(message) = crate::state::data_catalog_parameters_size_error(
+                crate::state::parameters_bytes(parameters),
+            ) {
+                return Err(invalid_request(message));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateDataCatalogErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // One lock for the whole read-modify-write, so two updates arriving together are
+        // applied one after the other and the registry never holds a half-applied
+        // catalog.
+        let mut store = state.lock();
+
+        let Some(record) = store.data_catalogs.get_mut(&input.name) else {
+            // Athena models no not-found error for this operation; naming a catalog this
+            // account does not hold is "something wrong with the input to the request",
+            // which is what `InvalidRequestException` (HTTP 400) reports, under the code
+            // for a refusal the request itself caused. The sentence comes from
+            // `crate::state`, which holds the update path's own wording of a catalog miss
+            // beside the read's and the delete's.
+            return Err(invalid_request(
+                crate::state::data_catalog_not_found_on_update(&input.name),
+            ));
+        };
+
+        // The `Parameters` the catalog holds once this update is applied: the map the
+        // request carried, which REPLACES the stored one (`Parameters` "specifies the
+        // Lambda function or functions to use for updating the data catalog", so the map
+        // a successful update is read back with is the map it carried), or the stored map
+        // itself for a request that named none.
+        let parameters: ::std::collections::HashMap<String, String> = match input.parameters {
+            Some(parameters) => parameters,
+            None => record
+                .parameters
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        };
+        // `Parameters` is "a mapping whose values depend on the catalog type", and the
+        // type this update states is the one they have to describe — so the map is checked
+        // against `Type` whether the request carried the map, the type, or both.
+        if let Some(message) =
+            crate::state::data_catalog_parameters_error(&catalog_type, &parameters)
+        {
+            return Err(invalid_request(message));
+        }
+        let connection_type = crate::state::federated_connection_type(&catalog_type, &parameters)
+            .map_err(invalid_request)?;
+
+        // Only now is anything written, and only what this request names: `Name` is what
+        // the catalog is addressed by rather than something an update changes, and a
+        // description the request left out keeps the value a read reported before this
+        // call.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataCatalog"))
+        // A catalog whose TYPE this update changes is a catalog whose creation is now the
+        // one the new type describes — an asynchronous one for the federated type and a
+        // synchronous one for every other — so the instant its creation is complete is
+        // taken from the new type, and a catalog whose type the update restates keeps the
+        // instant its create stored.
+        if record.catalog_type != catalog_type {
+            record.create_complete_at =
+                crate::state::create_complete_at(&catalog_type, ::std::time::SystemTime::now());
+        }
+        record.catalog_type = catalog_type;
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        record.parameters = parameters.into_iter().collect();
+        record.connection_type = connection_type;
+
+        // `UpdateDataCatalogOutput` models no members: the updated catalog is read back
+        // through `GetDataCatalog`.
+        Ok(UpdateDataCatalogOutput {})
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Every refusal above is a bad request rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request." Each one is caused by the request
+/// itself — a catalog this account does not hold, a parameter map that describes no
+/// catalog of the stated type — which is the class
+/// [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> UpdateDataCatalogError {
+    UpdateDataCatalogError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }

@@ -4966,3 +4966,9 @@ mod cloudformation_provisions_event_buses_and_bus_policies;
 // leaving a note here. (Six lines of that header fragment, ordinary comments for the
 // reason they state.)
 // and compiles nothing. (Five lines of that header fragment, ordinary comments for the
+// (Both suites are declared ONCE, further up this file: two branches landing in the same
+// window each appended a second declaration of them here, which is `E0428` and compiles no
+// (That suite stands declared ONCE, further up
+// (`cloudwatch_cfn_alarm_action_topic_policy` is declared ONCE, further up this file: two
+// compiles no suite of this target.)
+// one stays in the head block: an inner doc comment past the first item is `E0753`, so the

@@ -117,7 +117,7 @@ use crate::ops::types::{
     Column, DataCatalog, EngineVersion, ManagedQueryResultsConfiguration, QueryExecution,
     QueryExecutionContext, QueryExecutionStatistics, QueryExecutionStatus, ResultConfiguration,
     ResultReuseConfiguration, ResultReuseInformation, TableMetadata, Tag, WorkGroup,
-    WorkGroupConfiguration, WorkGroupSummary, CONNECTION_TYPE_VALUES,
+    WorkGroupConfiguration, WorkGroupSummary, CONNECTION_TYPE_VALUES, DATA_CATALOG_TYPE_VALUES,
 };
 
 /// The `WorkGroupState` a freshly created workgroup is in. One of
@@ -127,6 +127,13 @@ use crate::ops::types::{
 pub const WORK_GROUP_STATE_ENABLED: &str = "ENABLED";
 /// The other `WorkGroupState`; see [`WORK_GROUP_STATE_ENABLED`].
 pub const WORK_GROUP_STATE_DISABLED: &str = "DISABLED";
+
+/// What one of the boolean switches of a `WorkGroupConfiguration` means when no create or
+/// update ever set it: off. `WorkGroupConfiguration$RequesterPaysEnabled` states it for
+/// its own member — "The default is `false`" — and it is the reading every one of them
+/// documents, each describing a workgroup that does less when the switch is not set. See
+/// [`effective_work_group_configuration`].
+pub const WORK_GROUP_SWITCH_UNSET: bool = false;
 
 /// The engine version that asks Athena to choose one.
 ///
@@ -216,17 +223,63 @@ impl WorkGroupRecord {
     }
 
     /// The record as the modelled `WorkGroup` shape a read answers with.
+    ///
+    /// The configuration is reported through [`effective_work_group_configuration`], so a
+    /// switch no write ever set is reported with the value it has rather than left out.
     pub fn to_work_group(&self) -> WorkGroup {
         WorkGroup {
             name: self.name.clone(),
             state: Some(self.state.clone()),
-            configuration: Some(self.configuration.clone()),
+            configuration: Some(effective_work_group_configuration(&self.configuration)),
             description: self.description.clone(),
             creation_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             // Athena fills this only for an IAM Identity Center enabled workgroup,
             // whose Identity Center application this emulator does not create.
             identity_center_application_arn: None,
         }
+    }
+}
+
+/// The configuration a read reports for a workgroup that holds `stored`: every switch the
+/// shape carries as a boolean, reported with the value it has in effect.
+///
+/// `WorkGroupConfiguration` carries four of them — `EnforceWorkGroupConfiguration`,
+/// `PublishCloudWatchMetricsEnabled`, `RequesterPaysEnabled` and
+/// `EnableMinimumEncryptionConfiguration` — and each is documented by what the workgroup
+/// does when it is set and when it is not, `RequesterPaysEnabled` stating "The default is
+/// `false`" outright. So a workgroup whose create named none of them is not one whose
+/// settings are unknown but one with every switch off, and that is what a read of its
+/// configuration reports: an OFF switch, not an absent member.
+///
+/// DERIVED at read time and never written: the record keeps exactly what the create or
+/// update put in it, which is what makes the switch a later update leaves alone the one
+/// that write set. Every other member of the stored configuration is reported as it
+/// stands.
+pub fn effective_work_group_configuration(
+    stored: &WorkGroupConfiguration,
+) -> WorkGroupConfiguration {
+    WorkGroupConfiguration {
+        enforce_work_group_configuration: Some(
+            stored
+                .enforce_work_group_configuration
+                .unwrap_or(WORK_GROUP_SWITCH_UNSET),
+        ),
+        publish_cloud_watch_metrics_enabled: Some(
+            stored
+                .publish_cloud_watch_metrics_enabled
+                .unwrap_or(WORK_GROUP_SWITCH_UNSET),
+        ),
+        requester_pays_enabled: Some(
+            stored
+                .requester_pays_enabled
+                .unwrap_or(WORK_GROUP_SWITCH_UNSET),
+        ),
+        enable_minimum_encryption_configuration: Some(
+            stored
+                .enable_minimum_encryption_configuration
+                .unwrap_or(WORK_GROUP_SWITCH_UNSET),
+        ),
+        ..stored.clone()
     }
 }
 
@@ -449,6 +502,18 @@ pub fn data_catalog_not_found(catalog_name: &str) -> String {
 /// sentences are separate helpers and neither path can drift onto the other's wording.
 pub fn data_catalog_not_found_on_delete(catalog_name: &str) -> String {
     format!("DataCatalog {catalog_name} was not found")
+}
+
+/// The refusal message an UPDATE whose named data catalog this account does not hold
+/// answers with.
+///
+/// The same miss as [`data_catalog_not_found`], worded as the UPDATE path words it:
+/// "DataCatalog " + the requested `Name` + " does not exist." Athena words the three
+/// paths differently — a read states the name "was not found.", a delete the same without
+/// the closing period, and an update that the catalog "does not exist." — so each path
+/// keeps its own sentence and none can drift onto another's.
+pub fn data_catalog_not_found_on_update(catalog_name: &str) -> String {
+    format!("DataCatalog {catalog_name} does not exist.")
 }
 
 /// The refusal message for a delete that asks for the Athena catalog alone to be removed
@@ -1013,6 +1078,32 @@ pub fn parameters_bytes(parameters: &HashMap<String, String>) -> usize {
         .fold(0usize, |bytes, (key, value)| {
             bytes.saturating_add(key.len()).saturating_add(value.len())
         })
+}
+
+/// Why the `Parameters` map of `parameters_bytes` bytes is larger than one data catalog
+/// holds, if it is. Stated once, so the create path and the update path hold a map to the
+/// same bound with the same sentence; see [`MAX_DATA_CATALOG_PARAMETERS_BYTES`].
+pub fn data_catalog_parameters_size_error(parameters_bytes: usize) -> Option<String> {
+    (parameters_bytes > MAX_DATA_CATALOG_PARAMETERS_BYTES).then(|| {
+        format!(
+            "Parameters carries {parameters_bytes} bytes of keys and values, more than the \
+             {MAX_DATA_CATALOG_PARAMETERS_BYTES} bytes a data catalog's parameters can hold."
+        )
+    })
+}
+
+/// Why `catalog_type` is not a `DataCatalogType` this service registers a catalog under,
+/// if it is not: the member is the model's own enum, so the only values that reach here
+/// are the ones it declares, and this sentence names them. One wording for every path that
+/// takes a `Type`.
+pub fn data_catalog_type_error(catalog_type: &str) -> Option<String> {
+    (!DATA_CATALOG_TYPE_VALUES.contains(&catalog_type)).then(|| {
+        format!(
+            "Type {catalog_type} is not a supported data catalog type. Supported data \
+             catalog types are {}.",
+            DATA_CATALOG_TYPE_VALUES.join(", ")
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------

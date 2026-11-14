@@ -177,12 +177,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that is going to be refused never walks the registry, and no other Athena
         // request waits behind the work of measuring it.
         let catalog_type = input.r#type;
-        if !DATA_CATALOG_TYPE_VALUES.contains(&catalog_type.as_str()) {
-            return Err(invalid_request(format!(
-                "Type {catalog_type} is not a supported data catalog type. Supported data \
-                 catalog types are {}.",
-                DATA_CATALOG_TYPE_VALUES.join(", ")
-            )));
+        if let Some(message) = crate::state::data_catalog_type_error(&catalog_type) {
+            return Err(invalid_request(message));
         }
         // The name's documented length and character set, neither of which the model's
         // `CatalogNameString` carries.
@@ -191,13 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let parameters = input.parameters.unwrap_or_default();
-        let parameters_bytes = crate::state::parameters_bytes(&parameters);
-        if parameters_bytes > crate::state::MAX_DATA_CATALOG_PARAMETERS_BYTES {
-            return Err(invalid_request(format!(
-                "Parameters carries {parameters_bytes} bytes of keys and values, more than \
-                 the {} bytes a data catalog's parameters can hold.",
-                crate::state::MAX_DATA_CATALOG_PARAMETERS_BYTES
-            )));
+        if let Some(message) = crate::state::data_catalog_parameters_size_error(
+            crate::state::parameters_bytes(&parameters),
+        ) {
+            return Err(invalid_request(message));
         }
         // `Parameters` is "a mapping whose values depend on the catalog type", and each
         // type documents the keys it requires.

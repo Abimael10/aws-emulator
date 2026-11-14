@@ -23,6 +23,9 @@ mod data_catalog_delete;
 #[path = "all/data_catalog_lifecycle.rs"]
 mod data_catalog_lifecycle;
 
+#[path = "all/data_catalog_update.rs"]
+mod data_catalog_update;
+
 #[path = "all/database_statements.rs"]
 mod database_statements;
 
@@ -73,6 +76,9 @@ mod table_metadata;
 
 #[path = "all/work_group_authorization.rs"]
 mod work_group_authorization;
+
+#[path = "all/work_group_configuration_switches.rs"]
+mod work_group_configuration_switches;
 
 #[path = "all/work_group_delete.rs"]
 mod work_group_delete;
