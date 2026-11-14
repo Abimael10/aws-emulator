@@ -70,6 +70,28 @@ pub const METADATA_ENTRIES_PER_KIND: usize = 100;
 /// the same reason as [`METADATA_ENTRIES_PER_KIND`].
 pub const PROPERTIES_PER_TABLE: usize = 1_000;
 
+/// The table properties S3 Tables settles on every table it creates: the codec a
+/// writer compresses the table's Parquet data files with, which S3 Tables sets
+/// rather than leaving to the engine that writes the table.
+///
+/// A create that states a property of its own keeps it — the caller's document
+/// is applied over these — and a commit may set or remove any of them
+/// afterwards, so this is the state a table STARTS in and not a floor.
+pub const CREATED_TABLE_PROPERTIES: &[(&str, &str)] =
+    &[("write.parquet.compression-codec", "zstd")];
+
+/// One entry of a table's metadata log: a metadata file the table was described
+/// by before the current one, and when that description was last updated.
+///
+/// The Iceberg table specification records the PREVIOUS metadata file each time
+/// a new one is written, which is how a reader walks back through the table's
+/// descriptions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcebergMetadataLogEntry {
+    pub timestamp_ms: i64,
+    pub metadata_file: String,
+}
+
 /// `at` as Unix epoch milliseconds, which is how the Iceberg table metadata
 /// document carries an instant.
 pub fn epoch_millis(at: SystemTime) -> i64 {
@@ -268,6 +290,10 @@ pub struct IcebergTableMetadata {
     pub sort_orders: Vec<IcebergSortOrderRecord>,
     pub default_sort_order_id: i32,
     pub properties: BTreeMap<String, String>,
+    /// The metadata files this table was described by before the current one,
+    /// oldest first, each beside the instant that description was last updated.
+    /// Empty on a table whose first metadata file is still its current one.
+    pub metadata_log: Vec<IcebergMetadataLogEntry>,
     /// The version prefix of the table's current metadata file: zero for the
     /// file the create wrote, one higher for each commit after it.
     pub metadata_version: u32,
@@ -400,8 +426,45 @@ impl IcebergTableMetadata {
         members.insert("refs".to_string(), Value::Object(Map::new()));
         members.insert("snapshots".to_string(), Value::Array(Vec::new()));
         members.insert("snapshot-log".to_string(), Value::Array(Vec::new()));
-        members.insert("metadata-log".to_string(), Value::Array(Vec::new()));
+        members.insert(
+            "metadata-log".to_string(),
+            Value::Array(
+                self.metadata_log
+                    .iter()
+                    .map(|entry| {
+                        let mut logged = Map::new();
+                        logged.insert(
+                            "timestamp-ms".to_string(),
+                            Value::from(entry.timestamp_ms),
+                        );
+                        logged.insert(
+                            "metadata-file".to_string(),
+                            Value::from(entry.metadata_file.clone()),
+                        );
+                        Value::Object(logged)
+                    })
+                    .collect(),
+            ),
+        );
         Value::Object(members)
+    }
+
+    /// Record that `metadata_file`, last updated at `timestamp_ms`, was the
+    /// table's description before this record: what a new metadata file written
+    /// for the table logs about the one it replaces.
+    ///
+    /// BOUNDED, for the reason [`METADATA_ENTRIES_PER_KIND`] states: a table
+    /// committed to over and over keeps the most recent entries and forgets the
+    /// oldest, rather than growing the process's memory without limit.
+    pub fn record_previous_metadata_file(&mut self, metadata_file: String, timestamp_ms: i64) {
+        self.metadata_log.push(IcebergMetadataLogEntry {
+            timestamp_ms,
+            metadata_file,
+        });
+        let logged = self.metadata_log.len();
+        if logged > METADATA_ENTRIES_PER_KIND {
+            self.metadata_log.drain(..logged - METADATA_ENTRIES_PER_KIND);
+        }
     }
 
     /// This record with `updates` applied, or the reason the commit was not

@@ -154,6 +154,15 @@ fn no_such_table() -> GetTableError {
     .into()
 }
 
+/// `BadRequestException` (HTTP 400) — the request addresses a table by neither
+/// of the two whole forms the operation offers.
+fn invalid_addressing() -> GetTableError {
+    GetTableErrorModeled::BadRequestException(BadRequestException {
+        message: Some(crate::state::TABLE_ADDRESSING_MESSAGE.to_string()),
+    })
+    .into()
+}
+
 /// The `GetTable` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -182,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     const NAME: &'static str = "GetTable";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_TABLE_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_TABLE_OUTPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_TABLE_RECORD_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
@@ -202,56 +211,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store is touched.
         let store = state.lock();
         // The two addressing modes the model offers: a table's own ARN, which
-        // names it on its own, or the bucket, namespace and name that locate it.
-        // Neither of the four members is required on its own, so a request that
-        // carries neither whole mode addresses nothing.
+        // names it on its own, or the bucket, namespace and name that locate it
+        // together. Exactly ONE whole mode is an address: the ARN beside any
+        // part of the triple names the table twice over and leaves the service
+        // to choose which identifier it means, and a PARTIAL triple names no
+        // table at all — so both are refused before anything is resolved,
+        // rather than answered from whichever member this handler preferred.
         let table = match (
             input.table_arn.as_deref(),
             input.table_bucket_arn.as_deref(),
             input.namespace.as_deref(),
             input.name.as_deref(),
         ) {
-            (Some(table_arn), ..) => store.table_by_arn(table_arn),
+            (Some(table_arn), None, None, None) => store.table_by_arn(table_arn),
             (None, Some(table_bucket_arn), Some(namespace), Some(name)) => store
                 .table_buckets
                 .get(table_bucket_arn)
                 .and_then(|bucket| bucket.namespaces.get(namespace))
                 .and_then(|namespace| namespace.tables.get(name)),
-            _ => {
-                return Err(GetTableErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(
-                        "Either tableArn, or tableBucketARN, namespace and name together, must be \
-                         specified."
-                            .to_string(),
-                    ),
-                })
-                .into());
-            }
+            _ => return Err(invalid_addressing()),
         }
         .ok_or_else(no_such_table)?;
 
         Ok(GetTableOutput {
-            name: table.name.clone(),
-            r#type: table.table_type.as_wire().to_string(),
-            table_arn: table.table_arn.clone(),
-            namespace: table.namespace.clone(),
-            namespace_id: Some(table.namespace_id.clone()),
-            version_token: table.version_token.clone(),
-            metadata_location: table.metadata_location.clone(),
-            warehouse_location: table.warehouse_location.clone(),
-            created_at: ::aws_smithy_types::DateTime::from(table.created_at),
-            created_by: table.created_by.clone(),
-            // The service that manages the table, as the record carries it: set on a table
-            // a service provisioned in the bucket on the account's behalf, and nothing for a
-            // table a caller created through this API. No table here is a replica, so the
-            // member that reports a managed table's replication carries nothing.
-            managed_by_service: table.managed_by_service.clone(),
-            modified_at: ::aws_smithy_types::DateTime::from(table.modified_at),
+            record: GetTableRecord {
+                name: table.name.clone(),
+                r#type: table.table_type.as_wire().to_string(),
+                table_arn: table.table_arn.clone(),
+                namespace: table.namespace.clone(),
+                namespace_id: Some(table.namespace_id.clone()),
+                version_token: table.version_token.clone(),
+                metadata_location: table.metadata_location.clone(),
+                warehouse_location: table.warehouse_location.clone(),
+                created_at: ::aws_smithy_types::DateTime::from(table.created_at),
+                created_by: table.created_by.clone(),
+                // The service that manages the table, as the record carries it: set on a
+                // table a service provisioned in the bucket on the account's behalf, and
+                // nothing for a table a caller created through this API. No table here is a
+                // replica, so the member that reports a managed table's replication carries
+                // nothing.
+                managed_by_service: table.managed_by_service.clone(),
+                modified_at: ::aws_smithy_types::DateTime::from(table.modified_at),
+                owner_account_id: table.owner_account_id.clone(),
+                format: table.format.as_wire().to_string(),
+                table_bucket_id: Some(table.table_bucket_id.clone()),
+                managed_table_information: None,
+            },
+            // The account that last modified the table, which a table nothing
+            // has modified since it was created carries none of: the member is
+            // answered from the first modification recorded on the record
+            // onwards.
             modified_by: table.modified_by.clone(),
-            owner_account_id: table.owner_account_id.clone(),
-            format: table.format.as_wire().to_string(),
-            table_bucket_id: Some(table.table_bucket_id.clone()),
-            managed_table_information: None,
         })
     }
 }

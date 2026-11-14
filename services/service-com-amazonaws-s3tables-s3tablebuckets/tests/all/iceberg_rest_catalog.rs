@@ -619,8 +619,9 @@ async fn a_commit_advances_the_metadata_and_the_version_token() {
     );
     assert_eq!(
         unchanged.get("properties"),
-        Some(&json!({})),
-        "a refused commit must apply none of its updates, got {actual:?}",
+        Some(&json!({ "write.parquet.compression-codec": "zstd" })),
+        "a refused commit must apply none of its updates, leaving the table the properties \
+         its create settled, got {actual:?}",
         actual = unchanged.get("properties")
     );
 
@@ -670,8 +671,11 @@ async fn a_commit_advances_the_metadata_and_the_version_token() {
     let document = metadata(&committed, "the commit");
     assert_eq!(
         document.get("properties"),
-        Some(&json!({ "owner": "analytics" })),
-        "expected the committed properties, got {actual:?}",
+        Some(&json!({
+            "owner": "analytics",
+            "write.parquet.compression-codec": "zstd",
+        })),
+        "expected the committed properties beside the ones the create settled, got {actual:?}",
         actual = document.get("properties")
     );
     let default_order = document
@@ -930,8 +934,9 @@ async fn a_commit_past_the_bounds_one_commit_is_read_under_is_refused() {
         );
         assert_eq!(
             document.get("properties"),
-            Some(&json!({})),
-            "case {case:?}: a refused commit must set no property, got {actual:?}",
+            Some(&json!({ "write.parquet.compression-codec": "zstd" })),
+            "case {case:?}: a refused commit must set no property, leaving the table the \
+             properties its create settled, got {actual:?}",
             actual = document.get("properties")
         );
         assert_eq!(
@@ -947,17 +952,23 @@ async fn a_catalog_path_the_service_does_not_serve_is_left_to_the_model() {
     let emulator = Emulator::new();
     let region = "us-east-1";
 
-    // The catalog endpoint this service serves is the TABLE endpoint; a path
-    // beneath `/iceberg/v1` that is not one is not claimed here, so it is
-    // answered the way the emulator answers a route no operation serves.
+    // The catalog endpoints this service serves are the TABLE endpoint and the
+    // discovery endpoints beside it (`tests/all/iceberg_rest_discovery.rs`
+    // pins those); a path beneath `/iceberg/v1` that is neither is not claimed
+    // here, so it is answered the way the emulator answers a route no operation
+    // serves.
     for case in [
-        "/iceberg/v1/config",
-        "/iceberg/v1/arn%3Aaws%3As3tables%3Aus-east-1%3A000000000000%3Abucket%2Fb/namespaces",
+        // A namespace's path space is served for the methods this catalog
+        // answers; the CREATE of a namespace is not one of them.
+        ("POST", "/iceberg/v1/arn%3Aaws%3As3tables%3Aus-east-1%3A000000000000%3Abucket%2Fb/namespaces"),
+        // A path space of the catalog this service serves nothing of at all.
+        ("GET", "/iceberg/v1/arn%3Aaws%3As3tables%3Aus-east-1%3A000000000000%3Abucket%2Fb/transactions/commit"),
     ] {
-        let reply = emulator.call("GET", case, region, None).await;
+        let (method, path) = case;
+        let reply = emulator.call(method, path, region, None).await;
         assert_eq!(
             reply.status, 501,
-            "case {case:?}: this suite's rule does not cover {case}, so the emulator's \
+            "case {case:?}: this suite's rule does not cover {method} {path}, so the emulator's \
              unserved-route answer stands, got {status} {body}",
             status = reply.status,
             body = reply.body

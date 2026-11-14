@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTableBucketPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTableBucketPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTableBucketPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -136,6 +127,15 @@ impl From<DeleteTableBucketPolicyErrorModeled> for DeleteTableBucketPolicyError 
     }
 }
 
+/// `NotFoundException` (HTTP 404) — the store holds no table bucket at the ARN
+/// the request addresses.
+fn not_found() -> DeleteTableBucketPolicyError {
+    DeleteTableBucketPolicyErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
 /// The `DeleteTableBucketPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -172,18 +172,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTableBucketPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTableBucketPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTableBucketPolicy"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTableBucketPolicyErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        let bucket = store
+            .table_buckets
+            .get_mut(&input.table_bucket_arn)
+            .ok_or_else(not_found)?;
+
+        // The operation is `@idempotent` and names no policy of its own: what it
+        // asks for is that the bucket carry no resource-based policy, and that
+        // is the state it leaves whether or not one was there. So a bucket with
+        // no policy is already in the asked-for state and the delete reports
+        // success rather than a refusal — the read of the policy afterwards is
+        // what states that there is none.
+        let outcome = match bucket.policy.take() {
+            Some(_) => "deleted",
+            None => "unchanged",
+        };
+        let resource = bucket.arn.clone();
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what it
+        // changed and the outcome. Metadata only — never the policy document.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            resource = resource.as_str(),
+            outcome,
+            "table bucket policy deleted",
+        );
+
+        Ok(DeleteTableBucketPolicyOutput)
     }
 }

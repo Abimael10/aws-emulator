@@ -291,6 +291,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A fresh table bucket replicates nothing:
             // `PutTableBucketReplication` is what configures replication on it.
             replication: None,
+            // A fresh table bucket carries no resource-based policy:
+            // `PutTableBucketPolicy` is what attaches one to it.
+            policy: None,
             // A fresh table bucket carries no maintenance configuration of its
             // own: `PutTableBucketMaintenanceConfiguration` is what sets one,
             // and until then every modeled task runs under the service's own

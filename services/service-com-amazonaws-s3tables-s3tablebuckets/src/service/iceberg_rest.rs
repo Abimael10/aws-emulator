@@ -23,7 +23,9 @@
 //!
 //! # What is served
 //!
-//! The table endpoint of the catalog,
+//! The DISCOVERY endpoints a client finds the warehouse, its namespaces and a
+//! namespace's tables through ([`discovery`]), and the table endpoint of the
+//! catalog,
 //! `/iceberg/v1/{prefix}/namespaces/{namespace}/tables/{table}`, where `prefix`
 //! is the table bucket's ARN (the warehouse the catalog is addressed for):
 //!
@@ -53,6 +55,10 @@ use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse,
 use aws_smithy_types::body::SdkBody;
 use serde_json::{Map, Value};
 use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
+
+/// The catalog's discovery endpoints: the warehouse's configuration, the
+/// namespaces in it and the tables in one namespace.
+mod discovery;
 
 use crate::state::{
     IcebergPartitionFieldRecord, IcebergPartitionSpecRecord, IcebergSortFieldRecord,
@@ -177,6 +183,13 @@ pub(crate) fn catalog_request_of(method: &str, uri: &str) -> Option<CatalogReque
     })
 }
 
+/// Whether `method` and `uri` address an endpoint of this catalog at all — the
+/// one question [`crate::service::EmulatedService::override_operation`] asks,
+/// since the model binds no operation to any of these paths.
+pub(crate) fn serves(method: &str, uri: &str) -> bool {
+    catalog_request_of(method, uri).is_some() || discovery::request_of(method, uri).is_some()
+}
+
 /// The Iceberg REST catalog as an operation the router can run: author-written,
 /// so it reads the request and writes the response itself rather than through a
 /// modelled shape's codec.
@@ -202,8 +215,13 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for IcebergCatalog<Eng> {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            // The URI resolved to this operation, so it names the catalog's
-            // table endpoint; a URI that does not is never routed here.
+            // The URI resolved to this operation, so it names an endpoint of the
+            // catalog: either its table endpoint or one of the discovery
+            // endpoints beside it. A URI that names neither is never routed
+            // here.
+            if let Some(discovery) = discovery::request_of(req.method(), req.uri()) {
+                return self.discover(&discovery);
+            }
             let Some(request) = catalog_request_of(req.method(), req.uri()) else {
                 return error(
                     404,
@@ -365,10 +383,17 @@ impl<Eng: Send + Sync + 'static> IcebergCatalog<Eng> {
             members.insert("metadata".to_string(), document);
             return json(200, &Value::Object(members));
         }
-        let committed = match held.committed(updates, now) {
+        let mut committed = match held.committed(updates, now) {
             Ok(committed) => committed,
             Err(reason) => return error(400, "BadRequestException", &reason),
         };
+        // The description the commit replaces is logged on the new one: the
+        // metadata file the table was read from, beside the instant that
+        // description was last updated. A table whose create wrote no metadata
+        // file has none to log.
+        if let Some(previous) = held_location.clone() {
+            committed.record_previous_metadata_file(previous, held.last_updated_ms);
+        }
         // The commit writes a new metadata file for the table and the table's
         // version token names the new state of it, both minted from the store.
         let metadata_id = store.mint_metadata_id();
@@ -390,8 +415,7 @@ impl<Eng: Send + Sync + 'static> IcebergCatalog<Eng> {
         table.iceberg = Some(committed);
         table.metadata_location = Some(metadata_location.clone());
         table.version_token = version_token;
-        table.modified_at = now;
-        table.modified_by = account;
+        table.record_modification(account, now);
         let table_arn = table.table_arn.clone();
         // The lock covers the state change only; everything below is owned.
         drop(store);

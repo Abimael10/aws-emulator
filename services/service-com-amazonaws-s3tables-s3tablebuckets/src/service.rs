@@ -66,6 +66,11 @@ mod request_layer;
 /// path space the model binds no operation to.
 mod iceberg_rest;
 
+/// The name members this service resolves against stored state rather than
+/// format-checks — the lookup keys, as opposed to the names a create or a
+/// rename gives a resource.
+mod name_lookups;
+
 /// The one client-input error this service models: `BadRequestException`,
 /// `errorKind` client, `httpError` 400, one `message` member
 /// (`smithy_query(query="shape", shape="BadRequestException")`). It is a
@@ -211,6 +216,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// Held on the service for the same reason as the layer above: the seam that
     /// selects it hands back a borrow of one of the service's own operations.
     iceberg_catalog: iceberg_rest::IcebergCatalog<Eng>,
+    /// Serves a request whose only unmet constraint is the name FORMAT of a
+    /// member the operation LOOKS UP (see [`name_lookups`]). Held on the service
+    /// for the same reason as the two layers above.
+    name_lookups: name_lookups::NameLookups<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -222,7 +231,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             protocol: service_common::date_time_json::DateTimeRestJson::new(),
             unreadable_body: request_layer::UnreadableBody::new(),
-            iceberg_catalog: iceberg_rest::IcebergCatalog::new(engine),
+            iceberg_catalog: iceberg_rest::IcebergCatalog::new(Arc::clone(&engine)),
+            name_lookups: name_lookups::NameLookups::new(engine),
         }
     }
 }
@@ -270,7 +280,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // emulator does not implement. It IS served — by this service, out of
         // the same table records the control plane reads and writes — so a
         // request that addresses it resolves to the catalog operation.
-        if iceberg_rest::catalog_request_of(req.method(), req.uri()).is_some() {
+        if iceberg_rest::serves(req.method(), req.uri()) {
             return Some(&self.iceberg_catalog);
         }
         let routing = self.entry.protocol();
@@ -278,6 +288,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if let Ok(key) = routing.routing_key(req) {
             if request_layer::body_is_unreadable::<Eng>(key, codec, req) {
                 return Some(&self.unreadable_body);
+            }
+            // A name this operation ADDRESSES a resource by is a lookup key, not
+            // a name this service is being asked to create: the model's
+            // character set and length for it gate the create paths, and a
+            // lookup resolves the string against state and answers the modelled
+            // not-found for one nothing is stored under. The framework validates
+            // every modelled constraint before a handler runs, so that one class
+            // of refusal is taken off the lookup paths HERE, in front of the
+            // generated walk — every other refusal, including a create's own
+            // name, is left to it.
+            if name_lookups::resolves_names::<Eng>(key, codec, req) {
+                return Some(&self.name_lookups);
             }
         }
         None

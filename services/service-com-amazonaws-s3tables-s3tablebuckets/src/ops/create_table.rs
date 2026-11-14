@@ -721,12 +721,23 @@ fn stored_metadata(
         partition_specs: vec![partition_spec],
         sort_orders,
         default_sort_order_id,
-        properties: iceberg
-            .properties
+        // The properties S3 Tables settles on a table it creates, with the
+        // create's own document applied OVER them, so a request that states a
+        // property of its own keeps it.
+        properties: crate::state::CREATED_TABLE_PROPERTIES
             .iter()
-            .flatten()
-            .map(|(key, value)| (key.clone(), value.clone()))
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .chain(
+                iceberg
+                    .properties
+                    .iter()
+                    .flatten()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            )
             .collect(),
+        // The file this document is written to is the table's first, so the
+        // table was described by no metadata file before it.
+        metadata_log: Vec::new(),
         // The file this document is written to is the table's first.
         metadata_version: 0,
     })
@@ -956,9 +967,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             created_by: account.clone(),
             // A table that has not been changed since it was created was last
-            // modified when it was created.
+            // modified when it was created, and no account has modified it: the
+            // member that names the modifying account is written by the first
+            // change made to the table.
             modified_at: now,
-            modified_by: account.clone(),
+            modified_by: None,
             owner_account_id: account,
             encryption,
             storage_class,

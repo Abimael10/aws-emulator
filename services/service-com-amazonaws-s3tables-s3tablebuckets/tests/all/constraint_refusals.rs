@@ -22,6 +22,11 @@
 //! The accepted rows keep the refusals honest: a value AT each published bound
 //! is served, so the refusals are of the values outside the bound and not of the
 //! whole class.
+//!
+//! Only the members that NAME a resource being created or renamed are here. The
+//! same shapes also address an existing resource, and there the string is a
+//! lookup key rather than a name this service is being asked to create — which
+//! `tests/all/name_lookups.rs` is what pins.
 
 use serde_json::{json, Value};
 
@@ -189,6 +194,9 @@ fn fixed_sentence_cases() -> Vec<RefusalCase> {
             message: INVALID_NAMESPACE_NAME,
         },
         RefusalCase {
+            // The same shape reached as a path label by another operation: the
+            // list's element, outside the character set a namespace name is
+            // drawn from.
             label: "a namespace part holding a hyphen".to_string(),
             method: "PUT",
             path: format!("/namespaces/{}", encode(&arn)),
@@ -200,23 +208,6 @@ fn fixed_sentence_cases() -> Vec<RefusalCase> {
             method: "PUT",
             path: format!("/namespaces/{}", encode(&arn)),
             body: Some(json!({ "namespace": ["n".repeat(256)] })),
-            message: INVALID_NAMESPACE_NAME,
-        },
-        RefusalCase {
-            // The same shape reached as a path label by another operation.
-            label: "GetNamespace addressed by a namespace label outside the character set"
-                .to_string(),
-            method: "GET",
-            path: format!("/namespaces/{}/Uppercase", encode(&arn)),
-            body: None,
-            message: INVALID_NAMESPACE_NAME,
-        },
-        RefusalCase {
-            label: "CreateTable addressed by a namespace label outside the character set"
-                .to_string(),
-            method: "PUT",
-            path: format!("/tables/{}/Uppercase", encode(&arn)),
-            body: Some(table_request("resident")),
             message: INVALID_NAMESPACE_NAME,
         },
     ];

@@ -28,6 +28,10 @@ hex = { workspace = true }
 # Lays those digest bytes out as the canonical hyphenated UUID this service's ids are,
 # and writes the version and variant nibbles such a UUID carries.
 uuid = "1"
+# Percent-encodes the warehouse ARN the Iceberg REST catalog answers as its path prefix:
+# that value is a PATH SEGMENT of every later catalog request, so its `:` and `/` travel
+# escaped, and the escaping is this crate's rather than a hand-rolled table.
+percent-encoding = "2"
 # `date_time_json`: the workspace's ONE rendering of a `restJson1` timestamp whose model
 # declares the `date-time` form, which every timestamp member of this model does.
 # `iam_authorization`: the shared evaluation of a principal's policy documents against an

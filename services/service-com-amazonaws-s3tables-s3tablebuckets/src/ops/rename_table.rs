@@ -304,8 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         moved.name = target_name.clone();
         moved.namespace = target_namespace_names;
         moved.namespace_id = target_namespace_id;
-        moved.modified_at = now;
-        moved.modified_by = account;
+        moved.record_modification(account, now);
 
         // The record is keyed under its destination BEFORE it is unkeyed from
         // where it was, so the one table this store holds for it is never

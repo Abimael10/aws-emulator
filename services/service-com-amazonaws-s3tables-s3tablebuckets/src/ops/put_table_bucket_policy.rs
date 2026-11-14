@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTableBucketPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutTableBucketPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutTableBucketPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +130,24 @@ impl From<PutTableBucketPolicyErrorModeled> for PutTableBucketPolicyError {
     }
 }
 
+/// `NotFoundException` (HTTP 404) — the store holds no table bucket at the ARN
+/// the request addresses.
+fn not_found() -> PutTableBucketPolicyError {
+    PutTableBucketPolicyErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// `BadRequestException` (HTTP 400) — the document the put carries is not a
+/// resource-based policy at all.
+fn invalid_policy() -> PutTableBucketPolicyError {
+    PutTableBucketPolicyErrorModeled::BadRequestException(BadRequestException {
+        message: Some(crate::state::INVALID_RESOURCE_POLICY_MESSAGE.to_string()),
+    })
+    .into()
+}
+
 /// The `PutTableBucketPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -175,18 +184,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutTableBucketPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutTableBucketPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutTableBucketPolicy"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutTableBucketPolicyErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The document is read BEFORE the bucket is looked up or anything is
+        // written: text that is not a resource-based policy is the client
+        // request error the model's `BadRequestException` (HTTP 400) names, and
+        // it leaves whatever policy the bucket already carries untouched. WHAT
+        // a resource policy has to be is the workspace's one reading of that
+        // grammar, so every service that attaches one judges a document alike.
+        // Its LENGTH is the member's own `@length(1, 20480)`, already enforced
+        // at the boundary.
+        if ::service_common::iam_policy::resource_policy_defect(&input.resource_policy).is_some() {
+            return Err(invalid_policy());
+        }
+        // A service whose API takes a policy as a STRING does not echo the
+        // caller's bytes: it parses the document and renders it again, so two
+        // clients that submit the same policy written differently read the same
+        // text back. That layout is the workspace's one rendering of an attached
+        // policy document (`service_common::iam_policy::canonical_document`,
+        // whose module states the rule), and it is applied here rather than per
+        // read, so the stored document IS what every read answers.
+        let policy = ::service_common::iam_policy::canonical_document(&input.resource_policy);
+
+        let mut store = state.lock();
+        let bucket = store
+            .table_buckets
+            .get_mut(&input.table_bucket_arn)
+            .ok_or_else(not_found)?;
+
+        // The put REPLACES the bucket's policy with the document it carries —
+        // the operation is `@idempotent`, so the same put twice leaves the same
+        // one policy.
+        bucket.policy = Some(policy);
+        let resource = bucket.arn.clone();
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what it
+        // changed and the outcome. Metadata only — never the policy document,
+        // which names principals and the access they are granted.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            resource = resource.as_str(),
+            outcome = "stored",
+            "table bucket policy put",
+        );
+
+        Ok(PutTableBucketPolicyOutput)
     }
 }

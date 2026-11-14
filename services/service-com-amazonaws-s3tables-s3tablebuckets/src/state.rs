@@ -933,6 +933,14 @@ pub struct TableBucket {
     /// read or a delete of a bucket that has none is refused rather than
     /// answered with a default.
     pub replication: Option<ReplicationConfiguration>,
+    /// The bucket's resource-based policy document, `None` until a put sets one
+    /// on it: a table bucket carries no policy until a caller attaches one, so
+    /// a read of a bucket that has none is refused rather than answered with an
+    /// empty document, and a delete of one that has none is the no-op its
+    /// `@idempotent` trait describes. Held in the one layout an attached policy
+    /// document is reported in (`service_common::iam_policy::canonical_document`,
+    /// applied by the put), so every read answers the same text.
+    pub policy: Option<String>,
     /// The maintenance configurations a put has set on this bucket, keyed by
     /// the task each settles. A task with no entry runs under the service's own
     /// defaults, which [`effective_bucket_maintenance`] is where it is reported
@@ -1010,7 +1018,12 @@ pub struct Table {
     pub created_at: SystemTime,
     pub created_by: String,
     pub modified_at: SystemTime,
-    pub modified_by: String,
+    /// The account that last MODIFIED the table, `None` on a table nothing has
+    /// modified since it was created: a table's modification is recorded when
+    /// one happens, so a reader can tell a table that has been changed from one
+    /// that still stands as created. Every handler that changes a table writes
+    /// it ([`Table::record_modification`]).
+    pub modified_by: Option<String>,
     pub owner_account_id: String,
     pub encryption: Option<BucketEncryption>,
     pub storage_class: Option<StorageClass>,
@@ -1029,6 +1042,16 @@ pub struct Table {
     /// which [`table_task_schedule`] is where it is resolved from.
     pub maintenance_schedules: BTreeMap<TableMaintenanceType, MaintenanceSchedule>,
     pub tags: BTreeMap<String, String>,
+}
+
+impl Table {
+    /// Record that `account` modified this table `at`: the one place a table's
+    /// modification bookkeeping is written, so every handler that changes a
+    /// table leaves the same two facts behind it.
+    pub fn record_modification(&mut self, account: String, at: SystemTime) {
+        self.modified_at = at;
+        self.modified_by = Some(account);
+    }
 }
 
 /// Where a table lives: the index entry a `tableARN` resolves to, so the
@@ -1445,6 +1468,35 @@ pub const INVALID_TABLE_BUCKET_ARN_MESSAGE: &str = "The specified table bucket A
 /// text — it names the CLASS of the failure and takes nothing from the request,
 /// and it says "bucket" rather than "table bucket".
 pub const BUCKET_NOT_FOUND_MESSAGE: &str = "The specified bucket does not exist.";
+
+/// How this service states a table bucket that has no resource-based policy:
+/// the `NotFoundException` (HTTP 404) the bucket policy operations model. FIXED
+/// text — it names the CLASS of the failure (there is no such policy) and takes
+/// nothing from the request, as [`BUCKET_NOT_FOUND_MESSAGE`] does for the
+/// bucket itself.
+pub const BUCKET_POLICY_NOT_FOUND_MESSAGE: &str = "The specified bucket policy does not exist.";
+
+/// How this service states a resource-based policy document it will not attach:
+/// text that is not a resource policy at all (not JSON, no statement, a
+/// statement naming no principal, action or effect). FIXED text, as
+/// [`INVALID_TABLE_BUCKET_NAME_MESSAGE`]: it names the CLASS of the failure and
+/// quotes nothing of the document back.
+///
+/// This service's OWN phrase, in the form its other invalid-input sentences
+/// take: no recorded response of this emulator's corpus exercises a malformed
+/// policy on the bucket-policy put, so there is no AWS wording to reproduce for
+/// the class, and the shared policy grammar
+/// (`service_common::iam_policy::PolicyDefect`) deliberately leaves the sentence
+/// to the service that refuses the document.
+pub const INVALID_RESOURCE_POLICY_MESSAGE: &str = "The specified resource policy is not valid.";
+
+/// How this service states a `GetTable` request that addresses a table by
+/// neither of the two whole forms the operation offers — the table's own ARN
+/// alone, or the table bucket ARN, the namespace and the table name together.
+/// FIXED text: it names both forms and takes nothing from the request.
+pub const TABLE_ADDRESSING_MESSAGE: &str = "Invalid input: Must provide either table arn alone OR \
+                                           all of (table bucket arn, namespace, table name) \
+                                           together";
 
 /// How this service states a table bucket that has no metrics configuration:
 /// the `NotFoundException` (HTTP 404) the metrics operations model. FIXED

@@ -250,8 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| not_found(crate::state::TABLE_NOT_FOUND_MESSAGE))?;
         table.metadata_location = Some(input.metadata_location.clone());
         table.version_token = version_token;
-        table.modified_at = now;
-        table.modified_by = account;
+        table.record_modification(account, now);
 
         // The answer is read back out of the record that was just written, so a
         // response a caller sees is one the store can serve again.

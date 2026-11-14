@@ -181,6 +181,11 @@ async fn bucket_for(emulator: &Emulator, case: &CreateCase) -> String {
 }
 
 /// Every string member `GetTable` must answer with, as `(member, value)`.
+///
+/// `modifiedBy` is deliberately absent: S3 Tables answers it only once the table
+/// has been modified, and the tables this suite creates have not been — which
+/// the assertion below the table pins, and `tests/all/rename_table.rs` pins for
+/// a table that HAS been modified.
 fn table_members(reply: &Reply) -> Vec<(&'static str, String)> {
     [
         "name",
@@ -189,7 +194,6 @@ fn table_members(reply: &Reply) -> Vec<(&'static str, String)> {
         "versionToken",
         "warehouseLocation",
         "createdBy",
-        "modifiedBy",
         "ownerAccountId",
         "format",
         "namespaceId",
@@ -403,7 +407,6 @@ async fn a_created_namespace_and_table_are_readable_field_for_field() {
                 format!("s3://{table_id}--table-s3"),
             ),
             ("createdBy", ACCOUNT.to_string()),
-            ("modifiedBy", ACCOUNT.to_string()),
             ("ownerAccountId", ACCOUNT.to_string()),
             ("format", OpenTableFormat::Iceberg.as_wire().to_string()),
             ("namespaceId", namespace_id.clone()),
@@ -433,6 +436,13 @@ async fn a_created_namespace_and_table_are_readable_field_for_field() {
             modified_at, created_at,
             "case {label:?}: a table nothing has changed was last modified when it was created",
             label = case.label
+        );
+        assert!(
+            read.optional_text("modifiedBy").is_none(),
+            "case {label:?}: a table nothing has modified must report no modifying account, got \
+             {actual:?}",
+            label = case.label,
+            actual = read.optional_text("modifiedBy")
         );
 
         // The metadata file exists only for a table whose create described its

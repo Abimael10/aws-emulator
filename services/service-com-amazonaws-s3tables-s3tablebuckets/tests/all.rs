@@ -17,10 +17,14 @@ mod compaction_sort_order;
 mod constraint_refusals;
 #[path = "all/fixed_error_sentences.rs"]
 mod fixed_error_sentences;
+#[path = "all/get_table_addressing.rs"]
+mod get_table_addressing;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/iceberg_rest_catalog.rs"]
 mod iceberg_rest_catalog;
+#[path = "all/iceberg_rest_discovery.rs"]
+mod iceberg_rest_discovery;
 #[path = "all/invalid_input_refusals.rs"]
 mod invalid_input_refusals;
 #[path = "all/list_namespaces.rs"]
@@ -33,6 +37,8 @@ mod list_tables_summary_members;
 mod metrics_configuration_not_found_message;
 #[path = "all/namespace_and_table_lifecycle.rs"]
 mod namespace_and_table_lifecycle;
+#[path = "all/name_lookups.rs"]
+mod name_lookups;
 #[path = "all/non_empty_container_delete_class.rs"]
 mod non_empty_container_delete_class;
 #[path = "all/record_expiration_configuration_reads.rs"]
@@ -55,6 +61,8 @@ mod table_bucket_lifecycle;
 mod table_bucket_maintenance_configuration;
 #[path = "all/table_bucket_metrics_configuration.rs"]
 mod table_bucket_metrics_configuration;
+#[path = "all/table_bucket_policy.rs"]
+mod table_bucket_policy;
 #[path = "all/table_bucket_replication.rs"]
 mod table_bucket_replication;
 #[path = "all/table_bucket_storage_class.rs"]
@@ -71,6 +79,8 @@ mod table_maintenance_configuration;
 mod table_maintenance_put_round_trip;
 #[path = "all/table_metadata_location.rs"]
 mod table_metadata_location;
+#[path = "all/table_modification_record.rs"]
+mod table_modification_record;
 #[path = "all/table_record_expiration.rs"]
 mod table_record_expiration;
 #[path = "all/wire_forms.rs"]

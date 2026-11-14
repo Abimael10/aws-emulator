@@ -113,8 +113,10 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
             warehouse_location,
             created_at: now,
             created_by: account.clone(),
+            // A table nothing has modified since it was created was last
+            // modified when it was created, and no account has modified it.
             modified_at: now,
-            modified_by: account.clone(),
+            modified_by: None,
             owner_account_id: account,
             // The table names no encryption of its own, so it is encrypted the way its
             // bucket is — the same thing a create that names none settles.

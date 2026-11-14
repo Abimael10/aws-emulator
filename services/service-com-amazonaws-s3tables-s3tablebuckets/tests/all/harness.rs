@@ -764,6 +764,108 @@ impl Emulator {
             .await
     }
 
+    /// The catalog's configuration endpoint, with whichever query members the
+    /// case names, so a suite can ask for a warehouse or leave it out.
+    pub async fn catalog_config(&self, region: &str, query: &[(&str, String)]) -> Reply {
+        self.call(
+            "GET",
+            &format!("/iceberg/v1/config{}", query_string(query)),
+            region,
+            None,
+        )
+        .await
+    }
+
+    /// The catalog's namespace listing for one warehouse, with whichever query
+    /// members the case names.
+    pub async fn catalog_namespaces(
+        &self,
+        region: &str,
+        arn: &str,
+        query: &[(&str, String)],
+    ) -> Reply {
+        self.call(
+            "GET",
+            &format!(
+                "/iceberg/v1/{}/namespaces{}",
+                encode(arn),
+                query_string(query)
+            ),
+            region,
+            None,
+        )
+        .await
+    }
+
+    /// One namespace of the catalog: `GET` loads it, `HEAD` answers whether it
+    /// is there.
+    pub async fn catalog_namespace(
+        &self,
+        method: &str,
+        region: &str,
+        arn: &str,
+        namespace: &str,
+    ) -> Reply {
+        self.call(
+            method,
+            &format!(
+                "/iceberg/v1/{}/namespaces/{}",
+                encode(arn),
+                encode(namespace)
+            ),
+            region,
+            None,
+        )
+        .await
+    }
+
+    /// The catalog's table listing for one namespace.
+    pub async fn catalog_tables(&self, region: &str, arn: &str, namespace: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!(
+                "/iceberg/v1/{}/namespaces/{}/tables",
+                encode(arn),
+                encode(namespace)
+            ),
+            region,
+            None,
+        )
+        .await
+    }
+
+    /// `PutTableBucketPolicy`: the bucket's ARN is the one path label and the
+    /// document travels as the body's `resourcePolicy`.
+    pub async fn put_table_bucket_policy(&self, region: &str, arn: &str, policy: &str) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/buckets/{}/policy", encode(arn)),
+            region,
+            Some(&serde_json::json!({ "resourcePolicy": policy })),
+        )
+        .await
+    }
+
+    pub async fn get_table_bucket_policy(&self, region: &str, arn: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!("/buckets/{}/policy", encode(arn)),
+            region,
+            None,
+        )
+        .await
+    }
+
+    pub async fn delete_table_bucket_policy(&self, region: &str, arn: &str) -> Reply {
+        self.call(
+            "DELETE",
+            &format!("/buckets/{}/policy", encode(arn)),
+            region,
+            None,
+        )
+        .await
+    }
+
     /// `GetTableMetadataLocation`: the bucket's ARN, the namespace and the
     /// table's name are path labels.
     pub async fn get_table_metadata_location(
