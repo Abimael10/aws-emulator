@@ -17,7 +17,12 @@ pub struct DescribeClassificationJobInput {
     pub job_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.macie2#DescribeClassificationJobResponse")]
+// `DescribeClassificationJobOutput`'s schema and codec are written out by hand
+// rather than derived with `#[smithy_macros::smithy(shape = ...)]`, because
+// `createdAt` and `lastRunTime` target `__timestampIso8601` and the derive
+// drops that shape's `@timestampFormat("date-time")`. See
+// `super::date_time_wire` for the whole reason and for when to delete this
+// block; everything else below mirrors the derive exactly.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeClassificationJobOutput {
     pub allow_list_ids: Option<Vec<String>>,
@@ -43,10 +48,374 @@ pub struct DescribeClassificationJobOutput {
     pub user_paused_details: Option<UserPausedDetails>,
 }
 
+impl DescribeClassificationJobOutput {
+    pub const M_ALLOW_LIST_IDS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$allowListIds",
+        "allowListIds",
+        ::aws_smithy_schema::ShapeType::List,
+        0,
+    );
+    pub const M_CLIENT_TOKEN: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$clientToken",
+        "clientToken",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    /// `@timestampFormat("date-time")`, from the `__timestampIso8601` shape it
+    /// targets. THE reason this schema is hand-written.
+    pub const M_CREATED_AT: ::aws_smithy_schema::Schema = super::date_time_wire::date_time_member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$createdAt",
+        "createdAt",
+        2,
+    );
+    pub const M_CUSTOM_DATA_IDENTIFIER_IDS: ::aws_smithy_schema::Schema =
+        super::date_time_wire::member(
+            "com.amazonaws.macie2#DescribeClassificationJobResponse$customDataIdentifierIds",
+            "customDataIdentifierIds",
+            ::aws_smithy_schema::ShapeType::List,
+            3,
+        );
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$description",
+        "description",
+        ::aws_smithy_schema::ShapeType::String,
+        4,
+    );
+    pub const M_INITIAL_RUN: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$initialRun",
+        "initialRun",
+        ::aws_smithy_schema::ShapeType::Boolean,
+        5,
+    );
+    pub const M_JOB_ARN: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$jobArn",
+        "jobArn",
+        ::aws_smithy_schema::ShapeType::String,
+        6,
+    );
+    pub const M_JOB_ID: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$jobId",
+        "jobId",
+        ::aws_smithy_schema::ShapeType::String,
+        7,
+    );
+    /// Targets the `JobStatus` enum, which is string-encoded on the wire — the
+    /// derive classifies an enum member as a string too.
+    pub const M_JOB_STATUS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$jobStatus",
+        "jobStatus",
+        ::aws_smithy_schema::ShapeType::String,
+        8,
+    );
+    /// Targets the `JobType` enum; string-encoded, as above.
+    pub const M_JOB_TYPE: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$jobType",
+        "jobType",
+        ::aws_smithy_schema::ShapeType::String,
+        9,
+    );
+    pub const M_LAST_RUN_ERROR_STATUS: ::aws_smithy_schema::Schema =
+        super::date_time_wire::member(
+            "com.amazonaws.macie2#DescribeClassificationJobResponse$lastRunErrorStatus",
+            "lastRunErrorStatus",
+            ::aws_smithy_schema::ShapeType::Structure,
+            10,
+        );
+    /// `@timestampFormat("date-time")`, as `createdAt` above.
+    pub const M_LAST_RUN_TIME: ::aws_smithy_schema::Schema =
+        super::date_time_wire::date_time_member(
+            "com.amazonaws.macie2#DescribeClassificationJobResponse$lastRunTime",
+            "lastRunTime",
+            11,
+        );
+    pub const M_MANAGED_DATA_IDENTIFIER_IDS: ::aws_smithy_schema::Schema =
+        super::date_time_wire::member(
+            "com.amazonaws.macie2#DescribeClassificationJobResponse$managedDataIdentifierIds",
+            "managedDataIdentifierIds",
+            ::aws_smithy_schema::ShapeType::List,
+            12,
+        );
+    /// Targets the `ManagedDataIdentifierSelector` enum; string-encoded, as
+    /// above.
+    pub const M_MANAGED_DATA_IDENTIFIER_SELECTOR: ::aws_smithy_schema::Schema =
+        super::date_time_wire::member(
+            "com.amazonaws.macie2#DescribeClassificationJobResponse$managedDataIdentifierSelector",
+            "managedDataIdentifierSelector",
+            ::aws_smithy_schema::ShapeType::String,
+            13,
+        );
+    pub const M_NAME: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$name",
+        "name",
+        ::aws_smithy_schema::ShapeType::String,
+        14,
+    );
+    pub const M_S3_JOB_DEFINITION: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$s3JobDefinition",
+        "s3JobDefinition",
+        ::aws_smithy_schema::ShapeType::Structure,
+        15,
+    );
+    pub const M_SAMPLING_PERCENTAGE: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$samplingPercentage",
+        "samplingPercentage",
+        ::aws_smithy_schema::ShapeType::Integer,
+        16,
+    );
+    pub const M_SCHEDULE_FREQUENCY: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$scheduleFrequency",
+        "scheduleFrequency",
+        ::aws_smithy_schema::ShapeType::Structure,
+        17,
+    );
+    pub const M_STATISTICS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$statistics",
+        "statistics",
+        ::aws_smithy_schema::ShapeType::Structure,
+        18,
+    );
+    pub const M_TAGS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$tags",
+        "tags",
+        ::aws_smithy_schema::ShapeType::Map,
+        19,
+    );
+    pub const M_USER_PAUSED_DETAILS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#DescribeClassificationJobResponse$userPausedDetails",
+        "userPausedDetails",
+        ::aws_smithy_schema::ShapeType::Structure,
+        20,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.macie2#DescribeClassificationJobResponse",
+            "com.amazonaws.macie2",
+            "DescribeClassificationJobResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ALLOW_LIST_IDS,
+            &Self::M_CLIENT_TOKEN,
+            &Self::M_CREATED_AT,
+            &Self::M_CUSTOM_DATA_IDENTIFIER_IDS,
+            &Self::M_DESCRIPTION,
+            &Self::M_INITIAL_RUN,
+            &Self::M_JOB_ARN,
+            &Self::M_JOB_ID,
+            &Self::M_JOB_STATUS,
+            &Self::M_JOB_TYPE,
+            &Self::M_LAST_RUN_ERROR_STATUS,
+            &Self::M_LAST_RUN_TIME,
+            &Self::M_MANAGED_DATA_IDENTIFIER_IDS,
+            &Self::M_MANAGED_DATA_IDENTIFIER_SELECTOR,
+            &Self::M_NAME,
+            &Self::M_S3_JOB_DEFINITION,
+            &Self::M_SAMPLING_PERCENTAGE,
+            &Self::M_SCHEDULE_FREQUENCY,
+            &Self::M_STATISTICS,
+            &Self::M_TAGS,
+            &Self::M_USER_PAUSED_DETAILS,
+        ],
+    );
+}
+
+pub static DESCRIBE_CLASSIFICATION_JOB_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &DescribeClassificationJobOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DescribeClassificationJobOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // Every member is optional, so each is written only when present — the
+        // derive's `is_option` split.
+        if let Some(value) = self.allow_list_ids.as_ref() {
+            s.write_list(&Self::M_ALLOW_LIST_IDS, &|sl| {
+                for id in value.iter() {
+                    sl.write_string(&Self::M_ALLOW_LIST_IDS, id.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.client_token.as_ref() {
+            s.write_string(&Self::M_CLIENT_TOKEN, value.as_str())?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.custom_data_identifier_ids.as_ref() {
+            s.write_list(&Self::M_CUSTOM_DATA_IDENTIFIER_IDS, &|sl| {
+                for id in value.iter() {
+                    sl.write_string(&Self::M_CUSTOM_DATA_IDENTIFIER_IDS, id.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+        }
+        if let Some(value) = self.initial_run.as_ref() {
+            s.write_boolean(&Self::M_INITIAL_RUN, *value)?;
+        }
+        if let Some(value) = self.job_arn.as_ref() {
+            s.write_string(&Self::M_JOB_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.job_id.as_ref() {
+            s.write_string(&Self::M_JOB_ID, value.as_str())?;
+        }
+        if let Some(value) = self.job_status.as_ref() {
+            s.write_string(&Self::M_JOB_STATUS, value.as_str())?;
+        }
+        if let Some(value) = self.job_type.as_ref() {
+            s.write_string(&Self::M_JOB_TYPE, value.as_str())?;
+        }
+        if let Some(value) = self.last_run_error_status.as_ref() {
+            s.write_struct(&Self::M_LAST_RUN_ERROR_STATUS, value)?;
+        }
+        if let Some(value) = self.last_run_time.as_ref() {
+            s.write_timestamp(&Self::M_LAST_RUN_TIME, value)?;
+        }
+        if let Some(value) = self.managed_data_identifier_ids.as_ref() {
+            s.write_list(&Self::M_MANAGED_DATA_IDENTIFIER_IDS, &|sl| {
+                for id in value.iter() {
+                    sl.write_string(&Self::M_MANAGED_DATA_IDENTIFIER_IDS, id.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.managed_data_identifier_selector.as_ref() {
+            s.write_string(&Self::M_MANAGED_DATA_IDENTIFIER_SELECTOR, value.as_str())?;
+        }
+        if let Some(value) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.s3_job_definition.as_ref() {
+            s.write_struct(&Self::M_S3_JOB_DEFINITION, value)?;
+        }
+        if let Some(value) = self.sampling_percentage.as_ref() {
+            s.write_integer(&Self::M_SAMPLING_PERCENTAGE, *value)?;
+        }
+        if let Some(value) = self.schedule_frequency.as_ref() {
+            s.write_struct(&Self::M_SCHEDULE_FREQUENCY, value)?;
+        }
+        if let Some(value) = self.statistics.as_ref() {
+            s.write_struct(&Self::M_STATISTICS, value)?;
+        }
+        if let Some(value) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|sm| {
+                for (key, tag) in value.iter() {
+                    sm.write_string(&Self::M_TAGS, key.as_str())?;
+                    sm.write_string(&Self::M_TAGS, tag.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.user_paused_details.as_ref() {
+            s.write_struct(&Self::M_USER_PAUSED_DETAILS, value)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for DescribeClassificationJobOutput {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    let mut ids: Vec<String> = Vec::new();
+                    d.read_list(&Self::M_ALLOW_LIST_IDS, &mut |dl| {
+                        ids.push(dl.read_string(&Self::M_ALLOW_LIST_IDS)?);
+                        Ok(())
+                    })?;
+                    out.allow_list_ids = Some(ids);
+                }
+                Some(1) => out.client_token = Some(d.read_string(&Self::M_CLIENT_TOKEN)?),
+                Some(2) => out.created_at = Some(d.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(3) => {
+                    let mut ids: Vec<String> = Vec::new();
+                    d.read_list(&Self::M_CUSTOM_DATA_IDENTIFIER_IDS, &mut |dl| {
+                        ids.push(dl.read_string(&Self::M_CUSTOM_DATA_IDENTIFIER_IDS)?);
+                        Ok(())
+                    })?;
+                    out.custom_data_identifier_ids = Some(ids);
+                }
+                Some(4) => out.description = Some(d.read_string(&Self::M_DESCRIPTION)?),
+                Some(5) => out.initial_run = Some(d.read_boolean(&Self::M_INITIAL_RUN)?),
+                Some(6) => out.job_arn = Some(d.read_string(&Self::M_JOB_ARN)?),
+                Some(7) => out.job_id = Some(d.read_string(&Self::M_JOB_ID)?),
+                Some(8) => out.job_status = Some(d.read_string(&Self::M_JOB_STATUS)?),
+                Some(9) => out.job_type = Some(d.read_string(&Self::M_JOB_TYPE)?),
+                Some(10) => {
+                    out.last_run_error_status = Some(
+                        <LastRunErrorStatus as ::aws_smithy_schema_server::DeserializableStruct>
+                            ::deserialize(d)?,
+                    );
+                }
+                Some(11) => out.last_run_time = Some(d.read_timestamp(&Self::M_LAST_RUN_TIME)?),
+                Some(12) => {
+                    let mut ids: Vec<String> = Vec::new();
+                    d.read_list(&Self::M_MANAGED_DATA_IDENTIFIER_IDS, &mut |dl| {
+                        ids.push(dl.read_string(&Self::M_MANAGED_DATA_IDENTIFIER_IDS)?);
+                        Ok(())
+                    })?;
+                    out.managed_data_identifier_ids = Some(ids);
+                }
+                Some(13) => {
+                    out.managed_data_identifier_selector =
+                        Some(d.read_string(&Self::M_MANAGED_DATA_IDENTIFIER_SELECTOR)?);
+                }
+                Some(14) => out.name = Some(d.read_string(&Self::M_NAME)?),
+                Some(15) => {
+                    out.s3_job_definition = Some(
+                        <S3JobDefinition as ::aws_smithy_schema_server::DeserializableStruct>
+                            ::deserialize(d)?,
+                    );
+                }
+                Some(16) => {
+                    out.sampling_percentage = Some(d.read_integer(&Self::M_SAMPLING_PERCENTAGE)?);
+                }
+                Some(17) => {
+                    out.schedule_frequency = Some(
+                        <JobScheduleFrequency as ::aws_smithy_schema_server::DeserializableStruct>
+                            ::deserialize(d)?,
+                    );
+                }
+                Some(18) => {
+                    out.statistics = Some(
+                        <Statistics as ::aws_smithy_schema_server::DeserializableStruct>
+                            ::deserialize(d)?,
+                    );
+                }
+                Some(19) => {
+                    let mut tags: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    d.read_map(&Self::M_TAGS, &mut |key, dm| {
+                        tags.insert(key, dm.read_string(&Self::M_TAGS)?);
+                        Ok(())
+                    })?;
+                    out.tags = Some(tags);
+                }
+                Some(20) => {
+                    out.user_paused_details = Some(
+                        <UserPausedDetails as ::aws_smithy_schema_server::DeserializableStruct>
+                            ::deserialize(d)?,
+                    );
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.macie2#Statistics")]
 #[derive(Debug, Clone, Default)]
 pub struct Statistics {
     pub approximate_number_of_objects_to_process: Option<f64>,
     pub number_of_runs: Option<f64>,
 }
-

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClassificationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClassificationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClassificationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: projects the classification job `CreateClassificationJob`
+//! stored in `crate::state` — its status and every setting it was created
+//! with.
 //!
 //! ## Shape of an operation
 //!
@@ -221,18 +215,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClassificationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClassificationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClassificationJob"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeClassificationJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the classification job store is unavailable on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let state = store.lock();
+        if state.session(&region).is_none() {
+            return Err(DescribeClassificationJobErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(job) = state.job(&region, &input.job_id) else {
+            return Err(
+                DescribeClassificationJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::classification_job_not_found_message(
+                            &input.job_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeClassificationJobOutput {
+            allow_list_ids: job.allow_list_ids_output(),
+            client_token: Some(job.client_token.clone()),
+            created_at: Some(crate::state::to_date_time(job.created_at)),
+            custom_data_identifier_ids: job.custom_data_identifier_ids_output(),
+            description: job.description.clone(),
+            initial_run: Some(job.initial_run),
+            job_arn: Some(job.job_arn.clone()),
+            job_id: Some(job.job_id.clone()),
+            // The status the job is in as of this instant: the stored one, or
+            // the status the clock owes it once the run it started is due to
+            // have finished. The record itself is NOT edited — this read
+            // changes nothing a later caller sees.
+            job_status: Some(job.status_at(now).to_string()),
+            job_type: Some(job.job_type.clone()),
+            // `lastRunErrorStatus` reports whether "any account- or
+            // bucket-level access errors occurred when the job ran". This
+            // emulator attempts no access to the buckets a job addresses, so
+            // it holds no error status for a run to report either way.
+            last_run_error_status: None,
+            last_run_time: Some(crate::state::to_date_time(job.last_run_time())),
+            managed_data_identifier_ids: job.managed_data_identifier_ids_output(),
+            managed_data_identifier_selector: Some(
+                job.managed_data_identifier_selector.clone(),
+            ),
+            name: Some(job.name.clone()),
+            s3_job_definition: Some(job.s3_job_definition.clone()),
+            sampling_percentage: Some(job.sampling_percentage),
+            schedule_frequency: job.schedule_frequency.clone(),
+            statistics: Some(job.statistics()),
+            tags: job.tags_output(),
+            // `userPausedDetails` "is present only if the value for jobStatus
+            // is USER_PAUSED". A job this store holds carries the status its
+            // create started it in, and nothing has paused one, so there is no
+            // pause to report.
+            user_paused_details: None,
+        })
     }
 }

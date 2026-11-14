@@ -19,6 +19,8 @@ mod allow_lists;
 mod automated_discovery_configuration;
 #[path = "all/classification_export_configuration.rs"]
 mod classification_export_configuration;
+#[path = "all/classification_jobs.rs"]
+mod classification_jobs;
 #[path = "all/custom_data_identifier_patterns.rs"]
 mod custom_data_identifier_patterns;
 #[path = "all/custom_data_identifier_response_shape.rs"]

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateClassificationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateClassificationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateClassificationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a sensitive data discovery job in `crate::state`, with
+//! every member of the request stored, and reports the id and ARN it assigned.
 //!
 //! ## Shape of an operation
 //!
@@ -204,18 +197,989 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateClassificationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClassificationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateClassificationJob"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateClassificationJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the classification job store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // A job belongs to one region: the region the create addressed, which
+        // is also the region in its ARN.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // Every documented bound is checked BEFORE the store is touched, so a
+        // refused request leaves nothing behind — not even the client token it
+        // carried.
+        if let Some(message) = documented_violation(&input) {
+            return Err(CreateClassificationJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut state = store.lock();
+
+        // Macie has to be enabled in the region before any of its resources can
+        // be read or written, as every other operation of this service
+        // requires.
+        if state.session(&region).is_none() {
+            return Err(CreateClassificationJobErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A retry carrying the same `clientToken` replays the job that token
+        // minted instead of minting a second one.
+        let replay_key =
+            crate::state::idempotency_key(&region, Self::NAME, &input.client_token);
+        if let Some(minted) = state.idempotency.get(&replay_key).cloned() {
+            let replayed = state
+                .job(&region, &minted)
+                .map(|job| (job.job_arn.clone(), job.job_id.clone()));
+            if let Some((job_arn, job_id)) = replayed {
+                return Ok(CreateClassificationJobOutput {
+                    job_arn: Some(job_arn),
+                    job_id: Some(job_id),
+                });
+            }
+            // The job that token minted is gone, so the token replays nothing.
+            state.idempotency.remove(&replay_key);
+        }
+
+        // The EMULATOR's own bound on the job registry, reported through the
+        // quota error this operation models: without it a caller could grow one
+        // process's heap without limit.
+        if state.classification_jobs.len() >= crate::state::MAX_CLASSIFICATION_JOBS {
+            return Err(
+                CreateClassificationJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "This emulator holds the maximum of {} classification jobs. \
+                             Cancel a classification job before creating another.",
+                            crate::state::MAX_CLASSIFICATION_JOBS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The same bound on the SIZE of the job this request defines: its
+        // stored settings are as large as the request that named them.
+        let entries = list_entries(&input);
+        if entries > crate::state::MAX_JOB_LIST_ENTRIES {
+            return Err(
+                CreateClassificationJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "The settings for a job in this emulator can name as many as {} \
+                             accounts, buckets, identifiers and criteria values in total; this \
+                             request names {entries}.",
+                            crate::state::MAX_JOB_LIST_ENTRIES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let job_id = crate::state::new_resource_id(state.next_id_seed(), now);
+        let job_arn = crate::state::classification_job_arn(&region, &job_id);
+        let recurring = input.job_type == crate::state::JOB_TYPE_SCHEDULED;
+        // `initialRun` is a recurring job's setting: the output member's doc
+        // states "This value is also false for a one-time job".
+        let initial_run = recurring && input.initial_run.unwrap_or(false);
+        // A one-time job's only run starts when the job is created, and a
+        // recurring job's first run starts then too when it was configured to
+        // analyze existing objects immediately; otherwise no run has started
+        // and the job waits for its first scheduled one.
+        let run_started = !recurring || initial_run;
+
+        let job = crate::state::ClassificationJob {
+            job_id: job_id.clone(),
+            job_arn: job_arn.clone(),
+            region: region.clone(),
+            client_token: input.client_token.clone(),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            job_type: input.job_type.clone(),
+            job_status: if run_started {
+                crate::state::JOB_STATUS_RUNNING.to_string()
+            } else {
+                crate::state::JOB_STATUS_IDLE.to_string()
+            },
+            initial_run,
+            allow_list_ids: input.allow_list_ids.clone().unwrap_or_default(),
+            custom_data_identifier_ids: input.custom_data_identifier_ids.clone().unwrap_or_default(),
+            managed_data_identifier_ids: input
+                .managed_data_identifier_ids
+                .clone()
+                .unwrap_or_default(),
+            // The member carries a documented default, so the service applies
+            // it and later reads report the selection type that is in effect.
+            managed_data_identifier_selector: input
+                .managed_data_identifier_selector
+                .clone()
+                .unwrap_or_else(|| {
+                    crate::state::DEFAULT_MANAGED_DATA_IDENTIFIER_SELECTOR.to_string()
+                }),
+            s3_job_definition: input.s3_job_definition.clone(),
+            sampling_percentage: input
+                .sampling_percentage
+                .unwrap_or(crate::state::DEFAULT_SAMPLING_PERCENTAGE),
+            // A one-time job has no recurrence pattern, which the bound checks
+            // above already refuse a value for.
+            schedule_frequency: recurring.then(|| input.schedule_frequency.clone()).flatten(),
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<_, _>>(),
+            created_at: now,
+            last_run_started_at: run_started.then_some(now),
+            // The run this create starts is owed its end a span later; nothing
+            // waits for that instant, a read past it reports the status the
+            // clock owes.
+            run_settles_at: run_started.then(|| now + crate::state::RUN_SETTLES_AFTER),
+            runs_started: u32::from(run_started),
+        };
+
+        state.idempotency.insert(replay_key, job_id.clone());
+        state.classification_jobs.insert(job_id.clone(), job);
+
+        Ok(CreateClassificationJobOutput {
+            job_arn: Some(job_arn),
+            job_id: Some(job_id),
+        })
+    }
+}
+
+/// The first documented bound `input` breaks, worded for the caller, or `None`
+/// when it breaks none.
+///
+/// Each bound comes from the member's own documentation in this service's
+/// Smithy model; none of them is expressible as a modelled constraint, so the
+/// boundary validator passes them all and this is where they are refused. The
+/// constants are in `crate::state`, each citing the sentence it comes from.
+fn documented_violation(input: &CreateClassificationJobInput) -> Option<String> {
+    name_violation(&input.name)
+        .or_else(|| description_violation(input.description.as_deref()))
+        .or_else(|| sampling_percentage_violation(input.sampling_percentage))
+        .or_else(|| schedule_violation(&input.job_type, input.schedule_frequency.as_ref()))
+        .or_else(|| managed_data_identifier_violation(input))
+        .or_else(|| bucket_specification_violation(&input.s3_job_definition))
+        .or_else(|| tag_violation(input.tags.as_ref()))
+}
+
+/// The documented bound on `name`: "A custom name for the job. The name can
+/// contain as many as 500 characters." A job is addressed by its id, so the name
+/// carries no further grammar — but a job the caller named nothing is not a
+/// named job.
+fn name_violation(name: &str) -> Option<String> {
+    let chars = name.chars().count();
+    if chars == 0 {
+        return Some("The name must contain at least one character.".to_string());
+    }
+    if chars > crate::state::MAX_JOB_NAME_CHARS {
+        return Some(format!(
+            "The name can contain as many as {} characters.",
+            crate::state::MAX_JOB_NAME_CHARS
+        ));
+    }
+    None
+}
+
+/// The documented bound on `description`: "The description can contain as many
+/// as 200 characters."
+fn description_violation(description: Option<&str>) -> Option<String> {
+    if description?.chars().count() > crate::state::MAX_JOB_DESCRIPTION_CHARS {
+        return Some(format!(
+            "The description can contain as many as {} characters.",
+            crate::state::MAX_JOB_DESCRIPTION_CHARS
+        ));
+    }
+    None
+}
+
+/// `samplingPercentage` is "the sampling depth, as a percentage", so a value
+/// outside the percentage range is no sampling depth.
+fn sampling_percentage_violation(percentage: Option<i32>) -> Option<String> {
+    let percentage = percentage?;
+    if !(crate::state::MIN_SAMPLING_PERCENTAGE..=crate::state::MAX_SAMPLING_PERCENTAGE)
+        .contains(&percentage)
+    {
+        return Some(format!(
+            "The samplingPercentage must be a sampling depth from {} through {} percent.",
+            crate::state::MIN_SAMPLING_PERCENTAGE,
+            crate::state::MAX_SAMPLING_PERCENTAGE
+        ));
+    }
+    None
+}
+
+/// How the `jobType` and the `scheduleFrequency` have to agree, from the
+/// `jobType` member doc: "ONE_TIME - Run the job only once. If you specify this
+/// value, don't specify a value for the scheduleFrequency property. SCHEDULED -
+/// Run the job on a daily, weekly, or monthly basis. If you specify this value,
+/// use the scheduleFrequency property to specify the recurrence pattern for the
+/// job."
+///
+/// `jobType` targets a modelled enum, so reaching here it is one of
+/// [`crate::ops::types::JOB_TYPE_VALUES`].
+fn schedule_violation(job_type: &str, schedule: Option<&JobScheduleFrequency>) -> Option<String> {
+    let recurring = job_type == crate::state::JOB_TYPE_SCHEDULED;
+    match (recurring, schedule) {
+        (false, Some(_)) => Some(format!(
+            "If the jobType is {}, don't specify a value for the scheduleFrequency property.",
+            crate::state::JOB_TYPE_ONE_TIME
+        )),
+        (true, None) => Some(format!(
+            "If the jobType is {}, use the scheduleFrequency property to specify the \
+             recurrence pattern for the job.",
+            crate::state::JOB_TYPE_SCHEDULED
+        )),
+        (true, Some(frequency)) => recurrence_violation(frequency),
+        (false, None) => None,
+    }
+}
+
+/// The documented shape of a recurrence pattern: a `JobScheduleFrequency`
+/// "specifies the recurrence pattern for running a classification job", and the
+/// `jobType` doc states that a recurring job runs "on a daily, weekly, or
+/// monthly basis" — ONE of the three, so a frequency naming none or several
+/// names no pattern.
+fn recurrence_violation(frequency: &JobScheduleFrequency) -> Option<String> {
+    let named = [
+        frequency.daily_schedule.is_some(),
+        frequency.weekly_schedule.is_some(),
+        frequency.monthly_schedule.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if named != 1 {
+        return Some(
+            "Specify exactly one recurrence pattern for the scheduleFrequency property: \
+             dailySchedule, weeklySchedule, or monthlySchedule."
+                .to_string(),
+        );
+    }
+
+    // The `dayOfWeek` of a weekly pattern targets a modelled enum, so it is
+    // refused before this handler runs; the `dayOfMonth` of a monthly one is a
+    // bare integer whose range only its doc states.
+    if let Some(day) = frequency
+        .monthly_schedule
+        .as_ref()
+        .and_then(|monthly| monthly.day_of_month)
+    {
+        if !(crate::state::MIN_DAY_OF_MONTH..=crate::state::MAX_DAY_OF_MONTH).contains(&day) {
+            return Some(format!(
+                "The dayOfMonth can be an integer from {} through {}.",
+                crate::state::MIN_DAY_OF_MONTH,
+                crate::state::MAX_DAY_OF_MONTH
+            ));
+        }
+    }
+    None
+}
+
+/// How the `managedDataIdentifierSelector` and the identifier lists have to
+/// agree, from the selector's member doc: ALL, NONE and RECOMMENDED each state
+/// "don't specify any values for the managedDataIdentifierIds property", EXCLUDE
+/// and INCLUDE each use "the ones specified by the managedDataIdentifierIds
+/// property", and NONE additionally states "specify at least one value for the
+/// customDataIdentifierIds property".
+fn managed_data_identifier_violation(input: &CreateClassificationJobInput) -> Option<String> {
+    let selector = input
+        .managed_data_identifier_selector
+        .as_deref()
+        .unwrap_or(crate::state::DEFAULT_MANAGED_DATA_IDENTIFIER_SELECTOR);
+    let listed = input
+        .managed_data_identifier_ids
+        .as_deref()
+        .unwrap_or_default();
+
+    if crate::state::SELECTORS_NAMING_NO_MANAGED_DATA_IDENTIFIERS.contains(&selector)
+        && !listed.is_empty()
+    {
+        return Some(format!(
+            "If the managedDataIdentifierSelector is {selector}, don't specify any values \
+             for the managedDataIdentifierIds property."
+        ));
+    }
+    if crate::state::SELECTORS_NAMING_MANAGED_DATA_IDENTIFIERS.contains(&selector)
+        && listed.is_empty()
+    {
+        return Some(format!(
+            "If the managedDataIdentifierSelector is {selector}, specify at least one value \
+             for the managedDataIdentifierIds property."
+        ));
+    }
+    if selector == crate::state::MANAGED_DATA_IDENTIFIER_SELECTOR_NONE
+        && input
+            .custom_data_identifier_ids
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return Some(format!(
+            "If the managedDataIdentifierSelector is {selector}, specify at least one value \
+             for the customDataIdentifierIds property."
+        ));
+    }
+    None
+}
+
+/// The documented shape of an `s3JobDefinition`: "The bucket specification can
+/// be static (bucketDefinitions) or dynamic (bucketCriteria)" — one of the two,
+/// and a static specification names the buckets the job analyzes.
+fn bucket_specification_violation(definition: &S3JobDefinition) -> Option<String> {
+    match (
+        definition.bucket_definitions.as_deref(),
+        definition.bucket_criteria.as_ref(),
+    ) {
+        (Some(_), Some(_)) => Some(
+            "The bucket specification for the s3JobDefinition can be static \
+             (bucketDefinitions) or dynamic (bucketCriteria), not both."
+                .to_string(),
+        ),
+        (None, None) => Some(
+            "Specify a bucket specification for the s3JobDefinition: static \
+             (bucketDefinitions) or dynamic (bucketCriteria)."
+                .to_string(),
+        ),
+        (Some([]), None) => Some(
+            "The bucketDefinitions array must specify at least one account and the buckets \
+             to analyze for it."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// The documented bounds on `tags`: "A job can have a maximum of 50 tags. Each
+/// tag consists of a tag key and an associated tag value. The maximum length of
+/// a tag key is 128 characters. The maximum length of a tag value is 256
+/// characters."
+fn tag_violation(tags: Option<&::std::collections::HashMap<String, String>>) -> Option<String> {
+    let tags = tags?;
+    if tags.len() > crate::state::MAX_JOB_TAGS {
+        return Some(format!(
+            "A job can have a maximum of {} tags.",
+            crate::state::MAX_JOB_TAGS
+        ));
+    }
+    if tags
+        .keys()
+        .any(|key| key.chars().count() > crate::state::MAX_TAG_KEY_CHARS)
+    {
+        return Some(format!(
+            "The maximum length of a tag key is {} characters.",
+            crate::state::MAX_TAG_KEY_CHARS
+        ));
+    }
+    if tags
+        .values()
+        .any(|value| value.chars().count() > crate::state::MAX_TAG_VALUE_CHARS)
+    {
+        return Some(format!(
+            "The maximum length of a tag value is {} characters.",
+            crate::state::MAX_TAG_VALUE_CHARS
+        ));
+    }
+    None
+}
+
+/// Every list entry the job this request defines would store: the identifier
+/// ids it names, the accounts and buckets it analyzes, and the criteria terms
+/// and values that scope it.
+///
+/// This is what [`crate::state::MAX_JOB_LIST_ENTRIES`] bounds — the size of one
+/// stored job, which the request chooses.
+fn list_entries(input: &CreateClassificationJobInput) -> usize {
+    let ids: usize = [
+        input.allow_list_ids.as_deref(),
+        input.custom_data_identifier_ids.as_deref(),
+        input.managed_data_identifier_ids.as_deref(),
+    ]
+    .into_iter()
+    .map(|list| list.unwrap_or_default().len())
+    .sum();
+    ids.saturating_add(definition_entries(&input.s3_job_definition))
+}
+
+/// The same count over an `s3JobDefinition`: its static bucket specification,
+/// its dynamic one, and the scope of the analysis.
+fn definition_entries(definition: &S3JobDefinition) -> usize {
+    let buckets: usize = definition
+        .bucket_definitions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|account| 1_usize.saturating_add(account.buckets.len()))
+        .sum();
+    let criteria: usize = definition
+        .bucket_criteria
+        .as_ref()
+        .map(|criteria| {
+            [criteria.includes.as_ref(), criteria.excludes.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|block| {
+                    block
+                        .and
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(criterion_entries)
+                        .sum::<usize>()
+                })
+                .sum()
+        })
+        .unwrap_or_default();
+    let scoping: usize = definition
+        .scoping
+        .as_ref()
+        .map(|scoping| {
+            [scoping.includes.as_ref(), scoping.excludes.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|block| {
+                    block
+                        .and
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(scope_term_entries)
+                        .sum::<usize>()
+                })
+                .sum()
+        })
+        .unwrap_or_default();
+    buckets
+        .saturating_add(criteria)
+        .saturating_add(scoping)
+}
+
+/// One bucket-criteria term: the term itself and the values it compares
+/// against.
+fn criterion_entries(criterion: &CriteriaForJob) -> usize {
+    let simple = criterion
+        .simple_criterion
+        .as_ref()
+        .and_then(|simple| simple.values.as_deref())
+        .unwrap_or_default()
+        .len();
+    let tagged = criterion
+        .tag_criterion
+        .as_ref()
+        .and_then(|tagged| tagged.tag_values.as_deref())
+        .unwrap_or_default()
+        .len();
+    1_usize.saturating_add(simple).saturating_add(tagged)
+}
+
+/// One object-scoping term, on the same footing as [`criterion_entries`].
+fn scope_term_entries(term: &JobScopeTerm) -> usize {
+    let simple = term
+        .simple_scope_term
+        .as_ref()
+        .and_then(|simple| simple.values.as_deref())
+        .unwrap_or_default()
+        .len();
+    let tagged = term
+        .tag_scope_term
+        .as_ref()
+        .and_then(|tagged| tagged.tag_values.as_deref())
+        .unwrap_or_default()
+        .len();
+    1_usize.saturating_add(simple).saturating_add(tagged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        documented_violation, CreateClassificationJobInput, CriteriaBlockForJob, CriteriaForJob,
+        DailySchedule, JobScheduleFrequency, JobScopeTerm, JobScopingBlock, MonthlySchedule,
+        S3BucketCriteriaForJob, S3BucketDefinitionForJob, S3JobDefinition, Scoping,
+        SimpleCriterionForJob, SimpleScopeTerm, WeeklySchedule,
+    };
+
+    /// A static bucket specification, which every case below starts from.
+    fn buckets() -> S3JobDefinition {
+        S3JobDefinition {
+            bucket_definitions: Some(vec![S3BucketDefinitionForJob {
+                account_id: ::engine::emulator_account_id().to_string(),
+                buckets: vec!["sensitive-data".to_string()],
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// A one-time job inside every documented bound, which each case below then
+    /// breaks in exactly one way.
+    fn valid() -> CreateClassificationJobInput {
+        CreateClassificationJobInput {
+            client_token: "token".to_string(),
+            job_type: crate::state::JOB_TYPE_ONE_TIME.to_string(),
+            name: "demo".to_string(),
+            s3_job_definition: buckets(),
+            ..Default::default()
+        }
+    }
+
+    /// A recurring job inside every documented bound.
+    fn valid_recurring() -> CreateClassificationJobInput {
+        CreateClassificationJobInput {
+            job_type: crate::state::JOB_TYPE_SCHEDULED.to_string(),
+            schedule_frequency: Some(JobScheduleFrequency {
+                daily_schedule: Some(DailySchedule {}),
+                ..Default::default()
+            }),
+            ..valid()
+        }
+    }
+
+    /// The bound checks are a pure function of the request, so the whole class
+    /// is spanned here rather than through the engine: a request inside every
+    /// bound is accepted, and one outside any single bound is refused.
+    #[test]
+    fn every_documented_bound_is_enforced() {
+        let accepted: Vec<(&str, CreateClassificationJobInput)> = vec![
+            ("a one-time job with nothing optional named", valid()),
+            ("a recurring job with a daily pattern", valid_recurring()),
+            (
+                "a recurring job with a weekly pattern",
+                CreateClassificationJobInput {
+                    schedule_frequency: Some(JobScheduleFrequency {
+                        weekly_schedule: Some(WeeklySchedule {
+                            day_of_week: Some("MONDAY".to_string()),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..valid_recurring()
+                },
+            ),
+            (
+                "a monthly pattern on the first documented day",
+                CreateClassificationJobInput {
+                    schedule_frequency: Some(monthly(crate::state::MIN_DAY_OF_MONTH)),
+                    ..valid_recurring()
+                },
+            ),
+            (
+                "a monthly pattern on the last documented day",
+                CreateClassificationJobInput {
+                    schedule_frequency: Some(monthly(crate::state::MAX_DAY_OF_MONTH)),
+                    ..valid_recurring()
+                },
+            ),
+            (
+                "a name at its maximum",
+                CreateClassificationJobInput {
+                    name: "n".repeat(crate::state::MAX_JOB_NAME_CHARS),
+                    ..valid()
+                },
+            ),
+            (
+                "a multi-byte name counted in characters, not bytes",
+                CreateClassificationJobInput {
+                    name: "é".repeat(crate::state::MAX_JOB_NAME_CHARS),
+                    ..valid()
+                },
+            ),
+            (
+                "a description at its maximum",
+                CreateClassificationJobInput {
+                    description: Some("d".repeat(crate::state::MAX_JOB_DESCRIPTION_CHARS)),
+                    ..valid()
+                },
+            ),
+            (
+                "the shallowest sampling depth",
+                CreateClassificationJobInput {
+                    sampling_percentage: Some(crate::state::MIN_SAMPLING_PERCENTAGE),
+                    ..valid()
+                },
+            ),
+            (
+                "the deepest sampling depth",
+                CreateClassificationJobInput {
+                    sampling_percentage: Some(crate::state::MAX_SAMPLING_PERCENTAGE),
+                    ..valid()
+                },
+            ),
+            (
+                "a dynamic bucket specification",
+                CreateClassificationJobInput {
+                    s3_job_definition: S3JobDefinition {
+                        bucket_criteria: Some(S3BucketCriteriaForJob::default()),
+                        ..Default::default()
+                    },
+                    ..valid()
+                },
+            ),
+            (
+                "as many tags as a job may carry, each at its maximum length",
+                CreateClassificationJobInput {
+                    tags: Some(
+                        (0..crate::state::MAX_JOB_TAGS)
+                            .map(|index| {
+                                (
+                                    format!(
+                                        "{index:0>width$}",
+                                        width = crate::state::MAX_TAG_KEY_CHARS
+                                    ),
+                                    "v".repeat(crate::state::MAX_TAG_VALUE_CHARS),
+                                )
+                            })
+                            .collect(),
+                    ),
+                    ..valid()
+                },
+            ),
+        ];
+        for (case, input) in accepted {
+            assert_eq!(
+                documented_violation(&input),
+                None,
+                "case {case:?}: expected no violation, got {:?}",
+                documented_violation(&input)
+            );
+        }
+
+        let refused: Vec<(&str, CreateClassificationJobInput)> = vec![
+            (
+                "an empty name",
+                CreateClassificationJobInput {
+                    name: String::new(),
+                    ..valid()
+                },
+            ),
+            (
+                "a name one past its maximum",
+                CreateClassificationJobInput {
+                    name: "n".repeat(crate::state::MAX_JOB_NAME_CHARS + 1),
+                    ..valid()
+                },
+            ),
+            (
+                "a description one past its maximum",
+                CreateClassificationJobInput {
+                    description: Some("d".repeat(crate::state::MAX_JOB_DESCRIPTION_CHARS + 1)),
+                    ..valid()
+                },
+            ),
+            (
+                "a sampling depth one below the percentage range",
+                CreateClassificationJobInput {
+                    sampling_percentage: Some(crate::state::MIN_SAMPLING_PERCENTAGE - 1),
+                    ..valid()
+                },
+            ),
+            (
+                "a sampling depth one past the percentage range",
+                CreateClassificationJobInput {
+                    sampling_percentage: Some(crate::state::MAX_SAMPLING_PERCENTAGE + 1),
+                    ..valid()
+                },
+            ),
+            (
+                "a one-time job carrying a recurrence pattern",
+                CreateClassificationJobInput {
+                    schedule_frequency: Some(JobScheduleFrequency {
+                        daily_schedule: Some(DailySchedule {}),
+                        ..Default::default()
+                    }),
+                    ..valid()
+                },
+            ),
+            (
+                "a recurring job carrying no recurrence pattern",
+                CreateClassificationJobInput {
+                    schedule_frequency: None,
+                    ..valid_recurring()
+                },
+            ),
+            (
+                "a recurrence pattern naming nothing",
+                CreateClassificationJobInput {
+                    schedule_frequency: Some(JobScheduleFrequency::default()),
+                    ..valid_recurring()
+                },
+            ),
+            (
+                "two recurrence patterns at once",
+                CreateClassificationJobInput {
+                    schedule_frequency: Some(JobScheduleFrequency {
+                        daily_schedule: Some(DailySchedule {}),
+                        weekly_schedule: Some(WeeklySchedule {
+                            day_of_week: Some("MONDAY".to_string()),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..valid_recurring()
+                },
+            ),
+            (
+                "a monthly pattern one day before the first documented day",
+                CreateClassificationJobInput {
+                    schedule_frequency: Some(monthly(crate::state::MIN_DAY_OF_MONTH - 1)),
+                    ..valid_recurring()
+                },
+            ),
+            (
+                "a monthly pattern one day past the last documented day",
+                CreateClassificationJobInput {
+                    schedule_frequency: Some(monthly(crate::state::MAX_DAY_OF_MONTH + 1)),
+                    ..valid_recurring()
+                },
+            ),
+            (
+                "no bucket specification at all",
+                CreateClassificationJobInput {
+                    s3_job_definition: S3JobDefinition::default(),
+                    ..valid()
+                },
+            ),
+            (
+                "both a static and a dynamic bucket specification",
+                CreateClassificationJobInput {
+                    s3_job_definition: S3JobDefinition {
+                        bucket_criteria: Some(S3BucketCriteriaForJob::default()),
+                        ..buckets()
+                    },
+                    ..valid()
+                },
+            ),
+            (
+                "a static bucket specification naming no account",
+                CreateClassificationJobInput {
+                    s3_job_definition: S3JobDefinition {
+                        bucket_definitions: Some(Vec::new()),
+                        ..Default::default()
+                    },
+                    ..valid()
+                },
+            ),
+            (
+                "one tag too many",
+                CreateClassificationJobInput {
+                    tags: Some(
+                        (0..=crate::state::MAX_JOB_TAGS)
+                            .map(|index| (format!("key-{index}"), "value".to_string()))
+                            .collect(),
+                    ),
+                    ..valid()
+                },
+            ),
+            (
+                "a tag key one character too long",
+                CreateClassificationJobInput {
+                    tags: Some(
+                        [(
+                            "k".repeat(crate::state::MAX_TAG_KEY_CHARS + 1),
+                            "value".to_string(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    ..valid()
+                },
+            ),
+            (
+                "a tag value one character too long",
+                CreateClassificationJobInput {
+                    tags: Some(
+                        [(
+                            "key".to_string(),
+                            "v".repeat(crate::state::MAX_TAG_VALUE_CHARS + 1),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    ..valid()
+                },
+            ),
+        ];
+        for (case, input) in refused {
+            assert!(
+                documented_violation(&input).is_some(),
+                "case {case:?}: expected a ValidationException message, got None"
+            );
+        }
+    }
+
+    /// Each selection type is accepted with exactly the identifier lists its
+    /// own documentation names, and refused with any other — asserted over
+    /// every value the modelled enum carries, including the one a request that
+    /// names no selector gets.
+    #[test]
+    fn every_selection_type_is_matched_against_the_lists_it_documents() {
+        let managed = vec!["PERSON_NAME".to_string()];
+        let custom = vec!["a1b2c3".to_string()];
+        for selector in crate::ops::types::MANAGED_DATA_IDENTIFIER_SELECTOR_VALUES
+            .iter()
+            .map(|selector| Some((*selector).to_string()))
+            .chain([None])
+        {
+            let effective = selector
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_MANAGED_DATA_IDENTIFIER_SELECTOR.to_string());
+            let names_managed = crate::state::SELECTORS_NAMING_MANAGED_DATA_IDENTIFIERS
+                .contains(&effective.as_str());
+            let needs_custom = effective == crate::state::MANAGED_DATA_IDENTIFIER_SELECTOR_NONE;
+
+            // The lists the selection type documents: the managed identifiers
+            // only where it names them, and custom identifiers where it uses
+            // no managed one.
+            let matching = CreateClassificationJobInput {
+                managed_data_identifier_selector: selector.clone(),
+                managed_data_identifier_ids: names_managed.then(|| managed.clone()),
+                custom_data_identifier_ids: needs_custom.then(|| custom.clone()),
+                ..valid()
+            };
+            assert_eq!(
+                documented_violation(&matching),
+                None,
+                "case {effective:?} with the lists it documents: expected no violation, got {:?}",
+                documented_violation(&matching)
+            );
+
+            // The managed list inverted: named where the type names none, and
+            // absent where it names them.
+            let inverted = CreateClassificationJobInput {
+                managed_data_identifier_selector: selector.clone(),
+                managed_data_identifier_ids: (!names_managed).then(|| managed.clone()),
+                custom_data_identifier_ids: needs_custom.then(|| custom.clone()),
+                ..valid()
+            };
+            assert!(
+                documented_violation(&inverted).is_some(),
+                "case {effective:?} with the managed identifier list inverted: expected a \
+                 ValidationException message, got None"
+            );
+
+            if needs_custom {
+                let no_custom = CreateClassificationJobInput {
+                    managed_data_identifier_selector: selector.clone(),
+                    ..valid()
+                };
+                assert!(
+                    documented_violation(&no_custom).is_some(),
+                    "case {effective:?} with no custom data identifier: expected a \
+                     ValidationException message, got None"
+                );
+            }
+        }
+    }
+
+    /// A monthly recurrence pattern on `day_of_month`.
+    fn monthly(day_of_month: i32) -> JobScheduleFrequency {
+        JobScheduleFrequency {
+            monthly_schedule: Some(MonthlySchedule {
+                day_of_month: Some(day_of_month),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The emulator's bound on one job's size is stated over every list entry
+    /// the job would store, wherever in the request it sits — so a request that
+    /// names its entries in the bucket criteria or in the scope of the analysis
+    /// is counted exactly like one that names them as bucket definitions.
+    #[test]
+    fn one_jobs_size_counts_every_list_entry_it_would_store() {
+        let cases: Vec<(&str, usize, CreateClassificationJobInput)> = vec![
+            // One account and the one bucket named for it.
+            ("the smallest static specification", 2, valid()),
+            (
+                "identifier lists beside the buckets",
+                2 + 2 + 1 + 1,
+                CreateClassificationJobInput {
+                    allow_list_ids: Some(vec!["one".to_string(), "two".to_string()]),
+                    custom_data_identifier_ids: Some(vec!["cdi".to_string()]),
+                    managed_data_identifier_selector: Some("INCLUDE".to_string()),
+                    managed_data_identifier_ids: Some(vec!["ADDRESS".to_string()]),
+                    ..valid()
+                },
+            ),
+            (
+                "a criteria term and the values it compares against",
+                1 + 2,
+                CreateClassificationJobInput {
+                    s3_job_definition: S3JobDefinition {
+                        bucket_criteria: Some(S3BucketCriteriaForJob {
+                            includes: Some(CriteriaBlockForJob {
+                                and: Some(vec![CriteriaForJob {
+                                    simple_criterion: Some(SimpleCriterionForJob {
+                                        comparator: Some("EQ".to_string()),
+                                        key: Some("S3_BUCKET_NAME".to_string()),
+                                        values: Some(vec![
+                                            "one".to_string(),
+                                            "two".to_string(),
+                                        ]),
+                                    }),
+                                    ..Default::default()
+                                }]),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    ..valid()
+                },
+            ),
+            (
+                "a scope term beside the buckets",
+                2 + 1 + 1,
+                CreateClassificationJobInput {
+                    s3_job_definition: S3JobDefinition {
+                        scoping: Some(Scoping {
+                            excludes: Some(JobScopingBlock {
+                                and: Some(vec![JobScopeTerm {
+                                    simple_scope_term: Some(SimpleScopeTerm {
+                                        comparator: Some("EQ".to_string()),
+                                        key: Some("OBJECT_EXTENSION".to_string()),
+                                        values: Some(vec!["log".to_string()]),
+                                    }),
+                                    ..Default::default()
+                                }]),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..buckets()
+                    },
+                    ..valid()
+                },
+            ),
+            (
+                "nothing named at all",
+                0,
+                CreateClassificationJobInput {
+                    s3_job_definition: S3JobDefinition::default(),
+                    ..valid()
+                },
+            ),
+        ];
+        for (case, expected, input) in cases {
+            let counted = super::list_entries(&input);
+            assert_eq!(
+                counted, expected,
+                "case {case:?}: expected {expected} entries, got {counted}"
+            );
+        }
     }
 }

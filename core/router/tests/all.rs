@@ -5111,3 +5111,12 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (five more lines of that same fragment, ordinary comments for the reason they state:
 // and for every service crate's `tests/all.rs`, so check there rather than leaving a note
 // in this file's tail, where an inner doc comment is `E0753` and compiles nothing.)
+// (`cloudfront_edge_4xx_share_decides_the_alarm` is declared ONCE, in the sorted span beside
+// the other CloudFront suites above: a module may be declared only once, and the copy
+// appended here while two branches landed at once compiled neither.)
+// the other CloudFront suites above: the copy appended here compiled neither.)
+// this file: the copy appended here compiled neither.)
+// the head of this file: the copy appended here compiled neither.)
+// (`sfn_relayed_dynamodb_request_id` is declared once, a few lines above in this same tail:
+// two landings each appended their own copy.)
+// the copy appended here compiled neither.)

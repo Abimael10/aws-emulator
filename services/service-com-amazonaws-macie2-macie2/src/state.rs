@@ -28,17 +28,22 @@
 //! defines, which `GetFindingsFilter` projects, `UpdateFindingsFilter` edits and
 //! `DeleteFindingsFilter` deletes.
 //!
-//! Two planes of this state have a file of their own. The findings plane lives
-//! in [`findings`], because it carries a query of its own — the conditions a
-//! `findingCriteria` names and the order a `sortCriteria` asks for — beside the
-//! records themselves. The allow lists (`CreateAllowList` stores one,
-//! `GetAllowList` projects it together with the status it derives for it,
+//! Three planes of this state have a file of their own. The findings plane
+//! lives in [`findings`], because it carries a query of its own — the
+//! conditions a `findingCriteria` names and the order a `sortCriteria` asks for
+//! — beside the records themselves. The allow lists (`CreateAllowList` stores
+//! one, `GetAllowList` projects it together with the status it derives for it,
 //! `ListAllowLists` enumerates them) live in [`allow_lists`], which is where the
-//! object-store read that status rests on lives too. Everything either of them
-//! declares is re-exported here, so a handler reaches all of this service's
-//! state through `crate::state::…` whichever plane it touches.
+//! object-store read that status rests on lives too. The classification jobs
+//! `CreateClassificationJob` mints and `DescribeClassificationJob` projects live
+//! in [`classification_jobs`]. Everything any of them declares is re-exported
+//! here, so a handler reaches all of this service's state through
+//! `crate::state::…` whichever plane it touches.
 
+pub mod classification_jobs;
 pub mod findings;
+
+pub use classification_jobs::*;
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -698,10 +703,16 @@ pub struct ComAmazonawsMacie2Macie2State {
     /// same account may be a member in two regions, and each association is its
     /// own record.
     pub members: BTreeMap<(String, String), Member>,
+    /// The classification jobs of every region, keyed by job id, so an
+    /// id-addressed read is O(log n) and an enumeration is in a stable total
+    /// order. A job's own `region` is what scopes it, the same way a custom
+    /// data identifier's does.
+    pub classification_jobs: BTreeMap<String, ClassificationJob>,
     /// [`idempotency_key`] -> the resource the call carrying that client token
     /// produced: the region for `EnableMacie`, the minted id for
-    /// `CreateCustomDataIdentifier`. This is what makes a retry replay the
-    /// original result instead of producing a second one.
+    /// `CreateCustomDataIdentifier` and for `CreateClassificationJob`. This is
+    /// what makes a retry replay the original result instead of producing a
+    /// second one.
     pub idempotency: BTreeMap<String, String>,
     /// How many service-assigned identifiers this store has handed out.
     ///
@@ -802,6 +813,15 @@ impl ComAmazonawsMacie2Macie2State {
             .filter(move |identifier| identifier.region == region && !identifier.deleted)
     }
 
+    /// The classification job `job_id` of `region`, or `None` when no job of
+    /// that region carries the id — which is what an id from another region
+    /// answers too.
+    pub fn job(&self, region: &str, job_id: &str) -> Option<&ClassificationJob> {
+        self.classification_jobs
+            .get(job_id)
+            .filter(|job| job.region == region)
+    }
+
     /// The findings filter `id` of `region`. `None` when no filter of that
     /// region carries the id, which is what an id from another region answers
     /// too, and what an id a `DeleteFindingsFilter` has already removed
@@ -844,8 +864,9 @@ impl ComAmazonawsMacie2Macie2State {
     /// Retire everything Macie holds for `region`: `DisableMacie` "Disables
     /// Amazon Macie and deletes all settings and resources for a Macie
     /// account", so the session, the region's automated-discovery
-    /// configuration, its custom data identifiers, its allow lists and the
-    /// client tokens that minted them all go.
+    /// configuration, its custom data identifiers, its classification jobs,
+    /// its findings, its findings filters, its allow lists, its member
+    /// associations and the client tokens that minted them all go.
     pub fn forget_region(&mut self, region: &str) {
         self.sessions.remove(region);
         self.automated_discovery.remove(region);
@@ -853,6 +874,8 @@ impl ComAmazonawsMacie2Macie2State {
         self.classification_export.remove(region);
         self.custom_data_identifiers
             .retain(|_, identifier| identifier.region != region);
+        self.classification_jobs
+            .retain(|_, job| job.region != region);
         self.findings_filters
             .retain(|_, filter| filter.region != region);
         self.findings.retain(|_, finding| finding.region != region);
