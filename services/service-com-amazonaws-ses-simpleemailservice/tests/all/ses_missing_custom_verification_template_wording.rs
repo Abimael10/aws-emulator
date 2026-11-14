@@ -46,12 +46,15 @@ const RECIPIENT: &str = "recipient@example.net";
 /// The name the store DOES hold, which the misses below are measured against.
 const STORED: &str = "stored-template";
 
-/// The operations that resolve a custom verification email template by name and are
-/// served today, each named for the assertion messages.
+/// The operations that resolve a custom verification email template by name and answer
+/// the modelled absence when it misses, each named for the assertion messages.
 ///
-/// `DeleteCustomVerificationEmailTemplate` resolves one too, but it is still
-/// scaffolded (it answers 501), so it cannot be driven over the wire here; it reads
-/// the same wording once it is implemented.
+/// `DeleteCustomVerificationEmailTemplate` resolves one too, but it models no
+/// not-found error at all (`smithy_query(query="operation",
+/// operation="DeleteCustomVerificationEmailTemplate")` lists none), so a name the
+/// account holds nothing under is a success there rather than this refusal, and it is
+/// asserted where that rule lives
+/// (`ses_custom_verification_email_template_deletion.rs`).
 const RESOLVERS: &[&str] = &[
     "GetCustomVerificationEmailTemplate",
     "SendCustomVerificationEmail",

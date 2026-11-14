@@ -56,10 +56,6 @@ async fn operations_this_slice_left_unimplemented_still_answer_501() {
     // answer is the handler's, not the boundary validator's.
     let rows: &[(&str, &[(&str, &str)])] = &[
         (
-            "DeleteCustomVerificationEmailTemplate",
-            &[("TemplateName", "a-template")],
-        ),
-        (
             "SendBounce",
             &[
                 ("OriginalMessageId", "0000014fbe1c09cf-id"),
