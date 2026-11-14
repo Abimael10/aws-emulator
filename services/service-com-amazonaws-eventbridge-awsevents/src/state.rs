@@ -2429,6 +2429,10 @@ pub struct ComAmazonawsEventbridgeAwseventsState {
     /// fire on a `ScheduleExpression`, and which clock is driving them
     /// ([`schedule`]).
     pub schedules: schedule::Schedules,
+    /// Which instant the next invocation of each API destination may be made at,
+    /// which is what paces a destination to its own
+    /// `InvocationRateLimitPerSecond` ([`api_destination_pacing`]).
+    pub api_destination_pacing: api_destination_pacing::InvocationPacing,
 }
 
 /// The store comes up holding no bus RECORD at all: the account's `default` bus
@@ -2458,6 +2462,7 @@ impl Default for ComAmazonawsEventbridgeAwseventsState {
             delivered_bytes: 0,
             event_seq: 0,
             schedules: schedule::Schedules::default(),
+            api_destination_pacing: api_destination_pacing::InvocationPacing::default(),
         }
     }
 }
@@ -2465,6 +2470,11 @@ impl Default for ComAmazonawsEventbridgeAwseventsState {
 /// The store's own accessors and the clock-owed transitions a read may finish
 /// live beside the records, in their own file.
 mod store;
+
+/// The RATE an API destination is invoked at: which instant the next invocation
+/// of one may be made, so a destination is paced to its own
+/// `InvocationRateLimitPerSecond` rather than invoked as fast as events match.
+pub mod api_destination_pacing;
 
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

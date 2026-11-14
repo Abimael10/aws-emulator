@@ -503,6 +503,7 @@ async fn fire<Eng: Send + Sync + 'static>(
         cloudwatch: cloudwatch.as_ref(),
         glue: glue.as_ref(),
         kms: kms.as_ref(),
+        events: Some(state),
     };
     let mut clients = crate::ops::put_events::Clients::default();
     let mut budget = crate::ops::put_events::DeliveryBudget::new();
@@ -522,7 +523,7 @@ async fn fire<Eng: Send + Sync + 'static>(
             // is as old as this firing.
             published: now,
         };
-        let Some(outcome) = crate::ops::put_events::deliver(
+        let outcome = match crate::ops::put_events::deliver(
             callback,
             &rule.region,
             &mut clients,
@@ -531,8 +532,12 @@ async fn fire<Eng: Send + Sync + 'static>(
             &mut budget,
         )
         .await
-        else {
-            break;
+        {
+            crate::ops::put_events::Handed::Outcome(outcome) => outcome,
+            // The destination's own invocation rate has this invocation waiting for its
+            // slot on a task of its own, which records it when it is made.
+            crate::ops::put_events::Handed::Deferred => continue,
+            crate::ops::put_events::Handed::BudgetSpent => break,
         };
         invocations.push(super::TargetInvocation {
             event_id: event_id.clone(),

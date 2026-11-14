@@ -153,6 +153,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+#[path = "put_events/deferred.rs"]
+mod deferred;
 
 /// The api-destination half of the delivery pass: the HTTP request made at a
 /// destination's `InvocationEndpoint`, and the retries its target's
@@ -526,6 +528,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cloudwatch: cloudwatch.as_ref(),
             glue: glue.as_ref(),
             kms: kms.as_ref(),
+            events: Some(&state),
         };
 
         // Every pattern match is counted on the matched rule's own
@@ -626,7 +629,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .await;
                         outcome
                     } else {
-                        let Some(outcome) = deliver(
+                        match deliver(
                             ctx.callback(),
                             &dispatch.region,
                             &mut clients,
@@ -635,13 +638,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             &mut budget,
                         )
                         .await
-                        else {
+                        {
+                            Handed::Outcome(outcome) => outcome,
+                            // The destination's own invocation rate has this
+                            // invocation waiting for its slot on a task of its
+                            // own, which records it when it is made: there is
+                            // nothing to record here, and the remaining targets
+                            // are delivered to as usual.
+                            Handed::Deferred => continue,
                             // The request's delivery budget is spent: the
                             // remaining targets are not handed anything, and
                             // nothing is recorded for them either.
-                            break 'dispatch;
-                        };
-                        outcome
+                            Handed::BudgetSpent => break 'dispatch,
+                        }
                     };
                     invocations.push(crate::state::TargetInvocation {
                         event_id: dispatch.event_id.clone(),
@@ -1495,6 +1504,10 @@ struct ApiDestination {
     /// Whether the destination's `ApiDestinationState` is `ACTIVE`: one whose
     /// connection is not authorized is not invoked.
     active: bool,
+    /// `ApiDestinationRecord::invocation_rate_limit_per_second`, the ceiling the
+    /// destination's invocations are paced to
+    /// ([`crate::state::api_destination_pacing`]).
+    rate_per_second: i32,
     /// The credential half of the connection the destination invokes through,
     /// which every request to it carries
     /// ([`crate::state::invocation::ConnectionSecret`]) — the default (no
@@ -1596,6 +1609,7 @@ fn api_destination(
         endpoint: record.invocation_endpoint.clone(),
         method: record.http_method.clone(),
         active: store.api_destination_state(record) == crate::state::API_DESTINATION_STATE_ACTIVE,
+        rate_per_second: record.invocation_rate_limit_per_second,
         secret: store
             .connection_by_arn(&record.connection_arn)
             .map(|connection| connection.secret.clone())
@@ -1724,8 +1738,10 @@ impl DeliveryBudget {
 /// an `EventId` per accepted entry"), so what came of it goes into the
 /// invocation log and never changes what the caller is told.
 ///
-/// `None` once the budget is spent, so the caller stops delivering the rest of
-/// the request instead of dispatching past the cap.
+/// [`Handed::BudgetSpent`] once the budget is spent, so the caller stops
+/// delivering the rest of the request instead of dispatching past the cap, and
+/// [`Handed::Deferred`] for an invocation the destination's own rate has put on a
+/// task of its own, which records itself when it is made.
 ///
 /// `pub(crate)` because a REPLAYED event is handed to a matched rule's targets
 /// by this same code (`crate::ops::start_replay`): a replay re-publishes the
@@ -1738,7 +1754,7 @@ pub(crate) async fn deliver(
     stores: &Stores<'_>,
     handover: &Handover<'_>,
     budget: &mut DeliveryBudget,
-) -> Option<crate::state::InvocationOutcome> {
+) -> Handed {
     let target = handover.target;
     // Which API call this target is invoked by — `None` for a target kind this
     // emulator has no invocation path for, which is recorded as NOT ATTEMPTED
@@ -1769,7 +1785,7 @@ pub(crate) async fn deliver(
     // could have assumed, is a gap in this emulator rather than a refusal: it
     // spends nothing of the request's budget and is dead-lettered nowhere.
     if kind.is_none() && unassumable.is_none() {
-        return Some(crate::state::InvocationOutcome::NotAttempted(
+        return Handed::Outcome(crate::state::InvocationOutcome::NotAttempted(
             no_invocation_reason(&target.arn),
         ));
     }
@@ -1781,7 +1797,9 @@ pub(crate) async fn deliver(
     // target asked for ([`transformed`]).
     let reshaped = match transformed(handover) {
         Ok(reshaped) => reshaped,
-        Err(refusal) => return Some(crate::state::InvocationOutcome::NotAttempted(refusal)),
+        Err(refusal) => {
+            return Handed::Outcome(crate::state::InvocationOutcome::NotAttempted(refusal))
+        }
     };
     let body: &str = target
         .input
@@ -1800,7 +1818,7 @@ pub(crate) async fn deliver(
             "this request reached the emulator's delivery budget; the remaining targets \
              of the matched rules are not delivered to"
         );
-        return None;
+        return Handed::BudgetSpent;
     }
 
     // What a RETRIED invocation spent, filled in by the invocation that retries
@@ -1834,6 +1852,15 @@ pub(crate) async fn deliver(
             None => match own_input.then(|| invalid_input_refusal(body)).flatten() {
                 Some(refusal) => refusal,
                 None => {
+                    // An api-destination target is invoked no faster than the
+                    // destination's own rate: the invocation waits for the slot
+                    // that pacing books it, and one booked further off than a
+                    // publisher would wait for is made on a task of its own.
+                    if let Paced::Deferred =
+                        pace_api_destination(callback, region, stores, handover, body).await
+                    {
+                        return Handed::Deferred;
+                    }
                     kind.invoke(
                         callback, clients, stores, region, handover, body, &mut retries, budget,
                     )
@@ -1864,7 +1891,132 @@ pub(crate) async fn deliver(
     // invocation metrics, whichever way it went — a rule that is delivering is
     // as observable as one that is failing.
     count_invocation(stores.cloudwatch, handover, &outcome);
-    Some(outcome)
+    Handed::Outcome(outcome)
+}
+
+/// What came of handing one event to one target of a matched rule.
+pub(crate) enum Handed {
+    /// The handover was made, and this is what came of it.
+    Outcome(crate::state::InvocationOutcome),
+    /// The destination's own invocation rate put this invocation on a task of its
+    /// own ([`deferred`]): it is not due yet, and it records itself — and
+    /// dead-letters itself — when it is made. The caller has nothing to record for
+    /// it and goes on to the next target.
+    Deferred,
+    /// The request's delivery budget is spent: the remaining targets of the
+    /// matched rules are not delivered to.
+    BudgetSpent,
+}
+
+/// How long a delivery waits for an api destination's next slot IN the request
+/// that matched the event, rather than on a task of its own.
+///
+/// This emulator's own figure, not a limit AWS publishes: a destination at the
+/// default ceiling (300 a second) books slots a few milliseconds apart, and
+/// waiting those out where the delivery already is costs a publisher nothing and
+/// keeps the delivery in the request that matched the event. A slot further off
+/// than this belongs to a destination a burst has outrun, and holding `PutEvents`
+/// for it would answer the publisher late for a delivery its answer says nothing
+/// about.
+const INLINE_PACING_WAIT: ::std::time::Duration = ::std::time::Duration::from_millis(100);
+
+/// Whether this invocation is to be made now or has been deferred.
+enum Paced {
+    /// Make it: either the destination is inside its rate, or its slot was near
+    /// enough that this delivery has already waited for it.
+    Now,
+    /// A task of its own holds it until its slot comes ([`deferred`]).
+    Deferred,
+}
+
+/// Pace one api-destination invocation to the destination's own
+/// `InvocationRateLimitPerSecond`: book its slot, and wait for it where that is a
+/// wait a publisher would not notice ([`INLINE_PACING_WAIT`]) or hand it to a
+/// task of its own where it is longer.
+///
+/// The rule AWS follows: the rate limit THROTTLES a destination rather than
+/// dropping what it cannot send — "the maximum number of requests per second to
+/// send to the HTTP invocation endpoint" — so a burst larger than the rate is
+/// still delivered, every event exactly once, spread over time. The booking is
+/// what spreads them ([`crate::state::api_destination_pacing`]): each invocation
+/// takes the next free instant of the destination it names and leaves the one
+/// after it for the next.
+///
+/// A target that is not an api destination is paced by nothing — the rate limit is
+/// a property of the DESTINATION — and so is a delivery with no store to book in,
+/// and one with no runtime to defer onto or already holding as many deferred
+/// invocations as this emulator holds at once: each of those is invoked rather
+/// than dropped, which is what the rate limit is about. A destination that is not
+/// `ACTIVE` is paced by nothing either: what the rate limits is the REQUESTS made
+/// at the endpoint, and an inactive destination has none made at it
+/// ([`invoke_api_destination`] refuses it without one), so it books no slot and
+/// its refusal is not held back behind one.
+async fn pace_api_destination(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    stores: &Stores<'_>,
+    handover: &Handover<'_>,
+    body: &str,
+) -> Paced {
+    let target = handover.target;
+    let (Some(destination), Some(events)) = (target.api_destination.as_ref(), stores.events) else {
+        return Paced::Now;
+    };
+    if !destination.active {
+        return Paced::Now;
+    }
+    let now = ::std::time::SystemTime::now();
+    // The booking is taken with the guard held only for as long as booking takes,
+    // never across the invocation.
+    let due = events
+        .lock()
+        .api_destination_pacing
+        .book(&target.arn, destination.rate_per_second, now);
+    let waiting = due.duration_since(now).unwrap_or_default();
+    if waiting.is_zero() {
+        return Paced::Now;
+    }
+    if waiting <= INLINE_PACING_WAIT {
+        ::tokio::time::sleep(waiting).await;
+        return Paced::Now;
+    }
+    if !events.lock().api_destination_pacing.take_a_waiting_place() {
+        ::tracing::warn!(
+            destination = %destination.name,
+            bound = crate::state::api_destination_pacing::MAX_DEFERRED_INVOCATIONS,
+            "as many api-destination invocations are waiting for a slot as this emulator \
+             holds at once; this one is made without waiting for its own"
+        );
+        return Paced::Now;
+    }
+    let invocation = deferred::Deferred {
+        region: region.to_string(),
+        event_id: handover.event_id.to_string(),
+        bus: handover.bus.to_string(),
+        rule: handover.rule.to_string(),
+        rule_arn: handover.rule_arn.to_string(),
+        target: target.clone(),
+        body: body.to_string(),
+        trace_header: handover.trace_header.map(str::to_string),
+        published: handover.published,
+        due,
+    };
+    let owned = deferred::DeferredStores {
+        events: ::engine::ServiceState::clone(events),
+        cloudwatch: stores.cloudwatch.cloned(),
+        kms: stores.kms.cloned(),
+    };
+    if deferred::defer(callback, owned, invocation) {
+        return Paced::Deferred;
+    }
+    // Nothing to defer onto: the place taken above is given back and the
+    // invocation is made here, because an event the rate limit deferred is still
+    // an event that has to be delivered.
+    events
+        .lock()
+        .api_destination_pacing
+        .release_a_waiting_place();
+    Paced::Now
 }
 
 /// The stores of OTHER services in this same shared engine that one delivery
@@ -1886,6 +2038,12 @@ pub(crate) struct Stores<'a> {
     /// generated under it
     /// ([`crate::state::target_encryption::generate_data_key_denied`]).
     pub(crate) kms: Option<&'a ::engine::ServiceState<crate::state::target_encryption::KmsState>>,
+    /// This service's OWN store: where an api-destination invocation the
+    /// destination's rate has deferred books its slot and is recorded when it is
+    /// made ([`deferred`]). `None` is a delivery with no store to pace against,
+    /// which is invoked without pacing rather than withheld.
+    pub(crate) events:
+        Option<&'a ::engine::ServiceState<crate::state::ComAmazonawsEventbridgeAwseventsState>>,
 }
 
 /// Hand ONE routed event to the Glue workflow `arn` names, and answer what came

@@ -389,6 +389,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cloudwatch: cloudwatch.as_ref(),
             glue: glue.as_ref(),
             kms: kms.as_ref(),
+            events: Some(&state),
         };
         let mut budget = crate::ops::put_events::DeliveryBudget::new();
         let mut clients = crate::ops::put_events::Clients::default();
@@ -428,7 +429,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             for rule in &matched {
                 let rule_arn = crate::state::rule_arn(&region, &destination_bus, &rule.name);
                 for target in &rule.targets {
-                    let Some(outcome) = crate::ops::put_events::deliver(
+                    let outcome = match crate::ops::put_events::deliver(
                         ctx.callback(),
                         &region,
                         &mut clients,
@@ -450,11 +451,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &mut budget,
                     )
                     .await
-                    else {
+                    {
+                        crate::ops::put_events::Handed::Outcome(outcome) => outcome,
+                        // The destination's own invocation rate has this
+                        // invocation waiting for its slot on a task of its own,
+                        // which records it when it is made.
+                        crate::ops::put_events::Handed::Deferred => continue,
                         // The replay's delivery budget is spent: the remaining
                         // targets are not handed anything, and nothing is
                         // recorded for them either.
-                        break 'replay;
+                        crate::ops::put_events::Handed::BudgetSpent => break 'replay,
                     };
                     invocations.push(crate::state::TargetInvocation {
                         event_id: event.event_id.clone(),

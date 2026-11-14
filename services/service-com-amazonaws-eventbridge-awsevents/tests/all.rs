@@ -21,6 +21,8 @@ mod api_destination_rate_limit_refusal;
 mod api_destination_retry_bounds;
 #[path = "all/api_destination_state_settles_with_its_connection.rs"]
 mod api_destination_state_settles_with_its_connection;
+#[path = "all/api_destination_status_classification.rs"]
+mod api_destination_status_classification;
 #[path = "all/api_destination_survives_its_connections_deletion.rs"]
 mod api_destination_survives_its_connections_deletion;
 #[path = "all/api_destination_update.rs"]

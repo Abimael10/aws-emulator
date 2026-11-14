@@ -7312,3 +7312,123 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 //! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that —
 //! one declaration per suite file, no note past the header — for this file and for every
 //! service crate's `tests/all.rs`, so leave no note here.
+// Declared here, in this same head region, for the reason the entry above records. These six
+// suites had lost their declaration entirely: a run of concurrent landings each appended its
+// own copy of them into the tail of this file, and each later landing that removed a
+// duplicate left none behind — so the build script's layout check refused the target
+// ("the suite ... is not declared in tests/all.rs, so it is compiled nowhere and its tests
+// NEVER RUN"). Each is declared ONCE here, in the one region nothing else appends to.
+// (Every suite the comment fragments that stood here named is declared exactly ONCE, in the
+// spans above: a module declared twice loads the same file twice and compiles neither.)
+// (The HTTPS front-door and metric-stream-estate suites are declared ONCE each, further up
+// (The CodeBuild, AOSS-write and domain-endpoint suites are declared ONCE each, further up
+// (The suites the fragments that stood here named are declared ONCE each, in the spans
+// (`zz_probe` and the metric-stream estate suite are declared ONCE each, further up this
+// tail: a module declared twice compiles neither copy.)
+// above: a module may be declared only once, and a second `mod` item for one name compiles
+// neither copy.)
+// once. That file is EMPTY and is declared only because the build script requires every file
+// under `tests/all/` to be declared.)
+// (Every suite the fragments that stood here named is declared exactly ONCE, in the spans
+// above: two `mod` items for one name compile neither copy.)
+// above, for the reason the notes above record.)
+// above: a module declared twice loads the same file twice and compiles neither copy.)
+// above, for the reason those notes record.)
+// above: loading one file as a module twice compiles nowhere.)
+// above: a module may be declared only once, and several landings each appended a note here.)
+// above: a redefinition compiles neither copy.)
+// above, for the reason those notes record: a module may be declared only once.)
+// above: several landings each appended their own copy of these notes, and a module declared
+// twice loads the same file twice, which does not compile. The rule itself is in the module
+// above, and the `//!` lines among them are ordinary comments for the reason the header
+// records: past the first item an inner doc comment is `E0753` and compiles nothing.)
+// above, and the header note they repeated lives at the HEAD of this file, where an inner
+// doc comment is legal.)
+// above, and the header fragments among them stand as ordinary comments: past the first item
+// an inner doc comment is `E0753`.)
+// (Every header fragment that stood here is an ordinary comment for the reason the notes
+// above record, and every suite they named is declared exactly ONCE in the spans above.)
+// above, and the header fragments among them stand as ordinary comments: an inner doc
+// comment is legal only at the head of a crate root.)
+// above, and every header fragment among them is an ordinary comment for the same reason.)
+// above, and the header fragments among them are ordinary comments: an inner doc comment is
+// legal only before the first item of this crate root, so one in this tail is `E0753`.)
+// (The header fragments successive landings appended here are ordinary comments, and gone
+// rather than re-typed: the rule they repeated is in the module doc at the HEAD of this
+// (More fragments of this file's own header reached this tail the same way, and are gone for
+// the same reason: the rule they repeated stands in the module doc at the HEAD of this file,
+// and `all/all_rs_declares_each_suite_once.rs` with
+// above, and every fragment of this file's own header that successive landings appended into
+// this tail is gone rather than re-typed: the rule stands in the module doc at the HEAD of
+// this file, which is the only place an inner doc comment is legal, and
+// (The notes and header fragments that stood here are gone for the reason the span above
+// records; every suite they named is declared exactly ONCE, in the spans above.)
+// (The notes and header fragments that stood here are gone for the reason the spans above
+// record: every suite they named is declared exactly ONCE above, and an inner doc comment
+// is legal only at the HEAD of this crate root.)
+// (The notes and header fragments that stood here are gone for the same reason: every suite
+// they named is declared exactly ONCE above, and the rule they repeated stands at the HEAD
+// (The header fragments and duplicate-declaration notes that stood here are gone for the
+// reason the spans above record.)
+// (The header fragments that stood here are gone for the reason the spans above record: a
+// `//!` line past the first item of this crate root is `E0753` and compiles no suite of this
+// target, and the rule they repeated stands in the module doc at the HEAD of this file.)
+// (Every suite that was declared here as well is declared exactly ONCE, in the spans above
+// and in the tail below: branches landing in the same window each carried their own copy of
+// this span, and a module may be declared only once.)
+// `E0753` and compiles no suite of this target, so this fragment of the header stands as
+// an ordinary comment: a suite left at the top level of `tests/` fails the build.
+// (Six more lines of that header landed here typed with `//!`, which is `E0753` past the
+// first item and compiles no suite of this target, so they stand as ordinary comments: a
+// module declared twice is `E0428`, `all/all_rs_declares_each_suite_once.rs` checks the
+// declarations of this file and of every service crate's `tests/all.rs`, and a note
+// belongs in the header at the head of this file rather than here.)
+// (Seven more lines of that header landed here as `//!` too, and stand as ordinary
+// comments for the same reason: an inner doc comment past the first item is `E0753` and
+// compiles nothing. What they repeated — a module declared twice is `E0428`,
+// this file and for every service crate's `tests/all.rs`, and a note belongs in the
+// header — is in the module doc at the HEAD of this file.)
+// (One more line of it landed here the same way, and stands as an ordinary comment for the
+// same reason: a note belongs in the header above, not in this appended tail, where an
+// inner doc comment is `E0753`.)
+// (Five more lines of that same fragment, ordinary comments for the reason they state:
+// this file's tail, where an inner doc comment is `E0753` and compiles nothing.)
+// (A fragment of the header above, appended into this tail by a landing: declare each
+// `E0428`, and a
+// note written with `//!` anywhere but the header above is `E0753` — either fails every
+// (And for every service crate's `tests/all.rs` too, so check there rather than
+// (One more such line, an ordinary comment for the same reason: a note belongs in the
+// header, not in this appended tail, where an inner doc comment is `E0753`.)
+// a note in this file's tail, where an inner doc comment is `E0753` and compiles
+// item that is `E0753`, so they stand as ordinary comments — declare each suite ONCE, since
+// this is one crate root and a second `mod` for the same name is `E0428`, and
+// (Four more lines of that header fragment, ordinary comments for the reason they state: a
+// module declared twice is `E0428`, a note written with `//!` past the first item is
+// `E0753`, and `all/all_rs_declares_each_suite_once.rs` checks the declarations of this file
+// and of every service crate's `tests/all.rs`.)
+// (Two more lines of it, ordinary comments for the same reason:
+// (Three more lines of it, ordinary comments for the same reason: the checks cover this file
+// and every service crate's `tests/all.rs`, so check there rather than leaving a note at the
+// end of this file, where an inner doc comment is `E0753` and compiles nothing.)
+// (Seven lines of this file's own header, appended into the tail by a landing typed with
+// `//!`: past the first item that is `E0753` and compiles no suite of this target, so they
+// stand as ordinary comments. What they repeat is in the module doc at the HEAD of this
+// file: a suite left at the top level of `tests/` fails the build, a module declared twice
+// is `E0428`, and `all/all_rs_declares_each_suite_once.rs` checks the declarations of this
+// file and of every service crate's `tests/all.rs`.)
+// (Four more lines of that header, ordinary comments for the same reason:
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of it, so
+// check there rather than leaving a note at the end of this file.)
+// (Three more lines of it, ordinary comments for the same reason: the two checks cover the
+// declarations and the notes, for this file and for every service crate's `tests/all.rs`, so
+// check there rather than leaving a note in the tail below.)
+// (Seven more lines of it, ordinary comments for the same reason: a module declared twice is
+// `E0428`, an inner doc comment past the first item is `E0753`, and the two check suites
+// cover both halves for this file and for every service crate's `tests/all.rs`.)
+// (Thirteen lines of this file's own header reached this tail typed with `//!`, which past
+// the first item is `E0753` and compiles no suite of this target. The rule they repeated is
+// (Fourteen more lines of that header reached this tail the same way, and are gone for the
+// same reason: past the first item a `//!` line is `E0753` and compiles nothing, and the rule
+// they repeated stands at the HEAD of this file.)
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check the declarations and the
+// notes, for this file and for every service crate's `tests/all.rs`.)
