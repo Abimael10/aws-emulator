@@ -5272,3 +5272,7 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // item of a crate root that is `E0753` and compiles no suite of this target, so they are gone
 // rather than re-typed \u2014 the header at the top of this file carries the rule, and the two
 // guard suites check both halves of it.)
+// suite left at the top level of `tests/` fails the build. (An ordinary comment for the
+// reason it states: this line landed here as `//!`, which compiles no suite of this target.)
+// reason they state: as `//!` in this tail they compiled nothing.)
+// appended to the tail of this file would compile no suite of this target. (Seven more

@@ -18,6 +18,10 @@ pub mod authorization;
 /// where the account's trails deliver it.
 pub mod data_events;
 
+/// The MANAGEMENT events of this service's control plane: what the account's CloudTrail
+/// records and delivers for a call a client made with AWS developer credentials.
+pub mod management_events;
+
 /// What an identity pool's own configuration has to satisfy before it is stored, and how a
 /// configuration this service will not store is refused.
 pub mod pool_configuration;
@@ -3673,9 +3677,18 @@ pub struct ServedCall<'a> {
     pub response_elements: Option<::serde_json::Value>,
 }
 
-/// Record a call this service served in the account's management-event log, whatever it
-/// answered, so CloudTrail's `LookupEvents` reports it — with the error code and message
-/// its caller was answered with when it was refused.
+/// Record a call this service served as a MANAGEMENT event of the account, whatever it
+/// answered, so CloudTrail's `LookupEvents` reports it, each logging trail's bucket
+/// receives it and the default event bus carries it — with the error code and message its
+/// caller was answered with when it was refused.
+///
+/// The record is HELD rather than written ([`service_common::audited_operation::hold_management_event`]):
+/// it names the request its caller was answered under (`requestID`), and that id exists
+/// only once the response has been rendered, which is after this handler has returned. The
+/// layer each operation of this service is served behind takes the record from there, writes
+/// it with that id and makes the deliveries the account's CloudTrail makes for it
+/// ([`management_events::IdentityPoolAudit`]) — so a client holding a response finds the
+/// record of that very call, and a trail that is logging receives its log file.
 ///
 /// What is recorded is this service's ADMINISTRATION of identity pools: the calls a client
 /// makes with AWS developer credentials. The IDENTITY DATA PLANE — `GetId`,
@@ -3715,15 +3728,6 @@ pub fn record_served_call<Eng: Send + Sync + 'static, T, E>(
 ) where
     E: ::smithy_server_runtime::OperationError + ::std::fmt::Display,
 {
-    let Some(log) = management_event_log(engine) else {
-        // Not silent: an unrecorded call leaves no trace in the log by definition, so it
-        // leaves one here instead.
-        ::tracing::warn!(
-            operation = call.operation,
-            "the engine carries no management-event log: the call was served unrecorded"
-        );
-        return;
-    };
     let (error_code, error_message) =
         ::service_common::management_events::recorded_failure(outcome);
     // Whether this service's PERMISSION CHECK stopped the call: its gate
@@ -3737,7 +3741,7 @@ pub fn record_served_call<Eng: Send + Sync + 'static, T, E>(
     });
     let caller = ::service_common::management_events::recorded_caller(parts);
     let session = recorded_session(engine, caller.access_key_id.as_deref());
-    log.lock().record(
+    ::service_common::audited_operation::hold_management_event(
         ::service_common::management_events::ServedApiCall {
             event_name: call.operation.to_string(),
             event_source: EVENT_SOURCE.to_string(),
@@ -3787,7 +3791,6 @@ pub fn record_served_call<Eng: Send + Sync + 'static, T, E>(
             error_code,
             error_message,
         },
-        SystemTime::now(),
     );
 }
 

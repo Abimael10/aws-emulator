@@ -669,3 +669,88 @@ async fn a_recorded_read_leaves_what_a_later_caller_reads_untouched() {
         );
     }
 }
+
+/// RULE: the record of a served call names the REQUEST ITS CALLER WAS ANSWERED UNDER, so a
+/// client holding a response finds the record of that very call rather than guessing which
+/// of two records of one operation is its own.
+#[tokio::test]
+async fn a_record_names_the_request_its_caller_was_answered_under() {
+    let emulator = Emulator::new();
+    let pool_id = audited_pool(&emulator, "audited-request-id").await;
+
+    // The rows span what the rule generalises over: a reporting and a mutating call, a
+    // served and a refused one, and the same operation called twice — whose two records
+    // must name the two different requests that made them.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "a mutating call",
+            "CreateIdentityPool",
+            json!({
+                "IdentityPoolName": "audited-request-id-second",
+                "AllowUnauthenticatedIdentities": true,
+            }),
+        ),
+        (
+            "a reporting call",
+            "DescribeIdentityPool",
+            json!({"IdentityPoolId": &pool_id}),
+        ),
+        (
+            "the same reporting call again",
+            "DescribeIdentityPool",
+            json!({"IdentityPoolId": &pool_id}),
+        ),
+        (
+            "a refused call",
+            "DescribeIdentityPool",
+            json!({"IdentityPoolId": ABSENT_POOL_ID}),
+        ),
+        (
+            "a refused write",
+            "UpdateIdentityPool",
+            json!({
+                "IdentityPoolId": ABSENT_POOL_ID,
+                "IdentityPoolName": "nothing-to-update",
+                "AllowUnauthenticatedIdentities": true,
+            }),
+        ),
+    ];
+
+    let mut answered: Vec<(&str, String)> = Vec::new();
+    for (case, operation, request) in rows {
+        let before = emulator.recorded_events().len();
+        let (status, body, request_id) = emulator
+            .answered_in(DEFAULT_REGION, operation, &request)
+            .await;
+        assert!(
+            !request_id.is_empty(),
+            "case {case:?}: {operation} must name the request it answers, got {status} with \
+             {body}"
+        );
+        let recorded = emulator.recorded_events();
+        assert_eq!(
+            recorded.len(),
+            before + 1,
+            "case {case:?}: {operation} must append exactly one record, got {} where there \
+             were {before}",
+            recorded.len()
+        );
+        let event = &recorded[before];
+        assert_eq!(
+            event.get("requestID"),
+            Some(&json!(request_id)),
+            "case {case:?}: expected the record of {operation} to name the request \
+             {request_id:?} its caller was answered under, got {event}"
+        );
+        answered.push((case, request_id));
+    }
+
+    // Two calls to one operation are told apart by the request each of them answered.
+    for (first, second) in answered.iter().zip(answered.iter().skip(1)) {
+        assert_ne!(
+            first.1, second.1,
+            "cases {:?} and {:?}: two calls are answered under two ids, got {:?} twice",
+            first.0, second.0, first.1
+        );
+    }
+}

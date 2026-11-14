@@ -152,6 +152,25 @@ fn hold_record(call: ServedApiCall) {
     PENDING_RECORD.with(|slot| *slot.borrow_mut() = Some(call));
 }
 
+/// Hold the record of a call a HANDLER built itself, until the response that answers it
+/// exists.
+///
+/// The same slot [`AuditedOperation`] holds its own records in, for the service whose
+/// handlers build the record rather than letting the wrapper render it from the typed call —
+/// a record naming the resource the call addressed, say. Everything after the hold is the
+/// same for both: [`RecordedCall`] takes the record once the response exists, writes it with
+/// the id the CALLER was answered under, and delivers what the account's CloudTrail delivers
+/// for it. So a service that builds its own records still has them recorded, published onto
+/// the default event bus and written into each logging trail's bucket, exactly as a service
+/// served through an [`AuditedTable`] does.
+///
+/// Called as the LAST thing such a handler does, for the reason `PENDING_RECORD` states: the
+/// record is handed to the layer that awaited the handler's own run, so nothing may be
+/// awaited in between.
+pub fn hold_management_event(call: ServedApiCall) {
+    hold_record(call);
+}
+
 /// The wire error code of the scaffold's "not implemented" signal, which every generated
 /// service's error channel renders a stub with (`crate::scaffolded` in each service
 /// crate). A call it refused reached no implementation, so it is not an event.
@@ -510,6 +529,18 @@ pub struct RecordedCall<W, S> {
     inner: W,
     /// The service that records it.
     service: Arc<S>,
+}
+
+impl<W, S> RecordedCall<W, S> {
+    /// Serve `inner` with the management event its handler HELD
+    /// ([`hold_management_event`]) recorded and delivered through `service`.
+    ///
+    /// What a service whose handlers build their own records wires its operations behind,
+    /// outermost: [`AuditedTable`] files every row behind this same layer, so one and the
+    /// same code writes the record and makes the deliveries either way.
+    pub fn new(inner: W, service: Arc<S>) -> Self {
+        Self { inner, service }
+    }
 }
 
 impl<W: ErasedOperation, S: AuditedService> ErasedOperation for RecordedCall<W, S> {

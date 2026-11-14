@@ -90,6 +90,7 @@ pub mod validation;
 mod modeled_error_status;
 
 use error_type_header::ErrorTypeHeaderDefinition;
+use service_common::audited_operation::RecordedCall;
 use service_common::data_events::DeliveringDataEvents;
 use service_common::query_error_envelope::RequestIdEnvelopeDefinition;
 use smithy_server_runtime::{
@@ -100,17 +101,28 @@ use std::sync::Arc;
 use validation::QuotingSubmittedValues;
 
 use crate::state::data_events::IdentityPoolDataEvents;
+use crate::state::management_events::IdentityPoolAudit;
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
 /// [`QuotingSubmittedValues`] and keyed by its operation shape name — the routing key
 /// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
+///
+/// Every one of them is a CONTROL-PLANE call, so each is served behind the layer that
+/// writes the management event its handler held and makes the deliveries the account's
+/// CloudTrail makes for it ([`service_common::audited_operation::RecordedCall`]): event
+/// history, each logging trail's bucket and the default event bus. That layer is
+/// OUTERMOST, because the record names the request the CALLER was answered under and that
+/// id exists only once every layer that reports it has rendered the response.
 macro_rules! wrap_operations {
-    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+    ($table:expr, $engine:expr, $audit:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
         $(
             $table.add_operation(
                 stringify!($operation),
-                ::std::boxed::Box::new(QuotingSubmittedValues::new(
-                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                ::std::boxed::Box::new(RecordedCall::new(
+                    QuotingSubmittedValues::new(
+                        crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                    ),
+                    ::std::sync::Arc::clone($audit),
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
         )+
@@ -165,9 +177,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         let mut quoting_submitted_values = OperationRoutingTable::new();
+        // The account's record of this service's CONTROL-PLANE calls: one recorder for every
+        // operation below, so two of them cannot report one call differently.
+        let audit = Arc::new(IdentityPoolAudit::new(Arc::clone(&engine)));
         wrap_operations!(
             quoting_submitted_values,
             engine,
+            &audit,
             create_identity_pool::CreateIdentityPool,
             delete_identities::DeleteIdentities,
             delete_identity_pool::DeleteIdentityPool,

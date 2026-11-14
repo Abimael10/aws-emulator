@@ -1097,3 +1097,184 @@ async fn a_single_region_trail_delivers_only_the_data_events_of_its_own_region()
         }
     }
 }
+
+/// An advanced selector that admits the identity-pool data events of ONE pool: the `Data`
+/// category, the identity-pool resource type and that pool's own ARN.
+fn arn_scoped_selector(pool_id: &str) -> Value {
+    json!([{
+        "Name": "identity-pool-data-of-one-pool",
+        "FieldSelectors": [
+            {"Field": "eventCategory", "Equals": [DATA_CATEGORY]},
+            {"Field": "resources.type", "Equals": [IDENTITY_POOL_TYPE]},
+            {"Field": "resources.ARN", "Equals": [pool_arn(pool_id)]},
+        ],
+    }])
+}
+
+/// The selector that admits MANAGEMENT events, which a trail carries beside its data
+/// selector while a client audits both classes into one bucket.
+fn management_selector() -> Value {
+    json!({
+        "Name": "management",
+        "FieldSelectors": [{"Field": "eventCategory", "Equals": [MANAGEMENT_CATEGORY]}],
+    })
+}
+
+/// Mint an identity in `pool_id` and exchange it for an OpenID token, answering the id each
+/// call was answered under.
+async fn identity_calls(emulator: &Emulator, pool_id: &str) -> Vec<(&'static str, String)> {
+    let minted = emulator
+        .cognito_ok(
+            "a minted identity",
+            Caller::Anonymous,
+            "GetId",
+            &json!({"IdentityPoolId": pool_id, "Logins": {LOGIN_PROVIDER: LOGIN_TOKEN}}),
+        )
+        .await;
+    let identity_id = minted.body["IdentityId"]
+        .as_str()
+        .expect("GetId answers an IdentityId")
+        .to_string();
+    let exchanged = emulator
+        .cognito_ok(
+            "a minted OpenID token",
+            Caller::Anonymous,
+            "GetOpenIdToken",
+            &json!({
+                "IdentityId": &identity_id,
+                "Logins": {LOGIN_PROVIDER: LOGIN_TOKEN},
+            }),
+        )
+        .await;
+    vec![
+        ("GetId", minted.request_id),
+        ("GetOpenIdToken", exchanged.request_id),
+    ]
+}
+
+#[tokio::test]
+async fn an_arn_scoped_selector_installed_on_a_logging_trail_delivers_only_that_pool() {
+    let emulator = Emulator::new();
+    let bucket = "arn-scoped-data-trail-logs";
+    let trail = "arn-scoped-data-trail";
+    let key_prefix = "obs/arn-scoped";
+    let prefix = delivery_prefix(key_prefix);
+    emulator.log_bucket(bucket).await;
+    // The trail starts out logging MANAGEMENT events only, which is where a client that adds
+    // a data selector later starts from, and it is addressed by its ARN from here on.
+    let created = emulator
+        .cloudtrail(
+            "setup",
+            "CreateTrail",
+            &json!({
+                "Name": trail,
+                "S3BucketName": bucket,
+                "S3KeyPrefix": key_prefix,
+                "IsMultiRegionTrail": false,
+                "IncludeGlobalServiceEvents": false,
+            }),
+        )
+        .await;
+    let trail_arn = text(&created.body, "TrailARN");
+    assert!(
+        !trail_arn.is_empty(),
+        "setup: CreateTrail must answer the trail's ARN, got {}",
+        created.body
+    );
+    emulator
+        .cloudtrail(
+            "setup",
+            "PutEventSelectors",
+            &json!({
+                "TrailName": &trail_arn,
+                "AdvancedEventSelectors": json!([management_selector()]),
+            }),
+        )
+        .await;
+    emulator
+        .cloudtrail("setup", "StartLogging", &json!({"Name": &trail_arn}))
+        .await;
+
+    let named = fixture_pool(&emulator, "arn-scoped-pool-named").await;
+    let other = fixture_pool(&emulator, "arn-scoped-pool-other").await;
+
+    // The warm leg a client uses to prove the trail is capturing at all: a READ-ONLY
+    // management call of the same service, which the management selector admits.
+    let marker = emulator
+        .cognito_ok(
+            "a management marker",
+            Caller::RoleSession,
+            "DescribeIdentityPool",
+            &json!({"IdentityPoolId": &named}),
+        )
+        .await;
+
+    let before_any_data_selector = identity_calls(&emulator, &other).await;
+
+    // The data selector is ADDED beside the management one, on a trail that is already
+    // logging, and it names ONE pool's ARN.
+    let mut selectors = arn_scoped_selector(&named);
+    selectors
+        .as_array_mut()
+        .expect("the data selector set is a list")
+        .insert(0, management_selector());
+    let configured = emulator
+        .cloudtrail(
+            "the selector",
+            "PutEventSelectors",
+            &json!({"TrailName": &trail_arn, "AdvancedEventSelectors": &selectors}),
+        )
+        .await;
+    assert_eq!(
+        configured.body.get("AdvancedEventSelectors"),
+        Some(&selectors),
+        "case \"the selector\": expected the set echoed back unchanged, got {}",
+        configured.body
+    );
+
+    let on_named = identity_calls(&emulator, &named).await;
+    let on_other = identity_calls(&emulator, &other).await;
+
+    let delivered = emulator.delivered(bucket, &prefix).await;
+    /// One row: the case, the calls it made (each an operation and the id it was answered
+    /// under), and whether the trail delivers them.
+    type Row = (&'static str, Vec<(&'static str, String)>, bool);
+    let rows: Vec<Row> = vec![
+        (
+            "a management call of the same service",
+            vec![("DescribeIdentityPool", marker.request_id)],
+            true,
+        ),
+        (
+            "a data call made before any data selector",
+            before_any_data_selector,
+            false,
+        ),
+        ("the pool the data selector names", on_named, true),
+        (
+            "a pool the data selector does not name",
+            on_other,
+            false,
+        ),
+    ];
+    for (case, calls, expected) in rows {
+        for (operation, request_id) in calls {
+            let found = delivered
+                .iter()
+                .any(|(_, record)| text(record, "requestID") == request_id);
+            assert_eq!(
+                found, expected,
+                "case {case:?}: expected {operation} answered as {request_id:?} delivered == \
+                 {expected}, got records of {:?}",
+                delivered
+                    .iter()
+                    .map(|(_, record)| (
+                        text(record, "eventName"),
+                        text(record, "requestID"),
+                        record.pointer("/resources/0/ARN").cloned(),
+                    ))
+                    .collect::<Vec<(String, String, Option<Value>)>>()
+            );
+        }
+    }
+}

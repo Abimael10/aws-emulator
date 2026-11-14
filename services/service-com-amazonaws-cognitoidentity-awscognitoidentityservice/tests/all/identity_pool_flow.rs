@@ -52,6 +52,19 @@ impl Emulator {
         operation: &str,
         body: &Value,
     ) -> (u16, Value) {
+        let (status, parsed, _) = self.answered_in(region, operation, body).await;
+        (status, parsed)
+    }
+
+    /// The same call again, with the id the CALLER was answered under beside its status and
+    /// body — the `x-amzn-requestid` an SDK reports as `ResponseMetadata.RequestId`, which
+    /// is what joins a client's own answer to the record of that very call.
+    pub(crate) async fn answered_in(
+        &self,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value, String) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://cognito-identity.{region}.amazonaws.com/"))
@@ -77,6 +90,12 @@ impl Emulator {
             .expect("the request builds");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let request_id = response
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let bytes = response.into_body();
         let parsed = if bytes.is_empty() {
             Value::Null
@@ -88,7 +107,7 @@ impl Emulator {
                 )
             })
         };
-        (status, parsed)
+        (status, parsed, request_id)
     }
 
     /// Every event recorded in the account's management-event log of the SAME shared
