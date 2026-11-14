@@ -709,20 +709,18 @@ async fn a_stack_publishes_the_machine_arn_and_an_unassumable_role_fails_the_tas
             (Some("FAILED"), Some(TASK_FAILED_ERROR)),
             "case {case:?}: expected FAILED with {TASK_FAILED_ERROR}, got {described}"
         );
-        // The cause names the role reference an operator has to act on, and both of the
-        // principals the assume was attempted as.
+        // The cause is the service's FIXED sentence for a role it cannot act as: its own
+        // service principal, and the role reference an operator has to act on in the
+        // parenthesised suffix.
         let cause = string(&described, "cause", case);
-        for fragment in [
-            "is not authorized to assume the provided role",
-            "states.amazonaws.com",
-            &format!("states.{region}.amazonaws.com"),
-            role_arn.as_str(),
-        ] {
-            assert!(
-                cause.contains(fragment),
-                "case {case:?}: expected the cause to carry {fragment:?}, got {cause:?}"
-            );
-        }
+        let expected = format!(
+            "The principal states.amazonaws.com is not authorized to assume the provided role. \
+             (role: {role_arn})"
+        );
+        assert_eq!(
+            cause, expected,
+            "case {case:?}: expected the cause {expected:?}, got {cause:?}"
+        );
         // The TASK reported the failure as its own, and the work it named never happened.
         let events = history(&router, region, &execution_arn, case).await;
         let task_failures = types(&events)

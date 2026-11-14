@@ -290,6 +290,8 @@ mod terminal_runtime_errors;
 mod test_state;
 #[path = "all/test_state_reveal_secrets_authorization.rs"]
 mod test_state_reveal_secrets_authorization;
+#[path = "all/unassumable_role_cause.rs"]
+mod unassumable_role_cause;
 #[path = "all/unhandled_handler_error_task_failure.rs"]
 mod unhandled_handler_error_task_failure;
 #[path = "all/unmade_integration_status_change_error.rs"]

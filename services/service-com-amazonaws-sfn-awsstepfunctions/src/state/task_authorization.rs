@@ -151,9 +151,9 @@ pub fn assume_context(state_machine_arn: &str) -> Vec<(String, String)> {
 /// assumed, or `None` when nothing of the kind can be shown (see the module docs).
 ///
 /// The failure is the task's own — ASL's [`TASK_FAILED_ERROR`] — because the work the
-/// state names is what did not happen, and the cause is the service's own sentence for
-/// an execution role it cannot act as, which names both of the principals it tried to
-/// assume the role as.
+/// state names is what did not happen, and the cause is the service's fixed sentence for
+/// an execution role it cannot act as ([`unassumable_role_cause`]), which names the
+/// service principal a trust policy is written for and the role itself.
 ///
 /// It is resolved ONCE per walk, where the walk is started, because every `Task` state
 /// of that walk acts as the same role: the credentials a real execution assumes are
@@ -191,7 +191,7 @@ pub async fn unassumable_role(
     }
     Some(Failed {
         error: TASK_FAILED_ERROR.to_string(),
-        cause: unassumable_role_cause(&regional, role_arn),
+        cause: unassumable_role_cause(role_arn),
     })
 }
 
@@ -252,13 +252,18 @@ fn acting_principal(role_arn: &str, session_name: &str) -> String {
 
 /// The sentence the service refuses an execution role it cannot assume with.
 ///
-/// It names the two principals the assume was attempted as — the global one and
-/// `regional`, the Region's own — and the role itself, so an operator reading the
-/// failure knows which role reference to act on.
-fn unassumable_role_cause(regional: &str, role_arn: &str) -> String {
+/// Every word of it is fixed: the service blames its own service principal
+/// ([`SERVICE_PRINCIPAL`]) — the identity a trust policy is written for — and names the
+/// role reference an operator has to act on in a parenthesised suffix, so a catcher or
+/// a log alarm that matches the sentence, or parses the role out of the parenthesis,
+/// reads the same text here as from the service itself. The only variable part is
+/// `role_arn`, the `roleArn` configured on the state machine the execution ran; the
+/// Region's own principal ([`regional_service_principal`]) is this emulator's way of
+/// deciding the assume and is named by no refusal.
+fn unassumable_role_cause(role_arn: &str) -> String {
     format!(
-        "Neither the global service principal {SERVICE_PRINCIPAL}, nor the regional one \
-         {regional}, is not authorized to assume the provided role {role_arn}."
+        "The principal {SERVICE_PRINCIPAL} is not authorized to assume the provided role. \
+         (role: {role_arn})"
     )
 }
 

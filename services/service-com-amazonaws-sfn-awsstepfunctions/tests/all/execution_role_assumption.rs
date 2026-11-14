@@ -37,20 +37,26 @@ use crate::task_execution_role::{trust_document, Chain};
 
 /// A child definition that finishes at once: the work the parent's `Task` names, so a
 /// row can show whether that work happened at all.
-const CHILD: &str = r#"{"StartAt":"Done","States":{"Done":{"Type":"Pass","End":true}}}"#;
+///
+/// `pub(crate)` because `tests/all/unassumable_role_cause.rs` holds the WORDING of the
+/// refusal this suite's unassumable rows carry, over the same pair of services and the
+/// same parent/child shape: `tests/all.rs` is one crate root, so the definitions, the
+/// unheld role and the policy are stated here once.
+pub(crate) const CHILD: &str =
+    r#"{"StartAt":"Done","States":{"Done":{"Type":"Pass","End":true}}}"#;
 
 /// The integration the parent's `Task` names, which starts the child.
 const FIRE_AND_FORGET: &str = "arn:aws:states:::states:startExecution";
 
 /// A role ARN of this account that IAM holds nothing under.
-const NOT_HELD: &str = "arn:aws:iam::000000000000:role/NotHeldHere";
+pub(crate) const NOT_HELD: &str = "arn:aws:iam::000000000000:role/NotHeldHere";
 
 /// A role ARN of ANOTHER account, whose IAM this emulator is not the one to ask.
 const ANOTHER_ACCOUNT: &str = "arn:aws:iam::210987654321:role/Elsewhere";
 
 /// A policy allowing every Step Functions action, so a row that gets past the assume is
 /// not then refused on what the role may do.
-fn allow_everything() -> Value {
+pub(crate) fn allow_everything() -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": "states:*", "Resource": "*" }]
@@ -70,7 +76,7 @@ fn trust(effect: &str, principal: &str, action: &str) -> Value {
 }
 
 /// The parent definition: one `Task` that starts `child_arn`.
-fn parent_definition(child_arn: &str) -> String {
+pub(crate) fn parent_definition(child_arn: &str) -> String {
     json!({
         "StartAt": "CallChild",
         "States": {
@@ -248,21 +254,21 @@ async fn an_execution_whose_role_cannot_be_assumed_fails_at_its_task() {
             (Some("FAILED"), Some(TASK_FAILED_ERROR)),
             "case {case:?}: expected FAILED with {TASK_FAILED_ERROR}, got {described:?}"
         );
-        // The cause is the service's own sentence for an execution role it cannot act
-        // as: both of the principals the assume was attempted as, and the role itself,
-        // so an operator knows which role reference to act on.
+        // The cause is the service's FIXED sentence for an execution role it cannot act
+        // as: its own service principal and, in the parenthesised suffix, the role
+        // reference an operator has to act on. The Region's own principal is how the
+        // assume is DECIDED and belongs to no refusal — `tests/all/
+        // unassumable_role_cause.rs` holds that wording over every way the assume fails.
         let cause = string(&described, "cause");
-        for fragment in [
-            "is not authorized to assume the provided role",
-            "states.amazonaws.com",
-            &format!("states.{REGION}.amazonaws.com"),
-            row.role_arn.as_str(),
-        ] {
-            assert!(
-                cause.contains(fragment),
-                "case {case:?}: expected the cause to carry {fragment:?}, got {cause:?}"
-            );
-        }
+        let expected = format!(
+            "The principal states.amazonaws.com is not authorized to assume the provided role. \
+             (role: {})",
+            row.role_arn
+        );
+        assert_eq!(
+            cause, expected,
+            "case {case:?}: expected the cause {expected:?}, got {cause:?}"
+        );
         // The task reported that failure as its own, and the work it named never
         // happened: no child execution was started.
         let events = chain.history(&execution_arn).await;

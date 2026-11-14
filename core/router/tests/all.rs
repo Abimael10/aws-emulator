@@ -7956,3 +7956,20 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // declarations that are already gone — is removed rather than re-typed. Declare each suite
 // ONCE, with its `#[path]` line, above this point; the rules stand in the module doc at the
 // HEAD of this file, which is the only place an inner doc comment is legal.)
+//! inner doc comment (`//!`) is legal only BEFORE the first item, so a note like this
+//! one written anywhere but this header is `E0753` — either fails every suite in this
+//! target. `all/all_rs_declares_each_suite_once.rs` checks the declarations and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks the notes, for this
+//! file and for every service crate's `tests/all.rs`, so check there rather than
+// (`cloudfront_edge_4xx_share_decides_the_alarm` is declared ONCE above: two landings each
+// (`cloudformation_kms_encrypted_sns_sqs_pipeline` is declared ONCE, above: two landings
+// each appended a declaration of it here, which compiled neither copy.)
+// region above: two landings each appended a declaration of it here, which compiled neither.)
+// landings each appended a declaration of it here, which compiled neither copy.)
+// comment past the first item of this crate root is `E0753` and compiles nothing.)
+// so check there rather than leaving a note here. (Ordinary comments, for the reason
+// they state themselves.)
+// file: two landings each appended a declaration of it here, which compiled neither copy.)
+// lines of that same header fragment, ordinary comments for the reason they state: the two
+// guard suites check the declarations and the notes, so check there rather than leaving a
+// note in this appended tail.)
