@@ -21,6 +21,9 @@
 //!   `Describe*` operations must agree on.
 //! * the paging and filtering every `List*` operation shares ([`listing`]): the opaque
 //!   cursor, the page size and the modelled comparison operators.
+//! * the tags every taggable resource carries and how a tagging call reaches them
+//!   ([`tagging`]), which `TagResource`, `UntagResource` and `ListTagsForResource` all
+//!   go through.
 //! * the object storage location members a `CreateLocationObjectStorage` and an
 //!   `UpdateLocationObjectStorage` have to resolve the same way
 //!   ([`DEFAULT_SERVER_PROTOCOL`], [`default_server_port`] and
@@ -31,6 +34,7 @@
 
 pub mod bucket_access_role;
 pub mod listing;
+pub mod tagging;
 pub mod transfer;
 
 use std::collections::HashMap;

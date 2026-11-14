@@ -4682,3 +4682,4 @@ mod cognito_vended_session_principal_tag_scoped_read;
 // fragments of the header, as line comments for the reason the lines above record.)
 // (Every line of this block is an ordinary comment: the rule they state stands in the
 // module header at the HEAD of this file, the only place an inner doc comment is legal.)
+// leaving a note in the tail. (Ordinary comments here, for exactly that reason.)

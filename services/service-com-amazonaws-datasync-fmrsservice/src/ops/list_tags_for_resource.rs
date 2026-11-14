@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the resource `ResourceArn` names currently holds — whatever put them
+//! there, a create that carried `Tags` or a later `TagResource` — in the order they were
+//! applied, paged at `MaxResults` with the opaque cursor every `List*` operation of this
+//! service shares. This is a REPORT: it writes nothing but the transitions the clock had
+//! already made due. An ARN naming no resource this account holds is
+//! `InvalidRequestException` (HTTP 400), as is a `NextToken` this service did not issue.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +145,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalException(
+                InternalException {
+                    message: Some(
+                        "the DataSync emulator could not reach its state store".to_string(),
+                    ),
+                    error_code: None,
+                },
+            )
+            .into());
+        };
+
+        // The cursor of a tag page carries how many of the resource's tags the pages so
+        // far have returned: a tag has no creation sequence of its own, and the list is
+        // ordered by when each key was first applied.
+        let already_returned = usize::try_from(
+            crate::state::listing::resume_after(input.next_token.as_deref())
+                .map_err(listing_refused)?,
+        )
+        .unwrap_or(usize::MAX);
+        let page_size = crate::state::listing::page_size(input.max_results);
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+        // One entry past the page, so a final page is told from a truncated one.
+        let mut tags: Vec<TagListEntry> = store
+            .resource_tags(&input.resource_arn)
+            .map_err(refused)?
+            .iter()
+            .skip(already_returned)
+            .take(page_size.saturating_add(1))
+            .cloned()
+            .collect();
+        drop(store);
+
+        let truncated = tags.len() > page_size;
+        tags.truncate(page_size);
+        let returned_through = already_returned.saturating_add(tags.len());
+
+        Ok(ListTagsForResourceOutput {
+            tags: Some(tags),
+            // Only a truncated page has a next one; the final page carries no token.
+            next_token: truncated
+                .then(|| crate::state::listing::encode_cursor(returned_through as u64)),
+        })
     }
+}
+
+/// This operation's modelled client error, from a shared tagging refusal.
+fn refused(refusal: crate::state::tagging::TagRefusal) -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::InvalidRequestException(refusal.into_invalid_request()).into()
+}
+
+/// This operation's modelled client error, from a shared listing refusal — what a
+/// `NextToken` this service never issued earns.
+fn listing_refused(refusal: crate::state::listing::FilterRefusal) -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::InvalidRequestException(refusal.into_invalid_request()).into()
 }
