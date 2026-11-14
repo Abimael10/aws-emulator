@@ -31,7 +31,9 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
     PROVISIONING_DELAY, RSLVR_CODE_FIREWALL_RULE_NOT_FOUND,
 };
 
-use super::harness::{call, emulator, error_type, ok, string_member, without_status};
+use super::harness::{
+    call, emulator, error_type, ok, string_member, traced_message, without_status,
+};
 
 /// An id of the shape this service mints for a rule group or a domain list that
 /// the store holds nothing under, so a request naming it resolves to nothing.
@@ -180,11 +182,24 @@ fn refusal_message(body: &Value) -> String {
 /// The message Route 53 Resolver answers when no rule of the group a request
 /// named matches the source it named the rule by: the service error code for
 /// that fault, and both halves of what the request named — the rule group, and
-/// the member it named the rule by with the id it carried there.
+/// the member it named the rule by with the id it carried there. The trace
+/// clause the service closes such a refusal with is not part of this: it carries
+/// the trace of the request, so what is compared is the sentence before it
+/// ([`stated_sentence`]).
 fn rule_not_found_message(group_id: &str, member: &str, match_source_id: &str) -> String {
     format!(
         r#"[{RSLVR_CODE_FIREWALL_RULE_NOT_FOUND}] Can’t locate the rule for the Firewall rule group ID: "{group_id}" and {member} "{match_source_id}"."#
     )
+}
+
+/// The sentence `message` states, with the trace clause the service closes a DNS
+/// Firewall refusal with taken off it. A message that closes with no such clause
+/// fails here: the clause is part of the refusal.
+fn stated_sentence(case: &str, message: &str) -> String {
+    let (stated, _) = traced_message(message).unwrap_or_else(|| {
+        panic!("case {case:?}: the refusal must close with its trace clause, got {message:?}")
+    });
+    stated.to_string()
 }
 
 /// A delete removes the one rule the request names and answers with that rule
@@ -331,7 +346,7 @@ async fn a_delete_removes_the_rule_it_names_and_reports_it_as_held() {
             "case {case:?}: expected ResourceNotFoundException, got {refusal}"
         );
         assert_eq!(
-            refusal_message(&refusal),
+            stated_sentence(case, &refusal_message(&refusal)),
             rule_not_found_message(&group, match_source_member, &match_source_id),
             "case {case:?}: the refusal must state the sentence for a rule the group holds \
              none of, got {refusal}"

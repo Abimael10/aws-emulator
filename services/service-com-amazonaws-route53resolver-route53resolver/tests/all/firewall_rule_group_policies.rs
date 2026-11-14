@@ -29,7 +29,9 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{call, emulator, error_type, expect_error, ok, string_member, ACCOUNT, REGION};
+use super::harness::{
+    call, emulator, error_type, expect_error, ok, string_member, traced_message, ACCOUNT, REGION,
+};
 
 /// An account that is not the one this emulator's resources belong to, so a
 /// policy naming it really does share the rule group.
@@ -446,12 +448,20 @@ async fn an_arn_naming_no_rule_group_is_refused() {
         )
         .await;
         let message = string_member(&refusal, "Message");
+        // The refusal closes with the trace clause of the request, whose id is a
+        // different value on every call, so what is compared is the sentence
+        // before it.
+        let (stated, _) = traced_message(&message).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the refusal must close with its trace clause, got {message:?}"
+            )
+        });
         let expected = format!(
             "[{RSLVR_CODE_RESOURCE_NOT_FOUND}] Can’t find the resource with ID \"{}\".",
             arn.rsplit_once('/').map_or(arn.as_str(), |(_, id)| id)
         );
         assert_eq!(
-            message,
+            stated,
             expected,
             "case {case:?}: the refusal must name the rule group id, got {message:?} ({})",
             error_type(&refusal)

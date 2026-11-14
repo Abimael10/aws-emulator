@@ -220,7 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 DeleteFirewallRuleGroupErrorModeled::ResourceNotFoundException(
-                    crate::state::firewall_rule_group_not_found(&input.firewall_rule_group_id),
+                    crate::state::firewall_rule_group_not_found(
+                        &input.firewall_rule_group_id,
+                        &trace_root,
+                    ),
                 )
                 .into(),
             );
@@ -254,7 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // rather than assuming that away.
             return Err(
                 DeleteFirewallRuleGroupErrorModeled::ResourceNotFoundException(
-                    crate::state::firewall_rule_group_not_found(&input.firewall_rule_group_id),
+                    crate::state::firewall_rule_group_not_found(
+                        &input.firewall_rule_group_id,
+                        &trace_root,
+                    ),
                 )
                 .into(),
             );

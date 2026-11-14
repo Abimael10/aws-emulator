@@ -175,9 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); this pure
-        // read needs nothing from `ctx`: every member the rule shape declares is
-        // already on the record.
-        let _ = ctx;
+        // read needs nothing from `ctx` for its page: every member the rule shape
+        // declares is already on the record, and what it does take from `ctx` is
+        // the trace its refusal is reported under.
+        let trace_root = crate::state::request_trace_root(&ctx.parts().headers);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListFirewallRulesErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
@@ -215,7 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let store = state.lock();
             let Some(group) = store.firewall_rule_groups.get(&input.firewall_rule_group_id) else {
                 return Err(ListFirewallRulesErrorModeled::ResourceNotFoundException(
-                    crate::state::firewall_rule_group_not_found(&input.firewall_rule_group_id),
+                    crate::state::firewall_rule_group_not_found(
+                        &input.firewall_rule_group_id,
+                        &trace_root,
+                    ),
                 )
                 .into());
             };

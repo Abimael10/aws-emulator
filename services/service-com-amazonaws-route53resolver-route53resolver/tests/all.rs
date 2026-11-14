@@ -53,6 +53,8 @@ mod firewall_domain_plane_contract;
 mod firewall_domains;
 #[path = "all/firewall_lifecycle_status_messages.rs"]
 mod firewall_lifecycle_status_messages;
+#[path = "all/firewall_not_found_trace_clause.rs"]
+mod firewall_not_found_trace_clause;
 #[path = "all/firewall_resource_in_use.rs"]
 mod firewall_resource_in_use;
 #[path = "all/firewall_rule_deletion.rs"]

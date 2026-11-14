@@ -30,7 +30,7 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
     RSLVR_CODE_FIREWALL_RULE_NOT_FOUND,
 };
 
-use super::harness::{call, emulator, error_type, ok, string_member};
+use super::harness::{call, emulator, error_type, ok, string_member, traced_message};
 
 /// Ids of the shape this service mints for a domain list and for a DNS Firewall
 /// Advanced rule that the store holds nothing under, so a request naming either
@@ -60,11 +60,24 @@ fn refusal_message(body: &Value) -> String {
     string_member(body, "Message") + &string_member(body, "message")
 }
 
-/// The message the service reports for a rule the named group holds none of.
+/// The message the service reports for a rule the named group holds none of,
+/// WITHOUT the trace clause it closes with: that clause carries the trace of the
+/// request, a different value on every call, so what this suite compares is the
+/// sentence before it ([`stated_sentence`]).
 fn rule_not_found_message(group_id: &str, member: &str, match_source_id: &str) -> String {
     format!(
         r#"[{RSLVR_CODE_FIREWALL_RULE_NOT_FOUND}] Can’t locate the rule for the Firewall rule group ID: "{group_id}" and {member} "{match_source_id}"."#
     )
+}
+
+/// The sentence `message` states, with the trace clause the service closes a DNS
+/// Firewall refusal with taken off it. A message that closes with no such clause
+/// fails here: the clause is part of the refusal.
+fn stated_sentence(case: &str, message: &str) -> String {
+    let (stated, _) = traced_message(message).unwrap_or_else(|| {
+        panic!("case {case:?}: the refusal must close with its trace clause, got {message:?}")
+    });
+    stated.to_string()
 }
 
 /// The one error a batch operation reports for the single entry it carried, as
@@ -145,7 +158,7 @@ async fn every_operation_naming_a_rule_reports_the_same_not_found_sentence() {
             "case {case:?}: expected ResourceNotFoundException, got {refusal}"
         );
         assert_eq!(
-            refusal_message(&refusal),
+            stated_sentence(&case, &refusal_message(&refusal)),
             expected,
             "case {case:?}: the refusal must state the sentence for a rule the group holds \
              none of, got {refusal}"
@@ -166,7 +179,8 @@ async fn every_operation_naming_a_rule_reports_the_same_not_found_sentence() {
             "case {case:?}: expected Code ResourceNotFoundException, got {body}"
         );
         assert_eq!(
-            message, expected,
+            stated_sentence(&case, &message),
+            expected,
             "case {case:?}: the entry's error must state the sentence the single delete \
              answers for it, got {body}"
         );
@@ -192,7 +206,8 @@ async fn every_operation_naming_a_rule_reports_the_same_not_found_sentence() {
             "case {case:?}: expected Code ResourceNotFoundException, got {body}"
         );
         assert_eq!(
-            message, expected,
+            stated_sentence(&case, &message),
+            expected,
             "case {case:?}: the entry's error must state the same sentence the deletes \
              answer for the same rule, got {body}"
         );
@@ -223,7 +238,7 @@ async fn the_sentence_names_the_group_the_request_named() {
             "case {case:?}: the delete must answer HTTP 400, got {status}: {refusal}"
         );
         assert_eq!(
-            refusal_message(&refusal),
+            stated_sentence(case, &refusal_message(&refusal)),
             rule_not_found_message(group, FIREWALL_RULE_DOMAIN_LIST_MEMBER, UNHELD_DOMAIN_LIST_ID),
             "case {case:?}: the refusal must name the group the request named, got {refusal}"
         );

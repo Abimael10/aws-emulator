@@ -29,13 +29,22 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{call, emulator, error_type, ok, string_member};
+use super::harness::{call_tracing, emulator, error_type, ok, string_member, tracing_chain};
+
+/// The tracing chain every case of this suite sends, so a refusal that closes
+/// with the trace of the request it refused closes with a known `Root` and the
+/// whole message can be compared byte for byte.
+fn tracing() -> (String, String) {
+    tracing_chain(37)
+}
 
 /// The message Route 53 Resolver answers for a resource the caller named but
 /// cannot address: the bracketed service error code, the fixed sentence (with
-/// the typographic apostrophe AWS writes it with) and the id from the request.
+/// the typographic apostrophe AWS writes it with), the id from the request, and
+/// the trace clause of the request it closes with.
 fn cannot_find(resource_id: &str) -> String {
-    format!(r#"[RSLVR-02025] Can’t find the resource with ID "{resource_id}"."#)
+    let (_, root) = tracing();
+    format!(r#"[RSLVR-02025] Can’t find the resource with ID "{resource_id}". Trace Id: "{root}""#)
 }
 
 /// The fixed message `ListFirewallDomains` refuses a published list with.
@@ -87,7 +96,8 @@ async fn expect_refusal(
     expected_error: &str,
     expected_message: &str,
 ) {
-    let (status, answered) = call(router, operation, request).await;
+    let (chain, _) = tracing();
+    let (status, answered) = call_tracing(router, operation, request, Some(&chain)).await;
     assert_eq!(
         status, 400,
         "case {case:?}: {operation} must answer HTTP 400, got {status}: {answered}"

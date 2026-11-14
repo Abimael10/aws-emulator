@@ -276,7 +276,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(
                     AssociateFirewallRuleGroupErrorModeled::ResourceNotFoundException(
-                        crate::state::firewall_rule_group_not_found(&input.firewall_rule_group_id),
+                        crate::state::firewall_rule_group_not_found(
+                            &input.firewall_rule_group_id,
+                            &trace_root,
+                        ),
                     )
                     .into(),
                 );
@@ -318,7 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.firewall_rule_groups.get(&input.firewall_rule_group_id) else {
             return Err(
                 AssociateFirewallRuleGroupErrorModeled::ResourceNotFoundException(
-                    crate::state::firewall_rule_group_not_found(&input.firewall_rule_group_id),
+                    crate::state::firewall_rule_group_not_found(
+                        &input.firewall_rule_group_id,
+                        &trace_root,
+                    ),
                 )
                 .into(),
             );

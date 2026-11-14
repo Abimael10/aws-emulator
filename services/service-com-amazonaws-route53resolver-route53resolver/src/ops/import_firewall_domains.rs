@@ -258,7 +258,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `crate::state::firewall_domain_list_not_found`).
             return Err(
                 ImportFirewallDomainsErrorModeled::ResourceNotFoundException(
-                    crate::state::firewall_domain_list_not_found(&input.firewall_domain_list_id),
+                    crate::state::firewall_domain_list_not_found(
+                        &input.firewall_domain_list_id,
+                        &crate::state::request_trace_root(&ctx.parts().headers),
+                    ),
                 )
                 .into(),
             );

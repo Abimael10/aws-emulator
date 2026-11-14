@@ -210,7 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 DeleteFirewallDomainListErrorModeled::ResourceNotFoundException(
-                    crate::state::firewall_domain_list_not_found(&input.firewall_domain_list_id),
+                    crate::state::firewall_domain_list_not_found(
+                        &input.firewall_domain_list_id,
+                        &trace_root,
+                    ),
                 )
                 .into(),
             );
@@ -246,7 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // rather than assuming that away.
             return Err(
                 DeleteFirewallDomainListErrorModeled::ResourceNotFoundException(
-                    crate::state::firewall_domain_list_not_found(&input.firewall_domain_list_id),
+                    crate::state::firewall_domain_list_not_found(
+                        &input.firewall_domain_list_id,
+                        &trace_root,
+                    ),
                 )
                 .into(),
             );

@@ -145,7 +145,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // What this operation takes from `ctx` is the trace its refusals are
+        // reported under.
+        let trace_root = crate::state::request_trace_root(&ctx.parts().headers);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 PutFirewallRuleGroupPolicyErrorModeled::InternalServiceErrorException(
@@ -183,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.firewall_rule_group_by_arn_mut(&input.arn) else {
             return Err(
                 PutFirewallRuleGroupPolicyErrorModeled::ResourceNotFoundException(
-                    crate::state::firewall_rule_group_not_found(&input.arn),
+                    crate::state::firewall_rule_group_not_found(&input.arn, &trace_root),
                 )
                 .into(),
             );

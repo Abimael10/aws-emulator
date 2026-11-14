@@ -72,6 +72,10 @@ pub struct FirewallRuleCreate<'a> {
     pub dns_threat_protection: Option<&'a str>,
     pub confidence_threshold: Option<&'a str>,
     pub firewall_rule_type: Option<&'a FirewallRuleType>,
+    /// The trace of the request this create came in on
+    /// ([`request_trace_root`]), which the refusals naming a DNS Firewall
+    /// resource it cannot address close with ([`traced_message`]).
+    pub trace_root: &'a str,
 }
 
 /// Why one firewall-rule create was refused.
@@ -172,17 +176,24 @@ pub fn firewall_rule_update_batch_too_large(cap: usize) -> LimitExceededExceptio
 /// what the request named — the rule group, and the member it named the rule by
 /// with the id it carried there. `ResourceType` is the rule's modelled shape
 /// name, which is the resource that doesn't exist.
+/// The sentence closes with the trace clause of the request
+/// ([`traced_message`]), as every DNS Firewall refusal naming a resource the
+/// caller cannot address does.
 pub fn firewall_rule_not_found(
     firewall_rule_group_id: &str,
     match_source_member: &str,
     match_source_id: &str,
+    trace_root: &str,
 ) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(rslvr_message(
-            RSLVR_CODE_FIREWALL_RULE_NOT_FOUND,
-            &format!(
-                r#"Can’t locate the rule for the Firewall rule group ID: "{firewall_rule_group_id}" and {match_source_member} "{match_source_id}""#
+        message: Some(traced_message(
+            rslvr_message(
+                RSLVR_CODE_FIREWALL_RULE_NOT_FOUND,
+                &format!(
+                    r#"Can’t locate the rule for the Firewall rule group ID: "{firewall_rule_group_id}" and {match_source_member} "{match_source_id}""#
+                ),
             ),
+            trace_root,
         )),
         resource_type: Some(RESOURCE_TYPE_FIREWALL_RULE.to_string()),
     }
@@ -557,6 +568,9 @@ pub struct FirewallRuleUpdate<'a> {
     pub dns_threat_protection: Option<&'a str>,
     pub confidence_threshold: Option<&'a str>,
     pub firewall_rule_type: Option<&'a FirewallRuleType>,
+    /// The trace of the request this update came in on, as for
+    /// [`FirewallRuleCreate::trace_root`].
+    pub trace_root: &'a str,
 }
 
 /// Why one firewall-rule update was refused.
@@ -655,6 +669,10 @@ pub struct FirewallRuleMatchSource<'a> {
     /// What the request asks of the rule it names, as the sentences a request
     /// that names no single rule is refused with word it.
     pub action: &'a str,
+    /// The trace of the request that named the rule, as for
+    /// [`FirewallRuleCreate::trace_root`]: the refusals this naming is answered
+    /// with close with it.
+    pub trace_root: &'a str,
 }
 
 impl<'a> FirewallRuleMatchSource<'a> {
@@ -748,6 +766,7 @@ pub fn locate_firewall_rule<'a>(
                 named.firewall_rule_group_id,
                 match_source_member,
                 match_source_id,
+                named.trace_root,
             ),
         )),
         [only] => Ok((*only, (match_source_member, match_source_id))),
@@ -897,7 +916,7 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         // Firewall publishes itself, which such a rule may name.
         let Some(group) = self.firewall_rule_groups.get(request.firewall_rule_group_id) else {
             return Err(FirewallRuleCreateRefusal::ResourceNotFound(
-                firewall_rule_group_not_found(request.firewall_rule_group_id),
+                firewall_rule_group_not_found(request.firewall_rule_group_id, request.trace_root),
             ));
         };
 
@@ -947,7 +966,7 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                 && managed_firewall_domain_list(firewall_domain_list_id).is_none()
             {
                 return Err(FirewallRuleCreateRefusal::ResourceNotFound(
-                    firewall_domain_list_not_found(firewall_domain_list_id),
+                    firewall_domain_list_not_found(firewall_domain_list_id, request.trace_root),
                 ));
             }
         }
@@ -1041,7 +1060,7 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             .get_mut(request.firewall_rule_group_id)
         else {
             return Err(FirewallRuleCreateRefusal::ResourceNotFound(
-                firewall_rule_group_not_found(request.firewall_rule_group_id),
+                firewall_rule_group_not_found(request.firewall_rule_group_id, request.trace_root),
             ));
         };
         group.rules.push(record);
@@ -1073,7 +1092,7 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
     ) -> Result<FirewallRule, FirewallRuleUpdateRefusal> {
         let Some(group) = self.firewall_rule_groups.get(request.firewall_rule_group_id) else {
             return Err(FirewallRuleUpdateRefusal::ResourceNotFound(
-                firewall_rule_group_not_found(request.firewall_rule_group_id),
+                firewall_rule_group_not_found(request.firewall_rule_group_id, request.trace_root),
             ));
         };
 
@@ -1085,6 +1104,7 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             firewall_threat_protection_id: request.firewall_threat_protection_id,
             qtype: request.qtype,
             action: FIREWALL_RULE_ACTION_WORD_UPDATE,
+            trace_root: request.trace_root,
         };
         // The rule the entry named, beside the member it named it by and the id
         // it carried there — what a refusal about that rule states, carried out
@@ -1098,6 +1118,7 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                     request.firewall_rule_group_id,
                     match_source_member,
                     match_source_id,
+                    request.trace_root,
                 ),
             ));
         };
@@ -1217,7 +1238,7 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             .get_mut(request.firewall_rule_group_id)
         else {
             return Err(FirewallRuleUpdateRefusal::ResourceNotFound(
-                firewall_rule_group_not_found(request.firewall_rule_group_id),
+                firewall_rule_group_not_found(request.firewall_rule_group_id, request.trace_root),
             ));
         };
         let Some(record) = group.rules.get_mut(index) else {
@@ -1226,6 +1247,7 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                     request.firewall_rule_group_id,
                     match_source_member,
                     match_source_id,
+                    request.trace_root,
                 ),
             ));
         };
@@ -1303,7 +1325,7 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             .get_mut(named.firewall_rule_group_id)
         else {
             return Err(FirewallRuleDeleteRefusal::ResourceNotFound(
-                firewall_rule_group_not_found(named.firewall_rule_group_id),
+                firewall_rule_group_not_found(named.firewall_rule_group_id, named.trace_root),
             ));
         };
         let (index, _) = locate_firewall_rule(group, &named)?;

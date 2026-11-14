@@ -2312,11 +2312,19 @@ const NAME_MEMBER: &str = "Name";
 /// service's own, so nothing this account does changes it and it is not visible
 /// as a writable resource at all. Reporting one body for both is what makes
 /// those two indistinguishable, as [`resource_not_found_message`] describes.
+///
+/// The sentence closes with the trace clause of the request
+/// ([`traced_message`]), as every DNS Firewall refusal that names a resource the
+/// caller cannot address does.
 pub fn firewall_domain_list_not_found(
     firewall_domain_list_id: &str,
+    trace_root: &str,
 ) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(resource_not_found_message(firewall_domain_list_id)),
+        message: Some(traced_message(
+            resource_not_found_message(firewall_domain_list_id),
+            trace_root,
+        )),
         resource_type: Some(RESOURCE_TYPE_FIREWALL_DOMAIN_LIST.to_string()),
     }
 }
@@ -2400,10 +2408,18 @@ pub fn firewall_domain_list_in_progress_conflict(
 ///
 /// `firewall_rule_group` is how the request addressed the group — its
 /// `FirewallRuleGroupId`, or the `Arn` the policy operations take — and the
-/// sentence names the bare id either way.
-pub fn firewall_rule_group_not_found(firewall_rule_group: &str) -> ResourceNotFoundException {
+/// sentence names the bare id either way. It closes with the trace clause of the
+/// request ([`traced_message`]), as the rule-group association's own refusal
+/// does ([`firewall_rule_group_association_not_found`]).
+pub fn firewall_rule_group_not_found(
+    firewall_rule_group: &str,
+    trace_root: &str,
+) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(resource_not_found_message(firewall_rule_group)),
+        message: Some(traced_message(
+            resource_not_found_message(firewall_rule_group),
+            trace_root,
+        )),
         resource_type: Some(RESOURCE_TYPE_FIREWALL_RULE_GROUP.to_string()),
     }
 }

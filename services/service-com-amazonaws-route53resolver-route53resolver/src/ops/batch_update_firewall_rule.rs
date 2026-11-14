@@ -153,9 +153,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); a rule is
-        // not an ARN-bearing resource of its own, so this operation takes
-        // nothing from `ctx`.
-        let _ = ctx;
+        // not an ARN-bearing resource of its own, so what this operation takes
+        // from `ctx` is the trace the refusals of its entries are reported under.
+        let trace_root = crate::state::request_trace_root(&ctx.parts().headers);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 BatchUpdateFirewallRuleErrorModeled::InternalServiceErrorException(
@@ -212,6 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 dns_threat_protection: entry.dns_threat_protection.as_deref(),
                 confidence_threshold: entry.confidence_threshold.as_deref(),
                 firewall_rule_type: entry.firewall_rule_type.as_ref(),
+                trace_root: &trace_root,
             };
 
             match store.update_firewall_rule(request, now) {

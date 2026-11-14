@@ -27,7 +27,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::state::RSLVR_CODE_RESOURCE_NOT_FOUND;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{call, emulator, error_type, ok, string_member, traced_message, ACCOUNT, REGION};
+use super::harness::{
+    call, emulator, error_type, ok, string_member, traced_message, ACCOUNT, REGION,
+};
 
 /// An account that is not the one this emulator's resources belong to, so a
 /// policy document naming it really does ask for a share.
@@ -38,6 +40,10 @@ const OTHER_ACCOUNT: &str = "123456789012";
 /// builder so the wording itself is what this suite pins: the service error code
 /// in square brackets, the sentence with the resource's bare ID double-quoted
 /// inside it, and the closing period.
+///
+/// The trace clause a DNS Firewall refusal closes with is not part of it: it
+/// carries the trace of the request, so what is compared against this is the
+/// sentence before that clause ([`not_found_message`]).
 fn expected_message(resource_id: &str) -> String {
     format!("[{RSLVR_CODE_RESOURCE_NOT_FOUND}] Can’t find the resource with ID \"{resource_id}\".")
 }
@@ -194,7 +200,7 @@ async fn the_not_found_sentence_names_the_bare_id_however_the_resource_was_addre
                 }),
             ),
         ] {
-            let message = not_found_message(&router, case, operation, body).await;
+            let message = stated_not_found_message(&router, case, operation, body).await;
             assert_eq!(
                 message, expected,
                 "case {case:?}: {operation} addressed by {arn:?} must name the bare id, got \
@@ -220,7 +226,7 @@ async fn the_not_found_sentence_names_the_bare_id_however_the_resource_was_addre
                 json!({ "FirewallRuleGroupId": id.clone() }),
             ),
         ] {
-            let message = not_found_message(&router, case, operation, body).await;
+            let message = stated_not_found_message(&router, case, operation, body).await;
             assert_eq!(
                 message, expected,
                 "case {case:?}: {operation} addressed by {id:?} must answer the same sentence, \
@@ -284,7 +290,7 @@ async fn the_sentence_names_the_bare_id_for_every_resource_type() {
     // clause of the request (see [`super::firewall_association_error_bodies`]),
     // so what is compared for it is the sentence before that clause: the
     // identifier it names is the same bare id either way.
-    let message = not_found_message(
+    let message = stated_not_found_message(
         &router,
         "FirewallDomainListId",
         "GetFirewallDomainList",
@@ -358,7 +364,7 @@ async fn an_arn_rewritten_to_an_unknown_id_names_that_id_and_leaves_the_live_gro
             .map(|(prefix, _)| prefix)
             .unwrap_or(&live_arn);
         let rewritten = format!("{prefix}/{unknown_id}");
-        let message = not_found_message(
+        let message = stated_not_found_message(
             &router,
             case,
             "GetFirewallRuleGroupPolicy",
@@ -431,4 +437,23 @@ async fn not_found_message(
          {refusal}"
     );
     string_member(&refusal, "Message")
+}
+
+/// The same call for a DNS Firewall resource, whose refusal closes with the
+/// trace clause of the request: the sentence BEFORE that clause, which is what
+/// this suite compares. A message closing with no such clause fails here.
+async fn stated_not_found_message(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: Value,
+) -> String {
+    let message = not_found_message(router, case, operation, body).await;
+    let (stated, _) = traced_message(&message).unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: {operation} must close its refusal with the trace clause of the \
+             request, got {message:?}"
+        )
+    });
+    stated.to_string()
 }

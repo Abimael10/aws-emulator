@@ -173,8 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); this
-        // operation reports no ARN, so it takes nothing from `ctx`.
-        let _ = ctx;
+        // operation reports no ARN, and what it takes from `ctx` is the trace its
+        // refusal is reported under.
+        let trace_root = crate::state::request_trace_root(&ctx.parts().headers);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ListFirewallDomainsErrorModeled::InternalServiceErrorException(
@@ -214,6 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(ListFirewallDomainsErrorModeled::ResourceNotFoundException(
                         crate::state::firewall_domain_list_not_found(
                             &input.firewall_domain_list_id,
+                            &trace_root,
                         ),
                     )
                     .into());
