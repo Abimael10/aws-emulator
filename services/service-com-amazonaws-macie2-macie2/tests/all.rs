@@ -23,6 +23,8 @@ mod classification_export_configuration;
 mod custom_data_identifier_patterns;
 #[path = "all/custom_data_identifier_response_shape.rs"]
 mod custom_data_identifier_response_shape;
+#[path = "all/findings_filters.rs"]
+mod findings_filters;
 #[path = "all/findings_publication_configuration.rs"]
 mod findings_publication_configuration;
 #[path = "all/macie_session_and_custom_data_identifiers.rs"]

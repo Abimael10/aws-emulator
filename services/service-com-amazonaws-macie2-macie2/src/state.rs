@@ -24,6 +24,10 @@
 //! this administrator account, which `GetMember` projects and `ListMembers`
 //! enumerates.
 //!
+//! So does the findings-filter plane: the filters `CreateFindingsFilter`
+//! defines, which `GetFindingsFilter` projects, `UpdateFindingsFilter` edits and
+//! `DeleteFindingsFilter` deletes.
+//!
 //! Two planes of this state have a file of their own. The findings plane lives
 //! in [`findings`], because it carries a query of its own — the conditions a
 //! `findingCriteria` names and the order a `sortCriteria` asks for — beside the
@@ -41,7 +45,10 @@ use std::time::SystemTime;
 
 pub use findings::*;
 
-use crate::ops::types::{ClassificationExportConfiguration, S3Destination, SeverityLevel};
+use crate::ops::types::{
+    ClassificationExportConfiguration, CriterionAdditionalProperties, FindingCriteria,
+    S3Destination, SeverityLevel,
+};
 
 /// The ONE criterion an allow list specifies, and how a request specifying the
 /// wrong number of them is refused.
@@ -74,6 +81,11 @@ pub const CUSTOM_DATA_IDENTIFIER_RESOURCE_TYPE: &str = "custom-data-identifier";
 /// account id it carries (`GetMember$id` is an account id), so that is the
 /// resource portion after this segment.
 pub const MEMBER_RESOURCE_TYPE: &str = "member";
+
+/// The resource-type segment of a findings filter's ARN, read from the same
+/// Macie ARN grammar as [`CUSTOM_DATA_IDENTIFIER_RESOURCE_TYPE`] with this
+/// resource's own type in place of `allow-list`.
+pub const FINDINGS_FILTER_RESOURCE_TYPE: &str = "findings-filter";
 
 /// Width of a Macie resource id whose alphabet the model pins to lowercase
 /// alphanumerics: `CreateAllowListResponse$id` is `^[a-z0-9]{22}$` and
@@ -211,6 +223,38 @@ pub const DEFAULT_SEVERITY_OCCURRENCES_THRESHOLD: i64 = 1;
 /// [`SEVERITIES_ASCENDING`].
 pub const DEFAULT_SEVERITY: &str = "MEDIUM";
 
+/// The fewest characters a findings filter's `name` may contain: its member
+/// doc states "The name must contain at least 3 characters and can contain as
+/// many as 64 characters."
+pub const MIN_FILTER_NAME_CHARS: usize = 3;
+
+/// The widest `name` a findings filter may carry. Same doc sentence as
+/// [`MIN_FILTER_NAME_CHARS`].
+pub const MAX_FILTER_NAME_CHARS: usize = 64;
+
+/// The most tags one resource may carry: the `tags` member doc states "A
+/// findings filter can have a maximum of 50 tags."
+pub const MAX_TAGS: usize = 50;
+
+/// The widest tag key, in characters: the same doc continues "The maximum
+/// length of a tag key is 128 characters."
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+
+/// The widest tag value, in characters: "The maximum length of a tag value is
+/// 256 characters."
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// The most conditions one findings filter's `findingCriteria` may carry. The
+/// EMULATOR's own bound on how much one accepted request stores, not an AWS
+/// quota: a condition tests one finding property, of which the service has a
+/// fixed and far smaller catalog, so no real filter comes near it.
+pub const MAX_FILTER_CONDITIONS: usize = 100;
+
+/// The most values one of those conditions may list across `eq`,
+/// `eqExactMatch` and `neq` together. The EMULATOR's own bound, on the same
+/// footing as [`MAX_FILTER_CONDITIONS`].
+pub const MAX_FILTER_CONDITION_VALUES: usize = 100;
+
 /// The page size `ListCustomDataIdentifiers` uses when a request names no
 /// `maxResults`. The member is a bare `__integer` with neither a modelled range
 /// nor a documented default, so this is the EMULATOR's choice.
@@ -239,6 +283,12 @@ pub const FOREIGN_PAGE_TOKEN_MESSAGE: &str =
 /// caller could grow one process's heap without limit. A create past it answers
 /// the `ServiceQuotaExceededException` the operation models.
 pub const MAX_CUSTOM_DATA_IDENTIFIERS: usize = 10_000;
+
+/// The most findings filters one emulator process stores, across every region.
+/// The EMULATOR's own memory bound, on the same footing as
+/// [`MAX_CUSTOM_DATA_IDENTIFIERS`]: a create past it answers the
+/// `ServiceQuotaExceededException` the operation models.
+pub const MAX_FINDINGS_FILTERS: usize = 10_000;
 
 /// The most member accounts one emulator process associates, across every
 /// region. The EMULATOR's own memory bound, on the same footing as
@@ -484,6 +534,68 @@ impl CustomDataIdentifier {
     }
 }
 
+/// A stored findings filter — the criteria and other settings
+/// `CreateFindingsFilter` defines and `GetFindingsFilter` projects.
+///
+/// Every member of `GetFindingsFilterResponse` is a field here or projected
+/// from one.
+#[derive(Debug, Clone)]
+pub struct FindingsFilter {
+    pub id: String,
+    pub arn: String,
+    /// The region the create that minted this filter addressed. Macie is a
+    /// regional service, so a filter is only visible to a request naming the
+    /// region it was created in — which is also the region in its ARN.
+    pub region: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// `FindingsFilterAction` as the wire words it: an entry of
+    /// [`crate::ops::types::FINDINGS_FILTER_ACTION_VALUES`].
+    pub action: String,
+    /// The conditions the filter applies, keyed by the finding property each
+    /// one tests, in a `BTreeMap` so a read reports them in a stable order.
+    pub criterion: BTreeMap<String, CriterionAdditionalProperties>,
+    /// The position the create named, which is `None` until something names
+    /// one: the member is optional and carries no documented default, so a
+    /// filter whose create named no position has none to report.
+    pub position: Option<i32>,
+    /// Tags in a `BTreeMap` so a read reports them in a stable order.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl FindingsFilter {
+    /// This filter's `findingCriteria`, as a read reports them: PRESENT, and
+    /// carrying an empty map of conditions when the filter applies none.
+    ///
+    /// The criteria are what the filter IS, so a read always reports them —
+    /// "applies no condition" is an empty `criterion` map rather than an absent
+    /// member.
+    pub fn finding_criteria_output(&self) -> Option<FindingCriteria> {
+        Some(FindingCriteria {
+            criterion: Some(
+                self.criterion
+                    .iter()
+                    .map(|(property, condition)| (property.clone(), condition.clone()))
+                    .collect(),
+            ),
+        })
+    }
+
+    /// This filter's `tags`, as a read reports them: the modelled `TagMap` is a
+    /// hash map, and absent rather than empty when it carries none.
+    pub fn tags_output(&self) -> Option<std::collections::HashMap<String, String>> {
+        if self.tags.is_empty() {
+            return None;
+        }
+        Some(
+            self.tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    }
+}
+
 /// An account associated with this Macie administrator account, in one region.
 ///
 /// Every member of `GetMemberResponse` and of the modelled `Member` structure is
@@ -570,6 +682,9 @@ pub struct ComAmazonawsMacie2Macie2State {
     /// Custom data identifiers keyed by id, so an id-addressed read is
     /// O(log n) and an enumeration is in a stable total order.
     pub custom_data_identifiers: BTreeMap<String, CustomDataIdentifier>,
+    /// Findings filters keyed by id, so an id-addressed read is O(log n) and an
+    /// enumeration is in a stable total order.
+    pub findings_filters: BTreeMap<String, FindingsFilter>,
     /// The findings Macie holds, keyed by finding id, so an id-addressed read
     /// is O(log n) and an enumeration is in a stable total order. Each record
     /// names the region it belongs to, the way a custom data identifier does.
@@ -687,6 +802,45 @@ impl ComAmazonawsMacie2Macie2State {
             .filter(move |identifier| identifier.region == region && !identifier.deleted)
     }
 
+    /// The findings filter `id` of `region`. `None` when no filter of that
+    /// region carries the id, which is what an id from another region answers
+    /// too, and what an id a `DeleteFindingsFilter` has already removed
+    /// answers.
+    pub fn findings_filter(&self, region: &str, id: &str) -> Option<&FindingsFilter> {
+        self.findings_filters
+            .get(id)
+            .filter(|filter| filter.region == region)
+    }
+
+    /// The same record, for a write.
+    pub fn findings_filter_mut(&mut self, region: &str, id: &str) -> Option<&mut FindingsFilter> {
+        self.findings_filters
+            .get_mut(id)
+            .filter(|filter| filter.region == region)
+    }
+
+    /// Drop the findings filter `id` of `region`, handing back the record that
+    /// went, or `None` when that region holds no filter under the id.
+    ///
+    /// `DeleteFindingsFilter` "Deletes a findings filter" outright — unlike a
+    /// custom data identifier, nothing of it is reported afterwards — so the
+    /// record goes rather than carrying a retired flag.
+    ///
+    /// The client tokens that minted it go with it. A token replays the filter
+    /// it minted, so once that filter is gone the token replays nothing — and
+    /// dropping the entry here is what keeps the registry's own cap
+    /// ([`MAX_FINDINGS_FILTERS`]) the bound on how far a create-then-delete
+    /// caller can grow [`Self::idempotency`]. The purge is by the id the token
+    /// minted rather than by the key it is filed under, which is sound because
+    /// [`Self::next_id_seed`] hands out each id once across this whole store:
+    /// no other record of it can carry this filter's id.
+    pub fn remove_findings_filter(&mut self, region: &str, id: &str) -> Option<FindingsFilter> {
+        self.findings_filter(region, id)?;
+        let removed = self.findings_filters.remove(id);
+        self.idempotency.retain(|_, minted| minted != id);
+        removed
+    }
+
     /// Retire everything Macie holds for `region`: `DisableMacie` "Disables
     /// Amazon Macie and deletes all settings and resources for a Macie
     /// account", so the session, the region's automated-discovery
@@ -699,6 +853,8 @@ impl ComAmazonawsMacie2Macie2State {
         self.classification_export.remove(region);
         self.custom_data_identifiers
             .retain(|_, identifier| identifier.region != region);
+        self.findings_filters
+            .retain(|_, filter| filter.region != region);
         self.findings.retain(|_, finding| finding.region != region);
         self.allow_lists
             .retain(|_, allow_list| allow_list.region != region);
@@ -848,6 +1004,110 @@ pub fn custom_data_identifier_not_found_message(id: &str) -> String {
     format!("Custom Data Identifier not found for id: {id}")
 }
 
+/// Mint the ARN of a findings filter:
+/// `arn:aws:macie2:<region>:<account>:findings-filter/<id>`.
+pub fn findings_filter_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{FINDINGS_FILTER_RESOURCE_TYPE}/{id}"),
+    )
+}
+
+/// How the service refuses a call addressing a findings filter the addressed
+/// region holds none of. The WHOLE sentence is fixed text: unlike
+/// [`custom_data_identifier_not_found_message`], this refusal names no id and
+/// interpolates no request value.
+pub const FINDINGS_FILTER_NOT_FOUND_MESSAGE: &str =
+    "Resource not found. Verify any provided IDs are correct.";
+
+/// The first bound these findings-filter settings break, worded for the caller,
+/// or `None` when they break none.
+///
+/// `CreateFindingsFilter` and `UpdateFindingsFilter` write the SAME settings
+/// under the same bounds, so both refuse through this one check; each passes
+/// `None` for a member its request does not carry. None of the bounds is
+/// expressible as a modelled constraint, so the boundary validator passes them
+/// all and this is where they are refused. Each constant above cites either the
+/// documentation sentence it comes from or the emulator bound it is.
+pub fn findings_filter_settings_violation(
+    name: Option<&str>,
+    description: Option<&str>,
+    tags: Option<&std::collections::HashMap<String, String>>,
+    criterion: Option<&std::collections::HashMap<String, CriterionAdditionalProperties>>,
+) -> Option<String> {
+    if let Some(name) = name {
+        if !(MIN_FILTER_NAME_CHARS..=MAX_FILTER_NAME_CHARS).contains(&name.chars().count()) {
+            return Some(format!(
+                "The name must contain at least {MIN_FILTER_NAME_CHARS} characters and can \
+                 contain as many as {MAX_FILTER_NAME_CHARS} characters."
+            ));
+        }
+    }
+
+    if let Some(description) = description {
+        if description.chars().count() > MAX_DESCRIPTION_CHARS {
+            return Some(format!(
+                "The description can contain as many as {MAX_DESCRIPTION_CHARS} characters."
+            ));
+        }
+    }
+
+    if let Some(tags) = tags {
+        if tags.len() > MAX_TAGS {
+            return Some(format!(
+                "A findings filter can have a maximum of {MAX_TAGS} tags."
+            ));
+        }
+        if tags
+            .keys()
+            .any(|key| key.chars().count() > MAX_TAG_KEY_CHARS)
+        {
+            return Some(format!(
+                "The maximum length of a tag key is {MAX_TAG_KEY_CHARS} characters."
+            ));
+        }
+        if tags
+            .values()
+            .any(|value| value.chars().count() > MAX_TAG_VALUE_CHARS)
+        {
+            return Some(format!(
+                "The maximum length of a tag value is {MAX_TAG_VALUE_CHARS} characters."
+            ));
+        }
+    }
+
+    let criterion = criterion?;
+    if criterion.len() > MAX_FILTER_CONDITIONS {
+        return Some(format!(
+            "This emulator stores as many as {MAX_FILTER_CONDITIONS} conditions in the \
+             findingCriteria of a findings filter."
+        ));
+    }
+    if criterion.values().any(|condition| {
+        condition_values(condition) > MAX_FILTER_CONDITION_VALUES
+    }) {
+        return Some(format!(
+            "This emulator stores as many as {MAX_FILTER_CONDITION_VALUES} values in one \
+             condition of the findingCriteria of a findings filter."
+        ));
+    }
+    None
+}
+
+/// How many values one condition lists across the members that take a list.
+fn condition_values(condition: &CriterionAdditionalProperties) -> usize {
+    [
+        condition.eq.as_ref(),
+        condition.eq_exact_match.as_ref(),
+        condition.neq.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(Vec::len)
+    .sum()
+}
+
 /// The partition every ARN this emulator mints carries, which is what
 /// `Finding$partition` reports: "the Amazon Web Services partition that Amazon
 /// Macie created the finding in". Read off an emulated ARN rather than written
@@ -911,10 +1171,7 @@ const UUID_HIGH_BITS_SHIFT: u32 = 8 - (64 - UUID_LOW_HALF_BITS);
 
 /// The id of a custom data identifier for `seed`: a canonical UUID — 36
 /// characters, lowercase hex in 8-4-4-4-12 groups — which is the form Macie
-/// issues one of these ids in. The text comes from
-/// [`::service_common::uuid_from_random_bytes`], this tree's one rendering of 16
-/// service-produced bytes as a UUID, so neither the grouping nor the version
-/// and variant bits are spelled out here.
+/// issues one of these ids in ([`new_uuid_resource_id`] renders it).
 ///
 /// INJECTIVE in `seed`, the property [`new_resource_id`] rests on too: all 64
 /// bits of [`mix64`] of the seed land in positions that rendering leaves free
@@ -923,6 +1180,21 @@ const UUID_HIGH_BITS_SHIFT: u32 = 8 - (64 - UUID_LOW_HALF_BITS);
 /// same id however the clock behaves. The rest of the bytes carry the instant it
 /// was minted at, so the ids of one store do not read as a counter.
 pub fn new_custom_data_identifier_id(seed: u64, now: SystemTime) -> String {
+    new_uuid_resource_id(seed, now)
+}
+
+/// The id of a findings filter for `seed`, in the same canonical-UUID form
+/// ([`new_uuid_resource_id`]) Macie issues one of these ids in, and injective
+/// in `seed` for the same reason.
+pub fn new_findings_filter_id(seed: u64, now: SystemTime) -> String {
+    new_uuid_resource_id(seed, now)
+}
+
+/// A canonical UUID for `seed` — 36 characters, lowercase hex in 8-4-4-4-12
+/// groups. The text comes from [`::service_common::uuid_from_random_bytes`],
+/// this tree's one rendering of 16 service-produced bytes as a UUID, so neither
+/// the grouping nor the version and variant bits are spelled out here.
+fn new_uuid_resource_id(seed: u64, now: SystemTime) -> String {
     let unique = mix64(seed);
     let instant = mix64(minted_at_bits(now) ^ unique).to_be_bytes();
 

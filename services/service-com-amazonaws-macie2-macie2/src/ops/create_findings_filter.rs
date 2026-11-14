@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFindingsFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFindingsFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFindingsFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a findings filter in `crate::state`, with every member of
+//! the request stored, and reports the id and the ARN it assigned.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +171,277 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFindingsFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFindingsFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFindingsFilter"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFindingsFilterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the findings filter store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // A findings filter belongs to one region: the region the create
+        // addressed, which is also the region in its ARN.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // Every documented bound is checked BEFORE the store is touched, so a
+        // refused request leaves nothing behind.
+        if let Some(message) = documented_violation(&input) {
+            return Err(CreateFindingsFilterErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut state = store.lock();
+
+        // Macie has to be enabled in the region before any of its resources can
+        // be read or written, as every other operation of this service requires.
+        if state.session(&region).is_none() {
+            return Err(CreateFindingsFilterErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A retry carrying the same `clientToken` replays the filter that token
+        // minted instead of minting a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            let replay_key = crate::state::idempotency_key(&region, Self::NAME, token);
+            if let Some(minted) = state.idempotency.get(&replay_key).cloned() {
+                if let Some(filter) = state.findings_filter(&region, &minted) {
+                    return Ok(CreateFindingsFilterOutput {
+                        arn: Some(filter.arn.clone()),
+                        id: Some(filter.id.clone()),
+                    });
+                }
+                // The filter that token minted is gone, so the token replays
+                // nothing.
+                state.idempotency.remove(&replay_key);
+            }
+        }
+
+        // The EMULATOR's own bound on the filter registry, reported through the
+        // quota error this operation models: without it a caller could grow one
+        // process's heap without limit.
+        if state.findings_filters.len() >= crate::state::MAX_FINDINGS_FILTERS {
+            return Err(
+                CreateFindingsFilterErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "This emulator holds the maximum of {} findings filters. \
+                             Delete a findings filter before creating another.",
+                            crate::state::MAX_FINDINGS_FILTERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = crate::state::new_findings_filter_id(state.next_id_seed(), now);
+        let filter = crate::state::FindingsFilter {
+            arn: crate::state::findings_filter_arn(&region, &id),
+            id: id.clone(),
+            region: region.clone(),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            action: input.action.clone(),
+            criterion: input
+                .finding_criteria
+                .criterion
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<_, _>>(),
+            position: input.position,
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<_, _>>(),
+        };
+        let arn = filter.arn.clone();
+
+        if let Some(token) = input.client_token.as_deref() {
+            let replay_key = crate::state::idempotency_key(&region, Self::NAME, token);
+            state.idempotency.insert(replay_key, id.clone());
+        }
+        state.findings_filters.insert(id.clone(), filter);
+
+        Ok(CreateFindingsFilterOutput {
+            arn: Some(arn),
+            id: Some(id),
+        })
+    }
+}
+
+/// The first bound `input` breaks, worded for the caller, or `None` when it
+/// breaks none.
+///
+/// The bounds themselves are `crate::state`'s, because `UpdateFindingsFilter`
+/// writes the same settings under the same bounds; this names the members a
+/// CREATE carries. A create always names the filter's `name` and its criteria,
+/// and is the only one of the two that carries `tags`.
+fn documented_violation(input: &CreateFindingsFilterInput) -> Option<String> {
+    crate::state::findings_filter_settings_violation(
+        Some(&input.name),
+        input.description.as_deref(),
+        input.tags.as_ref(),
+        input.finding_criteria.criterion.as_ref(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{documented_violation, CreateFindingsFilterInput};
+
+    /// A request inside every documented bound, which each case below then
+    /// breaks in exactly one way.
+    fn valid() -> CreateFindingsFilterInput {
+        CreateFindingsFilterInput {
+            action: "ARCHIVE".to_string(),
+            name: "demo".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// One tag map of `count` entries, with the key and value widths a case
+    /// asks for.
+    fn tags(
+        count: usize,
+        key_chars: usize,
+        value_chars: usize,
+    ) -> ::std::collections::HashMap<String, String> {
+        (0..count)
+            .map(|at| {
+                let key = format!("{at}");
+                let padding = key_chars.saturating_sub(key.chars().count());
+                (
+                    format!("{key}{}", "k".repeat(padding)),
+                    "v".repeat(value_chars),
+                )
+            })
+            .collect()
+    }
+
+    /// The bound checks are a pure function of the request, so the whole class
+    /// is spanned here rather than through the engine: a request inside every
+    /// bound is accepted, and one outside any single bound is refused.
+    #[test]
+    fn every_documented_bound_is_enforced() {
+        let accepted: Vec<(&str, CreateFindingsFilterInput)> = vec![
+            ("inside every bound", valid()),
+            (
+                "name at its minimum",
+                CreateFindingsFilterInput {
+                    name: "n".repeat(crate::state::MIN_FILTER_NAME_CHARS),
+                    ..valid()
+                },
+            ),
+            (
+                "name at its maximum",
+                CreateFindingsFilterInput {
+                    name: "n".repeat(crate::state::MAX_FILTER_NAME_CHARS),
+                    ..valid()
+                },
+            ),
+            (
+                "a multi-byte name counted in characters, not bytes",
+                CreateFindingsFilterInput {
+                    name: "é".repeat(crate::state::MAX_FILTER_NAME_CHARS),
+                    ..valid()
+                },
+            ),
+            (
+                "description at its maximum",
+                CreateFindingsFilterInput {
+                    description: Some("d".repeat(crate::state::MAX_DESCRIPTION_CHARS)),
+                    ..valid()
+                },
+            ),
+            (
+                "tags at every bound at once",
+                CreateFindingsFilterInput {
+                    tags: Some(tags(
+                        crate::state::MAX_TAGS,
+                        crate::state::MAX_TAG_KEY_CHARS,
+                        crate::state::MAX_TAG_VALUE_CHARS,
+                    )),
+                    ..valid()
+                },
+            ),
+        ];
+        for (case, input) in accepted {
+            assert_eq!(
+                documented_violation(&input),
+                None,
+                "case {case:?}: expected no violation, got {:?}",
+                documented_violation(&input)
+            );
+        }
+
+        let refused: Vec<(&str, CreateFindingsFilterInput)> = vec![
+            (
+                "empty name",
+                CreateFindingsFilterInput {
+                    name: String::new(),
+                    ..valid()
+                },
+            ),
+            (
+                "name one character short",
+                CreateFindingsFilterInput {
+                    name: "n".repeat(crate::state::MIN_FILTER_NAME_CHARS - 1),
+                    ..valid()
+                },
+            ),
+            (
+                "name one past its maximum",
+                CreateFindingsFilterInput {
+                    name: "n".repeat(crate::state::MAX_FILTER_NAME_CHARS + 1),
+                    ..valid()
+                },
+            ),
+            (
+                "description one past its maximum",
+                CreateFindingsFilterInput {
+                    description: Some("d".repeat(crate::state::MAX_DESCRIPTION_CHARS + 1)),
+                    ..valid()
+                },
+            ),
+            (
+                "one tag too many",
+                CreateFindingsFilterInput {
+                    tags: Some(tags(crate::state::MAX_TAGS + 1, 3, 3)),
+                    ..valid()
+                },
+            ),
+            (
+                "a tag key one character too long",
+                CreateFindingsFilterInput {
+                    tags: Some(tags(1, crate::state::MAX_TAG_KEY_CHARS + 1, 3)),
+                    ..valid()
+                },
+            ),
+            (
+                "a tag value one character too long",
+                CreateFindingsFilterInput {
+                    tags: Some(tags(1, 3, crate::state::MAX_TAG_VALUE_CHARS + 1)),
+                    ..valid()
+                },
+            ),
+        ];
+        for (case, input) in refused {
+            assert!(
+                documented_violation(&input).is_some(),
+                "case {case:?}: expected a ValidationException message, got None"
+            );
+        }
     }
 }
