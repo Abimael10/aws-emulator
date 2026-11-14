@@ -4,19 +4,23 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+pub mod ec2_subnets;
+
 use crate::ops::types::{
     CreateReplicationConfigurationTemplateOutput, DisconnectSourceServerOutput,
-    IdentificationHints, NetworkInterface, PITPolicyRule, SourceProperties, StagingArea,
-    UpdateReplicationConfigurationTemplateOutput,
+    IdentificationHints, NetworkInterface, PITPolicyRule, ResourceNotFoundException,
+    SourceProperties, StagingArea, UpdateReplicationConfigurationTemplateOutput,
+    ValidationException,
 };
 
 /// Per-service state for com-amazonaws-drs-elasticdisasterrecoveryservice. A handler reaches it through [`service_state`].
+///
+/// The emulated account is onboarded to this service for as long as the emulator is
+/// up, so there is no initialization flag here and no operation refuses a request as
+/// an uninitialized account: `InitializeService` has nothing left to switch on (see
+/// `crate::ops::initialize_service`).
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDrsElasticdisasterrecoveryserviceState {
-    /// Whether `InitializeService` has run for the emulated account. Every other
-    /// DRS operation that models `UninitializedAccountException` refuses until it
-    /// has.
-    pub initialized: bool,
     /// Replication configuration templates, keyed by `replicationConfigurationTemplateID`.
     ///
     /// A [`BTreeMap`] rather than a `HashMap` because both `Describe*` operations
@@ -52,11 +56,14 @@ pub struct ReplicationConfigurationTemplateRecord {
     pub data_plane_routing: Option<String>,
     pub create_public_ip: Option<bool>,
     pub staging_area_tags: HashMap<String, String>,
-    /// `Option`, not a plain map, so an absent `tags` member round-trips as absent
-    /// rather than as an empty map a client never sent.
-    pub tags: Option<HashMap<String, String>>,
+    /// A template always carries a tag set, so a create that named none stores an
+    /// empty one: the service reports this member whether or not a client sent it.
+    pub tags: HashMap<String, String>,
     pub pit_policy: Vec<PITPolicyRule>,
-    pub auto_replicate_new_disks: Option<bool>,
+    /// A template always carries this setting — a create that named none stores the
+    /// service's default, [`AUTO_REPLICATE_NEW_DISKS_DEFAULT`] — so it too is always
+    /// reported.
+    pub auto_replicate_new_disks: bool,
     pub internet_protocol: Option<String>,
 }
 
@@ -103,9 +110,9 @@ impl ReplicationConfigurationTemplateRecord {
             data_plane_routing: self.data_plane_routing.clone(),
             create_public_ip: self.create_public_ip,
             staging_area_tags: Some(self.staging_area_tags.clone()),
-            tags: self.tags.clone(),
+            tags: Some(self.tags.clone()),
             pit_policy: Some(self.pit_policy.clone()),
-            auto_replicate_new_disks: self.auto_replicate_new_disks,
+            auto_replicate_new_disks: Some(self.auto_replicate_new_disks),
             internet_protocol: self.internet_protocol.clone(),
         }
     }
@@ -227,6 +234,58 @@ pub const REPLICATION_CONFIGURATION_TEMPLATE_QUOTA: usize = 1_000;
 /// The `serviceCode` a quota refusal reports: this service's ARN namespace and
 /// SigV4 signing name.
 pub const SERVICE_CODE: &str = "drs";
+
+/// The `reason` this service reports when a request's fields do not hold up.
+///
+/// The model's `ValidationExceptionReason` lists camelCase values (see
+/// `VALIDATION_EXCEPTION_REASON_VALUES` in `crate::ops::types`), but DRS answers this
+/// member in SCREAMING_SNAKE_CASE, so that is what a client branching on the reason
+/// reads off the wire.
+pub const FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
+
+/// The modelled `ValidationException` (HTTP 400) for a request this service refuses on
+/// one of its fields, carrying `message` and that reason.
+///
+/// The ONE place such a refusal is built, so every operation reports the same reason
+/// for the same class of failure.
+pub fn field_validation_failed(message: String) -> ValidationException {
+    ValidationException {
+        message: Some(message),
+        code: None,
+        reason: Some(FIELD_VALIDATION_FAILED.to_string()),
+        field_list: None,
+    }
+}
+
+/// Whether a replication configuration template replicates newly added disks when the
+/// create that minted it named no `autoReplicateNewDisks`: the service's own default
+/// for that setting, which the created template then reports and every later read
+/// reports with it.
+pub const AUTO_REPLICATE_NEW_DISKS_DEFAULT: bool = true;
+
+/// How this service names the replication-configuration-template resource when it
+/// reports one in an error: the `resourceType` of a not-found refusal, and the
+/// subject of its message.
+pub const REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_TYPE: &str =
+    "Replication Configuration Template";
+
+/// The modelled `ResourceNotFoundException` for a replication configuration template
+/// this store does not hold.
+///
+/// The ONE place that refusal is built, so every id-keyed template operation reports
+/// the same `resourceType`, the same `resourceId` (the id the request named, verbatim)
+/// and the same message: the service's name for the resource type, then the id it was
+/// asked for, then that it was not found.
+pub fn replication_configuration_template_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "{REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_TYPE} with Id: '{id}' was not found"
+        )),
+        code: None,
+        resource_id: Some(id.to_string()),
+        resource_type: Some(REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_TYPE.to_string()),
+    }
+}
 
 impl ComAmazonawsDrsElasticdisasterrecoveryserviceState {
     /// Mint a fresh id of the form `<prefix>-<17 base-62 characters>`.

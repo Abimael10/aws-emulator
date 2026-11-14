@@ -215,7 +215,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A replacement staging-area subnet is a subnet of the account, which is EC2's
+        // resource: it is resolved against EC2 before the stored template is touched,
+        // so an update cannot leave a template naming a subnet nothing holds. An
+        // update that supplies none resolves nothing.
+        if let Some(subnet_id) = input.staging_area_subnet_id.as_deref() {
+            let region = crate::state::request_region(ctx.parts());
+            if let Some(violation) =
+                crate::state::ec2_subnets::violation(ctx, &region, subnet_id).await
+            {
+                return Err(
+                    UpdateReplicationConfigurationTemplateErrorModeled::ValidationException(
+                        violation,
+                    )
+                    .into(),
+                );
+            }
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -230,34 +246,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        if !store.initialized {
-            return Err(
-                UpdateReplicationConfigurationTemplateErrorModeled::UninitializedAccountException(
-                    UninitializedAccountException {
-                        message: Some(
-                            "Elastic Disaster Recovery has not been initialized for this account; \
-                             call InitializeService first"
-                                .to_string(),
-                        ),
-                        code: None,
-                    },
-                )
-                .into(),
-            );
-        }
-
         let id = input.replication_configuration_template_id;
         let Some(record) = store.replication_configuration_templates.get_mut(&id) else {
             return Err(
                 UpdateReplicationConfigurationTemplateErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Replication configuration template {id} does not exist"
-                        )),
-                        code: None,
-                        resource_id: Some(id.clone()),
-                        resource_type: Some("ReplicationConfigurationTemplate".to_string()),
-                    },
+                    crate::state::replication_configuration_template_not_found(&id),
                 )
                 .into(),
             );
@@ -307,7 +300,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.pit_policy = value;
         }
         if let Some(value) = input.auto_replicate_new_disks {
-            record.auto_replicate_new_disks = Some(value);
+            record.auto_replicate_new_disks = value;
         }
         if let Some(value) = input.internet_protocol {
             record.internet_protocol = Some(value);

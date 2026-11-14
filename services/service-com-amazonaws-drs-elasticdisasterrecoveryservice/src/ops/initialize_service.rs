@@ -2,9 +2,11 @@
 
 //! @op InitializeService
 //!
-//! Flips this account's `initialized` flag in the service store. Every DRS
-//! operation that models `UninitializedAccountException` reads that flag, so this
-//! is the call that opens the rest of the service.
+//! Onboards the account to Elastic Disaster Recovery. The emulated account is
+//! onboarded for as long as the emulator is up — every other operation serves it
+//! without this call ever having been made — so there is nothing left for this
+//! call to switch on and it answers the documented empty 204, however many times
+//! it is made.
 //!
 //! ## Shape of an operation
 //!
@@ -132,10 +134,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `InitializeServiceRequest` models no members and `ctx` carries nothing this
         // operation needs: initialization is per-account, and the emulator serves one
-        // account.
+        // account — one that is already onboarded, so there is nothing for this call
+        // to change. Repeating it is therefore the same no-op, which is what makes it
+        // idempotent.
         let _ = (&input, ctx);
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        // The account is onboarded only in so far as its store is there to serve the
+        // rest of the service, so a 204 is reported only when this service's store is
+        // actually reachable.
+        if crate::state::service_state(&*self.engine).is_none() {
             return Err(InitializeServiceErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the service store is unavailable".to_string(),
@@ -143,12 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        };
-
-        // Idempotent: initializing an already-initialized account is a no-op that
-        // still answers 204, so a client that cannot remember whether it has called
-        // this can call it again.
-        state.lock().initialized = true;
+        }
 
         Ok(InitializeServiceOutput {})
     }

@@ -45,6 +45,21 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code this service answers a request body that does not satisfy the
+/// model's own rules with.
+///
+/// Elastic Disaster Recovery validates a request body against the schema its model
+/// publishes before the request reaches the operation, and states every failure of
+/// that check as this one code — not as the modelled `ValidationException`, which is
+/// what an OPERATION answers for a rule of its own (see
+/// `crate::ops::create_replication_configuration_template`).
+const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
+/// The whole message that refusal carries: fixed text, naming neither the member that
+/// failed nor the rule it failed, because the check is made against the body as a
+/// whole rather than member by member.
+const INVALID_REQUEST_BODY: &str = "Invalid request body";
+
 /// The `com-amazonaws-drs-elasticdisasterrecoveryservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -98,15 +113,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Every such refusal is one answer here: this service checks the request body
+        // against its model's schema up front, so an absent required member, a value
+        // off a pattern, outside a range, off an enumeration or a list of the wrong
+        // length are ONE failure of that check and are all stated the same way — the
+        // code and the message below, with the protocol's own 400. A refusal this
+        // service makes for a rule its model does not carry is a different answer and
+        // is made by the operation, as the modelled `ValidationException`.
+        //
+        // Anything else (an unauthenticated caller) keeps the framework's wording.
+        //
+        // It is stated once here rather than per operation because the check is the
+        // service's, not any one operation's: the same body-schema refusal is what a
+        // caller gets from every operation, and a recorded create whose policy list
+        // was one element short is the step between a create refused for a missing
+        // member and a create that succeeds — neither could be served correctly while
+        // this one was worded as a per-constraint report.
+        match refusal {
+            Refusal::Invalid(_) => Some(Refused {
+                code: BAD_REQUEST_EXCEPTION.to_string(),
+                message: INVALID_REQUEST_BODY.to_string(),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

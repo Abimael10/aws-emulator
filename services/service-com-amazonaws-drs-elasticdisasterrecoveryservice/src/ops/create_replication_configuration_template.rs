@@ -6,6 +6,10 @@
 //! request supplied under that id, and answers 201 with the STORED record — so a
 //! following Describe/Update reads back exactly what was created.
 //!
+//! A request that leaves out a member a replication template cannot be created
+//! without is refused with the modelled `ValidationException` naming those members,
+//! before any id is minted (see [`absent_required_members`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -178,6 +182,62 @@ impl From<CreateReplicationConfigurationTemplateErrorModeled> for CreateReplicat
     }
 }
 
+/// The fixed text of the refusal a create request gets when it leaves out members
+/// the service requires. What follows it is the list of absent member names.
+const MISSING_REQUIRED_PARAMETERS: &str = "Missing required parameters in input: ";
+
+/// The members a create must carry that the model marks optional, in alphabetical
+/// order — the order the refusal above lists them in.
+///
+/// The model marks only six input members `@required` — `stagingAreaSubnetId`,
+/// `replicationServersSecurityGroupsIDs`, `ebsEncryption`, `bandwidthThrottling`,
+/// `stagingAreaTags` and `pitPolicy`
+/// (`smithy_query(query="operation", operation="CreateReplicationConfigurationTemplate")`) —
+/// and the boundary validator has already refused a request missing one of those
+/// before this handler runs. The service requires the rest of the replication
+/// configuration as well: the members below describe settings a replication template
+/// has no default for, and the API reference lists each of them as a required request
+/// parameter. Only `autoReplicateNewDisks`, `ebsEncryptionKeyArn`, `internetProtocol`
+/// and `tags` are genuinely optional.
+///
+/// `bandwidthThrottling` is absent from the list even though it is required: it
+/// carries `@default(0)`, so an omitted member and a sent `0` deserialize to the same
+/// value and only the boundary can tell them apart.
+///
+/// Public so a test drives the rule from THIS list rather than keeping a second copy
+/// of it.
+pub const SERVICE_REQUIRED_MEMBERS: [&str; 6] = [
+    "associateDefaultSecurityGroup",
+    "createPublicIP",
+    "dataPlaneRouting",
+    "defaultLargeStagingDiskType",
+    "replicationServerInstanceType",
+    "useDedicatedReplicationServer",
+];
+
+/// The names of the members in [`SERVICE_REQUIRED_MEMBERS`] this request left out, in
+/// that list's alphabetical order.
+fn absent_required_members(
+    input: &CreateReplicationConfigurationTemplateInput,
+) -> Vec<&'static str> {
+    // One flag per name of `SERVICE_REQUIRED_MEMBERS`, in the SAME order: the two are
+    // zipped below, so a name added to that list needs its flag added here.
+    let supplied = [
+        input.associate_default_security_group.is_some(),
+        input.create_public_ip.is_some(),
+        input.data_plane_routing.is_some(),
+        input.default_large_staging_disk_type.is_some(),
+        input.replication_server_instance_type.is_some(),
+        input.use_dedicated_replication_server.is_some(),
+    ];
+    SERVICE_REQUIRED_MEMBERS
+        .iter()
+        .zip(supplied)
+        .filter(|(_, supplied)| !supplied)
+        .map(|(member, _)| *member)
+        .collect()
+}
+
 /// The `CreateReplicationConfigurationTemplate` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -214,6 +274,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Input first: a request that cannot describe a template is refused before any
+        // store is touched, so nothing is minted for it.
+        let absent = absent_required_members(&input);
+        if !absent.is_empty() {
+            return Err(
+                CreateReplicationConfigurationTemplateErrorModeled::ValidationException(
+                    crate::state::field_validation_failed(format!(
+                        "{MISSING_REQUIRED_PARAMETERS}{}",
+                        absent.join(", ")
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // The staging area is placed in a subnet of the account, which is EC2's
+        // resource: it is resolved against EC2 before anything is minted, so a
+        // template cannot be stored naming a subnet nothing holds.
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(violation) =
+            crate::state::ec2_subnets::violation(ctx, &region, &input.staging_area_subnet_id).await
+        {
+            return Err(
+                CreateReplicationConfigurationTemplateErrorModeled::ValidationException(violation)
+                    .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 CreateReplicationConfigurationTemplateErrorModeled::InternalServerException(
@@ -226,22 +314,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let mut store = state.lock();
-
-        if !store.initialized {
-            return Err(
-                CreateReplicationConfigurationTemplateErrorModeled::UninitializedAccountException(
-                    UninitializedAccountException {
-                        message: Some(
-                            "Elastic Disaster Recovery has not been initialized for this account; \
-                             call InitializeService first"
-                                .to_string(),
-                        ),
-                        code: None,
-                    },
-                )
-                .into(),
-            );
-        }
 
         // The emulator's own bound on this store: without it a caller that can reach
         // the port could loop this call until the host is out of memory. The refusal
@@ -259,7 +331,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         )),
                         code: None,
                         resource_id: None,
-                        resource_type: Some("ReplicationConfigurationTemplate".to_string()),
+                        resource_type: Some(
+                            crate::state::REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_TYPE
+                                .to_string(),
+                        ),
                         service_code: Some(crate::state::SERVICE_CODE.to_string()),
                         quota_code: None,
                     },
@@ -271,7 +346,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The id is minted first because the ARN is derived from it, and the ARN
         // carries the region the caller signed for.
         let id = store.next_id("rct");
-        let region = crate::state::request_region(ctx.parts());
         let record = crate::state::ReplicationConfigurationTemplateRecord {
             arn: crate::state::replication_configuration_template_arn(&region, &id),
             id: id.clone(),
@@ -288,9 +362,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             data_plane_routing: input.data_plane_routing,
             create_public_ip: input.create_public_ip,
             staging_area_tags: input.staging_area_tags,
-            tags: input.tags,
+            // A template carries a tag set and an auto-replicate setting whether or
+            // not the request named them, so what is stored for an absent member is
+            // the service's own value for it — and that is what the 201 reports.
+            tags: input.tags.unwrap_or_default(),
             pit_policy: input.pit_policy,
-            auto_replicate_new_disks: input.auto_replicate_new_disks,
+            auto_replicate_new_disks: input
+                .auto_replicate_new_disks
+                .unwrap_or(crate::state::AUTO_REPLICATE_NEW_DISKS_DEFAULT),
             internet_protocol: input.internet_protocol,
         };
 

@@ -11,12 +11,13 @@
 //! The rules under test, each asserted over a TABLE of inputs rather than one
 //! recorded request:
 //!
-//! 1. Every DRS operation whose model declares `UninitializedAccountException`
-//!    refuses with it (HTTP 400) until `InitializeService` has run, and serves
-//!    normally afterwards.
+//! 1. `InitializeService` answers the documented empty 204 however many times it is
+//!    called, and changes nothing a later caller sees. The rule that every other
+//!    operation serves an account that was never initialized lives in
+//!    `tests/all/account_initialization.rs`.
 //! 2. A create persists every member the request supplied and reports the stored
 //!    record, so a later read returns the same values; an update merges only the
-//!    members the request supplied; a delete makes the resource unreadable.
+//!    members the request supplied; a delete makes the resource stop being reported.
 //! 3. A `@paginated` read walks each stored item exactly once, in a stable order,
 //!    for any `maxResults`, and changes nothing a later caller sees.
 //! 4. The service bounds itself: the store holds at most its quota of templates
@@ -33,30 +34,30 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region every request in this suite signs for. The service reads it from the
 /// SigV4 credential scope, so a template's ARN must carry THIS region and not the
 /// emulator's `us-east-1` default.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One answer from the emulator: the pieces a client branches on.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The wire error code (`x-amzn-errortype` header, else the body's `__type`),
     /// reduced to the bare shape name.
-    error_code: Option<String>,
-    body: Value,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Answer {
-    fn member(&self, name: &str) -> Option<&Value> {
+    pub(crate) fn member(&self, name: &str) -> Option<&Value> {
         self.body.get(name)
     }
 }
 
 /// A router serving only DRS, over a single shared engine — the same assembly the
 /// production router performs for this service.
-fn drs() -> MultiServiceRouter {
+pub(crate) fn drs() -> MultiServiceRouter {
     drs_with_engine().0
 }
 
@@ -76,7 +77,7 @@ fn drs_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// `POST /<operation>` with `body`, routed by the SigV4 credential scope exactly as
 /// an AWS SDK client routes it.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
     let host = format!("drs.{REGION}.amazonaws.com");
     let request = http::Request::builder()
         .method("POST")
@@ -134,7 +135,7 @@ fn bare_shape_name(raw: &str) -> String {
 
 /// `^rct-[0-9a-zA-Z]{17}$`, the model's `ReplicationConfigurationTemplateID`
 /// pattern (length 21..21), checked without pulling in a regex engine.
-fn is_template_id(value: &str) -> bool {
+pub(crate) fn is_template_id(value: &str) -> bool {
     let Some(suffix) = value.strip_prefix("rct-") else {
         return false;
     };
@@ -142,7 +143,7 @@ fn is_template_id(value: &str) -> bool {
 }
 
 /// Initialize the account, asserting the documented 204 + empty body.
-async fn initialize(router: &MultiServiceRouter) {
+pub(crate) async fn initialize(router: &MultiServiceRouter) {
     let answer = call(router, "InitializeService", &json!({})).await;
     assert_eq!(
         answer.status, 204,
@@ -150,8 +151,9 @@ async fn initialize(router: &MultiServiceRouter) {
     );
 }
 
-/// A create request body: the required members, with `extra` merged over them.
-fn create_body(subnet: &str, extra: Value) -> Value {
+/// A create request body: the members the service requires, with `extra` merged over
+/// them.
+pub(crate) fn create_body(subnet: &str, extra: Value) -> Value {
     let mut body = json!({
         "stagingAreaSubnetId": subnet,
         "replicationServersSecurityGroupsIDs": ["sg-0123456789abcdef0"],
@@ -164,6 +166,14 @@ fn create_body(subnet: &str, extra: Value) -> Value {
             {"ruleID": 2, "units": "HOUR", "interval": 1, "retentionDuration": 24, "enabled": true},
             {"ruleID": 3, "units": "DAY", "interval": 1, "retentionDuration": 7, "enabled": true},
         ],
+        // Required by the service though the model marks them optional — see
+        // `missing_required_create_members_are_a_field_validation_failure`.
+        "associateDefaultSecurityGroup": true,
+        "createPublicIP": false,
+        "dataPlaneRouting": "PRIVATE_IP",
+        "defaultLargeStagingDiskType": "AUTO",
+        "replicationServerInstanceType": "t3.small",
+        "useDedicatedReplicationServer": false,
     });
     merge(&mut body, &extra);
     body
@@ -183,7 +193,7 @@ fn merge(target: &mut Value, patch: &Value) {
 }
 
 /// Create a template and return its id, failing the test on anything but a 201.
-async fn create(router: &MultiServiceRouter, body: &Value) -> String {
+pub(crate) async fn create(router: &MultiServiceRouter, body: &Value) -> String {
     let answer = call(router, "CreateReplicationConfigurationTemplate", body).await;
     assert_eq!(
         answer.status, 201,
@@ -197,7 +207,7 @@ async fn create(router: &MultiServiceRouter, body: &Value) -> String {
 }
 
 /// The `items` of a Describe answer.
-fn items(answer: &Answer) -> &Vec<Value> {
+pub(crate) fn items(answer: &Answer) -> &Vec<Value> {
     answer
         .member("items")
         .and_then(Value::as_array)
@@ -205,80 +215,10 @@ fn items(answer: &Answer) -> &Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 1 — the uninitialized-account gate
+// Rule 1 — InitializeService
 // ---------------------------------------------------------------------------
 
-/// Every operation whose model declares `UninitializedAccountException` answers it
-/// — 400, that code — on a fresh account, and stops doing so once the account is
-/// initialized. The table spans the four template operations plus the source-server
-/// read, i.e. every gated operation in this slice, with request shapes that differ
-/// (no members, full create, id-only, filtered read).
-#[tokio::test]
-async fn gated_operations_refuse_until_the_account_is_initialized() {
-    let absent_id = "rct-00000000000000000";
-    let cases: Vec<(&str, Value)> = vec![
-        (
-            "DescribeReplicationConfigurationTemplates",
-            json!({}),
-        ),
-        (
-            "CreateReplicationConfigurationTemplate",
-            create_body("subnet-0123456789abcdef0", json!({})),
-        ),
-        (
-            "UpdateReplicationConfigurationTemplate",
-            json!({"replicationConfigurationTemplateID": absent_id, "bandwidthThrottling": 10}),
-        ),
-        (
-            "DeleteReplicationConfigurationTemplate",
-            json!({"replicationConfigurationTemplateID": absent_id}),
-        ),
-        (
-            "DescribeSourceServers",
-            json!({"filters": {"sourceServerIDs": ["s-0123456789abcdef0"]}}),
-        ),
-    ];
-
-    let router = drs();
-    for (operation, body) in &cases {
-        let answer = call(&router, operation, body).await;
-        assert_eq!(
-            answer.status, 400,
-            "case {operation}: expected 400 before InitializeService, got {answer:?}"
-        );
-        assert_eq!(
-            answer.error_code.as_deref(),
-            Some("UninitializedAccountException"),
-            "case {operation}: expected UninitializedAccountException, got {answer:?}"
-        );
-    }
-
-    initialize(&router).await;
-
-    // After initialization the same requests are served: the two reads and the
-    // create succeed, and the id-keyed mutations fail on the MISSING TEMPLATE
-    // (404) rather than on the account gate.
-    for (operation, body) in &cases {
-        let answer = call(&router, operation, body).await;
-        let expected: u16 = match *operation {
-            "CreateReplicationConfigurationTemplate" => 201,
-            "UpdateReplicationConfigurationTemplate"
-            | "DeleteReplicationConfigurationTemplate" => 404,
-            _ => 200,
-        };
-        assert_eq!(
-            answer.status, expected,
-            "case {operation}: expected {expected} after InitializeService, got {answer:?}"
-        );
-        assert_ne!(
-            answer.error_code.as_deref(),
-            Some("UninitializedAccountException"),
-            "case {operation}: still gated after InitializeService: {answer:?}"
-        );
-    }
-}
-
-/// `InitializeService` is a no-op on an already-initialized account: 204 again, and
+/// `InitializeService` is a no-op on an already-onboarded account: 204 again, and
 /// the templates created in between survive it.
 #[tokio::test]
 async fn initialize_service_is_idempotent() {
@@ -434,16 +374,24 @@ async fn create_persists_every_supplied_member_and_describe_reports_it() {
         );
     }
 
-    // An optional member nobody sent must not appear at all.
+    // A template carries a tag set whether or not a create named one, so a create
+    // that sent no `tags` reports an empty map rather than an absent member.
     let minimal = call(
         &router,
         "DescribeReplicationConfigurationTemplates",
         &json!({"maxResults": 1}),
     )
     .await;
-    assert!(
-        items(&minimal)[0].get("tags").is_none(),
-        "case minimal: tags were never supplied, so they must be absent: {minimal:?}"
+    assert_eq!(
+        items(&minimal)[0].get("tags"),
+        Some(&json!({})),
+        "case minimal: no tags were supplied, so an empty set must be reported: {minimal:?}"
+    );
+    assert_eq!(
+        items(&minimal)[0].get("autoReplicateNewDisks"),
+        Some(&json!(true)),
+        "case minimal: no autoReplicateNewDisks was supplied, so the service's default \
+         must be reported: {minimal:?}"
     );
 }
 
@@ -544,8 +492,9 @@ async fn update_merges_only_the_supplied_members() {
     }
 }
 
-/// A delete removes the template: the id becomes unreadable (404) and an unfiltered
-/// read no longer lists it, while its siblings are untouched and keep their order.
+/// A delete removes the template: the id reports no template any more and an
+/// unfiltered read no longer lists it, while its siblings are untouched and keep their
+/// order.
 #[tokio::test]
 async fn delete_removes_only_that_template() {
     let router = drs();
@@ -589,11 +538,10 @@ async fn delete_removes_only_that_template() {
         &json!({"replicationConfigurationTemplateIDs": [doomed]}),
     )
     .await;
-    assert_eq!(gone.status, 404, "describe deleted: {gone:?}");
-    assert_eq!(
-        gone.error_code.as_deref(),
-        Some("ResourceNotFoundException"),
-        "describe deleted: {gone:?}"
+    assert_eq!(gone.status, 200, "describe deleted: {gone:?}");
+    assert!(
+        items(&gone).is_empty(),
+        "describe deleted: expected no template, got {gone:?}"
     );
 
     let listed = call(
@@ -628,22 +576,20 @@ async fn delete_removes_only_that_template() {
     }
 }
 
-/// An id-keyed operation on an id the store does not hold is a 404
-/// `ResourceNotFoundException`, for each of the three operations that take one.
+/// An id the store does not hold is answered according to what the operation DOES: an
+/// operation that acts on that one template refuses it (404
+/// `ResourceNotFoundException`), while the read that selects templates by id reports
+/// the ones it holds — none — with a 200.
 #[tokio::test]
 async fn unknown_template_id_is_not_found() {
     let router = drs();
     initialize(&router).await;
     // Created so the store is non-empty: "not found" must be about the id, not
     // about the store being empty.
-    create(&router, &create_body("subnet-0123456789abcdef0", json!({}))).await;
+    let present = create(&router, &create_body("subnet-0123456789abcdef0", json!({}))).await;
 
     let unknown = "rct-zzzzzzzzzzzzzzzzz";
     let cases: Vec<(&str, Value)> = vec![
-        (
-            "DescribeReplicationConfigurationTemplates",
-            json!({"replicationConfigurationTemplateIDs": [unknown]}),
-        ),
         (
             "UpdateReplicationConfigurationTemplate",
             json!({"replicationConfigurationTemplateID": unknown, "bandwidthThrottling": 1}),
@@ -664,6 +610,46 @@ async fn unknown_template_id_is_not_found() {
             answer.error_code.as_deref(),
             Some("ResourceNotFoundException"),
             "case {operation}: {answer:?}"
+        );
+    }
+
+    // The read reports what it holds of the ids it was given: nothing for an id alone,
+    // and only the stored one when the list mixes them.
+    let read_cases: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "only an unknown id",
+            json!({"replicationConfigurationTemplateIDs": [unknown]}),
+            Vec::new(),
+        ),
+        (
+            "an unknown id beside a stored one",
+            json!({"replicationConfigurationTemplateIDs": [unknown, present.as_str()]}),
+            vec![present.as_str()],
+        ),
+    ];
+    for (case, body, expected) in &read_cases {
+        let answer = call(
+            &router,
+            "DescribeReplicationConfigurationTemplates",
+            body,
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200, got {answer:?}"
+        );
+        let reported: Vec<String> = items(&answer)
+            .iter()
+            .map(|item| {
+                item["replicationConfigurationTemplateID"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            reported, *expected,
+            "case {case}: expected {expected:?}, got {reported:?}"
         );
     }
 }
@@ -1220,11 +1206,14 @@ async fn describe_source_servers_applies_every_modelled_filter() {
 // Modelled input constraints
 // ---------------------------------------------------------------------------
 
-/// A request outside a modelled constraint is refused with 400
-/// `ValidationException` — never stored, and never a 501. The rows walk each
-/// constraint the create input declares: the `stagingAreaSubnetId` pattern, the
-/// `pitPolicy` length(3,3) on both sides, the `bandwidthThrottling` range(min 0),
-/// the `ebsEncryption` enumeration, and `maxResults`' range(min 1) on the read.
+/// A request body outside a modelled constraint is refused with 400
+/// `BadRequestException` and the service's fixed "Invalid request body" — never
+/// stored, and never a 501. The body is checked against the model's schema before any
+/// handler runs, so one refusal answers them all. The rows walk each constraint the
+/// create input declares: the `stagingAreaSubnetId` pattern, the `pitPolicy`
+/// length(3,3) on both sides, the `bandwidthThrottling` range(min 0), the
+/// `ebsEncryption` enumeration, `maxResults`' range(min 1) on the read, and an absent
+/// member the model marks `@required`.
 #[tokio::test]
 async fn requests_outside_a_modelled_constraint_are_refused() {
     let router = drs();
@@ -1243,6 +1232,13 @@ async fn requests_outside_a_modelled_constraint_are_refused() {
         .as_array_mut()
         .expect("an array of rules")
         .push(json!({"ruleID": 4, "units": "DAY", "interval": 1, "retentionDuration": 7}));
+
+    // A create body with the model-`@required` `ebsEncryption` taken out of it.
+    let mut without_required = create_body("subnet-0123456789abcdef0", json!({}));
+    without_required
+        .as_object_mut()
+        .expect("an object body")
+        .remove("ebsEncryption");
 
     let cases: Vec<(&str, &str, Value)> = vec![
         (
@@ -1277,6 +1273,11 @@ async fn requests_outside_a_modelled_constraint_are_refused() {
             create_body("subnet-0123456789abcdef0", json!({"ebsEncryption": "MAYBE"})),
         ),
         (
+            "a required member absent",
+            "CreateReplicationConfigurationTemplate",
+            without_required,
+        ),
+        (
             "maxResults below range",
             "DescribeReplicationConfigurationTemplates",
             json!({"maxResults": 0}),
@@ -1296,7 +1297,12 @@ async fn requests_outside_a_modelled_constraint_are_refused() {
         );
         assert_eq!(
             answer.error_code.as_deref(),
-            Some("ValidationException"),
+            Some("BadRequestException"),
+            "case {case}: {answer:?}"
+        );
+        assert_eq!(
+            answer.member("message").and_then(Value::as_str),
+            Some("Invalid request body"),
             "case {case}: {answer:?}"
         );
     }

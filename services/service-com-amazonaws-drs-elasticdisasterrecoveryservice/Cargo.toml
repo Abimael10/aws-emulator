@@ -21,6 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): the account's subnets are EC2's resources, so a call
+# that stores a caller-named replication staging area resolves its subnet against EC2
+# (`src/state/ec2_subnets.rs`) before it stores anything. Only the generated client is
+# needed — the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
+# The tree's shared reading of a Region label, used before a caller-supplied Region
+# reaches an endpoint URL's authority.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -30,6 +39,11 @@ sha2 = { workspace = true }
 # Shipped by the scaffold; left declared so this crate's Cargo.lock entry stays
 # exactly the generated one.
 hex = { workspace = true }
+# The owner of the resource this service RESOLVES, mounted beside it in a test:
+# Amazon EC2 holds the account's subnets, so the staging-area resolution a create and
+# an update perform can only be driven end to end with EC2 on the same engine.
+# DEV-ONLY: this crate depends on no other service's crate outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

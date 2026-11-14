@@ -3819,6 +3819,7 @@ mod iam_denial_reason_attribution;
 // which is `E0753` anywhere but the head of a file — so it is an ordinary comment here.)
 // This file and every service crate's `tests/all.rs` are checked by that suite.
 // A suite left at the top level of `tests/` fails the build.
+// suite left at the top level of `tests/` fails the build.
 // (Appended again by a landing: an ordinary comment, since `//!` here is `E0753`.)
 // (And the same line once more, appended with `//!` by another landing in the same window:
 // past the first item that is `E0753`, so it stands as an ordinary comment.)
@@ -4000,6 +4001,8 @@ mod cloudformation_provisions_redshift_snapshot_copy_grants;
 // doc comment is legal only before the first item of this crate root, so a `//!` line in
 // this tail is `E0753` and compiles no suite of this target.)
 // doc comment is only legal before the first item of this crate root.)
+// this file and for every service crate's `tests/all.rs`, so check there rather than
+// leaving a note here.
 // … this file and for every service crate's `tests/all.rs`, so check there rather than
 // leaving a note here. (An ordinary comment, for the reason the lines above record.)
 // (And two more lines of it, appended the same way: the suite-declaration check covers this
@@ -4035,6 +4038,10 @@ mod cloudformation_provisions_redshift_snapshot_copy_grants;
 // (An appended fragment of the module doc: it stands as an ordinary comment because an
 // inner doc comment is only legal before the first item.) This file and every service
 // crate's `tests/all.rs` are checked by `all/all_rs_declares_each_suite_once.rs`.
+// ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and a
+// note written with `//!` anywhere but this header is `E0753` — either fails every
+// suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the
+// declarations, for this file and for every service crate's `tests/all.rs`.
 // name is `E0428` and a note written with `//!` anywhere but the header is `E0753` — either
 // fails every suite in this target. (Another copy of the header a landing appended here,
 // (Four more orphaned lines of that header fragment, appended with `//!` by another landing
@@ -4295,6 +4302,7 @@ mod lambda_in_function_cloudwatch_authorization;
 // A suite left at the top level of `tests/` fails the build. (A line comment: an inner
 // doc comment is legal only before the first item of the crate root.)
 // one stays in the HEADER: an inner doc comment past the first item is `E0753`, so the
+// suite left at the top level of `tests/` fails the build.
 // fragment that landed here ("a suite left at the top level of `tests/` fails the build")
 // stands as an ordinary comment.
 // At the head for the same reason as the two entries above it.
@@ -4425,6 +4433,12 @@ mod cloudformation_appsync_custom_domains;
 // reason the lines around them record.)
 // declarations, for this file and for every service crate's `tests/all.rs`. (Four more
 // lines of that header fragment, ordinary comments for the reason they state.)
+// ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and a
+// note written with `//!` anywhere but this header is `E0753` — either fails every
+// suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the
+// declarations, for this file and for every service crate's `tests/all.rs`.
+// this file and for every service crate's `tests/all.rs`, so check there rather than
+// leaving a note here.
 // fails every suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the
 // declarations, for this file and for every service crate's `tests/all.rs`, so check there
 // rather than leaving a note here. (Six more lines of that header fragment, as ordinary
@@ -4441,6 +4455,7 @@ mod cloudformation_appsync_custom_domains;
 // re-typed — the rule they repeated stands in the module doc at the HEAD of this file.)
 // (Seven more lines of that header landed here as `//!` too, and are gone for the same
 // reason: an inner doc comment past the first item is `E0753` and compiles nothing.)
+// leaving a note in the appended tail below, where an inner doc comment is `E0753`.
 // leaving a note in this appended tail, where an inner doc comment is `E0753`, and
 // … leaving a note in the appended tail below, where an inner doc comment is `E0753`.
 // (That suite is declared ONCE, further up this tail: two landings in the same window each

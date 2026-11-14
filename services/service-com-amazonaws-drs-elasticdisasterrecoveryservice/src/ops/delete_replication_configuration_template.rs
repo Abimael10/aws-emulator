@@ -153,22 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        if !store.initialized {
-            return Err(
-                DeleteReplicationConfigurationTemplateErrorModeled::UninitializedAccountException(
-                    UninitializedAccountException {
-                        message: Some(
-                            "Elastic Disaster Recovery has not been initialized for this account; \
-                             call InitializeService first"
-                                .to_string(),
-                        ),
-                        code: None,
-                    },
-                )
-                .into(),
-            );
-        }
-
         let id = input.replication_configuration_template_id;
         // The store is a `BTreeMap` keyed by id, so removing one template cannot
         // disturb the order the paginated Describe cuts pages on.
@@ -179,14 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 DeleteReplicationConfigurationTemplateErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Replication configuration template {id} does not exist"
-                        )),
-                        code: None,
-                        resource_id: Some(id.clone()),
-                        resource_type: Some("ReplicationConfigurationTemplate".to_string()),
-                    },
+                    crate::state::replication_configuration_template_not_found(&id),
                 )
                 .into(),
             );

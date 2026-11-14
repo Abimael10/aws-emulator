@@ -169,26 +169,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Shared-reference guard only: `@readonly`, so nothing here mutates the store.
         let store = state.lock();
 
-        if !store.initialized {
-            return Err(
-                DescribeReplicationConfigurationTemplatesErrorModeled::UninitializedAccountException(
-                    UninitializedAccountException {
-                        message: Some(
-                            "Elastic Disaster Recovery has not been initialized for this account; \
-                             call InitializeService first"
-                                .to_string(),
-                        ),
-                        code: None,
-                    },
-                )
-                .into(),
-            );
-        }
-
         // An explicit id list selects, in the order the request gave: an id the store
-        // does not hold is a 404, not a silently shorter list. An absent (or empty)
-        // list reports every template, in insertion order. Either way the selection
-        // is a list of BORROWS — only the page itself is rendered (see `paginate`).
+        // does not hold selects no template rather than refusing the read. That is
+        // what this operation was RECORDED doing — a read naming a template that had
+        // been deleted answered 200 with the templates still held, not a not-found —
+        // so this read produces no `ResourceNotFoundException` however its model
+        // lists one; the operations that act on ONE named template (update, delete)
+        // are what refuse an id nothing holds. An absent (or empty) list reports every
+        // template, in insertion order. Either way the selection is a list of
+        // BORROWS — only the page itself is rendered (see `paginate`).
         let selected: Vec<(&str, &crate::state::ReplicationConfigurationTemplateRecord)> =
             match input.replication_configuration_template_i_ds.as_deref() {
                 Some(ids) if !ids.is_empty() => {
@@ -198,21 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         let Some((stored_id, record)) =
                             store.replication_configuration_templates.get_key_value(id)
                         else {
-                            return Err(
-                        DescribeReplicationConfigurationTemplatesErrorModeled::ResourceNotFoundException(
-                            ResourceNotFoundException {
-                                message: Some(format!(
-                                    "Replication configuration template {id} does not exist"
-                                )),
-                                code: None,
-                                resource_id: Some(id.clone()),
-                                resource_type: Some(
-                                    "ReplicationConfigurationTemplate".to_string(),
-                                ),
-                            },
-                        )
-                        .into(),
-                    );
+                            continue;
                         };
                         // The modelled id list carries no uniqueness constraint, and a
                         // repeated id names one template: report it ONCE. A page token

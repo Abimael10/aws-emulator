@@ -211,22 +211,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Shared-reference guard only: `@readonly`, so nothing here mutates the store.
         let store = state.lock();
 
-        if !store.initialized {
-            return Err(
-                DescribeSourceServersErrorModeled::UninitializedAccountException(
-                    UninitializedAccountException {
-                        message: Some(
-                            "Elastic Disaster Recovery has not been initialized for this account; \
-                             call InitializeService first"
-                                .to_string(),
-                        ),
-                        code: None,
-                    },
-                )
-                .into(),
-            );
-        }
-
         // A selection of BORROWS: only the page the caller asked for is rendered to
         // the wire shape (see `paginate`), so the work under the lock is bounded.
         let selected: Vec<(&str, &crate::state::SourceServerRecord)> = store
