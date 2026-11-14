@@ -27,6 +27,12 @@ pub use service_managed::*;
 mod maintenance_jobs;
 pub use maintenance_jobs::*;
 
+/// Whether the calling principal's own identity-based IAM policies allow the
+/// action a request asks for. Named rather than glob-imported, so a handler
+/// reads `crate::state::authorization::refusal(..)` and the gate is visible at
+/// the call site.
+pub mod authorization;
+
 /// The tagging rules: which resource a `resourceArn` addresses, and which tag
 /// keys this service accepts.
 mod tagging;
@@ -272,6 +278,22 @@ pub const DEFAULT_BUCKET_ENCRYPTION: BucketEncryption = BucketEncryption {
 /// asked for nothing", not "nothing protects this bucket".
 pub fn effective_bucket_encryption(stored: Option<&BucketEncryption>) -> BucketEncryption {
     stored.cloned().unwrap_or(DEFAULT_BUCKET_ENCRYPTION)
+}
+
+/// The encryption a table is actually protected by: the configuration stored
+/// for the table itself, else the default encryption of the table bucket that
+/// holds it ([`effective_bucket_encryption`]).
+///
+/// A table is ALWAYS encrypted, so a read reports an algorithm whether or not a
+/// configuration of its own was ever set on it: a table whose record carries
+/// `None` named no encryption, which is what the bucket's default encryption
+/// configuration is for, and a bucket that carries none of its own is protected
+/// by [`DEFAULT_BUCKET_ENCRYPTION`].
+pub fn effective_table_encryption(
+    table: Option<&BucketEncryption>,
+    table_bucket: Option<&BucketEncryption>,
+) -> BucketEncryption {
+    effective_bucket_encryption(table.or(table_bucket))
 }
 
 /// The stored form of a table bucket's metrics configuration.
@@ -946,13 +968,16 @@ pub struct Namespace {
 
 /// A table, as this emulator stores it.
 ///
-/// `encryption` is `None` when the create named none, for the same reason as on
-/// [`TableBucket`]: which default applies belongs to the operation that reports
-/// it, so what is persisted is what the caller asked for. `storage_class` is
-/// different — a table is created IN a storage class, so the create settles it
-/// (the request's own, else the bucket's default at that moment) and persists
-/// the result, which is why a later change to the bucket's default moves no
-/// table that already exists. `metadata_location` is `Some` only once a metadata
+/// `encryption` and `storage_class` are settled by the CREATE and persisted: a
+/// table is created encrypted and in a storage class, with the configuration the
+/// request named, else the bucket's default at that moment, else the service
+/// default — which is why a later change to the bucket's default is the default
+/// for the tables created after it and touches no table that already exists.
+/// Either is `None` only on a record that carries none of its own, the tables an
+/// Amazon Web Services service creates on the account's behalf, which are
+/// protected and stored the way their bucket is
+/// ([`effective_table_encryption`], [`effective_table_storage_class`]).
+/// `metadata_location` is `Some` only once a metadata
 /// file exists for the
 /// table — the create writes one when the request carries table metadata, and
 /// `UpdateTableMetadataLocation` is what moves it afterwards.

@@ -61,6 +61,10 @@ mod table_bucket_replication;
 mod table_bucket_storage_class;
 #[path = "all/table_bucket_storage_class_reads.rs"]
 mod table_bucket_storage_class_reads;
+#[path = "all/table_encryption.rs"]
+mod table_encryption;
+#[path = "all/table_encryption_authorization.rs"]
+mod table_encryption_authorization;
 #[path = "all/table_maintenance_configuration.rs"]
 mod table_maintenance_configuration;
 #[path = "all/table_maintenance_put_round_trip.rs"]

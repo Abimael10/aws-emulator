@@ -802,7 +802,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The table-level overrides of what the bucket configures, stored as the
         // caller asked for them.
-        let encryption = match input.encryption_configuration {
+        let encryption_requested = match input.encryption_configuration {
             None => None,
             Some(configuration) => Some(
                 crate::state::stored_encryption(
@@ -860,6 +860,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already exists.
         let storage_class = Some(storage_class_requested.unwrap_or_else(|| {
             crate::state::effective_bucket_storage_class(bucket.storage_class)
+        }));
+        // A table is created ENCRYPTED, the same way: with the configuration
+        // this request names, else the bucket's own default — "the default
+        // encryption settings that will be applied to all tables created in this
+        // bucket unless overridden at the table level"
+        // (`smithy_query(query="doc", shape="CreateTableBucketRequest",
+        // member="encryptionConfiguration")`) — else the service default. It is
+        // settled here and persisted, so a later change to the bucket's default
+        // is the default for the tables created after it and re-encrypts no table
+        // that already exists.
+        let encryption = Some(encryption_requested.unwrap_or_else(|| {
+            crate::state::effective_bucket_encryption(bucket.encryption.as_ref())
         }));
         let namespace = bucket
             .namespaces

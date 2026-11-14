@@ -223,6 +223,29 @@ impl Emulator {
         .await
     }
 
+    /// `GetTableEncryption`: the bucket's ARN, the namespace and the table's
+    /// name are path labels.
+    pub async fn get_table_encryption(
+        &self,
+        region: &str,
+        arn: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Reply {
+        self.call(
+            "GET",
+            &format!(
+                "/tables/{}/{}/{}/encryption",
+                encode(arn),
+                encode(namespace),
+                encode(name)
+            ),
+            region,
+            None,
+        )
+        .await
+    }
+
     pub async fn put_table_bucket_metrics_configuration(&self, region: &str, arn: &str) -> Reply {
         self.call(
             "PUT",

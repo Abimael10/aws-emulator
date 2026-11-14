@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTableEncryption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTableEncryption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTableEncryption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +111,34 @@ impl From<GetTableEncryptionErrorModeled> for GetTableEncryptionError {
     }
 }
 
+/// `AccessDeniedException` (HTTP 403) — the calling principal's own
+/// identity-based IAM policies do not allow this action on the table bucket the
+/// request addresses. The sentence is IAM's own, built by the gate.
+fn access_denied(message: String) -> GetTableEncryptionError {
+    GetTableEncryptionErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `NotFoundException` (HTTP 404) — no table bucket is stored at the ARN the
+/// request addresses.
+fn no_such_bucket() -> GetTableEncryptionError {
+    GetTableEncryptionErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// `NotFoundException` (HTTP 404) — no table is stored at what the request
+/// addresses.
+fn no_such_table() -> GetTableEncryptionError {
+    GetTableEncryptionErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::TABLE_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
 /// The `GetTableEncryption` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +175,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTableEncryption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableEncryptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTableEncryption"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTableEncryptionErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // Reading a table's encryption takes the `s3tables:GetTableEncryption`
+        // permission, and the IAM resource that permission is granted on is the
+        // TABLE — addressed by its own ARN, under the bucket's, by the id it was
+        // minted with — so the ARN of the table this request names is resolved
+        // first and the decision is taken on it. A request naming a table this
+        // account does not hold has no table ARN to be judged on, so it falls to
+        // the bucket the request addressed, which is the only resource it names.
+        // No guard is held while the decision is taken.
+        let resource = {
+            let store = state.lock();
+            store
+                .table_buckets
+                .get(&input.table_bucket_arn)
+                .and_then(|bucket| bucket.namespaces.get(&input.namespace))
+                .and_then(|namespace| namespace.tables.get(&input.name))
+                .map_or_else(|| input.table_bucket_arn.clone(), |table| table.table_arn.clone())
+        };
+        // Decided BEFORE anything is answered: a caller holding no grant learns
+        // nothing about the table's encryption. See `crate::state::authorization`.
+        if let Some(message) =
+            crate::state::authorization::refusal(&*self.engine, ctx, Self::NAME, &resource)
+        {
+            return Err(access_denied(message));
+        }
+
+        // A pure read: what it answers with is reconstructed from the table's
+        // own record and that of the bucket holding it, and nothing in the
+        // store is touched.
+        let store = state.lock();
+        let bucket = store
+            .table_buckets
+            .get(&input.table_bucket_arn)
+            .ok_or_else(no_such_bucket)?;
+        let table = bucket
+            .namespaces
+            .get(&input.namespace)
+            .and_then(|namespace| namespace.tables.get(&input.name))
+            .ok_or_else(no_such_table)?;
+
+        // `encryptionConfiguration` is a REQUIRED output member, and every
+        // table is encrypted: by the configuration its create named, else by
+        // the default of the bucket that holds it.
+        let encryption = crate::state::effective_table_encryption(
+            table.encryption.as_ref(),
+            bucket.encryption.as_ref(),
+        );
+
+        Ok(GetTableEncryptionOutput {
+            encryption_configuration: EncryptionConfiguration {
+                sse_algorithm: encryption.sse_algorithm.as_wire().to_string(),
+                // Carried only by an algorithm that takes a key, which is the
+                // invariant the stored form already holds to.
+                kms_key_arn: encryption.kms_key_arn,
+            },
+        })
     }
 }

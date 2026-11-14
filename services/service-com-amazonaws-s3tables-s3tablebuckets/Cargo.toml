@@ -30,7 +30,14 @@ hex = { workspace = true }
 uuid = "1"
 # `date_time_json`: the workspace's ONE rendering of a `restJson1` timestamp whose model
 # declares the `date-time` form, which every timestamp member of this model does.
+# `iam_authorization`: the shared evaluation of a principal's policy documents against an
+# action on a resource, so every service that enforces authorization decides alike.
 service-common = { path = "../common" }
+# The STS store, for the identity an access key id speaks for: the principal
+# `sts:GetCallerIdentity` answers for the credentials a request signed with.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, for the identity-based policy documents in force on that principal.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [dev-dependencies]
 # The bounded, seeded generator behind the generated maintenance-configuration
