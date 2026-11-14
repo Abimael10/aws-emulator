@@ -43,6 +43,8 @@ mod stack_access_endpoints;
 mod stack_fleet_lifecycle;
 #[path = "all/stack_registry.rs"]
 mod stack_registry;
+#[path = "all/stack_server_side_defaults.rs"]
+mod stack_server_side_defaults;
 #[path = "all/stack_theme.rs"]
 mod stack_theme;
 #[path = "all/state_roundtrip.rs"]

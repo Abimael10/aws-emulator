@@ -98,14 +98,21 @@
 //! `CreateStack` and `UpdateStack` — asks before it stores one. What a write can settle
 //! from the request alone — an entry that names no endpoint at all, a list naming one
 //! endpoint type twice — is read before that hop is made ([`access_endpoints`]).
+//!
+//! What a stack's record holds for a configuration member its create did NOT name is the
+//! value the service configures itself, stated once in its own module
+//! ([`stack_defaults`]) and written into the record by the create, so the create response
+//! and every later read project one stored configuration.
 
 mod access_endpoints;
 mod images;
+mod stack_defaults;
 mod vpc_access_endpoints;
 mod wire_refusals;
 
 pub use access_endpoints::*;
 pub use images::*;
+pub use stack_defaults::*;
 pub use vpc_access_endpoints::*;
 pub use wire_refusals::*;
 
@@ -724,6 +731,10 @@ pub struct StackRecord {
     pub storage_connectors: Vec<StorageConnector>,
     pub redirect_url: Option<String>,
     pub feedback_url: Option<String>,
+    /// What a streaming session of this stack permits its user to do, what it keeps
+    /// between sessions and the protocol it prefers: the EFFECTIVE configuration, so a
+    /// create that named none of them stores what the service configures itself
+    /// ([`stack_defaults`]) rather than nothing.
     pub user_settings: Vec<UserSetting>,
     pub application_settings: Option<ApplicationSettingsResponse>,
     pub access_endpoints: Vec<AccessEndpoint>,

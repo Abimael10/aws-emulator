@@ -3,11 +3,15 @@
 //! @op CreateStack
 //! IMPLEMENTED: persists a [`crate::state::StackRecord`] in this service's store and
 //! returns the modelled `Stack` rendered FROM that record, so a later `DescribeStacks`
-//! answers with the same ARN, `CreatedTime` and configuration. A second create of the
-//! same `Name` answers `ResourceAlreadyExistsException` (HTTP 400). An `AccessEndpoints`
-//! list whose entry carries no `VpceId`, or which names one `EndpointType` twice, is
-//! refused on the request's own shape ([`crate::state::access_endpoints`]) and stores
-//! nothing.
+//! answers with the same ARN, `CreatedTime` and configuration. The configuration the
+//! request leaves unset is stored as the value the created stack has anyway — which user
+//! actions a streaming session permits, whether application settings persist, the
+//! streaming protocol the stack prefers ([`crate::state::stack_defaults`]) — so a reader
+//! that did not perform the create still sees the effective configuration. A second create
+//! of the same `Name` answers `ResourceAlreadyExistsException` (HTTP 400). An
+//! `AccessEndpoints` list whose entry carries no `VpceId`, or which names one
+//! `EndpointType` twice, is refused on the request's own shape
+//! ([`crate::state::access_endpoints`]) and stores nothing.
 //!
 //! `AccessEndpoints` is the one member that REFERENCES a resource of another service — an
 //! interface VPC endpoint of the account — so each entry's `VpceId` is resolved against
@@ -289,19 +293,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             storage_connectors: input.storage_connectors.unwrap_or_default(),
             redirect_url: input.redirect_url,
             feedback_url: input.feedback_url,
-            user_settings: input.user_settings.unwrap_or_default(),
+            // The three configuration members the service settles itself: what the
+            // request names is stored, and what it leaves unset is stored as the value the
+            // created stack has anyway ([`crate::state::stack_defaults`]), so the response
+            // below and every later read project one effective configuration.
+            user_settings: input
+                .user_settings
+                .unwrap_or_else(crate::state::default_user_settings),
             // The request carries `ApplicationSettings`; the resource reports the
             // `ApplicationSettingsResponse` form of that same configuration.
-            application_settings: input.application_settings.map(|settings| {
-                ApplicationSettingsResponse {
+            application_settings: Some(input.application_settings.map_or_else(
+                crate::state::default_application_settings,
+                |settings| ApplicationSettingsResponse {
                     enabled: Some(settings.enabled),
                     settings_group: settings.settings_group,
                     s3_bucket_name: None,
-                }
-            }),
+                },
+            )),
             access_endpoints: input.access_endpoints.unwrap_or_default(),
             embed_host_domains: input.embed_host_domains.unwrap_or_default(),
-            streaming_experience_settings: input.streaming_experience_settings,
+            streaming_experience_settings: Some(
+                input
+                    .streaming_experience_settings
+                    .unwrap_or_else(crate::state::default_streaming_experience_settings),
+            ),
             content_redirection: input.content_redirection,
             agent_access_config: input.agent_access_config,
             storage_connector_authentication: input.storage_connector_authentication,
