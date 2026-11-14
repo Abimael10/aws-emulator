@@ -50,6 +50,10 @@ pub mod data_automation_profile;
 /// `ListDataAutomationLibraryIngestionJobs`.
 pub mod library_ingestion;
 
+/// Whether the Amazon S3 locations an ingestion submission names are locations this
+/// account's object store holds. Used by `InvokeDataAutomationLibraryIngestionJob`.
+pub mod ingestion_locations;
+
 /// The `blueprintStage` a blueprint takes when `CreateBlueprint` names none.
 ///
 /// `CreateBlueprintRequest$blueprintStage` is OPTIONAL and targets the enum

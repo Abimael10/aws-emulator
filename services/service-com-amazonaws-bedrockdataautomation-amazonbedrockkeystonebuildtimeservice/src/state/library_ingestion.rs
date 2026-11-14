@@ -100,6 +100,15 @@ const INGESTION_JOB_RESOURCE_PREFIX: &str = "data-automation-library-ingestion-j
 pub const MISSING_INGESTION_INPUT_MESSAGE: &str =
     "inputConfiguration must specify either s3Object or inlinePayload.";
 
+/// What `InvokeDataAutomationLibraryIngestionJob` answers for a submission it refuses as
+/// carrying an invalid input parameter — an Amazon S3 location naming no bucket of this
+/// account's object store among them ([`super::ingestion_locations`]).
+///
+/// RECORDED behaviour, and entirely FIXED text: the sentence names no member, interpolates
+/// no value from the request and reads nothing from state, so it is spelled here once and
+/// never formatted.
+pub const INVALID_INGESTION_INPUT_MESSAGE: &str = "Invalid input parameter provided.";
+
 /// What `InvokeDataAutomationLibraryIngestionJob` answers once the store holds
 /// [`INGESTION_JOB_QUOTA`] jobs: this service's quota voice (the sentence form its other
 /// quota refusals take), with the quota itself read off the constant rather than spelled

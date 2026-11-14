@@ -31,6 +31,8 @@ mod data_automation_project_listing;
 mod data_automation_project_update;
 #[path = "all/identity_authorization.rs"]
 mod identity_authorization;
+#[path = "all/ingestion_submission_consistency.rs"]
+mod ingestion_submission_consistency;
 #[path = "all/library_ingestion_jobs.rs"]
 mod library_ingestion_jobs;
 #[path = "all/optimization_profile_resolution.rs"]

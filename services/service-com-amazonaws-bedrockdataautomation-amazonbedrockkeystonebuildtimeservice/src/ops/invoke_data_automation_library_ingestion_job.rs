@@ -178,22 +178,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let mut store = state.lock();
-
         // A job is a resource OF the library its `libraryArn` names — it ingests entities
         // into that library — so an ARN this store holds no library under names no library
         // to ingest into. Refused with the service's FIXED sentence for an unresolved
         // library, single-homed in `crate::state`, BEFORE anything is minted: a refused
         // submission leaves no record behind.
-        if !store.libraries.contains_key(&input.library_arn) {
-            return Err(
-                InvokeDataAutomationLibraryIngestionJobErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::LIBRARY_ARN_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                )
-                .into(),
-            );
+        //
+        // Scoped, so the store lock is released before the object store is asked about the
+        // submission's Amazon S3 locations below: no lock of this service's state is held
+        // across that in-process call.
+        {
+            let store = state.lock();
+            if !store.libraries.contains_key(&input.library_arn) {
+                return Err(
+                    InvokeDataAutomationLibraryIngestionJobErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(
+                                crate::state::LIBRARY_ARN_NOT_FOUND_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         // The modelled `InputConfiguration` makes both of its members optional, so the
@@ -221,12 +228,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Every Amazon S3 location the submission names has to be a location of this
+        // account's object store: the object store is what holds a bucket, so whether a
+        // submitted `s3://` value addresses anything at all is a question only it can
+        // answer, and the modelled `S3Uri` pattern (which is all the constraint walk ahead
+        // of this handler can check) says nothing about it. Asked BEFORE anything is
+        // minted, with no lock of this service's state held for the duration of the
+        // question, so a refused submission leaves no job behind.
+        let region = crate::state::request_region(ctx);
+        if let Some(unheld) = crate::state::ingestion_locations::location_of_no_bucket(
+            ctx.callback(),
+            &region,
+            crate::state::ingestion_locations::submitted_locations(
+                &input.input_configuration,
+                &input.output_configuration,
+            ),
+        )
+        .await
+        {
+            ::tracing::debug!(
+                location = ?unheld,
+                "an ingestion submission names an Amazon S3 location this account's object \
+                 store holds no bucket for"
+            );
+            return Err(
+                InvokeDataAutomationLibraryIngestionJobErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::library_ingestion::INVALID_INGESTION_INPUT_MESSAGE
+                                .to_string(),
+                        ),
+                        // The sentence this refusal carries names no member — it says only
+                        // that an input parameter was invalid — so it carries no field
+                        // entry either: an entry invented here would report a member the
+                        // service does not.
+                        field_list: None,
+                    },
+                )
+                .into(),
+            );
+        }
+        let mut store = state.lock();
+
         // An `@idempotencyToken` replay answers about the job the first call accepted
         // rather than accepting a second one, and answers with the ARN that is STORED.
         //
         // Consulted AFTER the request's own references are resolved, so a replay naming a
         // library this store does not hold, or carrying an input configuration that names
-        // no source, is refused exactly as a first call carrying it would be — a token
+        // no source or an Amazon S3 location of no bucket, is refused exactly as a first
+        // call carrying it would be — a token
         // cannot buy a success for a request the service would otherwise refuse. Scoped to
         // the library addressed for the same reason a read is: a job is a resource of one
         // library, so a token resolving to a job of another library is no replay of this
@@ -260,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let completes_at = submitted_at + crate::state::library_ingestion::INGESTION_JOB_SPAN;
         let sequence = store.take_arn_sequence();
         let job_arn = crate::state::library_ingestion::mint_ingestion_job_arn(
-            &crate::state::request_region(ctx),
+            &region,
             submitted_at_timestamp,
             sequence,
         );

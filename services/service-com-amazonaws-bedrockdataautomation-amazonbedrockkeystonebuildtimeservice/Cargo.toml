@@ -29,6 +29,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Amazon S3 client the buckets an ingestion submission's locations name are resolved
+# through before the job is minted (`state::ingestion_locations`): S3 is called over the
+# in-process callback into this same emulator, so no network client feature is enabled.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -36,6 +40,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The ingestion-location suite mounts the object store beside this service on one engine,
+# because a submission's Amazon S3 locations are resolved by calling S3 in process.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

@@ -3776,6 +3776,9 @@ mod iam_denial_reason_attribution;
 // which is `E0753` anywhere but the head of a file — so it is an ordinary comment here.)
 // This file and every service crate's `tests/all.rs` are checked by that suite.
 // A suite left at the top level of `tests/` fails the build.
+// suite left at the top level of `tests/` fails the build. (An ordinary comment, for the
+// reason this tail records: a `//!` line past the first item of this crate root is
+// `E0753`.)
 // it. The `sfn_relayed_dynamodb_request_id` suite is declared ONCE as well, just above: two
 // landings in the same window each appended it here, and a module declared twice is `E0428`
 // doc comment may only appear before any item, so a `//!` line in this appended tail is
@@ -3890,6 +3893,8 @@ mod cloudformation_provisions_redshift_snapshot_copy_grants;
 // doc comment is legal only before the first item of this crate root, so a `//!` line in
 // this tail is `E0753` and compiles no suite of this target.)
 // doc comment is only legal before the first item of this crate root.)
+// this file and for every service crate's `tests/all.rs`, so check there rather than
+// leaving a note here.
 // (`cloudfront_edge_4xx_share_decides_the_alarm` is declared ONCE, in the sorted CloudFront
 // span above: two branches landing at once each appended a declaration of it here, and a
 // module declared twice compiles neither copy.)
@@ -3919,6 +3924,10 @@ mod cloudformation_provisions_redshift_snapshot_copy_grants;
 // (An appended fragment of the module doc: it stands as an ordinary comment because an
 // inner doc comment is only legal before the first item.) This file and every service
 // crate's `tests/all.rs` are checked by `all/all_rs_declares_each_suite_once.rs`.
+// ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and a
+// note written with `//!` anywhere but this header is `E0753` — either fails every
+// suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the
+// declarations, for this file and for every service crate's `tests/all.rs`.
 // header that a landing appended here: past the first item a `//!` line is `E0753` and
 // compiles no suite in this target, so it stands as an ordinary comment.)
 // an ordinary comment for the reason the lines around it record.)
