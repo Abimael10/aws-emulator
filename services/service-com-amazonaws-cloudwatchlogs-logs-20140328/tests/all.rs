@@ -31,6 +31,8 @@ mod cmk_key_policy_scope;
 mod configuration_templates;
 #[path = "all/dangling_query_commands.rs"]
 mod dangling_query_commands;
+#[path = "all/data_protection_audit_findings.rs"]
+mod data_protection_audit_findings;
 #[path = "all/data_protection_masking.rs"]
 mod data_protection_masking;
 #[path = "all/data_protection_policies.rs"]
@@ -323,6 +325,8 @@ mod transformed_log_filters;
 mod transformed_subscription_delivery;
 #[path = "all/transformers.rs"]
 mod transformers;
+#[path = "all/unmask_authorization.rs"]
+mod unmask_authorization;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
 #[path = "all/vended_log_template_catalog_rows.rs"]

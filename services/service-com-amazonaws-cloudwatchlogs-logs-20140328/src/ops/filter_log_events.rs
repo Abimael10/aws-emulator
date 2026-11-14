@@ -140,6 +140,12 @@
 //! * `InvalidParameterException` (HTTP 400) — A parameter is specified incorrectly.
 //! * `ResourceNotFoundException` (HTTP 400) — The specified resource does not exist.
 //! * `ServiceUnavailableException` (HTTP 500) — The service cannot complete the request.
+//! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   code this service answers when the `logGroupName` / `logGroupIdentifier` pair names both
+//!   selectors or neither (`crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`).
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   code this service answers a read that asked to `unmask` without the `logs:Unmask`
+//!   permission the member documents (`crate::state::unmask_authorization`).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -157,7 +163,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatchlogs-logs-201
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.cloudwatchlogs#FilterLogEvents",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum FilterLogEventsErrorModeled {
@@ -168,6 +174,11 @@ pub enum FilterLogEventsErrorModeled {
     // answers it for the cross-member log-group-selector check, which this operation's own
     // `errors` list omits. See `crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`.
     ValidationException(ValidationException),
+    // Widened in the same way: the SERVICE models `AccessDeniedException` ("You don't have
+    // sufficient permissions to perform this action"), which is what this operation answers a
+    // read that asked to `unmask` without the `logs:Unmask` permission its own documentation
+    // requires. See `crate::state::unmask_authorization`.
+    AccessDeniedException(AccessDeniedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -374,12 +385,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; `unmask` selects WHICH version of a masked
-        // event's message is reported, which is applied where the page is rendered below;
-        // and `interleaved` is documented as ignored
+        // `ctx` carries the Region the credential scope names, which is where the resource the
+        // `unmask` decision below is taken against lives; `unmask` also selects WHICH version
+        // of a masked event's message is reported, which is applied where the page is
+        // rendered below; and `interleaved` is documented as ignored
         // ("this parameter is ignored and the value is assumed to be true"), which is what a
         // single pass over every selected stream in one event order already answers.
-        let _ = (ctx, input.interleaved);
+        let _ = input.interleaved;
+        let region = crate::state::request_region(ctx.parts());
+
+        // Naming both log-group selectors, or neither, is the cross-member check the
+        // service answers with `ValidationException` rather than with this operation's
+        // `InvalidParameterException` (see `crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`).
+        // Resolved before anything is looked up, because the group it names is what the
+        // authorization decision below is about.
+        let log_group_name = crate::state::resolve_log_group_target(
+            input.log_group_name.as_deref(),
+            input.log_group_identifier.as_deref(),
+        )
+        .map_err(|message| {
+            FilterLogEventsError::from(FilterLogEventsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            ))
+        })?;
+
+        // A read that asks to reveal what a data protection policy masked performs
+        // `logs:Unmask` as well as this operation's own action — "to use this operation with
+        // this parameter, you must be signed into an account with the logs:Unmask permission"
+        // — so it is decided against the caller's identity-based policies BEFORE the store is
+        // read, and a caller holding no such grant is served no event at all. This read is
+        // scoped to the whole log group rather than to one stream, so the resource is the
+        // group's own ARN (`crate::state::unmask_authorization`). A read that did not ask to
+        // unmask is not touched.
+        if let Some(message) = crate::state::unmask_authorization::refusal(
+            &*self.engine,
+            ctx,
+            input.unmask,
+            &crate::state::unmask_authorization::group_scoped_resource(&region, &log_group_name),
+        ) {
+            return Err(FilterLogEventsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             FilterLogEventsError::from(FilterLogEventsErrorModeled::ServiceUnavailableException(
@@ -397,21 +449,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         };
-
-        // Naming both log-group selectors, or neither, is the cross-member check the
-        // service answers with `ValidationException` rather than with this operation's
-        // `InvalidParameterException` (see `crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`).
-        let log_group_name = crate::state::resolve_log_group_target(
-            input.log_group_name.as_deref(),
-            input.log_group_identifier.as_deref(),
-        )
-        .map_err(|message| {
-            FilterLogEventsError::from(FilterLogEventsErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(message),
-                },
-            ))
-        })?;
 
         // "If you specify a value for both logStreamNames and logStreamNamePrefix, the
         // action returns an InvalidParameterException error."

@@ -20,6 +20,10 @@
 //! carry the events ingested while it was open and only those.
 //! Each accepted batch also publishes what the log group took IN — the count of the stored
 //! events and their uncompressed bytes — as the service's own `AWS/Logs` metric data.
+//! A stored event the log group's DATA PROTECTION POLICY finds sensitive data in is stored
+//! with that data masked ([`crate::state::data_protection`]) AND recorded as an audit finding
+//! in the log group the policy's Audit action names as its findings destination
+//! ([`crate::state::audit_findings`]) — the two halves of one policy, on one ingestion.
 //! This is the ONLY file to touch for this operation.
 //!
 //! THE INGESTION WINDOW is per event, not per batch: an event more than
@@ -344,7 +348,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // step ([`PutLogEvents::ingest`]) and the guard is gone by the time the deliveries
         // it resolved are handed over below: a lock guard must not be held across an
         // in-process call into another service.
-        let (output, deliveries) = self.ingest(&input)?;
+        let (output, deliveries) = self.ingest(&input, &region)?;
         // A stored event is also what a SUBSCRIPTION FILTER of this log group delivers:
         // "you can subscribe to a real-time stream of log events ingested through
         // PutLogEvents and have them delivered to a specific destination"
@@ -365,6 +369,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
     fn ingest(
         &self,
         input: &PutLogEventsInput,
+        region: &str,
     ) -> Result<
         (
             PutLogEventsOutput,
@@ -450,6 +455,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
             .log_groups
             .get(&input.log_group_name)
             .map(|group| store.data_protection_identifiers_for(group))
+            .unwrap_or_default();
+        // The Audit half of the same policies: the log groups their Audit action sends
+        // findings to, and the ARN of the group whose events are being audited — both read
+        // here, under the guard the identifiers were read through, so an ingestion is audited
+        // to the destinations the group was configured with when it arrived.
+        let findings_destinations = store
+            .log_groups
+            .get(&input.log_group_name)
+            .map(|group| store.audit_findings_destinations_for(group))
+            .unwrap_or_default();
+        let audited_group_arn = store
+            .log_groups
+            .get(&input.log_group_name)
+            .map(|group| group.log_group_arn.clone())
             .unwrap_or_default();
 
         // The documented batch constraints, which bound what one request may store:
@@ -554,16 +573,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
         // consumes nothing, so it leaves no trace a reader could observe.
         let mut batch: Vec<crate::state::StoredEvent> =
             Vec::with_capacity(input.log_events.len());
+        // The findings the audited events owe, one per stored event the policies found
+        // sensitive data in. Collected here because the detection that decides the masked
+        // version is the SAME detection the Audit half records, so the message is scanned
+        // once.
+        let mut findings: Vec<String> = Vec::new();
         for (event, admission) in input.log_events.iter().zip(&admissions) {
             if *admission != Admission::Accepted {
                 continue;
             }
+            let found = crate::state::data_protection::detected(&event.message, &data_identifiers);
+            if !findings_destinations.is_empty() {
+                findings.extend(crate::state::audit_findings::finding(
+                    &audited_group_arn,
+                    ingestion_time,
+                    &found,
+                ));
+            }
             let ingestion_seq = store.take_ingestion_seq();
             batch.push(crate::state::StoredEvent {
                 timestamp: event.timestamp,
-                masked_message: crate::state::data_protection::masked(
+                masked_message: crate::state::data_protection::masked_where(
                     &event.message,
-                    &data_identifiers,
+                    &found,
                 ),
                 message: event.message.clone(),
                 ingestion_time,
@@ -660,6 +692,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
             .saturating_add(added_bytes)
             .saturating_sub(discarded_bytes)
             .max(0);
+
+        // The AUDIT half of the group's data protection policies: each detection this batch
+        // made is delivered as a finding into the log group the policy's Audit action names,
+        // under the same guard the events were stored through, so the findings of an
+        // ingestion are in the store by the time the call answers. Written after the source
+        // stream is settled, so the borrow of the audited group has ended.
+        crate::state::audit_findings::deliver(
+            &mut store,
+            region,
+            &input.log_group_name,
+            &findings_destinations,
+            &findings,
+            ingestion_time,
+        );
 
         // The metric store is written with no log-store guard held, so the two services'
         // stores are never locked at once.

@@ -20,6 +20,13 @@
 //! sensitive term become asterisks and the rest of the message is the ingested text, which
 //! is what "the sensitive data is replaced by asterisks" says.
 //!
+//! DETECTION is one step and happens once per ingested message ([`detected`]): a policy's two
+//! blocks are an `Audit` action and a `Deidentify` action over the SAME `DataIdentifier` array
+//! ([`super::check_data_protection_policy_document`]), so the sensitive data found in a
+//! message is what the Deidentify half masks ([`masked_where`]) AND what the Audit half
+//! records as a finding ([`super::audit_findings`]). Neither half can therefore find anything
+//! the other does not.
+//!
 //! The policy in force for a group is the group's own TOGETHER WITH the account-level data
 //! protection policy that applies to it, because `PutAccountPolicy` states the two are
 //! cumulative ([`super::ComAmazonawsCloudwatchlogsLogs20140328State::data_protection_identifiers_for`]).
@@ -159,9 +166,14 @@ fn identifier_name(entry: &str) -> &str {
         .unwrap_or(entry)
 }
 
-/// What a match of one selected identifier is judged by: the expression it matched, and
-/// whatever else the identifier requires of a match ([`DetectedIdentifier::check`]).
-type SelectedIdentifier = (&'static Regex, Option<fn(&str) -> bool>);
+/// What a match of one selected identifier is judged by: the identifier itself, the
+/// expression it matched, and whatever else the identifier requires of a match
+/// ([`DetectedIdentifier::check`]).
+type SelectedIdentifier = (
+    &'static DetectedIdentifier,
+    &'static Regex,
+    Option<fn(&str) -> bool>,
+);
 
 /// The expressions one policy's `DataIdentifier` entries select, for the identifiers this
 /// emulator detects, each with whatever else a match of it must satisfy.
@@ -175,42 +187,94 @@ fn selected(identifiers: &[String]) -> Vec<SelectedIdentifier> {
                 .iter()
                 .any(|entry| identifier_name(entry) == identifier.name)
         })
-        .map(|(identifier, expression)| (expression, identifier.check))
+        .map(|(identifier, expression)| (identifier, expression, identifier.check))
         .collect()
+}
+
+/// WHAT one message was found to carry, for one data identifier a policy named: the
+/// identifier's own name and the spans of the message its data was found in.
+///
+/// The matched TEXT is deliberately not carried: the two halves a data protection policy acts
+/// through — masking the stored event and recording the detection — both need to know WHERE
+/// the sensitive data is and WHICH kind it is, and neither needs the value itself, so nothing
+/// downstream of a detection can leak one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detected {
+    /// The identifier's name, as AWS publishes it (`EmailAddress`).
+    pub name: &'static str,
+    /// The CHARACTER spans of the message the identifier matched, as `(start, end)` with the
+    /// end exclusive, in the order they were found.
+    pub spans: Vec<(usize, usize)>,
+}
+
+/// The sensitive data the policy naming `identifiers` finds in `message`: one entry per named
+/// identifier that matched, in the order [`DETECTED_IDENTIFIERS`] tries them.
+///
+/// The ONE scan of a message a data protection policy performs: an ingestion detects once and
+/// both halves of the policy act on what this answered — the Deidentify half masks the spans
+/// ([`masked`]) and the Audit half records which identifiers were seen
+/// ([`super::audit_findings`]) — so the two can never disagree about what was found.
+///
+/// Empty where the policy finds nothing: it names no identifier this emulator detects, or the
+/// message carries none of the data they describe.
+#[must_use]
+pub fn detected(message: &str, identifiers: &[String]) -> Vec<Detected> {
+    let expressions = selected(identifiers);
+    if expressions.is_empty() {
+        return Vec::new();
+    }
+    // The byte offset of each character, so a match's byte range selects the characters it
+    // covers — a span is reported, and masked, in characters.
+    let offsets: Vec<usize> = message.char_indices().map(|(offset, _)| offset).collect();
+    let mut found = Vec::new();
+    for (identifier, expression, check) in expressions {
+        let mut spans = Vec::new();
+        for matched in expression.find_iter(message) {
+            if check.is_some_and(|check| !check(matched.as_str())) {
+                continue;
+            }
+            let first = offsets.partition_point(|offset| *offset < matched.start());
+            let last = offsets.partition_point(|offset| *offset < matched.end());
+            spans.push((first, last));
+        }
+        if !spans.is_empty() {
+            found.push(Detected {
+                name: identifier.name,
+                spans,
+            });
+        }
+    }
+    found
 }
 
 /// The message as a reader sees it by DEFAULT once the policy naming `identifiers` is in
 /// force: every matched span replaced by asterisks, the rest of the message verbatim.
 ///
-/// `None` where the policy masks nothing of this message — it names no identifier this
-/// emulator detects, or the message carries none of the data they describe — which is what
-/// says the event needs no masked version stored beside the ingested bytes.
+/// `None` where the policy masks nothing of this message, which is what says the event needs
+/// no masked version stored beside the ingested bytes.
 pub fn masked(message: &str, identifiers: &[String]) -> Option<String> {
-    let expressions = selected(identifiers);
-    if expressions.is_empty() {
+    masked_where(message, &detected(message, identifiers))
+}
+
+/// [`masked`] over a detection already taken: the spans `found` names replaced by asterisks,
+/// so an ingestion that has to record the detection as well scans the message once.
+///
+/// Two identifiers matching overlapping text mask the union of what they found, since every
+/// span is written over the same rendering.
+#[must_use]
+pub fn masked_where(message: &str, found: &[Detected]) -> Option<String> {
+    if found.is_empty() {
         return None;
     }
-    // The spans every selected identifier matches, as character ranges over the message, so
-    // two identifiers matching overlapping text mask the union of what they found.
     let mut masked: Vec<char> = message.chars().collect();
-    // The byte offset of each character, so a match's byte range selects the characters it
-    // covers.
-    let offsets: Vec<usize> = message.char_indices().map(|(offset, _)| offset).collect();
-    let mut any = false;
-    for (expression, check) in expressions {
-        for found in expression.find_iter(message) {
-            if check.is_some_and(|check| !check(found.as_str())) {
-                continue;
-            }
-            let first = offsets.partition_point(|offset| *offset < found.start());
-            let last = offsets.partition_point(|offset| *offset < found.end());
-            for character in masked.iter_mut().take(last).skip(first) {
+    for detected in found {
+        for (first, last) in &detected.spans {
+            for character in masked.iter_mut().take(*last).skip(*first) {
                 *character = MASK_CHARACTER;
             }
-            any = true;
         }
     }
-    any.then(|| masked.iter().collect())
+    Some(masked.iter().collect())
 }
 
 /// The data identifiers a log group's OWN stored data protection policy names, or the empty
@@ -361,5 +425,106 @@ mod tests {
             Some("*************** and *************** from ***********"),
             "case \"two addresses and an IP\": got {actual:?}"
         );
+    }
+
+    /// One row of the detection table: what a failing assertion calls it, the identifiers the
+    /// policy names, the message scanned, and the `(identifier, spans)` pairs expected.
+    type DetectionRow = (
+        &'static str,
+        &'static [&'static str],
+        &'static str,
+        &'static [(&'static str, &'static [(usize, usize)])],
+    );
+
+    /// RULE: one scan reports WHICH identifiers were found and WHERE, and the masked
+    /// rendering is exactly those spans — so the detection the Audit half records and the
+    /// masking the Deidentify half applies describe the same findings.
+    #[test]
+    fn a_detection_names_the_identifiers_found_and_their_spans() {
+        // (case, the identifiers the policy names, the message, the detections expected)
+        let rows: &[DetectionRow] = &[
+            (
+                "one address in the middle of the message",
+                &["EmailAddress"],
+                "signup from ada@example.com accepted",
+                &[("EmailAddress", &[(12, 27)])],
+            ),
+            (
+                "two terms of one identifier",
+                &["EmailAddress"],
+                "ada@example.com invited bob@example.org",
+                &[("EmailAddress", &[(0, 15), (24, 39)])],
+            ),
+            (
+                "two identifiers, each found once",
+                &["EmailAddress", "IpAddress"],
+                "ada@example.com from 203.0.113.9",
+                &[("EmailAddress", &[(0, 15)]), ("IpAddress", &[(21, 32)])],
+            ),
+            (
+                "a term after a multi-byte character, counted in characters",
+                &["EmailAddress"],
+                "café ada@example.com",
+                &[("EmailAddress", &[(5, 20)])],
+            ),
+            (
+                "an identifier named but not found",
+                &["IpAddress"],
+                "signup from ada@example.com accepted",
+                &[],
+            ),
+            (
+                "an identifier this emulator does not detect",
+                &["DriversLicense-US"],
+                "signup from ada@example.com accepted",
+                &[],
+            ),
+        ];
+        for (case, identifiers, message, expected) in rows {
+            let listed: Vec<String> = identifiers
+                .iter()
+                .map(|name| format!("{MANAGED_DATA_IDENTIFIER_PREFIX}{name}"))
+                .collect();
+            let found = detected(message, &listed);
+            let reported: Vec<(&str, Vec<(usize, usize)>)> = found
+                .iter()
+                .map(|entry| (entry.name, entry.spans.clone()))
+                .collect();
+            let wanted: Vec<(&str, Vec<(usize, usize)>)> = expected
+                .iter()
+                .map(|(name, spans)| (*name, spans.to_vec()))
+                .collect();
+            assert_eq!(
+                reported, wanted,
+                "case {case:?}: expected the detections {wanted:?}, got {reported:?}"
+            );
+            // The masked rendering is those spans and nothing else: every reported span is
+            // asterisks, and the message is otherwise unchanged.
+            let rendered = masked_where(message, &found);
+            match rendered {
+                None => assert!(
+                    found.is_empty(),
+                    "case {case:?}: a detection must have a masked rendering, got none"
+                ),
+                Some(rendered) => {
+                    let characters: Vec<char> = rendered.chars().collect();
+                    let original: Vec<char> = message.chars().collect();
+                    for (index, character) in characters.iter().enumerate() {
+                        let inside = found.iter().any(|entry| {
+                            entry
+                                .spans
+                                .iter()
+                                .any(|(first, last)| (*first..*last).contains(&index))
+                        });
+                        let expected = if inside { '*' } else { original[index] };
+                        assert_eq!(
+                            *character, expected,
+                            "case {case:?}: at character {index} expected {expected:?}, got \
+                             {character:?} in {rendered:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

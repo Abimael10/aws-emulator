@@ -265,6 +265,14 @@ pub use policy_documents::*;
 /// ingested.
 pub mod data_protection;
 
+/// Recording each detection of sensitive data as a finding in the log group a data protection
+/// policy's Audit action names as its findings destination.
+pub mod audit_findings;
+
+/// Whether the caller may read what a data protection policy masked, which is the decision an
+/// event read asked to `unmask` takes.
+pub mod unmask_authorization;
+
 /// The vended-log delivery resources — a delivery, its source and its destination — as they
 /// are stored.
 mod deliveries;

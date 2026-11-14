@@ -121,6 +121,9 @@
 //! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below): the
 //!   code this service answers when the `logGroupName` / `logGroupIdentifier` pair names
 //!   both selectors or neither (`crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`).
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   code this service answers a read that asked to `unmask` without the `logs:Unmask`
+//!   permission the member documents (`crate::state::unmask_authorization`).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -138,7 +141,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatchlogs-logs-201
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.cloudwatchlogs#GetLogEvents",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum GetLogEventsErrorModeled {
@@ -149,6 +152,11 @@ pub enum GetLogEventsErrorModeled {
     // answers it for the cross-member log-group-selector check, which this operation's own
     // `errors` list omits. See `crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`.
     ValidationException(ValidationException),
+    // Widened in the same way: the SERVICE models `AccessDeniedException` ("You don't have
+    // sufficient permissions to perform this action"), which is what this operation answers a
+    // read that asked to `unmask` without the `logs:Unmask` permission its own documentation
+    // requires. See `crate::state::unmask_authorization`.
+    AccessDeniedException(AccessDeniedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -336,22 +344,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata. `unmask` selects WHICH version of a masked
-        // event's message is reported, which is applied where the page is rendered below.
-        let _ = ctx;
-
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetLogEventsError::from(GetLogEventsErrorModeled::ServiceUnavailableException(
-                ServiceUnavailableException {
-                    message: Some("the log store is unavailable".to_string()),
-                },
-            ))
-        })?;
-        let store = state.lock();
+        // `ctx` carries the Region the credential scope names, which is where the resource
+        // the `unmask` decision below is taken against lives. `unmask` also selects WHICH
+        // version of a masked event's message is reported, which is applied where the page is
+        // rendered.
+        let region = crate::state::request_region(ctx.parts());
 
         // Naming both log-group selectors, or neither, is the cross-member check the
         // service answers with `ValidationException` rather than with this operation's
         // `InvalidParameterException` (see `crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`).
+        // Resolved before anything is looked up, because the group it names is what the
+        // authorization decision below is about.
         let log_group_name = crate::state::resolve_log_group_target(
             input.log_group_name.as_deref(),
             input.log_group_identifier.as_deref(),
@@ -363,6 +366,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+
+        // A read that asks to reveal what a data protection policy masked performs
+        // `logs:Unmask` as well as this operation's own action — "to use this operation with
+        // this parameter, you must be signed into an account with the logs:Unmask permission"
+        // — so it is decided against the caller's identity-based policies BEFORE the store is
+        // read, and a caller holding no such grant is served no event at all. This read names
+        // one log stream, so the resource is the stream-qualified log group
+        // (`crate::state::unmask_authorization`). A read that did not ask to unmask is not
+        // touched.
+        if let Some(message) = crate::state::unmask_authorization::refusal(
+            &*self.engine,
+            ctx,
+            input.unmask,
+            &crate::state::unmask_authorization::stream_scoped_resource(&region, &log_group_name),
+        ) {
+            return Err(GetLogEventsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLogEventsError::from(GetLogEventsErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let store = state.lock();
 
         let Some(group) = store.log_groups.get(&log_group_name) else {
             return Err(GetLogEventsErrorModeled::ResourceNotFoundException(
