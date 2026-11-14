@@ -310,6 +310,18 @@ pub fn image_not_found_message(identifier: &str) -> String {
     format!("MicroVMImage not found for MicroVMImageID: {identifier}")
 }
 
+/// The `message` of the 404 a read addressed at BOTH a MicroVM image and one VERSION of
+/// it answers when the identifier resolves to no image of this account, built from the
+/// identifier and the version label the request carried.
+///
+/// The read addresses a version, so its refusal names the whole address it was given
+/// rather than the image half alone ([`image_not_found_message`], what the
+/// image-addressed reads answer): the two are distinct messages of the same error class
+/// (recorded AWS behaviour).
+pub fn version_address_image_not_found_message(identifier: &str, image_version: &str) -> String {
+    format!("MicroVMImage not found for MicroVMImage: {identifier}, Version: {image_version}")
+}
+
 /// The `message` of the 404 the DELETE path answers for an `imageIdentifier` that
 /// resolves to no record, built from the identifier the request carried.
 ///

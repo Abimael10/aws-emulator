@@ -31,6 +31,8 @@
 //!   `UpdateMicrovmImageVersionResponse` declare the version's build inputs, `state`,
 //!   `status`, `stateReason`, `createdAt`, `updatedAt` and `tags` and no such member
 //!   (`smithy_query(query="shape",shape="GetMicrovmImageVersionOutput,MicrovmImageVersionSummary",model_path="services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/smithy-model/com-amazonaws-lambdamicrovms-lambdamicrovms.json")`).
+//!   Every response reporting a version carries it, so the three paths that report one
+//!   cannot disagree about a version's settlement.
 //!
 //! Each member schema is declared in the `com.amazonaws.lambdamicrovms.recorded`
 //! namespace rather than in the service's own: the member is NOT in the model, so its

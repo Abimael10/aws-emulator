@@ -20,9 +20,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    image_not_found_message, image_version_not_found_message, invalid_arn_format_message,
-    managed_base_image_arn, next_image_version, access_denied_message, FIRST_IMAGE_VERSION,
-    MANAGED_BASE_IMAGE_IDS,
+    image_version_not_found_message, invalid_arn_format_message, managed_base_image_arn,
+    next_image_version, version_address_image_not_found_message, access_denied_message,
+    FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -195,6 +195,66 @@ fn assert_not_found(status: u16, body: &Value, expected_message: &str, case: &st
         "case {case}: expected the lookup's own message, got {:?}",
         body["message"]
     );
+}
+
+/// How long a poll for a clock-owed transition may take before the test gives up:
+/// generous, so a loaded host converges rather than fails.
+const SETTLE_DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(30);
+
+/// How long one such poll waits before looking again.
+const POLL_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_millis(50);
+
+/// The version `image_version` of `identifier` once its asynchronous build has SETTLED.
+///
+/// The build is owed by the clock, so this waits for the CONDITION — a terminal version
+/// state — by looking again until a generous deadline passes, rather than for any span of
+/// time.
+async fn settled_version(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    image_version: &str,
+    case: &str,
+) -> Value {
+    let deadline = ::std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (status, version) = get_version(router, identifier, image_version).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 for version {image_version}, got {status} {version}"
+        );
+        if version["state"].as_str() != Some("IN_PROGRESS") {
+            return version;
+        }
+        assert!(
+            ::std::time::Instant::now() < deadline,
+            "case {case:?}: version {image_version} of {identifier} never settled, \
+             last read {version}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The answer the version read gives once the image's asynchronous DELETION has removed
+/// the record: the condition a cleanup poll waits for, reached by looking again rather
+/// than by waiting for a span of time.
+async fn version_of_the_removed_image(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    image_version: &str,
+    case: &str,
+) -> (u16, Value) {
+    let deadline = ::std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (status, body) = get_version(router, identifier, image_version).await;
+        if status != 200 {
+            return (status, body);
+        }
+        assert!(
+            ::std::time::Instant::now() < deadline,
+            "case {case:?}: the image {identifier} was never removed, last read {body}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// RULE: the read is the stored version record, whichever form of the image's identifier
@@ -419,7 +479,9 @@ async fn a_version_the_image_does_not_hold_is_not_found() {
 
     let name = "held";
     create_image(&router, name, json!({})).await;
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    // The build is clock-owed: wait for the CONDITION — the version settled — rather than
+    // for a span of time.
+    settled_version(&router, name, FIRST_IMAGE_VERSION, "the image the rows address").await;
     let arn = expected_image_arn(name);
 
     // Rows differ in HOW the version fails to be one the image holds: a generation never
@@ -476,12 +538,19 @@ async fn a_version_the_image_does_not_hold_is_not_found() {
         "a delete in flight does not rewrite the version's own state, got {during}"
     );
 
-    tokio::time::sleep(PAST_THE_SPAN).await;
-    let (status, gone) = get_version(&router, &arn, FIRST_IMAGE_VERSION).await;
+    // The removal is clock-owed as well, so the read is looked at again until it reports
+    // the record gone rather than after a span of time.
+    let (status, gone) = version_of_the_removed_image(
+        &router,
+        &arn,
+        FIRST_IMAGE_VERSION,
+        "the removed image holds no version",
+    )
+    .await;
     assert_not_found(
         status,
         &gone,
-        &image_not_found_message(&arn),
+        &version_address_image_not_found_message(&arn, FIRST_IMAGE_VERSION),
         "the removed image holds no version",
     );
 }
@@ -501,7 +570,9 @@ async fn a_version_read_outside_this_accounts_own_images_is_denied() {
     // they name rather than for an empty store.
     let held = "held-image";
     create_image(&router, held, json!({})).await;
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    // The build is clock-owed: wait for the CONDITION — the version settled — rather than
+    // for a span of time.
+    settled_version(&router, held, FIRST_IMAGE_VERSION, "the image this account holds").await;
 
     // Rows differ in WHY the account holds no record of the identifier. The AWS-owned
     // rows name a catalogue entry that unambiguously EXISTS, so the refusal cannot be
@@ -582,7 +653,7 @@ async fn a_version_read_outside_this_accounts_own_images_is_denied() {
             assert_not_found(
                 status,
                 &body,
-                &image_not_found_message(identifier),
+                &version_address_image_not_found_message(identifier, image_version),
                 &format!("{case} ({identifier}) version {image_version}"),
             );
         }

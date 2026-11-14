@@ -88,8 +88,8 @@
 //! ## Beside the model
 //!
 //! Each row of a settled version carries one further member the model declares on no
-//! shape: `versionStateTimeBucket`, the time bucket that version's state settled in,
-//! projected out of the stored record through
+//! shape: `versionStateTimeBucket`, the composite of that version's state and the time
+//! bucket that state settled in, projected out of the stored record through
 //! [`crate::state::MicrovmImageVersion::reported_state_time_bucket`] under the member
 //! schema [`VERSION_STATE_TIME_BUCKET_ON_VERSION_SUMMARY`] — the same projection
 //! `GetMicrovmImageVersion` answers with. A version whose build is still in flight has

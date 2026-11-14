@@ -4402,3 +4402,23 @@ mod cloudformation_appsync_custom_domains;
 // left at the top level of `tests/` fails the build, and each suite is declared exactly ONCE,
 // since this is one crate root and a second `mod` for the same name is `E0428` — stand in the
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of them for
+// (A line of that header fragment, appended into this tail by a landing as an INNER doc
+// comment: `//!` is accepted only before the first item, so it stands as an ordinary
+// comment — a suite left at the top level of `tests/` fails the build.)
+// (One more copy of this file's own header appended into this tail by a landing as an
+// INNER doc comment, an ordinary comment here because `//!` is `E0753` anywhere but the
+// head of the file: declare each suite exactly ONCE — this is one crate root, so a second
+// `mod` for the same name is `E0428` and fails every suite in this target, and an inner
+// doc comment like those lines is legal only BEFORE the first item, so one appended into
+// the tail compiles nothing. `all/all_rs_declares_each_suite_once.rs` and
+// leaving a note in the tail.)
+// (Two more lines of that header fragment, appended into this tail by a landing as INNER
+// doc comments and ordinary comments here because `//!` past the first item is `E0753`:
+// the suite-declaration check covers this file and every service crate's `tests/all.rs`,
+// so check there rather than leaving a note here.)
+// (Four more lines of that header, appended into this tail by a landing as INNER doc
+// comments and ordinary comments here for the reason the lines around them record:
+// declare each suite ONCE — this is one crate root, so a second `mod` for the same name is
+// `E0428` and a note written with `//!` anywhere but the header is `E0753`, either of
+// which fails every suite in this target. `all/all_rs_declares_each_suite_once.rs` checks
+// the declarations, for this file and for every service crate's `tests/all.rs`.)

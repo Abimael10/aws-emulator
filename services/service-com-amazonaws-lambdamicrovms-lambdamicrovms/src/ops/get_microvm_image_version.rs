@@ -107,8 +107,8 @@
 //! ## Beside the model
 //!
 //! A settled version's recorded 200 carries one further top-level member the model
-//! declares on no shape: `versionStateTimeBucket`, the time bucket the version's state
-//! settled in, projected out of the stored record through
+//! declares on no shape: `versionStateTimeBucket`, the composite of the version's state
+//! and the time bucket that state settled in, projected out of the stored record through
 //! [`crate::state::MicrovmImageVersion::reported_state_time_bucket`] under the member
 //! schema [`VERSION_STATE_TIME_BUCKET_ON_GET_VERSION_OUTPUT`] — the same projection one
 //! row of `ListMicrovmImageVersions` carries, so the read of a version and a listing
@@ -243,9 +243,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let Some(image) = image else {
-            return Err(not_found(crate::state::image_not_found_message(
-                &input.image_identifier,
-            )));
+            // This read is addressed at a version, so the refusal for an image this
+            // account holds no record of names the whole address the request carried —
+            // the identifier and the version label — rather than the image half alone.
+            return Err(not_found(
+                crate::state::version_address_image_not_found_message(
+                    &input.image_identifier,
+                    &input.image_version,
+                ),
+            ));
         };
         // Past the image's verdict the lookup is an own-account one, so a version that
         // image does not hold is the modelled 404.

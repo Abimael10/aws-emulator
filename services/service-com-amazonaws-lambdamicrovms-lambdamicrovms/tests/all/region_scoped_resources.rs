@@ -27,7 +27,7 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::microvm_network:
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::ComAmazonawsLambdamicrovmsLambdamicrovmsState as MicrovmState;
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     image_not_found_message, microvm_not_found_message, too_many_regions_message,
-    FIRST_IMAGE_VERSION, IMAGE_STATE_CREATED, MAX_REGIONS,
+    version_address_image_not_found_message, FIRST_IMAGE_VERSION, IMAGE_STATE_CREATED, MAX_REGIONS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -120,16 +120,36 @@ async fn an_image_is_addressable_only_through_the_region_that_minted_it() {
         Some(arn.as_str()),
         "the create must mint the ARN of the region it was signed for, got {created}"
     );
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    // The build is clock-owed, so this waits for the CONDITION the rows below read about —
+    // the image's creation having settled in the region that minted it — by looking again
+    // until a generous deadline passes, rather than for a fixed time.
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (status, read) = get_image(&router, REGION, name).await;
+            assert_eq!(status, 200, "read the image {name}: got {status} {read}");
+            if read["state"].as_str() == Some(IMAGE_STATE_CREATED) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the image {name} never settled on {IMAGE_STATE_CREATED}: last read {read}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 
     for region in FOREIGN_REGIONS {
         // Rows differ in WHICH call asks about the identifier: the image's own read, the
         // version-addressed read and the tag listing all resolve the same
-        // `imageIdentifier`, so each must report the same absence.
-        let rows: Vec<(String, String)> = vec![
+        // `imageIdentifier`, so each must report the same absence — each in the words of
+        // the address it was given, which for the version-addressed read names the version
+        // beside the identifier.
+        let rows: Vec<(String, String, String)> = vec![
             (
                 "GetMicrovmImage".to_string(),
                 format!("/2025-09-09/microvm-images/{}", as_uri_value(&arn)),
+                image_not_found_message(&arn),
             ),
             (
                 "GetMicrovmImageVersion".to_string(),
@@ -138,18 +158,20 @@ async fn an_image_is_addressable_only_through_the_region_that_minted_it() {
                     as_uri_value(&arn),
                     as_uri_value(FIRST_IMAGE_VERSION)
                 ),
+                version_address_image_not_found_message(&arn, FIRST_IMAGE_VERSION),
             ),
             (
                 "ListTags".to_string(),
                 format!("/2017-03-31/tags/{}", as_uri_value(&arn)),
+                image_not_found_message(&arn),
             ),
         ];
-        for (operation, uri) in rows {
+        for (operation, uri, expected) in rows {
             let (status, body) = call_in_region(&router, region, "GET", &uri, None).await;
             assert_not_found(
                 status,
                 &body,
-                &image_not_found_message(&arn),
+                &expected,
                 &format!("{operation} for {arn} from {region}"),
             );
         }

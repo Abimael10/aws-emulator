@@ -75,3 +75,5 @@ mod resource_tag_removal;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/version_state_time_bucket.rs"]
+mod version_state_time_bucket;
