@@ -39,7 +39,10 @@
 //! `OnFailure$Destination` enumerates are the ones it writes to, so a destination naming a
 //! resource of any other service is refused with that same modelled 400 and no mapping is
 //! created (see [`crate::state::unsupported_mapping_destination`]) rather than stored as a
-//! dead-letter path nothing could ever write to.
+//! dead-letter path nothing could ever write to. It is held to the invoked function's
+//! EXECUTION ROLE too, since that is the identity the record is written under: a destination
+//! whose write the policies in force on that role withhold is refused with that same modelled
+//! 400 (see [`crate::state::unwritable_mapping_destination`]).
 //!
 //! A mapping on a QUEUE is also held to the queue's own configuration: a queue hands a
 //! message to one consumer for the length of its `VisibilityTimeout` and makes it visible
@@ -657,6 +660,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) = event_source_arn.as_deref().and_then(|event_source| {
             crate::state::unreadable_event_source(&*self.engine, &function_role, event_source)
         }) {
+            return Err(invalid_parameter(message));
+        }
+
+        // Lambda also WRITES the record of a batch this mapping gives up on as that same
+        // role, so a `DestinationConfig` naming a destination the policies in force on it
+        // withhold the write to is a dead-letter path no record could reach: it is refused
+        // here, before anything is persisted, on the same evidence as the read above (see
+        // [`crate::state::unwritable_mapping_destination`]).
+        if let Some(message) = crate::state::unwritable_mapping_destination(
+            &*self.engine,
+            &function_role,
+            input.destination_config.as_ref(),
+        ) {
             return Err(invalid_parameter(message));
         }
 

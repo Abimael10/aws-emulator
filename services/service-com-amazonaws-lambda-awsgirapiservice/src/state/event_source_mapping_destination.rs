@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH destinations an event source mapping may hand a record of a failed batch to.
+//! WHICH destinations an event source mapping may hand a record of a failed batch to, and
+//! whether the invoked function's EXECUTION ROLE may write the one a request names.
 //!
 //! `DestinationConfig` is "a configuration object that specifies the destination of an event
 //! after Lambda processes it", and the destination inside it is a resource Lambda WRITES to:
@@ -13,9 +14,14 @@
 //! So the two calls that state a mapping's destinations ([`crate::ops::create_event_source_mapping`]
 //! and [`crate::ops::update_event_source_mapping`]) hold every destination a request names
 //! to that enumeration, and refuse one it does not name with the modelled
-//! `InvalidParameterValueException` before anything is stored or changed.
+//! `InvalidParameterValueException` before anything is stored or changed. They hold it to one
+//! thing more: Lambda writes the record acting as the function's EXECUTION ROLE, so a
+//! destination whose write the policies in force on that role withhold is refused with that
+//! same modelled error ([`unwritable_mapping_destination`]) rather than stored as a
+//! dead-letter path no record could reach.
 //!
-//! A READ of the request alone: it decides, and changes nothing.
+//! A READ of the request and of the stores the decision is made from: it decides, and changes
+//! nothing.
 
 use crate::ops::types::DestinationConfig;
 
@@ -69,6 +75,50 @@ pub fn unsupported_mapping_destination(
         .iter()
         .any(|destination| !is_supported_mapping_destination(destination))
         .then(|| UNSUPPORTED_MAPPING_DESTINATION_MESSAGE.to_string())
+}
+
+/// The sentence a request whose `DestinationConfig` names a failure destination the invoked
+/// function's EXECUTION ROLE may not write is refused with — and `None` when that role may
+/// write it, or when nothing of the kind can be shown.
+///
+/// Lambda writes the record of a batch a mapping gave up on ACTING AS that role — "Lambda
+/// reads items from the event source and invokes the function"
+/// ([`CreateEventSourceMapping`](crate::ops::create_event_source_mapping)) under the
+/// function's own execution role — so a destination whose write the policies in force on it
+/// withhold is a dead-letter path no record could ever reach: the question is settled by the
+/// call that CONFIGURES the pair, before anything is persisted, exactly as it is settled for
+/// the event SOURCE the mapping reads ([`super::event_source_authorization`]) and for the
+/// destination an asynchronous invocation's record is delivered to
+/// ([`super::event_invoke_config::unwritable_destination`]).
+///
+/// The slot decided is the ON-FAILURE one, and only it: that is the one a mapping's record is
+/// written to ([`super::event_source_poller::failure_destination`]), so it is the only write
+/// a role has to be able to make for the mapping to work. An `OnSuccess` destination is not
+/// judged here — this emulator writes no record to it, so withholding a mapping for it would
+/// refuse a configuration on a write nothing makes.
+///
+/// On the same evidence as the gates above, so nothing is refused on evidence this emulator
+/// does not have: an engine carrying no IAM store, a role ARN that store holds no role for, a
+/// role carrying a grant this emulator cannot read, and a destination kind no write is stated
+/// for each refuse nothing.
+///
+/// A READ of both stores: it decides, and changes nothing.
+#[must_use]
+pub fn unwritable_mapping_destination<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    role_arn: &str,
+    destination_config: Option<&DestinationConfig>,
+) -> Option<String> {
+    let destination = super::event_source_poller::failure_destination::on_failure_destination(
+        destination_config,
+    )?;
+    let iam = super::event_source_authorization::iam_state(engine)?;
+    let (action, service) = super::event_invoke_config::withheld_destination_write(
+        &iam.lock(),
+        role_arn,
+        &destination,
+    )?;
+    Some(super::event_source_authorization::function_role_refusal_message(action, service))
 }
 
 #[cfg(test)]

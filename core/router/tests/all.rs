@@ -4937,3 +4937,27 @@ mod cloudformation_provisions_event_buses_and_bus_policies;
 // (Six more lines of that same header arrived here typed with `//!`, which is `E0753` past
 // the first item: they are dropped rather than re-typed, the rule they repeated standing in
 // (And thirteen more lines of it arrived here typed with `//!` as well, dropped for the
+// (`cloudformation_kms_encrypted_sns_sqs_pipeline` is declared ONCE, a few lines above in
+// this same tail: two landings each appended a declaration of it here, which is `E0428` and
+// compiles no suite of this target, so the duplicate is gone.)
+// comment is only legal before the first item of this crate root, so a `//!` line here is
+// `E0753` and compiles no suite in this target. The guidance it repeats stands at the head of
+// (Ordinary comments: this copy of the header landed past the first item, where `//!`
+// compiles no suite of this target. The guidance stands at the head of this file.)
+// line past the first item is `E0753`. The guidance stands at the head of this file.)
+// (The lines below were a copy of the module doc at the HEAD of this file, where that
+// rule stands: concurrently landing branches appended this copy here, and an inner doc
+// compiled no suite of this target. The copy is gone rather than re-typed.)
+// (More lines of this file's own header, appended here as `//!` by a landing: an inner
+// nothing. The header at the top of this file states the rule they repeated, so they are gone
+// line of that header fragment that landed here as `//!` is gone rather than re-typed.
+// lines of that header fragment, ordinary comments for the reason they state. Six further
+// lines of it landed here as `//!`, which is `E0753` past the first item, and are gone
+// this file's head is `E0753` — either fails every suite in this target; five more lines of
+// that fragment landed here as `//!` and are gone rather than re-typed, for that same
+// reason.
+// (Yet more lines of that same header landed here as `//!` while branches landed at once,
+// and are dropped for the reason just above: past the first item an inner doc comment is
+// `E0753` and compiles no suite of this target. The rules they repeated stand in the module
+// doc at the HEAD of this file.)
+// It. The `sfn_relayed_dynamodb_request_id` suite is declared ONCE as well, just above: two

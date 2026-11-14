@@ -540,6 +540,14 @@ async fn send_to_queue(
 }
 
 /// `PutEvents` the record to the event bus the ARN `bus` names.
+///
+/// An event bus is the one destination kind that carries the record inside an ENVELOPE of its
+/// own, and that envelope STATES THE OUTCOME: the `DetailType` is
+/// [`event_record_detail_type`] — the class of the record plus the outcome the event reached —
+/// so a rule on the bus selects success records from failure records by the key EventBridge
+/// matches patterns on, without reading the detail. The `Resources` of the envelope is the
+/// function the record is about, qualified by the version that ran
+/// ([`qualified_function_arn`]), which is what a pattern keyed on one function matches.
 async fn put_to_bus(
     completion: &Completion<'_>,
     bus: &str,
@@ -552,9 +560,9 @@ async fn put_to_bus(
         "Entries": [{
             "EventBusName": bus,
             "Source": EVENT_RECORD_SOURCE,
-            "DetailType": EVENT_RECORD_DETAIL_TYPE,
+            "DetailType": event_record_detail_type(completion),
             "Detail": body,
-            "Resources": [completion.invocation.invoked_function_arn.clone()],
+            "Resources": [qualified_function_arn(completion)],
         }]
     });
     called(completion, "events", "PutEvents", parsed.region, &input.to_string()).await
@@ -564,8 +572,31 @@ async fn put_to_bus(
 /// published it, as an AWS event names its publisher.
 const EVENT_RECORD_SOURCE: &str = "lambda";
 
-/// The `DetailType` of that event: what the detail IS.
-const EVENT_RECORD_DETAIL_TYPE: &str = "Lambda Function Invocation Result";
+/// The `DetailType` of that event: the class of the record, then the OUTCOME the event
+/// reached.
+///
+/// A destination slot is chosen by that outcome — `OnSuccess` is "the destination
+/// configuration for successful invocations" and `OnFailure` "the destination configuration
+/// for failed invocations" — so the envelope a bus destination carries the record in states
+/// which of the two it is: a record of an event whose handler returned is a
+/// `… - Success`, and one of an event Lambda gave up on is a `… - Failure`. That is the key a
+/// rule on the bus filters on, so a bus wired as both slots' destination still routes each
+/// outcome to its own targets.
+fn event_record_detail_type(completion: &Completion<'_>) -> &'static str {
+    if completion.failed() {
+        EVENT_RECORD_DETAIL_TYPE_FAILURE
+    } else {
+        EVENT_RECORD_DETAIL_TYPE_SUCCESS
+    }
+}
+
+/// The `DetailType` of the envelope carrying the record of an event whose handler RETURNED;
+/// see [`event_record_detail_type`].
+const EVENT_RECORD_DETAIL_TYPE_SUCCESS: &str = "Lambda Function Invocation Result - Success";
+
+/// The `DetailType` of the envelope carrying the record of an event Lambda GAVE UP ON; see
+/// [`event_record_detail_type`].
+const EVENT_RECORD_DETAIL_TYPE_FAILURE: &str = "Lambda Function Invocation Result - Failure";
 
 /// `Invoke` the function the ARN `function` names with the record as its event.
 ///

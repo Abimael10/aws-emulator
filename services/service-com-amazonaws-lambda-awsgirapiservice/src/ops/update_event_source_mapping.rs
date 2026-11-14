@@ -34,7 +34,10 @@
 //! each destination it names has to be one of the resources Lambda writes a record of a
 //! failed batch to — the kinds `OnFailure$Destination` enumerates — and one of any other
 //! service is refused with that same modelled 400 and changes nothing (see
-//! [`crate::state::unsupported_mapping_destination`]).
+//! [`crate::state::unsupported_mapping_destination`]); and the write that record takes has to
+//! be one the EXECUTION ROLE of the function the mapping invokes after this update may make,
+//! since that is the identity it is written under (see
+//! [`crate::state::unwritable_mapping_destination`]).
 //!
 //! The operation answers 202 Accepted, so the change is NOT in effect when the call
 //! returns: the mapping moves into `Updating` — one of the states
@@ -534,6 +537,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::unreadable_event_source(&*self.engine, role, event_source)
             })
         {
+            return Err(invalid_parameter(message));
+        }
+
+        // And to the third: Lambda WRITES the record of a batch the mapping gives up on as
+        // that same role, so a `DestinationConfig` this update states is held to what the
+        // role in force after it may write (see
+        // [`crate::state::unwritable_mapping_destination`]). The role in force is the
+        // re-targeted function's where the request names one, and the mapping's own
+        // otherwise — which is why a destination stated beside no `FunctionName` is still
+        // decided.
+        let destination_role = retarget_role.clone().or_else(|| {
+            let mapping = store.event_source_mappings.get(&input.uuid)?;
+            let function = store.functions.get(&mapping.function_name)?;
+            let version = mapping
+                .function_qualifier
+                .as_deref()
+                .and_then(|qualifier| function.resolved_version(qualifier))
+                .unwrap_or_else(|| crate::state::VERSION_LATEST.to_string());
+            function.config_of(&version).map(|config| config.role.clone())
+        });
+        if let Some(message) = destination_role.as_deref().and_then(|role| {
+            crate::state::unwritable_mapping_destination(
+                &*self.engine,
+                role,
+                input.destination_config.as_ref(),
+            )
+        }) {
             return Err(invalid_parameter(message));
         }
 

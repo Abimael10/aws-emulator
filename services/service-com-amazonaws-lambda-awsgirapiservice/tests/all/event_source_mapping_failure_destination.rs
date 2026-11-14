@@ -413,7 +413,10 @@ async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (St
 /// eliminates the need for the endpoints to process JSON formatting"
 /// (`RawMessageDelivery`), so the queue holds the published message itself — and the queue's
 /// own `Policy` written to admit that topic's deliveries. Answers the topic's ARN.
-async fn given_topic_fanning_out(
+///
+/// `pub(crate)` because every suite that observes a topic destination through a queue stands
+/// the pair up this one way (`tests/all/event_source_mapping_destination_role.rs`).
+pub(crate) async fn given_topic_fanning_out(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,

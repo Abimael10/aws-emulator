@@ -3013,7 +3013,7 @@ pub use event_source_mapping::{EventSourceMappingRecord, ShardCursor, ShardSourc
 pub mod event_source_mapping_destination;
 pub use event_source_mapping_destination::{
     is_supported_mapping_destination, unsupported_mapping_destination,
-    UNSUPPORTED_MAPPING_DESTINATION_MESSAGE,
+    unwritable_mapping_destination, UNSUPPORTED_MAPPING_DESTINATION_MESSAGE,
 };
 
 /// Which functions Lambda SnapStart can be applied to, and the refusals for asking for it

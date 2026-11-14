@@ -45,6 +45,8 @@ mod announced_download_locations;
 mod async_completion_destinations;
 #[path = "all/async_delivery.rs"]
 mod async_delivery;
+#[path = "all/async_destination_event_bus_envelope.rs"]
+mod async_destination_event_bus_envelope;
 #[path = "all/async_destination_record_shape.rs"]
 mod async_destination_record_shape;
 #[path = "all/async_event_delivery_ownership.rs"]
@@ -133,6 +135,8 @@ mod event_source_mapping_batch_item_failures;
 mod event_source_mapping_batching_window;
 #[path = "all/event_source_mapping_delete_in_use.rs"]
 mod event_source_mapping_delete_in_use;
+#[path = "all/event_source_mapping_destination_role.rs"]
+mod event_source_mapping_destination_role;
 #[path = "all/event_source_mapping_destination_service.rs"]
 mod event_source_mapping_destination_service;
 #[path = "all/event_source_mapping_deletion.rs"]

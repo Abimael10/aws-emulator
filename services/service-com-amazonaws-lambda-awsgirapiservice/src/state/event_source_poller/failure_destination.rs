@@ -94,14 +94,32 @@ pub(super) struct FailedBatch<'batch> {
 ///
 /// A mapping naming no destination has nowhere to record the batch, so nothing is written and
 /// nothing is reported: the discard itself is the caller's, and it happens either way.
+///
+/// The write is made ACTING AS the invoked function's execution role, so it is subject to the
+/// policies in force on that role: a destination whose write they withhold receives nothing at
+/// all ([`withheld_write`]). Nothing is retried and the discard stands either way — the
+/// records are gone from the function's reach whether or not the record of them landed.
 pub(super) async fn discard_batch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
+    policies: &super::PolicyStores,
     batch: &FailedBatch<'_>,
 ) {
     let Some(destination) = batch.run.on_failure_destination.as_deref() else {
         return;
     };
+    if let Some(withheld) = withheld_write(policies, batch.run, destination) {
+        ::tracing::warn!(
+            function = %batch.run.function_arn,
+            stream = %batch.run.stream_arn,
+            shard = %batch.shard,
+            destination = %destination,
+            detail = %withheld,
+            "the record of a discarded batch was not written: the policies in force on the \
+             function's execution role withhold the write its failure destination takes"
+        );
+        return;
+    }
     let record = batch_record(batch, SystemTime::now());
     let delivered = deliver(
         callback,
@@ -123,6 +141,36 @@ pub(super) async fn discard_batch(
             "the record of a discarded batch did not reach the mapping's failure destination"
         );
     }
+}
+
+/// Why the write that would record this batch at `destination` is WITHHELD — from the
+/// execution role of the function the mapping invokes — or `None` when it is not.
+///
+/// "Lambda reads items from the event source and invokes the function"
+/// (`CreateEventSourceMapping`) acting as that function's execution role, and the record of a
+/// batch it gave up on is one more call Lambda makes on the customer's behalf under the same
+/// identity, so it is decided by the same documents the poller's READS of the source are
+/// ([`super::withheld_shard_read`]) — and on the same evidence, so an engine carrying no IAM
+/// store, a role that store holds no record for, a mapping whose role this store cannot read
+/// and a destination kind no write is stated for all withhold nothing. The decision itself is
+/// [`crate::state::event_invoke_config::withheld_destination_write`], the one reading of what a
+/// role may write to a destination this crate has; the sentence is for the one log line a
+/// withheld write writes, since no caller is waiting on this write to be told anything.
+fn withheld_write(
+    policies: &super::PolicyStores,
+    run: &ShardSourcedMapping,
+    destination: &str,
+) -> Option<String> {
+    let role_arn = run.invoke_identity_arn.as_deref()?;
+    let iam = policies.iam.as_ref()?;
+    let (action, service) = crate::state::event_invoke_config::withheld_destination_write(
+        &iam.lock(),
+        role_arn,
+        destination,
+    )?;
+    Some(format!(
+        "{role_arn} may not call {action} on {service} for {destination}"
+    ))
 }
 
 /// The record ONE discarded batch is written as.

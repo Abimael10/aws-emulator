@@ -284,13 +284,38 @@ pub fn unwritable_destination<Eng: Send + Sync + 'static>(
     destinations: &[String],
 ) -> Option<String> {
     let iam = iam_state(engine)?;
+    let held = iam.lock();
     destinations.iter().find_map(|destination| {
-        let entry = write_of(destination)?;
-        let action = format!("{}:{}", entry.namespace, entry.action);
-        withholds_call(&iam.lock(), role_arn, &action, destination)
-            .filter(|withheld| *withheld)
-            .map(|_| provided_role_refusal_message(entry.action, entry.service))
+        withheld_destination_write(&held, role_arn, destination)
+            .map(|(action, service)| provided_role_refusal_message(action, service))
     })
+}
+
+/// The write that delivers a record to `destination` which the policies in force on `role_arn`
+/// WITHHOLD — as the call it is and the service it would have been made to — and `None` when
+/// that role may make the write, or when nothing of the kind can be shown.
+///
+/// The ONE reading of this question in this crate, because it is one rule wherever it is
+/// asked: Lambda delivers to a destination ACTING AS the invoked function's execution role, so
+/// a destination whose write that role may not make is a destination no record reaches. Three
+/// places ask it — the call that configures an asynchronous invocation's destination
+/// ([`unwritable_destination`]), the call that configures an event source mapping's
+/// ([`super::event_source_mapping_destination`]) and the poller that would write a discarded
+/// batch's record ([`super::event_source_poller::failure_destination`]) — and each WORDS the
+/// refusal its own error class is worded in, which is why the answer is the call rather than a
+/// sentence. A destination kind [`DESTINATION_WRITES`] states no write for is evidence of
+/// nothing and withholds nothing.
+#[must_use]
+pub(crate) fn withheld_destination_write(
+    iam: &super::event_source_authorization::IamState,
+    role_arn: &str,
+    destination: &str,
+) -> Option<(&'static str, &'static str)> {
+    let entry = write_of(destination)?;
+    let action = format!("{}:{}", entry.namespace, entry.action);
+    withholds_call(iam, role_arn, &action, destination)
+        .filter(|withheld| *withheld)
+        .map(|_| (entry.action, entry.service))
 }
 
 #[cfg(test)]

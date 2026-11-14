@@ -52,7 +52,9 @@
 //!   discards are gone from its function's reach, so the only thing a client can still learn
 //!   about them is what its `DestinationConfig$OnFailure` names: where it names a
 //!   destination, one record describing that batch — not its payloads — is written there
-//!   ([`failure_destination`]).
+//!   ([`failure_destination`]), and that write is made as the function's execution role like
+//!   every other call this poller makes, so a destination whose write the policies in force
+//!   on that role withhold receives nothing.
 //!
 //! * NOTHING IS READ FOR A FUNCTION THAT CANNOT BE INVOKED. "Lambda reads items from the
 //!   event source and invokes the function" (`CreateEventSourceMapping`), so a mapping
@@ -799,6 +801,7 @@ async fn move_batches(
             failure_destination::discard_batch(
                 callback,
                 &mut work.clients,
+                policies,
                 &failure_destination::FailedBatch {
                     run,
                     shard: &shard,

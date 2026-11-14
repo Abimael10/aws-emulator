@@ -317,7 +317,9 @@ impl EventSourceAccess {
     /// A QUEUE's sentence names the role as the FUNCTION's execution role — "The function
     /// execution role does not have permissions to call ReceiveMessage on SQS" — which is
     /// how the service worded this refusal when it was observed. Only the CALL and the
-    /// service it would have been made to vary with the request; the rest is fixed text.
+    /// service it would have been made to vary with the request; the rest is fixed text, and
+    /// it is rendered by [`function_role_refusal_message`] so this crate has ONE spelling of
+    /// that sentence.
     fn message(&self, event_source_arn: &str, withheld: &str) -> String {
         match self.refusal {
             Refusal::Shards { noun, tail } => format!(
@@ -325,10 +327,7 @@ impl EventSourceAccess {
                  the {actions} Actions on your {noun}{tail}",
                 actions = self.action_list()
             ),
-            Refusal::Call { service } => format!(
-                "The function execution role does not have permissions to call {withheld} on \
-                 {service}"
-            ),
+            Refusal::Call { service } => function_role_refusal_message(withheld, service),
         }
     }
 
@@ -377,6 +376,29 @@ fn access_of(event_source_arn: &str) -> Option<&'static EventSourceAccess> {
 /// service answered it when it was observed.
 pub(super) fn provided_role_refusal_message(action: &str, service: &str) -> String {
     format!("The provided execution role does not have permissions to call {action} on {service}")
+}
+
+/// How Lambda words the refusal of a role that may not make one call Lambda itself would make
+/// ON AN EVENT SOURCE MAPPING's behalf — a read of the source it polls, or the write that
+/// records a batch it gave up on: "The function execution role does not have permissions to
+/// call SendMessage on SQS".
+///
+/// The ONE rendering of that sentence in this crate: [`EventSourceAccess::message`]'s
+/// `Refusal::Call` arm, which is how the service worded the refusal of a QUEUE source's reads
+/// when it was observed, and the destination gate
+/// ([`super::event_source_mapping_destination::unwritable_mapping_destination`]) both answer
+/// through here, so one error class has one spelling.
+///
+/// It is NOT [`provided_role_refusal_message`], and the difference is recorded rather than
+/// chosen: the model describes no message for `InvalidParameterValueException`, the surfaces
+/// that stand a resource UP (a VPC attachment's network interfaces, an
+/// asynchronous-invocation destination) were observed opening "The provided execution role",
+/// and a mapping's own refusals open "The function execution role". Two error classes, two
+/// spellings, each of them fixed text a client compares exactly. Only the CALL and the service
+/// it would have been made to vary with the request; the destination's own ARN is not in the
+/// sentence.
+pub(super) fn function_role_refusal_message(action: &str, service: &str) -> String {
+    format!("The function execution role does not have permissions to call {action} on {service}")
 }
 
 /// Whether the identity-based documents in force on `role_arn` WITHHOLD the call `action`
