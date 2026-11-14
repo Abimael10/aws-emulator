@@ -282,14 +282,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation("Features must carry at least one FeatureValue"));
         }
 
+        // One value per feature name ([`crate::state::held_feature_values`]): `Features`
+        // is a list with no `uniqueItems`, so a call may name a feature more than once,
+        // and the value it then updates that feature to is the LAST it names — the same
+        // value the merge below settles on, so the event-time and identifier reads cannot
+        // disagree with what is stored.
+        let posted_features = crate::state::held_feature_values(&input.features);
+
         // The `EventTime` of an update is the value the group's own
         // `EventTimeFeatureName` carries among the posted features — the runtime API has
         // no separate member for it — and "If you omit EventTime, the service keeps the
         // record's existing EventTime and applies the update."
         let event_time_feature_name = definition.event_time_feature_name.clone();
-        let posted_event_time = match input
-            .features
+        let posted_event_time = match posted_features
             .iter()
+            .copied()
             .find(|feature| feature.feature_name == event_time_feature_name)
         {
             None => None,
@@ -354,9 +361,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record-identifier feature must post the value of the record it is updating: a
         // record's identity is not what this operation changes.
         let identifier_feature = definition.record_identifier_feature_name.clone();
-        if let Some(posted) = input
-            .features
+        if let Some(posted) = posted_features
             .iter()
+            .copied()
             .find(|feature| feature.feature_name == identifier_feature)
         {
             if posted.value_as_string.as_deref() != Some(identifier.as_str()) {
@@ -431,7 +438,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // does not carry yet is added — up to the store's per-record capacity bound,
         // which is this operation's to respect because it is the only one that GROWS a
         // record (`PutRecord` replaces a record's features wholesale).
-        for posted in &input.features {
+        for posted in posted_features.iter().copied() {
             let value = crate::state::StoredFeatureValue::from(posted);
             match updated
                 .features

@@ -82,8 +82,14 @@ impl OfflineRecord {
         definition: &::service_common::feature_store_groups::FeatureGroupRecord,
         record: &[crate::ops::types::FeatureValue],
     ) -> Self {
-        let features = record
+        // One column per feature name, the value being the LAST the write names for it
+        // ([`crate::state::held_feature_values`]): a `Record` is modelled with no
+        // `uniqueItems`, so a write may name a feature twice, and the row this lays out
+        // declares each column exactly once either way.
+        let held = crate::state::held_feature_values(record);
+        let features = held
             .iter()
+            .copied()
             .map(|feature| {
                 let value = match (&feature.value_as_string, &feature.value_as_string_list) {
                     (Some(value), _) => value.clone(),
@@ -95,8 +101,9 @@ impl OfflineRecord {
                 (feature.feature_name.clone(), value)
             })
             .collect();
-        let event_time = record
+        let event_time = held
             .iter()
+            .copied()
             .find(|feature| feature.feature_name == definition.event_time_feature_name)
             .and_then(|feature| feature.value_as_string.as_deref())
             .and_then(crate::state::parse_event_time_secs)

@@ -365,6 +365,41 @@ impl PreparedRecord {
     }
 }
 
+/// The feature values a record HOLDS, out of the list one write posts: exactly ONE value
+/// per feature name.
+///
+/// A `FeatureValue` is "The value associated with a feature", carrying "The name of a
+/// feature that a feature value corresponds to" — so a feature of a record has one value,
+/// which is also what a read of a record reports ("the latest value for all the Features",
+/// `GetRecord$FeatureNames`). The list the wire carries is modelled with no `uniqueItems`,
+/// though, so a write may legitimately name the same feature more than once; the value the
+/// record then holds for that feature is the LAST the write names, which is how a value
+/// posted under a name already held settles anywhere in this data plane. The values keep
+/// the order their names FIRST appear in, i.e. the order the write states them in.
+///
+/// Every whole-record write reads the record through this, so no store of this plane can
+/// end up holding one feature twice: the online record carries each feature once and the
+/// row replicated into the offline store declares each column once.
+pub fn held_feature_values(
+    record: &[crate::ops::types::FeatureValue],
+) -> Vec<&crate::ops::types::FeatureValue> {
+    let mut held: Vec<&crate::ops::types::FeatureValue> = Vec::with_capacity(record.len());
+    // Where each name's value sits in `held`, so a repeated name replaces the value it
+    // already posted instead of appending a second one — and in one pass, whatever the
+    // length of the posted list.
+    let mut slot_of_name: HashMap<&str, usize> = HashMap::with_capacity(record.len());
+    for feature in record {
+        match slot_of_name.get(feature.feature_name.as_str()) {
+            Some(&slot) => held[slot] = feature,
+            None => {
+                slot_of_name.insert(feature.feature_name.as_str(), held.len());
+                held.push(feature);
+            }
+        }
+    }
+    held
+}
+
 /// Read one posted record against the DEFINITION of the feature group it is written to.
 ///
 /// The two names the record is read through are the group's own, as the control plane
@@ -386,9 +421,16 @@ pub fn prepare_record(
         return Err("Record must carry at least one FeatureValue".to_owned());
     }
 
+    // One value per feature name ([`held_feature_values`]): every read below, and the
+    // record this write stores, are of the values the record HOLDS — so a write naming a
+    // feature twice stores that feature once, and the value it stores is the one the
+    // identifier and event-time reads see.
+    let held = held_feature_values(record);
+
     let identifier_feature_name = &definition.record_identifier_feature_name;
-    let identifier = match record
+    let identifier = match held
         .iter()
+        .copied()
         .find(|feature| feature.feature_name == *identifier_feature_name)
     {
         Some(crate::ops::types::FeatureValue {
@@ -413,8 +455,9 @@ pub fn prepare_record(
     // A record that carries no value for the group's event-time feature has no event
     // time, so neither the historic-record rule nor a TTL has anything to compute from.
     let event_time_feature_name = &definition.event_time_feature_name;
-    let event_time = record
+    let event_time = held
         .iter()
+        .copied()
         .find(|feature| feature.feature_name == *event_time_feature_name)
         .and_then(|feature| feature.value_as_string.clone());
 
@@ -455,7 +498,11 @@ pub fn prepare_record(
     // the default the feature group configures ([`effective_ttl_seconds`]).
     let mut stored = StoredRecord {
         identifier,
-        features: record.iter().map(StoredFeatureValue::from).collect(),
+        features: held
+            .iter()
+            .copied()
+            .map(StoredFeatureValue::from)
+            .collect(),
         event_time,
         expires_at: None,
         expires_at_secs: None,

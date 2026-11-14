@@ -31,6 +31,8 @@ mod pattern_refusal_rendering;
 mod refusal_message_wording;
 #[path = "all/rejection_statements.rs"]
 mod rejection_statements;
+#[path = "all/repeated_feature_names.rs"]
+mod repeated_feature_names;
 #[path = "all/sagemaker_signing_name_routing.rs"]
 mod sagemaker_signing_name_routing;
 #[path = "all/size_bound_statements.rs"]
