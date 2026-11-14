@@ -539,6 +539,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+        // A group is associated with target groups of its OWN Region and account: a target
+        // group is identified within one Region, so an ARN of anywhere else names nothing
+        // the group could ever register an instance in. Refused on the input — as the
+        // attach of the same member is — so the create stores no attachment that cannot
+        // resolve.
+        if crate::state::elbv2_targets::first_unattachable_target_group(
+            &region,
+            input
+                .target_group_ar_ns
+                .iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::elbv2_targets::UNATTACHABLE_TARGET_GROUPS_MESSAGE.to_string(),
+            ));
+        }
         // The zones the group places instances in. `VPCZoneIdentifier` is "a
         // comma-separated list of subnet IDs for a virtual private cloud (VPC) where
         // instances in the Auto Scaling group can be created", and a subnet is in

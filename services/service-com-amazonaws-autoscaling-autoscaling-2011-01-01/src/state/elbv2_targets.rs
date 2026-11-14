@@ -68,6 +68,15 @@
 //! (`AutoScalingState::drop_attachments`), because a target group ARN carries the id that
 //! service minted for that one target group and so can never be registered into again.
 //!
+//! # A target group this endpoint could never register in
+//!
+//! A target group is identified within ONE Region and ONE account, and the Auto Scaling
+//! group it serves is the one in that same Region, so an association whose ARN carries
+//! another Region or account — or is no target group ARN at all — names nothing that could
+//! ever take a registration. Such a value is refused on the INPUT
+//! ([`first_unattachable_target_group`]), before the group is touched, rather than stored as
+//! attachment that can never resolve.
+//!
 //! LOCKING. A reconcile reads the wanted set under this service's own lock, RELEASES it,
 //! and only then takes the Elastic Load Balancing v2 store's lock for the one pass that
 //! registers and deregisters; nothing awaits while either is held. A read of that store
@@ -192,6 +201,56 @@ pub fn attached_arns(group: &StoredGroup) -> Vec<&str> {
     }
     arns
 }
+
+/// What a load-balancer attachment of an Auto Scaling group has to NAME: an Elastic Load
+/// Balancing v2 TARGET GROUP, whose ARN carries that service's own namespace and the
+/// `targetgroup` resource type (`CreateTargetGroup` mints
+/// `arn:aws:elasticloadbalancing:<region>:<account>:targetgroup/<name>/<id>`). A value of
+/// any other form names no target group of any account.
+const TARGET_GROUP: ::service_common::arn::Requirement = ::service_common::arn::Requirement {
+    vendor: elbv2::SERVICE_NAMESPACE,
+    resource_type: Some("targetgroup"),
+    label: "an Elastic Load Balancing target group",
+};
+
+/// Whether `arn` names a target group an Auto Scaling group of the Region `region` can be
+/// associated with: a target group ARN ([`TARGET_GROUP`]) whose Region and account are the
+/// ones the request is addressed to.
+///
+/// A target group is identified WITHIN one Region and one account, and the group it serves
+/// is the one in that same Region, so an ARN carrying any other Region or account names
+/// nothing this endpoint could ever register an instance in — as unresolvable here as a
+/// value that is no ARN at all.
+fn is_attachable_target_group(region: &str, arn: &str) -> bool {
+    ::service_common::arn::parse(arn).is_some_and(|parsed| {
+        TARGET_GROUP.admits(arn)
+            && parsed.region == region
+            && parsed.account == ::engine::emulator_account_id()
+    })
+}
+
+/// The FIRST entry of `requested` that names no target group an Auto Scaling group of the
+/// Region `region` can be associated with, in request order — what makes a request naming it
+/// a bad REQUEST rather than one the store could not satisfy. `None` when every entry is one
+/// such a group may hold.
+pub fn first_unattachable_target_group<'a, I>(region: &str, requested: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    requested
+        .into_iter()
+        .find(|arn| !is_attachable_target_group(region, arn))
+}
+
+/// The message Amazon EC2 Auto Scaling refuses a request whose `TargetGroupARNs` names a
+/// target group it cannot resolve with — the whole sentence is fixed text, exactly as the
+/// same refusal for a Classic Load Balancer names no load balancer either.
+///
+/// The refusal is for the request as a WHOLE: a call that mixes resolvable ARNs with one
+/// that is not attaches none of them, so the message says what was wrong with the request
+/// rather than reporting a partial result.
+pub const UNATTACHABLE_TARGET_GROUPS_MESSAGE: &str =
+    "Provided Target Groups may not be valid. Please ensure they exist and try again.";
 
 /// The target groups `group` is attached to that Elastic Load Balancing v2 no longer
 /// holds, in attachment order: the attachments that can take no registration at all,

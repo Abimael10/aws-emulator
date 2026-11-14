@@ -39,23 +39,19 @@
 //! source, the target group's `TargetType`, the documented per-call bound on an attach, and
 //! how many of a group's attachments have been deleted out of band.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
-use service_com_amazonaws_ec2_amazonec2 as ec2_service;
-use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as elbv2_service;
 
+// The harness pieces this suite drives the three services through — the one engine they
+// share, their wires, and the resources a group is built from — live in `support`, which is
+// their one copy for every suite here.
 use crate::support::{
-    borrowed, ec2_query, form_encode, p, query, seed_subnets, tag_value, tag_values, xml_unescape,
-    SeededSubnet, REGION,
+    borrowed, create_launch_template, create_target_group, elbv2_query, emulator, p, query,
+    seed_subnets, tag_value, tag_values, vpc_of, xml_unescape, SeededSubnet, REGION,
 };
-
-/// The API version an Elastic Load Balancing v2 client puts in its awsQuery body, read from
-/// that service's own statement of it rather than written out here.
-const ELBV2_VERSION: &str = elbv2_service::service::shared_endpoint::API_VERSION;
 
 /// The most target groups ONE attach may name, from the model's own documentation for
 /// `AttachLoadBalancerTargetGroupsType$TargetGroupARNs`: "You can specify up to 10 target
@@ -76,123 +72,6 @@ const TARGET_TYPE_INSTANCE: &str = "instance";
 /// Application Load Balancer, Gateway Load Balancer, or Network Load Balancer target group"
 /// (`smithy_query(query="doc",shape="TrafficSourceIdentifier",member="Type")`).
 const TRAFFIC_SOURCE_TYPE_ELBV2: &str = "elbv2";
-
-/// One emulator with the three services on one engine: a group's instances are the
-/// account's own Amazon EC2 instances, and the targets they occupy are Elastic Load
-/// Balancing v2's own records, so one engine is what makes the three views one account.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));
-    router.register_service(ec2_service::EmulatedService::new(Arc::clone(&engine)));
-    router.register_service(elbv2_service::EmulatedService::new(Arc::clone(&engine)));
-    (router, engine)
-}
-
-/// POST one awsQuery action to Elastic Load Balancing v2, the way a client does, and answer
-/// its status and body.
-async fn elbv2_query(
-    router: &MultiServiceRouter,
-    action: &str,
-    params: &[(String, String)],
-) -> (u16, String) {
-    let mut body = format!("Action={action}&Version={ELBV2_VERSION}");
-    for (key, value) in params {
-        body.push('&');
-        body.push_str(key);
-        body.push('=');
-        body.push_str(&form_encode(value));
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!(
-            "https://elasticloadbalancingv2.{REGION}.amazonaws.com/"
-        ))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}\
-                 /elasticloadbalancingv2/aws4_request, SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .body(bytes::Bytes::from(body))
-        .expect("a valid request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let text = String::from_utf8_lossy(response.body()).to_string();
-    (status, text)
-}
-
-/// The VPC the seeded subnets are in, read back through Amazon EC2's own
-/// `DescribeSubnets` — the service that owns the subnet is what says which VPC it is in.
-async fn vpc_of(router: &MultiServiceRouter, subnet: &SeededSubnet) -> String {
-    let (status, body) = ec2_query(router, "DescribeSubnets", &[p("SubnetId.1", &subnet.id)]).await;
-    assert_eq!(
-        status, 200,
-        "DescribeSubnets for {:?} expected 200, got {status}: {body}",
-        subnet.id
-    );
-    let vpc_id = tag_value(&body, "vpcId");
-    assert!(
-        !vpc_id.is_empty(),
-        "DescribeSubnets must report the subnet's VPC, got {body}"
-    );
-    vpc_id
-}
-
-/// Create one Elastic Load Balancing v2 target group over the wire and answer the ARN that
-/// service minted for it.
-async fn create_target_group(
-    router: &MultiServiceRouter,
-    name: &str,
-    port: i32,
-    target_type: &str,
-    vpc_id: &str,
-) -> String {
-    let (status, body) = elbv2_query(
-        router,
-        "CreateTargetGroup",
-        &[
-            p("Name", name),
-            p("Protocol", "HTTP"),
-            p("Port", port.to_string()),
-            p("VpcId", vpc_id),
-            p("TargetType", target_type),
-        ],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "CreateTargetGroup for {name:?} expected 200, got {status}: {body}"
-    );
-    let arn = tag_value(&body, "TargetGroupArn");
-    assert!(
-        !arn.is_empty(),
-        "CreateTargetGroup must report the target group's ARN, got {body}"
-    );
-    arn
-}
-
-/// Create one Amazon EC2 launch template over the wire, so the group launches from a
-/// template the account actually holds.
-async fn create_launch_template(router: &MultiServiceRouter, name: &str) {
-    let (status, body) = ec2_query(
-        router,
-        "CreateLaunchTemplate",
-        &[
-            p("LaunchTemplateName", name),
-            p("LaunchTemplateData.ImageId", "ami-0123456789abcdef0"),
-            p("LaunchTemplateData.InstanceType", "t3.micro"),
-        ],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "CreateLaunchTemplate for {name:?} expected 200, got {status}: {body}"
-    );
-}
 
 /// How a group names the target groups it is created attached to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

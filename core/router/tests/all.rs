@@ -5120,3 +5120,6 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (`sfn_relayed_dynamodb_request_id` is declared once, a few lines above in this same tail:
 // two landings each appended their own copy.)
 // the copy appended here compiled neither.)
+// (`cloudwatch_cfn_alarm_action_topic_policy` is declared ONCE, in the sorted span far
+// module declared twice compiles neither copy, so the duplicate is gone rather than
+// re-typed.)

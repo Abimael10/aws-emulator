@@ -11,7 +11,9 @@ use std::sync::Arc;
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
+use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 use service_com_amazonaws_ec2_amazonec2::state as ec2;
+use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as elbv2_service;
 
 /// The region every suite signs for, so the ARNs the service stamps are checked
 /// against the region the request names rather than a default.
@@ -85,6 +87,134 @@ pub async fn query(
 /// One `(key, value)` request parameter, for a suite whose values are built per case.
 pub fn p(key: &str, value: impl Into<String>) -> (String, String) {
     (key.to_string(), value.into())
+}
+
+/// The API version an Elastic Load Balancing v2 client puts in its awsQuery body, read from
+/// that service's own statement of it rather than written out here.
+const ELBV2_VERSION: &str = elbv2_service::service::shared_endpoint::API_VERSION;
+
+/// One emulator with the three services on ONE engine: Auto Scaling, Amazon EC2 and Elastic
+/// Load Balancing v2.
+///
+/// THE ONE COPY for every suite here whose subject spans them — a group's instances are the
+/// account's own Amazon EC2 instances, and the target groups it is attached to and the
+/// targets they hold are Elastic Load Balancing v2's own records, so one engine is what
+/// makes the three views one account.
+pub fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(ec2_service::EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(elbv2_service::EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
+/// POST one awsQuery action to Elastic Load Balancing v2, the way a client does, and answer
+/// its status and body.
+///
+/// THE ONE COPY for every suite here that reaches the account's own target groups: they are
+/// that service's resources, and this is how a client asks it for them.
+pub async fn elbv2_query(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(String, String)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version={ELBV2_VERSION}");
+    for (key, value) in params {
+        body.push('&');
+        body.push_str(key);
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://elasticloadbalancingv2.{REGION}.amazonaws.com/"
+        ))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}\
+                 /elasticloadbalancingv2/aws4_request, SignedHeaders=host, Signature=abc"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a valid request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let text = String::from_utf8_lossy(response.body()).to_string();
+    (status, text)
+}
+
+/// The VPC a seeded subnet is in, read back through Amazon EC2's own `DescribeSubnets` —
+/// the service that owns the subnet is what says which VPC it is in.
+pub async fn vpc_of(router: &MultiServiceRouter, subnet: &SeededSubnet) -> String {
+    let (status, body) = ec2_query(router, "DescribeSubnets", &[p("SubnetId.1", &subnet.id)]).await;
+    assert_eq!(
+        status, 200,
+        "DescribeSubnets for {:?} expected 200, got {status}: {body}",
+        subnet.id
+    );
+    let vpc_id = tag_value(&body, "vpcId");
+    assert!(
+        !vpc_id.is_empty(),
+        "DescribeSubnets must report the subnet's VPC, got {body}"
+    );
+    vpc_id
+}
+
+/// Create one Elastic Load Balancing v2 target group over that service's own wire and answer
+/// the ARN it minted for it.
+pub async fn create_target_group(
+    router: &MultiServiceRouter,
+    name: &str,
+    port: i32,
+    target_type: &str,
+    vpc_id: &str,
+) -> String {
+    let (status, body) = elbv2_query(
+        router,
+        "CreateTargetGroup",
+        &[
+            p("Name", name),
+            p("Protocol", "HTTP"),
+            p("Port", port.to_string()),
+            p("VpcId", vpc_id),
+            p("TargetType", target_type),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateTargetGroup for {name:?} expected 200, got {status}: {body}"
+    );
+    let arn = tag_value(&body, "TargetGroupArn");
+    assert!(
+        !arn.is_empty(),
+        "CreateTargetGroup must report the target group's ARN, got {body}"
+    );
+    arn
+}
+
+/// Create one Amazon EC2 launch template over that service's own wire, so a group launches
+/// from a template the account actually holds.
+pub async fn create_launch_template(router: &MultiServiceRouter, name: &str) {
+    let (status, body) = ec2_query(
+        router,
+        "CreateLaunchTemplate",
+        &[
+            p("LaunchTemplateName", name),
+            p("LaunchTemplateData.ImageId", "ami-0123456789abcdef0"),
+            p("LaunchTemplateData.InstanceType", "t3.micro"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateLaunchTemplate for {name:?} expected 200, got {status}: {body}"
+    );
 }
 
 /// The owned parameters of a case, as the `&[(&str, &str)]` [`query`] takes.

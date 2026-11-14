@@ -14,6 +14,11 @@
 //! group owes in line with its new attachments ([`crate::state::elbv2_targets`]), which is
 //! what `DescribeTargetHealth` then reports.
 //!
+//! Every ARN the request names therefore has to name a target group of the Region and
+//! account the call is addressed to: an ARN of another Region names a target group this
+//! endpoint could never register an instance in, so the call is refused whole — nothing is
+//! attached and nothing is registered.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -182,6 +187,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if requested.len() > crate::state::MAX_TARGET_GROUPS_PER_CALL {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 crate::state::too_many_target_groups_message(),
+            ));
+        }
+        // Every ARN has to name a target group of the Region and account this request is
+        // addressed to: a target group is identified within one Region, and the group is in
+        // the Region the request is signed for, so an ARN of anywhere else names nothing
+        // this endpoint could register an instance in. Checked on the INPUT, before the
+        // group is looked up or touched, so the attachment the group would then claim can
+        // never be one that cannot resolve.
+        let region = crate::state::request_region(ctx.parts());
+        if crate::state::elbv2_targets::first_unattachable_target_group(
+            &region,
+            requested.iter().map(String::as_str),
+        )
+        .is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::elbv2_targets::UNATTACHABLE_TARGET_GROUPS_MESSAGE.to_string(),
             ));
         }
 
