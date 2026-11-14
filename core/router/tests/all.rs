@@ -13,6 +13,12 @@
 //! one stays HERE: an inner doc comment past the first item is `E0753`, so the same note
 //! appended to the tail of this file would compile no suite of this target.
 //! ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and
+//! fails every suite in this target. An inner doc comment (`//!`) is legal only before
+//! the first item, so these lines are the only place one may stand — a note appended
+//! further down this file is `E0753` and compiles no suite of this target, and must be
+//! an ordinary `//` comment. `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both, for this file
+//! and for every service crate's `tests/all.rs`.
 //! fails every suite in this target. `all/all_rs_declares_each_suite_once.rs` and
 //! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that
 //! for this file and for every service crate's `tests/all.rs`, so check there rather
@@ -1954,12 +1960,6 @@ mod apigateway_sns_service_integration;
 // crate's test target can drive it.
 #[path = "all/lambda_signed_write_to_an_aoss_collection_endpoint.rs"]
 mod lambda_signed_write_to_an_aoss_collection_endpoint;
-// (`apigateway_cognito_authorizer_app_client_audience` is declared in the head region of
-// this file already: two branches landing in the same window each declared it, and a module
-// may be declared only once.)
-// (`apigateway_cognito_authorizer_app_client_audience` is declared ONCE, in the sorted span
-// above beside the other API Gateway suites: it was appended here as well while two branches
-// were landing at once, which declared it a second time and compiled neither.)
 // (`apigateway_cognito_authorizer_app_client_audience` is declared once, in the head region
 // above: a file loaded as a module twice compiles neither copy.)
 // above, and `cloudformation_metric_stream_estate_is_drainable` once further down this tail:
@@ -1967,16 +1967,22 @@ mod lambda_signed_write_to_an_aoss_collection_endpoint;
 // `cloudformation_metric_stream_estate_is_drainable` are declared in the head region and the
 // sorted span above: each was appended here as well while two branches were landing at once,
 // which declared it a second time and compiled neither.)
-// (The API Gateway/Cognito authorizer suite is declared ONCE, in the head region above:
-// a module may be declared only once, and two branches landing at once appended it here
-// as well.)
-// (`apigateway_cognito_authorizer_app_client_audience` is declared in the head region above:
-// a module may be declared only once.)
+// (`apigateway_cognito_authorizer_app_client_audience` is declared in the head region of
+// this file already: two branches landing in the same window each declared it, and a module
+// may be declared only once.)
+// (`apigateway_cognito_authorizer_app_client_audience` is declared ONCE, in the sorted span
+// above beside the other API Gateway suites: it was appended here as well while two branches
+// were landing at once, which declared it a second time and compiled neither.)
 // (The Amazon Cognito authorizer suite is declared ONCE, in the head region above: a module
 // may be declared only once, and two branches landing at once appended it here as well.)
 // Declared ONCE, in the head region above beside the other API Gateway suites: it was
 // appended here as well while two branches were landing at once, which declared it a second
 // time and compiled neither.
+// (The API Gateway/Cognito authorizer suite is declared ONCE, in the head region above:
+// a module may be declared only once, and two branches landing at once appended it here
+// as well.)
+// (`apigateway_cognito_authorizer_app_client_audience` is declared in the head region above:
+// a module may be declared only once.)
 // (`apigateway_cognito_authorizer_app_client_audience` is declared once in the head region
 // above, and `cloudformation_metric_stream_estate_is_drainable` once in the tail below: a
 // module may be declared only once, and a second declaration compiles neither.)
@@ -2048,6 +2054,8 @@ mod redshift_health_alarms_evaluate;
 // module may be declared only once.)
 // (`cloudformation_metric_stream_filter_update` is declared once, in the head region above: a
 // module may be declared only once, and two branches landing at once each appended it here.)
+// (`cloudwatch_alarm_ssm_ops_item_action` is declared in the head region above: a module may
+// be declared only once.)
 // (`cloudformation_metric_stream_filter_update` is declared ONCE, in the head region above
 // beside the other `cloudformation_…` suites: it was appended here as well while two
 // branches were landing at once, which declared it a second time and compiled neither.)
@@ -2116,6 +2124,8 @@ mod redshift_health_alarms_evaluate;
 // service crate's test target can create the index and then read the document back out.
 #[path = "all/bedrock_knowledge_base_over_an_aoss_collection.rs"]
 mod bedrock_knowledge_base_over_an_aoss_collection;
+#[path = "all/bedrock_agent_ingestion_populates_its_s3_vectors_index.rs"]
+mod bedrock_agent_ingestion_populates_its_s3_vectors_index;
 // Declared in the appended tail: whether an UpdateStack that changes an AWS::DynamoDB::Table
 // in place is reported complete only once DynamoDB reports that table ACTIVE again spans
 // CloudFormation (which makes the calls) and DynamoDB (which decides the table's status), so
@@ -2156,7 +2166,6 @@ mod apigatewaymanagementapi_manage_connections_authorization;
 // `cloudformation_scripted_queue_deploy` are each declared ONCE, in the sorted spans above:
 // two branches landing in the same window declared each of them here as well, which compiled
 // region above: a module may be declared only once.)
-// landings each appended their own copy here, and a module may be declared only once.)
 // `cloudformation_provisions_cloudfront_resources` is declared once, just below: two `mod`
 // items for one name is a redefinition that compiles neither.
 // Declared in the appended tail: whether the address a stack's DomainEndpoint output hands
@@ -2539,6 +2548,12 @@ mod events_one_envelope_reaches_every_target_kind;
 // and SQS mounted together just as the firing leg does.
 #[path = "all/cloudfront_edge_4xx_share_decides_the_alarm.rs"]
 mod cloudfront_edge_4xx_share_decides_the_alarm;
+// Declared here, in this appended tail: whether a SESv2 send's email events reach the Lambda
+// target of a rule on the bus its event destination names spans SESv2, EventBridge, Lambda,
+// CloudFormation, IAM and Amazon SQS, so no single service crate's test target can wire it.
+// (That suite is declared ONCE, further up this file: two landings in the same window each
+// appended a declaration of it here, which is `E0428` and compiles no suite of this target,
+// so the duplicate is gone and the first declaration stands.)
 // this file: a module may be declared only once, and the line appended here while two
 // branches landed at once compiled neither.)
 // (Declared ONCE, further up this file: two branches landing in the same window each appended
@@ -2547,6 +2562,8 @@ mod cloudfront_edge_4xx_share_decides_the_alarm;
 // window each appended a declaration of it here.)
 // (Declared ONCE, further up this file: the copy that stood here was a second declaration
 // two branches landing in the same window each appended, which compiled neither.)
+// this file: a module may be declared only once, and the line appended here while two
+// branches landed at once compiled neither.)
 // (`cloudfront_edge_4xx_share_decides_the_alarm` is declared ONCE, in the sorted span above:
 // a module may be declared only once, and two branches landing in the same window each
 // declared it here as well.)
@@ -2636,9 +2653,12 @@ mod cloudformation_drift_detection_status_change_events;
 // have to agree for the chain to hold, so no single crate's test target can drive it.
 #[path = "all/s3_object_created_invalidates_the_distribution_edge.rs"]
 mod s3_object_created_invalidates_the_distribution_edge;
-// (Declared ONCE, in the head region above: the copy that stood here was a second
-// declaration two branches landing in the same window each appended.)
-// (`pricing_plan_subscription_resource_eligibility` is declared once, in the head region
+// A browser form POST into an EventBridge-enabled bucket, on the whole assembled router with
+// request authentication on: which service claims an unsigned `multipart/form-data` POST is
+// the router's own attribution, the publication is Amazon S3's, the reason-scoped match and
+// the handover EventBridge's, and what arrived is Amazon SQS's.
+#[path = "all/s3_form_post_upload_routes_by_event_bridge_reason.rs"]
+mod s3_form_post_upload_routes_by_event_bridge_reason;
 // ONCE, further down this tail: a module may be declared only once, and two branches landing
 // in the same window each appended their own copy here.)
 // Declared here, beside the other CloudFormation suites: whether a stack-deployed
@@ -2682,9 +2702,16 @@ mod sfn_relayed_dynamodb_request_id;
 // two landings in the same window each appended a declaration of it here.)
 // (`pricing_plan_subscription_resource_eligibility` is declared ONCE, in the head region
 // above: two landings in the same window each appended a declaration of it here.)
+// (The Pricing Plan Manager subscription-eligibility suite is declared ONCE, further up this
+// tail: a module may be declared only once, and two landings each appended a declaration of
 // (`sfn_relayed_dynamodb_request_id` is declared ONCE, a few lines above in this same tail:
 // (`cloudformation_kms_encrypted_sns_sqs_pipeline` is declared ONCE, in the sorted span
 // above: the copy that stood here was a second declaration, which compiled neither.)
+// (`cloudformation_kms_encrypted_sns_sqs_pipeline` is declared once, in the sorted span above:
+// flat-rate CloudFront subscription may be sold over a distribution is decided by the web ACL
+// association CloudFront holds and by a web ACL only WAFv2 mints, so no single service crate's
+// test target can set the association and then ask Pricing Plan Manager for the subscription.
+// (`pricing_plan_subscription_resource_eligibility` is declared ONCE, further up this tail: a
 // (`sfn_relayed_dynamodb_request_id` is declared ONCE, further up this tail: two landings in
 // the same window each appended a declaration of it here.)
 // (`cloudformation_provisions_cloudfront_resources` is declared ONCE, further up this file:
@@ -2870,11 +2897,6 @@ mod cloudformation_eventbridge_fan_out_to_lambda_and_sfn;
 // the HTTPS front door, both Cognito session suites and the IAM/Secrets Manager envelope are
 // each declared ONCE, further down this tail, for that same reason.)
 // are declared ONCE each, further up this tail, for that same reason.)
-#[path = "all/bedrock_agent_ingestion_populates_its_s3_vectors_index.rs"]
-mod bedrock_agent_ingestion_populates_its_s3_vectors_index;
-// (`bedrock_agent_ingestion_populates_its_s3_vectors_index` is declared once, further up this
-// tail: a module may be declared only once, and two branches landing at once each appended a
-// copy of it here.)
 // (`apigateway_cognito_authorizer_app_client_audience` is declared once, in the sorted block
 // at the head of this file: a module may be declared only once, and two branches landing at
 // once appended a second declaration of it here.)
@@ -2896,6 +2918,8 @@ mod bedrock_agent_ingestion_populates_its_s3_vectors_index;
 // `cloudformation_provisions_cloudfront_resources` is declared in the head region above: a
 // `cloudformation_scripted_queue_deploy` are each declared once in the sorted spans above: a
 // above: a module may be declared only once, and two branches landing in the same window each
+// declared it here as well.)
+// A suite left at the top level of `tests/` fails the build. Declare each suite exactly
 // A suite is declared exactly ONCE: this is one crate root, so a second `mod` for the same
 // name is `E0428` and fails every suite in this target. `all/all_rs_declares_each_suite_once.rs`
 // checks that for this file and for every service crate's `tests/all.rs`.
@@ -2903,7 +2927,6 @@ mod bedrock_agent_ingestion_populates_its_s3_vectors_index;
 // ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and fails
 // every suite in this target. `all/all_rs_declares_each_suite_once.rs` checks that for
 // this file and for every service crate's `tests/all.rs`, so check there rather than
-// A suite left at the top level of `tests/` fails the build. Declare each suite exactly
 // leaving a note here. (These five lines are ordinary comments, not `//!` inner doc
 // comments: an inner doc comment is only legal before an item, so appended here it is
 // `E0753` and compiles nothing in this target.)
@@ -2912,12 +2935,18 @@ mod bedrock_agent_ingestion_populates_its_s3_vectors_index;
 // Declared here, in this head region, for the reason those entries record: the appended tail
 // at the end of this file and the `e…` span are where every suite landing in the same window
 // `c…`/`s…` spans are regions concurrently landing suites add their line to.
+// it scales. (The suite is declared ONCE, in the head region of this file: two landings in
+// the same window each appended a declaration of it here too, and a module declared twice
+// is `E0428` and compiles neither.)
+// landings each appended their own copy here, and a module may be declared only once.)
+// this tail: the entry was appended here as well while two branches were landing at once,
 // (Written as ordinary comments: an inner doc comment is only legal at the TOP of a crate
 // root, so this note — appended here by a landing that copied it out of the header — is
 // `E0753` in this position and compiled none of the suites in this target.)
 // (A suite left at the top level of `tests/` fails the build. Declare each suite exactly
 // leaving a note here. These lines sit after the first item in this file, so they are
 // ordinary comments: an inner doc comment here is `E0753` and compiles no suite at all.)
+// suite left at the top level of `tests/` fails the build. Declare each suite exactly
 // leaving a note here. (Line comments, not `//!`: an inner doc comment is only legal at
 // the head of a crate root, so one in this tail is `E0753` and compiles no suite at all.)
 // (The five lines below arrived as INNER doc comments (`//!`) in this appended tail, where
@@ -2987,7 +3016,6 @@ mod cloudformation_provisions_lambda_event_invoke_configs;
 // which compiles neither.)
 // and `zz_probe` ONCE further up this tail: two landings each appended a second copy of each
 // here, and a module declared twice loads the same file twice, which compiles neither.)
-// this tail: the entry was appended here as well while two branches were landing at once,
 // (Ordinary `//` comments, not `//!`: an inner doc comment is legal only at the TOP of a
 // crate root, so a copy of the header note appended down here is `E0753` and compiles none
 // of the suites in this target.)
@@ -3042,6 +3070,11 @@ mod s3_object_read_identity_or_bucket_policy;
 // `cloudformation_domain_endpoint_is_dialled_by_consumers` is declared ONCE, in the span
 // above, for the reason the entry there records.
 // (`zz_probe` is declared ONCE, further up this tail, for the reason recorded there: two
+// (The note about declaring each suite exactly once lives in this file's header, where an
+// inner doc comment is legal: appended here, after items, `//!` is `E0753` and compiles
+// nothing in this target, so the copy that landed here is an ordinary comment.)
+// leaving a note here. (Line comments: an inner doc comment is only legal at a crate
+// root's head, so one in this tail is `E0753` and compiles no suite at all.)
 // suite's rule — what becomes of the record a client puts on the stream a stack deployed,
 // which only lands in a bucket if CloudFormation, IAM, Firehose and Amazon S3 all agree.
 #[path = "all/cloudformation_firehose_stream_direct_put_delivers.rs"]
@@ -3087,13 +3120,6 @@ mod s3_object_events_update_their_search_index;
 // service crate's test target can deploy the stack and then read the pool's roles back.
 #[path = "all/cloudformation_cognito_identity_role_attachment_refusal.rs"]
 mod cloudformation_cognito_identity_role_attachment_refusal;
-// leaving a note here. (Written as ordinary comments: an inner doc comment `//!` may only
-// appear before any item, so one in this appended tail is `E0753` and compiles nothing.)
-// crate's `tests/all.rs`.
-// leaving a note here. (These lines landed as INNER doc comments (`//!`) in this appended
-// tail, where only the crate root's own header may carry them: an inner doc comment past
-// the first item is `E0753` and compiles no suite of this target.)
-// leaving a note here. (Ordinary comments: appended after items, `//!` is `E0753`.)
 // leaving a note here. (These five lines are another fragment of this file's own header
 // that a merge of two appended tails landed down here; they are ordinary comments
 // because an inner doc comment may only appear before an item.)
@@ -3105,6 +3131,7 @@ mod cloudformation_cognito_identity_role_attachment_refusal;
 // is `E0753` and compiles no suite of this target.)
 // leaving a note here. (Plain comments: see the note above on `//!` in this tail.)
 // leaving a note here. (Plain comments: a `//!` line past the first item is `E0753`.)
+// leaving a note here. (Ordinary comments: appended after items, `//!` is `E0753`.)
 // it was appended here as well while two branches were landing at the same time.)
 // (`redshift_health_alarms_evaluate` is declared ONCE, further up this tail: a module may
 // be declared only once, and two branches landing at once appended it twice.)
@@ -3126,6 +3153,7 @@ mod cloudformation_cognito_identity_role_attachment_refusal;
 // tail: a module may be declared only once, however many landings append it here.)
 // Declared in the appended tail: what a session an identity pool vends may DO is decided by
 // IAM's record of the mapped role and
+// name is `E0428` and fails every suite in this target. `all/all_rs_declares_each_suite_once.rs`
 // checks that for this file and for every service crate's `tests/all.rs`, so check there
 // rather than leaving a note here.
 // Declared here, in this same head region, for the reason the entry above records: whether the
@@ -3137,6 +3165,8 @@ mod cloudformation_task_definition_runs_an_ecs_service;
 // leaving a note here. (These five lines are a fragment of this file's own header that a
 // merge of two appended tails landed down here; they are ordinary comments because an
 // inner doc comment may only appear before an item.)
+// leaving a note here. (Written as ordinary comments: an inner doc comment `//!` may only
+// appear before any item, so one in this appended tail is `E0753` and compiles nothing.)
 // (The crate-level guidance two concurrent landings appended here belongs to the module
 // header at the top of this file, where it now stands: an inner doc comment may only precede
 // items, so a `//!` line in this appended tail is `E0753` and compiles nothing.)
@@ -3146,8 +3176,6 @@ mod cloudformation_task_definition_runs_an_ecs_service;
 // this file and for every service crate's `tests/all.rs`. It is a LINE comment here: an
 // inner doc comment is only legal before the first item, so landing it in this tail failed
 // every suite in this target.)
-// this file and for every service crate's `tests/all.rs`. (An ordinary comment for the same
-// reason: an inner doc comment in this appended tail is `E0753`.)
 // this file and for every service crate's `tests/all.rs`. (The tail end of that same
 // header fragment, as an ordinary comment for the reason the lines above it record.)
 // this file and for every service crate's `tests/all.rs`. (Plain comment: see above.)
@@ -3253,6 +3281,15 @@ mod ecr_scan_on_push_event_reaches_its_queue_target;
 // above: two branches landing at once appended it here as well, and a module declared twice
 // (`cloudformation_kms_encrypted_sns_sqs_pipeline` is declared ONCE, further up this tail:
 // two landings each appended their own copy, and a module declared twice compiles neither.)
+// (A fragment of this file's own header that a merge of two appended tails landed down here;
+// it is an ordinary comment because an inner doc comment is only legal before the first
+// item, so landing it in this tail is `E0753` and compiles no suite of this target.)
+// this tail: two branches landing in the same window declared it here as well, which compiled
+// (`cloudfront_edge_4xx_share_decides_the_alarm` is declared once, in the sorted span above:
+// (`pricing_plan_subscription_resource_eligibility` is declared once, in the head region
+// (`bedrock_agent_ingestion_populates_its_s3_vectors_index` is declared once, further up this
+// tail: a module may be declared only once, and two branches landing at once each appended a
+// copy of it here.)
 // (The declaration rule these appended tails kept restating — one `mod` per suite, in this
 // one crate root — is stated once in this file's header and checked by
 // `all/all_rs_declares_each_suite_once.rs`; the fragments of that header which successive
@@ -3381,7 +3418,6 @@ mod apigateway_wafv2_waf_log_destination_gate;
 // (One more line of that same header fragment, appended here as an INNER doc comment: a
 // `//!` line past the first item of this crate root is `E0753`, so it stands as an ordinary
 // comment. The rule it repeats is in the module doc at the HEAD of this file.)
-// this tail: two branches landing in the same window declared it here as well, which compiled
 // (One more line of that same header fragment, which a concurrent landing appended here
 // typed with `//!`: an inner doc comment is legal only before the first item of a crate
 // root, so one in this tail is `E0753` and compiles no suite of this target. The rule it
@@ -3636,6 +3672,10 @@ mod chime_deleted_meeting_tagging;
 // (A stray line of that same repeated rule, an ordinary comment for the same reason:)
 // leaving a note here. (Ordinary line comments: an inner doc comment `//!` is only legal
 // before the first item of a crate root, so one in this appended tail is `E0753`.)
+// ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and a
+// note written with `//!` anywhere but this header is `E0753` — either fails every
+// suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the
+// declarations, for this file and for every service crate's `tests/all.rs`.
 // leaving a note here. (Ordinary comments: an inner doc comment `//!` is only legal before
 // (A leftover of that same appended note: it is a LINE comment here, for the reason the
 // entry above records.) this file and for every service crate's `tests/all.rs`.
@@ -3745,6 +3785,14 @@ mod iam_denial_reason_attribution;
 // comment is only legal before the first item of a crate root.)
 // this file and for every service crate's `tests/all.rs`. (An ordinary comment, for the reason
 // the lines above record.)
+// (Declared ONCE, in the head region above: the copy that stood here was a second
+// declaration two branches landing in the same window each appended.)
+// A suite is declared exactly ONCE: this is one crate root, so a second `mod` for the same
+// checks that for this file and for every service crate's `tests/all.rs`.
+// crate's `tests/all.rs`.
+// leaving a note here. (These lines landed as INNER doc comments (`//!`) in this appended
+// tail, where only the crate root's own header may carry them: an inner doc comment past
+// the first item is `E0753` and compiles no suite of this target.)
 // (The lines below arrived as INNER doc comments (`//!`) in this appended tail, where
 // is `E0753` and fails every suite in this target, so what the guidance says stands in the
 // header at the top of this file and the duplicates appended here are removed.)
@@ -3938,6 +3986,23 @@ mod cloudwatch_cfn_alarm_action_topic_policy;
 // stand as ordinary comments.)
 // this file and for every service crate's `tests/all.rs`. (Also `//` rather than `//!`,
 // for the reason the note above records.)
+// this file and for every service crate's `tests/all.rs`, and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks that a note like this
+// one stays HERE: an inner doc comment past the first item is `E0753`, so the same note
+// appended to the tail of this file would compile no suite of this target.
+// Declared ONCE in the head region of this file, for the reason the entry there records: the
+// IaC form of an EventBridge fan-out — one stack's rule with a Lambda target and a Step
+// Functions target under a target role — spans CloudFormation, EventBridge, Lambda, Step
+// Functions, IAM, STS and Amazon SQS at once. Two landings in the same window each appended a
+// declaration here as well, and a module declared twice compiles neither.
+// this file and for every service crate's `tests/all.rs`. (An ordinary comment for the same
+// reason: an inner doc comment in this appended tail is `E0753`.)
+// leaving a note here. (Ordinary comments: the same guidance stands as `//!` in the header
+// of this file, where an inner doc comment is legal; one down here is `E0753`.)
+// leaving a note here. (Ordinary comments: the guidance stands as `//!` in this file's
+// header, the one place an inner doc comment is legal.)
+// this file and for every service crate's `tests/all.rs`. (Ordinary comments, for the
+// reason the notes around them record: `//!` past the first item is `E0753`.)
 // (One more fragment of that header, appended here while branches were landing at once:
 // past the first item a `//!` line is `E0753` and compiles no suite in this target, so it
 // stands as an ordinary comment.) A suite left at the top level of `tests/` fails the build.
@@ -4080,6 +4145,28 @@ mod cloudformation_cloudfront_fronted_rest_api;
 // compiles no suite of this target. The rule it states stands at the head of this file.)
 // (That same header fragment once more, as an ordinary comment: a `//!` line past the first
 // item of this crate root is `E0753`, so it stands as a line comment and the rule it repeats
+// ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and fails
+// every suite in this target. `all/all_rs_declares_each_suite_once.rs` checks that for
+// this file and for every service crate's `tests/all.rs`, and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks that a note like this
+// one stays at the head: an inner doc comment past the first item is `E0753`, so the same
+// note appended to the tail of this file compiles no suite of this target.
+// doc comment past the first item is `E0753` and compiles no suite in this target, so this
+// fragment of the header stands as a line comment; the rule it states is at the head of
+// reason the appended fragments below record.)
+// suite left at the top level of `tests/` fails the build.
+// Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the
+// same name is `E0428` and fails every suite in this target, and an inner doc comment
+// like these lines is legal only BEFORE the first item, so one appended into the tail is
+// `E0753` and compiles nothing. `all/all_rs_declares_each_suite_once.rs` and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that for
+// leaving a note in the tail.
+// this file and for every service crate's `tests/all.rs`, so check there rather than
+// leaving a note here.
+// ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and a
+// note written with `//!` anywhere but this header is `E0753` — either fails every
+// suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the
+// declarations, for this file and for every service crate's `tests/all.rs`.
 // leaving a note here. (A fragment of this file's own header that a merge of two appended
 // tails landed down here; ordinary comments, because an inner doc comment `//!` may only
 // appear before the first item and one in this tail is `E0753`.)
@@ -4384,12 +4471,6 @@ mod cloudformation_appsync_custom_domains;
 // reason the lines around them record.)
 // declarations, for this file and for every service crate's `tests/all.rs`. (Four more
 // lines of that header fragment, ordinary comments for the reason they state.)
-//! ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and a
-//! note written with `//!` anywhere but this header is `E0753` — either fails every
-//! suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the
-//! declarations, for this file and for every service crate's `tests/all.rs`.
-//! this file and for every service crate's `tests/all.rs`, so check there rather than
-//! leaving a note here.
 // each appended a declaration of it here, which is `E0428` and compiles no suite of this
 // target, so the duplicate is gone and the first declaration stands.)
 // leaving a note here. (Written as ordinary comments: an inner doc comment is only legal

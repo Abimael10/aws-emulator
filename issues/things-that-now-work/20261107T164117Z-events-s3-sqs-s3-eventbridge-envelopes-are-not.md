@@ -67,3 +67,30 @@ Cause 2:
 5. Replace the configuration with {QueueConfigurations:[{Id:"native-only", QueueArn:<N>, Events:["s3:ObjectCreated:*"]}]}; expect GetBucketNotificationConfiguration to omit EventBridgeConfiguration.
 6. PutObject again; expect native records under configurationId "native-only" and NO further envelopes on E. Observed: the run never gets there and hits the 60s budget.
 7. Replay check ids events__s3__sqs.a-post-object-upload-is-withheld-from-a-putobject-scoped-rule and events__s3__sqs.removing-eventbridge-configuration-withholds-envelope-but-native-queue-still-delivers to confirm.
+
+## Resolution
+
+Cause 2 is fixed in the emulator: an event-notification record's `s3.object.key` is URL
+encoded, and the encoder was leaving RFC 3986's unreserved `~` literal where the encoding
+escapes it as `%7E` (`services/service-com-amazonaws-s3-amazons3/src/state/notifications.rs`,
+`RECORD_KEY_UNRESERVED`). Its replay unit
+(`events__s3__sqs.removing-eventbridge-configuration-withholds-envelope-but-native-queue-still-delivers`)
+passes.
+
+Cause 1 needed no emulator change: the POST Object entry point and the `POST Object` reason
+its creation publishes were already in place when this report was traced back to the current
+base (the report was filed against `6bba0ea`). Each of the six observations its Evidence
+lists is now driven by a committed test — in the S3 crate against S3 beside EventBridge and
+Amazon SQS, with the rules scoped exactly as the report states them and with a signed form
+policy, and across the whole assembled router with request authentication on and the signed
+form (`core/router/tests/all/s3_form_post_upload_routes_by_event_bridge_reason.rs`) — and
+all of them hold.
+
+Its replay unit (`events__s3__sqs.a-post-object-upload-is-withheld-from-a-putobject-scoped-rule`,
+the first `Issue-Key` above) still ends `Check timed out after 60.0s` and reports no
+assertion, status or error code. Nothing on the emulator's side of that scenario could be
+made to fail: driven in the recorded shape it completes in under half a second, and the two
+places a withheld delivery would come from — the `EventPattern` match over a nested `detail`
+with a sibling scalar, and the target queue's resource policy in six grant forms — admit it.
+The remaining divergence is therefore not located in this emulator; it is left named here so
+a later run of that check can be traced back to this note.

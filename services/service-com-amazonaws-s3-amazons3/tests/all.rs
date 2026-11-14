@@ -285,6 +285,8 @@ mod object_encryption;
 mod object_encryption_update;
 #[path = "all/object_etag_under_encryption.rs"]
 mod object_etag_under_encryption;
+#[path = "all/object_event_dual_destinations.rs"]
+mod object_event_dual_destinations;
 #[path = "all/object_event_notifications.rs"]
 mod object_event_notifications;
 #[path = "all/object_event_sequencer_order.rs"]

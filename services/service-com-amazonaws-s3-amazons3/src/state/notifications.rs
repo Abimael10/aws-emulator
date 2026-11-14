@@ -335,17 +335,19 @@ impl ObjectEvent {
     }
 }
 
-/// The characters the key in a published record is NOT percent-encoded over: RFC 3986's
-/// unreserved set plus the `/` of a key prefix.
+/// The characters the key in a published record is NOT percent-encoded over: the
+/// alphanumerics, the three unreserved punctuation characters URL encoding leaves alone
+/// (`-`, `_` and `.`) and the `/` of a key prefix.
 ///
-/// A record's key "is URL encoded" (Amazon S3 User Guide, *Event message structure*),
-/// which is why the published value is encoded at all; the path separator is left alone
-/// so a prefixed key reads as the path it is.
+/// A record's key "is URL encoded" (Amazon S3 User Guide, *Event message structure*): a
+/// space is published as `+` and a character outside that set is percent-encoded from its
+/// UTF-8 bytes — the `~` among them, which is unreserved to RFC 3986 and is published as
+/// `%7E`. The path separator is left alone on top of that, so a prefixed key reads as the
+/// path it is.
 const RECORD_KEY_UNRESERVED: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
     .remove(b'-')
-    .remove(b'_')
     .remove(b'.')
-    .remove(b'~')
+    .remove(b'_')
     .remove(b'/');
 
 /// `key` as a published record spells it.
@@ -1600,6 +1602,15 @@ mod tests {
             ("a key with a space", "red flower.jpg", "red+flower.jpg"),
             ("a key with parentheses", "test_file(3).png", "test_file%283%29.png"),
             ("a non-ASCII key", "café.txt", "caf%C3%A9.txt"),
+            // Every character outside the encoding's own set is escaped, among them the
+            // characters RFC 3986 leaves unreserved.
+            ("a key with a tilde", "backup~1.txt", "backup%7E1.txt"),
+            ("a key with a plus and an equals", "q3=2026+final", "q3%3D2026%2Bfinal"),
+            (
+                "a key of the characters the encoding leaves alone",
+                "input-1/report_v.2",
+                "input-1/report_v.2",
+            ),
         ];
         for (case, key, expected) in rows {
             let published = record_key(key);

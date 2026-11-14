@@ -18844,6 +18844,7 @@ dependencies = [
  "aws-sdk-lambda",
  "aws-sdk-sns",
  "aws-sdk-sqs",
+ "aws-sigv4",
  "aws-smithy-checksums",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",

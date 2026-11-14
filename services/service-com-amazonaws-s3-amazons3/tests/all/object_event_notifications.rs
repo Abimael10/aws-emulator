@@ -679,11 +679,19 @@ impl<'a> Destination<'a> {
     }
 }
 
-/// `key` as a REQUEST addresses it: the path segment a client sends, with the one
-/// character the rows carry that a URI cannot hold literally percent-encoded. What S3
-/// then stores is the decoded key, which is what the assertions compare against.
+/// `key` as a REQUEST addresses it: the path segment a client sends, percent-encoded over
+/// everything a URI cannot hold literally — RFC 3986's unreserved set and the `/` of a key
+/// prefix are the only characters left alone, so a key carrying a space, a `+`, an `=` or a
+/// non-ASCII character addresses the key the caller meant. What S3 then stores is the
+/// decoded key, which is what the assertions compare against.
 pub(crate) fn request_key(key: &str) -> String {
-    key.replace(' ', "%20")
+    const UNRESERVED: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~')
+        .remove(b'/');
+    ::percent_encoding::utf8_percent_encode(key, UNRESERVED).to_string()
 }
 
 /// The ARN of the queue named `name` in this account.

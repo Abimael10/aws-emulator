@@ -100,6 +100,10 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The SigV4 key schedule a BROWSER-FORM upload's policy is signed under: the form-upload
+# suite signs its policy with the SDK signer's own derivation rather than carrying a second
+# copy of it.
+aws-sigv4 = { workspace = true }
 # `quick-xml` above is also what the tests read a restXml body with.
 # EventBridge, SQS and Lambda are mounted beside S3 in the event-notification test:
 # without them there is nowhere for an object event to be delivered, and what that suite
