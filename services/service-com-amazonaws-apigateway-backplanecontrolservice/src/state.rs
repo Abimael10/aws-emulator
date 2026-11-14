@@ -2846,8 +2846,10 @@ pub struct Page {
     /// page, which is where the next page RESUMES. Absent once nothing follows the page,
     /// and that absence is what ends a walk of the collection.
     pub next_position: Option<String>,
-    /// The page size the REQUEST asked for; see [`Page::echoed_limit`].
-    requested_limit: Option<i32>,
+    /// The page size the service APPLIED to cut this page, for a request that asked for
+    /// one: the size it asked for, held inside the range the member publishes. Absent
+    /// when the request asked for no size at all. See [`Page::echoed_limit`].
+    applied_limit: Option<i32>,
 }
 
 impl Page {
@@ -2870,17 +2872,22 @@ impl Page {
             // what tells a caller the collection has ended.
             next_position: ordered.get(end).cloned(),
             ids,
-            requested_limit: limit,
+            // The page was cut to `size`, so that — and not the number the request
+            // carried — is the size this page HAS, whichever end of the published range
+            // the requested one lay outside of.
+            applied_limit: limit.map(|_| size),
         }
     }
 
-    /// The page size this answer echoes: the one the REQUEST asked for, for a page the
-    /// collection carries on after — the member states what the caller asked of a
-    /// collection it has not finished walking, so a request that asked for no size is
-    /// told none. The page that ends the collection paged nothing further, and reports
-    /// neither a size nor a cursor.
+    /// The page size this answer echoes: the size the page was CUT to, for a page the
+    /// collection carries on after — the member states the window the caller is being
+    /// paged through, which is the requested size held inside the range the member
+    /// publishes, so a request that asked for a size outside that range is told the size
+    /// it was served and a request that asked for no size is told none. The page that
+    /// ends the collection paged nothing further, and reports neither a size nor a
+    /// cursor.
     pub fn echoed_limit(&self) -> Option<i32> {
-        self.requested_limit.filter(|_| self.next_position.is_some())
+        self.applied_limit.filter(|_| self.next_position.is_some())
     }
 
     /// The page of elements as the answer's collection member REPORTS it: PRESENT, and

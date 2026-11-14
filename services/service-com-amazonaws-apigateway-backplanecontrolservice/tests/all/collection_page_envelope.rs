@@ -17,7 +17,8 @@
 //!   back every element exactly once;
 //! * a page the collection holds nothing after reports no cursor, which is what ends a
 //!   walk, and no echoed page size either; a page it does hold something after echoes the
-//!   page size the request asked for, and nothing when the request asked for none;
+//!   page size it was CUT to — the requested size held inside the published range — and
+//!   nothing when the request asked for none;
 //! * a collection that holds no element reports the page member as the EMPTY list, the
 //!   same shape as the page past the last element of a collection that does hold
 //!   elements;
@@ -218,8 +219,10 @@ async fn a_page_reports_the_cursor_the_collection_carries_on_at_and_echoes_the_s
         for size in page_sizes() {
             let gateway = Gateway::new();
             let listing = stand_up(&gateway, collection, COUNT).await;
-            let effective =
-                usize::try_from(size.clamp(1, i64::from(MAX_PAGE_LIMIT))).unwrap_or(1);
+            // The size the collection is PAGED by: the requested one, held inside the
+            // range the member publishes, which is what a page both holds and echoes.
+            let applied = size.clamp(1, i64::from(MAX_PAGE_LIMIT));
+            let effective = usize::try_from(applied).unwrap_or(1);
             let case = format!("{collection}(limit={size})");
 
             let mut walked: Vec<String> = Vec::new();
@@ -248,11 +251,11 @@ async fn a_page_reports_the_cursor_the_collection_carries_on_at_and_echoes_the_s
                      {reported:?}"
                 );
                 // The echoed page size travels with that cursor: a page the collection
-                // carries on after states what the caller asked of it, and the page that
-                // ends the collection echoes nothing.
+                // carries on after states the size it was cut to, and the page that ends
+                // the collection echoes nothing.
                 assert_eq!(
                     answer.body["limit"].as_i64(),
-                    reported.as_ref().map(|_| size),
+                    reported.as_ref().map(|_| applied),
                     "case {case}: round {round} echoes the page size beside the cursor, \
                      got {:?} for {reported:?}",
                     answer.body["limit"]

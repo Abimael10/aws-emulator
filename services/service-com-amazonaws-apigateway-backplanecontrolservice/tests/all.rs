@@ -164,8 +164,6 @@ mod domain_name_collection;
 mod domain_name_create_bounds;
 #[path = "all/domain_name_lifecycle.rs"]
 mod domain_name_lifecycle;
-#[path = "all/dynamodb_integration_template_written_item.rs"]
-mod dynamodb_integration_template_written_item;
 #[path = "all/dynamodb_service_integration.rs"]
 mod dynamodb_service_integration;
 #[path = "all/epoch_second_timestamps.rs"]
@@ -724,6 +722,13 @@ mod rest_api_policy_reporting;
 // Lambda and Amazon DynamoDB on one engine.
 #[path = "all/stage_cognito_gate_spares_its_backend.rs"]
 mod stage_cognito_gate_spares_its_backend;
+// Appended for the reason the note above gives: the PAGE SIZE a paginated collection
+// states beside the cursor it carries on at — the size the page was cut to, held inside
+// the range the `limit` member publishes.
+#[path = "all/collection_page_size_echo.rs"]
+mod collection_page_size_echo;
+#[path = "all/dynamodb_integration_template_written_item.rs"]
+mod dynamodb_integration_template_written_item;
 // Appended for the reason the note above gives: the WARNINGS a definition import reports
 // for a model reference the posted document does not resolve, and the `failOnWarnings`
 // refusal that states them.

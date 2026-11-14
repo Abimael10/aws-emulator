@@ -4183,3 +4183,8 @@ mod cloudformation_appsync_custom_domains;
 // leaving a note here. (Ordinary comments, for the reason they state themselves.)
 // the notes around it record.)
 // comment past the first item is `E0753`.)
+// past the first item of this crate root is `E0753` and compiles nothing.)
+// this file and for every service crate's `tests/all.rs`, which is why these lines stand
+// as ordinary comments rather than as a repeated header.
+// leaving a note here. (A plain comment: a `//!` line past the first item of this crate
+// root is `E0753` and compiles nothing.)

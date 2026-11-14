@@ -11,12 +11,14 @@
 //! else — `DocumentationParts` is `items` + `position`
 //! (`smithy_query(query="shape", shape="DocumentationParts")`), and `ApiKeys`,
 //! `BasePathMappings` and the rest are the same two members — while the service's own
-//! answer also ECHOES the page size the request asked for, as `limit`, beside the cursor
-//! the collection carries on at. A request that asked for no page size is told none (the
-//! member states what the caller requested, not the default the collection fell back
-//! to), and so is a request whose page ends the collection: the echo travels with the
-//! cursor, so an answer that reports no cursor reports no page size either
-//! (`crate::state::Page::echoed_limit`).
+//! answer also ECHOES the page size it APPLIED, as `limit`, beside the cursor the
+//! collection carries on at: the size the request asked for, held inside the range the
+//! member publishes, so a request that asked for a size outside that range is told the
+//! size it was served. A request that asked for no page size is told none (the member
+//! states the window the caller asked to be paged through, not the default the
+//! collection fell back to), and so is a request whose page ends the collection: the
+//! echo travels with the cursor, so an answer that reports no cursor reports no page
+//! size either (`crate::state::Page::echoed_limit`).
 //!
 //! `#[smithy_macros::smithy(shape = …)]` derives a structure's schema and serializer
 //! from the model's member list and admits exactly that list, so the echo cannot be a
@@ -40,8 +42,8 @@
 pub struct Paged<Collection> {
     /// The modelled collection shape: the page of elements and the `position` cursor.
     pub collection: Collection,
-    /// The page size the request asked for, echoed back; `None` when it asked for none,
-    /// and `None` for the page that ends the collection.
+    /// The page size the collection was paged by, echoed back; `None` when the request
+    /// asked for none, and `None` for the page that ends the collection.
     pub limit: Option<i32>,
 }
 

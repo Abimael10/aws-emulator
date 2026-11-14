@@ -4,7 +4,7 @@
 //! IMPLEMENTED: reports the stored `DocumentationPart`s of `restApiId` in the order of
 //! the ADDRESSES of the API entities they document, narrowed by the request's `type`,
 //! `name`, `path` and `locationStatus` filters and cut into a `position`/`limit` page,
-//! with `position` naming the location the collection carries on at and the requested
+//! with `position` naming the location the collection carries on at and the applied
 //! `limit` echoed beside it.
 //!
 //! ## Shape of an operation
