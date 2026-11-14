@@ -41,6 +41,8 @@ mod identifier_and_capacity_rules;
 mod job_attempt_records;
 #[path = "all/job_definition_deregistration.rs"]
 mod job_definition_deregistration;
+#[path = "all/job_definition_read_projection.rs"]
+mod job_definition_read_projection;
 #[path = "all/job_definition_registry.rs"]
 mod job_definition_registry;
 #[path = "all/job_definition_response_request_id.rs"]

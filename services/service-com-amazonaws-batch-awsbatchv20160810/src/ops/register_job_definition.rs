@@ -23,7 +23,10 @@
 //!
 //! What IS stored is normalised first: an environment variable stated with an empty value
 //! says nothing about the name it carries, so AWS Batch keeps no such variable and neither
-//! does the revision written here ([`crate::state::normalize_environments`]).
+//! does the revision written here ([`crate::state::normalize_environments`]). A definition
+//! that runs on Fargate is additionally stored carrying the platform version its
+//! containers will run on, which is the documented default when the request names none
+//! ([`crate::state::apply_fargate_platform_defaults`]).
 //!
 //! The per-node-range requirement — every `nodeProperties.nodeRangeProperties` entry must
 //! carry the containers its nodes run — is checked BEFORE the properties
@@ -471,6 +474,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             node_properties.as_mut(),
             ecs_properties.as_mut(),
         );
+        // "If one isn't specified, the LATEST platform version is used by default"
+        // (`FargatePlatformConfiguration$platformVersion` and
+        // `EcsTaskProperties$platformVersion`). The version decides how the job will
+        // really run, so a definition that runs on Fargate is STORED carrying it and
+        // every later read of the revision reports it.
+        if on_fargate {
+            crate::state::apply_fargate_platform_defaults(
+                container_properties.as_mut(),
+                ecs_properties.as_mut(),
+            );
+        }
 
         let mut store = state.lock();
         // The store is in memory and every request adds to it, so the number of

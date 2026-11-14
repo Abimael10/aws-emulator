@@ -7980,3 +7980,17 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // which is `E0428` and compiled no suite of this target.)
 // copy that stood here was a second declaration two concurrent landings each appended.)
 // appended.)
+//! Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the
+//! same name is `E0428`. An inner doc comment (`//!`) is legal only before the first
+//! item, so these header lines are the only place one may stand — a note further down
+//! this file must be an ordinary `//` comment, or it is `E0753` and compiles no suite of
+//! this target. `all/all_rs_declares_each_suite_once.rs` and
+//! for this file and for every service crate's `tests/all.rs`.
+// (More such notes stood here and are gone rather than re-typed, for the reason the note at
+// the end of this file records.)
+// (The header-fragment copies landings appended between these two declarations are gone
+// rather than re-typed, for the reason the note at the end of this file records.)
+// (The header copies and duplicate-declaration notes that concurrent landings appended to
+// this tail are gone rather than re-typed: the rules they each repeated — declare every
+// suite exactly ONCE, and keep an inner doc comment in the header, where the language
+// accepts it — stand in the module doc at the HEAD of this file, and

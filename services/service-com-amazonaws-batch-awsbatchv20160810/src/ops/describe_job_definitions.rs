@@ -9,6 +9,11 @@
 //! `(name, revision)` order, one `maxResults` page at a time with an opaque
 //! `nextToken` cursor to the next.
 //!
+//! Each revision is reported through the one job-definition projection
+//! ([`crate::state::described_job_definition`]): its collections are MATERIALISED, so a
+//! member the register supplied nothing for comes back as an empty map or list rather
+//! than as a missing member.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -247,11 +252,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_token = Some(crate::state::encode_page_token(&key.0, key.1));
                 break;
             }
-            let mut detail = definition.clone();
-            // Always materialised: a revision registered with no tags is described with an
-            // EMPTY map, never with the member missing.
-            detail.tags = crate::state::materialized_tags(&detail.tags);
-            page.push(detail);
+            // The stored revision, with its collections MATERIALISED: a member nothing
+            // was supplied for is described as an empty map or list, never as a missing
+            // member (`crate::state::described_job_definition`).
+            page.push(crate::state::described_job_definition(definition));
         }
 
         Ok(DescribeJobDefinitionsOutput {

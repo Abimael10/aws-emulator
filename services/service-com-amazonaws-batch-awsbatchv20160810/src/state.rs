@@ -75,11 +75,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod array_jobs;
 mod input_rules;
+mod job_definition_projection;
 mod job_logs;
 mod placement;
 
 pub use array_jobs::*;
 pub use input_rules::*;
+pub use job_definition_projection::*;
 pub use job_logs::*;
 pub use placement::*;
 
