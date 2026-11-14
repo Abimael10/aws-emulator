@@ -3,7 +3,9 @@
 //! @op CreateNetworkAclEntry
 //! IMPLEMENTED: stores one entry (a rule) on the network ACL the request names, in the
 //! place the service reports it in, so `DescribeNetworkAcls` reads back the rule the caller
-//! configured. This is the ONLY file to touch for this operation.
+//! configured. A create that asks for the rule the ACL already holds succeeds and writes
+//! nothing; only a different rule at a number the ACL already has an entry at is a conflict.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -223,9 +225,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "After you add an entry, you can't modify it; you must either replace it, or
         // create an entry and delete the old one" (this operation's own doc), so one rule
-        // number in one direction names one entry and a create never overwrites it.
-        if store.network_acl_holds_entry(network_acl_id, input.rule_number, input.egress) {
-            return Err(state::network_acl_entry_already_exists(input.rule_number));
+        // number in one direction names one entry and a create never overwrites it. What
+        // decides between the two is the CONTENTS of the entry that is already there: a
+        // create that asks for the rule the ACL already holds has nothing left to do and
+        // succeeds, leaving that one entry alone, and only a create that asks for a
+        // DIFFERENT rule at a number the ACL has an entry at is the conflict this code
+        // refuses. One read of the stored entry answers both.
+        if let Some(stored) =
+            store.network_acl_entry_at(network_acl_id, input.rule_number, input.egress)
+        {
+            if !state::same_network_acl_entry(stored, &entry) {
+                return Err(state::network_acl_entry_already_exists(input.rule_number));
+            }
+            // The request is one that would have succeeded, so a dry run answers the same
+            // thing here as it does below: "If you have the required permissions, the error
+            // response is DryRunOperation" (`$DryRun`).
+            if input.dry_run.unwrap_or(false) {
+                return Err(state::dry_run_operation());
+            }
+            // Nothing is written: the entry the request asks for is already the entry the
+            // ACL holds, so the ACL still reports exactly one rule at this number in this
+            // direction and the store is charged for it once.
+            return Ok(CreateNetworkAclEntryOutput);
         }
 
         // The ACL's own ceiling first, then the store's byte budget: a rule count on its own

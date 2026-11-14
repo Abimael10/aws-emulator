@@ -6907,3 +6907,45 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (The notes successive landings appended below this point were copies of this file's head
 // module doc and of `mod` lines already declared above; they are gone rather than re-worded,
 // and the rules stand once, in the module doc at the HEAD of this file.)
+// `cloudformation_scripted_queue_deploy` were each declared a SECOND time here by branches
+// landing at once, which compiled neither copy; each stands declared once in the sorted
+// spans at the head of this file, so the copies that stood here are gone.)
+// this file: two branches landing at once appended a second declaration of it here, which
+// compiled neither copy, so the copy that stood here is gone.)
+// the head of this file: two branches landing at once appended a second declaration of it
+// here, which compiled neither copy, so the copy that stood here is gone.)
+// two branches landing at once appended a second declaration of it here, which compiled
+// neither copy, so the copy that stood here is gone.)
+// which compiled neither, so the copy that stood here is gone.)
+// it, so the fragment is gone rather than re-typed. The second declaration of
+// `cloudwatch_cfn_alarm_action_topic_policy` that stood here is gone for the same reason:
+// it is declared ONCE, further up this file.)
+// (Fragments of this file's own header that landings appended into this tail, and the notes
+// recording declarations removed as duplicates, are collapsed into this one note: the rules
+// they repeat stand in the module doc at the HEAD of this file, which is the only place an
+// inner doc comment is legal, and every suite they named stands declared exactly once above.)
+// (And the rest of that run of notes, collapsed the same way: the rule they repeat is in the
+// module doc at the HEAD of this file, and every suite they named is declared once above.)
+// recording declarations removed as duplicates, are gone rather than re-typed: the rules they
+// repeat stand in the module doc at the HEAD of this file, which is the only place an inner
+// doc comment is legal — one past the first item is `E0753` and compiles no suite of this
+// (`s3_form_post_upload_routes_by_event_bridge_reason` is declared ONCE, further up this
+// file: two landings in the same window each appended a declaration of it, which compiled
+// (More of the same: header fragments and duplicate-declaration notes successive landings
+// appended here are gone rather than re-typed, every suite they named standing declared
+// exactly once above.)
+// (The notes those landings left about declarations removed as duplicates are collapsed into
+// this one: every suite they named stands declared exactly once above.)
+// (And the same again for the block that stood here: header fragments and
+// duplicate-declaration notes successive landings appended into this tail are collapsed into
+// one note, every suite they named standing declared exactly once above and the rules they
+// repeated standing in the module doc at the HEAD of this file.)
+// (More of the same, collapsed into one note: every suite those appended declarations named
+// stands declared exactly once above.)
+// (Everything successive landings appended below the declarations above — fragments of this
+// file's own header, and notes about declarations removed as duplicates — is collapsed into
+// this one note, for the one reason all of them record: a second `mod` of one name is
+// `E0428`, an inner doc comment past the first item is `E0753`, and either compiles no suite
+// of this target. Every suite they named stands declared exactly once above, and the rule
+// itself is in the module doc at the HEAD of this file.)
+// (Another run of the same appended notes, collapsed into this one line.)

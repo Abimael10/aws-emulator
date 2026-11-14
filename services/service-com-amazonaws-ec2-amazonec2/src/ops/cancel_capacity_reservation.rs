@@ -241,6 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let quote_state = quote.quote_state_at(now).to_string();
             if quote_state != state::CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE {
+                // A quote is generated usable, so the one state a stored quote reaches that
+                // this cancellation cannot be paid for with is the `expired` the clock moves
+                // it into once it stops being valid.
                 return Err(state::incorrect_state(format!(
                     "The cancellation quote '{quote_id}' is in state '{quote_state}', not \
                      '{active}', so it cannot be used for a cancellation",

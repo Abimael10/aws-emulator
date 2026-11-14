@@ -121,6 +121,42 @@ pub fn network_acl_entry_report_order(entry: &NetworkAclEntry) -> (bool, i32) {
     )
 }
 
+/// Whether two network ACL entries are the SAME RULE, member for member: the direction and
+/// rule number that name the entry, and every member that says what it matches and what it
+/// does with it.
+///
+/// The two members a reader fills in ([`reported_network_acl_entry`] gives an entry whose
+/// protocol has no ICMP numbers or no ports an EMPTY pair rather than none at all) are
+/// compared through their REPORTED value, so an entry a request describes and the entry a
+/// store holds are judged on one shape and a request that named neither is still the same
+/// rule. Read from each side rather than by projecting a copy of it, so a comparison
+/// allocates nothing; the projection stays the one place a STORED entry's shape is decided.
+///
+/// The ONE definition of "this rule is already there", for the writers that have to tell an
+/// entry already exactly as asked for from a DIFFERENT rule occupying the same number.
+pub fn same_network_acl_entry(left: &NetworkAclEntry, right: &NetworkAclEntry) -> bool {
+    let icmp = |entry: &NetworkAclEntry| {
+        entry
+            .icmp_type_code
+            .as_ref()
+            .map_or((None, None), |icmp| (icmp.r#type, icmp.code))
+    };
+    let ports = |entry: &NetworkAclEntry| {
+        entry
+            .port_range
+            .as_ref()
+            .map_or((None, None), |range| (range.from, range.to))
+    };
+    left.rule_number == right.rule_number
+        && left.egress.unwrap_or(false) == right.egress.unwrap_or(false)
+        && left.protocol == right.protocol
+        && left.rule_action == right.rule_action
+        && left.cidr_block == right.cidr_block
+        && left.ipv6_cidr_block == right.ipv6_cidr_block
+        && icmp(left) == icmp(right)
+        && ports(left) == ports(right)
+}
+
 /// Refuse an entry the ACL already holds at that rule number and direction: HTTP 400
 /// [`NETWORK_ACL_ENTRY_ALREADY_EXISTS`], naming the rule number the request sent.
 pub fn network_acl_entry_already_exists<E>(rule_number: i32) -> Scaffolded<E> {
@@ -434,27 +470,42 @@ pub fn validated_network_acl_entry<E>(
 }
 
 impl ComAmazonawsEc2Amazonec2State {
-    /// Whether the network ACL `network_acl_id` already holds an entry at `rule_number` in
-    /// the direction `egress` names.
+    /// The entry the network ACL `network_acl_id` holds at `rule_number` in the direction
+    /// `egress` names, or `None` when it holds none there.
     ///
     /// "Each network ACL has a set of numbered ingress rules and a separate set of numbered
     /// egress rules" (`CreateNetworkAclEntry`), so one rule number identifies one entry
-    /// WITHIN a direction and the same number may be used in both.
+    /// WITHIN a direction and the same number may be used in both — which is what makes this
+    /// one entry rather than a set. A writer that has to tell an entry already exactly as
+    /// asked for from a DIFFERENT rule at that number reads the stored entry here and
+    /// compares it with [`same_network_acl_entry`], in ONE pass over the ACL's entries.
+    pub fn network_acl_entry_at(
+        &self,
+        network_acl_id: &str,
+        rule_number: i32,
+        egress: bool,
+    ) -> Option<&NetworkAclEntry> {
+        self.network_acls
+            .get(network_acl_id)
+            .and_then(|network_acl| network_acl.entries.as_deref())
+            .and_then(|entries| {
+                entries.iter().find(|entry| {
+                    entry.rule_number == Some(rule_number)
+                        && entry.egress.unwrap_or(false) == egress
+                })
+            })
+    }
+
+    /// Whether the network ACL `network_acl_id` already holds an entry at `rule_number` in
+    /// the direction `egress` names — [`Self::network_acl_entry_at`] asked as a question.
     pub fn network_acl_holds_entry(
         &self,
         network_acl_id: &str,
         rule_number: i32,
         egress: bool,
     ) -> bool {
-        self.network_acls
-            .get(network_acl_id)
-            .and_then(|network_acl| network_acl.entries.as_deref())
-            .is_some_and(|entries| {
-                entries.iter().any(|entry| {
-                    entry.rule_number == Some(rule_number)
-                        && entry.egress.unwrap_or(false) == egress
-                })
-            })
+        self.network_acl_entry_at(network_acl_id, rule_number, egress)
+            .is_some()
     }
 
     /// How many entries of the network ACL `network_acl_id` count against

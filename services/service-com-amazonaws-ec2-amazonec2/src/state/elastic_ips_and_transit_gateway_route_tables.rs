@@ -629,14 +629,21 @@ pub const CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_PREFIX: &str = "crcq";
 pub const RESOURCE_TYPE_CAPACITY_RESERVATION_CANCELLATION_QUOTE: &str =
     "capacity-reservation-cancellation-quote";
 
-/// The state a quote is generated in: the `pending` member of the modelled
-/// `CapacityReservationCancellationQuoteState` enum
+/// The `pending` member of the modelled `CapacityReservationCancellationQuoteState` enum
 /// (`smithy_query(query="shape",shape="CapacityReservationCancellationQuoteState")`), the one
-/// word that enum carries for a quote that has been asked for and is not usable yet.
+/// word that enum carries for a quote whose terms are not settled yet.
+///
+/// No quote of this store is ever written in it: a generate computes the whole document it
+/// answers with before it stores it
+/// ([`ComAmazonawsEc2Amazonec2State::insert_capacity_reservation_cancellation_quote`]), so
+/// there is nothing left for a caller to wait for. It stays named here because it is a value
+/// of the modelled enum, which the state words of this resource are kept beside rather than
+/// leaving one of them to be spelled somewhere else when it is needed.
 pub const CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING: &str = "pending";
 
 /// That enum's `active` member — the state a quote has to be in to be used: "The cancellation
-/// quote must be in an active state" (`CancelCapacityReservationRequest$QuoteId`).
+/// quote must be in an active state" (`CancelCapacityReservationRequest$QuoteId`), and the
+/// state a generate mints one in.
 pub const CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE: &str = "active";
 
 /// That enum's `expired` member, where a quote sits once the wall clock has passed the
@@ -678,55 +685,38 @@ pub fn capacity_reservation_cancellation_quote_payload_bytes(
     tag_list_bytes(quote.tags.as_deref().unwrap_or_default())
 }
 
-/// What the clock owes one stored cancellation quote next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapacityReservationCancellationQuoteMove {
-    /// `pending` -> `active`: the quote is generated and usable.
-    Active,
-}
-
-/// The move the clock owes one cancellation quote: a [`ClockTransition`] to the next
-/// [`CapacityReservationCancellationQuoteMove`].
-pub type CapacityReservationCancellationQuoteTransition =
-    ClockTransition<CapacityReservationCancellationQuoteMove>;
-
 /// One stored Capacity Reservation cancellation quote: the modelled
-/// [`CapacityReservationCancellationQuote`] every operation that reports one answers with,
-/// plus the move the clock owes it.
+/// [`CapacityReservationCancellationQuote`] every operation that reports one answers with.
 ///
 /// The view is the modelled shape itself rather than a parallel record, so every member a
 /// writer sets round-trips through a reader without a field-by-field copy that can silently
-/// drop one — the same arrangement [`CapacityReservationRecord`] uses.
+/// drop one — the same arrangement [`CapacityReservationRecord`] uses. The one move a quote
+/// has is the clock's and is derived rather than stored
+/// ([`CapacityReservationCancellationQuoteRecord::quote_state_at`]), so there is no pending
+/// transition to carry beside the view.
 #[derive(Debug, Clone)]
 pub struct CapacityReservationCancellationQuoteRecord {
     /// The quote as the model shapes it.
     pub view: CapacityReservationCancellationQuote,
-    /// The move the clock owes this quote, while one is owed.
-    pub pending: Option<CapacityReservationCancellationQuoteTransition>,
 }
 
 impl CapacityReservationCancellationQuoteRecord {
     /// The quote's `CapacityReservationCancellationQuoteState` as it was last WRITTEN.
     ///
-    /// [`Self::quote_state_at`] is what a reader reports: both of a quote's moves are facts
-    /// of where the clock stands rather than something a writer stored.
+    /// [`Self::quote_state_at`] is what a reader reports: a quote's one move is a fact of
+    /// where the clock stands rather than something a writer stored.
     pub fn quote_state(&self) -> &str {
         self.view.quote_state.as_deref().unwrap_or_default()
     }
 
     /// The quote's state at `now`.
     ///
-    /// Two facts of the clock are derived here rather than stored, so a read reports what was
-    /// already due without writing anything:
-    ///
-    /// * The end of the wait for the quote to be generated: it is answered `pending` and the
-    ///   move to `active` fell due at the wall-clock instant its
-    ///   [`CapacityReservationCancellationQuoteTransition`] names ([`ClockTransition::at`]),
-    ///   whether or not anybody called again.
-    /// * The end of its validity: "Cancellation quotes are valid for 24 hours"
-    ///   (`CreateCapacityReservationCancellationQuote`), so a quote is `expired` from the
-    ///   `ExpirationTime` it carries on — which outranks the move above, a quote never
-    ///   becoming usable after it has stopped being valid.
+    /// The end of its validity is derived here rather than stored, so a read reports what was
+    /// already due without writing anything: "Cancellation quotes are valid for 24 hours"
+    /// (`CreateCapacityReservationCancellationQuote`), so a quote is `expired` from the
+    /// `ExpirationTime` it carries on, whether or not anybody called again. Up to that
+    /// instant it is the state it was written in, which for every quote this store holds is
+    /// the `active` a generate mints it in.
     pub fn quote_state_at(&self, now: SystemTime) -> &str {
         let now_key = date_time_key(system_time_to_date_time(now));
         if self
@@ -737,18 +727,7 @@ impl CapacityReservationCancellationQuoteRecord {
         {
             return CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_EXPIRED;
         }
-        let stored = self.quote_state();
-        let generated = stored == CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING
-            && self.pending.as_ref().is_some_and(|pending| {
-                matches!(
-                    pending.to,
-                    CapacityReservationCancellationQuoteMove::Active
-                ) && now >= pending.at
-            });
-        if generated {
-            return CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE;
-        }
-        stored
+        self.quote_state()
     }
 
     /// This quote as of `now`: the stored view with the state the clock has reached. A read
@@ -807,8 +786,7 @@ impl ComAmazonawsEc2Amazonec2State {
     /// ([`MAX_STORED_BYTES`]) — exactly as [`Self::insert_capacity_reservation`] asks its own:
     /// nothing here reclaims a stored quote, so an unbounded write path would grow this
     /// process without limit. A caller must map `None` onto the quota error its operation
-    /// answers. The bytes the record retains are charged here, and the clock-owed move is
-    /// recorded rather than slept for.
+    /// answers. The bytes the record retains are charged here.
     pub fn insert_capacity_reservation_cancellation_quote(
         &mut self,
         spec: CapacityReservationCancellationQuoteSpec,
@@ -838,24 +816,22 @@ impl ComAmazonawsEc2Amazonec2State {
                 .created_at
                 .checked_add(CAPACITY_RESERVATION_CANCELLATION_QUOTE_VALIDITY)
                 .map(system_time_to_date_time),
-            // Generated `pending`, with `active` owed one TRANSITION_DELAY later.
-            quote_state: Some(
-                CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING.to_string(),
-            ),
+            // Generated USABLE: "The quote includes the cancellation terms and a quote ID
+            // that you can pass to the CancelCapacityReservation action"
+            // (`CreateCapacityReservationCancellationQuote`), and that action takes a quote
+            // whose state is `active` (`CancelCapacityReservationRequest$QuoteId`). The terms
+            // and the configuration the quote carries are computed by the writer above and
+            // stored with it, so nothing about this document is still being worked out: a
+            // caller has nothing to wait for, and the quote is spendable from the instant it
+            // is reported until it stops being valid.
+            quote_state: Some(CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE.to_string()),
             current_configuration: Some(spec.current_configuration),
             cancellation_terms: Some(spec.cancellation_terms),
             tags: Some(spec.tags),
         };
         self.add_stored_bytes(capacity_reservation_cancellation_quote_payload_bytes(&view));
-        self.capacity_reservation_cancellation_quotes.insert(
-            quote_id.clone(),
-            CapacityReservationCancellationQuoteRecord {
-                view,
-                pending: Some(CapacityReservationCancellationQuoteTransition::starting_now(
-                    CapacityReservationCancellationQuoteMove::Active,
-                )),
-            },
-        );
+        self.capacity_reservation_cancellation_quotes
+            .insert(quote_id.clone(), CapacityReservationCancellationQuoteRecord { view });
         Some(quote_id)
     }
 }

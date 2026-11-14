@@ -67,23 +67,27 @@ use super::wire::{child, child_text, document, param, set_items};
 const REGION: &str = "us-east-1";
 
 /// One entry of a reported network ACL, as the tables below assert on it.
+///
+/// Shared with the sibling suite that drives the write path's idempotency
+/// (`network_acl_entry_idempotent_create`), which compiles into the same test binary: one
+/// reading of an ACL's `entrySet` rather than two that can drift.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ReportedEntry {
-    rule_number: String,
-    rule_action: String,
-    protocol: String,
-    cidr_block: Option<String>,
-    ipv6_cidr_block: Option<String>,
-    egress: String,
-    port_range: Option<(Option<String>, Option<String>)>,
-    icmp_type_code: Option<(Option<String>, Option<String>)>,
+pub(crate) struct ReportedEntry {
+    pub(crate) rule_number: String,
+    pub(crate) rule_action: String,
+    pub(crate) protocol: String,
+    pub(crate) cidr_block: Option<String>,
+    pub(crate) ipv6_cidr_block: Option<String>,
+    pub(crate) egress: String,
+    pub(crate) port_range: Option<(Option<String>, Option<String>)>,
+    pub(crate) icmp_type_code: Option<(Option<String>, Option<String>)>,
 }
 
 /// The entries the one ACL in `body` reports, in the order the response reported them.
 ///
 /// Read off the TREE: an entry's members are children of its own `<item>`, so scanning the
 /// body for an element name would mix two entries' ports together.
-fn reported_entries(case: &str, body: &str) -> Vec<ReportedEntry> {
+pub(crate) fn reported_entries(case: &str, body: &str) -> Vec<ReportedEntry> {
     let parsed = document(case, body);
     let acls = set_items(parsed.root_element(), "networkAclSet");
     let acl = acls
@@ -109,24 +113,24 @@ fn reported_entries(case: &str, body: &str) -> Vec<ReportedEntry> {
 
 /// One row of the create table: the request's members, and the entry they must read back as.
 #[derive(Debug, Clone)]
-struct EntryCase {
-    case: &'static str,
-    rule_number: i32,
-    egress: bool,
-    rule_action: &'static str,
-    protocol: &'static str,
+pub(crate) struct EntryCase {
+    pub(crate) case: &'static str,
+    pub(crate) rule_number: i32,
+    pub(crate) egress: bool,
+    pub(crate) rule_action: &'static str,
+    pub(crate) protocol: &'static str,
     /// The range exactly as the request spells it, which is not always how it reads back.
-    requested_cidr: &'static str,
+    pub(crate) requested_cidr: &'static str,
     /// Whether that range is the IPv6 one (`Ipv6CidrBlock` rather than `CidrBlock`).
-    ipv6: bool,
+    pub(crate) ipv6: bool,
     /// The range as the ACL must report it — the canonical form of the one requested.
-    reported_cidr: &'static str,
-    port_range: Option<(i32, i32)>,
-    icmp_type_code: Option<(i32, i32)>,
+    pub(crate) reported_cidr: &'static str,
+    pub(crate) port_range: Option<(i32, i32)>,
+    pub(crate) icmp_type_code: Option<(i32, i32)>,
 }
 
 /// The form fields of one `CreateNetworkAclEntry` request for `row` on `network_acl_id`.
-fn entry_params(network_acl_id: &str, row: &EntryCase) -> Vec<(String, String)> {
+pub(crate) fn entry_params(network_acl_id: &str, row: &EntryCase) -> Vec<(String, String)> {
     let mut params = vec![
         param("NetworkAclId", network_acl_id),
         param("RuleNumber", &row.rule_number.to_string()),
@@ -150,7 +154,7 @@ fn entry_params(network_acl_id: &str, row: &EntryCase) -> Vec<(String, String)> 
 }
 
 /// `row` as the ACL must report it once stored.
-fn expected_entry(row: &EntryCase) -> ReportedEntry {
+pub(crate) fn expected_entry(row: &EntryCase) -> ReportedEntry {
     ReportedEntry {
         rule_number: row.rule_number.to_string(),
         rule_action: row.rule_action.to_string(),
@@ -188,7 +192,7 @@ fn catch_all_entry(egress: bool) -> ReportedEntry {
 }
 
 /// One `CreateNetworkAclEntry` call carrying `params`, as its HTTP status and XML body.
-async fn create_entry(
+pub(crate) async fn create_entry(
     router: &MultiServiceRouter,
     params: &[(String, String)],
 ) -> (u16, String) {
@@ -237,7 +241,11 @@ async fn describe_one(
 }
 
 /// The XML of the one ACL `network_acl_id` names, asserted to be readable.
-async fn acl_body(router: &MultiServiceRouter, case: &str, network_acl_id: &str) -> String {
+pub(crate) async fn acl_body(
+    router: &MultiServiceRouter,
+    case: &str,
+    network_acl_id: &str,
+) -> String {
     let (status, body) = describe_one(router, network_acl_id).await;
     assert_eq!(
         status, 200,
@@ -250,7 +258,7 @@ async fn acl_body(router: &MultiServiceRouter, case: &str, network_acl_id: &str)
 /// A VPC created over the wire, and a network ACL in it — the ACL every entry below is
 /// created on. A created ACL is associated with no subnet, which is what lets the delete
 /// table below take it away.
-async fn vpc_and_acl(router: &MultiServiceRouter, cidr_block: &str) -> (String, String) {
+pub(crate) async fn vpc_and_acl(router: &MultiServiceRouter, cidr_block: &str) -> (String, String) {
     let (status, body) = super::ec2_query::call(
         router,
         REGION,

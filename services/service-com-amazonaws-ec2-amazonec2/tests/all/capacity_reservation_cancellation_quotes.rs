@@ -24,9 +24,9 @@
 //!    the whole hours left of the commitment and the instant it ends.
 //! 3. A quote is "valid for 24 hours"
 //!    (`CreateCapacityReservationCancellationQuote`): its `ExpirationTime` is that long after
-//!    its `CreateTime`, and its `QuoteState` follows the clock from there — generated
-//!    `pending`, `active` once the generation has fallen due, and `expired` from the instant
-//!    it stops being valid. A read reports that without writing it.
+//!    its `CreateTime`, and its `QuoteState` is the `active` a generate mints it in — the
+//!    state `CancelCapacityReservation` spends a quote in — until it is `expired` from the
+//!    instant it stops being valid. A read reports that without writing it.
 //! 4. The describe reports what the generates stored, narrowed by
 //!    `CapacityReservationCancellationQuoteIds`, by filter, or by neither, in
 //!    `CapacityReservationCancellationQuoteId` order and paged with the token this service
@@ -40,7 +40,7 @@
 //! committed for (including a commitment that is not a whole number of hours), which tags,
 //! which id form — so no single recorded request is the specification.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ec2::ops::types::CapacityReservationConfiguration;
 use ec2::state::ComAmazonawsEc2Amazonec2State as Ec2State;
@@ -49,11 +49,10 @@ use ec2::state::{
     CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_PREFIX,
     CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE,
     CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_EXPIRED,
-    CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING,
     CAPACITY_RESERVATION_CANCELLATION_QUOTE_VALIDITY, CAPACITY_RESERVATION_STATE_ACTIVE,
-    CAPACITY_RESERVATION_STATE_CANCELLING, CAPACITY_RESERVATION_STATE_SCHEDULED,
-    CapacityReservationCancellationQuoteSpec, CapacityReservationCommitment,
-    CapacityReservationSpec, TRANSITION_DELAY, iso8601_utc,
+    CAPACITY_RESERVATION_STATE_ASSESSING, CAPACITY_RESERVATION_STATE_CANCELLING,
+    CAPACITY_RESERVATION_STATE_SCHEDULED, CapacityReservationCancellationQuoteSpec,
+    CapacityReservationCommitment, CapacityReservationSpec, iso8601_utc,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -100,11 +99,13 @@ const NO_COMMITMENT_TERMS_MESSAGE: &str =
     "The Capacity Reservation contains no commitment terms. Quote is not needed for \
      cancellation.";
 
-/// Long enough past a clock-owed move's due instant that it has fallen due, with the margin
-/// every other suite of this crate gives one.
-fn past_the_transition() -> Duration {
-    TRANSITION_DELAY + Duration::from_millis(250)
-}
+/// How long a poll for a clock-owed move is given before the test gives up: far longer than
+/// any span this emulator owes one, so a loaded host cannot fail a test that a fast one
+/// passes.
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a poll waits between two looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// One `CreateCapacityReservationCancellationQuote` call carrying `params`.
 async fn generate(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
@@ -129,7 +130,7 @@ async fn describe(router: &MultiServiceRouter, params: &[(String, String)]) -> (
 }
 
 /// The form fields of one generate for `capacity_reservation_id`.
-fn quote_params(capacity_reservation_id: &str) -> Vec<(String, String)> {
+pub(crate) fn quote_params(capacity_reservation_id: &str) -> Vec<(String, String)> {
     vec![(
         "CapacityReservationId".to_string(),
         capacity_reservation_id.to_string(),
@@ -139,23 +140,27 @@ fn quote_params(capacity_reservation_id: &str) -> Vec<(String, String)> {
 /// What one future-dated Capacity Reservation is created with. Each row of the table differs
 /// only along what the rules generalise over: the capacity reserved, the instance family it
 /// is reserved in, how far ahead it starts and how long it committed for.
-struct ReservationCase {
+///
+/// Shared with the sibling suites that drive the same reservation shape through other
+/// operations (`capacity_reservation_cancellation_quote_use`), which compile into the same
+/// test binary: one definition of a future-dated row rather than two that can drift.
+pub(crate) struct ReservationCase {
     /// What the case is called in an assertion.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// A member of the modelled `InstanceType` catalog, in one of the instance families a
     /// future-dated reservation may reserve ("the C, M, R, I, T, and G instance families
     /// only", `CreateCapacityReservationRequest$InstanceType`).
-    instance_type: &'static str,
+    pub(crate) instance_type: &'static str,
     /// "The number of instances for which to reserve capacity" (`InstanceCount`).
-    instance_count: i32,
+    pub(crate) instance_count: i32,
     /// How far ahead the reservation starts: "between 5 and 120 days in advance"
     /// (`StartDate`).
-    lead_days: u64,
+    pub(crate) lead_days: u64,
     /// "Specify a commitment duration, in seconds" (`CommitmentDuration`).
-    commitment_seconds: u64,
+    pub(crate) commitment_seconds: u64,
     /// "The tags to apply to the cancellation quote"
     /// (`CreateCapacityReservationCancellationQuoteRequest$TagSpecifications`).
-    quote_tags: &'static [(&'static str, &'static str)],
+    pub(crate) quote_tags: &'static [(&'static str, &'static str)],
 }
 
 /// The rows every rule is asserted over.
@@ -269,7 +274,7 @@ fn tag_params(tags: &[(&str, &str)]) -> Vec<(String, String)> {
 
 /// Create the future-dated Capacity Reservation of `case` OVER THE WIRE and answer its id,
 /// once the clock has moved it past the assessment every future-dated request starts in.
-async fn create_future_dated(
+pub(crate) async fn create_future_dated(
     router: &MultiServiceRouter,
     case: &ReservationCase,
     start: SystemTime,
@@ -292,7 +297,35 @@ async fn create_future_dated(
     // "Amazon EC2 is assessing your request for a future-dated Capacity Reservation"
     // (`CapacityReservation$State`) until the move to `scheduled` falls due, so the quote
     // below is generated against a reservation whose state is settled rather than racing it.
-    tokio::time::sleep(past_the_transition()).await;
+    // Waited for as a CONDITION rather than for a span of the wall clock: the loop looks
+    // again until the state has left `assessing`.
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let (status, body) = super::ec2_query::call(
+            router,
+            REGION,
+            "DescribeCapacityReservations",
+            &[("CapacityReservationId.1".to_string(), id.clone())],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected HTTP 200 reading the reservation back, got {status} with \
+             body {body}",
+            case.name
+        );
+        let state = element(&body, "state").unwrap_or_default();
+        if state != CAPACITY_RESERVATION_STATE_ASSESSING {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {:?}: the reservation never left \
+             {CAPACITY_RESERVATION_STATE_ASSESSING}, last read {state:?}",
+            case.name
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
     id
 }
 
@@ -549,9 +582,9 @@ async fn a_quote_is_computed_from_the_reservations_commitment() {
             CAPACITY_RESERVATION_CANCELLATION_QUOTE_VALIDITY.as_secs()
         );
         assert_eq!(
-            quote.quote_state, CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING,
+            quote.quote_state, CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE,
             "case {name:?}: expected a freshly generated quote to be \
-             {CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING}, got {:?}",
+             {CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE}, got {:?}",
             quote.quote_state
         );
 
@@ -663,13 +696,11 @@ async fn a_quote_is_computed_from_the_reservations_commitment() {
              body {body}"
         );
         let read_back = reported_quote(name, &body);
-        assert!(
-            [
-                CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING,
-                CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE,
-            ]
-            .contains(&read_back.quote_state.as_str()),
-            "case {name:?}: expected the quote read back to be pending or active, got {:?}",
+        assert_eq!(
+            read_back.quote_state,
+            CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE,
+            "case {name:?}: expected the quote read back to still be \
+             {CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE}, got {:?}",
             read_back.quote_state
         );
         assert_eq!(
@@ -849,9 +880,8 @@ async fn only_a_reservation_under_a_live_commitment_can_be_quoted() {
 // The quote state follows the clock
 // ---------------------------------------------------------------------------
 
-/// A quote is generated `pending`, is `active` once the generation has fallen due, and is
-/// `expired` from the instant it stops being valid — and a read reports all three without
-/// writing any of them.
+/// A quote is generated `active`, stays `active` while it is valid, and is `expired` from the
+/// instant it stops being valid — and a read reports that without writing it.
 #[tokio::test]
 async fn the_quote_state_follows_the_clock() {
     let (router, engine) = super::ec2_query::emulator();
@@ -874,14 +904,14 @@ async fn the_quote_state_follows_the_clock() {
     let quote_id = reported_quote("generated", &body).id;
     assert_eq!(
         reported_quote("generated", &body).quote_state,
-        CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING,
+        CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE,
         "case {:?}: a quote is generated \
-         {CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING}, got {body}",
+         {CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE}, got {body}",
         case.name
     );
 
-    // The generation falls due on the clock, whether or not anybody asks again.
-    tokio::time::sleep(past_the_transition()).await;
+    // A quote that was usable when it was generated is usable when it is read back: nothing
+    // about reading it takes it to a state a cancel cannot spend.
     let (status, body) = describe(&router, &[]).await;
     assert_eq!(
         status, 200,
@@ -890,15 +920,16 @@ async fn the_quote_state_follows_the_clock() {
     assert_eq!(
         reported_quote("generated", &body).quote_state,
         CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE,
-        "case {:?}: the clock owes a generated quote \
-         {CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE}, got {body}",
+        "case {:?}: a generated quote stays \
+         {CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE} while it is valid, got {body}",
         case.name
     );
-    // The WORD the store holds has not changed: the state is derived from the instants the
-    // record carries, so reading it writes nothing a later caller could see.
+    // The WORD the store holds is the one the generate wrote: the state a reader reports is
+    // that word until the expiry it derives from the record's instants, so reading it writes
+    // nothing a later caller could see.
     assert_eq!(
         stored_quote_state(&engine, &quote_id),
-        CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING,
+        CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE,
         "a read must not write the state it derives"
     );
 
@@ -953,7 +984,7 @@ async fn the_quote_state_follows_the_clock() {
         );
         assert_eq!(
             stored_quote_state(&engine, &expired_id),
-            CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING,
+            CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE,
             "case {row:?}: a read must not write the expiry it derives"
         );
     }
@@ -994,9 +1025,8 @@ async fn the_describe_narrows_by_id_filter_and_page() {
         );
         generated.push((reported_quote(case.name, &body).id, reservation_id));
     }
-    // Every quote is active once the generations have fallen due, which is what the
+    // Every quote is `active` from the generate that minted it, which is what the
     // `quote-state` rows below select on.
-    tokio::time::sleep(past_the_transition()).await;
 
     let all_ids: Vec<String> = {
         let mut ids: Vec<String> = generated.iter().map(|(id, _)| id.clone()).collect();

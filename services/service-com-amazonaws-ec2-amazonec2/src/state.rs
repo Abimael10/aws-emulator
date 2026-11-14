@@ -1488,9 +1488,9 @@
 //! quotes `CreateCapacityReservationCancellationQuote` generated, as
 //! [`CapacityReservationCancellationQuoteRecord`]s: the modelled
 //! [`CapacityReservationCancellationQuote`] the create and
-//! `DescribeCapacityReservationCancellationQuotes` both answer with, plus the move the clock
-//! owes it, keyed by `CapacityReservationCancellationQuoteId` in a [`BTreeMap`] — the order
-//! the describe reports and pages over.
+//! `DescribeCapacityReservationCancellationQuotes` both answer with, keyed by
+//! `CapacityReservationCancellationQuoteId` in a [`BTreeMap`] — the order the describe
+//! reports and pages over.
 //! [`ComAmazonawsEc2Amazonec2State::insert_capacity_reservation_cancellation_quote`] is the
 //! one place a record is built, so the id, the creation instant and the instant the quote
 //! stops being usable are decided once however many writers there are.
@@ -1498,14 +1498,15 @@
 //! A quote is a DOCUMENT rather than a resource that tracks its reservation: its
 //! `CurrentConfiguration` and `CancellationTerms` are the terms as of the instant it was
 //! generated, which is what makes them quotable, and nothing a later call does to the
-//! reservation rewrites them. Only its `QuoteState` moves, and both moves are the clock's:
-//! it is generated `pending` and the clock owes it `active` one [`TRANSITION_DELAY`] later
-//! ([`ClockTransition`]), after which it is `expired` from the instant it stops being valid
-//! — "Cancellation quotes are valid for 24 hours"
-//! (`CreateCapacityReservationCancellationQuote`), carried on the record as its
-//! `ExpirationTime`. Neither is stored as a word a reader has to write:
-//! [`CapacityReservationCancellationQuoteRecord::quote_state_at`] derives both from those
-//! instants, the way [`CapacityReservationRecord::state_at`] derives a reservation's expiry.
+//! reservation rewrites them. Its `QuoteState` has ONE move, and it is the clock's: a quote
+//! is generated `active` — "The quote includes the cancellation terms and a quote ID that you
+//! can pass to the CancelCapacityReservation action"
+//! (`CreateCapacityReservationCancellationQuote`), so a quote a generate answers with is one
+//! a cancel can spend — and it is `expired` from the instant it stops being valid:
+//! "Cancellation quotes are valid for 24 hours" (same doc), carried on the record as its
+//! `ExpirationTime`. That move is not stored as a word a reader has to write:
+//! [`CapacityReservationCancellationQuoteRecord::quote_state_at`] derives it from that
+//! instant, the way [`CapacityReservationRecord::state_at`] derives a reservation's expiry.
 //!
 //! ## Capacity Reservation Fleets
 //!

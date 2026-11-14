@@ -819,6 +819,15 @@ mod capacity_reservation_cancellation_quote_region_scope;
 // `DescribeCapacityReservationCancellationQuotes` reports back out of that store.
 #[path = "all/capacity_reservation_cancellation_quotes.rs"]
 mod capacity_reservation_cancellation_quotes;
+// What SPENDING one of those quotes does: `CancelCapacityReservation` takes the quote the
+// mint answered with, and the id boundary both it and the interruptible-allocation update
+// resolve a Capacity Reservation id through.
+#[path = "all/capacity_reservation_cancellation_quote_use.rs"]
+mod capacity_reservation_cancellation_quote_use;
+// What a REPEATED `CreateNetworkAclEntry` does: the entry the ACL already holds is already
+// done, and only a different rule at that number is the conflict.
+#[path = "all/network_acl_entry_idempotent_create.rs"]
+mod network_acl_entry_idempotent_create;
 #[path = "all/capacity_reservation_fleets.rs"]
 mod capacity_reservation_fleets;
 #[path = "all/carrier_gateways.rs"]

@@ -4,7 +4,8 @@
 //! IMPLEMENTED: generates a cancellation quote for a future-dated Capacity Reservation whose
 //! commitment is still in force, and stores it — the quote's id, the configuration of the
 //! reservation as of this instant, the cancellation terms that follow from its commitment,
-//! and the 24 hours the quote stays valid for. Idempotent on `ClientToken`.
+//! and the 24 hours the quote stays valid for. The quote it answers with is one
+//! `CancelCapacityReservation` can spend. Idempotent on `ClientToken`.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
