@@ -1,0 +1,46 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: s3tables.untag-resource-malformed-tag-key-rejected
+Issue-Shape-Id: com.amazonaws.s3tables#S3TableBuckets
+Issue-Key: s3tables.untag-resource-malformed-tag-key-rejected|run#6|AssertionError|assert code == "ValidationException", f"expected ValidationException for over-length tag key, got {code!r}"
+Issue-Commit: a84a0a47137d3eec61135ddc1c28c473b0a18687
+
+# s3tables UntagResource with an over-length tag key is refused BadRequestException instead of the framework ValidationException with AWS's list-member length-constraint message
+
+> _Note: this issue was identified against the code base at commit `a84a0a47137d3eec61135ddc1c28c473b0a18687`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UntagResource
+
+## Description
+REOPENS 20261101T230800Z-s3tables-rejects-invalid-input-with-unmodeled-validationexception-instead.md: its fix left the call refused. That issue's fix re-labelled the generic member-constraint validator's refusal from `ValidationException` to `BadRequestException` for every s3tables member constraint, including the UntagResource paths it named (cause 7 of 7, UntagResource with a malformed resourceArn). On the UntagResource tagKeys path that blanket re-label is wrong: AWS answers the framework-level `ValidationException` there, so the operation is still refused with the wrong identity. Related open issue 20261102T055316Z-s3tables-constraint-violation-refusals-are-now-blanket-400.md records the same lost-code fault on two OTHER paths (PutTableBucketReplication.configuration...destinationTableBucketARN and PutTableRecordExpirationConfiguration.value.settings.days); it does not name UntagResource or the tagKeys list-member length constraint, so it does not cover this cause and closing it does not close this one.
+
+Cause 1 of 1: a tag key longer than the modeled 128-character maximum is refused with the service's BadRequestException instead of the framework's ValidationException, so the length-constraint report AWS returns for a list MEMBER constraint is not produced.
+
+AWS: UntagResource whose `tagKeys` list contains a member longer than 128 characters is refused with HTTP 400 and error code `ValidationException`, message "1 validation error detected: Value at 'tagKeys' failed to satisfy constraint: Member must satisfy constraint: [Member must have length less than or equal to 128, Member must have length greater than or equal to 1]". Fixed text: "1 validation error detected: Value at '", "' failed to satisfy constraint: Member must satisfy constraint: [Member must have length less than or equal to ", ", Member must have length greater than or equal to ", "]"; variable parts: the member path taken from the request's shape path (here `tagKeys`) and the two bounds taken from the model. The offending value is NOT quoted (the constraint is on the list's member, so AWS reports the list member's constraint set rather than one value), and the request has no effect: the tag already present on the resource is untouched, and untagging the well-formed key afterwards removes it. Smithy (services/service-com-amazonaws-s3tables-s3tablebuckets/smithy-model/com-amazonaws-s3tables-s3tablebuckets.json): UntagResourceRequest.tagKeys -> TagKeyList (required, httpQuery `tagKeys`), TagKeyList member -> TagKey @length(min 1, max 128); UntagResource models BadRequestException(400)/ConflictException(409)/ForbiddenException(403)/NotFoundException(404)/TooManyRequestsException(429)/InternalServerErrorException(500), http DELETE /tag/{resourceArn} code 204. No ValidationException shape exists in the service model, so this code is the framework-level (untyped) validation refusal — recorded behavior only for the code and the message on this path.
+Emulator: HTTP 400 with error code `BadRequestException` (the check asserts the code first and stops there, so the message the emulator serves on this path is not in the replay output; by the behavior of the same generic validator on sibling paths it is expected to be the generic per-value template, which also diverges from AWS's list-member form above).
+Why: `ValidationException` is the only code a client can branch on to tell a malformed-parameter refusal from the service's own semantic refusals — s3tables uses `BadRequestException` for business-rule rejections too (invalid open table format, non-empty namespace, bucket quota), and it carries no sub-code. A client that retries, reports or surfaces a field-level error differently for parameter errors now takes the service-error branch for a plain parameter error, and a `catch ValidationException` arm never fires. The message is also the only discriminator for WHICH member was malformed, so a client parsing it to highlight the offending tag key gets nothing it can match.
+Fix: the s3tables request-validation layer's refusal classification and its constraint-message rendering — a framework-validated member constraint must keep answering `ValidationException`, and a constraint on a LIST member must render AWS's "Value at '<path>' failed to satisfy constraint: Member must satisfy constraint: [<bounds>]" form (no quoted value) rather than the per-value template. The refusal is produced before the operation handler runs, so this is independent of the already-filed scaffold-stub issue for services/service-com-amazonaws-s3tables-s3tablebuckets/src/ops/untag_resource.rs; note, however, that this check's later steps (the rejected call leaves the existing tag in place, and untagging the well-formed key removes it) exercise that handler, so both must land before the check passes.
+Traces: s3tables.untag-resource-malformed-tag-key-rejected.
+
+## Evidence
+Replay of simparity-behavioral-aws-v1 against this checkout. Verdict `mismatch` for s3tables.untag-resource-malformed-tag-key-rejected: the emulator answered, with HTTP 400, so only the error code (and, unreached, the message) diverge.
+
+Failure detail:
+  File "check_s3tables_untag_resource_malformed_tag_key_rejected.py", line 26, in run
+    assert code == "ValidationException", f"expected ValidationException for over-length tag key, got {code!r}"
+  AssertionError: expected ValidationException for over-length tag key, got 'BadRequestException'
+
+Check shape: create a table bucket, TagResource(resourceArn=<bucket arn>, tags={"env": ...}), then UntagResource(resourceArn=<bucket arn>, tagKeys=["k"*200]). Expected $.Error.Code `ValidationException` and $.Error.Message exactly "1 validation error detected: Value at 'tagKeys' failed to satisfy constraint: Member must satisfy constraint: [Member must have length less than or equal to 128, Member must have length greater than or equal to 1]"; observed $.Error.Code `BadRequestException`. The 200-character key and the tag value in the check are the request's values filling the template, not part of the requirement. The check then asserts the pre-existing tag survives the rejected call and that UntagResource on the well-formed key removes it — neither assertion was reached.
+
+Model check via smithy_query on services/service-com-amazonaws-s3tables-s3tablebuckets/smithy-model/com-amazonaws-s3tables-s3tablebuckets.json: UntagResource input {resourceArn: @httpLabel @required @length(1,2048) @pattern ^arn:aws[-a-z0-9]*:[a-z0-9]+:[-a-z0-9]*:[0-9]{12}:bucket/.+$, tagKeys: @httpQuery("tagKeys") @required -> TagKeyList}; TagKeyList.member -> TagKey @length(1,128); errors BadRequestException(400), ConflictException(409), ForbiddenException(403), NotFoundException(404), TooManyRequestsException(429), InternalServerErrorException(500); http DELETE /tag/{resourceArn}, success code 204. No ValidationException shape is bound anywhere in the service model, which is why the correct code on this path can only come from the framework-level validator and not from a modeled error.
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout and replay simparity-behavioral-aws-v1 (or run the single check s3tables.untag-resource-malformed-tag-key-rejected directly).
+2. CreateTableBucket(name=<valid lower-case name>) and keep the returned arn.
+3. TagResource(resourceArn=<arn>, tags={"env": "<any value>"}).
+4. Call UntagResource(resourceArn=<arn>, tagKeys=["k" * 200]) (any key longer than 128 characters; use a botocore client with parameter_validation left on — the constraint is server-side here).
+5. Read $.Error.Code: expect `ValidationException` with HTTP 400, observe `BadRequestException`. Compare $.Error.Message against "1 validation error detected: Value at 'tagKeys' failed to satisfy constraint: Member must satisfy constraint: [Member must have length less than or equal to 128, Member must have length greater than or equal to 1]" — member path from the request, bounds from the model, offending value NOT quoted.
+6. ListTagsForResource(resourceArn=<arn>) must still report env=<the value from step 3>: the rejected call has no effect.
+7. UntagResource(resourceArn=<arn>, tagKeys=["env"]) must succeed (204) and a following ListTagsForResource must no longer contain `env`.
