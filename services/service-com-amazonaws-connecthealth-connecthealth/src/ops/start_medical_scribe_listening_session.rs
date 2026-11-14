@@ -167,6 +167,22 @@ fn invalid(detail: impl Into<String>) -> StartMedicalScribeListeningSessionError
     )
 }
 
+/// The refusal of a header-bound member, worded the way the rest of this service words
+/// the same refusal: the FRAMEWORK's own clause, except for the one member this service
+/// states itself — a `domainId` outside what `DomainId` declares, which carries this
+/// service's domain-id sentence ([`crate::service::domain_id_refusal`]) wherever a request
+/// names one. The generated operations reach that sentence through the service's
+/// `override_refusal` seam; this operation reads its own members, so it asks for the
+/// sentence here rather than growing a second wording of it.
+fn refused_member(refusal: RequestRefusal) -> StartMedicalScribeListeningSessionErrorModeled {
+    if let RequestRefusal::Invalid(violations) = &refusal {
+        if let Some(sentence) = crate::service::domain_id_refusal::sentence_for(violations) {
+            return invalid(sentence);
+        }
+    }
+    invalid(refusal.stated())
+}
+
 /// A resource of the request's scope this Region does not hold.
 fn not_found(message: String) -> StartMedicalScribeListeningSessionErrorModeled {
     StartMedicalScribeListeningSessionErrorModeled::ResourceNotFoundException(
@@ -506,9 +522,9 @@ fn apply_configuration(session: &mut ScribeSession, configuration: MedicalScribe
 /// EMPTY: every member of the settings shape is header-bound (its event-stream payload
 /// member is excluded from it), so an empty body is what keeps the JSON codec from being
 /// pointed at event-stream frames, and the model's own enums, patterns and ranges are
-/// what admit or refuse the request. The refusal is worded by the FRAMEWORK's own
-/// renderer, so a header-bound member of this operation reads exactly like a body member
-/// of another operation the request boundary refuses.
+/// what admit or refuse the request. The refusal is worded by [`refused_member`], so a
+/// header-bound member of this operation reads exactly like a body or label member of
+/// another operation the request boundary refuses.
 fn settings_from_headers(
     protocol: &dyn ServerHttpProtocol,
     req: &Request,
@@ -533,7 +549,7 @@ fn settings_from_headers(
         &headers_only,
         &StartMedicalScribeListeningSessionSettings::SCHEMA,
     )
-    .map_err(|refusal| invalid(refusal.stated()))
+    .map_err(refused_member)
 }
 
 /// Deserialize one frame's payload into the modelled event structure `T`, then check it

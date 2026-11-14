@@ -52,7 +52,12 @@
 //! `StartMedicalScribeListeningSession`: its output is a `@streaming` union, so the
 //! generated shim declines the request and this file hands it to the operation's own
 //! event-stream implementation instead.
+//!
+//! A second seam is taken: `override_refusal` words the ONE framework-level refusal this
+//! service does not state as the framework does — a `domainId` outside what `DomainId`
+//! declares, which it refuses with its own domain-id sentence ([`domain_id_refusal`]).
 
+pub mod domain_id_refusal;
 pub mod error_detail;
 pub mod tag_bounds;
 
@@ -143,16 +148,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. ONE refusal is reworded: a value supplied for this service's
+        // `domainId` member that is outside what `DomainId` declares, which ConnectHealth
+        // states as its own domain-id sentence rather than as the framework's generic
+        // member-constraint clause (see [`domain_id_refusal`]). The code it carries is
+        // unchanged, so a client branching on the code sees the same answer; every other
+        // refusal keeps the framework's wording.
+        domain_id_refusal::refused(refusal)
     }
 
     fn override_routing_error(

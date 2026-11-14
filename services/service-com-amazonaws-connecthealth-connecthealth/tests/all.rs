@@ -43,6 +43,8 @@ mod list_domains_account_scope;
 mod list_domains_filter_cursor_scope;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/malformed_domain_id_refusal.rs"]
+mod malformed_domain_id_refusal;
 #[path = "all/medical_scribe_listening_session_stream.rs"]
 mod medical_scribe_listening_session_stream;
 #[path = "all/pagination_token_issuance.rs"]

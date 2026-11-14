@@ -16,7 +16,10 @@
 //! * a value outside a member's modelled `@range` gets AWS's standard constraint sentence,
 //!   `N validation error(s) detected: Value '<value>' at '<member>' failed to satisfy
 //!   constraint: <requirement>`, naming the offending value, the member path and the bound
-//!   it violated.
+//!   it violated;
+//! * a `domainId` the service cannot read as a domain id gets the service's own sentence
+//!   instead of that clause (`src/service/domain_id_refusal.rs`), naming the value the
+//!   request supplied.
 //!
 //! The rows differ along what the rule generalises over: which operation is called, which
 //! of the two identifiers is the missing one, the form of the identifiers (both modelled
@@ -316,8 +319,10 @@ async fn an_error_the_framework_renders_reports_its_text_in_the_message_member_t
     let emulator = Emulator::new("us-west-2");
 
     // A `domainId` outside the model's own length/pattern never reaches a handler: the
-    // boundary validator refuses it. The sentence still has to arrive readable, and it
-    // still names the member and the value the request supplied.
+    // boundary validator refuses it, and this service words that refusal itself (its own
+    // domain-id sentence, pinned over the whole class by
+    // `tests/all/malformed_domain_id_refusal.rs`). The sentence still has to arrive
+    // readable here, and it still names the value the request supplied.
     let malformed: [(&str, &str); 5] = [
         ("too short (19)", "dom-aaaaaaaaaaaaaaa"),
         ("too long (26)", "dom-aaaaaaaaaaaaaaaaaaaaaa"),
@@ -335,12 +340,10 @@ async fn an_error_the_framework_renders_reports_its_text_in_the_message_member_t
             "case {case:?} ({bad_id}): expected 400 ValidationException, got {status} with {body}"
         );
         let text = detail_text(case, &body);
+        let expected_opening = format!("{bad_id} is not a valid domain id. (Service: ");
         assert!(
-            text.starts_with("1 validation error detected: ")
-                && text.contains("'domainId'")
-                && text.contains(bad_id),
-            "case {case:?}: the refusal must name the member and the value it was given, \
-             got {text:?}"
+            text.starts_with(&expected_opening),
+            "case {case:?}: expected a message starting {expected_opening:?}, got {text:?}"
         );
     }
 
