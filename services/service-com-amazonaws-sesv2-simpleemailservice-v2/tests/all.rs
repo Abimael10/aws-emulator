@@ -183,6 +183,8 @@ mod send_list_management_options;
 mod send_suppression_from_feedback;
 #[path = "all/send_unverified_identity_refusal.rs"]
 mod send_unverified_identity_refusal;
+#[path = "all/shared_refusal_sentences.rs"]
+mod shared_refusal_sentences;
 #[path = "all/sns_event_destination_delivery.rs"]
 mod sns_event_destination_delivery;
 #[path = "all/state_roundtrip.rs"]

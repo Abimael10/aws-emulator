@@ -168,7 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|size| *size > 0);
 
         // The token is this listing's own: it names the last endpoint the previous page
-        // returned, so the next page resumes strictly after it.
+        // returned, so the next page resumes strictly after it. A token that is not a
+        // position in this listing is refused in the one sentence this service words that
+        // condition in (`crate::state::invalid_next_token`).
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
@@ -176,11 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::MULTI_REGION_ENDPOINTS_PAGE_TOKEN_TAG,
                     token,
                 )
-                .ok_or_else(|| {
-                    bad_request(
-                        "NextToken is not a token returned by ListMultiRegionEndpoints.",
-                    )
-                })?,
+                .ok_or_else(|| bad_request(crate::state::invalid_next_token()))?,
             ),
         };
 

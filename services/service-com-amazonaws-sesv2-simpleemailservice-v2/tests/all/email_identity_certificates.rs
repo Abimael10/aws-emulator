@@ -1094,8 +1094,8 @@ async fn a_listing_refuses_a_token_it_did_not_issue() {
         );
         assert_eq!(
             refused.message(),
-            "NextToken is not a token returned by ListEmailIdentityCertificates.",
-            "case {token:?}: expected the token refusal's own sentence, got {:?}",
+            "Invalid next token.",
+            "case {token:?}: expected this service's one bad-cursor sentence, got {:?}",
             refused.message()
         );
     }
