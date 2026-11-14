@@ -494,7 +494,7 @@ async fn deleting_one_memory_record_leaves_every_other_record() {
              {body:?}"
         );
         assert_eq!(
-            body["message"], "MemoryItem does not exist",
+            body["message"], "The memory record was not found",
             "case {case:?}: expected the modelled not-found message, got {:?}",
             body["message"]
         );

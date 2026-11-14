@@ -4961,3 +4961,8 @@ mod cloudformation_provisions_event_buses_and_bus_policies;
 // `E0753` and compiles no suite of this target. The rules they repeated stand in the module
 // doc at the HEAD of this file.)
 // It. The `sfn_relayed_dynamodb_request_id` suite is declared ONCE as well, just above: two
+// suite left at the top level of `tests/` fails the build. (A line comment: the `//!`
+// form this fragment landed in here is `E0753` and compiles no suite of this target.)
+// leaving a note here. (Six lines of that header fragment, ordinary comments for the
+// reason they state.)
+// and compiles nothing. (Five lines of that header fragment, ordinary comments for the

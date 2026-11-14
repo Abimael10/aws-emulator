@@ -303,8 +303,10 @@ pub const MEMORY_RECORD_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
 /// The message a memory-record read or delete is refused with when the record the
 /// request addresses is not one this memory container holds: AWS's wording for that
-/// `ResourceNotFoundException`, whose text names nothing from the request.
-pub const MEMORY_RECORD_NOT_FOUND_MESSAGE: &str = "MemoryItem does not exist";
+/// `ResourceNotFoundException`, which names the resource the API exposes — the memory
+/// record — and carries no variable part at all, so neither the record id, the memory
+/// id nor the namespace the request spelled appears in it.
+pub const MEMORY_RECORD_NOT_FOUND_MESSAGE: &str = "The memory record was not found";
 
 /// The `memoryStrategyId` reported for a record whose creating request named no
 /// strategy.

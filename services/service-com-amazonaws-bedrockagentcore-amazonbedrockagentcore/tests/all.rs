@@ -43,6 +43,8 @@ mod memory_events;
 mod memory_extraction_jobs;
 #[path = "all/memory_ingestion.rs"]
 mod memory_ingestion;
+#[path = "all/memory_record_not_found_wording.rs"]
+mod memory_record_not_found_wording;
 #[path = "all/memory_records.rs"]
 mod memory_records;
 #[path = "all/on_demand_evaluation.rs"]
