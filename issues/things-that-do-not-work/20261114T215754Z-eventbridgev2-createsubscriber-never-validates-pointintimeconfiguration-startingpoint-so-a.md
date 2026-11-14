@@ -1,0 +1,64 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: eventbridgev2.point-in-time-starting-point-outside-allowed-range-rejected
+Issue-Shape-Id: com.amazonaws.eventbridgev2#AWSEventsV2
+Issue-Key: eventbridgev2.point-in-time-starting-point-outside-allowed-range-rejected|_refused#9|AssertionError|raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
+Issue-Commit: d3b7765ce05e53288156df4eb42460237bf11326
+
+# eventbridgev2: CreateSubscriber never validates PointInTimeConfiguration.StartingPoint, so a POINT_IN_TIME/TIMESTAMP subscriber is accepted with a starting point AWS refuses (future, under 5 minutes old, or outside the bus's retention window)
+
+> _Note: this issue was identified against the code base at commit `d3b7765ce05e53288156df4eb42460237bf11326`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateSubscriber
+
+## Description
+One net-new root cause on the bootstrapped eventbridgev2 service (sdkId EventBridgeV2, AWSEventsV2, protocol rpcv2Cbor, endpointPrefix eventsv2). Every other eventbridgev2 / eventbridgev2__iam__sqs / eventbridgev2__iam__sns__sqs / cloudformation__eventbridgev2 failure in this replay is already filed (ALREADY FILED stub clusters for TagResource, ListEventSources, PutResourcePolicy, RevokeResource, ListTagsForResource, PutRawEvents; OWNED by the open behavioral issues), so this is the only reportable cause.
+
+=== Cause 1 of 1: CreateSubscriber accepts any PointInTimeConfiguration.StartingPoint instead of refusing one outside the allowed replay window ===
+
+AWS: Smithy (services/service-com-amazonaws-eventbridgev2-awseventsv2/smithy-model/com-amazonaws-eventbridgev2-awseventsv2.json): CreateSubscriber takes StartingPosition (enum StartingPosition) and PointInTimeConfiguration, whose doc is "Point-in-time configuration for a subscriber. Only applicable when StartingPosition is POINT_IN_TIME"; PointInTimeConfiguration$PointType is @required ("Whether to start from the horizon or a specific timestamp") and PointInTimeConfiguration$StartingPoint is a Timestamp documented "Timestamp to start from. Required when PointType is TIMESTAMP." CreateSubscriber declares InvalidInputException (@error client, @httpError 400, single member Message, doc "A request parameter is missing or not valid."). Recorded behavior: when PointType is TIMESTAMP, AWS validates StartingPoint against the replayable window of the bus and refuses with HTTP 400, Error.Code InvalidInputException, in three classes, each message being wholly FIXED text except where noted:
+  - StartingPoint in the future -> Message "PointInTimeConfiguration.StartingPoint must not be in the future" (all fixed text; no value from the request appears).
+  - StartingPoint less than five minutes in the past -> Message "PointInTimeConfiguration.StartingPoint must be at least 5 minutes in the past" (all fixed text; the "5 minutes" is AWS's constant bound, not a request value).
+  - StartingPoint earlier than the bus's StorageConfiguration.RetentionWindowStartTime -> Message "PointInTimeConfiguration.StartingPoint (<stamp>) falls outside the bus's retention window", where the only variable part is <stamp>: the REQUEST's StartingPoint rendered in UTC as %Y-%m-%dT%H:%M:%SZ. Everything around it is fixed text.
+A refused CreateSubscriber must mint nothing: ListSubscribers(EventBusArn=<bus>, NamePrefix=<prefix>) must not show the refused names. A POINT_IN_TIME subscriber with PointType HORIZON carries no StartingPoint and is accepted, returning StartingPosition POINT_IN_TIME — that is the control that proves the refusal is scoped to the timestamp and not to POINT_IN_TIME itself.
+
+Emulator: no validation of PointInTimeConfiguration exists anywhere on this path. CreateSubscriber answers HTTP 200 (content-type application/cbor, smithy-protocol rpc-v2-cbor) and mints a RUNNING subscriber for a StartingPoint one hour in the FUTURE, echoing the out-of-range value straight back in PointInTimeConfiguration: the replay shows a 200 whose body carries 'StartingPosition': 'POINT_IN_TIME', 'PointInTimeConfiguration': {'PointType': 'TIMESTAMP', 'StartingPoint': <a timestamp one hour after the call>}, 'State': 'RUNNING' alongside a freshly minted SubscriberArn. (The particular ARN, names, account, region and timestamps in that response are this run's values, not the requirement.) In the handler, the request's PointInTimeConfiguration is read only to pick a log position (create_subscriber.rs:289-297, starting_position / crate::state::starting_sequence_number(bus, &starting_position, input.point_in_time_configuration.as_ref())) and is then stored verbatim on the new subscriber (create_subscriber.rs:413, point_in_time_configuration: input.point_in_time_configuration.clone()); between those two points the only InvalidInputException branches are for FilterConfiguration.Filters (309-317) and State (380-390). Because the first of the three cases already came back 200, the check's later assertions (the under-5-minutes case, the before-retention-window case, the HORIZON control, and the ListSubscribers assertion that no refused subscriber was listed) were never reached — the graded fact is the FUTURE StartingPoint being accepted; the other two classes are the same missing gate and are stated here so one fix covers the window as AWS defines it.
+
+Why: a client that computes a replay start time gets silent acceptance of a point the bus can never replay from. Against AWS the call fails fast at 400 with an actionable message and the caller corrects the timestamp; against the emulator it gets a RUNNING subscriber pinned to an unreachable position, so it waits on a replay that cannot arrive and has no error to explain it. Every error branch keyed on InvalidInputException/400 for this configuration is dead code, and a validation test asserting the refusal (and asserting the refused name is absent from ListSubscribers) cannot pass against the emulator at all.
+
+Fix: the CreateSubscriber handler's input validation — add a PointInTimeConfiguration gate before anything is minted, refusing with the modeled InvalidInputException (400) and AWS's wording for each of the three classes, evaluated against the call's own clock and against the bus's retention window start as reported by DescribeEventBus's StorageConfiguration; the state read that resolves a POINT_IN_TIME start position belongs behind that gate, not in front of it. The same gate also needs to be reachable before the store is mutated so a refused create leaves no subscriber behind. Code: services/service-com-amazonaws-eventbridgev2-awseventsv2/src/ops/create_subscriber.rs:289-297 (configuration consumed with no checks), :309-317 and :380-390 (the only existing InvalidInputException branches), :399-433 (the unconditional insert), and crate::state::starting_sequence_number. Related open issue that does NOT cover this and does NOT carry this check's replay key: 20261110T210822Z-eventbridgev2-3-net-new-behavioral-causes-deleteeventbus-is.md (its cause about event-bus reads omitting StorageConfiguration concerns DescribeEventBus's output shape; this cause is CreateSubscriber's missing validation of a request member). 20261113T145420Z-eventbridgev2-4-net-new-behavioral-causes-createsubscriber-s.md touches the same handler but only its client-token replay, name-collision and delivery paths, not the point-in-time window.
+
+Traces: eventbridgev2.point-in-time-starting-point-outside-allowed-range-rejected.
+
+## Evidence
+Replay of behavioral suite simparity-behavioral-aws-v1 against the emulator built from this checkout: 5/42 passed; eventbridgev2 5/17 (12 failed), of which 11 are ALREADY FILED or OWNED. The one net-new failure:
+
+[mismatch] eventbridgev2.point-in-time-starting-point-outside-allowed-range-rejected
+  Sequence: CreateEventBus(Name=<unique>, ClientToken=<tok>) -> poll DescribeEventBus until State == ACTIVE -> read StorageConfiguration.RetentionWindowStartTime -> CreateSubscriber(Name=<prefix>future, EventBusArn=<bus>, ClientToken=<stok>, InvokeConfiguration={RoleArn, TargetArn, SqsParameters:{}}, StartingPosition='POINT_IN_TIME', PointInTimeConfiguration={'PointType':'TIMESTAMP','StartingPoint': now + 1 hour}).
+  expected: refusal HTTP 400, Error.Code 'InvalidInputException', Error.Message 'PointInTimeConfiguration.StartingPoint must not be in the future'
+  actual:   AssertionError: expected the call to be refused, but it succeeded: {'SubscriberArn': 'arn:aws:events:us-west-2:000000000000:subscriber/sim2real-behav-ebv2-pit-81de78bbf692future/db475sd75vel7d78bzauk4g5q', 'Name': 'sim2real-behav-ebv2-pit-81de78bbf692future', 'EventBusArn': 'arn:aws:events:us-west-2:000000000000:event-busv2/sim2real-behav-ebv2-bus-a9e02f4d804c/8ppswfm06gk5qyrlc638zdebl', 'Type': 'UNORDERED', 'StartingPosition': 'POINT_IN_TIME', 'PointInTimeConfiguration': {'PointType': 'TIMESTAMP', 'StartingPoint': datetime.datetime(2026, 11, 14, 22, 42, 26, 772000)}, 'State': 'RUNNING', 'CreationTime': datetime.datetime(2026, 11, 14, 21, 42, 26), 'ResponseMetadata': {'HTTPStatusCode': 200, 'HTTPHeaders': {'content-type': 'application/cbor', 'smithy-protocol': 'rpc-v2-cbor', 'content-length': '465'}}}
+  (the ARNs, names, ids and timestamps above are this run's values; the requirement is the 400/InvalidInputException refusal and its message text.)
+  Not reached because the first attempt returned 200, but part of the same gate and asserted by the same check:
+    StartingPoint = now - 1 minute   -> expected ('InvalidInputException', 'PointInTimeConfiguration.StartingPoint must be at least 5 minutes in the past')
+    StartingPoint = RetentionWindowStartTime - 1 day -> expected ('InvalidInputException', "PointInTimeConfiguration.StartingPoint (<StartingPoint as %Y-%m-%dT%H:%M:%SZ in UTC>) falls outside the bus's retention window")
+    control: CreateSubscriber(... StartingPosition='POINT_IN_TIME', PointInTimeConfiguration={'PointType':'HORIZON'}) must be ACCEPTED and answer StartingPosition == 'POINT_IN_TIME'
+    ListSubscribers(EventBusArn=<bus>, NamePrefix=<prefix>) must then list exactly the HORIZON subscriber — no refused name.
+
+Emulator source: services/service-com-amazonaws-eventbridgev2-awseventsv2/src/ops/create_subscriber.rs:289-297 consumes StartingPosition/PointInTimeConfiguration only to compute next_sequence_number; :413 stores the configuration verbatim; the function's only InvalidInputException branches are :309-317 (FilterConfiguration.Filters) and :380-390 (State). No branch inspects PointType, StartingPoint or the bus's retention window.
+
+Model references: PointInTimeConfiguration{PointType @required enum, StartingPoint Timestamp "Required when PointType is TIMESTAMP", EndPoint Timestamp}; CreateSubscriber errors include InvalidInputException (client, httpError 400, member Message, "A request parameter is missing or not valid.").
+
+## Steps to Reproduce
+1. git_clone the repo and run run_behavioral_suite (it builds and boots the emulator).
+2. Reproduce check eventbridgev2.point-in-time-starting-point-outside-allowed-range-rejected directly:
+   a. CreateEventBus(Name=<unique>, ClientToken=<tok>); poll DescribeEventBus(EventBusArn=<bus arn>) until State == 'ACTIVE'.
+   b. Read window = DescribeEventBus(EventBusArn=<bus arn>)['StorageConfiguration']['RetentionWindowStartTime'].
+   c. CreateSubscriber(Name=<prefix>future, EventBusArn=<bus arn>, ClientToken=<fresh stok>, InvokeConfiguration={'RoleArn': <any role arn in the account>, 'TargetArn': <any sqs arn in the account>, 'SqsParameters': {}}, StartingPosition='POINT_IN_TIME', PointInTimeConfiguration={'PointType': 'TIMESTAMP', 'StartingPoint': now + 1 hour}).
+      AWS: HTTP 400, Error.Code 'InvalidInputException', Error.Message 'PointInTimeConfiguration.StartingPoint must not be in the future'.
+      Emulator: HTTP 200 with a minted SubscriberArn, State 'RUNNING', and the future StartingPoint echoed back in PointInTimeConfiguration.
+   d. Repeat (c) with StartingPoint = now - 1 minute: AWS answers 400 InvalidInputException 'PointInTimeConfiguration.StartingPoint must be at least 5 minutes in the past'.
+   e. Repeat (c) with StartingPoint = (window - 1 day) (microseconds zeroed): AWS answers 400 InvalidInputException "PointInTimeConfiguration.StartingPoint (<that timestamp in UTC as %Y-%m-%dT%H:%M:%SZ>) falls outside the bus's retention window".
+   f. CreateSubscriber(Name=<prefix>horizon, ... StartingPosition='POINT_IN_TIME', PointInTimeConfiguration={'PointType': 'HORIZON'}) must be ACCEPTED and answer StartingPosition == 'POINT_IN_TIME'.
+   g. ListSubscribers(EventBusArn=<bus arn>, NamePrefix=<prefix>) (paginated) must return exactly ['<prefix>horizon'] — none of the three refused names may have been minted.
