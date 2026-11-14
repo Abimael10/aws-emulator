@@ -1,15 +1,45 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Open a Session Manager session to a managed node and hand the caller what its client
+//! connects with: the session's id, the URL back to the agent on the node, and the token
+//! that authenticates that connection. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The session is recorded in [`crate::state::sessions`]
+//! (`ComAmazonawsSsmAmazonssmState::sessions`), which is what `DescribeSessions` then
+//! reports under `Active` and, once `TerminateSession` has ended it, under `History`. One
+//! write the start makes before it reads anything is materialising the node registrations
+//! the clock already owed
+//! ([`crate::state::node_registration::settle_registrations`]): whether the target is
+//! managed is a fact about the instant the call arrived, not about who called last.
+//!
+//! ## Which requests are refused, and with which modelled error
+//!
+//! * A `Target` that is not a managed node of THIS endpoint, or one whose agent is not
+//!   responding (`InstanceInformation$PingStatus`), is `TargetNotConnected`: "The specified
+//!   target managed node for the session isn't fully configured for use with Session
+//!   Manager … This error is also returned if you attempt to start a session on a managed
+//!   node that is located in a different account or Region", which a node held per Region
+//!   is. An instance whose instance-profile role does not let the agent register is
+//!   therefore refused here, because no registration of it exists
+//!   ([`crate::state::node_registration`]).
+//! * A `DocumentName` this endpoint resolves no document for is `InvalidDocument` ("The
+//!   specified SSM document doesn't exist"), resolved the way every document read of this
+//!   service resolves one, so either spelling of a document (its name or its ARN) names it.
+//!   A request that names NO document launches "a shell to the managed node … by default",
+//!   which is no document of the account: there is nothing to resolve, and the session
+//!   reports no `DocumentName`.
+//!
+//! ## What the caller is handed
+//!
+//! `StreamUrl` is "a URL back to SSM Agent on the managed node that the Session Manager
+//! client uses to send commands and receive output from the node", on the data-channel path
+//! the model documents — addressed at THIS emulator
+//! ([`crate::state::sessions::stream_url`]), the only address a client on this machine can
+//! reach. `TokenValue` is "an encrypted token value containing session and caller
+//! information": a secret, so it is drawn from the emulator's own credential store and
+//! never constructed here, and the entry minted for it is removed again because it is not a
+//! credential of this emulator.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +205,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSession"))
+        use crate::state::sessions;
+
+        // `Target`'s presence and length, `DocumentName`'s pattern and `Reason`'s length
+        // are MODELLED constraints, so the centralized walk has already refused anything
+        // outside them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartSessionErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        // The registration an instance of this Region had already made by now was owed at
+        // the same instant whether or not anybody called, so it is materialised before the
+        // store is asked about the target — with no guard of it held.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        // "The ID of the Amazon Web Services user that started the session"
+        // (`Session$Owner`), read with no guard held because it reads IAM's and STS's
+        // stores.
+        let owner = crate::state::identity_authorization::caller_arn(&*self.engine, ctx);
+
+        let mut store = state.lock();
+        // "Initiates a connection to a target (for example, a managed node)": a session is
+        // a connection to a node Systems Manager MANAGES, so the target has to be a node
+        // this endpoint holds and the agent on it has to be reachable — which is what
+        // `PingStatus` reports. A target no such node answers for is what
+        // `TargetNotConnected` exists for, including "a managed node that is located in a
+        // different account or Region", since a node is held per Region.
+        let connected = store
+            .managed_node(&region, &input.target)
+            .and_then(|node| node.properties.ping_status.clone())
+            .is_some_and(|status| status == crate::state::PING_STATUS_ONLINE);
+        if !connected {
+            return Err(StartSessionErrorModeled::TargetNotConnected(
+                TargetNotConnected {
+                    message: Some(format!("{} is not connected.", input.target)),
+                },
+            )
+            .into());
+        }
+
+        // "The name of the SSM document you want to use to define the type of session …
+        // You can call the GetDocument API to verify the document exists before attempting
+        // to start a session": a name this endpoint resolves no document for is what
+        // `InvalidDocument` reports. A request that names none launches "a shell to the
+        // managed node … by default", which is no document of this account, so there is
+        // nothing to resolve and nothing to refuse.
+        let document_name = match crate::state::non_empty(input.document_name.as_deref()) {
+            Some(named) => {
+                let Some(document) = store.resolve_document_for_request(named, &region, now) else {
+                    return Err(StartSessionErrorModeled::InvalidDocument(InvalidDocument {
+                        message: Some(crate::state::document_not_found_message(named)),
+                    })
+                    .into());
+                };
+                // `Session$DocumentName` is the document's own name, so a request that
+                // named it by ARN reports the name that ARN resolved to.
+                Some(document.name)
+            }
+            None => None,
+        };
+
+        // What keeps this process finite: nothing in the model bounds how many sessions an
+        // account starts, and a session that has ended stays in the store because
+        // `DescribeSessions` reports it under `History`. A store with no room left is a
+        // condition of this side rather than a defect in the request, which is what the
+        // modelled server error says.
+        if !store.can_hold_another_session() {
+            return Err(StartSessionErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(format!(
+                        "This emulator holds at most {} sessions across every Region",
+                        sessions::MAX_SESSIONS_TOTAL
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let session_id = sessions::mint_session_id(&owner);
+        store.insert_session(
+            &region,
+            sessions::SessionRecord::started(
+                session_id.clone(),
+                input.target,
+                owner,
+                document_name,
+                crate::state::non_empty(input.reason.as_deref()).map(str::to_string),
+                now,
+            ),
+        );
+        drop(store);
+
+        // "An encrypted token value containing session and caller information. This token
+        // is used to authenticate the connection to the managed node": a secret handed to
+        // the caller, so it comes from the one component that generates secrets rather than
+        // being constructed here. It is NOT a credential of this emulator and must never be
+        // accepted as one, so the entry minted for it is removed again. The modelled
+        // `TokenValue` carries 0..300 characters, so that is how much of the generated
+        // secret the token is — a prefix of it, never a value stretched to fill the member.
+        let minted = ctx
+            .credential_store()
+            .create(&::emulator_server::aws_credentials::AWS_SESSION);
+        let token_value = minted
+            .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+            .map(|secret| {
+                secret
+                    .chars()
+                    .take(sessions::MAX_TOKEN_VALUE_CHARS)
+                    .collect::<String>()
+            });
+        let _ = ctx.credential_store().delete(&minted.id);
+        let Some(token_value) = token_value else {
+            return Err(StartSessionErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "the token minted for this session carries no secret".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(StartSessionOutput {
+            stream_url: Some(sessions::stream_url(
+                &::service_common::data_plane_addressing::emulator_endpoint_authority(ctx),
+                &session_id,
+            )),
+            session_id: Some(session_id),
+            token_value: Some(token_value),
+        })
     }
 }

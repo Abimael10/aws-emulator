@@ -257,6 +257,10 @@ pub mod inventory;
 /// managed nodes, and the node record that registration writes.
 pub mod node_registration;
 
+/// The Session Manager sessions this endpoint holds: the record a start persists, what
+/// ends one, and how a report filters and pages them.
+pub mod sessions;
+
 /// The resource data sync configurations this service holds: the record a create
 /// persists, the configuration rules it is held to, and how a listing, an update and a
 /// delete address one.
@@ -3534,6 +3538,13 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// two windows of one store never carry one id.
     pub maintenance_window_sequence: u64,
 
+    /// Every Session Manager session, keyed by `(region, session id)`: a session is started
+    /// through one Region's endpoint and is reached there by the id the start minted
+    /// ([`sessions::mint_session_id`]). A `BTreeMap` so a report walks a stable, total
+    /// order — ascending by session id within one Region — and can resume a page from the
+    /// id it stopped at rather than from an offset. See [`sessions`].
+    pub sessions: BTreeMap<(String, String), sessions::SessionRecord>,
+
     /// The secret this store's Parameter Store continuation tokens are authenticated
     /// under, drawn from the system's randomness when the store is created
     /// ([`parameter_pagination`]): it is what lets a paginated read tell a token it ISSUED
@@ -3578,6 +3589,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             access_request_sequence: 0,
             maintenance_windows: BTreeMap::new(),
             maintenance_window_sequence: 0,
+            sessions: BTreeMap::new(),
             // One key per store, from the system's randomness: see `parameter_pagination`.
             page_token_key: parameter_pagination::PageTokenKey::new(),
         }
@@ -4036,6 +4048,29 @@ impl ComAmazonawsSsmAmazonssmState {
 /// this service's handlers.
 pub fn non_empty(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty())
+}
+
+/// The instant a caller-supplied timestamp names, or `None` for a value that names none:
+/// the ISO 8601 form an SDK renders a timestamp as, or the epoch seconds one sends when it
+/// sends a number.
+///
+/// THE ONE reading of such a value across this service — the time keys an OpsItem query
+/// compares against ([`ops_item_queries`]) and the two instant keys a session report filters
+/// by ([`sessions`]) — so two members of this service cannot accept different spellings of
+/// one instant.
+pub fn request_instant(value: &str) -> Option<SystemTime> {
+    for format in [
+        ::aws_smithy_types::date_time::Format::DateTime,
+        ::aws_smithy_types::date_time::Format::EpochSeconds,
+    ] {
+        if let Some(at) = ::aws_smithy_types::DateTime::from_str(value, format)
+            .ok()
+            .and_then(|at| SystemTime::try_from(at).ok())
+        {
+            return Some(at);
+        }
+    }
+    None
 }
 
 /// A modelled `TagList` as the store holds it: ordered, so two reads of one record

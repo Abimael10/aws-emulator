@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSessions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSessions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the Session Manager sessions this endpoint holds — "all active sessions (both
+//! connected and disconnected) or terminated sessions from the past 30 days" — narrowed by
+//! the request's filters and served one page at a time. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSessions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is computed from the sessions in [`crate::state::sessions`]
+//! (`ComAmazonawsSsmAmazonssmState::sessions`), which a session enters only by being
+//! started ([`crate::ops::start_session`]), so an account that has started none is reported
+//! as holding none. This operation writes nothing.
+//!
+//! ## Which sessions a request is answered with
+//!
+//! * `State` picks the set: a session that is still usable is reported under `Active`, and
+//!   one that has ended under `History` — the two sets `SessionState` declares
+//!   ([`crate::state::sessions::SessionRecord::state`]).
+//! * A `History` report reaches back [`crate::state::sessions::SESSION_HISTORY_WINDOW`]:
+//!   "terminated sessions from the past 30 days", so a session that ended before that
+//!   window is no longer reported.
+//! * Filters INTERSECT: a session is reported when every filter holds of it, each key
+//!   compared as `SessionFilter$value` documents it. A value that could not be a value of
+//!   the attribute its key filters — an instant that is not an instant, a status outside
+//!   the set that member lists — is a `ValidationException`
+//!   ([`crate::state::sessions::filter_rejection`]), a validation of the request rather
+//!   than the modelled `InvalidFilterKey`, which models no `message` member and so could
+//!   not say which value was refused. The KEYS themselves are the modelled
+//!   `SessionFilterKey` enum, so one outside it is refused before this handler runs.
+//! * A page holds `MaxResults` sessions (the modelled range 1..200), and the `NextToken` is
+//!   the id of the session the next page starts at — the cursor every paged report of this
+//!   service hands out — so a page resumes at an id rather than at an offset into a list
+//!   that may have changed. That cursor is total because the sessions are keyed by
+//!   `(region, session id)` and therefore walked in ascending session-id order
+//!   ([`crate::state::ComAmazonawsSsmAmazonssmState::sessions_in_region`]). A token no
+//!   session id could be is `InvalidNextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +173,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSessions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSessionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSessions"))
+        use crate::state::sessions;
+
+        // `State`'s presence and its enum, each filter key's enum, `Filters`' 1..6 length
+        // and `MaxResults`' 1..200 range are MODELLED constraints, so the centralized walk
+        // has already refused anything outside them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeSessionsErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            if let Some(why) = sessions::filter_rejection(&filter.key, &filter.value) {
+                return Err(crate::scaffolded::Scaffolded::validation(why));
+            }
+        }
+        let page_size = sessions::session_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        // The token this operation hands out is the id of the session the next page starts
+        // at, so a value no session id could be was not one of ours.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if sessions::could_be_session_id(token) => Some(token),
+            Some(_) => {
+                return Err(DescribeSessionsErrorModeled::InvalidNextToken(
+                    InvalidNextToken {
+                        message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Session Manager is regional: a session is reported through the endpoint it was
+        // started at, which is the Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let mut reported = Vec::new();
+        let mut next_token = None;
+        for (id, session) in store.sessions_in_region(&region) {
+            if resume_from.is_some_and(|from| id < from) {
+                continue;
+            }
+            if session.state() != input.state {
+                continue;
+            }
+            if !session.within_report_window(now) {
+                continue;
+            }
+            if !filters
+                .iter()
+                .all(|filter| session.matches_filter(&filter.key, &filter.value))
+            {
+                continue;
+            }
+            if reported.len() == page_size {
+                // The page is full and a session is still waiting: hand the caller the id
+                // it resumes at, so the next request continues where this one stopped.
+                next_token = Some(id.to_string());
+                break;
+            }
+            reported.push(session.to_session());
+        }
+
+        Ok(DescribeSessionsOutput {
+            sessions: Some(reported),
+            next_token,
+        })
     }
 }

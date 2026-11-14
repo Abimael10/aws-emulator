@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TerminateSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TerminateSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! End one Session Manager session: "Permanently ends a session and closes the data
+//! connection between the Session Manager client and SSM Agent on the managed node". This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TerminateSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The end is performed by THIS call rather than owed by the clock, so the session
+//! [`crate::state::sessions`] holds is `Terminated` from the instant the call arrives and
+//! `DescribeSessions` reports it under `History` from then on. "A terminated session can't
+//! be resumed", so a second request to end one changes nothing: the instant it ended is the
+//! one the first call recorded, and the id is reported again.
+//!
+//! A session id this endpoint holds none of terminates nothing, so the answer carries no
+//! `SessionId` — the member is "the ID of the session that has been terminated", and none
+//! was. A session is reached through the endpoint it was started at, so an id of another
+//! Region's endpoint is one this endpoint holds none of.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +140,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TerminateSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TerminateSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TerminateSession"))
+        // `SessionId`'s presence and length are MODELLED constraints, so the centralized
+        // walk has already refused anything outside them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TerminateSessionErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(session) = store.session_mut(&region, &input.session_id) else {
+            return Ok(TerminateSessionOutput { session_id: None });
+        };
+        session.terminate(now);
+
+        Ok(TerminateSessionOutput {
+            session_id: Some(input.session_id),
+        })
     }
 }

@@ -155,6 +155,8 @@ mod secure_string_encryption_at_rest;
 mod secure_string_key_state;
 #[path = "all/service_settings.rs"]
 mod service_settings;
+#[path = "all/session_manager_sessions.rs"]
+mod session_manager_sessions;
 #[path = "all/state_manager_associations.rs"]
 mod state_manager_associations;
 #[path = "all/state_roundtrip.rs"]

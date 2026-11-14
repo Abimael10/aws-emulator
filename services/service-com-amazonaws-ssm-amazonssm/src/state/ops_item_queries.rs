@@ -195,21 +195,11 @@ fn held_for(record: &OpsItemRecord, key: &str) -> Held {
     }
 }
 
-/// `value` read as the instant a time key is compared against: the ISO 8601 form an SDK
-/// renders a timestamp as, or the epoch seconds one sends when it sends a number.
+/// `value` read as the instant a time key is compared against: this service's ONE reading
+/// of a caller-supplied timestamp ([`super::request_instant`]), so a time key here and an
+/// instant filter of another report accept the same spellings.
 fn instant(value: &str) -> Option<SystemTime> {
-    for format in [
-        ::aws_smithy_types::date_time::Format::DateTime,
-        ::aws_smithy_types::date_time::Format::EpochSeconds,
-    ] {
-        if let Some(at) = ::aws_smithy_types::DateTime::from_str(value, format)
-            .ok()
-            .and_then(|at| SystemTime::try_from(at).ok())
-        {
-            return Some(at);
-        }
-    }
-    None
+    super::request_instant(value)
 }
 
 /// The first `characters` characters of `value`, which is what the `Equal` operator compares a

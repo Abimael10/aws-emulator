@@ -27,7 +27,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
-use ::service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData;
+use ::service_com_amazonaws_ec2_amazonec2::ops::types::{
+    IamInstanceProfile, IamInstanceProfileSpecification, RequestLaunchTemplateData,
+};
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 
 use crate::ops::types::{LaunchTemplateSpecification, MixedInstancesPolicy, Tag};
@@ -127,6 +129,10 @@ pub fn launch<Eng: Send + Sync + 'static>(
     if request.count == 0 {
         return Vec::new();
     }
+    // Resolved BEFORE Amazon EC2's store is locked, because resolving it reads IAM's:
+    // the two stores are never held at once, the order every consumer of a group's
+    // launch templates takes ([`super::iam_instance_profiles`]).
+    let iam_instance_profile = launched_instance_profile(engine, request);
     let Some(state) = ec2::service_state(engine) else {
         // No Amazon EC2 store on this engine is nowhere to launch an instance, so the
         // group is given none rather than an id nothing holds.
@@ -273,6 +279,23 @@ pub fn launch<Eng: Send + Sync + 'static>(
         // through the owning store's own seam, rather than left for the clock to finish
         // under a caller who was never shown the transient state.
         store.complete_launched_interface_attachments(&instance_id);
+        // "An instance profile … is used to pass an IAM role to an EC2 instance": the
+        // instance a group launches RUNS AS the instance profile its launch source names,
+        // which is an association of the account's own — the record Amazon EC2 reports
+        // under `Instance$IamInstanceProfile` and the only evidence any consumer of it
+        // has that the instance has a role (the SSM Agent's credentials among them). It
+        // is written through the owning store's own seam, for the same reason the
+        // interface attachment above is: nothing answers a caller the association being
+        // made, so the group completes it as it launches. A store with no room for it
+        // records none rather than failing the launch.
+        if let Some(profile) = iam_instance_profile.clone() {
+            store.insert_iam_instance_profile_association(
+                ec2::IamInstanceProfileAssociationSpec {
+                    instance_id: instance_id.clone(),
+                    iam_instance_profile: profile,
+                },
+            );
+        }
         launched.push(LaunchedInstance {
             instance_id,
             availability_zone: placement.availability_zone.clone(),
@@ -501,9 +524,7 @@ fn launch_parameters(
     let policy_template = request
         .mixed_instances_policy
         .and_then(|policy| policy.launch_template.as_ref());
-    let specification = request.launch_template.or_else(|| {
-        policy_template.and_then(|template| template.launch_template_specification.as_ref())
-    });
+    let specification = launched_specification(request);
     let override_entry = policy_template
         .and_then(|template| template.overrides.as_ref())
         .and_then(|overrides| overrides.first());
@@ -564,6 +585,117 @@ fn launch_parameters(
             .and_then(|monitoring| monitoring.enabled)
             .unwrap_or(false),
     }
+}
+
+/// The ONE launch-template specification a capacity change launches its instances from,
+/// when the group's launch source names a template at all: the group's own
+/// `LaunchTemplate`, or the launch template its mixed instances policy carries.
+///
+/// One reading, so the parameters an instance is launched with
+/// ([`launch_parameters`]) and the IAM instance profile it runs as
+/// ([`launched_instance_profile`]) come from the same launch-template version. The
+/// per-override templates a policy may name are not it: an override contributes the
+/// instance type (and the AMI) to launch, not the version this launch reads — the whole
+/// set is [`specifications`], which is what a request's templates are VALIDATED over.
+fn launched_specification<'a>(
+    request: &'a LaunchRequest<'_>,
+) -> Option<&'a LaunchTemplateSpecification> {
+    request.launch_template.or_else(|| {
+        request
+            .mixed_instances_policy
+            .and_then(|policy| policy.launch_template.as_ref())
+            .and_then(|template| template.launch_template_specification.as_ref())
+    })
+}
+
+/// The IAM instance profile every instance of this launch RUNS AS, as the association
+/// Amazon EC2 records over an instance reports it, or `None` when the group's launch
+/// source names none.
+///
+/// The reference the launch source carries is resolved against the account's own IAM
+/// records through the ONE reading of that member Amazon EC2 has
+/// ([`ec2::resolve_iam_instance_profile`]), so the profile an instance of a group runs as
+/// is the one a launch naming it would run as — the ARN and the unique id IAM holds the
+/// profile under, never values derived here.
+///
+/// Takes Amazon EC2's store lock for the launch-template read and IAM's for the
+/// resolution, one after the other and neither while the other is held; this runs before
+/// the launch locks EC2's store for its own pass.
+fn launched_instance_profile<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    request: &LaunchRequest<'_>,
+) -> Option<IamInstanceProfile> {
+    let specification = named_instance_profile(engine, request)?;
+    // Nothing the reading above can refuse reaches it: exactly one of the two spellings is
+    // filled, so neither the both-given nor the neither-given refusal is reachable, and a
+    // launch source carrying a reference that does not RESOLVE — an ill-formed ARN among
+    // them — is refused when the group is created or updated, before any capacity change
+    // launches from it ([`super::iam_instance_profiles::unresolvable_profile_error`]). What
+    // is left is the answer that reading gives a profile IAM holds no record of: the
+    // reference as the launch source spelled it, with no id.
+    ec2::resolve_iam_instance_profile::<::std::convert::Infallible, Eng>(engine, &specification)
+        .ok()
+}
+
+/// How the group's launch source spells the instance profile its instances run as, as the
+/// specification Amazon EC2's own reading of that member takes.
+///
+/// A launch template carries the reference as an ARN or as a name
+/// (`LaunchTemplateIamInstanceProfileSpecificationRequest`), and a launch configuration as
+/// one value that is "the name or the Amazon Resource Name (ARN) of the instance profile"
+/// (`LaunchConfiguration$IamInstanceProfile`) — read as an ARN exactly when the tree's one
+/// IAM-ARN reading says it names an instance profile. The ARN wins where a template carries
+/// both, the way the resolution every other consumer of these templates performs reads them
+/// ([`super::iam_instance_profiles`]). An empty value names nothing.
+fn named_instance_profile<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    request: &LaunchRequest<'_>,
+) -> Option<IamInstanceProfileSpecification> {
+    if let Some(configuration) = request.launch_configuration {
+        return configuration
+            .iam_instance_profile
+            .as_deref()
+            .and_then(spelled_profile_reference);
+    }
+    let profile = launch_template_data(engine, launched_specification(request)?)?
+        .iam_instance_profile?;
+    if let Some(arn) = profile.arn.filter(|arn| !arn.is_empty()) {
+        return Some(IamInstanceProfileSpecification {
+            arn: Some(arn),
+            name: None,
+        });
+    }
+    let name = profile.name.filter(|name| !name.is_empty())?;
+    Some(IamInstanceProfileSpecification {
+        arn: None,
+        name: Some(name),
+    })
+}
+
+/// The ONE value a launch configuration carries for the profile its instances run as, read
+/// as the specification Amazon EC2's own reading of that member takes: "the name or the
+/// Amazon Resource Name (ARN) of the instance profile"
+/// (`LaunchConfiguration$IamInstanceProfile`) is one member holding either spelling, so
+/// which one it is has to be read off the value.
+///
+/// It is an ARN exactly when the tree's one reading of an IAM ARN says it names an instance
+/// profile ([`::service_common::iam_role::instance_profile_name`]) — so a value that is
+/// ARN-shaped but names another vendor, another IAM entity type or another account is not
+/// taken for one — and a name otherwise. An empty value names nothing.
+fn spelled_profile_reference(reference: &str) -> Option<IamInstanceProfileSpecification> {
+    if reference.is_empty() {
+        return None;
+    }
+    if ::service_common::iam_role::instance_profile_name(reference).is_some() {
+        return Some(IamInstanceProfileSpecification {
+            arn: Some(reference.to_string()),
+            name: None,
+        });
+    }
+    Some(IamInstanceProfileSpecification {
+        arn: None,
+        name: Some(reference.to_string()),
+    })
 }
 
 /// Every launch template a group's launch source names, in the order the request names
@@ -828,4 +960,69 @@ pub fn resolves_image_through_ssm_parameter<Eng: Send + Sync + 'static>(
         .as_deref()
         .and_then(ec2::ssm_image_alias_parameter)
         .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    //! The reading of the ONE member a launch configuration spells its instance profile in,
+    //! driven on values rather than through a group: which spelling a value is cannot be
+    //! observed on the wire for a launch source `CreateLaunchConfiguration` refuses, so it
+    //! is held to the rule here.
+
+    use super::*;
+
+    /// A launch configuration's `IamInstanceProfile` is read as an ARN exactly when it
+    /// names an instance profile of an account, and as a name otherwise.
+    #[test]
+    fn a_launch_configuration_profile_is_read_as_an_arn_or_as_a_name() {
+        let account = ::engine::emulator_account_id();
+        let held_arn = format!("arn:aws:iam::{account}:instance-profile/asg-profile");
+        let under_path = format!("arn:aws:iam::{account}:instance-profile/service-role/asg-profile");
+        let role_arn = format!("arn:aws:iam::{account}:role/asg-profile");
+        // (case, the value the configuration carries, the ARN read off it, the name read
+        // off it)
+        let cases: &[(&str, &str, Option<&str>, Option<&str>)] = &[
+            ("a plain profile name", "asg-profile", None, Some("asg-profile")),
+            (
+                "a name that happens to carry a slash",
+                "team/asg-profile",
+                None,
+                Some("team/asg-profile"),
+            ),
+            ("the ARN of a profile", &held_arn, Some(&held_arn), None),
+            (
+                "the ARN of a profile under a path",
+                &under_path,
+                Some(&under_path),
+                None,
+            ),
+            (
+                "an ARN naming another IAM entity type",
+                &role_arn,
+                None,
+                Some(&role_arn),
+            ),
+            (
+                "a value that is not an ARN at all",
+                "instance-profile/asg-profile",
+                None,
+                Some("instance-profile/asg-profile"),
+            ),
+        ];
+        for (case, reference, arn, name) in cases {
+            let read = spelled_profile_reference(reference)
+                .unwrap_or_else(|| panic!("case {case:?}: expected {reference} to be read"));
+            assert_eq!(
+                (read.arn.as_deref(), read.name.as_deref()),
+                (*arn, *name),
+                "case {case:?}: expected ({arn:?}, {name:?}), got ({:?}, {:?})",
+                read.arn,
+                read.name
+            );
+        }
+        assert!(
+            spelled_profile_reference("").is_none(),
+            "case \"an empty value\": expected it to name no instance profile"
+        );
+    }
 }

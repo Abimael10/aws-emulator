@@ -49,7 +49,7 @@ const IAM_API_VERSION: &str = "2010-05-08";
 
 /// The public Systems Manager parameter the AL2023 image id is resolved through — the one
 /// the issue's client resolves its AMI by.
-const AL2023_PARAMETER: &str =
+pub(crate) const AL2023_PARAMETER: &str =
     "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64";
 
 /// The same for a Windows Server image, so a row can launch an instance whose AMI declares
@@ -71,17 +71,17 @@ const INVENTORY_TYPE: &str = "AWS:InstanceInformation";
 /// Generous on purpose: the registration span, Amazon EC2's own state transition and an
 /// association's run are each a stored due instant and nothing sleeps for any of them, so a
 /// case looks again until the condition holds rather than waiting a fixed time.
-const DEADLINE: Duration = Duration::from_secs(120);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(120);
 
 /// How long one look-again cycle pauses before polling again.
-const POLL_PAUSE: Duration = Duration::from_millis(50);
+pub(crate) const POLL_PAUSE: Duration = Duration::from_millis(50);
 
 /// A router with Systems Manager, Amazon EC2 and IAM mounted on ONE shared engine.
 ///
 /// All three are there because the registration is derived from all three: the instance and
 /// its instance-profile association are Amazon EC2's, the profile and the role's policies
 /// are IAM's, and the node is this service's.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not what these tests are about; the router still reads the SigV4
@@ -191,7 +191,7 @@ fn trust_policy(principal: &str) -> String {
 /// How one instance profile's role is granted — or withheld — the call the agent registers
 /// with.
 #[derive(Debug, Clone, Copy)]
-enum Grant {
+pub(crate) enum Grant {
     /// The AWS-managed policy a client attaches for this, whose document this emulator
     /// holds none of.
     AwsManaged,
@@ -203,13 +203,13 @@ enum Grant {
 
 /// One instance profile a case launches an instance with.
 #[derive(Debug, Clone, Copy)]
-struct Profile {
+pub(crate) struct Profile {
     /// The name of the profile and of the role it carries.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// The service principal its role's trust policy admits.
-    trusts: &'static str,
+    pub(crate) trusts: &'static str,
     /// What its role's identity-based policies say about the registration call.
-    grant: Grant,
+    pub(crate) grant: Grant,
 }
 
 /// The inline document granting exactly the call the agent registers with.
@@ -229,7 +229,7 @@ const DENIES_REGISTRATION: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\
 /// Build one instance profile the way a client builds one — `CreateRole`, the grant, then
 /// `CreateInstanceProfile` and `AddRoleToInstanceProfile` — and read it back through IAM's
 /// own reader, so the profile an instance is launched with is one IAM really holds.
-async fn create_profile(router: &MultiServiceRouter, profile: &Profile) {
+pub(crate) async fn create_profile(router: &MultiServiceRouter, profile: &Profile) {
     let case = profile.name;
     let trust = trust_policy(profile.trusts);
     iam_ok(
@@ -302,7 +302,7 @@ async fn create_profile(router: &MultiServiceRouter, profile: &Profile) {
 
 /// The image id the public Systems Manager parameter `name` resolves to, read through this
 /// service's own `GetParameter`.
-async fn image_id(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn image_id(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = call_in_region(router, REGION, "GetParameter", &json!({ "Name": name }))
         .await;
     assert_eq!(
@@ -317,7 +317,7 @@ async fn image_id(router: &MultiServiceRouter, name: &str) -> String {
 
 /// Launch one instance in `region` through Amazon EC2's own `RunInstances`, optionally with
 /// the instance profile `profile`, as the instance id that service answered.
-async fn launch(
+pub(crate) async fn launch(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -358,7 +358,7 @@ async fn node(router: &MultiServiceRouter, region: &str, instance_id: &str) -> O
 
 /// Look again until this service reports `instance_id` as a managed node, or [`DEADLINE`]
 /// passes.
-async fn node_when_registered(
+pub(crate) async fn node_when_registered(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,

@@ -87,6 +87,11 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # configuration publishes to an SNS topic, and the delivery is asserted on the SQS queue
 # subscribed to that topic.
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# Systems Manager is mounted beside them because the instance-profile association a group's
+# launch writes is what its agent registers a managed node with: whether a group's instance
+# becomes one is read where a client reads it, through that service's own
+# `DescribeInstanceInformation`.
+service-com-amazonaws-ssm-amazonssm = { workspace = true }
 
 [lints]
 workspace = true
