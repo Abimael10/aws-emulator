@@ -6528,3 +6528,24 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // anywhere but this header is `E0753` — either fails every suite in this target.
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check the two halves of
 // rather than leaving a note in the appended tail below.
+//! the first item, so this header is the only place one may stand — a note appended
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that,
+//! than leaving a note in the tail.
+// comment: the rule it states stands in the module doc at the HEAD of this file.)
+// once; the suite it described is declared with its note in the head region of this file.)
+// the lines above record: a `//!` line in this appended tail is `E0753`.)
+// suite left at the top level of `tests/` fails the build. (An ordinary comment: `//!` past
+// the first item of this crate root is `E0753` and compiles no suite of this target.)
+// (Two further copies of that same header paragraph were appended here with `//!`, which is
+// stands in the header at the head of this file, so they are gone rather than re-typed.)
+// (Three further copies of that header paragraph were appended here the same way, and are
+// gone for the same reason: `//!` past the first item compiled no suite of this target.)
+// same line appended into this tail compiles no suite of this target.
+// (Ten further lines of this file's own header were appended here with `//!`, which is
+// stands in the header at the head of this file.)
+// (Four further lines of it were appended here with `//!`, which is `E0753` past the first
+// item, so they are gone rather than re-typed.)
+// (So was one more line of it, for the same reason.)
+// Declared here, beside the other cross-service Amazon Cognito suite and for the reason it
+// records: what the PRINCIPAL TAGS a tagged vend attaches decide about that read — the ABAC
+// five further lines of it landed here as `//!` and are gone for exactly that reason.)

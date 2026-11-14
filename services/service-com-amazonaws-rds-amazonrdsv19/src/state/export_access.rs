@@ -124,8 +124,8 @@ fn export_context(role_arn: &str) -> Vec<(String, String)> {
 /// is that role's own ARN.
 const PRINCIPAL_ARN_KEY: &str = "aws:PrincipalArn";
 
-/// The KMS action of the two the export needs that the key `key_id` does NOT authorize the
-/// role `role_arn` to perform, or `None` where the key authorizes both of them.
+/// Whether the key `key_id`'s own policy withholds either of the two KMS operations the
+/// export has to perform on it under the role `role_arn`.
 ///
 /// "The caller of this operation must be authorized to run the following operations. These
 /// can be set in the Amazon Web Services KMS key policy: kms:CreateGrant kms:DescribeKey"
@@ -134,27 +134,37 @@ const PRINCIPAL_ARN_KEY: &str = "aws:PrincipalArn";
 /// the export runs under, and a policy that delegates to IAM by granting the account (the
 /// default key policy) authorizes it.
 ///
-/// `None` for everything that is not an answer: no KMS beside this service, a key it would
+/// WHICH of the two is withheld is not reported, because it is not reported to the caller
+/// either: a key the export cannot use is answered with the one sentence the export's key
+/// fault carries ([`super::export_kms_key_not_accessible_message`]), which names neither the
+/// role nor the action.
+///
+/// `false` for everything that is not an answer: no KMS beside this service, a key it would
 /// not report a policy for, or a document that could not be read. A refusal has to be
 /// grounded in what KMS said.
-pub async fn export_key_withheld_action(
+pub async fn export_key_withholds_a_required_action(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     key_id: &str,
     role_arn: &str,
-) -> Option<&'static str> {
-    let kms = super::managed_master_secret::kms_client(ctx, region)?;
-    let policy = kms
+) -> bool {
+    let Some(kms) = super::managed_master_secret::kms_client(ctx, region) else {
+        return false;
+    };
+    let Some(policy) = kms
         .get_key_policy()
         .key_id(key_id)
         .send()
         .await
-        .ok()?
-        .policy
-        .filter(|document| !document.is_empty())?;
+        .ok()
+        .and_then(|answer| answer.policy)
+        .filter(|document| !document.is_empty())
+    else {
+        return false;
+    };
     let principals = export_principals(role_arn);
     let context = export_context(role_arn);
-    EXPORT_KEY_ACTIONS.into_iter().find(|action| {
+    EXPORT_KEY_ACTIONS.into_iter().any(|action| {
         let request = ::service_common::iam_authorization::Request::new(
             action,
             // The key itself is the resource those actions are taken on; a key policy

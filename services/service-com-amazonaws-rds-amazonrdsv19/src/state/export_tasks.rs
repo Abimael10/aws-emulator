@@ -195,20 +195,16 @@ pub fn target_kms_key_not_accessible_message(key_id: &str) -> String {
 /// What the same fault carries on the EXPORT path, where `KmsKeyId` is the key the exported
 /// data is encrypted with: Amazon RDS words this one as a statement about the key itself,
 /// naming the identifier the request carried and nothing else.
+///
+/// It is the ONE sentence of the export's key fault, whichever condition left the key
+/// unusable — a key KMS holds nothing under, a key it holds disabled, and a key whose own
+/// policy withholds the `kms:CreateGrant` / `kms:DescribeKey` the export has to perform on it
+/// (`KmsKeyId`). Amazon RDS words all of them as the key's own absence, so the sentence names
+/// neither the role the export runs under nor the KMS action that was withheld, and its one
+/// variable part is the key reference echoed exactly as the request spelled it (key id, key
+/// ARN, alias name or alias ARN).
 pub fn export_kms_key_not_accessible_message(key_id: &str) -> String {
     format!("The KMS key {key_id} doesn't exist or is disabled.")
-}
-
-/// The same fault where the key EXISTS but the role the export runs under is not authorized
-/// to USE it: "the caller of this operation must be authorized to run the following
-/// operations" on the key (`KmsKeyId`), and a key whose own policy grants that role none of
-/// them encrypts nothing.
-///
-/// Worded as Amazon RDS words a missing authorization on an export — the role, the action
-/// and the resource the action is not granted on — so the variable parts are the request's
-/// `IamRoleArn`, the KMS action the export has to perform and the request's `KmsKeyId`.
-pub fn export_kms_key_not_authorized_message(role_arn: &str, action: &str, key_id: &str) -> String {
-    format!("The IAM role {role_arn} isn't authorized to call {action} on the KMS key {key_id}.")
 }
 
 /// What a request whose `SourceArn` names a resource of ANOTHER Region is refused with.

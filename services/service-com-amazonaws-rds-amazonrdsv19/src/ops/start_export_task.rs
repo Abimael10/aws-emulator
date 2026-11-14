@@ -423,9 +423,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // following operations" on it — `kms:CreateGrant` and `kms:DescribeKey` (`KmsKeyId`)
         // — and in KMS no principal holds any permission on a key its own policy does not
         // grant, so a key whose policy grants the role neither of them cannot encrypt this
-        // export. It is the modelled `KMSKeyNotAccessibleFault`, exactly as a key that does
-        // not exist is.
-        if let Some(action) = crate::state::export_key_withheld_action(
+        // export. It is the modelled `KMSKeyNotAccessibleFault`, worded in the one sentence
+        // that fault carries here, exactly as a key that does not exist is: Amazon RDS
+        // reports every condition that leaves the key unusable as the key's own absence, so
+        // the answer names the key the request passed and neither the role nor the action.
+        if crate::state::export_key_withholds_a_required_action(
             ctx,
             &region,
             &input.kms_key_id,
@@ -435,9 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(StartExportTaskErrorModeled::KMSKeyNotAccessibleFault(
                 KMSKeyNotAccessibleFault {
-                    message: Some(crate::state::export_kms_key_not_authorized_message(
-                        &input.iam_role_arn,
-                        action,
+                    message: Some(crate::state::export_kms_key_not_accessible_message(
                         &input.kms_key_id,
                     )),
                 },

@@ -226,7 +226,7 @@ pub use events::{
 };
 pub use export_tasks::{
     cross_region_export_bucket_message, cross_region_export_source_message,
-    export_kms_key_not_accessible_message, export_kms_key_not_authorized_message, export_part_id,
+    export_kms_key_not_accessible_message, export_part_id,
     export_role_missing_permissions_message, export_role_not_found_message, export_source_of,
     export_task_already_exists_message, export_task_not_found_message, export_task_quota_message,
     invalid_export_only_message, invalid_export_source_arn_message,

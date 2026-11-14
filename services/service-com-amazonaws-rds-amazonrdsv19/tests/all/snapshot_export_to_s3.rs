@@ -18,6 +18,11 @@
 //!   approximate and integer types keep their own Parquet types.
 //! * Each refusal of an export carries the status, the code and the SENTENCE Amazon RDS
 //!   words that error class in, with the request's own values in its variable parts.
+//! * Every condition that leaves the key named by `KmsKeyId` unable to encrypt the export —
+//!   a key KMS holds nothing under, a key it holds disabled, and a key whose own policy
+//!   withholds either of the two KMS operations the export performs on it — is answered with
+//!   the one `KMSKeyNotAccessibleFault` and the single sentence that fault carries here,
+//!   naming the key reference the request passed and nothing else.
 //!
 //! Amazon S3, IAM and KMS are mounted beside this service on ONE engine, exactly as the
 //! assembled router mounts them, and every object asserted here is read back through Amazon
@@ -36,7 +41,7 @@ use service_com_amazonaws_rds_amazonrdsv19::state as st;
 use smithy_server_runtime::MultiServiceRouter;
 use tokio::time::sleep;
 
-use crate::db_instances::{call, expect_error, expect_ok, text, REGION};
+use crate::db_instances::{call, expect_error, expect_ok, subtrees, text, REGION};
 use crate::rds_s3_integration::{create_bucket, emulator, kms, put_object_policy, role, s3};
 
 /// The canonical account id every generated emulator presents.
@@ -233,15 +238,9 @@ struct Destination {
 async fn destination(bucket: &str, role_name: &str) -> Destination {
     let (router, engine) = emulator();
     create_bucket(&router, bucket, REGION).await;
-    let key_id = kms(&router)
-        .create_key()
-        .description("the export's encryption key")
-        .send()
+    let key_id = created_key(&router, "the export's encryption key", None)
         .await
-        .expect("the emulated KMS creates the export key")
-        .key_metadata()
-        .map(|metadata| metadata.key_id().to_string())
-        .expect("the created key reports its id");
+        .id;
     let role_arn = role(
         &router,
         role_name,
@@ -848,18 +847,13 @@ async fn each_export_refusal_carries_the_services_own_sentence() {
         None,
     )
     .await;
-    let closed_key = kms(&destination.router)
-        .create_key()
-        .policy(format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{other_role}"}},"Action":"kms:*","Resource":"*"}}]}}"#
-        ))
-        .bypass_policy_lockout_safety_check(true)
-        .send()
-        .await
-        .expect("the emulated KMS creates the key with its own policy")
-        .key_metadata()
-        .map(|metadata| metadata.key_id().to_string())
-        .expect("the created key reports its id");
+    let closed_key = created_key(
+        &destination.router,
+        "a key whose policy decides only about another role",
+        Some(key_policy_allowing(&other_role, r#""kms:*""#)),
+    )
+    .await
+    .id;
 
     let rows = [
         RefusalRow {
@@ -926,11 +920,7 @@ async fn each_export_refusal_carries_the_services_own_sentence() {
             key_id: Some(closed_key.clone()),
             status: 400,
             code: "KMSKeyNotAccessibleFault",
-            message: format!(
-                "The IAM role {} isn't authorized to call kms:CreateGrant on the KMS key \
-                 {closed_key}.",
-                destination.role_arn
-            ),
+            message: format!("The KMS key {closed_key} doesn't exist or is disabled."),
         },
         RefusalRow {
             case: "a KMS key KMS holds nothing under",
@@ -980,4 +970,251 @@ async fn each_export_refusal_carries_the_services_own_sentence() {
         keys.is_empty(),
         "a refused export writes no object, got {keys:?}"
     );
+}
+
+/// One row of the unusable-key table: how the request spells the key, and what leaves that
+/// key unable to encrypt the export.
+struct UnusableKeyRow {
+    case: &'static str,
+    /// What makes the key unusable; the key reference the request carries is built from it.
+    defect: KeyDefect,
+}
+
+/// The conditions that leave the key named by `KmsKeyId` unable to encrypt an export.
+enum KeyDefect {
+    /// KMS holds no key under the reference the request carries, which is this value.
+    Absent(String),
+    /// KMS holds the key but it is not enabled; the request names it by its key id, or by
+    /// its key ARN when `by_arn`.
+    Disabled { by_arn: bool },
+    /// KMS holds the key enabled, and its own policy does not authorize the export's role
+    /// for both of the operations the export performs on it. The document is the key's
+    /// policy; the request names the key by its id, or by its ARN when `by_arn`.
+    Policy { document: String, by_arn: bool },
+}
+
+/// A key policy whose ONE statement decides about `principal`: the form a key's own policy
+/// takes when the account is not granted at all ("no AWS principal has any permissions to a
+/// KMS key unless the key policy allows it"), so a principal the statement does not cover is
+/// authorized for nothing.
+fn key_policy_allowing(principal: &str, actions: &str) -> String {
+    format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":{actions},"Resource":"*"}}]}}"#
+    )
+}
+
+/// A key policy that GRANTS the account — the default key policy's own statement, which
+/// delegates to IAM — and then denies `principal` the action `action` on the key: "an
+/// explicit deny in any policy overrides any allow", so the deny is what decides.
+fn key_policy_denying(principal: &str, action: &str) -> String {
+    format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{ACCOUNT}:root"}},"Action":"kms:*","Resource":"*"}},{{"Effect":"Deny","Principal":{{"AWS":"{principal}"}},"Action":"{action}","Resource":"*"}}]}}"#
+    )
+}
+
+/// Rule: every condition that leaves `KmsKeyId` unable to encrypt an export — a key KMS
+/// holds nothing under, a key it holds disabled, and a key whose own policy withholds either
+/// of the two KMS operations the export performs on it — is refused with the one modelled
+/// `KMSKeyNotAccessibleFault` (HTTP 400) and the single sentence that fault carries here,
+/// whose only variable part is the key reference echoed exactly as the request spelled it.
+/// Neither the role the export runs under nor the KMS action that was withheld is named, and
+/// no export task is recorded and no object written.
+///
+/// The rows span the three conditions, the spellings `KmsKeyId` accepts ("the key ARN, key
+/// ID, alias ARN, or alias name") and — across the policy rows — which of the two actions
+/// (`kms:CreateGrant` and `kms:DescribeKey`, as the member lists them) is the one withheld,
+/// so a sentence naming the action that failed could not pass.
+#[tokio::test]
+async fn every_condition_that_makes_the_export_key_unusable_carries_the_one_key_sentence() {
+    let destination = destination("emu-key-fault-bucket", "emu-key-fault-role").await;
+    let instance = "emu-key-fault-instance";
+    available_instance(&destination, "the unusable keys' source", instance).await;
+    seed(&instance_database(&destination, instance), SEEDED);
+    let source_arn = available_snapshot(
+        &destination,
+        "the unusable keys' source",
+        instance,
+        "emu-key-fault-snapshot",
+    )
+    .await;
+    // Another principal, for the policy rows that decide about someone else: a key that
+    // authorizes a different role authorizes this export for nothing.
+    let other_role = role(
+        &destination.router,
+        "emu-key-fault-other",
+        st::EXPORT_SERVICE_PRINCIPAL,
+        None,
+    )
+    .await;
+    let export_role = destination.role_arn.clone();
+
+    let rows = [
+        UnusableKeyRow {
+            case: "a key ARN KMS holds nothing under",
+            defect: KeyDefect::Absent(format!(
+                "arn:aws:kms:{REGION}:{ACCOUNT}:key/11111111-2222-3333-4444-555555555555"
+            )),
+        },
+        UnusableKeyRow {
+            case: "a bare key id KMS holds nothing under",
+            defect: KeyDefect::Absent("22222222-3333-4444-5555-666666666666".to_string()),
+        },
+        UnusableKeyRow {
+            case: "an alias this account holds no key under",
+            defect: KeyDefect::Absent("alias/emu-key-fault-absent".to_string()),
+        },
+        UnusableKeyRow {
+            case: "a key KMS holds disabled, named by its key id",
+            defect: KeyDefect::Disabled { by_arn: false },
+        },
+        UnusableKeyRow {
+            case: "a key KMS holds disabled, named by its key ARN",
+            defect: KeyDefect::Disabled { by_arn: true },
+        },
+        UnusableKeyRow {
+            case: "a key whose policy decides only about another principal",
+            defect: KeyDefect::Policy {
+                document: key_policy_allowing(&other_role, r#""kms:*""#),
+                by_arn: false,
+            },
+        },
+        UnusableKeyRow {
+            case: "a key whose policy denies the export role kms:CreateGrant",
+            defect: KeyDefect::Policy {
+                document: key_policy_denying(&export_role, "kms:CreateGrant"),
+                by_arn: false,
+            },
+        },
+        UnusableKeyRow {
+            case: "a key whose policy denies the export role kms:DescribeKey",
+            defect: KeyDefect::Policy {
+                document: key_policy_denying(&export_role, "kms:DescribeKey"),
+                by_arn: true,
+            },
+        },
+        UnusableKeyRow {
+            case: "a key whose policy grants the export role only kms:DescribeKey",
+            defect: KeyDefect::Policy {
+                document: key_policy_allowing(&export_role, r#""kms:DescribeKey""#),
+                by_arn: false,
+            },
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let named = match &row.defect {
+            KeyDefect::Absent(reference) => reference.clone(),
+            KeyDefect::Disabled { by_arn } => {
+                let key = created_key(&destination.router, row.case, None).await;
+                kms(&destination.router)
+                    .disable_key()
+                    .key_id(&key.id)
+                    .send()
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("case {:?}: the emulated KMS disables the key: {error}", row.case)
+                    });
+                key.named(*by_arn)
+            }
+            KeyDefect::Policy { document, by_arn } => {
+                created_key(&destination.router, row.case, Some(document.clone()))
+                    .await
+                    .named(*by_arn)
+            }
+        };
+        let body = expect_error(
+            row.case,
+            call(
+                &destination.router,
+                "StartExportTask",
+                &params![
+                    "ExportTaskIdentifier" => format!("emu-key-fault-export-{index}"),
+                    "SourceArn" => source_arn,
+                    "S3BucketName" => destination.bucket,
+                    "IamRoleArn" => destination.role_arn,
+                    "KmsKeyId" => named,
+                ],
+            )
+            .await,
+            400,
+            "KMSKeyNotAccessibleFault",
+        );
+        let expected = format!("The KMS key {named} doesn't exist or is disabled.");
+        let message = text(&body, "Message");
+        assert_eq!(
+            message, expected,
+            "case {:?}: expected the refusal sentence {expected:?}, got {message:?}",
+            row.case
+        );
+    }
+
+    // A refused export records no task and writes no object: the refusal is a decision about
+    // the request, so nothing of it survives anywhere.
+    let described = expect_ok(
+        "no task was recorded",
+        call(
+            &destination.router,
+            "DescribeExportTasks",
+            &params!["MaxRecords" => 20],
+        )
+        .await,
+    );
+    assert!(
+        subtrees(&described, "ExportTask").is_empty(),
+        "a refused export records no task, got {described}"
+    );
+    let keys = listed_keys(&destination, "").await;
+    assert!(
+        keys.is_empty(),
+        "a refused export writes no object, got {keys:?}"
+    );
+}
+
+/// One key this emulator's own KMS holds: both spellings of it a request may carry.
+struct CreatedKey {
+    id: String,
+    arn: String,
+}
+
+impl CreatedKey {
+    /// The reference a request names this key by: its ARN, or its bare key id.
+    fn named(self, by_arn: bool) -> String {
+        if by_arn {
+            self.arn
+        } else {
+            self.id
+        }
+    }
+}
+
+/// Create one key through this emulator's own KMS, with `policy` as its key policy when one
+/// is given — a key that service really holds, which is what the export resolves. The ONE
+/// create-a-key call of this suite: every key it stands up, with a policy or with the default
+/// one, is minted here.
+async fn created_key(
+    router: &MultiServiceRouter,
+    case: &str,
+    policy: Option<String>,
+) -> CreatedKey {
+    let mut request = kms(router).create_key().description(case);
+    if let Some(policy) = policy {
+        // A policy naming a principal other than this account's own calls for the lockout
+        // check to be bypassed, exactly as it does against the real service.
+        request = request
+            .policy(policy)
+            .bypass_policy_lockout_safety_check(true);
+    }
+    let metadata = request
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: the emulated KMS creates the key: {error}"))
+        .key_metadata
+        .unwrap_or_else(|| panic!("case {case:?}: the created key reports its metadata"));
+    CreatedKey {
+        id: metadata.key_id().to_string(),
+        arn: metadata
+            .arn()
+            .unwrap_or_else(|| panic!("case {case:?}: the created key reports its ARN"))
+            .to_string(),
+    }
 }
