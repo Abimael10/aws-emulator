@@ -1,23 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a control-plane deletion does to a configuration session that is already bound,
-//! driven end to end over HTTP.
+//! What a control-plane deletion does to a configuration session that is already
+//! polling, driven end to end over HTTP.
 //!
 //! The rule under test is about every level of the AppConfig hierarchy and every poll of
-//! a session, not about one deletion: resolving the (application, environment,
-//! configuration profile) triple is what STARTING a session does, so a token that
-//! resolves to a live, unexpired session is served from the configuration that session is
-//! bound to — the control plane is re-read only to pick up a version deployed since.
-//! A record deleted after the session was bound therefore does not retroactively unmake
-//! the session, and `GetLatestConfiguration`'s `ResourceNotFoundException` is left for the
-//! session that was bound to no configuration at all.
+//! a session, not about one deletion: a session is over LIVE control-plane state, so
+//! every poll resolves the session's (application, environment, configuration profile)
+//! triple against that store as it stands at the instant of the poll. Whatever the
+//! control plane no longer holds — a level of the hierarchy, or the configuration version
+//! the in-force deployment names — leaves the poll nothing to serve, and the poll is
+//! refused with the modelled `ResourceNotFoundException` (404) naming the resource that
+//! is gone. That is the same answer `StartConfigurationSession` gives for the same
+//! triple, so what a session is served never depends on when it was started: a token
+//! bounds a poll in TIME, it is not a standing grant over withdrawn state.
 //!
 //! The rows differ along what the rule generalises over: WHICH level the control plane
 //! removes (and how many at once), whether the session had already polled when the
-//! removal happened, and the form, content type and version label of the configuration it
-//! is bound to. Each row also checks the two halves that must NOT change: a session
-//! started after the removal is still judged by the control plane (that is where resource
-//! resolution belongs), and an untouched hierarchy's session keeps polling throughout.
+//! removal happened, whether the session spelled its triple by name or by id, and the
+//! form, content type and version label of the configuration it was serving. Each row
+//! also checks the two halves that must NOT change: a session started after the removal
+//! is judged the same way (that is what keeps the refusal a property of the state rather
+//! than of the token), and an untouched hierarchy's session keeps polling throughout, so
+//! the refusal is scoped to the removed records rather than being an outage of the
+//! endpoint.
 //!
 //! Every request goes through the router harness the polling suite sets up
 //! ([`super::configuration_session_poll::Emulator`]), which mounts AppConfigData and the
@@ -26,9 +31,7 @@
 
 use bytes::Bytes;
 
-use service_com_amazonaws_appconfigdata_appconfigdata::state::DEFAULT_POLL_INTERVAL_IN_SECONDS;
-
-use super::configuration_session_poll::{is_modelled_token, Emulator, Hierarchy};
+use super::configuration_session_poll::{Emulator, Hierarchy};
 
 /// One level of the hierarchy the control plane removes. AppConfig does not cascade the
 /// resources a container owns, so a row that reaches a container lists the children it
@@ -42,21 +45,36 @@ enum Removal {
     Application,
 }
 
-/// What a session STARTED after the removal must answer — the half of the rule that does
-/// not change, because resolution is `StartConfigurationSession`'s job.
+/// What a poll of the removed triple must answer: the modelled `ResourceType` for the
+/// resource the control plane no longer holds, and the input member `ReferencedBy` is
+/// keyed by where the refusal is about a resource a request parameter named.
+///
+/// The `ResourceType` values are the five the model's `ResourceType` enum declares
+/// (Application, ConfigurationProfile, Deployment, Environment, Configuration), listed in
+/// `src/ops/types/shared_types.rs` as `RESOURCE_TYPE_VALUES`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Withdrawn {
+    resource_type: &'static str,
+    /// `None` where the missing resource is the CONFIGURATION itself, which no
+    /// identifier of the session names.
+    referenced_by: Option<&'static str>,
+}
+
+/// What a session STARTED after the removal must answer — the half of the rule that
+/// shows the refusal belongs to the state and not to the age of a token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AfterRemoval {
     /// `StartConfigurationSession` is refused with the modelled
     /// `ResourceNotFoundException` naming this `ResourceType`, and the `Message` is that
     /// level's fixed "<ResourceType> not found" sentence.
     SessionRefused { resource_type: &'static str },
-    /// The triple still resolves, so the session is minted — and it is bound to no
-    /// configuration, which is the one case this operation reports as not found, with
-    /// this `ResourceType`.
+    /// The triple still resolves, so the session is minted — and its first poll is
+    /// refused with this `ResourceType`, exactly as the withdrawn session's poll is.
     PollRefused { resource_type: &'static str },
 }
 
-/// One removal, and the configuration the victim session is bound to when it happens.
+/// One removal, and the configuration the victim session was being served when it
+/// happened.
 struct Case {
     name: &'static str,
     /// What the control plane removes, in the order it has to.
@@ -64,9 +82,14 @@ struct Case {
     /// Whether the session had already polled once (so it holds the latest version) when
     /// the removal happened.
     polled_before: bool,
+    /// Whether the session spelled its triple by id rather than by name — each
+    /// identifier is "the ID or the name" of its level, and `ReferencedBy` echoes the
+    /// spelling the session used.
+    by_id: bool,
     content: &'static [u8],
     content_type: &'static str,
     version_label: Option<&'static str>,
+    withdrawn: Withdrawn,
     after: AfterRemoval,
 }
 
@@ -75,9 +98,14 @@ const CASES: &[Case] = &[
         name: "the hosted configuration version is deleted before the session's first poll",
         removed: &[Removal::HostedVersions],
         polled_before: false,
+        by_id: false,
         content: br#"{"feature":"on"}"#,
         content_type: "application/json",
         version_label: Some("v-one"),
+        withdrawn: Withdrawn {
+            resource_type: "Configuration",
+            referenced_by: None,
+        },
         after: AfterRemoval::PollRefused {
             resource_type: "Configuration",
         },
@@ -86,9 +114,14 @@ const CASES: &[Case] = &[
         name: "the hosted configuration version is deleted after a poll",
         removed: &[Removal::HostedVersions],
         polled_before: true,
+        by_id: false,
         content: b"feature: on\n",
         content_type: "application/x-yaml",
         version_label: None,
+        withdrawn: Withdrawn {
+            resource_type: "Configuration",
+            referenced_by: None,
+        },
         after: AfterRemoval::PollRefused {
             resource_type: "Configuration",
         },
@@ -97,9 +130,14 @@ const CASES: &[Case] = &[
         name: "the configuration profile is deleted after a poll",
         removed: &[Removal::HostedVersions, Removal::ConfigurationProfile],
         polled_before: true,
+        by_id: false,
         content: br#"{"victim":true}"#,
         content_type: "application/json",
         version_label: Some("release-1"),
+        withdrawn: Withdrawn {
+            resource_type: "ConfigurationProfile",
+            referenced_by: Some("ConfigurationProfileIdentifier"),
+        },
         after: AfterRemoval::SessionRefused {
             resource_type: "ConfigurationProfile",
         },
@@ -108,9 +146,14 @@ const CASES: &[Case] = &[
         name: "the configuration profile is deleted before the session's first poll",
         removed: &[Removal::HostedVersions, Removal::ConfigurationProfile],
         polled_before: false,
+        by_id: true,
         content: &[0x00, 0x9f, 0x92, 0x96, 0xff],
         content_type: "application/octet-stream",
         version_label: None,
+        withdrawn: Withdrawn {
+            resource_type: "ConfigurationProfile",
+            referenced_by: Some("ConfigurationProfileIdentifier"),
+        },
         after: AfterRemoval::SessionRefused {
             resource_type: "ConfigurationProfile",
         },
@@ -119,20 +162,30 @@ const CASES: &[Case] = &[
         name: "the environment is deleted after a poll",
         removed: &[Removal::Environment],
         polled_before: true,
+        by_id: false,
         content: b"on",
         content_type: "text/plain",
         version_label: Some("flag-2"),
+        withdrawn: Withdrawn {
+            resource_type: "Environment",
+            referenced_by: Some("EnvironmentIdentifier"),
+        },
         after: AfterRemoval::SessionRefused {
             resource_type: "Environment",
         },
     },
     Case {
-        name: "the environment is deleted before the session's first poll",
+        name: "the environment is deleted before the session's first poll, named by id",
         removed: &[Removal::Environment],
         polled_before: false,
+        by_id: true,
         content: b"feature: off\nextra: 2\n",
         content_type: "application/x-yaml",
         version_label: None,
+        withdrawn: Withdrawn {
+            resource_type: "Environment",
+            referenced_by: Some("EnvironmentIdentifier"),
+        },
         after: AfterRemoval::SessionRefused {
             resource_type: "Environment",
         },
@@ -146,9 +199,15 @@ const CASES: &[Case] = &[
             Removal::Application,
         ],
         polled_before: true,
+        by_id: false,
         content: &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
         content_type: "application/octet-stream",
         version_label: Some("binary-2"),
+        withdrawn: Withdrawn {
+            // Resolved outermost first, so the application is the level reported.
+            resource_type: "Application",
+            referenced_by: Some("ApplicationIdentifier"),
+        },
         after: AfterRemoval::SessionRefused {
             resource_type: "Application",
         },
@@ -160,12 +219,14 @@ const CASES: &[Case] = &[
 /// configuration is visible.
 const CONTROL_CONTENT: &[u8] = br#"{"control":true}"#;
 
-/// A session bound to a configuration keeps being served after the control plane removes
-/// the records it was bound through, whichever level is removed and whether or not it had
-/// already polled — while a session started afterwards is still judged by the control
-/// plane, and an untouched hierarchy's session is undisturbed.
+/// A session polling a configuration is WITHDRAWN as soon as the control plane stops
+/// holding what it polls: the live, unexpired token it already holds is refused with the
+/// modelled `ResourceNotFoundException` naming the resource that is gone, whichever level
+/// is removed, however the session spelled its triple and whether or not it had already
+/// polled — while a session started afterwards is judged exactly the same way, and an
+/// untouched hierarchy's session is undisturbed.
 #[tokio::test]
-async fn a_removal_does_not_break_a_session_already_bound_to_a_configuration() {
+async fn a_removal_withdraws_a_session_already_polling_a_configuration() {
     for case in CASES {
         let name = case.name;
         let emulator = Emulator::new();
@@ -207,8 +268,9 @@ async fn a_removal_does_not_break_a_session_already_bound_to_a_configuration() {
         );
         let control_token = control_poll.next_token();
 
-        // The victim: deployed, then a session started over it by NAME, so the removal
-        // below also takes away the records its names were bound through.
+        // The victim: deployed, then a session started over it with the spelling the row
+        // asks for, so the removal below takes away the records that spelling resolves
+        // through.
         let victim = emulator
             .create_hierarchy("VictimApp", "VictimEnvironment", "VictimProfile")
             .await;
@@ -221,107 +283,64 @@ async fn a_removal_does_not_break_a_session_already_bound_to_a_configuration() {
                 case.version_label,
             )
             .await;
+        let (application, environment, profile) = spelled(&victim, case.by_id);
         let token = emulator
-            .session_token(
-                &victim.application_name,
-                &victim.environment_name,
-                &victim.profile_name,
-            )
+            .session_token(application, environment, profile)
             .await;
 
-        // A row that polls first holds the latest version, so its poll after the removal
-        // is the no-change answer; a row that does not is still owed the content it is
-        // bound to.
-        let (token, expected_content, expected_label): (String, &[u8], Option<&str>) =
-            if case.polled_before {
-                let poll = emulator.get_latest_configuration(&token).await;
-                assert_eq!(
-                    poll.status,
-                    200,
-                    "case {name}: the poll before the removal expected 200, got {} body {}",
-                    poll.status,
-                    poll.text()
-                );
-                assert_eq!(
-                    poll.body.as_ref(),
-                    case.content,
-                    "case {name}: the poll before the removal must serve the deployed \
-                     content, got {:?}",
-                    poll.body.as_ref()
-                );
-                (poll.next_token(), b"", None)
-            } else {
-                (token, case.content, case.version_label)
-            };
+        // A row that polls first is served the deployed content and holds the latest
+        // version when the removal happens; a row that does not has been served nothing
+        // yet.
+        let token = if case.polled_before {
+            let poll = emulator.get_latest_configuration(&token).await;
+            assert_eq!(
+                poll.status,
+                200,
+                "case {name}: the poll before the removal expected 200, got {} body {}",
+                poll.status,
+                poll.text()
+            );
+            assert_eq!(
+                poll.body.as_ref(),
+                case.content,
+                "case {name}: the poll before the removal must serve the deployed \
+                 content, got {:?}",
+                poll.body.as_ref()
+            );
+            poll.next_token()
+        } else {
+            token
+        };
 
         remove(&emulator, &victim, case.removed).await;
 
-        // THE RULE: the token is live, so the poll is served — never refused because the
-        // records the session was bound through are gone.
-        let poll = emulator.get_latest_configuration(&token).await;
-        assert_eq!(
-            poll.status,
-            200,
-            "case {name}: the poll after the removal expected 200, got {} body {}",
-            poll.status,
-            poll.text()
-        );
-        assert_eq!(
-            poll.body.as_ref(),
-            expected_content,
-            "case {name}: expected the configuration the session is bound to ({:?}), got {:?}",
-            expected_content,
-            poll.body.as_ref()
-        );
-        assert_eq!(
-            poll.header("content-type"),
-            Some(case.content_type),
-            "case {name}: expected the bound configuration's content type {}, got {:?}",
-            case.content_type,
-            poll.header("content-type")
-        );
-        assert_eq!(
-            poll.header("version-label"),
-            expected_label,
-            "case {name}: expected the version label {expected_label:?}, got {:?}",
-            poll.header("version-label")
-        );
-        assert_eq!(
-            poll.header("next-poll-interval-in-seconds"),
-            Some(DEFAULT_POLL_INTERVAL_IN_SECONDS.to_string().as_str()),
-            "case {name}: expected the session's poll interval, got {:?}",
-            poll.header("next-poll-interval-in-seconds")
-        );
-        let next = poll.next_token();
-        assert!(
-            is_modelled_token(&next) && next != token,
-            "case {name}: the poll must rotate the token, got {next:?} for {token:?}"
+        // THE RULE: the token is live and unexpired, and the poll is refused anyway —
+        // what it polls is no longer there to serve.
+        let withdrawn = Withdrawal::read(&emulator, &token).await;
+        withdrawn.assert_is(
+            name,
+            "the poll after the removal",
+            case.withdrawn,
+            application,
+            environment,
+            profile,
         );
 
-        // And the poll CHAIN continues: the successor token is served too, and carries
-        // nothing new, because the version the client now holds is the bound one.
-        let again = emulator.get_latest_configuration(&next).await;
-        assert_eq!(
-            again.status,
-            200,
-            "case {name}: the next poll of the chain expected 200, got {} body {}",
-            again.status,
-            again.text()
-        );
-        assert!(
-            again.body.is_empty(),
-            "case {name}: the client already holds the bound version, so the next poll \
-             must serve no content, got {:?}",
-            again.body.as_ref()
-        );
-        assert!(
-            is_modelled_token(&again.next_token()),
-            "case {name}: the next poll must rotate the token too, got {:?}",
-            again.next_token()
+        // The refusal is the STABLE answer, not a one-off: the same token presented
+        // again is refused the same way, which is what lets a client's poll loop
+        // converge on it.
+        let again = Withdrawal::read(&emulator, &token).await;
+        again.assert_is(
+            name,
+            "the next poll of the chain",
+            case.withdrawn,
+            application,
+            environment,
+            profile,
         );
 
-        // The untouched hierarchy's session is undisturbed, which is what isolates the
-        // answers above to the removed records.
+        // The untouched hierarchy's session is undisturbed, which is what scopes the
+        // refusal above to the removed records rather than to the endpoint.
         let control_poll = emulator.get_latest_configuration(&control_token).await;
         assert_eq!(
             control_poll.status,
@@ -337,10 +356,133 @@ async fn a_removal_does_not_break_a_session_already_bound_to_a_configuration() {
             control_poll.body.as_ref()
         );
 
-        // A session started AFTER the removal is judged by the control plane: that is
-        // where an unresolvable level is refused, and a session bound to no configuration
-        // at all is the one case the poll reports as not found.
+        // And a session started AFTER the removal is judged the same way the withdrawn
+        // one is: the refusal is a property of the state, not of how old a token is.
         assert_after_removal(&emulator, &victim, case).await;
+    }
+}
+
+/// The victim's triple as the row's session spells it: every identifier is "the ID or the
+/// name" of its level.
+fn spelled(victim: &Hierarchy, by_id: bool) -> (&str, &str, &str) {
+    if by_id {
+        (
+            &victim.application_id,
+            &victim.environment_id,
+            &victim.profile_id,
+        )
+    } else {
+        (
+            &victim.application_name,
+            &victim.environment_name,
+            &victim.profile_name,
+        )
+    }
+}
+
+/// One refusal a withdrawn poll answered with, reduced to what the rule is about.
+struct Withdrawal {
+    status: u16,
+    error_type_header: Option<String>,
+    rotated: bool,
+    body: serde_json::Value,
+    text: String,
+}
+
+impl Withdrawal {
+    async fn read(emulator: &Emulator, token: &str) -> Self {
+        let reply = emulator.get_latest_configuration(token).await;
+        Self {
+            status: reply.status,
+            error_type_header: reply.header("x-amzn-errortype").map(str::to_string),
+            rotated: reply.header("next-poll-configuration-token").is_some(),
+            body: reply.json(),
+            text: reply.text(),
+        }
+    }
+
+    /// The whole refusal: 404 `ResourceNotFoundException` naming the resource that is
+    /// gone, with no configuration served and no successor token minted.
+    fn assert_is(
+        &self,
+        case: &str,
+        poll: &str,
+        expected: Withdrawn,
+        application: &str,
+        environment: &str,
+        profile: &str,
+    ) {
+        assert_eq!(
+            self.status, 404,
+            "case {case}: {poll} expected 404, got {} body {}",
+            self.status, self.text
+        );
+        assert_eq!(
+            self.body["__type"].as_str(),
+            Some("ResourceNotFoundException"),
+            "case {case}: {poll} expected ResourceNotFoundException, got {}",
+            self.text
+        );
+        assert_eq!(
+            self.error_type_header.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case}: {poll} expected the error type header, got {:?}",
+            self.error_type_header
+        );
+        assert_eq!(
+            self.body["ResourceType"].as_str(),
+            Some(expected.resource_type),
+            "case {case}: {poll} expected ResourceType {}, got {}",
+            expected.resource_type,
+            self.text
+        );
+        assert!(
+            !self.rotated,
+            "case {case}: {poll} serves nothing, so it must rotate no token, got {}",
+            self.text
+        );
+        match expected.referenced_by {
+            // A missing level of the hierarchy is named by the identifier the session
+            // referenced it with, in the spelling the session used.
+            Some(member) => {
+                let identifier = match member {
+                    "ApplicationIdentifier" => application,
+                    "EnvironmentIdentifier" => environment,
+                    _ => profile,
+                };
+                assert_eq!(
+                    self.body["ReferencedBy"][member].as_str(),
+                    Some(identifier),
+                    "case {case}: {poll} expected ReferencedBy[{member}] to name {identifier}, \
+                     got {}",
+                    self.text
+                );
+                assert_eq!(
+                    self.body["Message"].as_str(),
+                    Some(format!("{} not found", expected.resource_type).as_str()),
+                    "case {case}: {poll} expected the level's fixed not-found sentence, got {}",
+                    self.text
+                );
+            }
+            // The CONFIGURATION itself is what is missing, and no identifier of the
+            // session names it: the message says which configuration profile has
+            // nothing to serve.
+            None => {
+                assert!(
+                    self.body["ReferencedBy"].is_null(),
+                    "case {case}: {poll} names no resource parameter, so ReferencedBy must \
+                     be absent, got {}",
+                    self.text
+                );
+                assert!(
+                    self.body["Message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(profile)),
+                    "case {case}: {poll} expected a Message naming {profile}, got {}",
+                    self.text
+                );
+            }
+        }
     }
 }
 
@@ -437,17 +579,18 @@ async fn hosted_version_numbers(emulator: &Emulator, victim: &Hierarchy) -> Vec<
 
 /// Start a fresh session over the victim's triple after the removal and assert the row's
 /// [`AfterRemoval`]: an unresolvable level is refused by `StartConfigurationSession`, and
-/// a session the triple still resolves for is minted and then has nothing to serve.
+/// a session the triple still resolves for is minted and then has nothing to serve —
+/// which is the same verdict the already-polling session's token now gets.
 async fn assert_after_removal(emulator: &Emulator, victim: &Hierarchy, case: &Case) {
     let name = case.name;
+    let (application, environment, profile) = spelled(victim, case.by_id);
     let started = emulator
         .post_json(
             "/configurationsessions",
             &format!(
-                r#"{{"ApplicationIdentifier":"{}",
-                      "EnvironmentIdentifier":"{}",
-                      "ConfigurationProfileIdentifier":"{}"}}"#,
-                victim.application_name, victim.environment_name, victim.profile_name
+                r#"{{"ApplicationIdentifier":"{application}",
+                      "EnvironmentIdentifier":"{environment}",
+                      "ConfigurationProfileIdentifier":"{profile}"}}"#
             ),
         )
         .await;
@@ -493,7 +636,7 @@ async fn assert_after_removal(emulator: &Emulator, victim: &Hierarchy, case: &Ca
             assert_eq!(
                 poll.status,
                 404,
-                "case {name}: a session bound to no configuration expected 404, got {} body {}",
+                "case {name}: a session with nothing to serve expected 404, got {} body {}",
                 poll.status,
                 poll.text()
             );

@@ -236,11 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is minted (a client bootstrapping against the service reads that refusal as
         // "nothing deployed yet" and keeps waiting).
         //
-        // Resolving the triple is what STARTING a session does, so this call is also
-        // where the session is BOUND to the configuration that triple has in force: a
-        // poll is served from that binding when the control plane can no longer resolve
-        // the triple, instead of making the records' continued existence a precondition
-        // of every poll (`crate::state::Session::bound_configuration`).
+        // Resolving the triple is also where the session records the configuration that
+        // triple has in force (`crate::state::Session::bound_configuration`): a copy of
+        // an immutable version, which every token of the session's poll chain then shares
+        // for as long as that version is the one in force. Each poll resolves the triple
+        // against the control plane again, so the copy decides nothing a poll answers.
         //
         // WHICH configuration that is depends on where this session stands in a rollout
         // still under way: a configuration session is one TARGET of a deployment, and a

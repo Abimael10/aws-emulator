@@ -18,11 +18,12 @@
 //! [`served_configuration`]). A configuration deployed through `StartDeployment` is
 //! therefore the one a poll serves.
 //!
-//! What a session keeps of its own about that hierarchy is the configuration it is
-//! BOUND to ([`Session::bound_configuration`]): the one its last successful resolution
-//! produced. A poll re-reads the control plane to pick up a newer version, and falls
-//! back on that binding when the triple no longer resolves there, so a control-plane
-//! edit made after a session was bound never breaks the session's poll chain.
+//! What a session keeps of its own about that hierarchy is a copy of the configuration
+//! it was last served ([`Session::bound_configuration`]), which is what every token of
+//! one poll chain shares while the version in force stays the same. It is not a copy a
+//! poll falls back on: a session is over LIVE control-plane state, so once that store no
+//! longer resolves what the session polls, the poll is refused with the modelled
+//! `ResourceNotFoundException` naming the resource that is gone.
 //!
 //! The other thing the data plane keeps of its own about that hierarchy is how a NAME
 //! resolves. Every session identifier is "the ID or the name" of its level, and an id
@@ -113,20 +114,17 @@ pub struct Session {
     pub last_served_version: Option<String>,
     /// The configuration this session is BOUND to: the one the last resolution of its
     /// triple against the AppConfig control plane produced — recorded when the session
-    /// was started and carried forward by every poll that resolves.
+    /// was started and carried forward by every poll that resolves. `None` for a session
+    /// whose triple had nothing in force when it started.
     ///
-    /// Resolving the triple is what STARTING a session does, so a poll serves this
-    /// binding whenever the control plane can no longer resolve the triple: a record
-    /// deleted or made unreachable after the session was bound does not retroactively
-    /// unmake the session. `None` only for a session that was bound to no configuration
-    /// at all — its triple had nothing in force when the session started — which is the
-    /// one case a poll has nothing to serve.
-    ///
-    /// Shared behind an `Arc` because rotating a token clones the session: every token of
-    /// one poll chain shares the one configuration it is bound to, so polling in a loop
-    /// holds no more of them than the chain's current version. What the store holds at
-    /// once is bounded by the same two limits as the sessions themselves — each entry's
-    /// expiry and [`MAX_SESSIONS`].
+    /// A copy, never an entitlement: what a poll serves is what the control plane has in
+    /// force at the instant of the poll, and a triple that store no longer resolves is
+    /// refused rather than served from here. Shared behind an `Arc` because rotating a
+    /// token clones the session: a configuration VERSION is immutable once written, so
+    /// every token of one poll chain shares this one copy of it instead of holding a new
+    /// one per poll, and polling in a loop holds no more of them than the chain's current
+    /// version. What the store holds at once is bounded by the same two limits as the
+    /// sessions themselves — each entry's expiry and [`MAX_SESSIONS`].
     pub bound_configuration: Option<Arc<ServedConfiguration>>,
     /// Where this session stands in a gradual rollout: the position the control plane
     /// compares against a deployment's `PercentageComplete` when it decides which
@@ -507,8 +505,9 @@ pub struct UnresolvedResource {
     /// the resource that was not found", so it is filled only where the request
     /// itself named the resource, with EVERY member that referenced it: a missing level
     /// of the hierarchy is named by its own identifier, and a deployment is named by the
-    /// whole triple that identifies it. A poll names only its token, so a poll leaves it
-    /// absent ([`UnresolvedResource::unreferenced`]).
+    /// whole triple that identifies it. A poll references the resource through the
+    /// session its token resolves to, so it reports the same members, carrying the
+    /// identifiers that session was started with.
     referenced_by: Vec<(&'static str, String)>,
     /// What the refusal says, built from the request rather than stored as prose.
     pub message: String,
@@ -569,16 +568,6 @@ impl UnresolvedResource {
                 .map(|(member, identifier)| ((*member).to_string(), identifier.clone()))
                 .collect(),
         )
-    }
-
-    /// The same missing level, reported for a call whose own input did not name it:
-    /// the identifiers came from the session the token resolved to, so there is no
-    /// request parameter to key `ReferencedBy` by.
-    fn unreferenced(self) -> Self {
-        Self {
-            referenced_by: Vec::new(),
-            ..self
-        }
     }
 
     /// No configuration is deployed for a triple that does resolve, or the version the
@@ -772,9 +761,7 @@ pub fn served_configuration<Eng: Send + Sync + 'static>(
         environment_identifier,
         configuration_profile_identifier,
     ) {
-        // The poll's own input named none of these levels — see
-        // `UnresolvedResource::referenced_by`.
-        Err(unresolved) => return Some(Err(unresolved.unreferenced())),
+        Err(unresolved) => return Some(Err(unresolved)),
         Ok(resolution) => resolution,
     };
     served_in(
