@@ -89,6 +89,8 @@ mod expression_parameter_generations;
 mod expression_refusal_families;
 #[path = "all/expression_rules_and_write_admission.rs"]
 mod expression_rules_and_write_admission;
+#[path = "all/fine_grained_condition_keys.rs"]
+mod fine_grained_condition_keys;
 #[path = "all/global_secondary_indexes.rs"]
 mod global_secondary_indexes;
 #[path = "all/global_tables.rs"]

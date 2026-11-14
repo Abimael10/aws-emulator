@@ -462,13 +462,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let table = store.active_table(&region, &name, now).map_err(lift)?;
             // A table the policies in force do not let this caller write is not written
             // to at all: authorization is decided before the item is keyed, against the
-            // partition the item this put addresses belongs to.
-            if let Some(denial) = crate::state::authorization::denial_addressing(
+            // partition the item this put addresses belongs to and the attributes it
+            // carries.
+            if let Some(denial) = crate::state::authorization::denial_keys(
                 &caller,
                 table,
                 "dynamodb:PutItem",
                 now,
-                &crate::state::authorization::AddressedKeys::of_maps(table, [&item]),
+                &crate::state::authorization::RequestKeys::storing(
+                    crate::state::authorization::AddressedKeys::of_maps(table, [&item]),
+                    &item,
+                ),
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }

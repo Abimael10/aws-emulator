@@ -885,17 +885,19 @@ async fn a_conditioned_statement_is_decided_against_the_partition_and_the_sessio
             400,
         ),
         (
-            // A table walk names no partition, so the request carries no value for the key
-            // AND declares that it models none: the clause stays undecided and the grant
-            // does not reach the call. The request is NOT read as carrying the empty set
-            // of leading keys, which `ForAllValues:` would hold on and so would turn this
-            // conditioned grant into table-wide access.
-            "a scan, which addresses no partition the condition could be decided on",
+            // A table walk addresses no partition, so it carries NO value for the key and
+            // answers that it carries none: that is IAM's empty set, which
+            // `ForAllValues:` holds over ("if there are no request values, the condition
+            // returns true"). The conditioned grant therefore reaches the scan and it is
+            // served over every partition — the documented hazard of scoping a grant with
+            // `ForAllValues:` alone, not an emulator shortcut.
+            "a scan, which addresses no partition, so the set qualifier holds over the \
+             empty set",
             &one,
             tenant_role,
             "Scan",
             json!({"TableName": TENANTS_TABLE}),
-            400,
+            200,
         ),
         (
             "a numeric partition the session's tag names",

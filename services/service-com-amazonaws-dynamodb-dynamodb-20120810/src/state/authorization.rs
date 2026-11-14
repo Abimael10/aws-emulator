@@ -71,14 +71,30 @@
 //! ## What the request itself contributes to the decision
 //!
 //! A statement may be CONDITIONED, and a condition is decided against the keys the request
-//! carries values for. Two of them belong to a data-plane call of this service:
+//! carries values for. A data-plane call of this service ANSWERS for the keys below — it
+//! publishes each of them whether or not it carries a value, so a clause over one is
+//! decided by IAM's own rules for a key the request carries no value for (`ForAllValues:`
+//! holds over the empty set, `ForAnyValue:` does not, and an unqualified operator holds
+//! only where it is negated or spelled `…IfExists`) rather than being left undecided:
 //!
 //! * the partition this call addresses — [`AddressedKeys`], the value(s) of the table's
 //!   `HASH` key attribute the `Key`, the `Item`, the key condition or the statement names,
 //!   one per partition the call touches. A call that addresses no partition of its own (a
-//!   table or index walk) carries no value for it and models none, so a clause over it
-//!   cannot be decided and the statement carrying that clause neither grants nor is
-//!   weakened.
+//!   table or index walk) carries NO value for the key, which it answers for: that is IAM's
+//!   empty set and not an unknown. Only a call whose addressed partition cannot be read at
+//!   all ([`AddressedKeys::unknown`]) answers for nothing, because the value a clause would
+//!   be decided against is not established.
+//! * the attributes this call names — [`RequestKeys`], the top-level attribute names of the
+//!   projection a read asks for or of the item a write stores, which is what a fine-grained
+//!   statement admits a caller to some of an item's attributes with. A call that names none
+//!   carries no value for the key; a call whose named set this cannot ENUMERATE — the
+//!   attributes an update expression or a PartiQL statement writes — answers for the key
+//!   with nothing at all, so a clause over it stays undecided rather than holding over an
+//!   empty set the request did not have.
+//! * the selection a read asks for — the `Select` a `Query` or `Scan` states or implies,
+//!   and the one a key-addressed read implies: the attributes it listed
+//!   (`SPECIFIC_ATTRIBUTES`) or every attribute of the item (`ALL_ATTRIBUTES`). A call that
+//!   selects nothing — every write — carries no value for the key.
 //! * the session tags the calling principal carries, which is where a policy written with
 //!   `${aws:PrincipalTag/<key>}` takes the text it stands for. They are known for a
 //!   session this emulator's STS registry minted and for nobody else, so only such a
@@ -90,8 +106,8 @@
 //!   so a statement conditioned on the partitions a call addresses can pin them to the
 //!   caller's OWN federated subject.
 //!
-//! Both are passed through [`::service_common::iam_authorization::Request`] — for the
-//! table's own document as much as for the identity's — so the clause is decided by the
+//! Every one of them is passed through [`::service_common::iam_authorization::Request`] — for
+//! the table's own document as much as for the identity's — so the clause is decided by the
 //! tree's one evaluation of policy documents rather than here. A fine-grained statement
 //! over the partitions a call addresses therefore decides that call: it applies to the
 //! partitions its condition selects and to no others.
@@ -110,6 +126,15 @@ const LEADING_KEYS_CONDITION_KEY: &str = "dynamodb:LeadingKeys";
 /// after the tag key it carries: `aws:PrincipalTag/tenant` holds the value of the session
 /// tag `tenant`.
 const PRINCIPAL_TAG_CONDITION_KEY_FAMILY: &str = "aws:PrincipalTag/";
+
+/// The condition key whose values are the attributes a data-plane call names: one entry per
+/// top-level attribute name the call's projection or its item carries, which is what a
+/// fine-grained statement scopes a caller to some of an item's attributes with.
+const ATTRIBUTES_CONDITION_KEY: &str = "dynamodb:Attributes";
+
+/// The condition key whose value is WHICH attributes a read asks for, as the `Select` member
+/// of a read names them ([`Selection`]).
+const SELECT_CONDITION_KEY: &str = "dynamodb:Select";
 
 /// The principal a request speaks for, and everything the decision is made from.
 ///
@@ -305,24 +330,34 @@ fn account_root_arn(account: &str) -> String {
 /// holds their values: one entry per partition the `Key`, the `Item`, the key condition or
 /// the PartiQL statement names, in the order the request named them.
 ///
-/// A call that addresses no partition of its own — a table or index walk — knows no value
-/// for the key and MODELS none either, which is what [`Self::whole_table`] stands for: a
-/// clause over the key then stays undecided, so a statement carrying it neither grants nor
-/// is weakened. A call whose addressed partition cannot be read at all (a key map without
-/// the table's own `HASH` attribute, a value of another type than the one the table
-/// declared for it) is in that same position, because the value the clause would be
-/// decided against is not established — and such a request is refused for what is wrong
-/// with it once the decision is past.
+/// A call that addresses no partition of its own — a table or index walk
+/// ([`Self::whole_table`]) — carries NO value for the key and answers for it: that is
+/// IAM's empty set, which a `ForAllValues:` clause holds over and a `ForAnyValue:` one does
+/// not. A call whose addressed partition cannot be read at all ([`Self::unknown`]: a key map
+/// without the table's own `HASH` attribute, a value of another type than the one the table
+/// declared for it) answers for nothing, because the value the clause would be decided
+/// against is not established — and such a request is refused for what is wrong with it
+/// once the decision is past.
 #[derive(Debug, Clone, Default)]
 pub struct AddressedKeys {
-    /// `None` when the call addresses no partition of its own (see the type docs).
+    /// The partitions the call addresses, empty for a call that addresses none of its own;
+    /// `None` when they cannot be read at all (see the type docs).
     values: Option<Vec<String>>,
 }
 
 impl AddressedKeys {
-    /// A call that addresses no partition of its own: a table or index walk.
+    /// A call that addresses no partition of its own: a table or index walk, which carries
+    /// no value for the key and answers that it carries none.
     #[must_use]
     pub fn whole_table() -> Self {
+        Self {
+            values: Some(Vec::new()),
+        }
+    }
+
+    /// A call whose addressed partitions cannot be read at all (see the type docs).
+    #[must_use]
+    pub fn unknown() -> Self {
         Self { values: None }
     }
 
@@ -344,15 +379,11 @@ impl AddressedKeys {
         for value in values {
             match value.and_then(condition_key_text) {
                 Some(text) => addressed.push(text),
-                None => return Self::whole_table(),
+                None => return Self::unknown(),
             }
         }
         // A call that named no partition at all addresses the whole table, whatever the
-        // member it would have named one in: a request whose addressed partition this
-        // could not find is in the position of one that addresses none.
-        if addressed.is_empty() {
-            return Self::whole_table();
-        }
+        // member it would have named one in.
         Self {
             values: Some(addressed),
         }
@@ -368,8 +399,16 @@ impl AddressedKeys {
         };
         match statement {
             PartiqlStatement::Insert(insert) => Self::of_maps(table, [&insert.item]),
+            // A `SELECT` whose `WHERE` clause pins no partition of its own walks the
+            // table, exactly as one carrying no clause at all does.
             PartiqlStatement::Select(select) => match &select.filter {
-                Some(filter) => pinned(filter),
+                Some(filter) => {
+                    let equalities = pinned_equalities(filter);
+                    match equalities.get(table.partition_key_name()) {
+                        Some(value) => Self::of_values([Some(value)]),
+                        None => Self::whole_table(),
+                    }
+                }
                 None => Self::whole_table(),
             },
             PartiqlStatement::Update(update) => pinned(&update.filter),
@@ -397,16 +436,172 @@ pub(crate) fn condition_key_text(value: &AttributeValue) -> Option<String> {
     }
 }
 
+/// The condition keys a data-plane call of this service answers for, with the values it
+/// carries for each: the partitions it addresses, the attributes it names, and the
+/// selection a read asks for.
+///
+/// A key is published only where this call can answer for it COMPLETELY (see the module
+/// docs): an empty value list means "the request names none", so a call that names
+/// attributes this does not enumerate must answer for that key with nothing at all rather
+/// than with the empty set, exactly as [`AddressedKeys::unknown`] does for the partitions.
+#[derive(Debug, Clone)]
+pub struct RequestKeys {
+    /// The partitions the call addresses.
+    addressed: AddressedKeys,
+    /// The top-level attribute names the call names, in name order — empty for a call that
+    /// names none — or `None` where the call cannot answer for the whole set it names, or
+    /// names more of them than [`MAX_PUBLISHED_ATTRIBUTES`] (see the type docs).
+    attributes: Option<Vec<String>>,
+    /// The selection a read asks for, or `None` for a call that selects nothing. Every
+    /// data-plane call answers for this key: only a `Query` or a `Scan` carries the member,
+    /// and a read addressed by key implies one, so a call with neither really carries no
+    /// value for it.
+    select: Option<&'static str>,
+}
+
+impl RequestKeys {
+    /// A call that answers for the partitions it addresses alone: it selects nothing, and
+    /// the attributes it names are not enumerated here, so a clause over them stays
+    /// undecided rather than being read as naming none.
+    #[must_use]
+    pub fn addressing(addressed: AddressedKeys) -> Self {
+        Self {
+            addressed,
+            attributes: None,
+            select: None,
+        }
+    }
+
+    /// A read addressed by key, which has no `Select` member and implies one: the
+    /// attributes its projection listed, or every attribute of the item when it listed
+    /// none ("If no attribute names are specified, then all attributes are returned",
+    /// `GetItem$ProjectionExpression`).
+    #[must_use]
+    pub fn projected(addressed: AddressedKeys, projection: Option<&[DocumentPath]>) -> Self {
+        Self {
+            addressed,
+            attributes: named_attributes(projection.unwrap_or_default()),
+            select: Some(match projection {
+                Some(_) => SPECIFIC_ATTRIBUTES_SELECT,
+                None => ALL_ATTRIBUTES_SELECT,
+            }),
+        }
+    }
+
+    /// A read that states its own selection: the `Select` a `Query` or `Scan` carried, or
+    /// the one its projection and the schema it reads imply
+    /// ([`super::resolve_selection`]).
+    #[must_use]
+    pub fn selected(addressed: AddressedKeys, selection: &Selection) -> Self {
+        let (select, paths): (&'static str, &[DocumentPath]) = match selection {
+            Selection::Specific(paths) => (SPECIFIC_ATTRIBUTES_SELECT, paths),
+            Selection::AllAttributes => (ALL_ATTRIBUTES_SELECT, &[]),
+            Selection::AllProjected => (ALL_PROJECTED_ATTRIBUTES_SELECT, &[]),
+            Selection::Count => (COUNT_SELECT, &[]),
+        };
+        Self {
+            addressed,
+            attributes: named_attributes(paths),
+            select: Some(select),
+        }
+    }
+
+    /// A write that stores `item`, which names every attribute it carries and selects
+    /// nothing.
+    #[must_use]
+    pub fn storing(addressed: AddressedKeys, item: &Item) -> Self {
+        Self::storing_maps(addressed, [item])
+    }
+
+    /// A write whose named attributes are those of the item or key maps `maps` — the puts
+    /// and deletes one batch sends to one table, each naming the attributes of the item it
+    /// stores or of the key it removes, and nothing else.
+    #[must_use]
+    pub fn storing_maps<'a, I: IntoIterator<Item = &'a Item>>(
+        addressed: AddressedKeys,
+        maps: I,
+    ) -> Self {
+        Self {
+            addressed,
+            attributes: published_attributes(
+                maps.into_iter()
+                    .flat_map(|map| map.keys().map(String::as_str)),
+            ),
+            select: None,
+        }
+    }
+}
+
+/// The attributes a projection names, as the condition key that reports them holds their
+/// values: the TOP-LEVEL attribute name each document path starts at — a path that reaches
+/// inside an attribute names that attribute.
+fn named_attributes(paths: &[DocumentPath]) -> Option<Vec<String>> {
+    published_attributes(paths.iter().map(DocumentPath::attribute))
+}
+
+/// The attribute names a call names, as the condition key holds them: each name once, in
+/// name order, or `None` once the call names more than [`MAX_PUBLISHED_ATTRIBUTES`] of them
+/// — a set that large is one no statement enumerates, so the key is then answered with
+/// nothing at all rather than with a value list whose size the caller chooses (which is the
+/// "cannot enumerate" case [`RequestKeys`] already models).
+///
+/// The names are deduplicated through an ordered SET and the walk stops at the ceiling, so
+/// the work one call asks for here is linear in what it sent and bounded per name by this
+/// service's own constant rather than quadratic in the attribute count.
+fn published_attributes<'a, I: IntoIterator<Item = &'a str>>(names: I) -> Option<Vec<String>> {
+    let mut named: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    for name in names {
+        named.insert(name);
+        if named.len() > MAX_PUBLISHED_ATTRIBUTES {
+            return None;
+        }
+    }
+    Some(named.into_iter().map(str::to_string).collect())
+}
+
+/// The most attribute names one call publishes for the condition key that reports them: the
+/// ceiling a PROJECTION is already held to ([`super::MAX_PROJECTED_PATHS`]), so the item a
+/// write stores is read against the same bound as the paths a read lists.
+///
+/// A ceiling of this emulator's own rather than one AWS states, so that the context one
+/// request builds cannot grow with an attribute count the caller chooses; past it the key is
+/// answered with nothing, which leaves a clause over it undecided and so refuses the call
+/// where AWS, which publishes every name, might decide it either way.
+const MAX_PUBLISHED_ATTRIBUTES: usize = super::MAX_PROJECTED_PATHS;
+
+/// The `Select` a read of the attributes it listed asks for.
+const SPECIFIC_ATTRIBUTES_SELECT: &str = "SPECIFIC_ATTRIBUTES";
+
+/// The `Select` a read of every attribute of the item asks for.
+const ALL_ATTRIBUTES_SELECT: &str = "ALL_ATTRIBUTES";
+
+/// The `Select` a read of everything an index projects asks for.
+const ALL_PROJECTED_ATTRIBUTES_SELECT: &str = "ALL_PROJECTED_ATTRIBUTES";
+
+/// The `Select` a read that reports only how many items matched asks for.
+const COUNT_SELECT: &str = "COUNT";
+
 /// The condition keys this request carries values for, as `(key, value)` pairs: one entry
-/// per partition it addresses, one per session tag the calling principal carries, and one
-/// per claim of the web identity its credential was minted by exchanging.
-fn condition_context(caller: &Caller, addressed: &AddressedKeys) -> Vec<(String, String)> {
-    let mut context: Vec<(String, String)> = addressed
+/// per partition it addresses, one per attribute it names, one for the selection it asks
+/// for, one per session tag the calling principal carries, and one per claim of the web
+/// identity its credential was minted by exchanging.
+fn condition_context(caller: &Caller, keys: &RequestKeys) -> Vec<(String, String)> {
+    let mut context: Vec<(String, String)> = keys
+        .addressed
         .values
         .iter()
         .flatten()
         .map(|value| (LEADING_KEYS_CONDITION_KEY.to_string(), value.clone()))
         .collect();
+    context.extend(
+        keys.attributes
+            .iter()
+            .flatten()
+            .map(|name| (ATTRIBUTES_CONDITION_KEY.to_string(), name.clone())),
+    );
+    if let Some(select) = keys.select {
+        context.push((SELECT_CONDITION_KEY.to_string(), select.to_string()));
+    }
     for (key, value) in &caller.tags {
         context.push((
             format!("{PRINCIPAL_TAG_CONDITION_KEY_FAMILY}{key}"),
@@ -421,14 +616,22 @@ fn condition_context(caller: &Caller, addressed: &AddressedKeys) -> Vec<(String,
 /// keys whose absence from the context means the request carries no value for them rather
 /// than that this emulator cannot answer for them.
 ///
-/// A call that addresses partitions knows every one it addresses, and a caller whose
-/// session tags are known knows every tag it carries — so the whole tag FAMILY is
-/// published, which is what lets a clause over a tag key the principal does not carry be
-/// decided. A federated credential answers for each key its own exchange published, so
-/// those are published one by one ([`sts_store::federated_claim_keys`]).
-fn published_condition_keys<'a>(caller: &'a Caller, addressed: &AddressedKeys) -> Vec<&'a str> {
-    let mut published = Vec::new();
-    if addressed.values.is_some() {
+/// A data-plane call answers for the selection it asks for however few values it carries
+/// for it, for every partition it addresses unless they cannot be read at all
+/// ([`AddressedKeys::unknown`]), and for the attributes it names only where the whole set it
+/// names is enumerated ([`RequestKeys`]) — a call that names attributes this cannot
+/// enumerate publishes nothing for that key, so a clause over it stays undecided instead of
+/// holding over an empty set the request did not really have. A caller whose session tags
+/// are known knows every tag it carries — so the whole tag FAMILY is published, which is
+/// what lets a clause over a tag key the principal does not carry be decided. A federated
+/// credential answers for each key its own exchange published, so those are published one
+/// by one ([`sts_store::federated_claim_keys`]).
+fn published_condition_keys<'a>(caller: &'a Caller, keys: &RequestKeys) -> Vec<&'a str> {
+    let mut published = vec![SELECT_CONDITION_KEY];
+    if keys.attributes.is_some() {
+        published.push(ATTRIBUTES_CONDITION_KEY);
+    }
+    if keys.addressed.values.is_some() {
         published.push(LEADING_KEYS_CONDITION_KEY);
     }
     if caller.tags_known {
@@ -453,22 +656,14 @@ pub fn not_authorized(caller_arn: &str, action: &str, resource: &str, reason: &s
 
 /// The `AccessDeniedException` message a request that addresses no partition of its own
 /// earns when the policies in force do not permit it, or `None` when they do. See
-/// [`denial_addressing`], which this is the table-wide case of.
+/// [`denial_keys`], which this is the table-wide case of.
 pub fn denial(caller: &Caller, table: &Table, action: &str, now: SystemTime) -> Option<String> {
     denial_addressing(caller, table, action, now, &AddressedKeys::whole_table())
 }
 
-/// The `AccessDeniedException` message a data-plane request earns when the policies in
-/// force do not permit it, or `None` when they do.
-///
-/// `action` is the IAM action the operation performs (`dynamodb:GetItem`) and `addressed`
-/// the partitions the request acts on. The decision is the module docs' rule, over the
-/// table's own policy, the caller's identity-based documents and the session policies its
-/// credential was scoped with, with the request's own condition keys supplied so a
-/// CONDITIONED statement is decided on the request rather than left undecided; a table with
-/// no policy attached — or one whose application is not due yet — states nothing, so such a
-/// request is decided by the identity-based half alone, and a credential no mint scoped is
-/// capped by nothing.
+/// The `AccessDeniedException` message a data-plane request that names no attribute of its
+/// own earns when the policies in force do not permit it, or `None` when they do. See
+/// [`denial_keys`], which this is the case of for a call that only addresses partitions.
 pub fn denial_addressing(
     caller: &Caller,
     table: &Table,
@@ -476,14 +671,41 @@ pub fn denial_addressing(
     now: SystemTime,
     addressed: &AddressedKeys,
 ) -> Option<String> {
+    denial_keys(
+        caller,
+        table,
+        action,
+        now,
+        &RequestKeys::addressing(addressed.clone()),
+    )
+}
+
+/// The `AccessDeniedException` message a data-plane request earns when the policies in
+/// force do not permit it, or `None` when they do.
+///
+/// `action` is the IAM action the operation performs (`dynamodb:GetItem`) and `keys` the
+/// condition keys the request itself answers for ([`RequestKeys`]). The decision is the
+/// module docs' rule, over the table's own policy, the caller's identity-based documents and
+/// the session policies its credential was scoped with, with the request's own condition
+/// keys supplied so a CONDITIONED statement is decided on the request rather than left
+/// undecided; a table with no policy attached — or one whose application is not due yet —
+/// states nothing, so such a request is decided by the identity-based half alone, and a
+/// credential no mint scoped is capped by nothing.
+pub fn denial_keys(
+    caller: &Caller,
+    table: &Table,
+    action: &str,
+    now: SystemTime,
+    keys: &RequestKeys,
+) -> Option<String> {
     let refusal = |reason: &str| Some(not_authorized(&caller.arn, action, &table.arn, reason));
     // "PutResourcePolicy is an asynchronous operation" and "the policy application is
     // eventually consistent" (the `PutResourcePolicy` doc): what decides this request is
     // the revision in force at this instant, which inside the span of the newest write is
     // the one the resource carried before it ([`super::ResourcePolicySlot::visible`]).
     let policy = table.resource_policy.visible(now);
-    let context = condition_context(caller, addressed);
-    let published = published_condition_keys(caller, addressed);
+    let context = condition_context(caller, keys);
+    let published = published_condition_keys(caller, keys);
 
     // An explicit deny wins over every grant, including the account's own credential. It
     // is decided against every spelling the caller may be named by, its account's

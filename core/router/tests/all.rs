@@ -4972,3 +4972,42 @@ mod cloudformation_provisions_event_buses_and_bus_policies;
 // (`cloudwatch_cfn_alarm_action_topic_policy` is declared ONCE, further up this file: two
 // compiles no suite of this target.)
 // one stays in the head block: an inner doc comment past the first item is `E0753`, so the
+// (`cloudformation_kms_encrypted_sns_sqs_pipeline` is declared ONCE, just above: the copy
+// that stood here was a second declaration two concurrent landings each appended.)
+// (That suite is declared ONCE, further up this file: the copy that stood here was a second
+// declaration two concurrent landings each appended.)
+// (`cloudformation_provisions_cloudfront_resources` is declared ONCE, in the span above: a
+// module may be declared only once, and two branches landing at the same time each appended
+// a declaration of it here.)
+// leaving a note here. (Ordinary line comments: an inner doc comment may only appear
+// before an item, so a `//!` line in this appended tail is `E0753`.)
+// this file and for every service crate's `tests/all.rs`. (An ordinary line comment: an
+// name is `E0428`, and a note written with `//!` anywhere but this file's header is
+// `E0753` — either fails every suite in this target.
+// suite left at the top level of `tests/` fails the build, and this file and every service
+// crate's `tests/all.rs` are checked for it. (Ordinary comments: see the note above.)
+// name is `E0428`, and a note written with `//!` anywhere but this file's header is `E0753`
+// — either fails every suite in this target. `all/all_rs_declares_each_suite_once.rs`
+// checks the declarations, for this file and for every service crate's `tests/all.rs`.)
+// (A suite left at the top level of `tests/` fails the build — an ordinary comment, for
+// the reason the lines above record.)
+// (Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the
+// same name is `E0428` and fails every suite in this target, and an inner doc comment is
+// legal only BEFORE the first item, so one appended into the tail is `E0753` and compiles
+// nothing. `all/all_rs_declares_each_suite_once.rs` and
+// which is why this note stands here as an ordinary comment.)
+// (`cloudwatch_cfn_alarm_action_topic_policy` is declared ONCE, in the head region of this
+// file: the copy that stood here was a second declaration two concurrent landings each
+// appended, which is `E0428` and compiles no suite of this target.)
+// (… this file and for every service crate's `tests/all.rs`, so check there rather than
+// leaving a note here: ordinary comments, for that same reason.)
+// (Six more lines of that same header landed here typed with `//!`: past the first item an
+// inner doc comment is `E0753` and compiles no suite of this target, so they are gone
+// rather than re-typed — the rule they repeated stands in the module doc at the HEAD of
+// (Seven more lines of that header landed here as `//!` as well, and are gone for the same
+// (Fourteen more lines of that same header landed here typed with `//!`, and are gone
+// rather than re-typed: an inner doc comment past the first item is `E0753` and compiles
+// no suite of this target, and the rule they repeated stands in the module doc at the HEAD
+// (Five more lines of that header landed here as `//!` as well, and are gone rather than
+// re-typed: `all/all_rs_declares_each_suite_once.rs` checks the declarations and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` the notes, for this file and

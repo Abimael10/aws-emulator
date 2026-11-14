@@ -484,8 +484,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.apply_due_transitions(now);
         let table = store.active_table(&region, &name, now).map_err(lift)?;
         // A table the policies in force do not let this caller read answers the denial,
-        // not its items: it is decided before anything is read.
-        if let Some(denial) = crate::state::policy_denial(&caller, table, "dynamodb:Scan", now) {
+        // not its items: it is decided before anything is read. A scan addresses no
+        // partition of its own, and asks for the attributes its selection names.
+        if let Some(denial) = crate::state::authorization::denial_keys(
+            &caller,
+            table,
+            "dynamodb:Scan",
+            now,
+            &crate::state::authorization::RequestKeys::selected(
+                crate::state::authorization::AddressedKeys::whole_table(),
+                &selection,
+            ),
+        ) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
         // The items are stored ENCRYPTED under the table's KMS key, so a key KMS will not

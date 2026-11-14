@@ -278,13 +278,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let table = store.active_table(&region, &name, now).map_err(lift)?;
             // A table the policies in force do not let this caller read answers the
             // denial, not the item: it is decided before anything is read, against the
-            // partition this read addresses.
-            if let Some(denial) = crate::state::authorization::denial_addressing(
+            // partition this read addresses and the attributes it asks for.
+            if let Some(denial) = crate::state::authorization::denial_keys(
                 &caller,
                 table,
                 "dynamodb:GetItem",
                 now,
-                &crate::state::authorization::AddressedKeys::of_maps(table, [&input.key]),
+                &crate::state::authorization::RequestKeys::projected(
+                    crate::state::authorization::AddressedKeys::of_maps(table, [&input.key]),
+                    projected.as_deref(),
+                ),
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }

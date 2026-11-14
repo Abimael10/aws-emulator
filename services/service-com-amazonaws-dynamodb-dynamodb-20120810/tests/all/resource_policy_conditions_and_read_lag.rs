@@ -49,7 +49,7 @@ const MAX_POLICY_REVISION_ID_LENGTH: usize = 255;
 const PARTITIONS: [&str; 3] = ["secret", "private", "public"];
 
 /// The ARN of one of this emulator's tables.
-fn table_arn(name: &str) -> String {
+pub(crate) fn table_arn(name: &str) -> String {
     format!("{TABLE_ARN_PREFIX}{name}")
 }
 
@@ -66,7 +66,7 @@ async fn wait_for_policy_application() {
 }
 
 /// The `message`/`Message` member of a refusal, whichever casing it carries.
-fn message_of(body: &Value) -> String {
+pub(crate) fn message_of(body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)
@@ -93,7 +93,7 @@ async fn seeded_table(router: &MultiServiceRouter, name: &str) -> String {
 
 /// A document denying `actions` on `resource_arn` to every principal, gated on
 /// `condition`.
-fn conditioned_deny(resource_arn: &str, actions: Value, condition: Value) -> String {
+pub(crate) fn conditioned_deny(resource_arn: &str, actions: Value, condition: Value) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -108,7 +108,11 @@ fn conditioned_deny(resource_arn: &str, actions: Value, condition: Value) -> Str
 }
 
 /// Attach `document` and wait until it is the revision in force.
-async fn attach_and_apply(router: &MultiServiceRouter, resource_arn: &str, document: &str) {
+pub(crate) async fn attach_and_apply(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    document: &str,
+) {
     ok(
         router,
         "PutResourcePolicy",

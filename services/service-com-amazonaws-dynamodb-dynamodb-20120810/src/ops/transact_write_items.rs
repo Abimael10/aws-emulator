@@ -1026,19 +1026,30 @@ fn check_element_shape(
 
 /// `AccessDeniedException` when the policies in force do not let `caller` perform the
 /// action `requested` performs on `table`, so authorization is decided before any item is
-/// read or keyed — against the partition the action addresses.
+/// read or keyed — against the partition the action addresses and, for a `Put`, the
+/// attributes the item it stores names. An `Update` names the attributes its expression
+/// writes as well, which is not enumerated here, so it answers for that key with nothing
+/// ([`crate::state::authorization::RequestKeys`]).
 fn deny(
     caller: &crate::state::authorization::Caller,
     table: &crate::state::Table,
     requested: &Requested<'_>,
     now: ::std::time::SystemTime,
 ) -> Result<(), TransactWriteItemsError> {
-    match crate::state::authorization::denial_addressing(
+    let addressed =
+        crate::state::authorization::AddressedKeys::of_maps(table, [requested.addressed()]);
+    let keys = match requested {
+        Requested::Put(put) => {
+            crate::state::authorization::RequestKeys::storing(addressed, &put.item)
+        }
+        _ => crate::state::authorization::RequestKeys::addressing(addressed),
+    };
+    match crate::state::authorization::denial_keys(
         caller,
         table,
         requested.policy_action(),
         now,
-        &crate::state::authorization::AddressedKeys::of_maps(table, [requested.addressed()]),
+        &keys,
     ) {
         Some(denial) => Err(crate::scaffolded::Scaffolded::access_denied(denial)),
         None => Ok(()),

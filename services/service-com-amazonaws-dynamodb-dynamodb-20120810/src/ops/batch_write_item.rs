@@ -337,22 +337,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // whatever is wrong with the items it was sent. The decision is made against
             // the partitions this table's own writes address.
             let table = store.active_table(&region, &name, now).map_err(lift)?;
-            let addressed = crate::state::authorization::AddressedKeys::of_maps(
-                table,
-                requests.iter().filter_map(|request| {
+            // The item a put stores, or the key a delete removes, for each of this table's
+            // own requests: the partitions they address, and the attributes they name.
+            let maps: Vec<&crate::state::Item> = requests
+                .iter()
+                .filter_map(|request| {
                     request
                         .put_request
                         .as_ref()
                         .map(|put| &put.item)
                         .or_else(|| request.delete_request.as_ref().map(|delete| &delete.key))
-                }),
-            );
-            if let Some(denial) = crate::state::authorization::denial_addressing(
+                })
+                .collect();
+            let addressed =
+                crate::state::authorization::AddressedKeys::of_maps(table, maps.iter().copied());
+            if let Some(denial) = crate::state::authorization::denial_keys(
                 &caller,
                 table,
                 "dynamodb:BatchWriteItem",
                 now,
-                &addressed,
+                &crate::state::authorization::RequestKeys::storing_maps(
+                    addressed,
+                    maps.iter().copied(),
+                ),
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
