@@ -45,11 +45,12 @@
 //! carried by them, and both are derived here so that `BatchGetTraces` and
 //! `GetTraceSummaries` cannot disagree:
 //!
-//! * a subsegment that names a downstream service (`namespace: "remote"`) gets
-//!   an INFERRED top-level segment synthesised for that downstream service
-//!   ([`inferred_segments`]), which is the service X-Ray attributes the call to,
-//!   and which the call's own namespace TYPES ([`inferred_service_type`])
-//!   because a service nothing reported for carries no `origin`;
+//! * an entity that names a downstream service — one whose `namespace` makes it
+//!   a call OUT of the service it sits in — gets an INFERRED top-level segment
+//!   synthesised for that downstream service ([`inferred_segments`]), which is
+//!   the service X-Ray attributes the call to, and which the call itself TYPES
+//!   ([`inferred_service_type`]) because a service nothing reported for carries
+//!   no `origin` of its own;
 //! * every entity (a segment, or a subsegment inside one) records an
 //!   [`Outcome`], read from the `fault`/`error`/`throttle` fields its document
 //!   DECLARED: the one [`Classification`] a COUNTER splits it
@@ -96,12 +97,20 @@ pub mod retrievals;
 pub mod sampling_rules;
 pub mod sampling_statistics;
 pub mod span_delivery;
+// The two parts of the trace tree a reader is answered with: the nodes this
+// service infers for the calls a trace's documents made, and how those documents
+// are assembled into one tree. Reached only through the re-exports below, as
+// every other part of this state is.
+mod assembly;
+mod inferred;
 
 // Each part above owns one concern of this service's state and is re-exported
 // here, so every handler keeps reaching the store through `crate::state::…` and
 // no caller has to know which part a record, a bound or a wording lives in.
+pub use assembly::*;
 pub use encryption_key::*;
 pub use graphs::*;
+pub use inferred::*;
 pub use pagination::*;
 pub use query_window::*;
 pub use retrievals::*;
@@ -1089,6 +1098,10 @@ pub struct SegmentRecord {
     pub http: Option<HttpRecord>,
     /// The segment's `annotations`, as submitted.
     pub annotations: BTreeMap<String, serde_json::Value>,
+    /// The segment's `aws` block, as submitted: on a call OUT it names the AWS
+    /// service the call reached and the resource it addressed, which is what
+    /// types the node inferred for it ([`inferred_service_type`]).
+    pub aws: Option<JsonObject>,
     /// The segment's `origin` — the resource type that ran the service.
     pub origin: Option<String>,
     /// The segment's `account_id`, when it names one.
@@ -1113,8 +1126,8 @@ pub struct SegmentRecord {
     /// [`MAX_SUBSEGMENT_DEPTH`] levels deep.
     pub subsegments: Vec<SubsegmentRecord>,
     /// Whether this segment was SYNTHESISED by the service for a downstream
-    /// service a stored document only called (`namespace: "remote"`), rather than
-    /// submitted. Its document carries `"inferred": true`.
+    /// service a stored document only called, rather than submitted. Its
+    /// document carries `"inferred": true`.
     pub inferred: bool,
     /// The service type of the node this segment stands for when the service
     /// INFERRED it from a call out of another service
@@ -1155,6 +1168,10 @@ pub struct SubsegmentRecord {
     pub http: Option<HttpRecord>,
     /// The subsegment's `annotations`, as submitted.
     pub annotations: BTreeMap<String, serde_json::Value>,
+    /// The subsegment's `aws` block, as submitted: on a call OUT it names the
+    /// AWS service the call reached and the resource it addressed, which is what
+    /// types the node inferred for it ([`inferred_service_type`]).
+    pub aws: Option<JsonObject>,
     /// The exceptions this subsegment's `cause` block carries.
     pub exceptions: Vec<CauseException>,
     /// The subsegments nested under this one.
@@ -1763,6 +1780,7 @@ pub fn parse_segment_document(document: &str) -> Result<(String, SegmentRecord),
         throttle: flag(object, "throttle"),
         http: parse_http(object.get("http")),
         annotations: parse_annotations(object),
+        aws: parse_aws(object),
         origin: optional_string(object, "origin"),
         account_id: optional_string(object, "account_id"),
         user: optional_string(object, "user"),
@@ -1794,6 +1812,17 @@ fn parse_annotations(object: &JsonObject) -> BTreeMap<String, serde_json::Value>
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// An entity's `aws` block, as submitted — "information about the Amazon Web
+/// Services services that your application calls" for a subsegment, and about
+/// the resource the application runs on for a segment. Kept whole: which of its
+/// members is set is what names the resource a call addressed.
+fn parse_aws(object: &JsonObject) -> Option<JsonObject> {
+    object
+        .get("aws")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
 }
 
 /// The exceptions an entity's `cause` block carries. `cause` is either an object
@@ -1865,6 +1894,7 @@ fn parse_subsegments(
             throttle: flag(object, "throttle"),
             http: parse_http(object.get("http")),
             annotations: parse_annotations(object),
+            aws: parse_aws(object),
             exceptions: parse_cause(object.get("cause")),
             subsegments: parse_subsegments(id, object.get("subsegments"), depth + 1, budget)?,
         });
@@ -1888,168 +1918,6 @@ fn parse_http(value: Option<&serde_json::Value>) -> Option<HttpRecord> {
             .and_then(serde_json::Value::as_i64)
             .and_then(|status| i32::try_from(status).ok()),
     })
-}
-
-/// The `namespace` that makes a subsegment a call OUT of the service it sits in,
-/// so the work it covers is a downstream service's.
-pub const REMOTE_NAMESPACE: &str = "remote";
-
-/// The `namespace` that makes a subsegment a call out through the AWS SDK, so
-/// the work it covers is an AWS service's.
-pub const AWS_NAMESPACE: &str = "aws";
-
-/// The service type of a node X-Ray INFERRED from a call out of an instrumented
-/// service, which the calling entity's `namespace` names, or `None` when the
-/// entity names no downstream service at all.
-///
-/// `Service$Type` documents the vocabulary: [`SERVICE_TYPE_REMOTE`] is "a
-/// downstream service of indeterminate type", which is what a
-/// [`REMOTE_NAMESPACE`] entity records, and `AWS::<name>` is what
-/// "downstream calls to Amazon Web Services ... that didn't target a specific
-/// table" report, which is what an [`AWS_NAMESPACE`] entity records. An entity
-/// with neither namespace recorded in-process work and infers no service.
-///
-/// This is the crate's ONE namespace-to-service-type derivation, so every
-/// surface that reports the identity of an inferred service — a service graph's
-/// nodes, a trace summary's `ServiceIds`, a root cause's services, a
-/// `service(name, type)` filter expression — types that service the same way.
-pub fn inferred_service_type(name: &str, namespace: Option<&str>) -> Option<String> {
-    match namespace? {
-        REMOTE_NAMESPACE => Some(SERVICE_TYPE_REMOTE.to_string()),
-        AWS_NAMESPACE => Some(format!("AWS::{name}")),
-        _ => None,
-    }
-}
-
-/// The id of the segment synthesised for the remote subsegment `remote_id` of
-/// `trace_id`: 16 hexadecimal digits, as a segment id is.
-///
-/// Service-assigned and derived only from what it identifies, so it is the same
-/// on every read and distinct per remote subsegment — re-submitting the same
-/// document replaces the inferred segment it already derived instead of adding a
-/// second one. The mixing is [`service_common::stable_hex_id`], the one
-/// deterministic id helper the service crates share: this id travels on the
-/// wire, so it has to be reproducible across builds as well as across reads,
-/// which `std`'s default hasher does not promise. It is still an opaque id, not
-/// a value to depend on.
-fn inferred_segment_id(trace_id: &str, remote_id: &str) -> String {
-    ::service_common::stable_hex_id(&["inferred", trace_id, remote_id])
-}
-
-/// The segments X-Ray synthesises for the downstream services `segment` only
-/// CALLED: one per subsegment in its tree whose `namespace` is
-/// [`REMOTE_NAMESPACE`] and that carries an id to parent the synthesised segment
-/// on.
-///
-/// Each is a top-level segment of the same trace whose `parent_id` is the remote
-/// subsegment's id and whose document carries `"inferred": true`, so a reader
-/// building a service map sees the downstream node the caller recorded. Its
-/// times, `http` block, outcome flags and `cause` are the subsegment's: the
-/// remote subsegment is the only record of what the downstream service did.
-///
-/// The tree is walked with an explicit worklist rather than by recursion, so the
-/// nesting a submitted document carries costs heap and not call stack; the order
-/// is the recursion's, a node then its children left to right.
-pub fn inferred_segments(trace_id: &str, segment: &SegmentRecord) -> Vec<SegmentRecord> {
-    let mut out = Vec::new();
-    if segment.inferred {
-        // A synthesised segment never derives further segments from itself. It
-        // carries no subsegments either, so this is belt and braces: only
-        // `inferred_segment` sets the flag, never a submitted document.
-        return out;
-    }
-    let mut pending: Vec<&SubsegmentRecord> = segment.subsegments.iter().rev().collect();
-    while let Some(subsegment) = pending.pop() {
-        if let (Some(remote_id), true) = (
-            subsegment.id.as_deref(),
-            subsegment.namespace.as_deref() == Some(REMOTE_NAMESPACE),
-        ) {
-            out.push(inferred_segment(
-                trace_id,
-                remote_id,
-                subsegment,
-                segment.start_time,
-            ));
-        }
-        pending.extend(subsegment.subsegments.iter().rev());
-    }
-    out
-}
-
-/// One inferred segment: the record, and the document a reader returns for it.
-///
-/// `timed_from` is the calling segment's own `start_time`, which is when a
-/// remote subsegment that carries no `start_time` of its own is timed from: it
-/// is the only instant known for it.
-fn inferred_segment(
-    trace_id: &str,
-    remote_id: &str,
-    remote: &SubsegmentRecord,
-    timed_from: f64,
-) -> SegmentRecord {
-    let start_time = remote.start_time.unwrap_or(timed_from);
-    let id = inferred_segment_id(trace_id, remote_id);
-    let mut document = serde_json::Map::new();
-    document.insert("id".to_string(), serde_json::json!(id));
-    document.insert("name".to_string(), serde_json::json!(remote.name));
-    document.insert("trace_id".to_string(), serde_json::json!(trace_id));
-    document.insert("parent_id".to_string(), serde_json::json!(remote_id));
-    document.insert("start_time".to_string(), serde_json::json!(start_time));
-    match remote.end_time {
-        Some(end_time) => {
-            document.insert("end_time".to_string(), serde_json::json!(end_time));
-        }
-        None => {
-            document.insert("in_progress".to_string(), serde_json::json!(true));
-        }
-    }
-    document.insert("inferred".to_string(), serde_json::json!(true));
-    for (member, set) in [
-        ("fault", remote.fault),
-        ("error", remote.error),
-        ("throttle", remote.throttle),
-    ] {
-        if set {
-            document.insert(member.to_string(), serde_json::json!(true));
-        }
-    }
-    if let Some(http) = &remote.http {
-        document.insert("http".to_string(), http_document(http));
-    }
-    if !remote.exceptions.is_empty() {
-        document.insert("cause".to_string(), cause_document(&remote.exceptions));
-    }
-
-    SegmentRecord {
-        id,
-        parent_id: Some(remote_id.to_string()),
-        name: remote.name.clone(),
-        document: serde_json::Value::Object(document).to_string(),
-        start_time,
-        end_time: remote.end_time,
-        in_progress: remote.in_progress,
-        error: remote.error,
-        fault: remote.fault,
-        throttle: remote.throttle,
-        http: remote.http.clone(),
-        annotations: BTreeMap::new(),
-        origin: None,
-        account_id: None,
-        user: None,
-        resource_arn: None,
-        // An inferred segment stands for a downstream SERVICE, not for work
-        // inside one, so it is no `type: "subsegment"` document; and it carries
-        // no `namespace` of its own — the namespace that produced it was the
-        // remote subsegment's.
-        segment_type: None,
-        namespace: None,
-        exceptions: remote.exceptions.clone(),
-        subsegments: Vec::new(),
-        inferred: true,
-        // The node this segment stands for reported nothing itself, so it has no
-        // `origin`: what types it is the call that inferred it.
-        inferred_type: inferred_service_type(&remote.name, remote.namespace.as_deref()),
-    }
 }
 
 /// An `http` block, as a segment document carries it.
@@ -3003,14 +2871,46 @@ impl ComAmazonawsXrayAwsxrayState {
     /// An inferred segment that does not fit marks the trace `limit_exceeded`
     /// like any other refused segment, but is not reported as an
     /// `UnprocessedTraceSegment`: the caller submitted no such document.
+    ///
+    /// A node is inferred only for a call that reached a service reporting
+    /// NOTHING of its own ([`reported_calls`]): a service that submits a segment
+    /// for the call it was reached by is the node, so the one this service had
+    /// inferred for that call is dropped ([`drop_inferred_under`]) whichever of
+    /// the two documents arrives first.
     pub fn ingest_segment(
         &mut self,
         trace_id: &str,
         segment: SegmentRecord,
     ) -> Result<(), SegmentRejection> {
         let inferred = inferred_segments(trace_id, &segment);
+        // The call this document reports for, where it reports for one: a
+        // submitted SEGMENT hanging from another service's call out. A submitted
+        // subsegment is work inside the service that recorded it, so it reports
+        // for no call of anyone else's ([`reported_calls`]).
+        let reports_for = (!segment.inferred && !segment.is_subsegment())
+            .then(|| segment.parent_id.clone())
+            .flatten();
         self.store_segment(trace_id, segment)?;
+        if let (Some(call_id), Some(trace)) = (reports_for, self.traces.get_mut(trace_id)) {
+            drop_inferred_under(trace, trace_id, &call_id);
+        }
+        // Which calls of this trace a service has already reported for, read
+        // ONCE for the whole document rather than per node it derived: a
+        // document may name many calls, and a trace may hold many segments, so
+        // one scan here is what keeps their product off this path.
+        let reported = self
+            .traces
+            .get(trace_id)
+            .map(reported_calls)
+            .unwrap_or_default();
         for extra in inferred {
+            if extra
+                .parent_id
+                .as_deref()
+                .is_some_and(|call_id| reported.contains(call_id))
+            {
+                continue;
+            }
             // The rejection is dropped deliberately: `store_segment` has
             // already recorded it on the trace as `limit_exceeded`.
             let _ = self.store_segment(trace_id, extra);

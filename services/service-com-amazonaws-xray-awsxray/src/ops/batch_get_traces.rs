@@ -256,25 +256,30 @@ pub const TRACES_PAGE_SIZE: usize = crate::state::MAX_TRACE_IDS_PER_CALL;
 /// Rebuild one `Trace` from its stored segments, carrying at most `budget`
 /// segment documents. Returns the trace and how many it carried.
 ///
+/// The documents are the trace ASSEMBLED
+/// (`crate::state::assembled_documents`): a trace is one tree, so an entity
+/// submitted as its own subsegment document is answered for inside the entity it
+/// named rather than beside it.
+///
 /// `LimitExceeded` is true when the trace dropped a segment at ingest because it
 /// was full, or when this response could not carry all of them — never a
 /// hardcoded `false`. The caller defers a trace that does not fit, so the
 /// truncating branch is reached only by a trace larger than a whole page budget.
 fn trace_of(trace: &crate::state::TraceRecord, budget: usize) -> (Trace, usize) {
-    let carried = trace.segments.len().min(budget);
-    let truncated = carried < trace.segments.len();
+    let assembled = crate::state::assembled_documents(trace);
+    let carried = assembled.len().min(budget);
+    let truncated = carried < assembled.len();
     let wire = Trace {
         id: Some(trace.id.clone()),
         duration: trace.duration(),
         limit_exceeded: Some(trace.limit_exceeded || truncated),
         segments: Some(
-            trace
-                .segments
-                .iter()
+            assembled
+                .into_iter()
                 .take(carried)
                 .map(|segment| Segment {
-                    id: Some(segment.id.clone()),
-                    document: Some(segment.document.clone()),
+                    id: Some(segment.id),
+                    document: Some(segment.document),
                 })
                 .collect(),
         ),

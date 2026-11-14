@@ -12,8 +12,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    classify, inferred_service_type, timestamp_of, Classification, SegmentRecord, SubsegmentRecord,
-    TraceRecord, MAX_HISTOGRAM_ENTRIES,
+    classify, inferred_service_type, timestamp_of, Classification, JsonObject, SegmentRecord,
+    SubsegmentRecord, TraceRecord, MAX_HISTOGRAM_ENTRIES,
 };
 use crate::ops::types::{
     Edge, EdgeStatistics, ErrorStatistics, FaultStatistics, HistogramEntry, Service,
@@ -283,10 +283,15 @@ impl NodeKey {
 /// downstream call. `Service$Type` names the matching node types: `remote` is
 /// "a downstream service of indeterminate type", and `AWS::<Service>` is what
 /// "downstream calls to Amazon Web Services ... that didn't target a specific
-/// table" report. A subsegment with neither namespace recorded in-process work
-/// and so names no service at all.
-fn downstream_node(name: &str, namespace: Option<&str>) -> Option<NodeKey> {
-    let inferred_type = inferred_service_type(name, namespace)?;
+/// table" report, with the resource's own type where the call DID target one,
+/// which is what its `aws` block names. A subsegment with neither namespace
+/// recorded in-process work and so names no service at all.
+fn downstream_node(
+    name: &str,
+    namespace: Option<&str>,
+    aws: Option<&JsonObject>,
+) -> Option<NodeKey> {
+    let inferred_type = inferred_service_type(name, namespace, aws)?;
     Some(NodeKey {
         name: name.to_string(),
         inferred_type: Some(inferred_type),
@@ -501,7 +506,11 @@ pub fn service_graph<'a>(
                 subsegment_budget -= 1;
                 pending.extend(subsegment.subsegments.iter().rev());
                 let Some(downstream) =
-                    downstream_node(&subsegment.name, subsegment.namespace.as_deref())
+                    downstream_node(
+                        &subsegment.name,
+                        subsegment.namespace.as_deref(),
+                        subsegment.aws.as_ref(),
+                    )
                 else {
                     continue;
                 };
@@ -551,7 +560,11 @@ pub fn service_graph<'a>(
             // A subsegment names a downstream service only through its
             // `namespace`; a segment names the service that handled it.
             let downstream = if segment.is_subsegment() {
-                match downstream_node(&segment.name, segment.namespace.as_deref()) {
+                match downstream_node(
+                    &segment.name,
+                    segment.namespace.as_deref(),
+                    segment.aws.as_ref(),
+                ) {
                     Some(key) => key,
                     None => continue,
                 }

@@ -362,6 +362,25 @@ pub(crate) async fn documents_of(router: &MultiServiceRouter, trace_id: &str) ->
         .unwrap_or_default()
 }
 
+/// Every entity one segment document carries: the document itself, and each
+/// subsegment nested inside it, recursively — a trace is one tree, so an entity
+/// submitted as its own document is answered for inside the entity it named.
+///
+/// `pub(crate)` for the same reason as [`documents_of`]: a suite reading a chain
+/// back reads its entities the same one way.
+pub(crate) fn entities_of(document: &Value) -> Vec<Value> {
+    let mut entities = vec![document.clone()];
+    for nested in document
+        .get("subsegments")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        entities.extend(entities_of(nested));
+    }
+    entities
+}
+
 /// The member `name` of a JSON object, as text.
 fn member(case: &str, body: &Value, name: &str) -> String {
     body.get(name)
@@ -766,7 +785,11 @@ async fn a_deployed_stage_propagates_the_trace_context_onto_its_proxy_integratio
             "case {case:?}: expected an {FUNCTION_ORIGIN} segment={}, got {held:?}",
             row.lambda_segments
         );
-        let ids: Vec<&str> = held
+        // A trace is one TREE, so an entity submitted as its own document is answered for
+        // inside the entity it named: the handler's subsegment is looked for across every
+        // entity the trace holds rather than among its top-level documents alone.
+        let entities: Vec<Value> = held.iter().flat_map(entities_of).collect();
+        let ids: Vec<&str> = entities
             .iter()
             .filter_map(|document| document.get("id").and_then(Value::as_str))
             .collect();
@@ -804,7 +827,7 @@ async fn a_deployed_stage_propagates_the_trace_context_onto_its_proxy_integratio
             "case {case:?}: expected the function segment to be the span the handler saw as \
              its Parent, got {held:?}"
         );
-        let subsegment = held
+        let subsegment = entities
             .iter()
             .find(|document| document.get("id").and_then(Value::as_str) == Some(sub_id.as_str()))
             .cloned()

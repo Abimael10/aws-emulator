@@ -13,10 +13,10 @@
 //! * a well-formed id with nothing stored under it is a MISS: it is neither
 //!   answered for in `Traces` nor reported in `UnprocessedTraceIds`, which is
 //!   for ids the service failed to process;
-//! * a subsegment that names a downstream service (`namespace: "remote"`) is
-//!   answered for by an extra, service-synthesised top-level segment carrying
-//!   `"inferred": true` whose `parent_id` is that subsegment's id, and every
-//!   submitted document comes back byte for byte;
+//! * a subsegment that names a downstream service (a `namespace` of `remote` or
+//!   `aws`) is answered for by an extra, service-synthesised top-level segment
+//!   carrying `"inferred": true` whose `parent_id` is that subsegment's id, and
+//!   every submitted document comes back byte for byte;
 //! * each entity of a trace is classified EXCLUSIVELY as a fault, a throttle, an
 //!   error or none of them — so a document setting both `throttle` and `error`
 //!   is a throttle and not also an error — and each flag is then read in the
@@ -439,7 +439,7 @@ fn infer_cases(trace: &str) -> Vec<InferCase> {
             inferred_names: vec!["quartz"],
         },
         InferCase {
-            case: "another namespace is not a downstream service",
+            case: "an aws-namespace subsegment is a downstream AWS service",
             document: {
                 let mut document =
                     root_document("1111111111111111", trace, "client", 1_400.0, Some(1_400.6));
@@ -447,9 +447,9 @@ fn infer_cases(trace: &str) -> Vec<InferCase> {
                     json!([subsegment("2222222222222222", "quartz", Some("aws"), vec![])]);
                 document
             },
-            segments: 1,
-            inferred_parents: vec![],
-            inferred_names: vec![],
+            segments: 2,
+            inferred_parents: vec!["2222222222222222"],
+            inferred_names: vec!["quartz"],
         },
         InferCase {
             case: "two remote subsegments infer one service each",

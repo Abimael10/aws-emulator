@@ -370,12 +370,39 @@ async fn documents_of(router: &MultiServiceRouter, trace_id: &str) -> Vec<Value>
         .unwrap_or_default()
 }
 
-/// The `name` of every document in `documents`.
+/// Every entity one segment document holds: the document itself, and each subsegment carried
+/// inside it, recursively — a trace is one TREE, so an entity submitted as its own document is
+/// answered for inside the entity it named rather than beside it.
+fn entities_of(document: &Value) -> Vec<Value> {
+    let mut entities = vec![document.clone()];
+    for nested in document
+        .get("subsegments")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        entities.extend(entities_of(nested));
+    }
+    entities
+}
+
+/// The `name` of every entity a producer SUBMITTED, wherever the assembled trace holds it. The
+/// nodes X-Ray synthesised for the services those entities called are left out: they are this
+/// service's own projection of a call rather than a document the daemon was sent.
 fn names_of(documents: &[Value]) -> BTreeSet<String> {
-    documents
+    submitted_entities(documents)
         .iter()
         .filter_map(|document| document.get("name").and_then(Value::as_str))
         .map(str::to_string)
+        .collect()
+}
+
+/// Every entity of `documents` a producer submitted, in the order the trace holds them.
+fn submitted_entities(documents: &[Value]) -> Vec<Value> {
+    documents
+        .iter()
+        .flat_map(entities_of)
+        .filter(|document| document.get("inferred").is_none())
         .collect()
 }
 
@@ -778,7 +805,7 @@ async fn a_traced_invocations_datagram_reaches_the_trace_store_through_the_daemo
     for row in ROWS {
         let case = row.case;
         for stored in row.stored {
-            let submitted = held
+            let submitted = submitted_entities(&held)
                 .iter()
                 .find(|held| held.get("name").and_then(Value::as_str) == Some(*stored))
                 .cloned()

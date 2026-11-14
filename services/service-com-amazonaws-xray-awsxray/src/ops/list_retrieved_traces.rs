@@ -348,20 +348,20 @@ fn trace_format_required() -> String {
 }
 
 /// One trimmed stored trace as the modelled `RetrievedTrace`: its spans are the
-/// stored segment documents, byte for byte, the way `BatchGetTraces` answers
-/// them ("For information on what each trace returns, see BatchGetTraces").
+/// trace ASSEMBLED (`crate::state::assembled_documents`), the way
+/// `BatchGetTraces` answers it ("For information on what each trace returns, see
+/// BatchGetTraces") — so the two surfaces never describe one trace differently.
 fn retrieved_trace(trace: &crate::state::TraceRecord) -> RetrievedTrace {
     RetrievedTrace {
         id: Some(trace.id.clone()),
         duration: trace.duration(),
         spans: Some(
-            trace
-                .segments
-                .iter()
+            crate::state::assembled_documents(trace)
+                .into_iter()
                 .take(MAX_SPANS_PER_RETRIEVED_TRACE)
                 .map(|segment| Span {
-                    id: Some(segment.id.clone()),
-                    document: Some(segment.document.clone()),
+                    id: Some(segment.id),
+                    document: Some(segment.document),
                 })
                 .collect(),
         ),

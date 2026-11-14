@@ -4505,3 +4505,12 @@ mod iot_job_cancel_unwinds_the_device_queue;
 // A suite left at the top level of `tests/` fails the build. (A fragment of this file's own
 // header that a landing appended here typed with `//!`, which is `E0753` anywhere but the
 // head of a crate root, so it stands as an ordinary comment.)
+// (`sfn_relayed_dynamodb_request_id` is declared ONCE, further up this same tail: two
+// landings in the same window each appended a declaration of it here, which is `E0428` and
+// compiles neither copy, so the one that stood here is gone.)
+// Declared here, in the appended tail, which is where every new suite inserts its lines: the
+// whole API Gateway -> Lambda -> DynamoDB/S3 -> X-Ray trace tree a traced stage leaves behind
+// spans six service crates at once, so no single service crate's test target can drive it.
+#[path = "all/apigateway_lambda_ddb_s3_trace_tree.rs"]
+mod apigateway_lambda_ddb_s3_trace_tree;
+// (The same line appended again with `//!`, which is `E0753` past the first item.)

@@ -44,6 +44,9 @@ mod group_identifier_exclusivity;
 #[path = "all/indexing_rules.rs"]
 mod indexing_rules;
 
+#[path = "all/inferred_downstream_nodes.rs"]
+mod inferred_downstream_nodes;
+
 #[path = "all/inferred_service_type.rs"]
 mod inferred_service_type;
 
@@ -142,6 +145,9 @@ mod trace_retrieval_lifecycle;
 
 #[path = "all/trace_segment_destination.rs"]
 mod trace_segment_destination;
+
+#[path = "all/trace_tree_assembly.rs"]
+mod trace_tree_assembly;
 
 #[path = "all/transaction_search_span_delivery.rs"]
 mod transaction_search_span_delivery;
