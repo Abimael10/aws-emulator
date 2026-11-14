@@ -327,6 +327,10 @@ async fn placement_subnet(router: &MultiServiceRouter) -> String {
 
 /// Register one Fargate-compatible `awsvpc` revision of [`FAMILY`] running `image`, and
 /// answer its ARN.
+///
+/// It names an EXECUTION role, the principal Amazon ECS fetches an image as: a Fargate
+/// revision whose image is held in Amazon ECR and that names none could be pulled by nobody,
+/// which `RegisterTaskDefinition` refuses.
 async fn register(router: &MultiServiceRouter, image: &str, case: &str) -> String {
     let body = ok(
         router,
@@ -337,6 +341,7 @@ async fn register(router: &MultiServiceRouter, image: &str, case: &str) -> Strin
             "cpu": "256",
             "memory": "512",
             "requiresCompatibilities": ["FARGATE"],
+            "executionRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/ecs-execution"),
             "containerDefinitions": [container("app", image)],
         }),
         case,

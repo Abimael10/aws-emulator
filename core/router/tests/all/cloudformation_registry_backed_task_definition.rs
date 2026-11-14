@@ -341,6 +341,7 @@ const ROWS: &[Row] = &[
                 "Memory": "512",
                 "NetworkMode": "awsvpc",
                 "RequiresCompatibilities": ["FARGATE"],
+                "ExecutionRoleArn": "ecsTaskExecutionRole",
                 "ContainerDefinitions": [{
                   "Name": "worker",
                   "Image": { "Fn::Sub": "${Registry.RepositoryUri}:latest" },

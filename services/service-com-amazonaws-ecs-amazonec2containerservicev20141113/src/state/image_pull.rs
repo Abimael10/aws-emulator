@@ -436,6 +436,57 @@ fn is_ecr_image(image: &str) -> bool {
     host.contains(ECR_REGISTRY_INFIX) && host.contains(".amazonaws.")
 }
 
+/// Whether any of `images` is one a registry serves only to an AUTHENTICATED principal, so
+/// that fetching it needs the task execution role Amazon ECS pulls as
+/// (`TaskDefinition$executionRoleArn`).
+///
+/// Amazon ECR is such a registry: a pull from it is two signed calls
+/// (`ecr:GetAuthorizationToken` and `ecr:BatchGetImage`), decided over the policies in force
+/// on the principal making them. A public registry serves anyone, and a reference naming no
+/// registry at all resolves to one ([`DOCKER_HUB_REGISTRY`]), so neither needs a principal —
+/// which is why the question is asked of the registry the reference RESOLVES to
+/// ([`registry_host`]) rather than of the reference's text.
+///
+/// The ONE reading both of this service's registration-time rules take: the launch types a
+/// revision can run under derive it
+/// ([`TaskDefinitionRecord::pull_needs_execution_role`]) and a registration that requires
+/// Fargate is refused by it, so the launch types a revision admits and the registrations
+/// Amazon ECS accepts cannot disagree. WHETHER a registry serves one particular pull is
+/// another question, and Amazon ECR's own to answer about the references it publishes
+/// ([`::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull`]).
+pub fn needs_execution_role_to_pull<'a>(mut images: impl Iterator<Item = &'a str>) -> bool {
+    images.any(serves_only_an_authenticated_principal)
+}
+
+/// Whether the registry ONE image reference resolves to serves it only to an authenticated
+/// principal — the per-reference half of [`needs_execution_role_to_pull`].
+fn serves_only_an_authenticated_principal(image: &str) -> bool {
+    is_ecr_image(image) || addresses_this_emulators_registry(registry_host(image))
+}
+
+/// Whether `host` is an address of THIS EMULATOR rather than the name of a registry
+/// published on the internet — which makes it the endpoint Amazon ECR announces its own
+/// registry at here.
+///
+/// `Repository$repositoryUri` is "The URI for the repository. You can use this URI for
+/// container image push and pull operations", and the registry is reachable on this machine
+/// only where the emulator serves it, so a client that asked that service for the URI is
+/// handed an ADDRESS of this emulator and pulls from there. A reference carrying that
+/// address therefore names a repository of the account's own registry, exactly as the
+/// published `<account>.dkr.ecr.<region>.<suffix>` form does.
+///
+/// Read through the tree's one reading of the question
+/// (`service_common::data_plane_addressing`): a host-shaped value that names no service is
+/// an address of this emulator, whichever interface and port it is served on — nothing here
+/// reads an environment variable or a bind address, so the answer does not change with how
+/// the emulator was started. A reference to a registry of the developer's own addressed by
+/// IP reads as this registry too, which is the same answer this emulator gives such an
+/// address everywhere else: it is the only registry it serves.
+fn addresses_this_emulators_registry(host: &str) -> bool {
+    ::service_common::data_plane_addressing::is_host_shaped(host)
+        && !::service_common::data_plane_addressing::names_a_service(host)
+}
+
 /// The route table that APPLIES to `subnet_id`: the one a caller explicitly associated
 /// with it, and otherwise the MAIN table of its VPC.
 ///

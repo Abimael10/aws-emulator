@@ -1524,6 +1524,13 @@ pub const ATTRIBUTE_LOGGING_DRIVER_PREFIX: &str = "com.amazonaws.ecs.capability.
 /// capability.
 pub const ATTRIBUTE_FIRELENS_PREFIX: &str = "ecs.capability.firelens.";
 
+/// The attribute a container instance needs to hand a task's containers the credentials of
+/// the role the revision names in `TaskDefinition$taskRoleArn` ("the IAM role that
+/// containers in this task can assume"): the agent serves those credentials to the
+/// containers itself, so only an agent publishing this capability can run such a revision.
+/// One of the Amazon ECS container-agent capabilities, as the agent publishes it.
+pub const ATTRIBUTE_TASK_IAM_ROLE: &str = "com.amazonaws.ecs.capability.task-iam-role";
+
 /// The attribute a container instance needs to let the task's EXECUTION ROLE carry the
 /// credentials the `awslogs` log driver ships logs with — the driver is configured on the
 /// agent's behalf, so the capability is required only where a revision pairs that driver
@@ -3345,7 +3352,11 @@ impl TaskDefinitionRecord {
     ///   for Fargate"); ECS Managed Instances place tasks on AWS-managed capacity that
     ///   gives each task its own network interface, so they likewise need `awsvpc`;
     ///   `awsvpc` is in turn not available to the external (on-premises) launch type; EC2
-    ///   supports every network mode;
+    ///   supports every network mode; and Fargate additionally needs a principal for
+    ///   every image fetch the revision's containers need authenticating
+    ///   ([`TaskDefinitionRecord::pull_needs_execution_role`]), because a Fargate task
+    ///   runs on capacity Amazon ECS owns and so has no container instance whose own role
+    ///   the agent could pull under;
     /// * Amazon ECS validated the revision against it at all
     ///   ([`TaskDefinitionRecord::validated_against`]) — every launch type a placement
     ///   may name outright, plus whatever the registration asked for.
@@ -3357,7 +3368,12 @@ impl TaskDefinitionRecord {
                 "EC2" => true,
                 "EXTERNAL" => !awsvpc,
                 "MANAGED_INSTANCES" => awsvpc,
-                "FARGATE" => awsvpc && self.cpu.is_some() && self.memory.is_some(),
+                "FARGATE" => {
+                    awsvpc
+                        && self.cpu.is_some()
+                        && self.memory.is_some()
+                        && !self.pull_needs_execution_role()
+                }
                 // Every launch type is classified above by its own documented
                 // requirements, so one added to [`COMPATIBILITY_ORDER`] later has to be
                 // classified deliberately rather than inheriting a neighbour's rule.
@@ -3366,6 +3382,26 @@ impl TaskDefinitionRecord {
             .filter(|launch_type| self.validated_against(launch_type))
             .map(|launch_type| (*launch_type).to_string())
             .collect()
+    }
+
+    /// Whether an image this revision's containers run can be fetched only AS the task
+    /// execution role, which the revision names none of.
+    ///
+    /// Amazon ECS pulls an image held in Amazon ECR as "the task execution role that grants
+    /// the Amazon ECS container agent permission to make Amazon Web Services API calls on
+    /// your behalf" (`TaskDefinition$executionRoleArn`), since that registry serves a pull
+    /// only to an authenticated principal ([`needs_execution_role_to_pull`]). On capacity of
+    /// the caller's own the agent falls back on the container instance's own IAM role, so
+    /// such a revision still runs there; Amazon ECS's own capacity has no such instance,
+    /// which is why this is read where a FARGATE compatibility is derived and where a
+    /// registration that REQUIRES Fargate is checked.
+    pub fn pull_needs_execution_role(&self) -> bool {
+        self.execution_role_arn.is_none()
+            && needs_execution_role_to_pull(
+                self.container_definitions
+                    .iter()
+                    .filter_map(|container| container.image.as_deref()),
+            )
     }
 
     /// Whether Amazon ECS validated this revision against `launch_type` at all, before
@@ -3395,7 +3431,8 @@ impl TaskDefinitionRecord {
     /// DERIVED from the stored revision: every feature it declares that only a container
     /// instance publishing a capability can serve contributes that capability's
     /// attribute — the `awsvpc` network mode needs [`ATTRIBUTE_TASK_ENI`] (and with it
-    /// the Docker remote-API version that carries task networking), a `secrets` or
+    /// the Docker remote-API version that carries task networking), a `taskRoleArn` needs
+    /// [`ATTRIBUTE_TASK_IAM_ROLE`], a `secrets` or
     /// `secretOptions` reference needs the attribute of the secret store it names, an
     /// S3 `environmentFiles` entry needs [`ATTRIBUTE_ENV_FILES_S3`], a privileged
     /// container needs [`ATTRIBUTE_PRIVILEGED_CONTAINER`], a named `logDriver` needs
@@ -3418,6 +3455,12 @@ impl TaskDefinitionRecord {
         if self.network_mode == NETWORK_MODE_AWSVPC {
             names.push(ATTRIBUTE_DOCKER_REMOTE_API_1_18.to_string());
             names.push(ATTRIBUTE_TASK_ENI.to_string());
+        }
+        // A revision that names a TASK role has the agent serve that role's credentials to
+        // its containers, which is its own capability ([`ATTRIBUTE_TASK_IAM_ROLE`]) — so a
+        // revision that names none requires nothing of the kind.
+        if self.task_role_arn.is_some() {
+            names.push(ATTRIBUTE_TASK_IAM_ROLE.to_string());
         }
         let has_execution_role = self.execution_role_arn.is_some();
         for container in &self.container_definitions {

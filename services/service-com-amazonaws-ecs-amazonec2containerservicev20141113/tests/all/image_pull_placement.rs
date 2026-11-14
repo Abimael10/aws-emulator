@@ -355,6 +355,11 @@ async fn network(router: &MultiServiceRouter) -> Network {
 }
 
 /// Register one Fargate-compatible `awsvpc` revision of `family` running `image`.
+///
+/// Every revision names an EXECUTION role, the principal Amazon ECS fetches an image as: a
+/// Fargate revision whose image is held in Amazon ECR and that names none could be pulled by
+/// nobody, which `RegisterTaskDefinition` refuses — and what these rows are about is the
+/// PATH from the placement to the registry, which is decided after the pull has a principal.
 async fn register(router: &MultiServiceRouter, family: &str, image: &str, case: &str) {
     ok(
         router,
@@ -365,6 +370,7 @@ async fn register(router: &MultiServiceRouter, family: &str, image: &str, case: 
             "cpu": "256",
             "memory": "512",
             "requiresCompatibilities": ["FARGATE"],
+            "executionRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/ecs-execution"),
             "containerDefinitions": [container("app", image)],
         }),
         case,

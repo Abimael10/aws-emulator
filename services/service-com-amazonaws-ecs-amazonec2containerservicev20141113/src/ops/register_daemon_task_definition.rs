@@ -210,6 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Each role member takes "the short name or full Amazon Resource Name (ARN) of the
+        // IAM role" (`RegisterDaemonTaskDefinition$taskRoleArn`), so a reference is
+        // RESOLVED to the role's ARN once, here, exactly as the plain registration resolves
+        // its own ([`crate::state::requested_role_arn`]).
+        let task_role_arn = crate::state::requested_role_arn(input.task_role_arn.as_deref());
+        let execution_role_arn =
+            crate::state::requested_role_arn(input.execution_role_arn.as_deref());
+
         // A daemon is made of containers, so a registration has to describe at least one
         // — and at most as many as a task definition may hold, which is also what bounds
         // the work and the stored bytes ONE registration can ask for.
@@ -304,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         if let Some(message) = crate::state::container_credential_violation(
             &credential_views,
-            input.execution_role_arn.as_deref(),
+            execution_role_arn.as_deref(),
         ) {
             return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
                 ClientException {
@@ -354,8 +362,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             volumes: input.volumes.clone().unwrap_or_default(),
             cpu: input.cpu.clone(),
             memory: input.memory.clone(),
-            task_role_arn: input.task_role_arn.clone(),
-            execution_role_arn: input.execution_role_arn.clone(),
+            task_role_arn,
+            execution_role_arn,
             // "The default is none. If none is specified or no value is provided, the
             // daemon runs with its own PID/IPC namespace": the mode the daemon runs in is
             // resolved ONCE, here, so every later read reports it.

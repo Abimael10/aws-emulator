@@ -299,6 +299,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .network_mode
             .clone()
             .unwrap_or_else(|| DEFAULT_NETWORK_MODE.to_string());
+        // Each role member takes "the short name or full Amazon Resource Name (ARN) of the
+        // IAM role" (`RegisterTaskDefinition$taskRoleArn`), so a reference is RESOLVED to
+        // the role's ARN once, here, and every later read of the revision reports that ARN
+        // — the one resolution this service takes of an IAM role reference
+        // ([`crate::state::requested_role_arn`]).
+        let task_role_arn = crate::state::requested_role_arn(input.task_role_arn.as_deref());
+        let execution_role_arn =
+            crate::state::requested_role_arn(input.execution_role_arn.as_deref());
         let requires_compatibilities = input.requires_compatibilities.clone().unwrap_or_default();
         let wants_fargate = requires_compatibilities
             .iter()
@@ -476,7 +484,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && definition.log_configuration.as_ref().is_some_and(|logging| {
                     logging.log_driver == crate::state::LOG_DRIVER_AWSLOGS
                 })
-                && input.execution_role_arn.is_none()
+                && execution_role_arn.is_none()
             {
                 return Err(RegisterTaskDefinitionErrorModeled::ClientException(
                     ClientException {
@@ -560,6 +568,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Amazon ECS pulls an image a registry serves only to an authenticated principal
+        // AS the task execution role ([`crate::state::needs_execution_role_to_pull`]), and
+        // a Fargate task runs on capacity Amazon ECS owns — there is no container instance
+        // of the caller's whose own IAM role the agent could fall back on — so a
+        // registration that REQUIRES Fargate and names no role could pull no such image.
+        // The same pairing [`crate::state::TaskDefinitionRecord::pull_needs_execution_role`]
+        // reads where the derived compatibilities are reported, so the launch types a
+        // revision admits and the registrations Amazon ECS accepts cannot disagree.
+        if wants_fargate
+            && execution_role_arn.is_none()
+            && crate::state::needs_execution_role_to_pull(
+                input
+                    .container_definitions
+                    .iter()
+                    .filter_map(|definition| definition.image.as_deref()),
+            )
+        {
+            return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(
+                        "Fargate requires task definition to have execution role ARN to \
+                         support ECR images."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         // The rules about the container list that are not about ONE container's own
         // values: the members whose values the Amazon ECS agent fetches on the task's
         // behalf and so need the task execution role, the log driver that only delivers
@@ -575,7 +612,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         if let Some(message) = crate::state::container_credential_violation(
             &credential_views,
-            input.execution_role_arn.as_deref(),
+            execution_role_arn.as_deref(),
         ) {
             return Err(RegisterTaskDefinitionErrorModeled::ClientException(
                 ClientException {
@@ -643,8 +680,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             volumes: input.volumes.clone().unwrap_or_default(),
             placement_constraints: input.placement_constraints.clone().unwrap_or_default(),
             requires_compatibilities,
-            task_role_arn: input.task_role_arn.clone(),
-            execution_role_arn: input.execution_role_arn.clone(),
+            task_role_arn,
+            execution_role_arn,
             pid_mode: input.pid_mode.clone(),
             ipc_mode: input.ipc_mode.clone(),
             proxy_configuration: input.proxy_configuration.clone(),

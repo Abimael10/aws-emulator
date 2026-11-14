@@ -1522,15 +1522,22 @@ pub(super) fn circuit_breaker_threshold(
     i32::try_from(bounded).unwrap_or(i32::MAX)
 }
 
-/// The ARN of the IAM role the CREATE named, resolved from the `role` reference it
-/// carried, and `None` when it named none.
+/// The ARN of the IAM role a request named, resolved from the `role` reference it carried,
+/// and `None` when it named none.
 ///
-/// `CreateService$role`: "The name or full Amazon Resource Name (ARN) of the IAM role".
+/// `CreateService$role`: "The name or full Amazon Resource Name (ARN) of the IAM role", a
+/// form the task-definition registrations' own role members share
+/// (`RegisterTaskDefinition$taskRoleArn`: "The short name or full Amazon Resource Name (ARN)
+/// of the IAM role") — so one resolution serves every member that takes either form: a
+/// value already spelling an ARN is the role it names, and a NAME is the role of that name
+/// in this account. A member that is absent, or that spells nothing but whitespace, names no
+/// role at all ([`declared_task_role_arn`] reads the same member the same way).
+///
 /// Which services report the ECS SERVICE-LINKED role instead is decided by what the
 /// service IS, not by this request alone, so it is resolved where the service is reported
 /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::service_role_arn`]).
 pub fn requested_role_arn(requested: Option<&str>) -> Option<String> {
-    match requested {
+    match declared_task_role_arn(requested) {
         // "If your specified role has a path other than /, then you must either specify
         // the full role ARN (this is recommended) or prefix the role name with the path."
         Some(reference) if reference.starts_with("arn:") => Some(reference.to_string()),

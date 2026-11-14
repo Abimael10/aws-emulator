@@ -229,6 +229,8 @@ mod task_definition_reference_refusals;
 mod task_definition_rendering;
 #[path = "all/task_definition_revision_requirement.rs"]
 mod task_definition_revision_requirement;
+#[path = "all/task_definition_role_references.rs"]
+mod task_definition_role_references;
 #[path = "all/task_interface_allocation.rs"]
 mod task_interface_allocation;
 #[path = "all/task_interface_attach_and_connectivity.rs"]
