@@ -9,9 +9,9 @@
 //! The rule under test: an identifier Amazon Chime SDK Messaging generates is minted in
 //! the id form that identifier's class carries — the generated last segment of one of this
 //! service's app-instance-scoped ARNs (`…/channel/<id>`, `…/channel-flow/<id>`) is a
-//! 64-character lowercase hex digest, and a `MessageId` is a canonical hyphenated
-//! lowercase UUID — while an id the CALLER supplies is carried through unchanged. Each
-//! generated id is also unique per resource and is the id the resource reads back by.
+//! canonical hyphenated lowercase UUID, and a `MessageId` is an opaque undelimited id —
+//! while an id the CALLER supplies is carried through unchanged. Each generated id is also
+//! unique per resource and is the id the resource reads back by.
 //!
 //! The tables span what that rule generalises over rather than re-running one recorded
 //! request: two `AppInstanceArn` forms, every `ChannelMode` and `ChannelPrivacy` wire
@@ -34,16 +34,22 @@ const APP_INSTANCE: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/3c
 /// ARN form only.
 const SHORT_APP_INSTANCE: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai2";
 
-/// How many characters a generated channel id or channel flow id carries.
+/// How many characters a generated `MessageId` carries.
 ///
-/// The id shape Amazon Chime SDK Messaging's recorded app-instance-scoped ARNs have: a
-/// full lowercase hex digest, which is also exactly `ChannelId`'s modelled maximum
-/// (`smithy_query(query="shape", shape="ChannelId")`: `len 1..64`).
+/// The id shape Amazon Chime SDK Messaging's recorded message ids have: an opaque,
+/// undelimited lowercase hex id, inside `MessageId`'s modelled bounds
+/// (`smithy_query(query="shape", shape="MessageId")`: `len 1..128`, pattern
+/// `^[-_a-zA-Z0-9]*$`).
 ///
 /// Stated here independently of the service's own digest width on purpose: the number is
 /// what the service owes its callers, so a test that read it from the implementation could
 /// not tell a changed id shape from an unchanged one.
-const GENERATED_ID_LENGTH: usize = 64;
+const MESSAGE_ID_LENGTH: usize = 64;
+
+/// `ChannelId`'s modelled maximum length, from
+/// `smithy_query(query="operation", operation="CreateChannel")` (`len 1..64`): a generated
+/// channel id has to fit inside it.
+const CHANNEL_ID_MAX_LENGTH: usize = 64;
 
 /// The `ChannelMode` wire values, from
 /// `smithy_query(query="shape", shape="ChannelMode")`.
@@ -58,13 +64,16 @@ const MESSAGE_TYPES: [&str; 2] = ["STANDARD", "CONTROL"];
 /// `smithy_query(query="shape", shape="ChannelMessagePersistenceType")`.
 const PERSISTENCE_TYPES: [&str; 2] = ["PERSISTENT", "NON_PERSISTENT"];
 
-/// Why `value` is not a generated ARN id segment, or `None` when it is one.
-fn resource_id_violation(value: &str) -> Option<String> {
-    if value.len() != GENERATED_ID_LENGTH {
+/// Why `value` is not an opaque, undelimited generated id, or `None` when it is one.
+fn opaque_id_violation(value: &str) -> Option<String> {
+    if value.len() != MESSAGE_ID_LENGTH {
         return Some(format!(
-            "expected {GENERATED_ID_LENGTH} characters, got {}",
+            "expected {MESSAGE_ID_LENGTH} characters, got {}",
             value.len()
         ));
+    }
+    if value.contains('-') {
+        return Some("expected no hyphen groups, got a hyphenated id".to_string());
     }
     if !value
         .chars()
@@ -128,10 +137,10 @@ struct ChannelCase {
 }
 
 /// RULE: the channel id `CreateChannel` generates when the request names none is a
-/// 64-character lowercase hex digest, unique per channel, and it is the id the channel's
+/// canonical hyphenated lowercase UUID, unique per channel, and it is the id the channel's
 /// ARN reads back by; a `ChannelId` the caller supplies is carried through unchanged.
 #[tokio::test]
-async fn a_generated_channel_id_is_a_full_hex_digest() {
+async fn a_generated_channel_id_is_a_hyphenated_uuid() {
     let emulator = Emulator::new();
 
     let mut rows = vec![
@@ -226,13 +235,20 @@ async fn a_generated_channel_id_is_a_full_hex_digest() {
                 case.label
             ),
             None => {
-                if let Some(violation) = resource_id_violation(&channel_id) {
+                if let Some(violation) = uuid_violation(&channel_id) {
                     panic!(
-                        "case {:?}: the generated channel id {channel_id:?} is not a full hex \
-                         digest: {violation}",
+                        "case {:?}: the generated channel id {channel_id:?} is not a hyphenated \
+                         uuid: {violation}",
                         case.label
                     );
                 }
+                assert!(
+                    channel_id.len() <= CHANNEL_ID_MAX_LENGTH,
+                    "case {:?}: the generated channel id {channel_id:?} is {} characters, over \
+                     ChannelId's modelled maximum of {CHANNEL_ID_MAX_LENGTH}",
+                    case.label,
+                    channel_id.len()
+                );
                 assert!(
                     generated.insert(channel_id.clone()),
                     "case {:?}: the generated channel id {channel_id:?} repeats an earlier one",
@@ -259,10 +275,10 @@ async fn a_generated_channel_id_is_a_full_hex_digest() {
 }
 
 /// RULE, applied to the other ARN this service derives an id segment for: the channel flow
-/// id `CreateChannelFlow` generates is a 64-character lowercase hex digest, unique per
+/// id `CreateChannelFlow` generates is a canonical hyphenated lowercase UUID, unique per
 /// flow, and it is the id the flow reads back by.
 #[tokio::test]
-async fn a_generated_channel_flow_id_is_a_full_hex_digest() {
+async fn a_generated_channel_flow_id_is_a_hyphenated_uuid() {
     let emulator = Emulator::new();
 
     // (case, the app instance the flow is created under, how many processors it declares)
@@ -314,10 +330,10 @@ async fn a_generated_channel_flow_id_is_a_full_hex_digest() {
             .unwrap_or_else(|| panic!("case {case:?}: no ChannelFlowArn in {:?}", created.body))
             .to_string();
         let flow_id = id_segment(&arn, "channel-flow");
-        if let Some(violation) = resource_id_violation(&flow_id) {
+        if let Some(violation) = uuid_violation(&flow_id) {
             panic!(
-                "case {case:?}: the generated channel flow id {flow_id:?} is not a full hex \
-                 digest: {violation}"
+                "case {case:?}: the generated channel flow id {flow_id:?} is not a hyphenated \
+                 uuid: {violation}"
             );
         }
         assert!(
@@ -342,10 +358,10 @@ async fn a_generated_channel_flow_id_is_a_full_hex_digest() {
     }
 }
 
-/// RULE: the `MessageId` `SendChannelMessage` generates is a canonical hyphenated
-/// lowercase UUID, unique per message, and it is the id the message reads back by.
+/// RULE: the `MessageId` `SendChannelMessage` generates is an opaque, undelimited id — not
+/// a hyphenated UUID — unique per message, and it is the id the message reads back by.
 #[tokio::test]
-async fn a_generated_message_id_is_a_hyphenated_uuid() {
+async fn a_generated_message_id_is_an_opaque_undelimited_id() {
     let emulator = Emulator::new();
     let channel = emulator
         .channel(APP_INSTANCE, "message-ids", "message-ids-token")
@@ -388,10 +404,10 @@ async fn a_generated_message_id_is_a_hyphenated_uuid() {
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: no MessageId in {:?}", sent.body))
             .to_string();
-        if let Some(violation) = uuid_violation(&message_id) {
+        if let Some(violation) = opaque_id_violation(&message_id) {
             panic!(
-                "case {case:?}: the generated MessageId {message_id:?} is not a hyphenated \
-                 uuid: {violation}"
+                "case {case:?}: the generated MessageId {message_id:?} is not an opaque \
+                 undelimited id: {violation}"
             );
         }
         assert!(
@@ -399,8 +415,8 @@ async fn a_generated_message_id_is_a_hyphenated_uuid() {
             "case {case:?}: the generated MessageId {message_id:?} repeats an earlier one"
         );
 
-        // A persisted message reads back by the id the send returned — the hyphens
-        // included, through the restJson1 label the id becomes.
+        // A persisted message reads back by the id the send returned, through the
+        // restJson1 label the id becomes.
         if *persistence == "PERSISTENT" {
             let got = emulator.get_message(&channel, &message_id).await;
             assert_eq!(
@@ -424,7 +440,7 @@ async fn a_generated_message_id_is_a_hyphenated_uuid() {
     }
 
     // The uniqueness and the form hold over a run of sends, not just the table above: 40
-    // more messages into the same channel, every id its own canonical uuid.
+    // more messages into the same channel, every id its own opaque value.
     for index in 0..40 {
         let sent = emulator
             .send_message(
@@ -446,10 +462,10 @@ async fn a_generated_message_id_is_a_hyphenated_uuid() {
             .as_str()
             .unwrap_or_else(|| panic!("bulk send {index}: no MessageId in {:?}", sent.body))
             .to_string();
-        if let Some(violation) = uuid_violation(&message_id) {
+        if let Some(violation) = opaque_id_violation(&message_id) {
             panic!(
-                "bulk send {index}: the generated MessageId {message_id:?} is not a hyphenated \
-                 uuid: {violation}"
+                "bulk send {index}: the generated MessageId {message_id:?} is not an opaque \
+                 undelimited id: {violation}"
             );
         }
         assert!(

@@ -15,7 +15,7 @@ engine = { workspace = true }
 # `chime_identity_names`: the identity NAME directory this service READS, which Chime SDK
 # Identity writes, for the `Name` every participant it reports carries beside its ARN.
 # `uuid_from_random_bytes`: the family's one rendering of 16 opaque bytes as the
-# hyphenated uuid a minted `MessageId` is.
+# hyphenated uuid a generated ARN id segment (a channel id, a channel flow id) is.
 service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

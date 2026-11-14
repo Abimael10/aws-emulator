@@ -74,10 +74,10 @@ pub const UNRESOLVABLE_APP_INSTANCE: &str =
     "An invalid App Instance ARN was supplied for the input parameter.";
 
 /// How many bytes the digest every id this service mints is laid out from carries:
-/// SHA-256's output length. Hex-rendered whole, it is the 64-character id the generated
-/// segment of this service's app-instance-scoped ARNs is, which is also exactly
-/// `ChannelId`'s modelled maximum (`smithy_query(query="shape", shape="ChannelId")`:
-/// `len 1..64`); its first 16 bytes are the ones a `MessageId`'s uuid is laid out from.
+/// SHA-256's output length. Hex-rendered whole, it is the 64-character opaque id a
+/// `MessageId` is, inside `MessageId`'s modelled maximum
+/// (`smithy_query(query="shape", shape="MessageId")`: `len 1..128`); its first 16 bytes
+/// are the ones a generated ARN id segment's uuid is laid out from.
 const ID_DIGEST_BYTES: usize = 32;
 
 /// How many channel flows this emulator stores at once.
@@ -296,33 +296,39 @@ impl ComAmazonawsChimesdkmessagingChimemessagingserviceState {
     ///
     /// Both carry the same id shape, because both are the generated last segment of an
     /// app-instance-scoped ARN of this service (`…/channel/<id>`,
-    /// `…/channel-flow/<id>`): a FULL lowercase hex digest, 64 characters, which is also
-    /// exactly `ChannelId`'s modelled maximum (`len 1..64`) and inside its
-    /// `^[A-Za-z0-9]([A-Za-z0-9:\-_.@]{0,62}[A-Za-z0-9])?$`.
-    ///
-    /// The digest comes from [`Self::id_digest`], so two ids minted in the same
-    /// nanosecond differ and nothing the caller sent is recoverable from the result.
-    pub fn mint_resource_id(&mut self, salt: &str) -> String {
-        hex::encode(self.id_digest(salt))
-    }
-
-    /// Mint a `MessageId` for a message this service accepts.
-    ///
-    /// A message id carries a different shape from the ARN id segments above: the
-    /// canonical hyphenated lowercase UUID form, which `MessageId`'s `len 1..128`,
-    /// `^[-_a-zA-Z0-9]*$` admits (the hyphens included). The family's one rendering of 16
-    /// opaque bytes in that form is
+    /// `…/channel-flow/<id>`): the canonical hyphenated lowercase UUID form, which is the
+    /// form `CreateChannel` documents for an id the caller did not supply —
+    /// `smithy_query(query="doc", shape="CreateChannelRequest", member="ChannelId")`: "An
+    /// ID for the channel being created. If you do not specify an ID, a UUID will be
+    /// created for the channel." — and which fits `ChannelId`'s modelled `len 1..64` and
+    /// its `^[A-Za-z0-9]([A-Za-z0-9:\-_.@]{0,62}[A-Za-z0-9])?$`. The family's one
+    /// rendering of 16 opaque bytes in that form is
     /// [`::service_common::uuid_from_random_bytes`], so the version and variant bits and
     /// the group boundaries are not restated here.
     ///
-    /// The bytes handed to it are [`Self::id_digest`]'s, the same source the ARN id
-    /// segments draw, so the uniqueness argument is the one stated there.
-    pub fn mint_message_id(&mut self, salt: &str) -> String {
+    /// The bytes handed to it come from [`Self::id_digest`], so two ids minted in the same
+    /// nanosecond differ and nothing the caller sent is recoverable from the result.
+    pub fn mint_resource_id(&mut self, salt: &str) -> String {
         let digest = self.id_digest(salt);
         let bytes: [u8; 16] = digest[..16]
             .try_into()
             .expect("16 of the digest's 32 bytes");
         ::service_common::uuid_from_random_bytes(bytes)
+    }
+
+    /// Mint a `MessageId` for a message this service accepts.
+    ///
+    /// A message id carries a different shape from the ARN id segments above: it is no
+    /// ARN segment and the API documents no UUID for it, so it is an OPAQUE id — a FULL
+    /// lowercase hex digest, 64 undelimited characters, inside `MessageId`'s modelled
+    /// `len 1..128` and `^[-_a-zA-Z0-9]*$`
+    /// (`smithy_query(query="operation", operation="SendChannelMessage")`), which is the
+    /// shape the ids Amazon Chime SDK Messaging assigns to messages carry.
+    ///
+    /// The digest comes from [`Self::id_digest`], the same source the ARN id segments
+    /// draw, so the uniqueness argument is the one stated there.
+    pub fn mint_message_id(&mut self, salt: &str) -> String {
+        hex::encode(self.id_digest(salt))
     }
 
     /// The digest every id this service mints is laid out from: a SHA-256 over `salt`, a
