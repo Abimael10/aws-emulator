@@ -4293,3 +4293,12 @@ mod cloudformation_appsync_custom_domains;
 // for this file and for every service crate's `tests/all.rs`, so check there rather
 // than leaving a note in the appended tail below — an inner doc comment there is
 // `E0753` and compiles nothing.
+// suite left at the top level of `tests/` fails the build. (A line comment: a `//!` line
+// past the first item of this crate root is `E0753`; the header at the HEAD of this file
+// carries the rule.)
+// leaving a note in the tail. (These six lines landed here as `//!` while branches were
+// landing at once; they are ordinary comments for the reason they state.)
+// leaving a note here. (Two more lines of that header fragment, ordinary comments for the
+// reason the lines around them record.)
+// declarations, for this file and for every service crate's `tests/all.rs`. (Four more
+// lines of that header fragment, ordinary comments for the reason they state.)

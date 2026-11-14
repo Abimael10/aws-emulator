@@ -875,6 +875,16 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// ([`IndexingConfiguration::disabled`]). That is what makes the read a pure
     /// read — it never has to create the record it reports.
     pub indexing_configuration: IndexingConfiguration,
+    /// The account's SOFTWARE PACKAGE CONFIGURATION — one record, not a map, because
+    /// neither `UpdatePackageConfiguration` nor `GetPackageConfiguration` names a
+    /// resource: there is one package configuration per account.
+    ///
+    /// It is a plain field and not an `Option`, for the reason
+    /// [`ComAmazonawsIotAwsiotserviceState::indexing_configuration`] is: an account that
+    /// has never updated it still HAS a configuration — package version reporting by
+    /// jobs turned off and no role named — so the read never has to create the record it
+    /// reports. See [`PackageConfiguration`].
+    pub package_configuration: PackageConfiguration,
     /// The BUILD each fleet index is in, keyed by index name
     /// ([`FLEET_INDEX_NAMES`]).
     ///
@@ -2965,6 +2975,14 @@ pub use role_aliases::{
     DEFAULT_CREDENTIAL_DURATION_SECONDS, MAX_ROLE_ALIASES, MAX_ROLE_ALIAS_TAGS,
 };
 
+// What the account's SOFTWARE PACKAGE CONFIGURATION is — the one record
+// `UpdatePackageConfiguration` writes and `GetPackageConfiguration` reports — lives in
+// `state/package_configuration.rs`, beside the store accessor for the same reason the
+// rules engine does. Its names are re-exported here so a handler reaches them as
+// `crate::state::<name>`.
+pub mod package_configuration;
+pub use package_configuration::PackageConfiguration;
+
 // What the account's V2 LOGGING OPTIONS are — the one record `SetV2LoggingOptions`
 // writes and `GetV2LoggingOptions` reports — lives in `state/v2_logging.rs`, beside the
 // store accessor for the same reason the rules engine does. Its names are re-exported
@@ -3807,6 +3825,23 @@ pub fn missing_package_message(package_name: &str) -> String {
 /// ([`missing_package_message`]).
 pub fn missing_package_version_message(package_name: &str, version_name: &str) -> String {
     format!("PackageVersion {version_name} for package {package_name} not found")
+}
+
+/// How this service states that a `(packageName, versionName)` pair already names a
+/// package version, so creating it again is refused.
+///
+/// The package catalog guards a create of a version against the record already stored
+/// under that pair, and states the refusal as a failed conditional check that names the
+/// request as a repeat: the package first, then the version, both taken from the
+/// request. The model gives `ConflictException` ("The request conflicts with the
+/// current state of the resource", HTTP 409) but no message text
+/// (`smithy_query(query="shape",shape="ConflictException")`), so the sentence is the
+/// service's own and the only variable parts are the two names.
+pub fn duplicate_package_version_message(package_name: &str, version_name: &str) -> String {
+    format!(
+        "Conditional check failure: Received duplicate request for package {package_name} \
+         version {version_name}"
+    )
 }
 
 /// How many software packages this emulator keeps for the account.

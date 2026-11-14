@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPackageConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPackageConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPackageConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's software package configuration as this service's state holds
+//! it — the record `UpdatePackageConfiguration` writes — so what this call answers is
+//! what the last update persisted and nothing it invents.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +130,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPackageConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPackageConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPackageConfiguration"))
+        // The configuration is account-wide, and `GetPackageConfigurationRequest` binds
+        // no members at all, so nothing about the request selects what is reported.
+        let _ = (&input, ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetPackageConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        // A pure read: the record is rendered from the state under the lock and the
+        // store is left exactly as it was, so a later caller sees what this one saw. An
+        // account that has never updated the configuration still has one — version
+        // reporting by jobs off, with no role named — so there is no record to create
+        // here and no refusal for a configuration nobody has written.
+        let version_update_by_jobs_config = state
+            .lock()
+            .package_configuration
+            .version_update_by_jobs_config();
+
+        Ok(GetPackageConfigurationOutput {
+            version_update_by_jobs_config: Some(version_update_by_jobs_config),
+        })
     }
 }

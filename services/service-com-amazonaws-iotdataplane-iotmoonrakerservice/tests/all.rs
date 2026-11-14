@@ -23,6 +23,8 @@ mod named_shadow_listing_emptiness;
 mod publish_topic_and_payload_limits;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/reserved_shadow_namespace.rs"]
+mod reserved_shadow_namespace;
 #[path = "all/reserved_topic_namespace.rs"]
 mod reserved_topic_namespace;
 #[path = "all/response_envelope.rs"]

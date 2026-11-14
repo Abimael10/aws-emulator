@@ -214,12 +214,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // package, is already taken — what this operation's `ConflictException`
             // (HTTP 409, "The request conflicts with the current state of the resource")
             // names. Changing a version that exists is `UpdatePackageVersion`'s job, so
-            // nothing is overwritten here.
+            // nothing is overwritten here. The refusal is stated the way the catalog
+            // states a create that repeats a stored pair
+            // ([`crate::state::duplicate_package_version_message`]), with the package
+            // and version names taken from the request.
             return Err(CreatePackageVersionErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "Version {} of package {} already exists",
-                        existing.version_name, existing.package_name
+                    message: Some(crate::state::duplicate_package_version_message(
+                        &input.package_name,
+                        &input.version_name,
                     )),
                     resource_id: Some(existing.version_name.clone()),
                 },

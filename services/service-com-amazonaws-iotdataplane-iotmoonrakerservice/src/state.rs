@@ -224,6 +224,19 @@ pub fn addressed_shadow_name<'a>(thing_name: &'a str, shadow_name: Option<&'a st
 /// the FIRST character is reserved: a `$` later in the name (`fleet$a`) is ordinary.
 pub const RESERVED_SHADOW_PREFIX: char = '$';
 
+/// The shadow names in the reserved namespace this service SERVES to clients.
+///
+/// The reserved namespace is the SERVICE's, not an unaddressable one: a name AWS IoT
+/// reserves for a feature of its own is read and written through the ordinary shadow
+/// API, and only the rest of the namespace — names kept for no served feature — is
+/// refused. `$package` is the named shadow AWS IoT reserves for a thing's software
+/// package version reporting, which the Software Package Catalog's package
+/// configuration (`iot:UpdatePackageConfiguration$versionUpdateByJobsConfig`, "this
+/// updates the thing's reserved named shadow that the job targets") names as the
+/// shadow a job's version reporting targets, so a client addressing it is addressing a
+/// shadow this service keeps for it.
+pub const SERVED_RESERVED_SHADOW_NAMES: [&str; 1] = ["$package"];
+
 /// The service's rejection of a shadow name in the reserved namespace, naming the shadow
 /// the request addressed — which is the one thing the caller has to change.
 pub fn invalid_shadow_name(name: &str) -> String {
@@ -236,13 +249,14 @@ pub fn invalid_shadow_name(name: &str) -> String {
 /// The rule is the shadow-NAME rule, and it holds wherever a request names one shadow —
 /// a write and a read alike, so a name the write path refuses is never reported by the
 /// read path as a shadow that merely holds nothing: a name in the reserved namespace
-/// ([`RESERVED_SHADOW_PREFIX`]) is not a name a client may address. A request that names
-/// no shadow addresses the unnamed ("classic") shadow, which is never refused here.
+/// ([`RESERVED_SHADOW_PREFIX`]) that this service serves no feature of its own under
+/// ([`SERVED_RESERVED_SHADOW_NAMES`]) is not a name a client may address. A request that
+/// names no shadow addresses the unnamed ("classic") shadow, which is never refused here.
 /// Every other bound on the name — its length and its character set — is the MODEL's, and
 /// is weighed at this service's front door before a handler runs (see [`BAD_REQUEST`]).
 pub fn shadow_name_refusal(shadow_name: Option<&str>) -> Option<String> {
     let name = shadow_name?;
-    if name.starts_with(RESERVED_SHADOW_PREFIX) {
+    if name.starts_with(RESERVED_SHADOW_PREFIX) && !SERVED_RESERVED_SHADOW_NAMES.contains(&name) {
         return Some(invalid_shadow_name(name));
     }
     None

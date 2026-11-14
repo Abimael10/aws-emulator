@@ -79,10 +79,14 @@ mod ota_update_deployment;
 mod ota_update_job_document;
 #[path = "all/package_catalog.rs"]
 mod package_catalog;
+#[path = "all/package_configuration.rs"]
+mod package_configuration;
 #[path = "all/package_default_version.rs"]
 mod package_default_version;
 #[path = "all/package_deletion.rs"]
 mod package_deletion;
+#[path = "all/package_version_conflict_wording.rs"]
+mod package_version_conflict_wording;
 #[path = "all/package_version_sbom.rs"]
 mod package_version_sbom;
 #[path = "all/package_version_update.rs"]
