@@ -11,12 +11,12 @@
 // points it into `tests/all/`.
 #[path = "all/api_cache.rs"]
 mod api_cache;
-#[path = "all/api_inventory_listing_authorization.rs"]
-mod api_inventory_listing_authorization;
 #[path = "all/api_cache_create_rules.rs"]
 mod api_cache_create_rules;
 #[path = "all/api_cache_refusal_messages.rs"]
 mod api_cache_refusal_messages;
+#[path = "all/api_inventory_listing_authorization.rs"]
+mod api_inventory_listing_authorization;
 #[path = "all/api_key_deletes_across_page_sizes.rs"]
 mod api_key_deletes_across_page_sizes;
 #[path = "all/api_key_deletes_drawn_expirations.rs"]
@@ -145,6 +145,8 @@ mod resolvers;
 mod resource_tags;
 #[path = "all/response_member_projections.rs"]
 mod response_member_projections;
+#[path = "all/sandbox_evaluation_authorization.rs"]
+mod sandbox_evaluation_authorization;
 #[path = "all/schema_creation.rs"]
 mod schema_creation;
 #[path = "all/schema_creation_status_polling.rs"]

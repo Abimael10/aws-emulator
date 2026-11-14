@@ -7939,3 +7939,20 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // into the tail by a landing, or a note about a declaration that is no longer duplicated.
 // Declare each suite ONCE, with its `#[path]` line, and keep the rules in the module doc at
 // (Pruned, for the reason the note above records.)
+// (A span of duplicated fragments of this file's own header that landings appended into
+// this tail is removed here: several of them were typed with `//!`, which past the first
+// item of a crate root is `E0753` and compiled no suite of this target, and the rules they
+// repeated stand in the module doc at the HEAD of this file.)
+// (The tail of duplicated header fragments that landings appended below this point is gone:
+// many were typed with `//!`, which past the first item of a crate root is `E0753` and
+// compiled no suite of this target, and the rules they repeated stand in the module doc at
+// the HEAD of this file. Add a new suite's `#[path]`/`mod` pair above, not a note here.)
+// (And so are the lines that stood here, including several typed with `//!`.)
+// (The lines that followed are gone for the same reason as the tail above.)
+// (A block of duplicated fragments of this file's own header that landings had appended
+// here is removed; the rules it repeated stand in the module doc at the head of this file.)
+// (Everything concurrent landings appended after the last declaration above — copies of
+// this file's own header, several of them typed with `//!`, and notes about duplicate `mod`
+// declarations that are already gone — is removed rather than re-typed. Declare each suite
+// ONCE, with its `#[path]` line, above this point; the rules stand in the module doc at the
+// HEAD of this file, which is the only place an inner doc comment is legal.)

@@ -1,16 +1,18 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: appsync.access-denied-domain-name appsync.access-denied-flush-api-cache appsync.access-denied-sandbox-eval
+Issue-Trace-Ids: appsync.access-denied-domain-name appsync.access-denied-flush-api-cache
 Issue-Shape-Id: com.amazonaws.appsync#AWSDeepdishControlPlaneService
 Issue-Key: appsync.access-denied-domain-name|_poll_until_denied#8|AssertionError|raise AssertionError(f"{description} not met within {timeout_s}s; last code={code!r}")
 Issue-Key: appsync.access-denied-flush-api-cache|run#11|AssertionError|assert code == "AccessDeniedException", f"expected AccessDeniedException, got {code}"
-Issue-Key: appsync.access-denied-sandbox-eval|_poll#17|AssertionError|raise AssertionError(
 Issue-Commit: 1f5faf3c8256779e62f28c9306d3764c9324fb2e
 
 # AppSync authorization gaps: domain-name and FlushApiCache calls are served to unauthorized principals, and the EvaluateCode/EvaluateMappingTemplate sandbox is still a NotImplemented stub (3 causes)
 
 > _Note: this issue was identified against the code base at commit `1f5faf3c8256779e62f28c9306d3764c9324fb2e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+> _Resolution: causes 1 and 2 — the identity-based gate in front of the domain-name surface, and in front of `FlushApiCache`, judged against the resource the request addresses — are closed, and so is the authorization half of cause 3: both sandbox evaluations are judged before the operation runs, which `tests/all/sandbox_evaluation_authorization.rs` pins. The DATA-PLANE half of cause 3 — `EvaluateMappingTemplate` rendering a Velocity template, which no maintained Rust engine crate does — is still open, and its trace id `appsync.access-denied-sandbox-eval` and replay key moved with it to
+> `issues/things-that-do-not-work/20261115T090000Z-appsync-evaluatemappingtemplate-renders-no-velocity-template.md`, where the blocker is written down. They are no longer listed above, so this report's own keys are the two that pass._
 
 ## Operation
 FlushApiCache

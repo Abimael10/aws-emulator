@@ -53,6 +53,10 @@ pub const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
 pub const ACCESS_DENIED: &str = "AccessDeniedException";
 pub const ACCESS_DENIED_STATUS: u16 = 403;
 
+/// The name the one inline policy a principal of this suite carries is stored under, which
+/// is also the one a later put replaces and a delete removes.
+const INLINE_POLICY_NAME: &str = "inline";
+
 /// One response, reduced to what a client branches on.
 #[derive(Debug)]
 pub struct Reply {
@@ -202,17 +206,7 @@ impl Emulator {
         let arn = xml_element(&created, "Arn")
             .unwrap_or_else(|| panic!("CreateUser answers the user's Arn, got {created}"));
         if let Some(policy) = policy {
-            self.query(
-                "iam",
-                "2010-05-08",
-                "PutUserPolicy",
-                &[
-                    ("UserName", user_name.to_string()),
-                    ("PolicyName", "inline".to_string()),
-                    ("PolicyDocument", policy.to_string()),
-                ],
-            )
-            .await;
+            self.put_user_policy(user_name, policy).await;
         }
         let minted = self
             .query(
@@ -227,6 +221,38 @@ impl Emulator {
                 .unwrap_or_else(|| panic!("CreateAccessKey answers an AccessKeyId, got {minted}")),
             arn,
         }
+    }
+
+    /// Attach `policy` to the IAM user `user_name` as its inline policy, through IAM's own
+    /// `PutUserPolicy` — the write a suite uses to put a document in force on a principal
+    /// that already exists.
+    pub async fn put_user_policy(&self, user_name: &str, policy: &str) {
+        self.query(
+            "iam",
+            "2010-05-08",
+            "PutUserPolicy",
+            &[
+                ("UserName", user_name.to_string()),
+                ("PolicyName", INLINE_POLICY_NAME.to_string()),
+                ("PolicyDocument", policy.to_string()),
+            ],
+        )
+        .await;
+    }
+
+    /// Remove that inline policy again, through IAM's own `DeleteUserPolicy`, so the
+    /// principal is back to carrying no document of its own.
+    pub async fn delete_user_policy(&self, user_name: &str) {
+        self.query(
+            "iam",
+            "2010-05-08",
+            "DeleteUserPolicy",
+            &[
+                ("UserName", user_name.to_string()),
+                ("PolicyName", INLINE_POLICY_NAME.to_string()),
+            ],
+        )
+        .await;
     }
 
     /// Create an IAM role carrying `policy` as its inline policy (when one is given),
@@ -255,7 +281,7 @@ impl Emulator {
                 "PutRolePolicy",
                 &[
                     ("RoleName", role_name.to_string()),
-                    ("PolicyName", "inline".to_string()),
+                    ("PolicyName", INLINE_POLICY_NAME.to_string()),
                     ("PolicyDocument", policy.to_string()),
                 ],
             )
