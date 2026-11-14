@@ -4220,12 +4220,14 @@ fn unseal_token(token: &str) -> Option<String> {
 /// Why a `NextToken` a request carries names no page of the listing it was handed to.
 ///
 /// The two are DISJOINT, and the modelled refusals they map to are too: a token that does not
-/// decode and verify is not one this service ever issued, which is a parameter that "can't be
-/// used" (`InvalidArgumentException`), while a token that decodes and verifies but whose mint
-/// instant is past the cursor lifetime is the one `ExpiredNextTokenException` publishes ("The
-/// pagination token passed to the operation is expired"). Deciding the first before the
-/// second is what keeps a corrupt cursor from being reported as a stale one — the two carry
-/// opposite advice to a paginating client.
+/// decode and verify is not one this service ever issued, so it is a malformed request
+/// parameter, refused under the input-validation class the listing models for one
+/// (`ValidationException` where the operation binds it, otherwise the generic
+/// `InvalidArgumentException` for a parameter that "can't be used"), while a token that
+/// decodes and verifies but whose mint instant is past the cursor lifetime is the one
+/// `ExpiredNextTokenException` publishes ("The pagination token passed to the operation is
+/// expired"). Deciding the first before the second is what keeps a corrupt cursor from being
+/// reported as a stale one — the two carry opposite advice to a paginating client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NextTokenRefusal {
     /// Not a token this service issued for this listing: it does not decode, its digest does

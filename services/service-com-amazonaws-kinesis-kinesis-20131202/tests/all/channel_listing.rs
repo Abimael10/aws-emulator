@@ -12,7 +12,7 @@
 //! ordered by name whatever order they were created in, a page holds at most `MaxResults` of
 //! them (100 by default, and at most 100), and a `NextToken` is handed back exactly when the
 //! region holds a channel past the page, which resumes precisely where the page stopped and is
-//! refused once it no longer names a page — with `InvalidArgumentException` and "Invalid
+//! refused once it no longer names a page — with `ValidationException` and "Invalid
 //! NextToken." when it is not a cursor this listing issued (it does not decode and verify, or it
 //! was minted for another listing or another region), and with `ExpiredNextTokenException` only
 //! when a cursor it DID issue is outside its lifetime. A `StreamFilter` keeps only the channels
@@ -617,7 +617,7 @@ async fn a_listing_refuses_a_cursor_it_never_issued() {
         RefusalRow {
             case: "a NextToken this service never issued",
             token: "not-a-token".to_string(),
-            expected_code: "InvalidArgumentException",
+            expected_code: "ValidationException",
             expected_message: INVALID_NEXT_TOKEN_MESSAGE.to_string(),
         },
         RefusalRow {
@@ -653,7 +653,7 @@ async fn a_listing_refuses_a_cursor_it_never_issued() {
                 SystemTime::now(),
             )
             .encode(),
-            expected_code: "InvalidArgumentException",
+            expected_code: "ValidationException",
             expected_message: INVALID_NEXT_TOKEN_MESSAGE.to_string(),
         },
         RefusalRow {
@@ -667,7 +667,7 @@ async fn a_listing_refuses_a_cursor_it_never_issued() {
                 SystemTime::now(),
             )
             .encode(),
-            expected_code: "InvalidArgumentException",
+            expected_code: "ValidationException",
             expected_message: INVALID_NEXT_TOKEN_MESSAGE.to_string(),
         },
     ];

@@ -6,12 +6,15 @@
 //! RULE: a pagination token is refused under the error class the REASON it names no page
 //! belongs to. A string that is not a cursor this listing issued — its bytes do not decode,
 //! the seal they carry does not verify them, or it was minted for another listing or another
-//! region — is a parameter that "can't be used": HTTP 400, `InvalidArgumentException`, with
-//! the fixed sentence "Invalid NextToken.". `ExpiredNextTokenException` is reserved for a
-//! cursor the listing DID issue whose lifetime has elapsed ("The pagination token passed to
-//! the operation is expired"). Verification is decided BEFORE the lifetime, so the two
-//! refusals stay disjoint — a paginating client restarts its scan on the expiry and fails
-//! fast on the invalid argument, so collapsing them loops the client forever.
+//! region — is a malformed request parameter: HTTP 400 with the fixed sentence "Invalid
+//! NextToken.", under the input-validation class the operation itself models for one —
+//! `ValidationException` where the model binds it to the operation, and otherwise the generic
+//! `InvalidArgumentException` for a parameter that "can't be used".
+//! `ExpiredNextTokenException` is reserved for a cursor the listing DID issue whose lifetime
+//! has elapsed ("The pagination token passed to the operation is expired"). Verification is
+//! decided BEFORE the lifetime, so the two refusals stay disjoint — a paginating client
+//! restarts its scan on the expiry and fails fast on the malformed cursor, so collapsing them
+//! loops the client forever.
 //!
 //! The recorded flow this was derived from takes one `ListStreamConsumers` cursor and
 //! replaces its last eight characters, which is one row of the table below. The rows differ
@@ -143,6 +146,11 @@ struct Listing {
     base: Value,
     /// The response member a served page of this listing carries.
     items_member: &'static str,
+    /// The input-validation class this operation models for a malformed parameter:
+    /// `ValidationException` when the model binds it to the operation
+    /// (`smithy_query(query="digest")` -> this operation's `errors`), the generic
+    /// `InvalidArgumentException` when it does not.
+    malformed_code: &'static str,
     /// A cursor this listing issued, inside its lifetime.
     live: String,
     /// A cursor this listing issued whose lifetime has elapsed.
@@ -232,6 +240,7 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
             operation: "ListStreams",
             base: json!({}),
             items_member: "StreamNames",
+            malformed_code: "InvalidArgumentException",
             live: first_page_token(emulator, "ListStreams", &json!({ "Limit": 1 })).await,
             expired: RegionalPageToken::new(
                 RegionalListing::Streams,
@@ -245,6 +254,7 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
             operation: "ListShards",
             base: json!({}),
             items_member: "Shards",
+            malformed_code: "InvalidArgumentException",
             live: first_page_token(
                 emulator,
                 "ListShards",
@@ -263,6 +273,7 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
             operation: "ListStreamConsumers",
             base: json!({ "StreamARN": consumer_stream }),
             items_member: "Consumers",
+            malformed_code: "InvalidArgumentException",
             live: first_page_token(
                 emulator,
                 "ListStreamConsumers",
@@ -281,6 +292,8 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
             operation: "ListChannels",
             base: json!({}),
             items_member: "ChannelSummaries",
+            // The only one of the four the model binds `ValidationException` to.
+            malformed_code: "ValidationException",
             // This listing pages the region's channels, which no create of the setup above
             // adds: a cursor it issued is minted here instead, and a cursor naming a channel
             // the region does not hold still serves a page — an empty one.
@@ -338,9 +351,9 @@ async fn assert_serves(emulator: &Emulator, case: &str, listing: &Listing) {
     );
 }
 
-// 1. A cursor that does not decode and verify is an INVALID ARGUMENT, never an expiry
+// 1. A cursor that does not decode and verify is a MALFORMED PARAMETER, never an expiry
 #[tokio::test]
-async fn an_altered_next_token_is_refused_as_an_invalid_argument() {
+async fn an_altered_next_token_is_refused_as_a_malformed_parameter() {
     let emulator = Emulator::new();
     let listings = listings(&emulator).await;
 
@@ -365,9 +378,10 @@ async fn an_altered_next_token_is_refused_as_an_invalid_argument() {
             );
             assert_eq!(
                 error_code(&response),
-                "InvalidArgumentException",
-                "case {case}: expected InvalidArgumentException for a cursor that does not \
-                 decode and verify, got {response}"
+                listing.malformed_code,
+                "case {case}: expected {} for a cursor that does not decode and verify, got \
+                 {response}",
+                listing.malformed_code
             );
             assert_eq!(
                 error_message(&response),

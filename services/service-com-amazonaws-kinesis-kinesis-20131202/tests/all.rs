@@ -27,6 +27,8 @@ mod batch_write_validation;
 mod capacity_mode;
 #[path = "all/channel_configuration_updates.rs"]
 mod channel_configuration_updates;
+#[path = "all/channel_cursor_refusal.rs"]
+mod channel_cursor_refusal;
 #[path = "all/channel_dependents.rs"]
 mod channel_dependents;
 #[path = "all/channel_key_authorization.rs"]

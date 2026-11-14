@@ -157,13 +157,15 @@ fn passes_stream_filter(
 }
 
 /// The modelled refusal for a `NextToken` that names no page, under the error class the
-/// reason it names none belongs to: a token this service never issued for this listing is a
-/// parameter that "can't be used" (`InvalidArgumentException`), and only one it issued whose
+/// reason it names none belongs to: a token this service never issued for this listing is not
+/// a page cursor at all but a malformed request parameter, which this operation models its own
+/// input-validation class for (`ValidationException`) rather than the generic bad-argument
+/// class it answers every OTHER unusable argument with, and only a token it issued whose
 /// lifetime has elapsed is the expiry.
 fn next_token_refusal(refusal: crate::state::NextTokenRefusal) -> ListChannelsError {
     match refusal {
         crate::state::NextTokenRefusal::NotIssued => {
-            ListChannelsErrorModeled::InvalidArgumentException(InvalidArgumentException {
+            ListChannelsErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
             })
             .into()
