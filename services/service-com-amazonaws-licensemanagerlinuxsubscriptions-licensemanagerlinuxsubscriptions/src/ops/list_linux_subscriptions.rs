@@ -193,6 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (page, next_token) = crate::state::paginate(
             &selected,
+            // The secret THIS store authenticates its cursors under, so the continuation
+            // this page offers is told apart from a value a caller assembled.
+            &state.page_token_key(),
             // The cursor belongs to THIS list: the operation plus the filter selection, so
             // a cursor minted for another selection is not accepted here.
             &format!(

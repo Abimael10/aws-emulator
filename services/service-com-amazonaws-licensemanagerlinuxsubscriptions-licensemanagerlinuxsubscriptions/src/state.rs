@@ -23,6 +23,14 @@ use crate::ops::types::{
     Filter, LinuxSubscriptionsDiscoverySettings, RegisteredSubscriptionProvider, OPERATOR_VALUES,
 };
 
+/// The secret a store's pagination cursors are authenticated under, and the width of the
+/// authenticator it puts ahead of a cursor — the workspace's one reading of "a token this
+/// endpoint issued" rather than a second one written here.
+///
+/// Re-exported so a suite of this crate can name the type the store holds without reaching
+/// past this module.
+pub use ::service_common::page_tokens::{AUTHENTICATOR_BYTES, PageTokenKey};
+
 /// `SubscriptionProviderStatus` of a registration that is USABLE: License Manager holds
 /// the provider access token and retrieves subscription data with it
 /// (`SubscriptionProviderStatus`: ACTIVE | INVALID | PENDING).
@@ -400,9 +408,27 @@ pub struct ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscr
     /// pass picks the plan up at its beginning — which is what a pass that read its whole
     /// plan leaves behind.
     pub discovery_resume: Option<DiscoveryResume>,
+    /// The secret this store's pagination cursors are authenticated under, drawn from the
+    /// system's randomness when the store is created and never reported ([`PageTokenKey`],
+    /// whose own `Debug` renders nothing of it, so this state's derived `Debug` carries
+    /// none of it either).
+    ///
+    /// It is what lets a paged read tell a `NextToken` THIS store minted from one a caller
+    /// assembled: the position a cursor names travels inside the token, so only the
+    /// authenticator over it distinguishes the two ([`paginate`]).
+    page_token_key: PageTokenKey,
 }
 
 impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState {
+    /// The secret this store's pagination cursors are minted and verified under, for the
+    /// paged reads to hand to [`paginate`].
+    ///
+    /// Handed out by value — [`PageTokenKey`] is `Copy` — so a read takes the key off the
+    /// store and goes on to borrow the records it is about to report in the same call.
+    pub fn page_token_key(&self) -> PageTokenKey {
+        self.page_token_key
+    }
+
     /// Materialize every provider status transition the clock owes by `now`.
     ///
     /// Called by the operations that REPORT a `SubscriptionProviderStatus` before they read
@@ -986,10 +1012,10 @@ pub fn is_known_region(region: &str) -> bool {
 ///
 /// `MaxResults` is the page size; a `NextToken` is this service's opaque cursor, minted
 /// by the previous page of the SAME list (`kind` names that list: the operation and
-/// whatever selected it) and rejected otherwise — a token is not a client-chosen value,
-/// so an unparseable or foreign one is a `ValidationException` rather than a silent
-/// restart from the beginning. A page size below 1 would make no progress, so it is
-/// refused too.
+/// whatever selected it) under `token_key`, the secret the store that minted it holds, and
+/// rejected otherwise — a token is not a client-chosen value, so an unparseable, foreign
+/// or caller-assembled one is a `ValidationException` rather than a silent restart from
+/// the beginning. A page size below 1 would make no progress, so it is refused too.
 ///
 /// A cursor names the ELEMENT the previous page reported LAST, by `cursor_key` — the
 /// element's own identity in the list's order — and the next page starts at the first
@@ -1005,6 +1031,7 @@ pub fn is_known_region(region: &str) -> bool {
 /// is stored or grouped under.
 pub fn paginate<T: Clone>(
     items: &[T],
+    token_key: &PageTokenKey,
     kind: &str,
     cursor_key: impl Fn(&T) -> Vec<String>,
     max_results: Option<i32>,
@@ -1029,7 +1056,7 @@ pub fn paginate<T: Clone>(
     // end of it: the walk reported everything it could and is over.
     let start = match next_token {
         Some(token) => {
-            let reported_last = decode_page_token(kind, token)?;
+            let reported_last = decode_page_token(token_key, kind, token)?;
             items
                 .iter()
                 .position(|item| cursor_key(item) > reported_last)
@@ -1040,28 +1067,28 @@ pub fn paginate<T: Clone>(
     let end = start.saturating_add(page_size).min(items.len());
     let page = items[start..end].to_vec();
     let token = (end < items.len())
-        .then(|| encode_page_token(kind, &cursor_key(&items[end - 1])));
+        .then(|| encode_page_token(token_key, kind, &cursor_key(&items[end - 1])));
     Ok((page, token))
 }
 
 /// This service's opaque pagination cursor: the identity of the list it belongs to and the
-/// key of the element the page that minted it reported last.
+/// key of the element the page that minted it reported last, behind the authenticator
+/// `token_key` computes over both ([`PageTokenKey::mint`]).
 ///
-/// Hex over a JSON pair rather than a hand-rolled framing, so the DECODE below is
-/// `serde_json`'s — a cursor is caller-supplied input, and the typed shape it has to parse
-/// into is what decides whether it is one. Hex is an encoding, not a secret: a client can
-/// decode one. What makes a cursor trustworthy here is the list-identity check in
-/// [`decode_page_token`] — a token is only honoured by the list that minted it, so a forged
-/// or stale one is refused rather than applied to a different list.
+/// The position a cursor names travels INSIDE the token — nothing is kept on the side to
+/// look up — so what tells a cursor this service minted from one a caller assembled is the
+/// authenticator, computed under a secret the store draws from the system's randomness and
+/// never reveals. The payload behind it is a JSON pair rather than a hand-rolled framing,
+/// so the DECODE below is `serde_json`'s, and the whole is rendered in hex: this service's
+/// spelling for an opaque token, a value a client round-trips rather than reads.
 ///
-/// The identity bound into the token is [`list_identity`]'s FIXED-SIZE digest of `kind`,
-/// never `kind` itself, so the token a page mints stays the same size however large the
-/// request that selected the list was.
-fn encode_page_token(kind: &str, key: &[String]) -> String {
-    let token = ::hex::encode(
-        ::serde_json::to_vec(&(list_identity(kind), key))
-            .expect("a list identity and a cursor key serialize"),
-    );
+/// The identity bound into the token is [`list_identity`]'s FIXED-SIZE authenticator over
+/// `kind`, never `kind` itself, so the token a page mints stays the same size however large
+/// the request that selected the list was.
+fn encode_page_token(token_key: &PageTokenKey, kind: &str, key: &[String]) -> String {
+    let payload = ::serde_json::to_string(&(list_identity(token_key, kind), key))
+        .expect("a list identity and a cursor key serialize");
+    let token = ::hex::encode(token_key.mint(&payload));
     debug_assert!(
         token.len() <= MAX_NEXT_TOKEN,
         "a minted cursor must fit the modelled NextToken maximum of {MAX_NEXT_TOKEN}, got {}",
@@ -1070,36 +1097,54 @@ fn encode_page_token(kind: &str, key: &[String]) -> String {
     token
 }
 
-/// Decode a cursor minted by [`encode_page_token`] for the same list, into the key of the
-/// element the minting page reported last.
-fn decode_page_token(kind: &str, token: &str) -> Result<Vec<String>, StateError> {
+/// Decode a cursor THIS store minted for the same list, into the key of the element the
+/// minting page reported last.
+///
+/// Every other value is the one refusal: a token that is not hex, one too short to carry an
+/// authenticator, one whose authenticator this store's secret does not verify (a
+/// caller-assembled one included, however exactly it has a minted token's shape), one whose
+/// payload is not the pair a cursor carries, and one minted for another list.
+fn decode_page_token(
+    token_key: &PageTokenKey,
+    kind: &str,
+    token: &str,
+) -> Result<Vec<String>, StateError> {
     let invalid = || StateError::Validation("NextToken is not a valid pagination token".to_string());
-    let decoded = ::hex::decode(token).map_err(|_| invalid())?;
+    let authenticated = ::hex::decode(token).map_err(|_| invalid())?;
+    let payload = token_key.cursor_of(&authenticated).ok_or_else(invalid)?;
     let (token_identity, key): (String, Vec<String>) =
-        ::serde_json::from_slice(&decoded).map_err(|_| invalid())?;
-    if token_identity != list_identity(kind) {
+        ::serde_json::from_str(&payload).map_err(|_| invalid())?;
+    if token_identity != list_identity(token_key, kind) {
         return Err(invalid());
     }
     Ok(key)
 }
 
-/// The identity of the list a cursor belongs to: a fixed-size digest of `kind`, the list's
-/// full description (the operation plus whatever selected it).
+/// The identity of the list a cursor belongs to: a fixed-size value derived from `kind`, the
+/// list's full description (the operation plus whatever selected it).
 ///
 /// A cursor is minted by the service and SENT BACK by the client, so its length is bounded
 /// by the model — `NextToken` is `@length 1..16384` on the `Filters`-driven lists — while
 /// `kind` renders the whole selection that produced the list, which a selection the model
 /// allows (`FilterList` carries no `@length`, over `StringList` values of up to 100 entries
-/// of up to 100 characters) can make arbitrarily long. Binding the list into the token as
-/// SHA-256 over that description makes the minted cursor's size independent of the request's
-/// size, so a walk the service started can always be continued, and still binds the cursor
-/// to ONE list: two different descriptions share a digest only on a hash collision, so a
-/// cursor minted for another selection is refused exactly as before.
+/// of up to 100 characters) can make arbitrarily long. Binding the list into the token as a
+/// fixed-size value makes the minted cursor's size independent of the request's size, so a
+/// walk the service started can always be continued, and still binds the cursor to ONE
+/// list: two different descriptions share one identity only on a hash collision, so a
+/// cursor minted for another selection is refused.
 ///
-/// SHA-256 comes from the `sha2` crate rather than being hand-rolled.
-fn list_identity(kind: &str) -> String {
-    use ::sha2::Digest as _;
-    ::hex::encode(::sha2::Sha256::digest(kind.as_bytes()))
+/// That value is the authenticator the shared minter computes over `kind` — the leading
+/// [`AUTHENTICATOR_BYTES`] of what it mints for it — so the store's one secret is what
+/// names the list too, and this module holds no digest of its own.
+fn list_identity(token_key: &PageTokenKey, kind: &str) -> String {
+    // Taken off the front of what the minter answers rather than sliced, so the rendering
+    // is total whatever it hands back.
+    let authenticator: Vec<u8> = token_key
+        .mint(kind)
+        .into_iter()
+        .take(AUTHENTICATOR_BYTES)
+        .collect();
+    ::hex::encode(authenticator)
 }
 
 /// The longest `NextToken` a client may send back to this service, from the model:

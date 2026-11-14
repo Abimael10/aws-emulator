@@ -31,6 +31,8 @@ mod error_taxonomy;
 mod harness;
 #[path = "all/linux_subscriptions.rs"]
 mod linux_subscriptions;
+#[path = "all/page_cursors_are_only_what_the_listing_minted.rs"]
+mod page_cursors_are_only_what_the_listing_minted;
 #[path = "all/page_token_length_bound.rs"]
 mod page_token_length_bound;
 #[path = "all/paged_walk_under_writes.rs"]

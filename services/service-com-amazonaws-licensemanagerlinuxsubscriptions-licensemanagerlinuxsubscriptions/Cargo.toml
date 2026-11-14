@@ -21,11 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Encodes/decodes this service's opaque pagination cursors.
+# This service's spelling of the authenticated bytes behind an opaque pagination cursor:
+# the token on the wire is the hex of what `service_common::page_tokens` mints.
 hex = { workspace = true }
-# SHA-256 over the description of the list a pagination cursor belongs to, so the cursor
-# binds to that list at a fixed size instead of carrying the request's whole selection.
-sha2 = { workspace = true }
 # The Secrets Manager client `RegisterSubscriptionProvider` reads the subscription
 # provider's access token through, over the in-process callback into this same emulator (no
 # network client feature is enabled: the transport is the emulator's own).
