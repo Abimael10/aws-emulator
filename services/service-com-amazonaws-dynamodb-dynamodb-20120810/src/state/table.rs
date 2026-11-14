@@ -446,10 +446,11 @@ impl Table {
 
     /// The primary key a paging member (`ExclusiveStartKey`) resumes from: read
     /// through the same key schema as a `Key`, and refused as the INVALID RESUME
-    /// TOKEN it is when it is no key of that schema at all
-    /// ([`START_KEY_INVALID_MESSAGE`]) — with the schema reason stated after it when the
-    /// token's attributes ARE that schema's key attributes but one of them is stated
-    /// wrongly, left out or carrying another TYPE than the schema declares
+    /// TOKEN it is when it is no key of that schema — an attribute the schema declares no
+    /// key for, a spare attribute beside the key, or a declared key attribute the token
+    /// leaves out ([`START_KEY_INVALID_MESSAGE`]) — with the schema reason stated after it
+    /// only when the token carries exactly that schema's key attributes and states one of
+    /// them in another TYPE than the schema declares
     /// ([`START_KEY_SCHEMA_MISMATCH_MESSAGE`]).
     pub fn key_of_start_key(&self, key: &Item) -> Result<ItemKey, RequestError> {
         self.key_of_map(key, KeySource::StartKey).map_err(Into::into)
@@ -912,9 +913,9 @@ impl Table {
     /// INVALID RESUME TOKEN it is ([`START_KEY_INVALID_MESSAGE`]), and one carrying a key
     /// attribute with a type other than the table declared states the schema reason after
     /// it ([`START_KEY_SCHEMA_MISMATCH_MESSAGE`]) — as a base-table token does
-    /// ([`Self::key_of_start_key`]), which words a DROPPED table key attribute that way
-    /// too. An index cursor carries both schemas' key attributes, so one it does not carry
-    /// in full is not that cursor at all.
+    /// ([`Self::key_of_start_key`]), which words a DROPPED table key attribute as the
+    /// invalid token too. An index cursor carries both schemas' key attributes, so one it
+    /// does not carry in full is not that cursor at all.
     pub fn index_key_of_start_key(
         &self,
         index: &SecondaryIndex<'_>,

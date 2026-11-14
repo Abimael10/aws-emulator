@@ -5,19 +5,19 @@
 //! RULE under test: the operations that address a public key by `Id` — `GetPublicKey`,
 //! `GetPublicKeyConfig`, `UpdatePublicKey` and `DeletePublicKey`
 //! (`smithy_query(query="operation",operation="GetPublicKey,GetPublicKeyConfig,UpdatePublicKey,DeletePublicKey")`)
-//! — model one 404 error, `NoSuchPublicKey`, so one code and one status cover both ways an
-//! `Id` can fail to name a key and the MESSAGE is what tells them apart: only a value that is
-//! a well-formed identifier of ANOTHER resource kind this service mints could never have been
-//! a public key id, so it is the identifier the service cannot READ, while every other value
-//! the store holds no key for — one of the public key namespace, a name, a word of no id shape
-//! at all — is the key that is ABSENT. Neither sentence echoes the value submitted.
+//! — model one 404 error, `NoSuchPublicKey`, and the `Id` they address the key by is a plain
+//! `string` the model constrains in no way, so no value can fail to be READABLE as a public
+//! key id: every `Id` the store holds no key under is the key that is ABSENT and carries that
+//! kind's one does-not-exist sentence, whatever form the value takes. The sentence echoes
+//! nothing the request submitted.
 //!
 //! The rows span what the rule generalises over — a value's RELATION to this service's
-//! identifier namespaces, on both sides of the split. The point this suite adds to the
+//! identifier namespaces. The point this suite adds to the
 //! sibling table in [`crate::refusal_message_fidelity`] is that the values it drives are ids
 //! that really do resolve: the key group id below names a key group `GetKeyGroup` answers 200
 //! for, and the public key id below names the key `GetPublicKey` answers 200 for, so each read
-//! is shown to resolve its OWN kind's id and to refuse every other.
+//! is shown to resolve its OWN kind's id and to report every other as the key it does not
+//! hold.
 //!
 //! The wire harness and the create helpers are the crate's own.
 
@@ -30,17 +30,13 @@ use crate::distribution_lifecycle::{emulator, is_minted_uuid};
 use crate::key_group_lifecycle::{create_group, get_group, Group};
 use crate::public_key_lifecycle::{create_key, get_key, pem, Key};
 
-/// The sentence `NoSuchPublicKey` carries for an `Id` of a public key's own shape the store
-/// holds no key for, spelled out as a literal rather than read off the crate's producer, so
-/// the WORDING is what these rows are held to.
+/// The sentence `NoSuchPublicKey` carries for an `Id` the store holds no key under, spelled
+/// out as a literal rather than read off the crate's producer, so the WORDING is what these
+/// rows are held to.
 const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
 
-/// The sentence the same code carries for an `Id` outside that shape: the identifier the
-/// service cannot read, named by the member that carried it.
-const ID_FORMAT_INVALID: &str = "Id format is invalid";
-
 #[tokio::test]
-async fn a_public_key_id_outside_its_shape_is_unreadable_and_one_inside_it_is_absent() {
+async fn a_public_key_id_of_any_shape_the_store_holds_no_key_under_is_absent() {
     let router = emulator();
 
     // The one public key the account holds, and the one key group: both ids are MINTED here
@@ -100,12 +96,12 @@ async fn a_public_key_id_outside_its_shape_is_unreadable_and_one_inside_it_is_ab
     // (case, the `Id` the read is addressed with, the sentence it is refused with) — a live
     // id of another kind, each other namespace this service mints ids in, a value in the
     // public key namespace of no minted id's width, and ids that could have been public keys
-    // CloudFront issued.
+    // CloudFront issued. ONE sentence covers them all.
     let rows: Vec<(&str, String, &str)> = vec![
         (
             "a key group id that really names a key group",
             group_id,
-            ID_FORMAT_INVALID,
+            NO_SUCH_PUBLIC_KEY,
         ),
         (
             "the public key prefix with a body of no minted id's width",
@@ -115,12 +111,12 @@ async fn a_public_key_id_outside_its_shape_is_unreadable_and_one_inside_it_is_ab
         (
             "a field-level encryption profile id",
             format!("{FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX}4AAAAAAAAAAAA"),
-            ID_FORMAT_INVALID,
+            NO_SUCH_PUBLIC_KEY,
         ),
         (
             "a field-level encryption configuration id",
             format!("{FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX}5AAAAAAAAAAAA"),
-            ID_FORMAT_INVALID,
+            NO_SUCH_PUBLIC_KEY,
         ),
         (
             "a public key id of this namespace that was never minted",

@@ -247,6 +247,8 @@ mod result_filter_expressions;
 mod restore_table_to_point_in_time;
 #[path = "all/start_key_boundary_refusals.rs"]
 mod start_key_boundary_refusals;
+#[path = "all/start_key_missing_key_element.rs"]
+mod start_key_missing_key_element;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_checkpoint_resume.rs"]

@@ -24,11 +24,11 @@
 //!   sure that the request can't be replayed": the same request again reports the key the
 //!   first create stored, and a different configuration under a reference already taken is
 //!   refused (`PublicKeyAlreadyExists`, 409);
-//! * an id of the public key namespace, or of no namespace of this service at all, that no
-//!   public key holds is `NoSuchPublicKey` (404) under the fixed sentence this service states
-//!   for that code, from BOTH readers of the one record (an id drawn from ANOTHER of this
-//!   service's namespaces is the identifier-format sentence instead, which
-//!   `refusal_message_fidelity` holds that surface to);
+//! * an id of the public key namespace, of ANOTHER of this service's namespaces, or of no
+//!   namespace of this service at all that no
+//!   public key holds is `NoSuchPublicKey` (404) under the one fixed sentence this service
+//!   states for that code, from BOTH readers of the one record (the wider table over this
+//!   service's other namespaces is `refusal_message_fidelity`'s);
 //! * `PublicKeyConfig$Comment`: "The comment cannot be longer than 128 characters", so a
 //!   longer comment is refused before anything is stored;
 //! * the number of public keys the account holds is BOUNDED, and a create past the bound
@@ -52,12 +52,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The sentence `NoSuchPublicKey` carries: a property of the store rather than of the
 /// request, so it names no id. Spelled out here as a literal rather than read back off the
-/// crate's constant, so the WORDING is what these rows are held to.
+/// crate's constant, so the WORDING is what these rows are held to. ONE sentence covers
+/// every `Id` the store holds no key under, whatever form the value takes.
 const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
-
-/// The sentence the same code carries for an `Id` outside the shape a public key id takes,
-/// spelled out here for the same reason.
-const PUBLIC_KEY_ID_FORMAT_INVALID: &str = "Id format is invalid";
 
 /// The sentence `PublicKeyAlreadyExists` carries when the NAME a create submits is one
 /// another key of the account already holds, spelled out here for the same reason.
@@ -502,18 +499,18 @@ async fn create_persists_the_configuration_every_read_then_reports() {
         );
     }
 
-    // An id no public key holds. The SENTENCE splits two conditions: only a well-formed
-    // identifier of ANOTHER resource kind this service mints is the identifier this service
-    // cannot read, while every other value the store holds no key for — an id of this
-    // namespace that was never minted, a word of no id shape at all — is the key reported
-    // ABSENT. BOTH readers of the one record answer the same way, under fixed text that names
+    // An id no public key holds, in the forms such a value takes: an id of this namespace
+    // that was never minted, a word of no id shape at all, a bare digit, and a well-formed
+    // identifier of another resource kind this service mints. ONE sentence covers them all —
+    // the key reported ABSENT — because the `Id` is a plain string the model constrains in no
+    // way. BOTH readers of the one record answer the same way, under fixed text that names
     // no part of the request. The wider table over this service's other namespaces is
     // asserted in `refusal_message_fidelity`.
     for (id, sentence) in [
         ("K1AAAAAAAAAAAA", NO_SUCH_PUBLIC_KEY),
         ("not-an-id", NO_SUCH_PUBLIC_KEY),
         ("0", NO_SUCH_PUBLIC_KEY),
-        ("E1AAAAAAAAAAAA", PUBLIC_KEY_ID_FORMAT_INVALID),
+        ("E1AAAAAAAAAAAA", NO_SUCH_PUBLIC_KEY),
     ] {
         for (reader, missing) in [
             ("GetPublicKey", get_key(&router, id).await),

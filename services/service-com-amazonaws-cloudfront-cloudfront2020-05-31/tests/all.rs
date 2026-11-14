@@ -290,6 +290,8 @@ mod published_address_resolves_to_this_service;
 mod published_edge_address;
 #[path = "all/published_routing_endpoint.rs"]
 mod published_routing_endpoint;
+#[path = "all/public_key_absent_id_one_sentence.rs"]
+mod public_key_absent_id_one_sentence;
 #[path = "all/public_key_delete.rs"]
 mod public_key_delete;
 #[path = "all/public_key_id_is_resolved_against_the_store.rs"]

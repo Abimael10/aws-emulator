@@ -345,10 +345,9 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                 },
                 Call {
                     // The identifier is an ARN the CALLER composes for the resource the
-                    // action is applied to, so a DB INSTANCE ARN that resolves to no
-                    // resource of the account is refused on the MEMBER that carried it,
-                    // echoing the value the request supplied. (A DB CLUSTER ARN that
-                    // resolves to nothing is the cluster path's own not-found fault.)
+                    // action is applied to, and one that resolves to no resource of the
+                    // account is reported ABSENT under the fault this operation's model
+                    // declares for exactly that, naming the resource the ARN addresses.
                     case: "rds ApplyPendingMaintenanceAction on a missing resource ARN",
                     addressed: Addressed::Signed("rds"),
                     action: "ApplyPendingMaintenanceAction",
@@ -360,8 +359,8 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                         ("ApplyAction", "system-update"),
                         ("OptInType", "immediate"),
                     ],
-                    expected_status: Some(400),
-                    expected_code: Some("InvalidParameterValue"),
+                    expected_status: Some(404),
+                    expected_code: Some("ResourceNotFoundFault"),
                     expected_body_contains: &["<ErrorResponse", "<RequestId>"],
                     expected_body_excludes: &[],
                 },

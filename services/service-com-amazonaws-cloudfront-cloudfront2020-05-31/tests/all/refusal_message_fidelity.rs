@@ -59,12 +59,8 @@ use crate::web_acl_association::create as create_distribution_returning_id;
 
 /// The sentence `NoSuchPublicKey` carries for an `Id` the store holds no public key for,
 /// spelled out here as a literal rather than read off the crate's producer, so the WORDING is
-/// what these rows are held to.
+/// what these rows are held to. ONE sentence covers every such `Id`, whatever form it takes.
 const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
-
-/// The sentence the same code carries for an `Id` outside the shape a public key id takes:
-/// the identifier the service cannot read, named by the member that carried it.
-const PUBLIC_KEY_ID_FORMAT_INVALID: &str = "Id format is invalid";
 
 /// The sentence an `IpCount` outside the documented value set is refused with: it names the
 /// parameter the quantity arrives under and the two counts a list may be allocated for.
@@ -436,13 +432,13 @@ struct IdRow {
 }
 
 /// Every operation that addresses a public key by `Id` answers `NoSuchPublicKey` (404) for an
-/// `Id` it cannot resolve, and the SENTENCE splits the two ways that happens: only a value
-/// that is a well-formed identifier of ANOTHER resource kind this service mints — a
-/// distribution, a key group, a field-level encryption profile or configuration — could never
-/// have been a public key id, so it is the identifier the service cannot READ; every other
-/// value the store holds no key for — an id of the public key namespace that was never minted
-/// or is of no minted id's width, a name, a caller reference, a word of no id shape at all —
-/// is the key that is ABSENT. No refusal touches the key the account really holds.
+/// `Id` it cannot resolve, with ONE sentence: the `Id` is a plain string the model constrains
+/// in no way, so no value can fail to be readable as a public key id and every value the
+/// store holds no key under — a well-formed identifier of another resource kind this service
+/// mints (a distribution, a key group's UUID, a field-level encryption profile or
+/// configuration), an id of the public key namespace that was never minted or is of no minted
+/// id's width, a name, a caller reference, a word of no id shape at all — is the key that is
+/// ABSENT. No refusal touches the key the account really holds.
 #[tokio::test]
 async fn every_id_the_store_holds_no_public_key_for_is_reported_absent() {
     let router = emulator();
@@ -501,12 +497,12 @@ async fn every_id_the_store_holds_no_public_key_for_is_reported_absent() {
         IdRow {
             case: "a distribution id where a public key id belongs",
             id: distribution_id,
-            message: PUBLIC_KEY_ID_FORMAT_INVALID,
+            message: NO_SUCH_PUBLIC_KEY,
         },
         IdRow {
             case: "a key group id, which this service draws as a UUID",
             id: group_id,
-            message: PUBLIC_KEY_ID_FORMAT_INVALID,
+            message: NO_SUCH_PUBLIC_KEY,
         },
         IdRow {
             // The prefix is the one this service mints profile ids under
@@ -514,14 +510,14 @@ async fn every_id_the_store_holds_no_public_key_for_is_reported_absent() {
             // alphabet, as `P280MFCLSYOCVU` is.
             case: "a field-level encryption profile id",
             id: format!("{FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX}2AAAAAAAAAAAA"),
-            message: PUBLIC_KEY_ID_FORMAT_INVALID,
+            message: NO_SUCH_PUBLIC_KEY,
         },
         IdRow {
             // The sibling field-level encryption CONFIG namespace
             // (`FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX`).
             case: "a field-level encryption configuration id",
             id: format!("{FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX}3AAAAAAAAAAAA"),
-            message: PUBLIC_KEY_ID_FORMAT_INVALID,
+            message: NO_SUCH_PUBLIC_KEY,
         },
         IdRow {
             // In the public key namespace (`PUBLIC_KEY_ID_PREFIX`) though of no minted id's

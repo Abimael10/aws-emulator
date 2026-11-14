@@ -245,6 +245,8 @@ mod integration_deletion;
 mod invalid_marker_refusal_wording;
 #[path = "all/lifecycle_poll_loops.rs"]
 mod lifecycle_poll_loops;
+#[path = "all/maintenance_action_absent_resource.rs"]
+mod maintenance_action_absent_resource;
 #[path = "all/maintenance_action_resource_guard.rs"]
 mod maintenance_action_resource_guard;
 #[path = "all/managed_master_secret_cluster_creation.rs"]

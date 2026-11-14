@@ -3191,6 +3191,21 @@ pub const MAX_PUBLIC_KEY_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
 /// The sentence states a property of the store rather than of the request — the id names no
 /// public key — so nothing from the request belongs in the text and every path that raises
 /// this code reads the same.
+///
+/// This is the answer an operation that ADDRESSES a public key by its `Id` gives an id it
+/// cannot resolve, whatever form the value takes. `GetPublicKey` and its siblings declare
+/// this one error, and the `Id` they address the key by is a plain `string` the model
+/// constrains in no way, so no value can fail to be READABLE as a public key id: every id
+/// the store holds no key under — an id of the public key namespace that was never minted or
+/// of no minted id's width, a well-formed identifier of another resource kind this service
+/// mints, a name, a caller reference, a word of no id shape at all — puts the request in one
+/// and the same condition, the key that is ABSENT, which is the recorded contract for this
+/// resource.
+///
+/// Another resource of this service whose recorded answers DO split on the form of the value
+/// — a field-level encryption profile or configuration, for whose `Id` CloudFront reports an
+/// identifier it cannot read — is read by its own rule
+/// ([`unresolved_field_level_encryption_profile_id`]).
 pub fn no_such_public_key() -> crate::ops::types::NoSuchPublicKey {
     crate::ops::types::NoSuchPublicKey {
         message: Some(NO_SUCH_PUBLIC_KEY_MESSAGE.to_string()),
@@ -3205,30 +3220,6 @@ pub fn no_such_public_key() -> crate::ops::types::NoSuchPublicKey {
 /// specified public key doesn't exist."), and the wire wording is what a client reads. Do not
 /// "correct" this constant to the documentation sentence.
 pub const NO_SUCH_PUBLIC_KEY_MESSAGE: &str = "The specified CloudFront public key does not exist.";
-
-/// The modelled `NoSuchPublicKey` (HTTP 404) an operation that ADDRESSES a public key by its
-/// `Id` answers an id it cannot resolve.
-///
-/// `GetPublicKey`'s model declares this one error, so one code and one status cover both
-/// outcomes and the MESSAGE is what tells them apart, decided by the cross-kind half of the
-/// split [`unresolved_field_level_encryption_profile_id`] makes for a profile
-/// ([`is_minted_entity_id_of_another_kind`]): a value that is a
-/// well-formed identifier of ANOTHER resource kind this service mints could never have been a
-/// public key id, so it is the identifier CloudFront cannot READ
-/// ([`id_format_invalid_message`]), while every other value the store holds no key for — an id
-/// of the public key namespace that was never minted or is of no minted id's width, a name, a
-/// caller reference, a word of no id shape at all — is a public key that is ABSENT
-/// ([`NO_SUCH_PUBLIC_KEY_MESSAGE`]), which is the recorded contract for this resource. Both
-/// sentences are fixed text and neither echoes the value submitted.
-pub fn unresolved_public_key_id(id: &str) -> crate::ops::types::NoSuchPublicKey {
-    if is_minted_entity_id_of_another_kind(id, crate::state::is_public_key_id) {
-        crate::ops::types::NoSuchPublicKey {
-            message: Some(id_format_invalid_message("Id")),
-        }
-    } else {
-        no_such_public_key()
-    }
-}
 
 /// The modelled `PublicKeyInUse` (HTTP 409) for a delete of a public key a stored record
 /// still references.
@@ -3309,8 +3300,8 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
 /// shape and no message text: the identifier-format sentence for an `Id` outside the form
 /// this kind's identifiers take, and the absent-profile sentence for one OF that form the
 /// account does not hold (a profile read back after its delete). A public key is read by a
-/// rule of its own ([`unresolved_public_key_id`]), because its recorded answers split
-/// differently.
+/// rule of its own ([`no_such_public_key`]): its recorded answers report every id the
+/// account holds no key under as the key that is absent, whatever form the value takes.
 ///
 /// Only an identifier that ADDRESSES the operation is judged this way: a profile id borne by a
 /// submitted DOCUMENT (a mapping's `ProfileId` on a configuration create or update) addresses
@@ -3326,27 +3317,6 @@ pub fn unresolved_field_level_encryption_profile_id(
     } else {
         no_such_field_level_encryption_profile()
     }
-}
-
-/// Whether `value` is a minted id of a resource kind OTHER than the one an operation
-/// ADDRESSES — `addressed` being the predicate of the kind it addresses: an id of the
-/// field-level encryption CONFIG or PROFILE namespaces, a public key, a distribution, or one
-/// of the UUID-keyed kinds.
-///
-/// Each of those namespaces is disjoint from the others', so a value in one of them could
-/// never have been an id of a kind it does not belong to — which is what separates an
-/// identifier of the WRONG RESOURCE KIND from an id, a name or a caller reference of the
-/// right kind that the store simply holds nothing for.
-pub(super) fn is_minted_entity_id_of_another_kind(
-    value: &str,
-    addressed: fn(&str) -> bool,
-) -> bool {
-    !addressed(value)
-        && (is_field_level_encryption_config_id(value)
-            || is_field_level_encryption_profile_id(value)
-            || is_public_key_id(value)
-            || is_distribution_id(value)
-            || is_minted_uuid(value))
 }
 
 /// The modelled `FieldLevelEncryptionProfileInUse` (HTTP 409) for a delete of a profile a

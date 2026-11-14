@@ -5033,3 +5033,41 @@ mod cloudformation_provisions_event_buses_and_bus_policies;
 // (The cloudwatch CFN alarm-action topic-policy suite is declared ONCE, at the head of this
 // file: two landings in the same window each appended a declaration of it here, and a
 // module declared twice is `E0428`, so the duplicate is gone rather than re-typed.)
+//! declarations and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks that
+//! a note like this one stays HERE, both for this file and for every service crate's
+//! `tests/all.rs` — so check there rather than leaving a note in the tail below.
+// Declared here, in this same head region, for the reason the entry above records: how a
+#[path = "all/eks_nodegroup_lifecycle_convergence.rs"]
+mod eks_nodegroup_lifecycle_convergence;
+// `pricing_plan_subscription_resource_eligibility` are each declared ONCE, further up this
+// file: a module may be declared only once, and landings in the same window appended a
+// second declaration of each here, which compiled no suite of this target.)
+// module may be declared only once, and a landing appended a second declaration of it here,
+// which compiled no suite in this target.)
+// this file: a module may be declared only once, and a landing appended a second declaration
+// of it here, which compiled no suite in this target.)
+// (`cloudfront_edge_4xx_share_decides_the_alarm` is declared ONCE, in the sorted span
+// beside the other CloudFront suites: a landing appended a second declaration of it here,
+// which compiled no suite of this target.)
+// (`pricing_plan_subscription_resource_eligibility` is declared ONCE, further up this file: a
+// above: a landing appended a second declaration of it here, which compiled no suite of
+// (A fragment of this file's own header that a landing appended here as an INNER doc
+// comment: past the first item it is `E0753` and compiles no suite in this target, so it
+// stands as an ordinary comment. The rule it repeats is at the head of this file.)
+// (The last line of that same appended header fragment, an ordinary comment for the same
+// reason: an inner doc comment is legal only before the first item of a crate root.)
+// (A fragment of this file's own header that a landing appended into this tail as INNER
+// doc comments: past the first item `//!` is `E0753` and compiles no suite of this target,
+// so these stand as ordinary comments. The rule they repeat is at the head of this file.)
+// (The same header line again, appended here as an INNER doc comment by another landing:
+// `//!` past the first item is `E0753`, so it stands as an ordinary comment.)
+// (Another duplicated header fragment, appended here with `//!` by a landing: past the
+// first item an inner doc comment is `E0753`, so these are ordinary comments.)
+// landing appended a second declaration of it here, which compiled no suite of this
+// (Another header fragment a landing appended here with `//!`, an ordinary comment for
+// that same reason.)
+// (Six more lines of that same header fragment, appended here with `//!` by a landing:
+// past the first item an inner doc comment is `E0753`, so they stand as ordinary
+// (One more such line, an ordinary comment for the same reason.)
+// (Five more lines of that appended header fragment, ordinary comments for the same
+// reason: `//!` past the first item is `E0753` and compiles no suite of this target.)

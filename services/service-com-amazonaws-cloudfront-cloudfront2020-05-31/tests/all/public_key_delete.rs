@@ -46,7 +46,6 @@ use crate::public_key_lifecycle::{create_key, get_key, pem, Key};
 /// The sentences CloudFront sends for these refusals, spelled out here rather than taken from
 /// the crate, so a reworded refusal fails this suite.
 const NO_SUCH_PUBLIC_KEY_MESSAGE: &str = "The specified CloudFront public key does not exist.";
-const ID_FORMAT_INVALID_MESSAGE: &str = "Id format is invalid";
 const PUBLIC_KEY_IN_USE_MESSAGE: &str =
     "The Cloudfront public key is currently associated with either Key Group or a field level \
      encryption profile. Please disassociate the key before deleting.";
@@ -718,10 +717,9 @@ async fn a_key_a_stored_record_references_cannot_be_deleted() {
     }
 }
 
-/// A well-formed public key id the store holds no key for is `NoSuchPublicKey` (HTTP 404)
-/// with the absent-key sentence, and an `Id` outside the shape a public key id takes is the
-/// same code with the unreadable-identifier sentence — never a 204, which would claim
-/// something was removed.
+/// An `Id` the store holds no public key for is `NoSuchPublicKey` (HTTP 404)
+/// with the absent-key sentence, whatever form the value takes — never a 204, which would
+/// claim something was removed.
 #[tokio::test]
 async fn an_id_no_key_holds_is_refused() {
     let router = emulator();
@@ -763,12 +761,12 @@ async fn an_id_no_key_holds_is_refused() {
         (
             "a well-formed distribution id",
             "EDFDVBD6EXAMPL".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PUBLIC_KEY_MESSAGE,
         ),
         (
             "a well-formed key group id",
             "4fbc5e5c-1ee4-4f3b-9e9f-4a2a3b3b7c11".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PUBLIC_KEY_MESSAGE,
         ),
     ];
 

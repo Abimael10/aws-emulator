@@ -11,7 +11,8 @@
 //! anything is written
 //! when the request is not one S3 records: an id outside the published length, an id that
 //! disagrees with the payload's own `Id`, or a member naming a value outside its enum's
-//! published set (`InvalidArgument`), and a NEW configuration past
+//! published set (`InvalidArgument`), a destination whose `AccountId` is written EMPTY
+//! (`MalformedXML`), and a NEW configuration past
 //! [`crate::state::MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET`] (`TooManyConfigurations`).
 //!
 //! The read side is `GetBucketInventoryConfiguration`, implemented in the same change so a
@@ -339,13 +340,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "The account ID that owns the destination S3 bucket. If no account ID is provided,
+        // the owner is not validated before exporting data"
+        // (`InventoryS3BucketDestination$AccountId`): the member may be left OUT, and then
+        // the owner is not validated — but one the document WROTE EMPTY names no account at
+        // all, which is a document that did not validate against the published schema
+        // ([`crate::state::is_present_and_empty`]), as the same member of an analytics export
+        // is read ([`super::put_bucket_analytics_configuration`]). A value that DOES name an
+        // account is stored as submitted, whichever account it names: S3 verifies the owner
+        // when it writes an export, not when it records the configuration.
+        if crate::state::is_present_and_empty(
+            configuration
+                .destination
+                .s3_bucket_destination
+                .account_id
+                .as_ref(),
+        ) {
+            return Err(malformed_inventory_configuration());
+        }
+
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
             // Unreachable: the lookup above ran under this same guard.
             return Err(
                 PutBucketInventoryConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
             );
         };
-
         // The payload is the whole configuration, so the stored container is exactly the one
         // this request carried, under the id it names: a second put under the same id
         // replaces it rather than merging into it.
@@ -381,6 +400,22 @@ fn invalid_enum_value(
         crate::state::INVALID_ARGUMENT_CODE,
         crate::state::INVALID_ARGUMENT_STATUS,
         format!("{member} must name one of {published:?}, got {value:?}"),
+    )
+}
+
+/// The refusal for an `InventoryConfiguration` document that does not validate against the
+/// schema the API publishes for it.
+///
+/// It carries that code's own FIXED published text
+/// ([`crate::state::MALFORMED_XML_MESSAGE`]) rather than anything about this request, the
+/// reading the sibling analytics put gives its own payload
+/// ([`super::put_bucket_analytics_configuration`]): the code says the document did not
+/// validate against the published schema, and the schema is the same for every document.
+fn malformed_inventory_configuration() -> PutBucketInventoryConfigurationError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        crate::state::MALFORMED_XML_CODE,
+        crate::state::MALFORMED_XML_STATUS,
+        crate::state::MALFORMED_XML_MESSAGE,
     )
 }
 

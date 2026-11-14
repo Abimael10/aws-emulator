@@ -350,9 +350,10 @@ async fn a_name_that_resolves_to_nothing_answers_that_resources_not_found_fault(
             "DBClusterNotFoundFault",
         ),
         // `ApplyPendingMaintenanceAction` is NOT in this table: its `ResourceIdentifier` is
-        // an ARN the caller composes, so which answer an identifier that resolves to nothing
-        // earns depends on the resource KIND that ARN names. The sibling suite
-        // `all/maintenance_action_resource_guard.rs` asserts that rule over the shapes such
+        // an ARN the caller composes, so the resource its report NAMES is the one that ARN
+        // addresses rather than the value as sent. The sibling suites
+        // `all/maintenance_action_resource_guard.rs` and
+        // `all/maintenance_action_absent_resource.rs` assert that rule over the shapes such
         // an identifier can take.
         (
             "DescribeGlobalClusters for a global cluster that was never created",
@@ -480,8 +481,8 @@ async fn a_resource_is_addressable_only_in_the_region_it_was_created_in() {
     }
 
     // And the instance's own ARN resolves to no resource in the other region either: the
-    // maintenance-action front door refuses an identifier that resolves to nothing on the
-    // MEMBER that carried it (see `all/maintenance_action_resource_guard.rs` for the rule),
+    // maintenance-action front door reports an identifier that resolves to nothing as the
+    // ABSENT resource it names (see `all/maintenance_action_resource_guard.rs` for the rule),
     // which is still a statement about the REGION and not about the name.
     expect_error(
         "ApplyPendingMaintenanceAction from another region",
@@ -499,8 +500,8 @@ async fn a_resource_is_addressable_only_in_the_region_it_was_created_in() {
             ],
         )
         .await,
-        400,
-        "InvalidParameterValue",
+        404,
+        "ResourceNotFoundFault",
     );
 
     // In its own region the same name resolves, which is what makes the rows above a

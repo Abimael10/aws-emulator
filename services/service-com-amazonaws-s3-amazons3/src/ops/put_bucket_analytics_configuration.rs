@@ -12,7 +12,8 @@
 //! every bucket configuration id shares (`InvalidConfigurationId` for an id the request
 //! states none of, else `InvalidConfigId`; see
 //! [`crate::state::configuration_id_fault`]), an id that disagrees with the payload's own
-//! `Id` or an `And` filter naming fewer than two predicates (`InvalidArgument`), and a NEW
+//! `Id`, an `And` filter naming fewer than two predicates or an export destination whose
+//! `BucketAccountId` is written EMPTY (`MalformedXML`), and a NEW
 //! configuration past [`crate::state::MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET`]
 //! (`TooManyConfigurations`).
 //!
@@ -301,10 +302,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // destination S3 bucket" (`AnalyticsS3BucketDestination$BucketAccountId`) is "a
         // preventive measure to verify that the account that owns the destination bucket is
         // the account you specify" — a check S3 makes when it WRITES an export, not when it
-        // records the configuration — so the value is stored as submitted and a later read
-        // reports it verbatim, whichever account it names and whether that account exists at
-        // all. The same holds of the destination bucket behind a well-formed ARN: this write
-        // records a reference, it does not claim the bucket is there.
+        // records the configuration — so a value that names an account is stored as
+        // submitted and a later read reports it verbatim, whichever account it names and
+        // whether that account exists at all. The same holds of the destination bucket behind
+        // a well-formed ARN: this write records a reference, it does not claim the bucket is
+        // there.
+        //
+        // A member the document WROTE EMPTY is a different matter: it names no account at
+        // all, which is a document that did not validate against the published schema
+        // ([`crate::state::is_present_and_empty`]) — unlike leaving the member out, which
+        // the schema admits and which the member's own documentation gives a meaning to.
         if let Some(export) = &input
             .analytics_configuration
             .storage_class_analysis
@@ -317,6 +324,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::INVALID_DESTINATION_STATUS,
                     fault.message(),
                 ));
+            }
+            if crate::state::is_present_and_empty(destination.bucket_account_id.as_ref()) {
+                return Err(malformed_analytics_configuration());
             }
         }
 

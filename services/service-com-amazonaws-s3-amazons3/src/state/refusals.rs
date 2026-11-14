@@ -441,6 +441,23 @@ pub const MALFORMED_XML_MESSAGE: &str =
     "The XML you provided was not well-formed or did not validate against our published \
      schema";
 
+/// Whether an optional member a submitted configuration document carries is PRESENT and
+/// EMPTY, which is a document that "did not validate against our published schema"
+/// ([`MALFORMED_XML_CODE`]) rather than one that left the member out.
+///
+/// An optional element of an S3 configuration document is either ABSENT — which the schema
+/// admits, and which the member's own documentation gives a meaning ("If no account ID is
+/// provided, the owner is not validated before exporting data",
+/// `AnalyticsS3BucketDestination$BucketAccountId`) — or present carrying a value of its
+/// type. An element the request WROTE while leaving its content empty is neither: the value
+/// is of no account's id, so the document does not validate, and S3 refuses it before
+/// recording anything. The members are plain `string`s in the model
+/// (`smithy_query(query="shape",shape="AccountId")` reports no length constraint), so the
+/// boundary validator cannot refuse one and the handler is what reports it.
+pub fn is_present_and_empty(value: Option<&String>) -> bool {
+    value.is_some_and(|value| value.is_empty())
+}
+
 /// The first character of `document` that the XML 1.0 character set does not allow, or
 /// `None` when every one of them is a `Char`.
 ///

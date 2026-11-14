@@ -430,8 +430,16 @@ pub struct CommandRun {
     pub phases: Vec<BuildPhase>,
     /// Whether the build got far enough to have output to put anywhere. A build whose
     /// specification could not be read, or whose runtimes could not be installed, never
-    /// reached its own finishing work, so it reports no upload phase at all.
+    /// reached its own finishing work, so it reports no upload phase at all — and neither
+    /// does one a phase failure ABORTED ([`Self::aborted`]), since the phases after that
+    /// failure were never attempted.
     pub reached_output: bool,
+    /// Whether a phase failure ENDED the build: `on-failure: ABORT` (the default) stops the
+    /// build at the phase that failed, so every phase after it — the later buildspec phases
+    /// and the upload of the build's artifacts — is one the build never attempted, and the
+    /// build reports none of them. The build's own finishing work still runs, so
+    /// [`finish_build`] still reports that.
+    pub aborted: bool,
     /// The buildspec it ran, which is what declares WHICH files its artifacts and its
     /// cache are made of — `None` for a build that never got one.
     pub spec: Option<Buildspec>,
@@ -514,6 +522,7 @@ pub fn run_commands(
                 failed: true,
                 phases,
                 reached_output: false,
+                aborted: false,
                 spec: None,
                 produced: Vec::new(),
                 exported_variables: None,
@@ -538,6 +547,7 @@ pub fn run_commands(
                 failed: true,
                 phases,
                 reached_output: false,
+                aborted: false,
                 spec: None,
                 produced: Vec::new(),
                 exported_variables: None,
@@ -572,6 +582,7 @@ pub fn run_commands(
         }
     }
     let mut failed = false;
+    let mut aborted = false;
     for declared in &read.phases {
         let outcome = run_phase(&mut shell, declared);
         let phase_failed = outcome.is_some();
@@ -591,6 +602,7 @@ pub fn run_commands(
         // reports none of the ones after it; `on-failure: CONTINUE` goes on to the next
         // phase, however many phases have already failed.
         if phase_failed && declared.abort_on_failure {
+            aborted = true;
             break;
         }
         // `exit` ended the build's session: a non-zero status already failed the phase
@@ -604,10 +616,15 @@ pub fn run_commands(
     CommandRun {
         failed,
         phases,
-        // A build that ran its commands has output to put where its artifacts say, whether
-        // those commands succeeded or not: CodeBuild uploads what the build produced for a
-        // FAILED build exactly as for one that succeeded.
-        reached_output: true,
+        // A build that ran its commands through has output to put where its artifacts say,
+        // whether those commands succeeded or not: CodeBuild uploads what a build whose
+        // phases all ran produced for a FAILED build exactly as for one that succeeded.
+        //
+        // A build a phase failure ABORTED is the other case: the build ended at that phase,
+        // so putting its output anywhere is work it never attempted, and it reports no
+        // upload phase at all ([`CommandRun::aborted`]).
+        reached_output: !aborted,
+        aborted,
         produced: shell
             .files()
             .into_iter()
@@ -624,11 +641,16 @@ pub fn run_commands(
 /// `upload` is what the transfer answered — `None` for one that put the build's output
 /// where it belongs (which includes a build with nothing to put anywhere), and the context
 /// CodeBuild reports for one that could not.
+///
+/// A build a phase failure ABORTED attempted no upload at all, so it reports no
+/// `UPLOAD_ARTIFACTS` phase — its own finishing work still ran, which is the phase it does
+/// report before the terminal marker.
 pub fn finish_build(run: CommandRun, upload: Option<PhaseContext>, due_millis: i64) -> BuildRun {
     let CommandRun {
         mut failed,
         mut phases,
         reached_output,
+        aborted,
         exported_variables,
         ..
     } = run;
@@ -646,6 +668,10 @@ pub fn finish_build(run: CommandRun, upload: Option<PhaseContext>, due_millis: i
             due_millis,
             upload.map(|context| vec![context]),
         ));
+    }
+    // The build's own finishing work runs for every build that got as far as running its
+    // commands — the one it aborted at among them.
+    if reached_output || aborted {
         phases.push(finished_phase(
             PHASE_FINALIZING,
             BUILD_STATUS_SUCCEEDED,

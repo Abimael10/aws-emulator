@@ -177,6 +177,8 @@ mod error_message_envelope;
 // `error_message_envelope`, which spans the same rule from the model's own catalog.
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/export_destination_account_id.rs"]
+mod export_destination_account_id;
 #[path = "all/express_session_tokens.rs"]
 mod express_session_tokens;
 #[path = "all/federated_session_authorization.rs"]

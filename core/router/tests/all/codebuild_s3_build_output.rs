@@ -11,8 +11,9 @@
 //! artifact is stored in MyArtifacts/<build-ID>/MyArtifact.zip") — and reports the S3 ARN
 //! of what it put there; a build whose buildspec declares no artifact file, or whose
 //! declared paths match nothing it produced, uploads nothing and ends FAILED with the
-//! client error CodeBuild states for it; a build that FAILED on one of its own commands
-//! still uploads what it did produce; a project whose cache is held in the store carries
+//! client error CodeBuild states for it; a build a phase failure ABORTED uploads nothing at
+//! all, since the upload is work it never attempted; a project whose cache is held in the
+//! store carries
 //! its declared cached paths from one build into the next, until `InvalidateProjectCache`
 //! resets it; and a build whose source is an object of the store runs on the files that
 //! archive holds.
@@ -528,10 +529,12 @@ async fn zipped_artifacts_land_as_one_object_with_its_checksums() {
     }
 }
 
-/// RULE: a build that FAILED on one of its own commands still uploads what it produced —
-/// the output of the phase's `finally` block included.
+/// RULE: a build a phase failure ABORTED uploads nothing — the upload of its artifacts is
+/// work it never attempted, so the destination holds no object and the build reports no
+/// `UPLOAD_ARTIFACTS` phase — while the phase's own `finally` block still ran, which is what
+/// the failing phase's context reports.
 #[tokio::test]
-async fn a_failed_builds_output_is_still_uploaded() {
+async fn an_aborted_builds_output_is_not_uploaded() {
     let router = emulator();
     let role = codebuild_role(&router, "codebuild-failed-role").await;
     let bucket = "codebuild-failed-output";
@@ -559,20 +562,23 @@ async fn a_failed_builds_output_is_still_uploaded() {
         "Error while executing command: exit 7. Reason: exit status 7",
         "expected the command and the status it exited with, got {build}"
     );
-    let keys = object_keys(&router, bucket).await;
-    assert_eq!(
-        keys,
-        ["build/out.txt"],
-        "a FAILED build still uploads what it produced, got {keys:?}"
+    // The phases after the failing one were never attempted, the upload among them.
+    let phases: Vec<String> = build["phases"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|phase| phase["phaseType"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !phases.contains(&"UPLOAD_ARTIFACTS".to_string()),
+        "an aborted build never attempted its upload, so it reports no upload phase, got \
+         {phases:?}"
     );
-    let bytes = object_bytes(&router, bucket, "build/out.txt")
-        .await
-        .expect("the artifact is served");
-    assert_eq!(
-        String::from_utf8_lossy(&bytes),
-        "pre-marker\nfinally-marker\n",
-        "expected both markers in the order they were written, got {:?}",
-        String::from_utf8_lossy(&bytes)
+    let keys = object_keys(&router, bucket).await;
+    assert!(
+        keys.is_empty(),
+        "an aborted build uploads nothing, got {keys:?}"
     );
 }
 

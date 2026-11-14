@@ -116,28 +116,28 @@ pub fn missing_item_key_message(attribute: &str) -> String {
     format!("{INVALID_PARAMETER_CLAUSE}: Missing the key {attribute} in the item")
 }
 
-/// How an `ExclusiveStartKey` that is NO KEY of the schema being paged at all is refused: a
+/// How an `ExclusiveStartKey` that is NO KEY of the schema being paged is refused: a
 /// resume token is not an item selector — a caller gets it from the previous page's
 /// `LastEvaluatedKey` — so AWS states the TOKEN invalid, in this one fixed sentence that
-/// names neither the attribute nor the schema. A map carrying an attribute the schema
-/// declares no key for, one carrying a spare attribute beside the key, and one carrying no
+/// names neither the attribute nor the schema, with NOTHING appended to it. A map carrying
+/// an attribute the schema declares no key for, one carrying a spare attribute beside the
+/// key, one that LEAVES OUT a key attribute the schema declares, and one carrying no
 /// attribute at all are all of them tokens that are not this schema's key, so all of them
-/// earn it. A token whose attributes ARE that schema's key attributes, but which does not
-/// state them as the schema declares them, is the other refusal
+/// earn it. Only a token that carries exactly that schema's key attributes while stating one
+/// of them in another TYPE than the schema declares is diagnosed further
 /// ([`START_KEY_SCHEMA_MISMATCH_MESSAGE`]).
 pub const START_KEY_INVALID_MESSAGE: &str = "The provided starting key is invalid";
 
-/// How an `ExclusiveStartKey` whose attributes are the key attributes of the schema being
-/// paged, but whose KEY ELEMENT does not match that schema, is refused: AWS states the
-/// token invalid and then says WHY after a colon — the same key-schema sentence a `Key`
+/// How an `ExclusiveStartKey` that carries the key attributes of the schema being paged,
+/// with one of them typed against that schema, is refused: AWS states the token invalid and
+/// then says WHY after a colon — the same key-schema sentence a `Key`
 /// member is refused with ([`KEY_SCHEMA_MISMATCH_MESSAGE`]), which tells the caller its
 /// token holds this schema's key attributes wrongly rather than being no key of it at all.
 /// Both halves are fixed text.
 ///
-/// TWO defects earn it, the ways one key element of the schema can be stated wrongly: an
-/// element carrying another TYPE than the schema declares for it, and an element the token
-/// leaves out while naming nothing the schema does not declare — a cursor from which a
-/// declared key attribute was dropped.
+/// ONE defect earns it: an element carrying another TYPE than the schema declares for it. A
+/// token that leaves a declared key attribute out does not carry that schema's key at all,
+/// so it is the invalid TOKEN ([`START_KEY_INVALID_MESSAGE`]) with nothing appended.
 pub const START_KEY_SCHEMA_MISMATCH_MESSAGE: &str =
     "The provided starting key is invalid: The provided key element does not match the schema";
 
@@ -149,13 +149,17 @@ pub const START_KEY_SCHEMA_MISMATCH_MESSAGE: &str =
 /// SINGLE-item write carries is the whole item, so a key attribute it does not carry is
 /// reported as the value it did not give, and one of another type as the mismatch between
 /// the two types; an `ExclusiveStartKey` is a resume token, so a map that is no key of the
-/// schema being paged at all makes it an invalid token, while a token whose attributes ARE
-/// that schema's key attributes but which states one of them wrongly — another TYPE than
-/// the schema declares, or a declared element left out — is diagnosed further
+/// schema being paged makes it an invalid token, while a token that carries exactly that
+/// schema's key attributes with one of them in another TYPE than the schema declares is
+/// diagnosed further
 /// ([`Self::typed_against_schema`]); a BATCHED write's element is held to the schema as a
 /// whole, so every way it differs from it is the one mismatch sentence; and a
 /// TRANSACTIONAL write's element is reported per defect for its TYPE, as a single-item
 /// write's is, which is the mismatch its cancellation reason states.
+///
+/// A resume token that leaves a declared key element OUT is no key of the schema being
+/// paged, so it earns that member's one invalid-token sentence rather than the further
+/// diagnosis ([`START_KEY_INVALID_MESSAGE`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeySource {
     Item,
@@ -171,14 +175,13 @@ impl KeySource {
     fn absent(self, attribute: &str) -> RequestError {
         match self {
             Self::Item => RequestError::Validation(missing_item_key_message(attribute)),
-            // A resume token that names only key attributes of this schema and leaves one
-            // of them out states this schema's key element wrongly, which is the defect
-            // AWS diagnoses after the colon — the same sentence a wrongly TYPED element
-            // earns ([`Self::typed_against_schema`]).
-            Self::StartKey => {
-                RequestError::Validation(START_KEY_SCHEMA_MISMATCH_MESSAGE.to_string())
-            }
-            Self::BatchItem | Self::TransactItem | Self::Key => self.mismatch(),
+            // A resume token that leaves out a key attribute the schema declares carries
+            // no key of that schema, so it is the invalid TOKEN with nothing appended —
+            // the same sentence every other map that is not this schema's key earns, which
+            // is why it shares the arm below; only a token that carries them all with one
+            // of them TYPED against the schema is diagnosed further
+            // ([`Self::typed_against_schema`]).
+            Self::StartKey | Self::BatchItem | Self::TransactItem | Self::Key => self.mismatch(),
         }
     }
 
