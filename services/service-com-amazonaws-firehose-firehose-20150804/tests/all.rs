@@ -103,6 +103,8 @@ mod parquet_serializer_parameters;
 mod processor_parameters;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
+#[path = "all/source_fed_buffering_window.rs"]
+mod source_fed_buffering_window;
 #[path = "all/source_fed_stream_delivers_no_direct_put.rs"]
 mod source_fed_stream_delivers_no_direct_put;
 #[path = "all/splunk_destination_delivery.rs"]
