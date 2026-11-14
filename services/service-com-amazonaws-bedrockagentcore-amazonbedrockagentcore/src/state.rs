@@ -118,6 +118,33 @@ pub use extraction_jobs::*;
 mod payment_sessions;
 pub use payment_sessions::*;
 
+/// The ONE filesystem a code interpreter session's three views share:
+/// [`SandboxFilesystem`], how a RUN (a script or a command) reaches the session's workspace
+/// without holding this service's state guard.
+mod code_interpreter_sandbox;
+pub use code_interpreter_sandbox::*;
+
+/// The command plane of a code interpreter session: the bounded shell its `executeCommand`
+/// and `startCommandExecution` tools perform a caller's command line in.
+mod code_interpreter_shell;
+pub use code_interpreter_shell::*;
+
+/// The programs the environment of a code interpreter session provides beside the shell's
+/// own utilities: [`SandboxPrograms`], the read-only utilities that report on the session's
+/// filesystem.
+mod code_interpreter_programs;
+pub use code_interpreter_programs::*;
+
+/// The asynchronous half of that plane: [`CommandTaskRecord`], the tasks
+/// `startCommandExecution` submits, `getTask` reports and `stopTask` cancels.
+mod code_interpreter_tasks;
+pub use code_interpreter_tasks::*;
+
+/// The PYTHON engine a code interpreter session's `executeCode` tool runs a submitted
+/// program in, and everything that bounds and contains it.
+mod code_interpreter_python;
+pub use code_interpreter_python::*;
+
 use crate::ops::types::{
     Branch, Certificate, Event, ExtractionConfig, IngestPayloadType, MemoryContent, MemoryRecord,
     MemoryRecordMetadataValue, MemoryRecordOutput, MetadataValue, PayloadType, SessionSummary,
@@ -316,6 +343,17 @@ pub fn record_expires_at(
 /// differently.
 pub fn session_already_terminated(session_id: &str) -> String {
     format!("Session already terminated: {session_id}")
+}
+
+/// How this service words the `ValidationException` a tool invocation gets when the code
+/// interpreter session it names is no longer running: `Code interpreter session
+/// <sessionId> is not active`, with the session taken from the request.
+///
+/// A session that has been stopped or has run out of time-to-live cannot be made usable
+/// again, so the condition is a request member that no longer addresses anything a tool can
+/// run in — not a state the caller can resolve and retry.
+pub fn code_interpreter_session_not_active(session_id: &str) -> String {
+    format!("Code interpreter session {session_id} is not active")
 }
 
 /// Per-service state for com-amazonaws-bedrockagentcore-amazonbedrockagentcore. A handler reaches it through [`service_state`].
@@ -1506,15 +1544,31 @@ pub struct CodeInterpreterSessionRecord {
     /// [`MAX_SESSION_FILES`] and [`MAX_SESSION_FILE_BYTES`].
     pub files: BTreeMap<String, SessionFile>,
     /// The scripts this session's `executeCode` tool has run to completion, oldest
-    /// first: the session's execution CONTEXT, which the next run is evaluated on top
-    /// of unless that run asked for the context to be cleared. A script that ended on
-    /// an exception is not kept, and neither is one whose run hit a bound. Bounded by
-    /// [`MAX_CONTEXT_SCRIPTS`] and [`MAX_CONTEXT_BYTES`], oldest first.
-    pub context_scripts: Vec<String>,
+    /// first: the session's execution CONTEXT, which the next run of the same LANGUAGE is
+    /// evaluated on top of unless that run asked for the context to be cleared. A script
+    /// that ended on an exception is not kept, and neither is one whose run hit a bound.
+    /// Bounded by [`MAX_CONTEXT_SCRIPTS`] and [`MAX_CONTEXT_BYTES`], oldest first.
+    pub context_scripts: Vec<ContextScript>,
+    /// The tasks this session's `startCommandExecution` tool has submitted, keyed by the
+    /// task id it minted for each. Bounded by [`MAX_SESSION_TASKS`].
+    pub tasks: BTreeMap<String, CommandTaskRecord>,
     /// The value [`ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState::next_seq`]
     /// handed this session: its eviction order, and what keeps two sessions started in
     /// the same millisecond apart.
     pub seq: u64,
+}
+
+/// One script of a session's execution context: the LANGUAGE it was submitted as and its
+/// source.
+///
+/// The language is part of the record because a session's context is per language: a run is
+/// evaluated on top of the scripts of its own language, since the engine that performs a
+/// JavaScript run cannot read a Python program and the other way round. What `clearContext`
+/// clears is the whole session namespace, every language of it.
+#[derive(Debug, Clone)]
+pub struct ContextScript {
+    pub language: String,
+    pub source: String,
 }
 
 /// One file in a session's workspace: the bytes a `writeFiles` tool put there and when
@@ -1626,6 +1680,7 @@ impl CodeInterpreterSessionRecord {
             stop_tokens: BTreeMap::new(),
             files: BTreeMap::new(),
             context_scripts: Vec::new(),
+            tasks: BTreeMap::new(),
             seq,
         }
     }
@@ -1669,6 +1724,7 @@ impl CodeInterpreterSessionRecord {
         self.last_updated_at = now;
         self.files.clear();
         self.context_scripts.clear();
+        self.tasks.clear();
         if let Some(token) = client_token {
             self.stop_tokens.insert(token.to_string(), now);
             while self.stop_tokens.len() > MAX_STOP_TOKENS_PER_SESSION {
@@ -1814,8 +1870,8 @@ impl CodeInterpreterSessionRecord {
         entries.into_iter().collect()
     }
 
-    /// Keep `script` as part of this session's execution context, so the next run of
-    /// its `executeCode` tool is evaluated on top of it.
+    /// Keep `script` as part of this session's execution context for `language`, so the
+    /// next run of its `executeCode` tool in that language is evaluated on top of it.
     ///
     /// Called only for a script that ran to completion: one that ended on an exception
     /// defined nothing a later run can rely on. The oldest script gives way once
@@ -1823,7 +1879,12 @@ impl CodeInterpreterSessionRecord {
     /// survives. `bytes_elsewhere` is what every OTHER session holds, so the context
     /// this session keeps holds the whole-store ceiling too: a script the store has no
     /// room for is not kept at all, exactly as one larger than the whole context is not.
-    pub fn keep_context_script(&mut self, script: String, bytes_elsewhere: usize) {
+    pub fn keep_context_script(
+        &mut self,
+        language: &str,
+        script: String,
+        bytes_elsewhere: usize,
+    ) {
         // The context this session may hold: its own ceiling, and no more than the room
         // the rest of the store leaves under the whole-store one.
         let own_room = MAX_STORED_SESSION_BYTES
@@ -1835,7 +1896,10 @@ impl CodeInterpreterSessionRecord {
             // already happened.
             return;
         }
-        self.context_scripts.push(script);
+        self.context_scripts.push(ContextScript {
+            language: language.to_string(),
+            source: script,
+        });
         while self.context_scripts.len() > MAX_CONTEXT_SCRIPTS || self.context_bytes() > own_room {
             if self.context_scripts.is_empty() {
                 break;
@@ -1844,9 +1908,93 @@ impl CodeInterpreterSessionRecord {
         }
     }
 
+    /// The sources of this session's execution context for `language`, oldest first: what
+    /// the next run in that language is evaluated on top of.
+    #[must_use]
+    pub fn context_scripts_in(&self, language: &str) -> Vec<String> {
+        self.context_scripts
+            .iter()
+            .filter(|script| script.language == language)
+            .map(|script| script.source.clone())
+            .collect()
+    }
+
+    /// Drop this session's whole execution context, every language of it, which is what
+    /// `clearContext` asks for: the namespace a later run sees is the one its own code
+    /// builds.
+    pub fn clear_context(&mut self) {
+        self.context_scripts.clear();
+    }
+
+    /// Drop the context scripts of `language` at `positions` — the positions a run was
+    /// handed them in ([`Self::context_scripts_in`]).
+    ///
+    /// For the scripts a run reported it could no longer evaluate: a context script
+    /// rebuilds the namespace it left, and one that no longer runs rebuilds nothing, so it
+    /// is not part of the session's context any more.
+    pub fn forget_context_scripts(&mut self, language: &str, positions: &[usize]) {
+        let mut seen = 0usize;
+        self.context_scripts.retain(|script| {
+            if script.language != language {
+                return true;
+            }
+            let position = seen;
+            seen = seen.saturating_add(1);
+            !positions.contains(&position)
+        });
+    }
+
+    /// Whether this session has room for one more task, pruning the tasks that have reached
+    /// a terminal status to make it.
+    ///
+    /// A task holds its command line and what performing it came to, so what one session
+    /// stores has a ceiling ([`MAX_SESSION_TASKS`]): the tasks nothing can move out of their
+    /// status any more give way first, oldest first, and a session whose tasks are ALL still
+    /// live has no room — which the submitting tool reports rather than dropping a task a
+    /// caller is still waiting for.
+    pub fn room_for_a_task(&mut self, now: SystemTime) -> bool {
+        if self.tasks.len() < MAX_SESSION_TASKS {
+            return true;
+        }
+        let mut terminal: Vec<(u64, String)> = self
+            .tasks
+            .values()
+            .filter(|task| task.is_terminal() || task.status_as_of(now) == TASK_STATUS_CANCELED)
+            .map(|task| (task.seq, task.task_id.clone()))
+            .collect();
+        terminal.sort_unstable();
+        for (_, task_id) in terminal {
+            self.tasks.remove(&task_id);
+            if self.tasks.len() < MAX_SESSION_TASKS {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Put `task` in this session, dropping the oldest task once the session holds more
+    /// than [`MAX_SESSION_TASKS`].
+    pub fn submit_task(&mut self, task: CommandTaskRecord) {
+        self.tasks.insert(task.task_id.clone(), task);
+        while self.tasks.len() > MAX_SESSION_TASKS {
+            let Some(oldest) = self
+                .tasks
+                .values()
+                .min_by_key(|task| task.seq)
+                .map(|task| task.task_id.clone())
+            else {
+                break;
+            };
+            self.tasks.remove(&oldest);
+        }
+    }
+
     /// How many bytes this session's execution context holds across every script in it.
     pub fn context_bytes(&self) -> usize {
-        self.context_scripts.iter().map(String::len).sum()
+        self.context_scripts
+            .iter()
+            .map(|script| script.source.len())
+            .sum()
     }
 
     /// What this session is charged in the whole-store accounting

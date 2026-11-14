@@ -23,6 +23,8 @@ mod batch_evaluations;
 mod browser_session_streams;
 #[path = "all/browser_sessions.rs"]
 mod browser_sessions;
+#[path = "all/code_interpreter_runtime.rs"]
+mod code_interpreter_runtime;
 #[path = "all/code_interpreter_session_stop.rs"]
 mod code_interpreter_session_stop;
 #[path = "all/code_interpreter_sessions.rs"]

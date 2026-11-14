@@ -39,18 +39,18 @@ use std::time::Duration;
 
 /// The system code interpreter AWS ships; `codeInterpreterIdentifier` is modelled as a
 /// plain string, so any identifier a caller names addresses its own session set.
-const SYSTEM_INTERPRETER: &str = "aws.codeinterpreter.v1";
+pub(crate) const SYSTEM_INTERPRETER: &str = "aws.codeinterpreter.v1";
 
 /// The media type an event-stream body carries.
 const EVENT_STREAM: &str = "application/vnd.amazon.eventstream";
 
 /// The header `sessionId` binds on both the request and the response (source:
 /// smithy_query query="operation" operation="InvokeCodeInterpreter").
-const SESSION_HEADER: &str = "x-amzn-code-interpreter-session-id";
+pub(crate) const SESSION_HEADER: &str = "x-amzn-code-interpreter-session-id";
 
 /// The emulator, with request authentication off so a test signs nothing, plus the
 /// shared engine so a case can age a stored session's clock without sleeping.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -59,20 +59,20 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// One HTTP exchange.
-struct Call {
-    status: u16,
+pub(crate) struct Call {
+    pub(crate) status: u16,
     headers: http::HeaderMap,
     body: bytes::Bytes,
 }
 
 impl Call {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 
     /// The wire error code: the `x-amzn-errortype` header restJson1 sets, or the
     /// body's `__type`.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         if let Some(value) = self.headers.get("x-amzn-errortype") {
             return value.to_str().unwrap_or_default().to_string();
         }
@@ -83,7 +83,7 @@ impl Call {
             .to_string()
     }
 
-    fn header(&self, name: &str) -> String {
+    pub(crate) fn header(&self, name: &str) -> String {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -150,7 +150,7 @@ fn label(value: &str) -> String {
 }
 
 /// `StartCodeInterpreterSession`, answering with the minted `sessionId`.
-async fn start_session(router: &MultiServiceRouter, body: Value) -> String {
+pub(crate) async fn start_session(router: &MultiServiceRouter, body: Value) -> String {
     let call = send(
         router,
         "PUT",
@@ -193,7 +193,7 @@ async fn get_session(router: &MultiServiceRouter, session_id: &str) -> Call {
 }
 
 /// `StopCodeInterpreterSession`.
-async fn stop_session(
+pub(crate) async fn stop_session(
     router: &MultiServiceRouter,
     session_id: &str,
     client_token: Option<&str>,
@@ -218,7 +218,7 @@ async fn stop_session(
 
 /// `InvokeCodeInterpreter`: `POST /code-interpreters/{id}/tools/invoke`, with the
 /// session in the header the model binds it to.
-async fn invoke(
+pub(crate) async fn invoke(
     router: &MultiServiceRouter,
     session_id: Option<&str>,
     name: &str,
@@ -282,7 +282,7 @@ fn decode_frames(case: &str, body: &[u8]) -> Vec<(String, Value)> {
 
 /// The one `result` event a served tool invocation answers with, after asserting the
 /// whole wire shape around it.
-fn result_event(case: &str, call: &Call) -> Value {
+pub(crate) fn result_event(case: &str, call: &Call) -> Value {
     assert_eq!(
         call.status,
         200,
@@ -314,7 +314,7 @@ fn result_event(case: &str, call: &Call) -> Value {
     payload
 }
 
-fn text_of(result: &Value) -> String {
+pub(crate) fn text_of(result: &Value) -> String {
     result
         .get("content")
         .and_then(Value::as_array)
@@ -329,14 +329,14 @@ fn text_of(result: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn structured<'a>(result: &'a Value, member: &str) -> &'a Value {
+pub(crate) fn structured<'a>(result: &'a Value, member: &str) -> &'a Value {
     result
         .get("structuredContent")
         .and_then(|structured| structured.get(member))
         .unwrap_or(&Value::Null)
 }
 
-fn is_error(result: &Value) -> bool {
+pub(crate) fn is_error(result: &Value) -> bool {
     result
         .get("isError")
         .and_then(Value::as_bool)
@@ -358,7 +358,7 @@ fn age_session(engine: &engine::InMemoryEngine, session_id: &str, by: Duration) 
 }
 
 /// How many files the stored session's workspace holds.
-fn workspace_files(engine: &engine::InMemoryEngine, session_id: &str) -> usize {
+pub(crate) fn workspace_files(engine: &engine::InMemoryEngine, session_id: &str) -> usize {
     let state = agentcore::state::service_state(engine).expect("the service state");
     let store = state.lock();
     store
@@ -909,7 +909,8 @@ async fn the_file_tools_round_trip_the_session_workspace() {
 
 /// A tool path addresses the session's workspace and nothing else: a path that is
 /// absolute, that walks out of the workspace, or that is past the bounds a workspace
-/// path has, is refused with a 400 `ValidationException` and stores nothing.
+/// path has, is refused IN BAND — a 200 whose result carries `isError` and the lead-in
+/// every tool-level failure is worded with — and stores nothing.
 #[tokio::test]
 async fn a_tool_path_that_leaves_the_workspace_is_refused() {
     let (router, engine) = emulator();
@@ -934,17 +935,15 @@ async fn a_tool_path_that_leaves_the_workspace_is_refused() {
             json!({"content": [{"path": path, "text": "x"}]}),
         )
         .await;
-        assert_eq!(
-            write.status, 400,
-            "case {case:?}: expected HTTP 400, got {} with {:?}",
-            write.status,
-            write.json()
+        let written = result_event(case, &write);
+        assert!(
+            is_error(&written),
+            "case {case:?}: expected an in-band tool failure, got {written}"
         );
-        assert_eq!(
-            write.error_code(),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {:?}",
-            write.json()
+        assert!(
+            text_of(&written).starts_with("Error executing tool writeFiles"),
+            "case {case:?}: expected the tool-failure lead-in, got {:?}",
+            text_of(&written)
         );
 
         let read = invoke(
@@ -954,10 +953,15 @@ async fn a_tool_path_that_leaves_the_workspace_is_refused() {
             json!({"paths": [path]}),
         )
         .await;
-        assert_eq!(
-            read.status, 400,
-            "case {case:?}: a read of the same path is refused the same way, got {}",
-            read.status
+        let read = result_event(case, &read);
+        assert!(
+            is_error(&read),
+            "case {case:?}: a read of the same path is refused the same way, got {read}"
+        );
+        assert!(
+            text_of(&read).starts_with("Error executing tool readFiles"),
+            "case {case:?}: expected the tool-failure lead-in, got {:?}",
+            text_of(&read)
         );
     }
     assert_eq!(
@@ -1256,8 +1260,8 @@ async fn the_whole_store_bounds_every_session_workspace_together() {
     );
 }
 
-/// `executeCode` runs the script when the runtime named is one the embedded engine
-/// serves, and reports that nothing ran for any other.
+/// `executeCode` runs the script when the runtime named is one that runs the language
+/// named, and reports a tool-level failure for a pairing that names no run at all.
 #[tokio::test]
 async fn only_a_runtime_the_engine_serves_runs_the_script() {
     let (router, _engine) = emulator();
@@ -1287,6 +1291,11 @@ async fn only_a_runtime_the_engine_serves_runs_the_script() {
             assert!(
                 is_error(&result) && structured(&result, "stdout").is_null(),
                 "case {case:?}: expected nothing to have run, got {result}"
+            );
+            assert!(
+                text_of(&result).starts_with("Error executing tool executeCode"),
+                "case {case:?}: expected the tool-failure lead-in, got {:?}",
+                text_of(&result)
             );
         }
     }
@@ -1326,44 +1335,27 @@ async fn a_tool_invocation_missing_a_required_argument_is_refused() {
     }
 }
 
-/// A tool this emulator embeds no engine for says so: `isError`, the reason in the
+/// A LANGUAGE this emulator embeds no engine for says so: `isError`, the reason in the
 /// result, and NO output, exit status or duration for work nothing performed.
 #[tokio::test]
 async fn a_tool_with_no_engine_reports_that_nothing_ran() {
     let (router, _engine) = emulator();
     let session = start_session(&router, json!({})).await;
 
-    // Rows: the `ProgrammingLanguage` values with no engine here, the `LanguageRuntime`
-    // one, and every tool of the command plane (source: smithy_query query="shape"
-    // shape="ProgrammingLanguage,LanguageRuntime,ToolName").
+    // Rows: the `ProgrammingLanguage` value with no engine here, on its own default
+    // runtime and on each runtime a caller may name for it (source: smithy_query
+    // query="shape" shape="ProgrammingLanguage,LanguageRuntime").
     let cases: Vec<(&str, &str, Value)> = vec![
-        (
-            "python-code",
-            "executeCode",
-            json!({"code": "print(1)", "language": "python"}),
-        ),
         (
             "typescript-code",
             "executeCode",
             json!({"code": "const a: number = 1;", "language": "typescript"}),
         ),
         (
-            "javascript-on-the-python-runtime",
+            "typescript-on-deno",
             "executeCode",
-            json!({"code": "console.log(1)", "language": "javascript", "runtime": "python"}),
+            json!({"code": "const a: number = 1;", "language": "typescript", "runtime": "deno"}),
         ),
-        (
-            "a-command",
-            "executeCommand",
-            json!({"command": "ls -la"}),
-        ),
-        (
-            "a-command-started-as-a-task",
-            "startCommandExecution",
-            json!({"command": "sleep 1"}),
-        ),
-        ("a-task-read-back", "getTask", json!({"taskId": "task-1"})),
-        ("a-task-stopped", "stopTask", json!({"taskId": "task-1"})),
     ];
 
     for (case, tool, arguments) in cases {
@@ -1473,7 +1465,8 @@ async fn a_session_that_is_not_live_serves_no_tool() {
         "the live session is what makes the unknown one a per-session answer"
     );
 
-    // A stopped session.
+    // A stopped session. A tool call on it is refused as a `sessionId` that no longer
+    // addresses anything a tool can run in.
     let stopped = start_session(&router, json!({})).await;
     let stop = stop_session(&router, &stopped, None).await;
     assert_eq!(stop.status, 200, "expected the stop to be served");
@@ -1484,8 +1477,14 @@ async fn a_session_that_is_not_live_serves_no_tool() {
         let call = invoke(&router, Some(&stopped), tool, arguments).await;
         assert_eq!(
             (call.status, call.error_code().as_str()),
-            (409, "ConflictException"),
+            (400, "ValidationException"),
             "case {case:?}: a stopped session cannot run a tool, got {:?}",
+            call.json()
+        );
+        assert_eq!(
+            call.json().get("message").and_then(Value::as_str),
+            Some(format!("Code interpreter session {stopped} is not active").as_str()),
+            "case {case:?}: expected the session's own sentence, got {:?}",
             call.json()
         );
     }
@@ -1502,7 +1501,7 @@ async fn a_session_that_is_not_live_serves_no_tool() {
     .await;
     assert_eq!(
         (call.status, call.error_code().as_str()),
-        (409, "ConflictException"),
+        (400, "ValidationException"),
         "a session past its time-to-live cannot run a tool, got {:?}",
         call.json()
     );

@@ -29,18 +29,38 @@
 //!   `console` is the `stdout` / `stderr` the result reports. A run is evaluated on top
 //!   of the scripts this session has already run to completion, which is what makes
 //!   `clearContext` mean something: with it set, the context is dropped first.
-//! * `executeCode` with any other `language`, and the command tools (`executeCommand`,
-//!   `startCommandExecution`, `getTask`, `stopTask`) — this emulator embeds no engine
-//!   for them (there is no in-process Python runtime, no TypeScript transpiler and no
-//!   command shell), so the result says the work was NOT run, with `isError` set.
-//!   Nothing is synthesised to look as though it ran: no output, no exit status and no
-//!   duration is reported for work no engine performed.
+//! * `executeCode` with `language: python` — the submitted program RUNS too, in the
+//!   contained Python interpreter this crate embeds (`crate::state::run_python`), over
+//!   the same session workspace the file tools read and write, and on top of the same
+//!   per-language context.
+//! * `executeCommand` and `startCommandExecution` — the command line is PERFORMED, by
+//!   the bounded POSIX shell the workspace drives for caller-supplied shell text
+//!   (`crate::state::run_command`), over that same session workspace: so the file
+//!   tools, a run and a command are three views of ONE filesystem. The synchronous tool
+//!   answers with the two streams and the exit status; the asynchronous one mints a task
+//!   ([`crate::state::CommandTaskRecord`]) that `getTask` reports and `stopTask`
+//!   cancels.
+//! * `executeCode` with any other `language` — this emulator embeds no engine for it
+//!   (there is no TypeScript transpiler here), so the result says the work was NOT run,
+//!   with `isError` set. Nothing is synthesised to look as though it ran: no output, no
+//!   exit status and no duration is reported for work no engine performed.
 //!
 //! Which members the `result` carries follows from the tool, not from the call:
 //! `structuredContent` reports a RUN (its members are `stdout`, `stderr`, `exitCode`,
 //! `executionTime`, `taskId`, `taskStatus`), so a workspace tool has nothing to put in
 //! it; and `isError` says that "the result represents an error", so a tool that did
 //! what was asked reports nothing there. [`ToolOutcome`] is where that lives.
+//!
+//! # A tool that could not do what was asked
+//!
+//! A failure of the invoked TOOL — a path that does not address the session workspace, a
+//! file the workspace does not hold, a workspace with no room left, a task id that names
+//! none — is reported IN BAND, on a 200 whose `result` carries `isError` and a text block
+//! beginning `Error executing tool ` and the tool's name ([`ToolOutcome::Failed`]). It is
+//! not a modelled API error: `isError` is documented as indicating that "the result
+//! represents an error", which is what a tool-level failure is, and a client that handles
+//! one keeps using its session. The modelled errors below are for the REQUEST — the
+//! interpreter, the session and the arguments a tool cannot be invoked without at all.
 //!
 //! # How a run is bounded and contained
 //!
@@ -97,10 +117,9 @@
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — the session named is not one this
 //!   emulator holds for that code interpreter.
-//! * `ConflictException` (HTTP 409) — the session is `TERMINATED` (stopped, or past its
-//!   time-to-live), which the model documents as a session a tool call cannot use.
-//! * `ValidationException` (HTTP 400) — the invoked tool was given no argument it
-//!   cannot work without, or one that addresses nothing in the workspace.
+//! * `ValidationException` (HTTP 400) — the session named is `TERMINATED` (stopped, or
+//!   past its time-to-live), so it is no longer a session a tool can run in; or the
+//!   invoked tool was given no argument it cannot work without.
 //! * `AccessDeniedException` (403), `InternalServerException` (500),
 //!   `ServiceQuotaExceededException` (402), `ThrottlingException` (429).
 
@@ -208,6 +227,10 @@ const RESOURCE_BLOB: &str = "blob";
 /// The media type reported for a workspace entry that is a directory rather than a
 /// file, which is how a `listFiles` block tells the two apart.
 const DIRECTORY_MEDIA_TYPE: &str = "inode/directory";
+
+/// Milliseconds in one second, the unit `ToolResultStructuredContent$executionTime`
+/// states a duration in.
+const MILLISECONDS_PER_SECOND: f64 = 1_000.0;
 
 /// This operation's own modelled 400 `ValidationException`, for a tool argument the
 /// invoked tool cannot work without or cannot work with.
@@ -317,15 +340,15 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
                                 },
                             )
                         })?;
-                    // The model documents that a session which "has expired or been
-                    // stopped" cannot serve a tool call: that is a request conflicting
-                    // with the current state of the resource.
+                    // A session that "has expired or been stopped" cannot serve a tool
+                    // call, and it can never come back: the `sessionId` the request
+                    // carries no longer addresses anything a tool can run in, which is a
+                    // member the caller has to change rather than a conflict it can
+                    // resolve and retry.
                     let status = session.status_as_of(now);
                     if status == crate::state::CODE_INTERPRETER_SESSION_TERMINATED {
-                        return Err(InvokeCodeInterpreterErrorModeled::ConflictException(
-                            ConflictException {
-                                message: Some(crate::state::session_already_terminated(named)),
-                            },
+                        return Err(validation(
+                            crate::state::code_interpreter_session_not_active(named),
                         ));
                     }
                     named.to_string()
@@ -352,6 +375,16 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
         };
 
         let arguments = input.arguments.clone().unwrap_or_default();
+        // Every task of this session whose command the CLOCK has made due is performed
+        // here, before the invoked tool reads anything: a task converges by being
+        // materialised, so the file a submitted command wrote is in the workspace for
+        // whichever tool looks next, not only for a `getTask`.
+        self.converge_due_tasks(
+            &state,
+            &input.code_interpreter_identifier,
+            &session_id,
+        )
+        .await?;
         // `ToolName` is a closed enum the request walk already checked the value
         // against, so the final arm is unreachable for a served request — it is here
         // because a match over a string has to be total.
@@ -390,9 +423,33 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
                 &session_id,
                 |session| remove_files(session, &arguments),
             )?,
-            "executeCommand" | "startCommandExecution" | "getTask" | "stopTask" => {
-                Ok(no_command_runtime(&input.name))
+            "executeCommand" => {
+                self.execute_command(
+                    &state,
+                    &input.code_interpreter_identifier,
+                    &session_id,
+                    &arguments,
+                )
+                .await
             }
+            "startCommandExecution" => self.start_command_execution(
+                &state,
+                &input.code_interpreter_identifier,
+                &session_id,
+                &arguments,
+            ),
+            "getTask" => self.report_task(
+                &state,
+                &input.code_interpreter_identifier,
+                &session_id,
+                &arguments,
+            ),
+            "stopTask" => self.stop_task(
+                &state,
+                &input.code_interpreter_identifier,
+                &session_id,
+                &arguments,
+            ),
             other => return Err(validation(format!("{other} is not a code interpreter tool."))),
         };
         let result = outcome?.into_result();
@@ -480,8 +537,9 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
         Ok(write_files(session, arguments, now, elsewhere))
     }
 
-    /// `executeCode`: run the submitted script in the engine this emulator embeds for
-    /// the language it names, on top of the session's execution context.
+    /// `executeCode`: run the submitted program in the engine this emulator embeds for
+    /// the language it names, on top of the session's execution context for that
+    /// language and over the session's own workspace.
     async fn execute_code(
         &self,
         state: &::engine::ServiceState<
@@ -501,19 +559,39 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
                 "The executeCode tool requires the language argument.",
             ));
         };
-        // `language` and `runtime` both name what the code is to run under, and only
-        // JavaScript has an engine here.
-        let runs_javascript = language == LANGUAGE_JAVASCRIPT
-            && arguments
-                .runtime
-                .as_deref()
-                .is_none_or(|runtime| JAVASCRIPT_RUNTIMES.contains(&runtime));
-        if !runs_javascript {
-            return Ok(ToolOutcome::NothingRan(format!(
-                "This code interpreter session has no {language} engine, so the code was not \
-                 run. The engine it embeds runs {LANGUAGE_JAVASCRIPT}."
-            )));
-        }
+        // `language` names what the program IS and `runtime` what it is to run under, so
+        // the engine follows from the language and a runtime that cannot run that
+        // language is a tool call that does not describe a run at all.
+        let runtime = arguments.runtime.as_deref();
+        let engine = match language.as_str() {
+            LANGUAGE_JAVASCRIPT
+                if runtime.is_none_or(|named| JAVASCRIPT_RUNTIMES.contains(&named)) =>
+            {
+                CodeEngine::JavaScript
+            }
+            crate::state::LANGUAGE_PYTHON
+                if runtime.is_none_or(|named| named == crate::state::PYTHON_RUNTIME) =>
+            {
+                CodeEngine::Python
+            }
+            LANGUAGE_JAVASCRIPT | crate::state::LANGUAGE_PYTHON => {
+                let named = runtime.unwrap_or_default();
+                return Ok(tool_failed(
+                    "executeCode",
+                    format!(
+                        "the {named} runtime does not run {language}; a runtime names what the \
+                         code of that language runs under"
+                    ),
+                ));
+            }
+            other => {
+                return Ok(ToolOutcome::NothingRan(format!(
+                    "This code interpreter session has no {other} engine, so the code was not \
+                     run. The engines it embeds run {LANGUAGE_JAVASCRIPT} and {}.",
+                    crate::state::LANGUAGE_PYTHON
+                )))
+            }
+        };
         if script.len() > MAX_SCRIPT_BYTES {
             return Ok(ToolOutcome::NothingRan(format!(
                 "The submitted script is {} bytes, past the {MAX_SCRIPT_BYTES} this session \
@@ -522,18 +600,21 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
             )));
         }
 
-        // The context this run is evaluated on top of, copied out under the guard, and
-        // dropped first where the call asked for a clear context. The guard is released
-        // before anything is evaluated.
-        let context_scripts = {
+        // The context this run is evaluated on top of and the workspace it reads and
+        // writes, copied out under the guard — the context dropped first where the call
+        // asked for a clear one. The guard is released before anything is evaluated.
+        let (context_scripts, sandbox) = {
             let mut store = state.lock();
             let session = store
                 .code_interpreter_session_mut(code_interpreter_identifier, session_id)
                 .ok_or_else(|| session_gone(code_interpreter_identifier, session_id))?;
             if arguments.clear_context == Some(true) {
-                session.context_scripts.clear();
+                session.clear_context();
             }
-            session.context_scripts.clone()
+            (
+                session.context_scripts_in(&language),
+                crate::state::SandboxFilesystem::of_session(session),
+            )
         };
 
         let submitted = script.clone();
@@ -549,40 +630,512 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
                 )
             })?
             .map_err(|error| internal(format!("the run slots are gone: {error}")))?;
-        // Off the async worker: the engine is synchronous and CPU-bound, and the
-        // runtime has to stay responsive while a script runs.
-        let run = ::tokio::task::spawn_blocking(move || run_script(&context_scripts, &submitted))
-            .await
-            .map_err(|error| internal(format!("the script run could not be joined: {error}")))?;
+        // Off the async worker: an engine is synchronous and CPU-bound, and the runtime
+        // has to stay responsive while a program runs.
+        let (mut run, sandbox) = match engine {
+            CodeEngine::JavaScript => {
+                // A JavaScript run reaches no filesystem at all: plain QuickJS exposes
+                // none, and this module installs none, so the workspace is untouched.
+                let run =
+                    ::tokio::task::spawn_blocking(move || run_script(&context_scripts, &submitted))
+                        .await
+                        .map_err(|error| {
+                            internal(format!("the script run could not be joined: {error}"))
+                        })?;
+                (run, None)
+            }
+            CodeEngine::Python => {
+                let filesystem = Arc::new(Mutex::new(sandbox));
+                // The engine spawns the run's own thread and bounds the wait for its
+                // answer itself, so nothing of the run reaches the async worker.
+                let run = crate::state::run_python(&context_scripts, &submitted, &filesystem).await;
+                (
+                    ScriptRun {
+                        stdout: run.stdout,
+                        stderr: run.stderr,
+                        exit_code: run.exit_code,
+                        elapsed: run.elapsed,
+                        failed_context: run.failed_context,
+                    },
+                    Some(filesystem),
+                )
+            }
+        };
         drop(permit);
 
-        if run.exit_code == 0 {
-            // A script that ran to completion becomes part of what the next run of this
-            // session sees. One that ended on an exception defined nothing a later run
-            // can rely on, so it is not kept.
+        {
             let mut store = state.lock();
             let elsewhere =
                 store.session_bytes_elsewhere(code_interpreter_identifier, session_id);
-            if let Some(session) =
-                store.code_interpreter_session_mut(code_interpreter_identifier, session_id)
-            {
-                session.keep_context_script(script, elsewhere);
+            // What the run wrote in the workspace, back into the session: the file tools
+            // and the command plane read the same filesystem a run writes. A write the
+            // workspace had no room for is said so on the run's own error stream.
+            if let Some(filesystem) = &sandbox {
+                let filesystem = filesystem.lock().unwrap_or_else(PoisonError::into_inner);
+                if filesystem.changed() {
+                    if let Some(session) =
+                        store.code_interpreter_session_mut(code_interpreter_identifier, session_id)
+                    {
+                        let refused =
+                            filesystem.apply_to(session, SystemTime::now(), elsewhere);
+                        if refused > 0 {
+                            run.stderr.push_str(&workspace_had_no_room(refused));
+                        }
+                    }
+                }
+            }
+            if !run.failed_context.is_empty() {
+                // A context program that no longer runs rebuilds nothing, so it is not
+                // part of this session's context any more. Dropped BEFORE this run's own
+                // program is kept, because the positions are the ones of the context this
+                // run was handed.
+                if let Some(session) =
+                    store.code_interpreter_session_mut(code_interpreter_identifier, session_id)
+                {
+                    session.forget_context_scripts(&language, &run.failed_context);
+                }
+            }
+            if run.exit_code == 0 {
+                // A program that ran to completion becomes part of what the next run of
+                // this session in the same language sees. One that ended on an exception
+                // defined nothing a later run can rely on, so it is not kept.
+                if let Some(session) =
+                    store.code_interpreter_session_mut(code_interpreter_identifier, session_id)
+                {
+                    session.keep_context_script(&language, script, elsewhere);
+                }
             }
         }
 
-        let text = if run.stdout.is_empty() && !run.stderr.is_empty() {
-            run.stderr.clone()
-        } else {
-            run.stdout.clone()
-        };
-        Ok(ToolOutcome::Ran {
-            content: vec![text_block(text)],
-            stdout: run.stdout,
-            stderr: run.stderr,
-            exit_code: run.exit_code,
-            elapsed: run.elapsed,
-        })
+        Ok(ran_outcome(run))
     }
+
+    /// `executeCommand`: perform the command line in the session's own workspace and
+    /// report the two streams and the status it ended with.
+    async fn execute_command(
+        &self,
+        state: &::engine::ServiceState<
+            crate::state::ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState,
+        >,
+        code_interpreter_identifier: &str,
+        session_id: &str,
+        arguments: &ToolArguments,
+    ) -> Result<ToolOutcome, InvokeCodeInterpreterErrorModeled> {
+        let Some(command) = arguments.command.clone() else {
+            return Err(validation(
+                "The executeCommand tool requires the command argument.",
+            ));
+        };
+        if let Some(refused) = command_past_the_ceiling("executeCommand", &command) {
+            return Ok(refused);
+        }
+        let sandbox = self.with_session(
+            state,
+            code_interpreter_identifier,
+            session_id,
+            crate::state::SandboxFilesystem::of_session,
+        )?;
+        let (run, sandbox) = self.perform_commands(vec![command], sandbox).await?;
+        let Some(run) = run.into_iter().next() else {
+            return Err(internal("the command run reported nothing"));
+        };
+        let refused =
+            self.take_workspace_back(state, code_interpreter_identifier, session_id, &sandbox);
+        let mut stderr = run.stderr;
+        // A file the command wrote that the workspace had no room for is said so on the
+        // command's own error stream: the same condition a `writeFiles` call is refused for
+        // is never left looking stored.
+        if refused > 0 {
+            stderr.push_str(&workspace_had_no_room(refused));
+        }
+        // The time the command's own program asked to take, honoured by answering no
+        // sooner than that: the caller observes the span its command waited for. Nothing is
+        // held while this call waits — no state guard, no run slot and no thread.
+        if !run.slept.is_zero() {
+            ::tokio::time::sleep(run.slept).await;
+        }
+        Ok(ran_outcome(ScriptRun {
+            stdout: run.stdout,
+            stderr,
+            exit_code: run.exit_code,
+            elapsed: run.elapsed.saturating_add(run.slept),
+            // A command is not evaluated on top of a context, so there is none to report.
+            failed_context: Vec::new(),
+        }))
+    }
+
+    /// `startCommandExecution`: mint a task for the command line and answer with its id
+    /// and its status, which is a status nothing has finished yet.
+    fn start_command_execution(
+        &self,
+        state: &::engine::ServiceState<
+            crate::state::ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState,
+        >,
+        code_interpreter_identifier: &str,
+        session_id: &str,
+        arguments: &ToolArguments,
+    ) -> Result<ToolOutcome, InvokeCodeInterpreterErrorModeled> {
+        let Some(command) = arguments.command.clone() else {
+            return Err(validation(
+                "The startCommandExecution tool requires the command argument.",
+            ));
+        };
+        if let Some(refused) = command_past_the_ceiling("startCommandExecution", &command) {
+            return Ok(refused);
+        }
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        let seq = store.next_seq();
+        let session = store
+            .code_interpreter_session_mut(code_interpreter_identifier, session_id)
+            .ok_or_else(|| session_gone(code_interpreter_identifier, session_id))?;
+        // The tasks one session holds have a ceiling, and a caller chooses how many it
+        // submits: a submission the session has no room for is refused in band, exactly as a
+        // write a full workspace has no room for is.
+        if !session.room_for_a_task(now) {
+            return Ok(tool_failed(
+                "startCommandExecution",
+                format!(
+                    "this code interpreter session holds the {} tasks one session may; read \
+                     or stop a task you no longer need",
+                    crate::state::MAX_SESSION_TASKS
+                ),
+            ));
+        }
+        let task = crate::state::CommandTaskRecord::submitted(seq, command, now);
+        let reported = task_outcome(&task, now);
+        session.submit_task(task);
+        Ok(reported)
+    }
+
+    /// `getTask`: report the task the call names, as it stands now.
+    fn report_task(
+        &self,
+        state: &::engine::ServiceState<
+            crate::state::ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState,
+        >,
+        code_interpreter_identifier: &str,
+        session_id: &str,
+        arguments: &ToolArguments,
+    ) -> Result<ToolOutcome, InvokeCodeInterpreterErrorModeled> {
+        let task_id = required_task_id("getTask", arguments)?;
+        let now = SystemTime::now();
+        self.with_session(
+            state,
+            code_interpreter_identifier,
+            session_id,
+            |session| match session.tasks.get(&task_id) {
+                Some(task) => task_outcome(task, now),
+                None => no_such_task("getTask", &task_id),
+            },
+        )
+    }
+
+    /// `stopTask`: cancel the task the call names, so the command it carries is never
+    /// performed, and report the status it is in afterwards.
+    fn stop_task(
+        &self,
+        state: &::engine::ServiceState<
+            crate::state::ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState,
+        >,
+        code_interpreter_identifier: &str,
+        session_id: &str,
+        arguments: &ToolArguments,
+    ) -> Result<ToolOutcome, InvokeCodeInterpreterErrorModeled> {
+        let task_id = required_task_id("stopTask", arguments)?;
+        let now = SystemTime::now();
+        self.with_session_mut(
+            state,
+            code_interpreter_identifier,
+            session_id,
+            |session| match session.tasks.get_mut(&task_id) {
+                Some(task) => {
+                    // A task that has already reached a terminal status is reported as it
+                    // stands: there is nothing left to cancel.
+                    task.cancel(now);
+                    task_outcome(task, now)
+                }
+                None => no_such_task("stopTask", &task_id),
+            },
+        )
+    }
+
+    /// Perform every task of this session whose command the clock has made due.
+    ///
+    /// Called at the start of EVERY tool invocation on the session, which is what makes a
+    /// submitted task converge: the transition from a non-terminal status to a terminal
+    /// one was owed at [`crate::state::CommandTaskRecord::due_at`] whether or not anybody
+    /// called, so the first call after that instant is what materialises it. A task a
+    /// `stopTask` cancelled first is never performed at all.
+    ///
+    /// Each task is claimed under the guard, performed with NO guard held, and its answer
+    /// stored under the guard again, so one caller's command cannot stall another
+    /// caller's request and two callers cannot perform the same task twice.
+    async fn converge_due_tasks(
+        &self,
+        state: &::engine::ServiceState<
+            crate::state::ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState,
+        >,
+        code_interpreter_identifier: &str,
+        session_id: &str,
+    ) -> Result<(), InvokeCodeInterpreterErrorModeled> {
+        let now = SystemTime::now();
+        let (claimed, sandbox) = {
+            let mut store = state.lock();
+            let Some(session) =
+                store.code_interpreter_session_mut(code_interpreter_identifier, session_id)
+            else {
+                return Ok(());
+            };
+            let mut claimed: Vec<(String, String)> = Vec::new();
+            for task in session.tasks.values_mut() {
+                // At most as many as ONE call performs: the rest are performed by the calls
+                // after this one, so the work of a call stays proportional to the call
+                // rather than to a backlog an earlier caller chose.
+                if claimed.len() >= crate::state::MAX_DUE_TASKS_PER_CALL {
+                    break;
+                }
+                if task.due_at_instant(now) {
+                    task.performing = true;
+                    claimed.push((task.task_id.clone(), task.command.clone()));
+                }
+            }
+            if claimed.is_empty() {
+                return Ok(());
+            }
+            claimed.sort_by(|left, right| left.0.cmp(&right.0));
+            (
+                claimed,
+                crate::state::SandboxFilesystem::of_session(session),
+            )
+        };
+
+        let commands: Vec<String> = claimed.iter().map(|(_, command)| command.clone()).collect();
+        let performed = self.perform_commands(commands, sandbox).await;
+        // A claim is RELEASED however the performing ended: a task left claimed would be
+        // non-terminal for ever — never due again, and never pruned — so one that could not
+        // be performed goes back to being due instead.
+        let (runs, sandbox) = match performed {
+            Ok(performed) => performed,
+            Err(error) => {
+                let mut store = state.lock();
+                if let Some(session) =
+                    store.code_interpreter_session_mut(code_interpreter_identifier, session_id)
+                {
+                    for (task_id, _) in &claimed {
+                        if let Some(task) = session.tasks.get_mut(task_id) {
+                            task.performing = false;
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        let stored_at = SystemTime::now();
+        let mut store = state.lock();
+        let elsewhere = store.session_bytes_elsewhere(code_interpreter_identifier, session_id);
+        if let Some(session) =
+            store.code_interpreter_session_mut(code_interpreter_identifier, session_id)
+        {
+            for ((task_id, _), run) in claimed.iter().zip(runs) {
+                let Some(task) = session.tasks.get_mut(task_id) else {
+                    continue;
+                };
+                task.performing = false;
+                // A task cancelled while its command was being performed keeps the
+                // cancelled status it was given.
+                if task.canceled_at.is_none() {
+                    task.outcome = Some(crate::state::CommandTaskOutcome {
+                        stdout: run.stdout,
+                        stderr: run.stderr,
+                        exit_code: run.exit_code,
+                        elapsed: run.elapsed,
+                        performed_at: stored_at,
+                        // The time the command's own program asked to take: the task is
+                        // `working` until it has passed, so a task that waits takes the
+                        // time it waited for.
+                        finishes_at: stored_at.checked_add(run.slept).unwrap_or(stored_at),
+                    });
+                }
+            }
+            let refused = sandbox.apply_to(session, stored_at, elsewhere);
+            // A file the task's command wrote that the workspace had no room for is said so
+            // on the task's own error stream, rather than left looking stored.
+            if refused > 0 {
+                for (task_id, _) in &claimed {
+                    if let Some(outcome) = session
+                        .tasks
+                        .get_mut(task_id)
+                        .and_then(|task| task.outcome.as_mut())
+                    {
+                        outcome.stderr.push_str(&workspace_had_no_room(refused));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Perform `commands`, in order, over `sandbox` — on a blocking thread, under one of
+    /// the service's run slots and with no state guard held.
+    async fn perform_commands(
+        &self,
+        commands: Vec<String>,
+        sandbox: crate::state::SandboxFilesystem,
+    ) -> Result<
+        (
+            Vec<crate::state::CommandRun>,
+            crate::state::SandboxFilesystem,
+        ),
+        InvokeCodeInterpreterErrorModeled,
+    > {
+        let permit = ::tokio::time::timeout(PERMIT_WAIT, Arc::clone(&self.runs).acquire_owned())
+            .await
+            .map_err(|_| {
+                throttling(
+                    "Too many code executions are running in this code interpreter. Retry the \
+                     request.",
+                )
+            })?
+            .map_err(|error| internal(format!("the run slots are gone: {error}")))?;
+        let performed = ::tokio::task::spawn_blocking(move || {
+            let mut sandbox = sandbox;
+            let runs: Vec<crate::state::CommandRun> = commands
+                .iter()
+                .map(|command| crate::state::run_command(command, &mut sandbox))
+                .collect();
+            (runs, sandbox)
+        })
+        .await
+        .map_err(|error| internal(format!("the command run could not be joined: {error}")))?;
+        drop(permit);
+        Ok(performed)
+    }
+
+    /// Put what a run or a command wrote in `sandbox` back into the session's workspace,
+    /// answering how many of those writes the workspace had no room for.
+    fn take_workspace_back(
+        &self,
+        state: &::engine::ServiceState<
+            crate::state::ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState,
+        >,
+        code_interpreter_identifier: &str,
+        session_id: &str,
+        sandbox: &crate::state::SandboxFilesystem,
+    ) -> usize {
+        if !sandbox.changed() {
+            return 0;
+        }
+        let mut store = state.lock();
+        let elsewhere = store.session_bytes_elsewhere(code_interpreter_identifier, session_id);
+        match store.code_interpreter_session_mut(code_interpreter_identifier, session_id) {
+            Some(session) => sandbox.apply_to(session, SystemTime::now(), elsewhere),
+            None => 0,
+        }
+    }
+}
+
+/// What a run or a command is told when the workspace had no room for the files it wrote:
+/// the same condition a `writeFiles` call is refused for, on the stream the run reports its
+/// own failures on.
+fn workspace_had_no_room(refused: usize) -> String {
+    format!(
+        "The session workspace had no room for {refused} of the files this run wrote, so they \
+         were not stored.\n"
+    )
+}
+
+/// Which engine a submitted program runs in, as its `language` and `runtime` name it.
+enum CodeEngine {
+    /// The QuickJS engine embedded in this process.
+    JavaScript,
+    /// The contained Python interpreter this crate embeds
+    /// ([`crate::state::run_python`]).
+    Python,
+}
+
+/// The result for a program or a command this emulator RAN: the text a client reads is
+/// the output it produced, and the structured half is the run's own report.
+fn ran_outcome(run: ScriptRun) -> ToolOutcome {
+    let text = if run.stdout.is_empty() && !run.stderr.is_empty() {
+        run.stderr.clone()
+    } else {
+        run.stdout.clone()
+    };
+    ToolOutcome::Ran {
+        content: vec![text_block(text)],
+        stdout: run.stdout,
+        stderr: run.stderr,
+        exit_code: run.exit_code,
+        elapsed: run.elapsed,
+    }
+}
+
+/// The in-band failure for a command line longer than one call carries, or `None` for one
+/// inside that ceiling ([`crate::state::MAX_COMMAND_BYTES`]).
+///
+/// Checked before anything is performed OR stored, so neither the shell nor a submitted
+/// task's record is ever handed a line past it.
+fn command_past_the_ceiling(tool: &str, command: &str) -> Option<ToolOutcome> {
+    (command.len() > crate::state::MAX_COMMAND_BYTES).then(|| {
+        tool_failed(
+            tool,
+            format!(
+                "the command is {} bytes, past the {} this session performs",
+                command.len(),
+                crate::state::MAX_COMMAND_BYTES
+            ),
+        )
+    })
+}
+
+/// The `taskId` a task tool cannot work without.
+fn required_task_id(
+    tool: &str,
+    arguments: &ToolArguments,
+) -> Result<String, InvokeCodeInterpreterErrorModeled> {
+    arguments
+        .task_id
+        .clone()
+        .filter(|task_id| !task_id.is_empty())
+        .ok_or_else(|| validation(format!("The {tool} tool requires the taskId argument.")))
+}
+
+/// How a task is reported, whichever tool reports it: its id and its status always, and
+/// the two streams, the exit status and the duration once its work is over \u2014 not before,
+/// because a task that is still working has produced no status to report.
+fn task_outcome(task: &crate::state::CommandTaskRecord, now: SystemTime) -> ToolOutcome {
+    let status = task.status_as_of(now);
+    let finished = matches!(
+        status,
+        crate::state::TASK_STATUS_COMPLETED | crate::state::TASK_STATUS_FAILED
+    );
+    let run = task.outcome.as_ref().filter(|_| finished).map(|outcome| TaskRun {
+        stdout: outcome.stdout.clone(),
+        stderr: outcome.stderr.clone(),
+        exit_code: outcome.exit_code,
+        elapsed: task.reported_duration().unwrap_or(outcome.elapsed),
+    });
+    let text = match &run {
+        Some(run) if !run.stdout.is_empty() => run.stdout.clone(),
+        Some(run) if !run.stderr.is_empty() => run.stderr.clone(),
+        _ => format!("Task {} is {status}.", task.task_id),
+    };
+    ToolOutcome::Task {
+        content: vec![text_block(text)],
+        task_id: task.task_id.clone(),
+        task_status: status,
+        run,
+    }
+}
+
+/// The in-band failure for a task tool whose `taskId` names no task of this session.
+fn no_such_task(tool: &str, task_id: &str) -> ToolOutcome {
+    tool_failed(
+        tool,
+        format!("this code interpreter session holds no task {task_id}"),
+    )
 }
 
 /// What one tool invocation did, before it is worded as a `CodeInterpreterResult`.
@@ -600,12 +1153,19 @@ enum ToolOutcome {
     /// A workspace tool that did what was asked: the blocks a client reads, and
     /// nothing else.
     Content(Vec<ContentBlock>),
-    /// A tool that ran and could not do what was asked — a path the workspace does not
-    /// hold, or a workspace with no room left.
-    Failed(String),
-    /// A script this emulator RAN: the blocks a client reads, plus the report of the
-    /// run itself (`0` for a script that ran to completion, `1` for one that did not)
-    /// and how long THAT run took — not how long the call around it took.
+    /// A tool that ran and could not do what was asked — a path that does not address
+    /// the session workspace, a path the workspace does not hold, a workspace with no
+    /// room left, a task id that names no task. Reported in band, as the lead-in the
+    /// tool plane words every tool-level failure with ([`Self::into_result`]).
+    Failed {
+        /// The tool that could not do what was asked, which the lead-in names.
+        tool: String,
+        /// Why it could not, worded for the caller that sent the arguments.
+        reason: String,
+    },
+    /// A program or a command this emulator RAN: the blocks a client reads, plus the
+    /// report of the run itself (`0` for work that ran to completion) and how long THAT
+    /// run took — not how long the call around it took.
     Ran {
         content: Vec<ContentBlock>,
         stdout: String,
@@ -613,8 +1173,34 @@ enum ToolOutcome {
         exit_code: i32,
         elapsed: Duration,
     },
+    /// A TASK of the asynchronous command plane, as the tool that submitted, read or
+    /// cancelled it reports it: its id and its status, plus the run once its command has
+    /// been performed.
+    Task {
+        content: Vec<ContentBlock>,
+        task_id: String,
+        task_status: &'static str,
+        run: Option<TaskRun>,
+    },
     /// Work this emulator embeds no engine for, so nothing performed it.
     NothingRan(String),
+}
+
+/// What performing one task's command came to, as a task report carries it.
+struct TaskRun {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    elapsed: Duration,
+}
+
+/// The in-band failure of one tool: the lead-in AWS words a tool-level failure with,
+/// the tool's name, and why it could not do what was asked.
+fn tool_failed(tool: &str, reason: impl Into<String>) -> ToolOutcome {
+    ToolOutcome::Failed {
+        tool: tool.to_string(),
+        reason: reason.into(),
+    }
 }
 
 impl ToolOutcome {
@@ -627,8 +1213,13 @@ impl ToolOutcome {
                 structured_content: None,
                 is_error: None,
             },
-            Self::Failed(reason) => CodeInterpreterResult {
-                content: vec![text_block(reason)],
+            // A tool-level failure is reported on the result rather than as an API
+            // error, with the lead-in the tool plane words every one of them with: the
+            // fixed `Error executing tool `, the tool's own name, and the reason. No
+            // file content and no resource link accompanies it — the tool did not do
+            // what was asked, so there is nothing of the workspace to carry.
+            Self::Failed { tool, reason } => CodeInterpreterResult {
+                content: vec![text_block(format!("Error executing tool {tool}: {reason}"))],
                 structured_content: None,
                 is_error: Some(true),
             },
@@ -646,10 +1237,40 @@ impl ToolOutcome {
                     stdout: Some(stdout),
                     stderr: Some(stderr),
                     exit_code: Some(exit_code),
-                    // Seconds, as a `Double`: the engine's own time on this run.
-                    execution_time: Some(elapsed.as_secs_f64()),
+                    // Milliseconds, as a `Double`: the member is documented as "the
+                    // execution time of the tool operation in milliseconds" (source:
+                    // smithy_query query="shape"
+                    // shape="ToolResultStructuredContent"), and this is the engine's own
+                    // time on this run.
+                    execution_time: Some(elapsed.as_secs_f64() * MILLISECONDS_PER_SECOND),
                 }),
                 is_error: Some(exit_code != 0),
+            },
+            // A task report: its id and its status always, and the run's own report once
+            // the command has been performed. A task whose command FAILED is an error
+            // result, on the same rule a synchronous run follows; one that was cancelled
+            // is not — the caller asked for that.
+            Self::Task {
+                content,
+                task_id,
+                task_status,
+                run,
+            } => CodeInterpreterResult {
+                content,
+                structured_content: Some(ToolResultStructuredContent {
+                    task_id: Some(task_id),
+                    task_status: Some(task_status.to_string()),
+                    stdout: run.as_ref().map(|run| run.stdout.clone()),
+                    stderr: run.as_ref().map(|run| run.stderr.clone()),
+                    exit_code: run.as_ref().map(|run| run.exit_code),
+                    execution_time: run
+                        .as_ref()
+                        .map(|run| run.elapsed.as_secs_f64() * MILLISECONDS_PER_SECOND),
+                }),
+                is_error: run
+                    .as_ref()
+                    .map(|run| run.exit_code != 0)
+                    .filter(|failed| *failed),
             },
             // No output, status or duration: nothing ran to produce any.
             Self::NothingRan(reason) => CodeInterpreterResult {
@@ -686,17 +1307,6 @@ fn text_block(text: impl Into<String>) -> ContentBlock {
     }
 }
 
-/// The result for work this emulator embeds no engine for.
-///
-/// The answer for every tool of the command plane. A command runs in a shell inside the
-/// session's sandbox, and this emulator embeds none — so no command is run, no task is
-/// ever started, and therefore no task id addresses one either.
-fn no_command_runtime(tool: &str) -> ToolOutcome {
-    ToolOutcome::NothingRan(format!(
-        "This code interpreter session has no command runtime, so the {tool} tool ran nothing."
-    ))
-}
-
 /// `writeFiles`: put every block's bytes in the session's workspace.
 ///
 /// All or nothing: the paths are normalized and the bytes taken first, a block that
@@ -720,7 +1330,10 @@ fn write_files(
     }
     let mut pending: Vec<(String, Vec<u8>)> = Vec::with_capacity(blocks.len());
     for block in blocks {
-        let key = workspace_key(&block.path)?;
+        let key = match workspace_key("writeFiles", &block.path) {
+            Ok(key) => key,
+            Err(refused) => return *refused,
+        };
         let bytes = match (block.text.as_ref(), block.blob.as_ref()) {
             (Some(text), None) => text.as_bytes().to_vec(),
             (None, Some(blob)) => blob.clone(),
@@ -747,24 +1360,7 @@ fn write_files(
         .map(|(key, bytes)| (key.clone(), bytes.len()))
         .collect();
     if let Err(full) = session.room_for(&sizes, bytes_elsewhere) {
-        return Ok(ToolOutcome::Failed(match full {
-            crate::state::WorkspaceFull::Files(limit) => format!(
-                "The session workspace holds at most {limit} files, so none of the {} files this \
-                 call names was written.",
-                pending.len()
-            ),
-            crate::state::WorkspaceFull::Bytes(limit) => format!(
-                "The session workspace holds at most {limit} bytes, so none of the {} files this \
-                 call names was written.",
-                pending.len()
-            ),
-            crate::state::WorkspaceFull::StoreBytes(limit) => format!(
-                "The code interpreter sessions of this emulator together hold at most {limit} \
-                 bytes, so none of the {} files this call names was written. Stop a session you \
-                 no longer need, or remove files from it.",
-                pending.len()
-            ),
-        }));
+        return Ok(workspace_full("writeFiles", full, Some(pending.len())));
     }
 
     let mut written = String::new();
@@ -774,18 +1370,7 @@ fn write_files(
         // store checks each write anyway, and its answer is reported rather than
         // dropped.
         if let Err(full) = session.write_file(&key, bytes, now, bytes_elsewhere) {
-            return Ok(ToolOutcome::Failed(match full {
-                crate::state::WorkspaceFull::Files(limit) => format!(
-                    "The session workspace holds at most {limit} files, so {key} was not written."
-                ),
-                crate::state::WorkspaceFull::Bytes(limit) => format!(
-                    "The session workspace holds at most {limit} bytes, so {key} was not written."
-                ),
-                crate::state::WorkspaceFull::StoreBytes(limit) => format!(
-                    "The code interpreter sessions of this emulator together hold at most {limit} \
-                     bytes, so {key} was not written."
-                ),
-            }));
+            return Ok(workspace_full("writeFiles", full, None));
         }
         written.push_str(&format!("Wrote {key} ({size} bytes)\n"));
     }
@@ -797,13 +1382,16 @@ fn read_files(
     session: &crate::state::CodeInterpreterSessionRecord,
     arguments: &ToolArguments,
 ) -> Result<ToolOutcome, InvokeCodeInterpreterErrorModeled> {
-    let keys = workspace_keys(arguments, "readFiles")?;
+    let keys = match workspace_keys(arguments, "readFiles") {
+        Ok(keys) => keys,
+        Err(refused) => return *refused,
+    };
     let missing: Vec<&String> = keys
         .iter()
         .filter(|key| !session.files.contains_key(*key))
         .collect();
     if !missing.is_empty() {
-        return Ok(not_in_workspace(&missing));
+        return Ok(not_in_workspace("readFiles", &missing));
     }
     let mut content = Vec::with_capacity(keys.len());
     // What this result has already materialised, so the response stays proportional to
@@ -815,10 +1403,13 @@ fn read_files(
         };
         emitted = emitted.saturating_add(file.bytes.len());
         if emitted > MAX_READ_RESULT_BYTES {
-            return Ok(ToolOutcome::Failed(format!(
-                "The files named hold more than the {MAX_READ_RESULT_BYTES} bytes one readFiles \
-                 result carries, so nothing was read. Read fewer files per call."
-            )));
+            return Ok(tool_failed(
+                "readFiles",
+                format!(
+                    "the files named hold more than the {MAX_READ_RESULT_BYTES} bytes one \
+                     readFiles result carries, so nothing was read; read fewer files per call"
+                ),
+            ));
         }
         let media_type = media_type_of(key);
         // Text where the stored bytes are text, bytes where they are not: the file's
@@ -854,15 +1445,16 @@ fn list_files(
     session: &crate::state::CodeInterpreterSessionRecord,
     arguments: &ToolArguments,
 ) -> Result<ToolOutcome, InvokeCodeInterpreterErrorModeled> {
-    let directory = crate::state::normalize_session_directory(
-        arguments.directory_path.as_deref().unwrap_or_default(),
-    )
-    .map_err(|rejection| {
-        validation(path_rejection_message(
-            arguments.directory_path.as_deref().unwrap_or_default(),
-            rejection,
-        ))
-    })?;
+    let named = arguments.directory_path.as_deref().unwrap_or_default();
+    let directory = match crate::state::normalize_session_directory(named) {
+        Ok(directory) => directory,
+        Err(rejection) => {
+            return Ok(tool_failed(
+                "listFiles",
+                path_rejection_reason(named, rejection),
+            ))
+        }
+    };
     let content: Vec<ContentBlock> = session
         .list_directory(&directory)
         .into_iter()
@@ -886,13 +1478,16 @@ fn remove_files(
     session: &mut crate::state::CodeInterpreterSessionRecord,
     arguments: &ToolArguments,
 ) -> Result<ToolOutcome, InvokeCodeInterpreterErrorModeled> {
-    let keys = workspace_keys(arguments, "removeFiles")?;
+    let keys = match workspace_keys(arguments, "removeFiles") {
+        Ok(keys) => keys,
+        Err(refused) => return *refused,
+    };
     let missing: Vec<&String> = keys
         .iter()
         .filter(|key| !session.files.contains_key(*key))
         .collect();
     if !missing.is_empty() {
-        return Ok(not_in_workspace(&missing));
+        return Ok(not_in_workspace("removeFiles", &missing));
     }
     let mut removed = String::new();
     for key in &keys {
@@ -902,48 +1497,92 @@ fn remove_files(
     Ok(ToolOutcome::Content(vec![text_block(removed)]))
 }
 
-/// The result for a tool whose paths address nothing in the workspace: the tool ran and
-/// could not do what was asked.
-fn not_in_workspace(missing: &[&String]) -> ToolOutcome {
+/// The in-band failure for a tool whose paths address nothing in the workspace: the tool
+/// ran and could not do what was asked.
+fn not_in_workspace(tool: &str, missing: &[&String]) -> ToolOutcome {
     let listed = missing
         .iter()
         .map(|key| key.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    ToolOutcome::Failed(format!(
-        "The session workspace holds no such file: {listed}"
-    ))
+    tool_failed(
+        tool,
+        format!("the session workspace holds no such file: {listed}"),
+    )
 }
 
-/// The workspace key one tool `path` addresses, or the 400 that says why it addresses
-/// none.
-fn workspace_key(path: &str) -> Result<String, InvokeCodeInterpreterErrorModeled> {
-    crate::state::normalize_session_path(path)
-        .map_err(|rejection| validation(path_rejection_message(path, rejection)))
+/// The in-band failure for a workspace with no room left for what a tool was asked to
+/// write, naming the ceiling it met.
+///
+/// `batch` is how many files the call named, for the write that is refused BEFORE any of
+/// them is stored.
+fn workspace_full(
+    tool: &str,
+    full: crate::state::WorkspaceFull,
+    batch: Option<usize>,
+) -> ToolOutcome {
+    let refused = match batch {
+        Some(files) => format!("none of the {files} files this call names was written"),
+        None => "the file was not written".to_string(),
+    };
+    tool_failed(
+        tool,
+        match full {
+            crate::state::WorkspaceFull::Files(limit) => {
+                format!("the session workspace holds at most {limit} files, so {refused}")
+            }
+            crate::state::WorkspaceFull::Bytes(limit) => {
+                format!("the session workspace holds at most {limit} bytes, so {refused}")
+            }
+            crate::state::WorkspaceFull::StoreBytes(limit) => format!(
+                "the code interpreter sessions of this emulator together hold at most {limit} \
+                 bytes, so {refused}; stop a session you no longer need, or remove files from it"
+            ),
+        },
+    )
 }
+
+/// The workspace key one tool `path` addresses, or how the tool reports that it
+/// addresses none.
+///
+/// A path that does not address the session workspace is a failure of the invoked TOOL,
+/// not of the request: it is reported IN BAND, on the result, which is why the `Err` side
+/// here carries a whole answer — the in-band `Ok(Failed)` for a path, or the modelled
+/// error for a request the tool cannot be invoked with at all — for the caller to return
+/// as it stands.
+fn workspace_key(tool: &str, path: &str) -> Result<String, Box<ToolAnswer>> {
+    crate::state::normalize_session_path(path).map_err(|rejection| {
+        Box::new(Ok(tool_failed(tool, path_rejection_reason(path, rejection))))
+    })
+}
+
+/// What one of the file tools answers: the outcome it computed, or the modelled error for
+/// a request it could not be invoked with.
+///
+/// It is BOXED where it travels as the `Err` side of a path lookup ([`workspace_key`]), so
+/// the lookup's own result stays small: a whole answer is the larger of the two sides, and a
+/// function that returns one by value would carry that on every call.
+type ToolAnswer = Result<ToolOutcome, InvokeCodeInterpreterErrorModeled>;
 
 /// The workspace keys a tool's `paths` (or its single `path`) addresses, each named
 /// once: repeating a path addresses the same file, and de-duplicating is what keeps one
 /// repeated name from multiplying the work and the response.
-fn workspace_keys(
-    arguments: &ToolArguments,
-    tool: &str,
-) -> Result<Vec<String>, InvokeCodeInterpreterErrorModeled> {
+fn workspace_keys(arguments: &ToolArguments, tool: &str) -> Result<Vec<String>, Box<ToolAnswer>> {
     let named: Vec<String> = match (arguments.paths.as_deref(), arguments.path.as_deref()) {
         (Some(paths), _) if !paths.is_empty() => paths.to_vec(),
         (_, Some(path)) => vec![path.to_string()],
         _ => {
-            return Err(validation(format!(
+            return Err(Box::new(Err(validation(format!(
                 "The {tool} tool requires the paths argument."
-            )))
+            )))))
         }
     };
     if named.len() > MAX_TOOL_PATHS {
-        return Err(too_many_paths(tool, named.len()));
+        return Err(Box::new(Err(too_many_paths(tool, named.len()))));
     }
     let mut keys: Vec<String> = Vec::with_capacity(named.len());
     for path in &named {
-        let key = workspace_key(path)?;
+        let key = workspace_key(tool, path)?;
         if !keys.contains(&key) {
             keys.push(key);
         }
@@ -959,23 +1598,28 @@ fn too_many_paths(tool: &str, named: usize) -> InvokeCodeInterpreterErrorModeled
     ))
 }
 
-/// Why a path addresses nothing, worded for the caller that sent it.
-fn path_rejection_message(path: &str, rejection: crate::state::PathRejection) -> String {
+/// Why a path addresses nothing in the session workspace, worded for the caller that sent
+/// it, as the reason half of the in-band failure ([`tool_failed`]).
+///
+/// A path that is absolute and one that walks out through a parent segment are the same
+/// condition — the path does not stay inside the session's own workspace — so both are
+/// reported as the traversal they are, naming the path the request carried.
+fn path_rejection_reason(path: &str, rejection: crate::state::PathRejection) -> String {
     match rejection {
         crate::state::PathRejection::Empty => {
-            "A tool path must name a file in the session workspace.".to_string()
+            "a tool path must name a file in the session workspace".to_string()
         }
         crate::state::PathRejection::Absolute => format!(
-            "The tool path {path} is absolute; a path addresses the session workspace and is \
-             relative to it."
+            "path traversal is not allowed: the path {path} is absolute, and a tool path \
+             addresses the session workspace and is relative to it"
         ),
         crate::state::PathRejection::Escapes => format!(
-            "The tool path {path} leaves the session workspace; a path cannot contain a parent \
-             segment."
+            "path traversal is not allowed: the path {path} leaves the session workspace \
+             through a parent segment"
         ),
         crate::state::PathRejection::TooLong => format!(
-            "The tool path {path} is longer than the {} bytes or {} segments a session workspace \
-             path has.",
+            "the tool path {path} is longer than the {} bytes or {} segments a session \
+             workspace path has",
             crate::state::MAX_SESSION_PATH_BYTES,
             crate::state::MAX_SESSION_PATH_SEGMENTS
         ),
@@ -1040,6 +1684,9 @@ struct ScriptRun {
     /// `executionTime`: measured around the evaluation only, so no permit wait or lock
     /// acquisition is counted as the script's own time.
     elapsed: Duration,
+    /// Which of the session's CONTEXT scripts no longer run, by their position in the
+    /// context this run was handed — see [`crate::state::PythonRun::failed_context`].
+    failed_context: Vec<usize>,
 }
 
 /// What a run wrote to its output streams, as the host collected it.
@@ -1115,18 +1762,24 @@ globalThis.console = (function () {
 fn run_script(context_scripts: &[String], script: &str) -> ScriptRun {
     let started = Instant::now();
     let capture = Arc::new(Mutex::new(Capture::default()));
-    let outcome = evaluate(&capture, context_scripts, script);
+    let failed_context = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let outcome = evaluate(&capture, &failed_context, context_scripts, script);
     let elapsed = started.elapsed();
     let captured = captured(&capture);
     let mut stdout = captured.stdout.clone();
     let mut stderr = captured.stderr.clone();
     drop(captured);
+    let failed_context = failed_context
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     match outcome {
         Ok(()) => ScriptRun {
             stdout,
             stderr,
             exit_code: 0,
             elapsed,
+            failed_context,
         },
         Err(failure) => {
             // The engine stops a script that outran the wall clock by raising inside
@@ -1152,6 +1805,7 @@ fn run_script(context_scripts: &[String], script: &str) -> ScriptRun {
                 stderr,
                 exit_code: 1,
                 elapsed,
+                failed_context,
             }
         }
     }
@@ -1161,6 +1815,7 @@ fn run_script(context_scripts: &[String], script: &str) -> ScriptRun {
 /// the submitted script. `Err` carries the engine's own account of what went wrong.
 fn evaluate(
     capture: &Arc<Mutex<Capture>>,
+    failed_context: &Arc<Mutex<Vec<usize>>>,
     context_scripts: &[String],
     script: &str,
 ) -> Result<(), String> {
@@ -1177,9 +1832,16 @@ fn evaluate(
     context.with(|ctx| {
         install_console(&ctx, capture)?;
         // The context this session already built, re-evaluated with its output not
-        // collected, so the variables and functions earlier runs defined are in scope.
-        for earlier in context_scripts {
-            run_one(&ctx, earlier)?;
+        // collected, so the variables and functions earlier runs defined are in scope. A
+        // context script that no longer runs is not this run's failure: it is reported for
+        // the caller to drop from the session's context, and the rest still run.
+        for (position, earlier) in context_scripts.iter().enumerate() {
+            if run_one(&ctx, earlier).is_err() {
+                failed_context
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(position);
+            }
         }
         captured(capture).recording = true;
         run_one(&ctx, script)

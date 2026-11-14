@@ -50,6 +50,19 @@ tracing = { workspace = true }
 # reviewed here. One version is pinned for the whole workspace, so the binary carries
 # a single QuickJS.
 rquickjs = "0.14"
+# The PYTHON half of the code interpreter's `executeCode` RUNS the submitted program, so
+# it needs a contained Python interpreter — and this crate adds NO execution substrate of
+# its own for it. It drives the ONE contained interpreter this workspace already holds
+# (`state::execution::python` of the crate below), exactly as the Amazon EMR notebook and
+# Spark-step planes do: one interpreter per run, built with its host-reaching surface
+# compiled out, its native modules narrowed to an allow-list, its `posix` that crate's own
+# with every host-reaching call refused, and the deadline, step, memory, recursion and
+# output bounds enforced in host code the caller's program cannot reach. The kernel the
+# program runs in, and the session workspace it reads and writes, are ordinary Python this
+# crate supplies on the run's import path (`state::code_interpreter_python`); the only
+# filesystem a run sees is that in-memory workspace, and the run is given no seam to
+# dispatch an AWS call on.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # The AgentCore CONTROL plane, whose store owns the browsers a browser session is
 # started on: `StartBrowserSession` names one it did not create, so the data plane
 # resolves the `browserIdentifier` against the component that owns it rather than

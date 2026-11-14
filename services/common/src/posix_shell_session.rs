@@ -153,6 +153,11 @@
 //! * `service-com-amazonaws-sagemaker-sagemaker`'s `state::notebook_lifecycle_hook` performs
 //!   a notebook instance's lifecycle hook and keeps its output, which it publishes to that
 //!   hook's CloudWatch Logs stream.
+//! * `service-com-amazonaws-bedrockagentcore-amazonbedrockagentcore`'s
+//!   `state::code_interpreter_shell` performs a code interpreter session's `executeCommand`
+//!   and `startCommandExecution` programs over that session's own workspace, and reports the
+//!   two streams separately ([`ShellSession::output`], [`ShellSession::errors`]) because its
+//!   API carries a member for each.
 //!
 //! One service still carries its OWN copy of this session, written before this module
 //! existed, and it is to be MIGRATED onto this one rather than copied again — exactly as the
@@ -185,6 +190,11 @@ struct Redirections {
     error: Option<(String, bool)>,
     /// The path standard input is read from.
     input: Option<String>,
+    /// Set by `2>&1`: standard error goes wherever standard OUTPUT goes for this command,
+    /// which is how a program asks for its diagnostics on the one stream its caller reads.
+    error_to_out: bool,
+    /// Set by `1>&2`: the same the other way round.
+    out_to_error: bool,
 }
 
 /// The commands a session provides, as their names.
@@ -256,6 +266,17 @@ pub trait ProgramFiles {
     /// Remove the file at `path`, answering whether there was one to remove — what a program
     /// that MOVES a file does to the one it carried away.
     fn remove(&mut self, path: &str) -> bool;
+
+    /// The names directly under the DIRECTORY `path` names (the tree's root for the empty
+    /// path), each once and in path order — what a program that LISTS a directory answers.
+    ///
+    /// The default is empty, which is what a tree that holds no directory entry of its own
+    /// answers for every path: an environment whose programs list a directory is one whose
+    /// session implements this.
+    fn entries_in(&self, path: &str) -> Vec<String> {
+        let _ = path;
+        Vec::new()
+    }
 }
 
 /// The commands a session whose tree is a MACHINE's — or its own WORKING tree
@@ -264,15 +285,18 @@ pub trait ProgramFiles {
 ///
 /// Each one's whole effect is inside the session and the tree it works over: `printf` writes
 /// one line of output, `mkdir`, `touch` and `rm` change the tree, `test` (and its `[`
-/// spelling) answers a question about it, `sh -c` performs a program in this same
-/// session, which is how a machine's init system runs one line, and `.` (with its bash
-/// `source` spelling) performs the commands of a file the tree holds in this same session,
-/// which is how a program reads a file of assignments the environment published to it. A
-/// session given neither tree provides none of them: a directory, a removal, a nested
-/// program and a file to read commands from are what an environment with storage of its own
-/// has, and such a session's tree is only the files its redirections left.
+/// spelling) answers a question about it, `sh` performs a program in this same session —
+/// `sh -c PROGRAM` the text it was given and `sh FILE` the script the TREE holds at that
+/// path, which is how a machine's init system runs one line and how a script left in the
+/// tree is run — `.` (with its bash `source` spelling) performs the commands of a file the
+/// tree holds in this same session, which is how a program reads a file of assignments the
+/// environment published to it, and `sleep` states the TIME the program took
+/// ([`ShellSession::slept`]). A session given neither tree provides none of them: a
+/// directory, a removal, a nested program and a file to read commands from are what an
+/// environment with storage of its own has, and such a session's tree is only the files its
+/// redirections left.
 pub const VOLUME_COMMANDS: &[&str] = &[
-    "printf", "mkdir", "touch", "rm", "test", "[", "sh", "bash", ".", "source",
+    "printf", "mkdir", "touch", "rm", "test", "[", "sh", "bash", ".", "source", "sleep",
 ];
 
 /// The commands an assignment written before them persists in the session for: POSIX's
@@ -352,6 +376,9 @@ pub struct Bounds {
     /// How many bytes the whole tree may hold at once, so neither a few large files nor very
     /// many small ones grow it without a stated ceiling.
     pub tree_bytes: usize,
+    /// How many seconds of `sleep` one session may state in total ([`ShellSession::slept`]),
+    /// so a caller that honours that time is never asked for an unbounded wait.
+    pub sleep_seconds: u64,
 }
 
 impl Default for Bounds {
@@ -373,6 +400,7 @@ impl Default for Bounds {
             files: 256,
             file_bytes: 256 * 1024,
             tree_bytes: 4 * 1024 * 1024,
+            sleep_seconds: 300,
         }
     }
 }
@@ -505,6 +533,11 @@ pub struct ShellSession {
     /// What the program wrote, one entry per performed command that wrote a line, kept only
     /// when the configuration asks for it.
     output: Vec<String>,
+    /// What the program's commands reported they could not do, one entry per line, kept
+    /// under the same limits as [`Self::output`] and for the same callers: a service whose
+    /// API reports the two streams SEPARATELY ([`Self::errors`]) reads this one, and nothing
+    /// is kept at all for a session whose configuration asks for no output.
+    errors: Vec<String>,
     /// The programs the environment this session runs in provides, asked for a command
     /// neither catalog names; `None` for a session whose environment provides none.
     programs: Option<Box<dyn EnvironmentPrograms>>,
@@ -541,6 +574,8 @@ pub struct ShellSession {
     /// Set when a write to the file a redirection named did not happen, which is what makes
     /// the command carrying it answer as one that could not be run.
     redirect_failed: bool,
+    /// How long this session's `sleep` commands have stated the program took.
+    slept: ::std::time::Duration,
 }
 
 /// The FILES of the tree this session works over, handed to the ENVIRONMENT's programs
@@ -564,6 +599,10 @@ impl ProgramFiles for SessionFiles<'_> {
     fn remove(&mut self, path: &str) -> bool {
         self.session.tree_remove_file(path)
     }
+
+    fn entries_in(&self, path: &str) -> Vec<String> {
+        self.session.tree_entry_names(path)
+    }
 }
 
 impl ShellSession {
@@ -583,6 +622,7 @@ impl ShellSession {
             commands_left: config.bounds.commands,
             exit_status: None,
             output: Vec::new(),
+            errors: Vec::new(),
             programs: None,
             volume: None,
             captures: Vec::new(),
@@ -594,6 +634,7 @@ impl ShellSession {
             working_tree: false,
             tree_bytes: 0,
             redirect_failed: false,
+            slept: ::std::time::Duration::ZERO,
             config,
         };
         for (name, value) in variables {
@@ -725,6 +766,29 @@ impl ShellSession {
     #[must_use]
     pub fn into_output(self) -> Vec<String> {
         self.output
+    }
+
+    /// The lines this session's commands wrote to standard ERROR, in the order they wrote
+    /// them — what a command reported it could not do.
+    ///
+    /// For a caller whose API reports the two streams as members of its own: a session given
+    /// a MACHINE's tree keeps a diagnostic on its console ([`Self::output`]) as well, because
+    /// that is where a guest's diagnostics are read, and for every other session this is the
+    /// only place one is kept. Empty for a session whose configuration keeps no output, and
+    /// for one whose commands reported nothing.
+    #[must_use]
+    pub fn errors(&self) -> &[String] {
+        &self.errors
+    }
+
+    /// How long this session's `sleep` commands stated the program took
+    /// ([`Self::run_sleep`]).
+    ///
+    /// No thread waited for it: a caller whose API reports how long a command took, or
+    /// converges a submitted task on it, is the one that honours this.
+    #[must_use]
+    pub fn slept(&self) -> ::std::time::Duration {
+        self.slept
     }
 
 
@@ -1105,8 +1169,10 @@ impl ShellSession {
     /// appending"), and `>|` is `>` with the no-clobber option off. A session given a
     /// MACHINE's tree performs the other descriptors a machine's program redirects too —
     /// standard error to a file or a device (`2>`, `2>>`) and standard input from one (`<`).
-    /// A duplication (`>&`), a read-write open, a here-document, a here-string and a
-    /// descriptor other than 0, 1 and 2 are forms no session performs.
+    /// A duplication of one standard stream onto the other (`2>&1`, `1>&2`) is performed by
+    /// every session, which is how a program asks for its diagnostics on the one stream its
+    /// caller reads. A read-write open, a here-document, a here-string, a duplication of any
+    /// other descriptor and a descriptor other than 0, 1 and 2 are forms no session performs.
     fn apply_redirect(
         &mut self,
         redirect: &::brush_parser::ast::IoRedirect,
@@ -1117,6 +1183,24 @@ impl ShellSession {
         let ::brush_parser::ast::IoRedirect::File(fd, kind, target) = redirect else {
             return false;
         };
+        // A DUPLICATION names a descriptor rather than a file, however the grammar spelled
+        // it: `2>&1` and `1>&2` are the only two a session performs, because the two
+        // standard streams are the only descriptors it has.
+        if matches!(kind, Kind::DuplicateOutput) {
+            let duplicated = match target {
+                ::brush_parser::ast::IoFileRedirectTarget::Duplicate(word)
+                | ::brush_parser::ast::IoFileRedirectTarget::Filename(word) => self
+                    .expand_word(&word.value)
+                    .and_then(|named| named.parse().ok()),
+                _ => None,
+            };
+            match (fd.unwrap_or(STANDARD_OUTPUT), duplicated) {
+                (STANDARD_ERROR, Some(STANDARD_OUTPUT)) => redirections.error_to_out = true,
+                (STANDARD_OUTPUT, Some(STANDARD_ERROR)) => redirections.out_to_error = true,
+                _ => return false,
+            }
+            return true;
+        }
         let ::brush_parser::ast::IoFileRedirectTarget::Filename(word) = target else {
             return false;
         };
@@ -1260,6 +1344,34 @@ impl ShellSession {
         }
     }
 
+    /// The names directly under the DIRECTORY `directory` of the tree this session works
+    /// over (its root for the empty path), each once and in path order.
+    ///
+    /// The tree keys a file by its whole path and holds no entry of its own for a directory,
+    /// so a name here is either a file directly under that path or the first segment of a
+    /// deeper file's path, which is what makes it a directory.
+    fn tree_entry_names(&self, directory: &str) -> Vec<String> {
+        let held = directory.trim();
+        let held = held.strip_prefix("./").unwrap_or(held);
+        let prefix = match held {
+            "" | "." | "/" => String::new(),
+            named => format!("{}/", named.trim_end_matches('/')),
+        };
+        let mut names: Vec<String> = Vec::new();
+        for (path, _) in self.tree_files() {
+            let Some(relative) = path.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            let relative = relative.strip_prefix('/').unwrap_or(relative);
+            let name = relative.split('/').next().unwrap_or(relative).to_string();
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names.sort();
+        names
+    }
+
     /// Perform the program the ENVIRONMENT this session runs in provides for `name`, when it
     /// provides one ([`EnvironmentPrograms`]).
     ///
@@ -1375,6 +1487,10 @@ impl ShellSession {
     /// it reports: a redirection the tree refused, or a capture past
     /// [`Bounds::substitution_bytes`].
     fn write_stdout(&mut self, text: &str, redirections: &Redirections) -> bool {
+        if redirections.out_to_error {
+            // `1>&2`: this command's output goes where its diagnostics go.
+            return self.write_error_stream(text, redirections);
+        }
         self.write_stream(redirections.out.clone(), text)
     }
 
@@ -1388,6 +1504,19 @@ impl ShellSession {
     /// where a guest's diagnostics are read; for every other session a diagnostic is not part
     /// of what the program wrote, so nothing keeps it.
     fn write_stderr(&mut self, text: &str, redirections: &Redirections) -> bool {
+        if redirections.error_to_out {
+            // `2>&1`: this command's diagnostics go where its output goes, so they are what
+            // a redirection takes, what a substitution captures and what the caller reads as
+            // standard output.
+            return self.write_stream(redirections.out.clone(), text);
+        }
+        self.write_error_stream(text, redirections)
+    }
+
+    /// [`Self::write_stderr`]'s write to the ERROR stream itself, with no duplication
+    /// applied: the file or device a redirection of standard error names, and otherwise what
+    /// the session keeps.
+    fn write_error_stream(&mut self, text: &str, redirections: &Redirections) -> bool {
         if let Some((path, append)) = redirections.error.clone() {
             if !self.write_path(&path, text, append) {
                 self.redirect_failed = true;
@@ -1395,6 +1524,10 @@ impl ShellSession {
             }
             return true;
         }
+        // Kept for the caller that reports the two streams separately ([`Self::errors`]),
+        // and ALSO on the console of a session given a machine's tree, which is where a
+        // guest's diagnostics are read.
+        self.keep_error(text);
         if self.volume.is_some() {
             self.keep_output(text);
         }
@@ -1450,6 +1583,31 @@ impl ShellSession {
                 line.truncate(cut);
             }
             self.output.push(line);
+        }
+    }
+
+    /// [`Self::keep_output`] for standard ERROR, into the lines [`Self::errors`] answers
+    /// with and under the same limits.
+    fn keep_error(&mut self, text: &str) {
+        let Some(limits) = self.config.output else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        for line in text.strip_suffix('\n').unwrap_or(text).split('\n') {
+            if self.errors.len() >= limits.lines {
+                return;
+            }
+            let mut line = line.to_string();
+            if line.len() > limits.line_bytes {
+                let mut cut = limits.line_bytes;
+                while cut > 0 && !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                line.truncate(cut);
+            }
+            self.errors.push(line);
         }
     }
 
@@ -1546,8 +1704,10 @@ impl ShellSession {
     /// tree holds none, and `rm` removes a file (`-f` passes over one that is not there).
     /// `test`, and its `[` spelling, answers a question about the tree or about two values.
     /// `sh -c` performs a program in THIS session, which is how a machine's init system
-    /// runs one line of a script, and `.` performs the commands of a file the tree holds in
-    /// it ([`Self::run_dot`]).
+    /// runs one line of a script, `sh FILE` performs the script the tree holds at that path
+    /// in the same way, `.` performs the commands of a file the tree holds in it
+    /// ([`Self::run_dot`]), and `sleep` states the TIME the program took
+    /// ([`Self::slept`]).
     fn run_volume_command(
         &mut self,
         name: &str,
@@ -1561,10 +1721,63 @@ impl ShellSession {
             "touch" => self.run_touch(arguments, redirections),
             "rm" => self.run_remove(arguments, redirections),
             "test" | "[" => self.run_test(name, arguments),
-            "sh" | "bash" => self.run_nested_program(arguments),
+            "sh" | "bash" => self.run_nested_program(arguments, redirections),
             "." | "source" => self.run_dot(arguments, redirections),
+            "sleep" => self.run_sleep(arguments, redirections),
             _ => self.config.statuses.could_not_run,
         }
+    }
+
+    /// `sleep`: the time the program asked to take, added to what this session has slept
+    /// ([`Self::slept`]).
+    ///
+    /// No thread waits for it. This session performs a program's commands in process and
+    /// has no clock of its own to spend, so what a `sleep` states is the TIME THE PROGRAM
+    /// TOOK: the caller whose API reports a duration, or converges a submitted task on one,
+    /// honours it, and a caller that reports no duration performs the sleep in no time at
+    /// all. What one program may ask for in total is bounded ([`Bounds::sleep_seconds`]).
+    ///
+    /// "The sleep utility shall suspend execution for at least the integral number of
+    /// seconds specified by the time operand": a time this command cannot read is the
+    /// utility's own usage failure, and so is a missing operand.
+    fn run_sleep(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
+        let Some(operand) = arguments.iter().find(|argument| !argument.starts_with('-')) else {
+            let _ = self.write_stderr("sleep: missing operand\n", redirections);
+            return self.config.statuses.failure;
+        };
+        // The suffixes the common implementation accepts beside plain seconds.
+        let (value, unit) = match operand.chars().next_back() {
+            Some(suffix @ ('s' | 'm' | 'h' | 'd')) => (
+                &operand[..operand.len().saturating_sub(suffix.len_utf8())],
+                suffix,
+            ),
+            _ => (operand.as_str(), 's'),
+        };
+        let Ok(seconds) = value.parse::<f64>() else {
+            let _ = self.write_stderr(
+                &format!("sleep: invalid time interval '{operand}'\n"),
+                redirections,
+            );
+            return self.config.statuses.failure;
+        };
+        if !seconds.is_finite() || seconds < 0.0 {
+            let _ = self.write_stderr(
+                &format!("sleep: invalid time interval '{operand}'\n"),
+                redirections,
+            );
+            return self.config.statuses.failure;
+        }
+        let factor = match unit {
+            'm' => 60.0,
+            'h' => 3_600.0,
+            'd' => 86_400.0,
+            _ => 1.0,
+        };
+        let asked = ::std::time::Duration::try_from_secs_f64(seconds * factor)
+            .unwrap_or(::std::time::Duration::ZERO);
+        let ceiling = ::std::time::Duration::from_secs(self.config.bounds.sleep_seconds);
+        self.slept = self.slept.saturating_add(asked).min(ceiling);
+        self.config.statuses.success
     }
 
     /// `cat`: the contents of each file named, in order, on standard output.
@@ -1803,25 +2016,45 @@ impl ShellSession {
         }
     }
 
-    /// `sh -c PROGRAM` (and `bash -c`): the program performed in THIS session, under the
-    /// same bounds and against the same tree and variables.
+    /// `sh -c PROGRAM` (and `bash -c`), and `sh FILE`: the program performed in THIS
+    /// session, under the same bounds and against the same tree and variables.
+    ///
+    /// `sh FILE` is the other way a program of an environment with storage is written — a
+    /// script the commands before it left in the tree — so the text performed is read out of
+    /// the SAME tree ([`Self::read_path`]) and nothing else: no host path is opened for it,
+    /// and a path the tree holds no file for is reported the way a shell reports a script it
+    /// cannot open, with the status it exits with.
     ///
     /// It counts against the same budget and the same DEPTH a command substitution does
     /// ([`Bounds::substitutions`], [`Bounds::substitution_depth`]): a nested shell is the
     /// other way one program can run another, so what bounds this module's own recursion has
     /// to count both.
     ///
-    /// Any other invocation — a script named by path, an interactive shell, a login shell —
-    /// needs something this session does not have, so it is a command that could not run.
-    fn run_nested_program(&mut self, arguments: &[String]) -> i32 {
-        let Some((flag, rest)) = arguments.split_first() else {
+    /// Any other invocation — an interactive shell, a login shell, a program read from
+    /// standard input — needs something this session does not have, so it is a command that
+    /// could not run.
+    fn run_nested_program(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
+        let Some((first, rest)) = arguments.split_first() else {
             return self.config.statuses.could_not_run;
         };
-        if flag != "-c" {
+        let program = if first == "-c" {
+            match rest.first() {
+                Some(program) => program.clone(),
+                None => return self.config.statuses.could_not_run,
+            }
+        } else if first.starts_with('-') {
             return self.config.statuses.could_not_run;
-        }
-        let Some(program) = rest.first() else {
-            return self.config.statuses.could_not_run;
+        } else {
+            match self.read_path(first) {
+                Some(text) => text,
+                None => {
+                    let _ = self.write_stderr(
+                        &format!("sh: {first}: No such file or directory\n"),
+                        redirections,
+                    );
+                    return self.config.statuses.could_not_run;
+                }
+            }
         };
         if self.substitutions_left == 0 || self.nesting_depth() >= self.config.bounds.substitution_depth
         {
@@ -1829,7 +2062,7 @@ impl ShellSession {
         }
         self.substitutions_left = self.substitutions_left.saturating_sub(1);
         self.nested_programs = self.nested_programs.saturating_add(1);
-        let status = self.run_program(program);
+        let status = self.run_program(&program);
         self.nested_programs = self.nested_programs.saturating_sub(1);
         status
     }

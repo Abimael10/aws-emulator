@@ -290,7 +290,7 @@ async fn assert_terminated(router: &MultiServiceRouter, case: &str, session: &St
     let refused = invoke_list_files(router, &session.interpreter, &session.session_id).await;
     assert_eq!(
         (refused.status, refused.error_code().as_str()),
-        (409, "ConflictException"),
+        (400, "ValidationException"),
         "case {case:?}: a terminated session serves no tool, got {} with {:?}",
         refused.status,
         refused.body

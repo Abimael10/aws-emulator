@@ -10317,6 +10317,7 @@ dependencies = [
  "rquickjs",
  "serde_json",
  "service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol",
+ "service-com-amazonaws-lambda-awsgirapiservice",
  "service-common",
  "sha2 0.10.9",
  "tokio",
