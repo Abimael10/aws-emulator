@@ -3198,6 +3198,20 @@ pub fn names_an_execution(arn: &str) -> bool {
     read_execution_arn(arn, &arn_region(arn)).is_ok()
 }
 
+/// The STATE MACHINE the execution `arn` is a run of, or `None` for a value that is
+/// not an execution ARN of this service.
+///
+/// An execution ARN carries the name of the state machine it is of
+/// ([`read_execution_arn`]), so the owning state machine's ARN is a function of the
+/// execution ARN alone and nothing is looked up to answer it — which is what lets a
+/// caller name that state machine before the store is consulted. Read in whatever
+/// region the ARN itself names, exactly as [`names_an_execution`] reads one.
+pub fn execution_state_machine_arn(arn: &str) -> Option<String> {
+    let region = arn_region(arn);
+    let (name, _execution) = read_execution_arn(arn, &region).ok()?;
+    Some(state_machine_arn(&region, &name))
+}
+
 /// Whether `id` is one of the ids this store mints: a version-4 UUID as
 /// [`ComAmazonawsSfnAwsstepfunctionsState::fresh_execution_id`] renders it, 8-4-4-4-12
 /// in lowercase hexadecimal.

@@ -58,8 +58,10 @@
 //!
 //! The resource is what the request ADDRESSES: the ARN it carries in the member THAT
 //! OPERATION names its resource by ([`ADDRESSED_BY`], keyed by operation so a member
-//! another operation names its resource by cannot decide this one), the ARN a create would
-//! MINT for the name it carries ([`minted_resource`]), and otherwise [`any_resource`] — a
+//! another operation names its resource by cannot decide this one), the resource the TASK
+//! TOKEN it carries belongs to for an operation addressed that way
+//! ([`ADDRESSED_BY_TASK_TOKEN`]), the ARN a create would MINT for the name it carries
+//! ([`minted_resource`]), and otherwise [`any_resource`] — a
 //! call that names no resource of this service in a member of its own, which is judged
 //! against EVERY resource of this service in the account and Region the request was made
 //! for, written in this service's own ARN form with the parts that name one resource
@@ -70,6 +72,16 @@
 //! alias is to point at) is in that last group: the ARN it would be judged against is not a
 //! member of the request, so such a call is decided against every resource rather than
 //! against an ARN read out of a nested shape.
+//!
+//! A `SendTask*` call carries no ARN at all — the task it settles is named by the
+//! `taskToken` the service itself minted for that task — and a task token of this service
+//! NAMES the resource its task is of ([`crate::state::read_task_token`]): the activity a
+//! worker was handed the task by, and for a callback (`.waitForTaskToken`) task the
+//! execution waiting at it, whose own resource is the STATE MACHINE it is a run of. So such
+//! a call is judged against that resource, read out of the token the request carried and
+//! before anything is looked up, exactly as every other request is judged against the
+//! resource it names. A value that is not a token this service ever minted names nothing, so
+//! a call carrying one is judged as a call that named no resource at all.
 
 use ::std::sync::Arc;
 
@@ -84,11 +96,11 @@ use super::authorization::{caller_action_denial, operation_action, service_actio
 pub const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 
 /// The resource a request that names no resource of this service in a member of its own is
-/// judged against, as AWS writes it for such a request — a listing, a call addressed by a
-/// task token, a state tested without a state machine, a definition validated without one,
-/// and a create whose resource is named only inside a nested shape (see the module docs):
-/// every resource of this service in the Region the request was made for and the account
-/// this emulator serves, spelled by the one place this crate writes that ARN
+/// judged against, as AWS writes it for such a request — a listing, a state tested without a
+/// state machine, a definition validated without one, a create whose resource is named only
+/// inside a nested shape, and a call carrying a task token this service never minted (see the
+/// module docs): every resource of this service in the Region the request was made for and
+/// the account this emulator serves, spelled by the one place this crate writes that ARN
 /// ([`crate::state::every_resource_arn`]).
 #[must_use]
 pub fn any_resource(region: &str) -> String {
@@ -133,6 +145,9 @@ pub const ADDRESSED_BY: &[(&str, &[&str])] = &[
     ("ListTagsForResource", &["resourceArn"]),
     ("PublishStateMachineVersion", &["stateMachineArn"]),
     ("RedriveExecution", &["executionArn"]),
+    // The three `SendTask*` operations name no ARN: the task each settles is named by the
+    // `taskToken` the service minted for it, which is where their resource is read from
+    // ([`ADDRESSED_BY_TASK_TOKEN`]).
     ("SendTaskFailure", &[]),
     ("SendTaskHeartbeat", &[]),
     ("SendTaskSuccess", &[]),
@@ -158,6 +173,53 @@ pub fn addressed_by(operation: &str) -> &'static [&'static str] {
         .iter()
         .find(|(named, _)| *named == operation)
         .map_or(&[], |(_, members)| *members)
+}
+
+/// The member a request carries the TASK TOKEN of the task it is about in.
+///
+/// Source: the one member each of the operations below declares the token under
+/// (`SendTaskSuccessInput$taskToken`, `SendTaskFailureInput$taskToken`,
+/// `SendTaskHeartbeatInput$taskToken`).
+const TASK_TOKEN_MEMBER: &str = "taskToken";
+
+/// The operations whose request names the resource it is about through a TASK TOKEN rather
+/// than through an ARN of its own.
+///
+/// Source: every operation of this model whose input declares [`TASK_TOKEN_MEMBER`] — the
+/// three `SendTask*` calls a worker settles or renews a task with
+/// (`smithy_query(query="operation",operation="SendTaskSuccess,SendTaskFailure,SendTaskHeartbeat",model_path="services/service-com-amazonaws-sfn-awsstepfunctions/smithy-model/com-amazonaws-sfn-awsstepfunctions.json")`).
+/// Public, so that catalog is re-derived from the model by this crate's own tests
+/// (`tests/all/identity_policy_authorization.rs`) rather than only transcribed here.
+pub const ADDRESSED_BY_TASK_TOKEN: &[&str] =
+    &["SendTaskFailure", "SendTaskHeartbeat", "SendTaskSuccess"];
+
+/// Whether `operation` names the resource it addresses through a task token
+/// ([`ADDRESSED_BY_TASK_TOKEN`]).
+#[must_use]
+pub fn addressed_by_task_token(operation: &str) -> bool {
+    ADDRESSED_BY_TASK_TOKEN.contains(&operation)
+}
+
+/// The resource of this service the task token `token` belongs to, or `None` for a value
+/// this service never minted — which names nothing, so a call carrying one is judged as a
+/// call that named no resource at all.
+///
+/// A token NAMES the resource its task is of ([`crate::state::read_task_token`]): the
+/// ACTIVITY a worker was handed the task by, which is itself a resource of this service, and
+/// for a callback (`.waitForTaskToken`) task the EXECUTION waiting at it — a run of a state
+/// machine, so the resource the task belongs to is that STATE MACHINE
+/// ([`crate::state::execution_state_machine_arn`]). RECORDED behaviour for that second
+/// reading: a refusal of a `SendTask*` call made with a callback token names the state
+/// machine the waiting execution runs on `on resource:`, not the execution and not every
+/// resource — the model declares no error of its own for an authorization refusal, so the
+/// recorded refusal is what says which resource such a call is about.
+///
+/// Both readings are functions of the token alone, so nothing is looked up to decide the
+/// call and a token whose task has already been closed is judged exactly as one whose task
+/// is outstanding.
+fn token_resource(token: &str) -> Option<String> {
+    let named = crate::state::read_task_token(token)?;
+    Some(crate::state::execution_state_machine_arn(&named).unwrap_or(named))
 }
 
 /// The operation of THIS service that `routing_key` names, spelled by this service's own
@@ -275,6 +337,15 @@ fn addressed_in(submitted: Option<&::serde_json::Value>, operation: &str, region
     for named in addressed_by(operation) {
         if let Some(arn) = member(named) {
             return arn;
+        }
+    }
+    // A `SendTask*` call names its resource only through the token the service minted for
+    // the task: the activity the task was handed out by, or the state machine whose
+    // execution is waiting at a callback task. Read from the token itself, so nothing is
+    // looked up to decide it.
+    if addressed_by_task_token(operation) {
+        if let Some(named) = member(TASK_TOKEN_MEMBER).as_deref().and_then(token_resource) {
+            return named;
         }
     }
     member(NAME_MEMBER)
@@ -438,6 +509,10 @@ mod tests {
     /// The Region the ARNs below are read in.
     const REGION: &str = "us-west-2";
 
+    /// A minted task id, in the 8-4-4-4-12 lowercase-hexadecimal form this service renders
+    /// a version-4 UUID in, so a token built from it is one this service would have minted.
+    const MINTED_ID: &str = "0f1e2d3c-4b5a-4968-8776-65544332211a";
+
     /// Every resource of this service in that Region: what a request naming none of them
     /// is judged against.
     fn any_resource_of_the_region() -> String {
@@ -445,14 +520,16 @@ mod tests {
     }
 
     /// RULE: a request is judged against the ARN it NAMES, in the member ITS OWN
-    /// operation names its resource by; one that names none of them is judged against the
-    /// ARN its name mints, and otherwise against every resource of this service.
+    /// operation names its resource by; one addressed by a TASK TOKEN is judged against the
+    /// resource that token BELONGS TO; one that names neither is judged against the ARN its
+    /// name mints, and otherwise against every resource of this service.
     ///
     /// The rows span every member of [`ADDRESSED_BY`] (including operations the issue this
     /// rule was written for did not cite), the precedence between the two members one
-    /// operation may carry, both creates, the three ways a request names no resource at
-    /// all, and a member another operation would be judged by carried on an operation that
-    /// does not model it.
+    /// operation may carry, both creates, every operation of
+    /// [`ADDRESSED_BY_TASK_TOKEN`] and both kinds of resource a token names, the ways a
+    /// request names no resource at all, and a member another operation would be judged by
+    /// carried on an operation that does not model it.
     #[test]
     fn a_request_is_judged_against_the_arn_it_names() {
         let machine = crate::state::state_machine_arn(REGION, "addressed");
@@ -536,7 +613,28 @@ mod tests {
                 any_resource_of_the_region(),
             ),
             (
-                "a call addressed by a task token",
+                "a settlement addressed by a callback task's token",
+                "SendTaskSuccess",
+                json!({
+                    "taskToken": crate::state::task_token(MINTED_ID, &execution),
+                    "output": "{}",
+                }),
+                machine.clone(),
+            ),
+            (
+                "a failure addressed by an activity task's token",
+                "SendTaskFailure",
+                json!({ "taskToken": crate::state::task_token(MINTED_ID, &activity) }),
+                activity.clone(),
+            ),
+            (
+                "a heartbeat addressed by a callback task's token",
+                "SendTaskHeartbeat",
+                json!({ "taskToken": crate::state::task_token(MINTED_ID, &execution) }),
+                machine.clone(),
+            ),
+            (
+                "a task token this service never minted",
                 "SendTaskSuccess",
                 json!({ "taskToken": "token", "output": "{}" }),
                 any_resource_of_the_region(),
@@ -545,6 +643,12 @@ mod tests {
                 "a state tested with no state machine around it",
                 "TestState",
                 json!({ "definition": r#"{"Type":"Pass","End":true}"# }),
+                any_resource_of_the_region(),
+            ),
+            (
+                "a task token carried on an operation that names none",
+                "DescribeExecution",
+                json!({ "taskToken": crate::state::task_token(MINTED_ID, &execution) }),
                 any_resource_of_the_region(),
             ),
             (

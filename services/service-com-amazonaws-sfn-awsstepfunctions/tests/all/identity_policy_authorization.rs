@@ -31,14 +31,23 @@
 //! own Smithy model below, so a model that grows an operation, or renames the member one
 //! addresses its resource by, fails here rather than silently deciding that call against
 //! every resource.
+//!
+//! A `SendTask*` call names no ARN of its own, so the last test here takes the same rule
+//! over the resource its TASK TOKEN belongs to — an activity's task and a callback
+//! (`.waitForTaskToken`) task of a state machine's execution — with the token read back out
+//! of the work this service handed it to.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_sfn_awsstepfunctions::service::identity_authorization;
+use service_com_amazonaws_sfn_awsstepfunctions::state::{
+    read_task_token, task_authorization, EVENT_TASK_SUBMITTED,
+};
 use service_com_amazonaws_sfn_awsstepfunctions::EmulatedService;
 
 use crate::execution_data_encryption::{form_encode, xml_element, SFN};
@@ -276,6 +285,33 @@ impl Emulator {
             arn: xml_element(&assumed, "Arn")
                 .unwrap_or_else(|| panic!("AssumeRole answers the session's Arn, got {assumed}")),
         }
+    }
+
+    /// An IAM role a STATE MACHINE acts as: trusted by this service's own principal, and
+    /// allowed every action of this service, so the integration call a `Task` state makes is
+    /// really served. Answers its ARN.
+    async fn state_machine_role(&self, role_name: &str) -> String {
+        let trust = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": task_authorization::SERVICE_PRINCIPAL },
+                "Action": "sts:AssumeRole",
+            }]
+        });
+        self.query(
+            "iam",
+            IAM_VERSION,
+            "CreateRole",
+            &[
+                ("RoleName", role_name.to_string()),
+                ("AssumeRolePolicyDocument", trust.to_string()),
+            ],
+        )
+        .await;
+        self.put_role_policy(role_name, &allowing(&["states:*"], &["*"]))
+            .await;
+        format!("arn:aws:iam::{ACCOUNT}:role/{role_name}")
     }
 
     /// Replace the inline policy of the role `role_name`, which is how a grant is put in
@@ -867,7 +903,10 @@ async fn a_grant_is_read_for_the_resource_the_request_names() {
 /// (`service::identity_authorization::ADDRESSED_BY`), which is a transcription of this
 /// crate's Smithy model: every operation the model binds carries a row, every member a row
 /// names is a member of THAT operation's own input, and every member of an input that
-/// names an ARN of this service's own resources is listed for it.
+/// names an ARN of this service's own resources is listed for it. Its companion
+/// (`service::identity_authorization::ADDRESSED_BY_TASK_TOKEN`) is the same transcription
+/// for the operations that name their resource through a task token instead: exactly the
+/// ones whose input declares `taskToken`.
 ///
 /// So a model that grows an operation, renames a member, or moves a resource ARN onto
 /// another operation fails here rather than leaving that call judged against every
@@ -883,9 +922,14 @@ fn the_catalog_of_addressed_members_is_the_model_s_own() {
         .and_then(Value::as_object)
         .expect("the Smithy model carries a shapes map");
 
+    // The member a request carries the task token of the task it is about in, which is how
+    // an operation that names no ARN of its own still names a resource.
+    let task_token_member = "taskToken";
+
     // The members of an input that name an ARN of a resource of THIS service: every member
     // the catalog may list, read off the model's own member names rather than guessed at.
-    // A `roleArn` names an IAM role and a `taskToken` names no resource, so neither is one.
+    // A `roleArn` names an IAM role, and a `taskToken` is no ARN — it names its resource
+    // through the token's own contents — so neither is one.
     let names_a_resource = |member: &str| {
         matches!(
             member,
@@ -944,6 +988,15 @@ fn the_catalog_of_addressed_members_is_the_model_s_own() {
                  service, which the catalog does not list for it; it lists {listed:?}"
             );
         }
+        // An operation is judged through its task token exactly when its own input carries
+        // one, so the two catalogs cannot drift from the model either way.
+        let carries_token = member_names.contains(&task_token_member);
+        let judged_by_token = identity_authorization::addressed_by_task_token(operation);
+        assert_eq!(
+            judged_by_token, carries_token,
+            "case {operation:?}: {input} declares {task_token_member:?}={carries_token}, so \
+             expected the token catalog to carry it={carries_token}, got {judged_by_token}"
+        );
     }
     assert_eq!(
         bound,
@@ -952,4 +1005,346 @@ fn the_catalog_of_addressed_members_is_the_model_s_own() {
          operation(s)",
         identity_authorization::ADDRESSED_BY.len()
     );
+}
+
+/// How long a poll below waits for a condition this service owes — a task queued on an
+/// activity, a callback task's token handed to the work it called.
+///
+/// Generous: nothing here measures how fast the host is, so the deadline is only a backstop
+/// against a condition that never holds at all.
+const TOKEN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a poll below waits between two looks at the condition it waits FOR.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The child a nested-execution callback task starts: it runs to its own end, because what
+/// the parent waits for is the TOKEN and not the child.
+const CALLBACK_CHILD: &str =
+    r#"{"StartAt":"Done","States":{"Done":{"Type":"Pass","Result":{"ok":true},"End":true}}}"#;
+
+/// The optimized integration a callback task below is handed over by: a nested Step
+/// Functions execution, which carries the token as the child's own input and so needs no
+/// other service mounted.
+const CALLBACK_RESOURCE: &str = "arn:aws:states:::states:startExecution.waitForTaskToken";
+
+/// An ACTIVITY and a state machine whose one `Task` hands its work to that activity: the two
+/// together are what queues a task a worker can be handed a token for.
+async fn activity_handoff(emulator: &Emulator, name: &str) -> (String, String) {
+    let created = emulator
+        .sfn("CreateActivity", &json!({ "name": name }))
+        .await;
+    let activity = string(&created, "activityArn");
+    let definition = json!({
+        "StartAt": "HandOff",
+        "States": { "HandOff": { "Type": "Task", "Resource": activity, "End": true } },
+    });
+    let machine = emulator
+        .sfn(
+            "CreateStateMachine",
+            &json!({
+                "name": format!("{name}-machine"),
+                "definition": definition.to_string(),
+                "roleArn": ROLE_ARN,
+            }),
+        )
+        .await;
+    (activity, string(&machine, "stateMachineArn"))
+}
+
+/// A token of an OUTSTANDING activity task, as `GetActivityTask` hands it to a worker: one
+/// execution of `machine` queues a task on `activity`, and the poll is repeated until the
+/// worker is handed its token or the deadline passes.
+async fn activity_task_token(
+    emulator: &Emulator,
+    case: &str,
+    activity: &str,
+    machine: &str,
+    run: &str,
+) -> String {
+    emulator
+        .sfn(
+            "StartExecution",
+            &json!({ "stateMachineArn": machine, "name": run }),
+        )
+        .await;
+    let deadline = Instant::now() + TOKEN_DEADLINE;
+    loop {
+        let polled = emulator
+            .sfn(
+                "GetActivityTask",
+                &json!({ "activityArn": activity, "workerName": run }),
+            )
+            .await;
+        if let Some(token) = polled.get("taskToken").and_then(Value::as_str) {
+            return token.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected a task queued on {activity}, got {polled:?}"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// The parent state machine every callback token below is minted by, with the child its
+/// `Task` starts: one `Task` asking for the callback pattern over a nested execution, which
+/// is handed the token through `$$.Task.Token`.
+///
+/// `role_arn` is the role the machine acts as, which this service assumes to make the
+/// integration call — so it has to be one this service may assume.
+async fn callback_machine(emulator: &Emulator, name: &str, role_arn: &str) -> String {
+    let child = emulator
+        .sfn(
+            "CreateStateMachine",
+            &json!({
+                "name": format!("{name}-child"),
+                "definition": CALLBACK_CHILD,
+                "roleArn": role_arn,
+            }),
+        )
+        .await;
+    let child_arn = string(&child, "stateMachineArn");
+    let definition = json!({
+        "StartAt": "WaitForCallback",
+        "States": { "WaitForCallback": {
+            "Type": "Task",
+            "Resource": CALLBACK_RESOURCE,
+            "Parameters": {
+                "stateMachineArn": child_arn,
+                "input": { "token.$": "$$.Task.Token" },
+            },
+            "End": true,
+        }},
+    });
+    let parent = emulator
+        .sfn(
+            "CreateStateMachine",
+            &json!({
+                "name": format!("{name}-parent"),
+                "definition": definition.to_string(),
+                "roleArn": role_arn,
+            }),
+        )
+        .await;
+    string(&parent, "stateMachineArn")
+}
+
+/// A token of an OUTSTANDING callback (`.waitForTaskToken`) task, with the execution waiting
+/// at it: one execution of `machine` hands its token to the child it starts, so the token is
+/// read back out of the child's own input — the work outside holding it, exactly as a Lambda
+/// handler holds the token its invocation was given.
+async fn callback_task_token(
+    emulator: &Emulator,
+    case: &str,
+    machine: &str,
+    run: &str,
+) -> (String, String) {
+    let started = emulator
+        .sfn(
+            "StartExecution",
+            &json!({ "stateMachineArn": machine, "name": run }),
+        )
+        .await;
+    let execution = string(&started, "executionArn");
+    let deadline = Instant::now() + TOKEN_DEADLINE;
+    loop {
+        let history = emulator
+            .sfn(
+                "GetExecutionHistory",
+                &json!({ "executionArn": execution }),
+            )
+            .await;
+        let submitted = history
+            .get("events")
+            .and_then(Value::as_array)
+            .and_then(|events| {
+                events
+                    .iter()
+                    .find(|event| {
+                        event.get("type").and_then(Value::as_str) == Some(EVENT_TASK_SUBMITTED)
+                    })
+                    .cloned()
+            });
+        if let Some(event) = submitted {
+            let details = event.get("taskSubmittedEventDetails").unwrap_or_else(|| {
+                panic!("case {case:?}: expected the submission's details in {event:?}")
+            });
+            let answered: Value = serde_json::from_str(&string(details, "output"))
+                .unwrap_or_else(|why| panic!("case {case:?}: the submission's output is JSON: {why}"));
+            let child_execution = string(&answered, "ExecutionArn");
+            let described = emulator
+                .sfn(
+                    "DescribeExecution",
+                    &json!({ "executionArn": child_execution }),
+                )
+                .await;
+            let input: Value = serde_json::from_str(&string(&described, "input"))
+                .unwrap_or_else(|why| panic!("case {case:?}: the child's input is JSON: {why}"));
+            return (string(&input, "token"), execution);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the callback task to be handed over, got {history:?}"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// One `SendTask*` call the rule below is taken over: which operation, and which kind of
+/// resource the token it carries names.
+struct TokenRow {
+    case: &'static str,
+    operation: &'static str,
+    /// The members the call carries beside its `taskToken`.
+    extra: Value,
+    /// Whether the token names an ACTIVITY (else the EXECUTION waiting at a callback task).
+    activity: bool,
+}
+
+/// RULE: a `SendTask*` call names no ARN of its own — the task it settles is named by the
+/// task token this service minted for that task — so it is judged against the RESOURCE THAT
+/// TASK BELONGS TO: the activity a worker was handed the task by, and for a callback
+/// (`.waitForTaskToken`) task, whose token names the execution waiting at it, the state
+/// machine that execution is a run of. A caller whose identity-based documents allow the
+/// action on that resource is served; one whose grant names another resource of this
+/// service, or nothing of this service at all, is refused HTTP 400 `AccessDeniedException`
+/// naming the principal, the action and that same resource — and the refused call settles
+/// nothing, which the call served after it proves by settling the task that is still
+/// outstanding.
+///
+/// The rows differ along what the rule generalises over: the OPERATION (all three calls that
+/// carry a task token) and the KIND of task the token names (an activity's task, and a
+/// callback task of a state machine's execution).
+#[tokio::test]
+async fn a_send_task_call_is_judged_against_the_resource_its_token_names() {
+    let rows = [
+        TokenRow {
+            case: "a success on a callback task",
+            operation: "SendTaskSuccess",
+            extra: json!({ "output": r#"{"approved":true}"# }),
+            activity: false,
+        },
+        TokenRow {
+            case: "a heartbeat on a callback task",
+            operation: "SendTaskHeartbeat",
+            extra: json!({}),
+            activity: false,
+        },
+        TokenRow {
+            case: "a failure on a callback task",
+            operation: "SendTaskFailure",
+            extra: json!({ "error": "WorkerSaidNo", "cause": "the work outside refused" }),
+            activity: false,
+        },
+        TokenRow {
+            case: "a success on an activity task",
+            operation: "SendTaskSuccess",
+            extra: json!({ "output": r#"{"approved":true}"# }),
+            activity: true,
+        },
+        TokenRow {
+            case: "a heartbeat on an activity task",
+            operation: "SendTaskHeartbeat",
+            extra: json!({}),
+            activity: true,
+        },
+        TokenRow {
+            case: "a failure on an activity task",
+            operation: "SendTaskFailure",
+            extra: json!({ "error": "WorkerSaidNo", "cause": "the worker refused" }),
+            activity: true,
+        },
+    ];
+
+    let emulator = Emulator::new();
+    let machine_role = emulator.state_machine_role("sfn-token-machines").await;
+    let (activity, activity_machine) = activity_handoff(&emulator, "token-judged").await;
+    let callback_parent = callback_machine(&emulator, "token-judged", &machine_role).await;
+
+    for (index, row) in rows.iter().enumerate() {
+        let TokenRow {
+            case,
+            operation,
+            extra,
+            activity: of_an_activity,
+        } = row;
+        let run = format!("token-run-{index}");
+        // What the token NAMES (the activity a worker polls, or the execution waiting at a
+        // callback task), and the resource of this service that task BELONGS TO — the two
+        // differ exactly for a callback task, whose execution is a run of a state machine.
+        let (token, named, judged) = if *of_an_activity {
+            let token =
+                activity_task_token(&emulator, case, &activity, &activity_machine, &run).await;
+            (token, activity.clone(), activity.clone())
+        } else {
+            let (token, execution) =
+                callback_task_token(&emulator, case, &callback_parent, &run).await;
+            (token, execution, callback_parent.clone())
+        };
+        let reads_as = read_task_token(&token).unwrap_or_else(|| {
+            panic!("case {case:?}: expected a token this service issued, got {token:?}")
+        });
+        assert_eq!(
+            reads_as, named,
+            "case {case:?}: expected the token to name {named}, got {reads_as}"
+        );
+
+        let mut request = json!({ "taskToken": token });
+        let members = request.as_object_mut().expect("the request is an object");
+        for (member, value) in extra.as_object().expect("the extra members are an object") {
+            members.insert(member.clone(), value.clone());
+        }
+        let action = format!("states:{operation}");
+        let role = format!("sfn-token-{index}");
+        let elsewhere = format!("{judged}-other");
+
+        // (the case's own wording, the document in force, whether the call is served)
+        let decisions = [
+            (
+                "nothing of this service",
+                allowing(&["s3:GetObject"], &["*"]),
+                false,
+            ),
+            (
+                "the action on another resource of this service",
+                allowing(&[action.as_str()], &[elsewhere.as_str()]),
+                false,
+            ),
+            (
+                "the action on the resource the token belongs to",
+                allowing(&[action.as_str()], &[judged.as_str()]),
+                true,
+            ),
+        ];
+        let principal = emulator.assumed_role(&role, &decisions[0].1).await;
+        for (allowed, document, served) in &decisions {
+            emulator.put_role_policy(&role, document).await;
+            let (status, answer) = emulator
+                .call_as(&principal.access_key_id, operation, &request)
+                .await;
+            let decided = format!("{case:?} allowing {allowed:?}");
+            if *served {
+                assert_eq!(
+                    status, 200,
+                    "case {decided}: expected the call to be served, got {status} with {answer:?}"
+                );
+                continue;
+            }
+            assert_eq!(
+                status, ACCESS_DENIED_STATUS,
+                "case {decided}: expected {ACCESS_DENIED_STATUS}, got {status} with {answer:?}"
+            );
+            assert_eq!(
+                error_code(&answer),
+                ACCESS_DENIED,
+                "case {decided}: expected {ACCESS_DENIED}, got {answer:?}"
+            );
+            let expected = not_authorized(&principal.arn, &action, &judged, &no_grant(&action));
+            assert_eq!(
+                message(&answer),
+                expected,
+                "case {decided}: expected {expected:?}, got {answer:?}"
+            );
+        }
+    }
 }

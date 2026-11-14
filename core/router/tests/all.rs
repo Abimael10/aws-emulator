@@ -4207,3 +4207,19 @@ mod cloudformation_appsync_custom_domains;
 // than re-typed: past the first item an inner doc comment is `E0753` and compiles no suite
 // of this target, and the rule they repeated stands in the module doc at the HEAD of this
 // file.)
+// header that a merge of two appended tails landed here: an inner doc comment is legal only
+// before the first item of a crate root, so in this tail it is an ordinary comment.)
+// this file and for every service crate's `tests/all.rs`. (The same fragment again, and an
+// ordinary comment for the same reason: `//!` is only accepted before the first item.)
+// suite left at the top level of `tests/` fails the build. (The same header fragment once
+// more, as an ordinary comment: `//!` is legal only before the first item of a crate root.)
+// (A landing appended this fragment of the header here typed with `//!`: an inner doc
+// comment is legal only BEFORE the first item, so in this tail it is `E0753` and compiles
+// nothing. Declare each suite exactly ONCE: this is one crate root, so a second `mod` for
+// the same name is `E0428` and fails every suite in this target.
+// `all/all_rs_declares_each_suite_once.rs` and
+// this file and every service crate's `tests/all.rs`, so nothing new goes here.)
+// first item of this crate root.)
+// declarations, for this file and for every service crate's `tests/all.rs`. (One more
+// fragment of the header that a landing appended here: past the first item a `//!` line is
+// `E0753` and compiles no suite in this target, so it stands as an ordinary comment.)
