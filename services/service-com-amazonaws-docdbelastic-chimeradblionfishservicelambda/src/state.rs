@@ -654,6 +654,30 @@ pub fn invalid_cluster_name(value: &str) -> ValidationException {
     }
 }
 
+/// The `ValidationException` (HTTP 400) for a restore asked to mint a cluster under a
+/// name an existing cluster already holds.
+///
+/// A restore does not word this as the `Invalid Input - '<subject>'. <rule>` sentence
+/// [`invalid_input`] builds, nor as the duplicate-name conflict a create answers
+/// ([`ResourceKind::duplicate_name_message`]): it states the rule that was broken —
+/// cluster names are compared case-insensitively, so a name is free only when NO
+/// cluster holds it in any spelling — and then names BOTH names it compared, the one
+/// the request spelled and the one the cluster already in state carries. Those two are
+/// the only variable parts; the rest of the sentence is fixed text.
+///
+/// `requested` is therefore the name exactly as the request spelled it (which is what a
+/// caller recognises, and may differ in case from the stored one) and `existing` is the
+/// stored name of the cluster holding it.
+pub fn cluster_name_taken(requested: &str, existing: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Invalid cluster name: Cluster names are case-insensitive and cannot be the same as \
+             name as an existing cluster. Cluster name {requested} is not valid because cluster \
+             {existing} exists."
+        ),
+    }
+}
+
 /// The member name as this service spells it inside a refusal sentence: the modelled
 /// member name with an initial capital (`shardCapacity` -> `ShardCapacity`, the
 /// spelling the recorded refusal of that member uses).
@@ -962,6 +986,17 @@ pub fn name_conflict(kind: ResourceKind, existing_arn: &str) -> ConflictExceptio
     )
 }
 
+/// What the service answers when a cluster cannot take the operation asked of it
+/// because a change is already in flight on it.
+///
+/// Like every other refusal sentence here the WHOLE message is fixed text: neither the
+/// cluster's name nor the transient status it is in is spliced into it — the cluster is
+/// identified by `ConflictException$resourceId` and its class by `resourceType` — so
+/// the one refusal a caller is expected to RETRY on is the same sentence for every
+/// cluster, every in-flight change and every transient status, which is what lets a
+/// client, a waiter or a runbook recognise it.
+pub const CLUSTER_IN_USE: &str = "Can't perform operation on cluster as it's in use";
+
 /// Refuse a modification of a cluster whose status does not admit one.
 ///
 /// An elastic cluster carries out one change at a time. A change the service is still
@@ -975,7 +1010,8 @@ pub fn name_conflict(kind: ResourceKind, existing_arn: &str) -> ConflictExceptio
 ///
 /// Call [`ClusterRecord::settle_due`] first, so a cluster whose transition the clock
 /// has already made due is judged by the status it is owed and not by the one it was
-/// left in.
+/// left in. The refusal is worded by [`CLUSTER_IN_USE`], so every state-refused
+/// modification of every cluster states it identically.
 pub fn ensure_modifiable(record: &ClusterRecord) -> Result<(), ConflictException> {
     if record.is_settled_available() {
         return Ok(());
@@ -983,10 +1019,7 @@ pub fn ensure_modifiable(record: &ClusterRecord) -> Result<(), ConflictException
     Err(conflict(
         ResourceKind::Cluster,
         &record.cluster_arn,
-        format!(
-            "The elastic cluster {} is in {} status and cannot be modified until it is {}",
-            record.cluster_name, record.status, STATUS_ACTIVE
-        ),
+        CLUSTER_IN_USE.to_string(),
     ))
 }
 

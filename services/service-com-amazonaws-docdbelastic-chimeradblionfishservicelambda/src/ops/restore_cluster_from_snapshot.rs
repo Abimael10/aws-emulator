@@ -233,13 +233,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(RestoreClusterFromSnapshotErrorModeled::ServiceQuotaExceededException)?;
         // A name already in use is refused as request validation here, not as a state
         // conflict: the recorded refusal of a restore under an existing cluster's name
-        // is HTTP 400 `ValidationException`, where `CreateCluster` answers 409.
-        if guard.cluster_names.contains_key(&cluster_name) {
+        // is HTTP 400 `ValidationException`, where `CreateCluster` answers 409. The
+        // comparison is case-insensitive, which is the rule the refusal states, so it
+        // names both the name the request spelled and the stored name holding it.
+        if let Some(existing_arn) = guard.cluster_names.get(&cluster_name).cloned() {
+            let existing_name = guard
+                .clusters
+                .get(&existing_arn)
+                .map(|record| record.cluster_name.clone())
+                .unwrap_or_else(|| cluster_name.clone());
             return Err(RestoreClusterFromSnapshotErrorModeled::ValidationException(
-                state::invalid_input(
-                    &cluster_name,
-                    "ClusterName must not name an elastic cluster that already exists.",
-                ),
+                state::cluster_name_taken(&input.cluster_name, &existing_name),
             )
             .into());
         }

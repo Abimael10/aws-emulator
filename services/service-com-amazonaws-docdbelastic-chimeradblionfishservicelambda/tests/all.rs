@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/cluster_delete_state_gate.rs"]
 mod cluster_delete_state_gate;
+#[path = "all/cluster_in_use_wording.rs"]
+mod cluster_in_use_wording;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
 #[path = "all/cluster_snapshot_copy.rs"]
@@ -37,6 +39,8 @@ mod not_found_wording;
 mod pending_maintenance_reads;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/restore_name_taken_wording.rs"]
+mod restore_name_taken_wording;
 #[path = "all/resource_tag_writes.rs"]
 mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]
