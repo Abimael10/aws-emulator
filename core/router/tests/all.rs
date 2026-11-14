@@ -5276,3 +5276,20 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // reason it states: this line landed here as `//!`, which compiles no suite of this target.)
 // reason they state: as `//!` in this tail they compiled nothing.)
 // appended to the tail of this file would compile no suite of this target. (Seven more
+//! declarations and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` the notes,
+//! than leaving a note in the appended tail below.
+// head of this file: two branches landing at once declared each of them here as well, and a
+// module declared twice compiles neither copy, so the copies that stood here are gone.)
+// above: two branches landing at once appended a second declaration of it here, and a
+// (Fragments of this file's own header, and notes about declarations that are no longer
+// duplicated, were pruned from this tail: the rule they repeated stands in the module doc
+// at the HEAD of this file, and an inner doc comment past the first item is `E0753`.)
+// item an inner doc comment is `E0753`, so they are gone rather than re-typed.)
+// leaving a note at the end of this file — an inner doc comment is legal only before the
+// first item, so one appended to the tail is `E0753` and compiles nothing.
+// (The notes that stood here were fragments of this file's own header and bookkeeping about
+// declarations that are no longer duplicated; they were pruned. Declare each suite ONCE,
+// with its `#[path]` line, and keep the rules in the module doc at the HEAD of this file,
+// where an inner doc comment is legal.)
+// (Pruned, for the reason recorded above: everything that stood here was a fragment of this
+// file's own header or a note about a duplicate declaration that is already gone.)

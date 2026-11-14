@@ -472,29 +472,43 @@ pub fn bucket_name_of(bucket_arn: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// What `s3RecordingConfig`'s bucket resolution answers when the bucket cannot be
-/// resolved: the service's SINGLE fixed refusal text for that condition, whatever made
-/// the resolution fail — a `bucketArn` that names no bucket and a bucket the account does
-/// not hold are the same answer, because both are the bucket's location failing to
-/// resolve. Entirely fixed text: it interpolates no bucket, ARN, account or region. As
-/// with every other refusal here the status (431) and the error code
-/// (`InvalidParameterException`) are the contract, and this is the wording that goes
-/// with them.
-pub const UNRESOLVABLE_RECORDING_BUCKET: &str =
+/// What `s3RecordingConfig`'s bucket resolution answers when there IS no such bucket: the
+/// service's fixed refusal text for that condition. It is the answer whenever the bucket
+/// the `bucketArn` names is not there — a bucket S3 reports this account does not hold,
+/// and a `bucketArn` that names no bucket at all, are both a bucket that does not exist.
+/// Entirely fixed text: it interpolates no bucket, ARN, account or region. As with every
+/// other refusal here the status (431) and the error code (`InvalidParameterException`)
+/// are the contract, and this is the wording that goes with them.
+pub const RECORDING_BUCKET_DOES_NOT_EXIST: &str =
+    "Unable to create new S3 endpoint config - bucket does not exist.";
+
+/// What the same resolution answers for the OTHER condition it can fail on: a bucket S3
+/// answered about without handing over its location — the read of the location itself was
+/// refused, which is the condition whose remedy is a permission on the bucket, and why
+/// this text names that permission while [`RECORDING_BUCKET_DOES_NOT_EXIST`] does not.
+/// Telling the two apart is what tells a caller whether to fix a name or a policy.
+///
+/// Fixed text in the same way, and carried with the same status and error code.
+pub const RECORDING_BUCKET_LOCATION_UNREADABLE: &str =
     "Unable to create new S3 endpoint config - unable to get location of bucket. Ensure \
      that Ground Station has s3:GetBucketLocation permissions on the bucket.";
 
-/// Refuse a `configData` whose recording bucket cannot be resolved — and only then.
+/// Refuse a `configData` whose recording bucket cannot be resolved — and only then,
+/// naming the condition that stopped the resolution.
 ///
 /// An `s3RecordingConfig` names the bucket to record to by ARN, and Ground Station
 /// resolves that bucket — it has to know where the bucket is before it can record to it —
-/// before it will store the config: a bucket S3 reports this account does not hold, and a
-/// `bucketArn` that names no bucket at all, are refused with the modelled
-/// `InvalidParameterException` (HTTP 431) instead of being stored, so a caller never holds
-/// a recording config that cannot record. Both failures are ONE refusal, carrying
-/// [`UNRESOLVABLE_RECORDING_BUCKET`]: what the caller is told is that the bucket's
-/// location could not be obtained, not which way the lookup came back empty. A bucket that
-/// RESOLVES is accepted.
+/// before it will store the config: a bucket that cannot be resolved is refused with the
+/// modelled `InvalidParameterException` (HTTP 431) instead of being stored, so a caller
+/// never holds a recording config that cannot record. A bucket that RESOLVES is accepted.
+///
+/// WHICH refusal is decided by what S3 answered, because the two conditions are remedied
+/// differently. A bucket S3 reports is not there — and a `bucketArn` that names no bucket
+/// at all, which is the same thing settled without asking — carries
+/// [`RECORDING_BUCKET_DOES_NOT_EXIST`]; a bucket S3 answered about while withholding its
+/// location carries [`RECORDING_BUCKET_LOCATION_UNREADABLE`], the text that names the
+/// permission such a read needs. A caller is told to fix the name it typed only when the
+/// name is what is wrong.
 ///
 /// S3 is reached the way the framework documents a handler reaching another emulated
 /// service ([`smithy_server_runtime::OperationContext::callback`]): an AWS SDK client
@@ -506,9 +520,9 @@ pub const UNRESOLVABLE_RECORDING_BUCKET: &str =
 /// through an HTTP response header […] we recommend using the HeadBucket operation for
 /// bucket Region discovery"), so one call answers the resolution this refusal is about.
 ///
-/// `None` means the create or update may proceed. That INCLUDES every answer that is not
-/// S3 reporting the bucket absent — a router with no S3 mounted, or any other failure to
-/// ask: nothing is then known about the bucket, and a refusal has to be grounded in what
+/// `None` means the create or update may proceed. That INCLUDES every failure in which S3
+/// never answered at all — a router with no S3 mounted, or any other failure to ask:
+/// nothing is then known about the bucket, and a refusal has to be grounded in what
 /// S3 answered rather than assumed (worth a warning, because that is a deployment where
 /// this gate does not run). Every other `ConfigTypeData` member names no bucket and is
 /// nothing for this to resolve.
@@ -520,17 +534,18 @@ pub async fn unresolvable_recording_bucket(
     let ConfigTypeData::s3RecordingConfig(recording) = config_data else {
         return None;
     };
-    let refusal = || {
+    let refusal = |message: &str| {
         invalid_parameter(
             "configData.s3RecordingConfig.bucketArn",
-            UNRESOLVABLE_RECORDING_BUCKET.to_string(),
+            message.to_string(),
         )
     };
     // A value that is not an S3 bucket ARN names no bucket, and that is settled without
-    // asking S3: there is nothing to ask about. An ARN of any other service names no
-    // bucket either, however its resource part is spelled (see [`bucket_name_of`]).
+    // asking S3: there is nothing to ask about, and no such bucket exists. An ARN of any
+    // other service names no bucket either, however its resource part is spelled (see
+    // [`bucket_name_of`]).
     let Some(bucket) = bucket_name_of(&recording.bucket_arn) else {
-        return Some(refusal());
+        return Some(refusal(RECORDING_BUCKET_DOES_NOT_EXIST));
     };
     let answer = s3_client(ctx, region, ctx.callback().aws_credentials_provider())
         .head_bucket()
@@ -538,19 +553,19 @@ pub async fn unresolvable_recording_bucket(
         .send()
         .await;
     match answer {
-        // S3 holds the bucket, so the config can record to it.
+        // S3 holds the bucket and reported where it is, so the config can record to it.
         Ok(_) => None,
-        // S3 says this account holds no such bucket, so its location cannot be obtained
-        // either: the refusal is grounded.
-        Err(error) if bucket_reported_absent(&error) => Some(refusal()),
-        Err(error) => {
-            ::tracing::warn!(
-                bucket_arn = %recording.bucket_arn,
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "the recording config's bucket could not be resolved against S3"
-            );
-            None
-        }
+        Err(error) => match unresolved_bucket_condition(&error) {
+            Some(message) => Some(refusal(message)),
+            None => {
+                ::tracing::warn!(
+                    bucket_arn = %recording.bucket_arn,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "the recording config's bucket could not be resolved against S3"
+                );
+                None
+            }
+        },
     }
 }
 
@@ -589,18 +604,35 @@ fn s3_client(
     ::aws_sdk_s3::Client::from_conf(config)
 }
 
-/// Whether an S3 `HeadBucket` failure is S3 reporting that the bucket does not exist
-/// (`NotFound`, the only error that operation models), as opposed to the call not
-/// reaching S3 at all.
-fn bucket_reported_absent(
+/// The HTTP status Amazon S3 refuses a request its policies do not allow with
+/// (`AccessDenied`), which is the answer that withholds a bucket's location from a caller
+/// S3 holds the bucket for.
+const BUCKET_READ_DENIED_STATUS: u16 = 403;
+
+/// WHICH condition an S3 `HeadBucket` failure reports about the recording bucket, as the
+/// text the refusal carries — `None` when S3 reported no condition about the bucket at
+/// all, which grounds no refusal.
+///
+/// S3 answering `NotFound` (the only error that operation models) is the bucket not being
+/// there. S3 REFUSING the read — the access denial a missing permission on the bucket
+/// earns, which is the condition AWS names a remedy for — is an answer about a bucket
+/// whose location the caller may not have. Anything else settles nothing: the call may
+/// never have reached S3 (a deployment with no object storage behind it answers the
+/// request itself), and a refusal has to be grounded in what S3 said.
+fn unresolved_bucket_condition(
     error: &::aws_sdk_s3::error::SdkError<
         ::aws_sdk_s3::operation::head_bucket::HeadBucketError,
         ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
     >,
-) -> bool {
+) -> Option<&'static str> {
+    let answered = error.as_service_error()?;
+    if ::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found(answered) {
+        return Some(RECORDING_BUCKET_DOES_NOT_EXIST);
+    }
     error
-        .as_service_error()
-        .is_some_and(::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found)
+        .raw_response()
+        .is_some_and(|answer| answer.status().as_u16() == BUCKET_READ_DENIED_STATUS)
+        .then_some(RECORDING_BUCKET_LOCATION_UNREADABLE)
 }
 
 /// How long an upload URL `GetAgentTaskResponseUrl` hands out stays signed for.
@@ -1425,15 +1457,24 @@ pub fn list_filter_admits(named: &[String], value: &str) -> bool {
     named.is_empty() || named.iter().any(|wanted| wanted == value)
 }
 
-/// The two members a window-filtered listing is asked for its window in, spelled once so
-/// the refusal below names and quotes the same members every listing binds.
-const SEARCH_WINDOW_START_PARAMETER: &str = "startTime";
-
-/// See [`SEARCH_WINDOW_START_PARAMETER`].
+/// The member a window-filtered listing's window refusal names: the `endTime` that does
+/// not run forwards from the request's `startTime`, spelled once so every listing blames
+/// the same member.
 const SEARCH_WINDOW_END_PARAMETER: &str = "endTime";
 
+/// What a listing answers a window that does not run forwards: the service's fixed
+/// sentence for that error class, carried with the status (431) and the error code
+/// (`InvalidParameterException`) the model declares.
+///
+/// Entirely fixed text — it quotes neither instant the request carried, nor the names of
+/// the two members it carried them in — so every such request reads the same words, and it
+/// is the same sentence whichever window-filtered listing was asked
+/// ([`validate_search_window`]).
+pub const SEARCH_WINDOW_NOT_FORWARDS: &str = "Invalid request: End date must be after start date";
+
 /// Refuse a search window that does not run forwards, with the modelled
-/// `InvalidParameterException` (HTTP 431) naming [`SEARCH_WINDOW_END_PARAMETER`].
+/// `InvalidParameterException` (HTTP 431) naming [`SEARCH_WINDOW_END_PARAMETER`] and
+/// carrying [`SEARCH_WINDOW_NOT_FORWARDS`].
 ///
 /// The window a listing searches runs forwards: a request whose `endTime` precedes its
 /// `startTime` describes no interval at all, so it is refused rather than answered with
@@ -1452,9 +1493,7 @@ pub fn validate_search_window(
     if end_time.as_secs_f64() < start_time.as_secs_f64() {
         return Err(invalid_parameter(
             SEARCH_WINDOW_END_PARAMETER,
-            format!(
-                "{SEARCH_WINDOW_END_PARAMETER} must not precede {SEARCH_WINDOW_START_PARAMETER}"
-            ),
+            SEARCH_WINDOW_NOT_FORWARDS.to_string(),
         ));
     }
     Ok(())
@@ -1783,16 +1822,31 @@ pub fn validate_tag_keys(keys: &[String]) -> Result<(), InvalidParameterExceptio
     Ok(())
 }
 
-/// The message every operation addressed at a config by its `(configType, configId)`
-/// pair carries when that pair names no config — built from the two `@httpLabel`
-/// members of the request, id before type, which is the rule the recorded corpus shows
-/// for this service's config reads.
+/// The message a READ of a config addressed by its `(configType, configId)` pair carries
+/// when that pair names no config — built from the two `@httpLabel` members of the
+/// request, id before type, which is the rule the recorded corpus shows for this service's
+/// config reads.
 ///
-/// It lives here rather than in one handler because the two operations that LOOK UP a
-/// config by that pair answer it — `GetConfig` and `DeleteConfig`. The operation that
-/// WRITES one does not: see [`config_mutation_not_found_message`].
+/// It lives here rather than in the handler because the text belongs to the error class of
+/// the operation that answers it, and the operation that answers THIS one is `GetConfig`.
+/// Neither of the two writes addressed by the same pair reuses it: the delete answers
+/// [`config_delete_not_found_message`] and the update answers
+/// [`config_mutation_not_found_message`], each the text of its own error class.
 pub fn config_not_found_message(config_type: &str, config_id: &str) -> String {
     format!("No config found with id {config_id} and type {config_type}")
+}
+
+/// The message `DeleteConfig` carries when the pair it addressed names no config.
+///
+/// The DELETE path words it its own way: the resource, then the identifiers the request's
+/// two `@httpLabel` members carried, then that it was not found — `Config <configId> with
+/// type <configType> not found`, where the read path ([`config_not_found_message`]) leads
+/// with the absence instead. The two operations are told apart by what they answer, so a
+/// caller distinguishing a failed read from a failed delete reads which one it called; the
+/// same split this service already makes between reading a mission profile and deleting
+/// one ([`mission_profile_delete_not_found_message`]).
+pub fn config_delete_not_found_message(config_type: &str, config_id: &str) -> String {
+    format!("Config {config_id} with type {config_type} not found")
 }
 
 /// The message `UpdateConfig` carries when the pair it addressed names no config.
@@ -2129,17 +2183,32 @@ pub fn config_reference_not_found_message(arn: &str, required_type: Option<&str>
     }
 }
 
-/// What this service answers when a dataflow endpoint group a request names does not
-/// exist: the service's own fixed sentence for that error class, which names the kind of
+/// What a READ of a dataflow endpoint group answers when the group a request names does
+/// not exist: the service's fixed sentence for that error class, which names the kind of
 /// resource and ends the sentence, and discloses neither the id nor the ARN that was asked
 /// for.
 ///
-/// It lives here rather than in one handler because every operation addressed at a group
-/// by its `{dataflowEndpointGroupId}` label answers it — `GetDataflowEndpointGroup` and
-/// `DeleteDataflowEndpointGroup` — so it is one text of the service: one resource, one
-/// error class, one sentence. The read's wording is the recorded one; the delete reads it
-/// from here rather than carrying a sentence of its own.
+/// `GetDataflowEndpointGroup`, which resolves a group by its `{dataflowEndpointGroupId}`
+/// label, answers it. The DELETE of a group answers its own, id-bearing text instead
+/// ([`dataflow_endpoint_group_delete_not_found_message`]), the same split this service
+/// makes between reading a mission profile and deleting one.
 pub const DATAFLOW_ENDPOINT_GROUP_NOT_FOUND: &str = "The specified group does not exist.";
+
+/// The message `DeleteDataflowEndpointGroup` carries when `{dataflowEndpointGroupId}`
+/// names no group: the fixed words `No Dataflow Endpoint Group found with id ` followed by
+/// the one variable part, the id the request path carried.
+///
+/// A delete reports WHICH group it could not find, because a caller deleting several at
+/// once attributes the failure by that id — the same split this service makes between
+/// reading a mission profile and deleting one
+/// ([`mission_profile_delete_not_found_message`]) and between reading a config and
+/// deleting one ([`config_delete_not_found_message`]); the read of a group answers the bare
+/// [`DATAFLOW_ENDPOINT_GROUP_NOT_FOUND`] literal, so neither is derived from the other.
+pub fn dataflow_endpoint_group_delete_not_found_message(
+    dataflow_endpoint_group_id: &str,
+) -> String {
+    format!("No Dataflow Endpoint Group found with id {dataflow_endpoint_group_id}")
+}
 
 /// Which kind of endpoint an `EndpointDetails` describes.
 ///

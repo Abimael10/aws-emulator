@@ -148,12 +148,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // first is what makes this delete read the statuses that hold now.
         guard.settle_due_contacts();
 
-        // The service's dataflow-endpoint-group literal, for either read of the store
-        // below: it does not disclose the id that was asked for.
+        // The id this delete could not find, in the words of THIS operation's error class
+        // rather than the read's, for either read of the store below.
         let not_found = || {
             DeleteDataflowEndpointGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::DATAFLOW_ENDPOINT_GROUP_NOT_FOUND.to_string()),
+                    message: Some(
+                        crate::state::dataflow_endpoint_group_delete_not_found_message(
+                            &input.dataflow_endpoint_group_id,
+                        ),
+                    ),
                 },
             )
         };

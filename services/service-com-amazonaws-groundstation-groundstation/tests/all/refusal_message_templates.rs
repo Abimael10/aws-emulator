@@ -19,8 +19,9 @@
 //!   name no contact crossed with every member an update can carry;
 //! * the `securityDetails` gate of `CreateDataflowEndpointGroup` answers one sentence
 //!   whichever item of `endpointDetails` omitted the member;
-//! * `GetDataflowEndpointGroup` and `DeleteDataflowEndpointGroup` answer one sentence for
-//!   a group id that was deleted and for one that never existed;
+//! * `GetDataflowEndpointGroup` answers one sentence for a group id that was deleted and
+//!   for one that never existed, while the DELETE of such a group names the id it could not
+//!   find;
 //! * `DeleteMissionProfile` names the `{missionProfileId}` it could not find;
 //! * every operation that resolves a ground station by name answers one sentence, over
 //!   names differing in length, case and spelling.
@@ -333,7 +334,8 @@ async fn the_security_details_gate_answers_one_sentence_whichever_item_omits_it(
 }
 
 #[tokio::test]
-async fn both_dataflow_endpoint_group_operations_answer_one_sentence_for_a_group_that_is_gone() {
+async fn the_two_dataflow_endpoint_group_operations_answer_their_own_texts_for_a_group_that_is_gone()
+{
     let (router, _engine) = harness_with_engine();
 
     // A group created and then deleted, so the rows cover a group that USED to exist as
@@ -360,26 +362,39 @@ async fn both_dataflow_endpoint_group_operations_answer_one_sentence_for_a_group
     ids.push(deleted_id);
 
     for id in &ids {
-        for (operation, reply) in [
-            ("GetDataflowEndpointGroup", get_group(&router, id).await),
-            (
-                "DeleteDataflowEndpointGroup",
-                delete_group(&router, id).await,
-            ),
-        ] {
-            let case = format!("{operation} on {id}");
-            let message = not_found_message(&case, &reply);
-            assert_eq!(
-                message, "The specified group does not exist.",
-                "case {case}: the refusal is this service's fixed sentence for a group it \
-                 does not hold, got {message:?}"
-            );
-            assert!(
-                !message.contains(id),
-                "case {case}: this sentence has no slot, so it echoes no id back, got \
-                 {message:?}"
-            );
-        }
+        // The READ answers the service's literal for a group it does not hold, which has no
+        // slot and so echoes no id back.
+        let case = format!("GetDataflowEndpointGroup on {id}");
+        let read = not_found_message(&case, &get_group(&router, id).await);
+        assert_eq!(
+            read, "The specified group does not exist.",
+            "case {case}: the read's refusal is this service's fixed sentence for a group it \
+             does not hold, got {read:?}"
+        );
+        assert!(
+            !read.contains(id),
+            "case {case}: this sentence has no slot, so it echoes no id back, got {read:?}"
+        );
+
+        // The DELETE answers in the words of its own error class, naming the id its path
+        // carried — the same composition every other delete of this service answers with.
+        let case = format!("DeleteDataflowEndpointGroup on {id}");
+        let deleted = not_found_message(&case, &delete_group(&router, id).await);
+        assert_eq!(
+            deleted,
+            format!("No Dataflow Endpoint Group found with id {id}"),
+            "case {case}: the delete's refusal is the fixed words around the id the path \
+             carried, got {deleted:?}"
+        );
+        assert!(
+            !deleted.replace(id.as_str(), "").contains(engine::EMULATOR_ACCOUNT_ID),
+            "case {case}: outside the id slot nothing of the environment belongs in the \
+             text, got {deleted:?}"
+        );
+        assert_ne!(
+            deleted, read,
+            "case {case}: the read and the delete answer different texts"
+        );
     }
 }
 

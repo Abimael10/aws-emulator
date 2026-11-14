@@ -156,9 +156,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .configs
             .get(&key)
             .map(|config| config.config_arn.clone())
+            // A pair naming no config is a missing resource, answered in the words of
+            // THIS operation's error class rather than the read's
+            // (`crate::state::config_delete_not_found_message`).
             .ok_or_else(|| {
                 DeleteConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(crate::state::config_not_found_message(
+                    message: Some(crate::state::config_delete_not_found_message(
                         &input.config_type,
                         &input.config_id,
                     )),

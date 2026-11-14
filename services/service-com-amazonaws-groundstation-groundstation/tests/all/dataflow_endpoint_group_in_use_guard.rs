@@ -31,7 +31,7 @@ use service_com_amazonaws_groundstation_groundstation::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::dataflow_endpoint_group_deletion::assert_group_absent;
+use crate::dataflow_endpoint_group_deletion::{assert_group_absent, assert_group_delete_absent};
 use crate::dataflow_endpoint_groups::{
     create_group, delete_group, details, endpoint_kinds, expected_arn, get_group,
 };
@@ -465,8 +465,9 @@ async fn the_refusal_names_every_contact_wired_to_the_group_and_no_other() {
     );
 
     // An id naming no group at all is still the missing-resource refusal, not the in-use one.
-    assert_group_absent(
+    assert_group_delete_absent(
         "an id the account never held",
+        ABSENT_UUID,
         &delete_group(&router, ABSENT_UUID).await,
     );
 

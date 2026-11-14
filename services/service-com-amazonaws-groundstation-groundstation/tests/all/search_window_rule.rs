@@ -5,8 +5,9 @@
 //!
 //! The RULE under test: the window a listing searches runs forwards, so a request whose
 //! `endTime` precedes its `startTime` describes no interval at all and is refused —
-//! `InvalidParameterException` (HTTP 431) naming `endTime` — while a window naming the
-//! same instant twice still describes an interval and is answered. It is ONE rule, read by
+//! `InvalidParameterException` (HTTP 431) naming `endTime` and carrying this service's
+//! fixed sentence for that error class — while a window naming the same instant twice still
+//! describes an interval and is answered. It is ONE rule, read by
 //! `ListContacts`, `ListEphemerides` and `ListGroundStationReservations` alike
 //! (`state::validate_search_window`), so this suite drives every one of them over the SAME
 //! table of windows and asserts not only that each answer follows the rule but that the
@@ -18,7 +19,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    parse_ground_stations, service_state,
+    parse_ground_stations, service_state, SEARCH_WINDOW_NOT_FORWARDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -27,6 +28,23 @@ use crate::scheduling_loop::{harness, harness_with_engine, send};
 /// The instant every window below is measured from: a round epoch-seconds value in the
 /// future, as the other suites of this target use.
 const BASE: f64 = 1_800_000_000.0;
+
+/// The sentence a window that does not run forwards is refused with, written out here as
+/// well as exported from the crate: FIXED text, quoting neither instant the request
+/// carried nor the members it carried them in, so a drift in the crate's constant fails
+/// this suite rather than passing unnoticed.
+const WINDOW_REFUSAL_MESSAGE: &str = "Invalid request: End date must be after start date";
+
+/// The crate's exported constant and the sentence this suite pins are the same text, so a
+/// drift in either one fails here.
+#[test]
+fn the_exported_refusal_text_is_the_sentence_aws_answers() {
+    assert_eq!(
+        SEARCH_WINDOW_NOT_FORWARDS, WINDOW_REFUSAL_MESSAGE,
+        "case exported-constant: expected the backwards-window sentence, got \
+         {SEARCH_WINDOW_NOT_FORWARDS:?}"
+    );
+}
 
 /// The ground station `ListGroundStationReservations` is asked about. Nothing is reserved
 /// at it in this suite — an answered listing here is an empty page, which is all this
@@ -247,8 +265,15 @@ async fn every_window_filtered_listing_refuses_a_window_that_does_not_run_forwar
                 );
                 assert_eq!(
                     answer.message,
-                    "endTime must not precede startTime",
+                    WINDOW_REFUSAL_MESSAGE,
                     "case {case}/{}: wrong refusal text, got {answer:?}",
+                    listing.operation()
+                );
+                assert!(
+                    !answer.message.contains(&window.0.to_string())
+                        && !answer.message.contains(&window.1.to_string()),
+                    "case {case}/{}: this sentence has no slot, so it quotes neither \
+                     instant back, got {answer:?}",
                     listing.operation()
                 );
             }
@@ -325,7 +350,7 @@ async fn a_backwards_window_is_refused_before_any_other_filter_is_judged() {
         );
         assert_eq!(
             reply.string("message"),
-            "endTime must not precede startTime",
+            WINDOW_REFUSAL_MESSAGE,
             "case {case}/{}: wrong refusal text, got {}",
             listing.operation(),
             reply.body

@@ -83,6 +83,8 @@ mod dataflow_endpoint_groups;
 mod dataflow_endpoint_groups_v2;
 #[path = "all/dataflow_endpoint_mtu.rs"]
 mod dataflow_endpoint_mtu;
+#[path = "all/delete_refusal_texts.rs"]
+mod delete_refusal_texts;
 #[path = "all/empty_list_filters.rs"]
 mod empty_list_filters;
 #[path = "all/ended_contact_takes_no_version.rs"]

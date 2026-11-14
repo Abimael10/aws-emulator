@@ -19,8 +19,8 @@
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    service_state, BAD_REQUEST_ERROR_CODE, DATAFLOW_ENDPOINT_GROUP_NOT_FOUND,
-    INVALID_REQUEST_BODY,
+    dataflow_endpoint_group_delete_not_found_message, service_state, BAD_REQUEST_ERROR_CODE,
+    DATAFLOW_ENDPOINT_GROUP_NOT_FOUND, INVALID_REQUEST_BODY,
 };
 
 use crate::dataflow_endpoint_group_listing::listed_ids;
@@ -135,6 +135,33 @@ pub(crate) fn assert_group_absent(case: &str, reply: &Reply) {
     );
 }
 
+/// Assert that `reply` is the refusal a DELETE answers for a dataflow endpoint group the
+/// account does not hold: the same HTTP 434 `ResourceNotFoundException` shape, carrying
+/// this operation's own text, which names the `{dataflowEndpointGroupId}` the request
+/// path carried where the read's sentence has no slot at all.
+///
+/// `pub(crate)` for the same reason [`assert_group_absent`] is: the suites that repeat a
+/// delete assert it through this ONE helper.
+pub(crate) fn assert_group_delete_absent(case: &str, group_id: &str, reply: &Reply) {
+    assert_eq!(
+        reply.status, 434,
+        "case {case}: expected 434, got {} {}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error_code(),
+        "ResourceNotFoundException",
+        "case {case}: wrong error shape, got {}",
+        reply.body
+    );
+    assert_eq!(
+        reply.string("message"),
+        dataflow_endpoint_group_delete_not_found_message(group_id),
+        "case {case}: wrong refusal text, got {}",
+        reply.body
+    );
+}
+
 #[tokio::test]
 async fn a_deleted_group_is_gone_from_every_read_and_the_others_are_untouched() {
     let (router, engine) = harness_with_engine();
@@ -182,8 +209,9 @@ async fn a_deleted_group_is_gone_from_every_read_and_the_others_are_untouched() 
             &format!("{label}: read after the delete"),
             &get_group(&router, &id).await,
         );
-        assert_group_absent(
+        assert_group_delete_absent(
             &format!("{label}: the same delete repeated"),
+            &id,
             &delete_group(&router, &id).await,
         );
         assert_group_absent(
@@ -279,8 +307,9 @@ async fn a_refused_delete_removes_nothing() {
     let id = created.string("dataflowEndpointGroupId");
 
     // A well-formed id no group holds is a missing resource.
-    assert_group_absent(
+    assert_group_delete_absent(
         "an id the account never held",
+        ABSENT_UUID,
         &delete_group(&router, ABSENT_UUID).await,
     );
 

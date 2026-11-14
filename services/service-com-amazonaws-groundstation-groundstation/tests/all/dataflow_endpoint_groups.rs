@@ -35,7 +35,7 @@ use service_com_amazonaws_groundstation_groundstation::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::dataflow_endpoint_group_deletion::assert_group_absent;
+use crate::dataflow_endpoint_group_deletion::{assert_group_absent, assert_group_delete_absent};
 use crate::dataflow_endpoint_group_listing::listed_ids;
 use crate::scheduling_loop::{harness, is_uuid, send, Reply, ABSENT_UUID, AFTER_SETTLE, REGION};
 
@@ -916,12 +916,17 @@ async fn the_listing_returns_every_group_once_and_a_deleted_group_is_gone() {
 
     for (label, reply) in [
         ("a read of a deleted group", get_group(&router, &removed).await),
-        ("the same delete repeated", delete_group(&router, &removed).await),
         ("a read of a group never created", get_group(&router, ABSENT_UUID).await),
     ] {
         // The not-found shape has ONE owner in this target: the deletion suite's helper.
         assert_group_absent(label, &reply);
     }
+    // A repeat of the delete is the same shape in the DELETE's own words.
+    assert_group_delete_absent(
+        "the same delete repeated",
+        &removed,
+        &delete_group(&router, &removed).await,
+    );
 
     let listed = listed_ids(&router, Some(2), created.len()).await;
     assert_eq!(

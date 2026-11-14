@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_groundstation_groundstation::state::UNRESOLVABLE_RECORDING_BUCKET;
+use service_com_amazonaws_groundstation_groundstation::state::RECORDING_BUCKET_DOES_NOT_EXIST;
 use service_com_amazonaws_groundstation_groundstation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -65,6 +65,29 @@ pub(crate) async fn create_bucket(router: &MultiServiceRouter, bucket: &str) -> 
         .header("authorization", S3_AUTH)
         .body(bytes::Bytes::new())
         .expect("build the CreateBucket request");
+    router.dispatch(request).await.status().as_u16()
+}
+
+/// `PUT /<bucket>?policy` against the emulator's S3 front door — `PutBucketPolicy`, with
+/// `document` as the body. Answers the HTTP status.
+///
+/// A bucket policy is how a test puts S3 in the one state that makes it ANSWER about a
+/// bucket while withholding it: a statement denying the read of the bucket earns the
+/// access denial, which is the condition Ground Station reports as the bucket's location
+/// not being obtainable.
+pub(crate) async fn put_bucket_policy(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    document: &str,
+) -> u16 {
+    let request = http::Request::builder()
+        .method("PUT")
+        .uri(format!("https://s3.{REGION}.amazonaws.com/{bucket}?policy"))
+        .header("host", format!("s3.{REGION}.amazonaws.com"))
+        .header("content-type", "application/json")
+        .header("authorization", S3_AUTH)
+        .body(bytes::Bytes::from(document.to_string()))
+        .expect("build the PutBucketPolicy request");
     router.dispatch(request).await.status().as_u16()
 }
 
@@ -191,7 +214,7 @@ async fn a_recording_config_is_refused_only_for_a_bucket_that_does_not_exist() {
         );
         assert_eq!(
             reply.string("message"),
-            UNRESOLVABLE_RECORDING_BUCKET,
+            RECORDING_BUCKET_DOES_NOT_EXIST,
             "case {case}: wrong refusal text, got {}",
             reply.body
         );
@@ -230,7 +253,7 @@ async fn a_recording_config_is_refused_only_for_a_bucket_that_does_not_exist() {
     );
     assert_eq!(
         refused.string("message"),
-        UNRESOLVABLE_RECORDING_BUCKET,
+        RECORDING_BUCKET_DOES_NOT_EXIST,
         "case update-to-an-absent-bucket: wrong refusal text, got {}",
         refused.body
     );
