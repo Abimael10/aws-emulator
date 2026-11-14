@@ -4477,3 +4477,13 @@ mod cloudformation_appsync_custom_domains;
 // this is one crate root, so a second `mod` for the same name is `E0428`, and a note
 // written with `//!` anywhere but this file's header is `E0753`; either fails every suite
 // in this target. `all/all_rs_declares_each_suite_once.rs` checks the declarations, for
+#[path = "all/iot_job_cancel_unwinds_the_device_queue.rs"]
+mod iot_job_cancel_unwinds_the_device_queue;
+// region of this file: the IaC form of an EventBridge fan-out — one stack's rule with a
+// Lambda target and a Step Functions target under a target role — spans CloudFormation,
+// declared twice is `E0428` and compiles neither copy.)
+// leaving a note here. (Ordinary comments: an inner doc comment `//!` may appear only
+// comment is only legal before the first item of a module.)
+// suite left at the top level of `tests/` fails the build. (Ordinary comment: an inner doc
+// this file and for every service crate's `tests/all.rs`. (Ordinary comment, for the reason
+// the line above records.)
