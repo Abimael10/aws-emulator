@@ -719,6 +719,18 @@ pub const INVALID_BUCKET_STATE_STATUS: u16 = 409;
 pub const OBJECT_LOCK_VERSIONING_REQUIRED_MESSAGE: &str =
     "Versioning must be 'Enabled' on the bucket to apply a Object Lock configuration";
 
+/// The `<Message>` S3 sends beside the 409 [`INVALID_BUCKET_STATE_CODE`] of a
+/// `PutBucketVersioning` that would move a bucket carrying an Object Lock configuration out
+/// of the `Enabled` versioning state: Object Lock is addressed to object VERSIONS, so a
+/// locked bucket has to stay versioned for its whole life (Amazon S3 User Guide, *Using S3
+/// Object Lock*) and its versioning state cannot be changed at all.
+///
+/// A fixed sentence for that one condition, naming nothing of the request — which is why it
+/// lives here beside the other code/message pairs rather than being built in the handler.
+pub const OBJECT_LOCK_VERSIONING_IMMUTABLE_MESSAGE: &str =
+    "An Object Lock configuration is present on this bucket, so the versioning state cannot \
+     be changed.";
+
 /// The code S3 answers a call that cannot be served because of the state the object is in:
 /// `InvalidObjectState`, HTTP 403 — the status the shape itself carries
 /// (`smithy_query(query="shape",shape="InvalidObjectState")`).

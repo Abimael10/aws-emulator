@@ -14,7 +14,9 @@
 //!   (`INVALID_PARAMETER_VALUE`), the rejected member's name in `Context`, and
 //!   the one-sentence `Parameter <MemberName> is invalid.` — on every operation
 //!   and every member of that class, with the member name the only thing that
-//!   varies between two of them;
+//!   varies between two of them; a member that names a BACKUP VAULT by ARN
+//!   carries the narrower class's own sentence instead (`Invalid backup vault
+//!   ARN`), since what it required was that KIND of ARN;
 //! * which values name an MPA approval team is the form the service that MINTS
 //!   one publishes, so a value outside it is refused as that member and a value
 //!   inside it is recorded on the vault and read back;
@@ -215,8 +217,21 @@ fn parameter_sentence(member: &str) -> String {
     format!("Parameter {member} is invalid.")
 }
 
-/// Assert one row earns the class's refusal, naming its member.
+/// The sentence AWS states for a member that names a BACKUP VAULT by ARN and was
+/// given a value that is not one: the KIND of ARN the member required, fixed text
+/// naming neither the member nor the value.
+const VAULT_ARN_SENTENCE: &str = "Invalid backup vault ARN";
+
+/// Assert one row earns the class's refusal, naming its member, with the
+/// member's own generic sentence.
 async fn assert_parameter_refusal(router: &MultiServiceRouter, row: &Rejected) {
+    assert_refusal(router, row, &parameter_sentence(row.member)).await;
+}
+
+/// Assert one row earns the class's refusal, naming its member and stating
+/// `sentence` — which is the class's own for a plain ARN member and the
+/// vault-ARN class's for a member that names a vault.
+async fn assert_refusal(router: &MultiServiceRouter, row: &Rejected, sentence: &str) {
     let (status, errortype, refused) =
         call_reported(router, row.method, &row.path, row.body.as_deref()).await;
     let answered = (
@@ -235,10 +250,10 @@ async fn assert_parameter_refusal(router: &MultiServiceRouter, row: &Rejected) {
             INVALID_PARAMETER.to_string(),
             INVALID_PARAMETER_VALUE.to_string(),
             row.member.to_string(),
-            parameter_sentence(row.member),
+            sentence.to_string(),
         ),
         "case {:?}: expected 400 {INVALID_PARAMETER} with Code={INVALID_PARAMETER_VALUE}, \
-         Context={:?} and the member's own sentence, got {status} {refused:?}",
+         Context={:?} and the sentence {sentence:?}, got {status} {refused:?}",
         row.case,
         row.member
     );
@@ -260,15 +275,21 @@ async fn a_member_value_of_the_wrong_form_is_refused_as_that_member() {
         "setup: CreateBackupVault refusal-vault should succeed, got {status} {created:?}"
     );
 
-    let mut rows: Vec<Rejected> = Vec::new();
+    let mut plain: Vec<Rejected> = Vec::new();
     for (case, value) in NOT_ARNS {
-        rows.extend(plain_arn_rows(case, value));
+        plain.extend(plain_arn_rows(case, value));
     }
+    for row in &plain {
+        assert_refusal(&router, row, &parameter_sentence(row.member)).await;
+    }
+    // A member that names a BACKUP VAULT states the kind of ARN it required
+    // instead, which is the sentence AWS answers that narrower class with.
+    let mut vaults: Vec<Rejected> = Vec::new();
     for (case, value) in not_vault_arns() {
-        rows.extend(vault_arn_rows(case, &value));
+        vaults.extend(vault_arn_rows(case, &value));
     }
-    for row in &rows {
-        assert_parameter_refusal(&router, row).await;
+    for row in &vaults {
+        assert_refusal(&router, row, VAULT_ARN_SENTENCE).await;
     }
 
     // Non-vacuity: the same operations SERVE the same requests when every

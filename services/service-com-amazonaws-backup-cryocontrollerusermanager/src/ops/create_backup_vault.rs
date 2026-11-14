@@ -259,12 +259,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every vault is encrypted by a KMS key: the one this request named,
         // or — "if you do not specify a key, Backup creates a KMS key for you
-        // by default" (model doc for `EncryptionKeyArn`) — this service's own
-        // default key for the region, so a read always has a key to report.
+        // by default" (model doc for `EncryptionKeyArn`) — the Amazon Web
+        // Services managed key of this service, as KMS resolves it, so the key
+        // a read reports is one KMS itself holds.
         let customer_managed_key = input.encryption_key_arn.is_some();
         let encryption_key_arn = match input.encryption_key_arn {
             Some(arn) => arn,
-            None => store.default_encryption_key_arn(&region, now),
+            None => crate::state::default_encryption_key_arn(
+                &*self.engine,
+                &mut store,
+                &region,
+                now,
+            ),
         };
         let vault = crate::state::BackupVault {
             name: input.backup_vault_name.clone(),

@@ -134,10 +134,17 @@ pub use tagging::*;
 mod authorization;
 pub use authorization::*;
 
+/// Which KMS key a vault created with no `EncryptionKeyArn` is encrypted under:
+/// the Amazon Web Services managed key of this service, resolved against the
+/// shared KMS store. Re-exported for the reason given on `events`.
+mod vault_encryption_key;
+pub use vault_encryption_key::*;
+
 use crate::ops::types::{
-    AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupPlanInput, BackupRule,
+    AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupPlanInput,
+    BackupPlansListMember, BackupRule,
     BackupRuleInput,
-    BackupSelection, CalculatedLifecycle, ConflictException, CopyJob, FrameworkControl,
+    BackupSelection, CalculatedLifecycle, Conditions, ConflictException, CopyJob, FrameworkControl,
     InvalidParameterValueException, InvalidRequestException, InvalidResourceStateException,
     LegalHold, Lifecycle, MissingParameterValueException, RecoveryPointSelection,
     ResourceNotFoundException, ScanSetting,
@@ -209,6 +216,21 @@ pub const MIN_LOCK_RETENTION_DAYS: i64 = 1;
 /// `MaxRetentionDays`: "The longest maximum retention period you can specify is
 /// 36500 days (approximately 100 years)."
 pub const MAX_LOCK_RETENTION_DAYS: i64 = 36_500;
+
+/// The least a recovery point transitioned to cold storage stays there, which
+/// is the interval a `Lifecycle` has to leave between its transition and its
+/// deletion: "backups transitioned to cold storage must be stored in cold
+/// storage for a minimum of 90 days" (the model's doc for the `Lifecycle`
+/// shape), which its `DeleteAfterDays` member states as "this value must be at
+/// least 90 days after the number of days specified in
+/// MoveToColdStorageAfterDays".
+pub const MIN_COLD_STORAGE_DAYS: i64 = 90;
+
+/// The value a `Lifecycle` member carries to state NO transition and no
+/// expiry: "to remove the existing lifecycle and retention periods and keep
+/// your recovery points indefinitely, specify -1 for MoveToColdStorageAfterDays
+/// and DeleteAfterDays" (the model's doc for the `Lifecycle` shape).
+pub const INDEFINITE_LIFECYCLE_DAYS: i64 = -1;
 
 /// `BackupJobState` a freshly started job is in (model enum `BackupJobState`).
 pub const BACKUP_JOB_STATE_CREATED: &str = "CREATED";
@@ -940,6 +962,32 @@ pub const MESSAGE_CRON_INVALID_PREFIX: &str = "Cron expression is not valid: ";
 /// all — the whole condition [`schedule::rule_schedule_refusal`] decides, since
 /// what fails is the parse and no part of the expression is quoted back.
 pub const MESSAGE_CRON_INVALID: &str = "Invalid cron expression";
+
+/// The sentence AWS states for a `Lifecycle` whose deletion falls less than
+/// [`MIN_COLD_STORAGE_DAYS`] days after its transition to cold storage —
+/// FIXED text: it quotes neither day count, naming the two members and the
+/// interval the service requires between them.
+///
+/// The rule is the model's own: `DeleteAfterDays` "must be at least 90 days
+/// after the number of days specified in MoveToColdStorageAfterDays", because
+/// "backups transitioned to cold storage must be stored in cold storage for a
+/// minimum of 90 days" (the `Lifecycle` shape's doc).
+pub const MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL: &str =
+    "Invalid lifecycle. DeleteAfterDays cannot be less than 90 days apart from \
+     MoveToColdStorageAfterDays";
+
+/// The sentence AWS states for a BACKUP VAULT named by an ARN that is not one
+/// — FIXED text: the rejected value is not quoted back into it.
+pub const MESSAGE_BACKUP_VAULT_ARN_INVALID: &str = "Invalid backup vault ARN";
+
+/// The sentence AWS states for a backup-plan delete the plan's own resource
+/// selections still bar — FIXED text: it names neither the plan nor how many
+/// selections it holds, only what has to be deleted first. "A backup plan can
+/// only be deleted after all associated selections of resources have been
+/// deleted" (model doc for `DeleteBackupPlan`). No `Code`: this condition has
+/// no observed token.
+pub const MESSAGE_PLAN_SELECTIONS_EXIST: &str =
+    "Related backup plan selections must be deleted prior to backup plan deletion";
 
 /// The service principal a role AWS Backup acts under has to let assume it:
 /// this service's own, which the model states — the service shape's
@@ -1803,6 +1851,54 @@ pub fn rejected_arn(member: &str, value: &str) -> Option<InvalidParameterValueEx
     Some(rejected_parameter(member))
 }
 
+/// Why the `lifecycle` a request would store is not one AWS Backup accepts, or
+/// `None` when it is (including an absent one).
+///
+/// ONE check for every `Lifecycle` this service takes — a backup plan rule's
+/// own, the lifecycle of each of that rule's copy actions, and the lifecycle a
+/// job or a recovery-point update carries — for the reason given on
+/// [`rejected_window_minutes`]: the members target plain `long`s, so the
+/// framework's boundary validator passes any pair, while the model states the
+/// service constraint between them. `DeleteAfterDays` "must be at least 90 days
+/// after the number of days specified in MoveToColdStorageAfterDays" (model doc
+/// for the member), so a pair that names both and leaves less than
+/// [`MIN_COLD_STORAGE_DAYS`] days between them asks for a transition the service
+/// cannot honour.
+///
+/// [`INDEFINITE_LIFECYCLE_DAYS`] is not such a value: "to remove the existing
+/// lifecycle and retention periods and keep your recovery points indefinitely,
+/// specify -1 for MoveToColdStorageAfterDays and DeleteAfterDays" (the
+/// `Lifecycle` shape's doc), so either member set to it states no transition and
+/// no deletion to measure an interval between.
+///
+/// The REASON is returned rather than a refusal, because the operations that
+/// take a lifecycle state it differently: one inside a plan body carries the
+/// per-rule validation envelope ([`rejected_backup_plan_rule`]), while a job's
+/// own carries the reason by itself.
+#[must_use]
+pub fn lifecycle_refusal_reason(lifecycle: Option<&Lifecycle>) -> Option<&'static str> {
+    let lifecycle = lifecycle?;
+    let cold = lifecycle.move_to_cold_storage_after_days?;
+    let delete = lifecycle.delete_after_days?;
+    if cold == INDEFINITE_LIFECYCLE_DAYS || delete == INDEFINITE_LIFECYCLE_DAYS {
+        return None;
+    }
+    let interval = delete.checked_sub(cold)?;
+    (interval < MIN_COLD_STORAGE_DAYS).then_some(MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL)
+}
+
+/// The modelled refusal for a `Lifecycle` an operation takes on its OWN (not
+/// inside a plan body), or `None` when the lifecycle is one AWS accepts: the
+/// reason [`lifecycle_refusal_reason`] decides, stated as the refusal's whole
+/// sentence.
+pub fn rejected_lifecycle(lifecycle: Option<&Lifecycle>) -> Option<InvalidParameterValueException> {
+    let reason = lifecycle_refusal_reason(lifecycle)?;
+    Some(InvalidParameterValueException {
+        message: Some(reason.to_string()),
+        ..Default::default()
+    })
+}
+
 /// Why a `BackupPlan` body is not one AWS stores, as
 /// [`rejected_backup_plan_body`] decides it.
 ///
@@ -1839,9 +1935,12 @@ pub enum RejectedBackupPlanBody {
 /// * every rule's `ScheduleExpression` is an expression jobs can be initiated
 ///   from ([`schedule::rule_schedule_refusal`]), rather than a rule being
 ///   stored whose schedule nothing resolves;
-/// * the members the model types as `ARN` with no pattern carry one
-///   ([`rejected_arn`]), rather than a rule being stored whose destination no
-///   ARN resolves to.
+/// * every `Lifecycle` the rule carries \u2014 its own and each copy action's \u2014
+///   leaves the interval the model requires between the transition to cold
+///   storage and the deletion ([`lifecycle_refusal_reason`]);
+/// * the members that name a BACKUP VAULT by ARN carry one
+///   ([`rejected_backup_vault_arn`]), rather than a rule being stored whose
+///   destination no vault ARN resolves to.
 pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBackupPlanBody> {
     if plan.rules.is_empty() {
         return Some(RejectedBackupPlanBody::Value(InvalidParameterValueException {
@@ -1889,7 +1988,30 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
                 &reason,
             )));
         }
-        let arns = rule
+        // The lifecycle of the rule, and of each of its copy actions, keeps the
+        // interval the model requires between a transition to cold storage and
+        // the deletion that follows it; a rule that does not is refused with
+        // the same per-rule envelope, rather than stored with a retention the
+        // service could never honour.
+        let lifecycles = ::std::iter::once(rule.lifecycle.as_ref()).chain(
+            rule.copy_actions
+                .iter()
+                .flatten()
+                .map(|copy| copy.lifecycle.as_ref()),
+        );
+        for lifecycle in lifecycles {
+            if let Some(reason) = lifecycle_refusal_reason(lifecycle) {
+                return Some(RejectedBackupPlanBody::Value(rejected_backup_plan_rule(
+                    reason,
+                )));
+            }
+        }
+        // `TargetLogicallyAirGappedBackupVaultArn` and a copy action's
+        // `DestinationBackupVaultArn` both name a BACKUP VAULT, and the model
+        // types each as `ARN` with no pattern, so the narrower check is the one
+        // that applies: a value that is the ARN of something else names no
+        // vault a copy could be written to.
+        let vault_arns = rule
             .target_logically_air_gapped_backup_vault_arn
             .as_deref()
             .map(|arn| ("TargetLogicallyAirGappedBackupVaultArn", arn))
@@ -1900,8 +2022,8 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
                     copy.destination_backup_vault_arn.as_str(),
                 )
             }));
-        for (member, arn) in arns {
-            if let Some(refusal) = rejected_arn(member, arn) {
+        for (member, arn) in vault_arns {
+            if let Some(refusal) = rejected_backup_vault_arn(member, arn) {
                 return Some(RejectedBackupPlanBody::Value(refusal));
             }
         }
@@ -1958,7 +2080,22 @@ pub fn resolved_backup_vault_arn(
     member: &str,
     value: &str,
 ) -> Result<BackupVaultArnParts, InvalidParameterValueException> {
-    backup_vault_arn_parts(value).ok_or_else(|| rejected_parameter(member))
+    backup_vault_arn_parts(value).ok_or_else(|| rejected_backup_vault_arn_value(member))
+}
+
+/// The modelled refusal every member that names a BACKUP VAULT by ARN answers a
+/// value that is not one with: the class's own `Code`
+/// ([`ERROR_CODE_INVALID_PARAMETER_VALUE`]) and the condition's own fixed
+/// sentence ([`MESSAGE_BACKUP_VAULT_ARN_INVALID`]), which states the KIND of ARN
+/// that was required rather than the member or the value — the member is still
+/// carried in `Context`, where a client reads which input to fix.
+fn rejected_backup_vault_arn_value(member: &str) -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        code: Some(ERROR_CODE_INVALID_PARAMETER_VALUE.to_string()),
+        message: Some(MESSAGE_BACKUP_VAULT_ARN_INVALID.to_string()),
+        context: Some(member.to_string()),
+        ..Default::default()
+    }
 }
 
 /// The modelled refusal for a `MaxResults` outside
@@ -2607,6 +2744,27 @@ impl BackupPlanRecord {
         let overflow = (self.superseded.len() + 1).saturating_sub(MAX_BACKUP_PLAN_VERSIONS);
         self.superseded.drain(..overflow);
     }
+
+    /// The ONE list projection of a stored plan AT one of its versions, so
+    /// every operation that reports plans reports the same members of the same
+    /// record: the identifiers and the account-level instants are the plan's
+    /// own, while the name, the version id and the advanced settings are the
+    /// ones that version carries.
+    pub fn listed(&self, version: &BackupPlanVersion) -> BackupPlansListMember {
+        BackupPlansListMember {
+            backup_plan_arn: Some(self.arn.clone()),
+            backup_plan_id: Some(self.plan_id.clone()),
+            backup_plan_name: Some(version.name.clone()),
+            version_id: Some(version.version_id.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(version.creation_date)),
+            deletion_date: self.deletion_date.map(::aws_smithy_types::DateTime::from),
+            last_execution_date: self
+                .last_execution_date
+                .map(::aws_smithy_types::DateTime::from),
+            creator_request_id: self.creator_request_id.clone(),
+            advanced_backup_settings: version.advanced_backup_settings_view(),
+        }
+    }
 }
 
 /// One rule of a plan as it is STORED: the rule the caller configured, plus the
@@ -2614,8 +2772,10 @@ impl BackupPlanRecord {
 /// is used to schedule the backup of a selection of resources", a member only
 /// the service fills) and the backup windows the service fills in where the
 /// request stated none ([`DEFAULT_START_WINDOW_MINUTES`],
-/// [`DEFAULT_COMPLETION_WINDOW_MINUTES`]) — a stored rule carries the windows
-/// its jobs are really scheduled with, so every read of the plan reports them.
+/// [`DEFAULT_COMPLETION_WINDOW_MINUTES`],
+/// [`schedule::DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE`]) — a stored rule carries
+/// the windows and the time zone its jobs are really scheduled with, so every
+/// read of the plan reports them.
 pub fn stored_backup_rule(rule: BackupRuleInput, rule_id: String) -> BackupRule {
     BackupRule {
         rule_name: rule.rule_name,
@@ -2636,10 +2796,46 @@ pub fn stored_backup_rule(rule: BackupRuleInput, rule_id: String) -> BackupRule 
         rule_id: Some(rule_id),
         copy_actions: rule.copy_actions,
         enable_continuous_backup: rule.enable_continuous_backup,
-        schedule_expression_timezone: rule.schedule_expression_timezone,
+        // "The timezone in which the schedule expression is set. By default,
+        // ScheduleExpressions are in UTC" (model doc for the member): a rule
+        // that names no zone is scheduled in the service's default one, so the
+        // zone it really runs in is what is stored and read back.
+        schedule_expression_timezone: Some(
+            rule.schedule_expression_timezone
+                .unwrap_or_else(|| schedule::DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE.to_string()),
+        ),
         index_actions: rule.index_actions,
         scan_actions: rule.scan_actions,
     }
+}
+
+/// One resource selection as it is STORED: the body the caller gave, with every
+/// COLLECTION member it left out filled in as empty.
+///
+/// A selection names the resources to back up in three published grammars, each
+/// a list — `Resources` and `NotResources` (ARNs) and `ListOfTags` (the legacy
+/// tag conditions) — plus the `Conditions` structure of FOUR operator lists:
+/// `StringEquals`, `StringNotEquals`, `StringLike` and `StringNotLike`
+/// (`smithy_query(query="shape",shape="BackupSelection")` and `Conditions`). AWS
+/// reports the selection it holds in FULL: a grammar the request did not use
+/// reads back as an empty list rather than as a member a client cannot tell from
+/// an unknown one, and a condition declared under one operator never reappears
+/// under another. So the completion is applied where the body is STORED, and
+/// every read of the selection reports the same complete body.
+pub fn stored_backup_selection(mut selection: BackupSelection) -> BackupSelection {
+    selection.resources.get_or_insert_with(Vec::new);
+    selection.not_resources.get_or_insert_with(Vec::new);
+    selection.list_of_tags.get_or_insert_with(Vec::new);
+    let conditions = selection.conditions.get_or_insert_with(Conditions::default);
+    for operator in [
+        &mut conditions.string_equals,
+        &mut conditions.string_not_equals,
+        &mut conditions.string_like,
+        &mut conditions.string_not_like,
+    ] {
+        operator.get_or_insert_with(Vec::new);
+    }
+    selection
 }
 
 /// One resource selection of a backup plan as `CreateBackupSelection` stored it:

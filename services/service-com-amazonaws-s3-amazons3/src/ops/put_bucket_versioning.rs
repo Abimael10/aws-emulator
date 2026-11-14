@@ -299,6 +299,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
             return Err(PutBucketVersioningErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
+
+        // "Object Lock works only in versioned buckets" (Amazon S3 User Guide, *Using S3
+        // Object Lock*), and a lock is placed for the life of the bucket: a retention is
+        // addressed to an object VERSION, so a bucket carrying an Object Lock configuration
+        // can never leave the `Enabled` versioning state — a request that would move it out
+        // of that state is refused for the STATE the bucket is in, which is what
+        // `InvalidBucketState` reports (HTTP 409). The code is not a shape in this model, so
+        // it goes out through the unmodelled channel. A bucket with no lock takes either
+        // state, and a request naming the state the locked bucket is already in changes
+        // nothing and is served.
+        if bucket.object_lock_enabled() && status != crate::state::VERSIONING_ENABLED_STATUS {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_BUCKET_STATE_CODE,
+                crate::state::INVALID_BUCKET_STATE_STATUS,
+                crate::state::OBJECT_LOCK_VERSIONING_IMMUTABLE_MESSAGE,
+            ));
+        }
+
         bucket.set_versioning(status, configuration.mfa_delete.as_deref());
 
         // `Unit` output: success is the 200 and an empty body.

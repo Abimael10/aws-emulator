@@ -19,6 +19,8 @@ mod backup_job_role_outcome;
 mod backup_plan;
 #[path = "all/backup_plan_deletion.rs"]
 mod backup_plan_deletion;
+#[path = "all/backup_plan_listing.rs"]
+mod backup_plan_listing;
 #[path = "all/backup_plan_update.rs"]
 mod backup_plan_update;
 #[path = "all/backup_selection.rs"]
@@ -41,6 +43,8 @@ mod framework_update_idempotency;
 mod job_state_change_events;
 #[path = "all/legal_hold.rs"]
 mod legal_hold;
+#[path = "all/lifecycle_cold_storage_interval.rs"]
+mod lifecycle_cold_storage_interval;
 #[path = "all/legal_hold_cancel_record_retention.rs"]
 mod legal_hold_cancel_record_retention;
 #[path = "all/legal_hold_cancel_state_refusal.rs"]
@@ -59,6 +63,8 @@ mod logically_air_gapped_vault;
 mod mpa_approval_team_disassociation;
 #[path = "all/plan_and_selection_refusals.rs"]
 mod plan_and_selection_refusals;
+#[path = "all/plan_rule_schedule_timezone.rs"]
+mod plan_rule_schedule_timezone;
 #[path = "all/recovery_point_cross_account_authorization.rs"]
 mod recovery_point_cross_account_authorization;
 #[path = "all/recovery_point_deletion.rs"]
@@ -87,6 +93,8 @@ mod restore_metadata_validation;
 mod restore_testing_plan;
 #[path = "all/scheduled_runs_preview.rs"]
 mod scheduled_runs_preview;
+#[path = "all/selection_body_completion.rs"]
+mod selection_body_completion;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/supported_resource_types.rs"]
@@ -97,6 +105,8 @@ mod tiering_configuration;
 mod tiering_configuration_update;
 #[path = "all/vault_and_backup_job.rs"]
 mod vault_and_backup_job;
+#[path = "all/vault_default_key_in_kms.rs"]
+mod vault_default_key_in_kms;
 #[path = "all/vault_access_policy.rs"]
 mod vault_access_policy;
 #[path = "all/vault_lock_refusal_order.rs"]

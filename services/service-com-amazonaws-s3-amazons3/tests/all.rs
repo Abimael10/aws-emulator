@@ -307,6 +307,8 @@ mod object_listing_v1;
 mod object_lock_enforcement;
 #[path = "all/object_lock_on_write.rs"]
 mod object_lock_on_write;
+#[path = "all/object_lock_versioning_immutability.rs"]
+mod object_lock_versioning_immutability;
 #[path = "all/object_partial_reads.rs"]
 mod object_partial_reads;
 #[path = "all/object_plane_byte_budget.rs"]

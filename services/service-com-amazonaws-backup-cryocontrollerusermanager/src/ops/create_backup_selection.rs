@@ -290,7 +290,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::BackupSelectionRecord {
             selection_id: selection_id.clone(),
             plan_id: input.backup_plan_id.clone(),
-            selection,
+            // Stored with the `Conditions` structure completed, so every read
+            // of the selection reports all four operator lists
+            // (`crate::state::stored_backup_selection`).
+            selection: crate::state::stored_backup_selection(selection),
             creator_request_id: input.creator_request_id,
             creation_date: now,
         };

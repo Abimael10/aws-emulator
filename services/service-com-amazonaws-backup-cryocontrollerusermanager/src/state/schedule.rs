@@ -21,6 +21,15 @@ use super::BackupRuleInput;
 /// `BackupRule$ScheduleExpression`).
 pub const DEFAULT_SCHEDULE_EXPRESSION: &str = "cron(0 5 ? * * *)";
 
+/// The time zone a rule's schedule is read in when the rule names none: "the
+/// timezone in which the schedule expression is set. By default,
+/// ScheduleExpressions are in UTC" (model doc for
+/// `BackupRule$ScheduleExpressionTimezone`), named as the IANA zone UTC is
+/// published under. A rule stored without one carries this zone
+/// (`super::stored_backup_rule`), so every read of the rule reports the zone its
+/// schedule really runs in.
+pub const DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE: &str = "Etc/UTC";
+
 /// How many whitespace-separated fields a rule's cron expression carries: the
 /// minute, hour, day-of-month, month, day-of-week and year of an Amazon Web
 /// Services cron expression (the model's own examples for
@@ -86,12 +95,13 @@ pub fn parse_schedule_expression(expression: &str) -> Option<::cron::Schedule> {
 
 /// The time zone a rule's schedule is read in: "The timezone in which the
 /// schedule expression is set. By default, ScheduleExpressions are in UTC"
-/// (model doc for `BackupRule$ScheduleExpressionTimezone`). `None` when the
+/// (model doc for `BackupRule$ScheduleExpressionTimezone`) — so a rule naming
+/// none is read in [`DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE`]. `None` when the
 /// stored name resolves to no zone at all.
 #[must_use]
 pub fn schedule_timezone(timezone: Option<&str>) -> Option<::chrono_tz::Tz> {
-    match timezone {
-        None => Some(::chrono_tz::UTC),
-        Some(name) => name.parse::<::chrono_tz::Tz>().ok(),
-    }
+    timezone
+        .unwrap_or(DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE)
+        .parse::<::chrono_tz::Tz>()
+        .ok()
 }

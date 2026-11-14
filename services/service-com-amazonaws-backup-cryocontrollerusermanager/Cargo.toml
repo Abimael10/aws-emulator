@@ -45,6 +45,12 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # (`state::restore_execution::perform_restore`). Only the generated client is
 # needed — the emulator supplies the transport.
 aws-sdk-dynamodb = { version = "1", default-features = false }
+# The KMS service crate, for the Amazon Web Services managed key a backup vault
+# created with no `EncryptionKeyArn` is encrypted under: the key behind the
+# predefined `alias/aws/backup` alias is resolved in the KMS store on the shared
+# engine, so the ARN a vault publishes is one `kms:DescribeKey` resolves
+# (`state::vault_encryption_key`).
+service-com-amazonaws-kms-trentservice = { workspace = true }
 # `eventbridge_client`: the tree's ONE construction of that in-process EventBridge
 # client, so this service configures the publication hop exactly as every other
 # publisher does. `iam_role`: the shared reading of a caller-supplied IAM role ARN

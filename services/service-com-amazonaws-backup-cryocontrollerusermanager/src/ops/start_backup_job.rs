@@ -321,6 +321,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
             }
         }
 
+        // The lifecycle this job's recovery point would be kept under keeps the
+        // interval the model requires between its transition to cold storage
+        // and its deletion — the same check every operation that takes one
+        // applies — so no point is created with a retention the service could
+        // never honour.
+        if let Some(refusal) = crate::state::rejected_lifecycle(input.lifecycle.as_ref()) {
+            return Err(StartBackupJobErrorModeled::InvalidParameterValueException(refusal).into());
+        }
+
         let mut store = state.lock();
         // The one store whose KEYS a caller chooses: forget expired records and
         // the oldest beyond the ceiling before recording another.

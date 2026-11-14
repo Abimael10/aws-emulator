@@ -254,6 +254,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
         ) {
             return Err(StartCopyJobErrorModeled::InvalidParameterValueException(refusal).into());
         }
+        // The lifecycle the copy would be kept under keeps the interval the
+        // model requires between its transition to cold storage and its
+        // deletion — the same check every operation that takes one applies.
+        if let Some(refusal) = crate::state::rejected_lifecycle(input.lifecycle.as_ref()) {
+            return Err(StartCopyJobErrorModeled::InvalidParameterValueException(refusal).into());
+        }
         let Some(destination) =
             crate::state::backup_vault_arn_parts(&input.destination_backup_vault_arn)
         else {
