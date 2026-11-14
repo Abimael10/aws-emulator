@@ -11,10 +11,12 @@
 //! and every other key the pool holds is left exactly as it was. A call that is refused
 //! writes nothing, so a pool's tag set only ever changes through a call that succeeded.
 //!
-//! Four rules refuse a call before it writes: a tag entry outside the bounds the model's
-//! own `IdentityPoolTagsType` states (400 `ValidationException`, the protocol-level
-//! constraint refusal, because the bounds are on the map's KEY and VALUE shapes and so are
-//! not checked by the boundary walk over the member); a key or a value carrying a character
+//! Four rules refuse a call before it writes: a tag KEY outside the bounds the model's own
+//! `IdentityPoolTagsType` states (400 `ValidationException`, the protocol-level constraint
+//! refusal, stated once at the `tags` member — quoting the map the request sent and listing
+//! what a key of it has to satisfy — because a map's key is the one modelled constraint the
+//! boundary walk ahead of this handler treats as a path segment rather than as a constrained
+//! leaf, while the map's VALUES that walk does check); a key or a value carrying a character
 //! tags may not hold; a key in the `aws:` namespace AWS reserves for its own tags; and a
 //! call that would leave the pool with more tags than an identity pool can have. The last
 //! three are bad input parameters, which is the modelled 400 `InvalidParameterException` —
@@ -242,17 +244,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> TagResource<Eng> 
         let mut requested: Vec<(&String, &String)> = input.tags.iter().collect();
         requested.sort_by_key(|(tag_key, _)| *tag_key);
 
-        // The MODELLED bounds on the map's own key and value shapes. The protocol's
-        // boundary walk checks the map's VALUES against `TagValueType` before this handler
-        // runs, but not its KEYS, so a key outside `TagKeysType`'s bound reaches here: a
-        // constraint the model states is a protocol-level refusal — HTTP 400
-        // `ValidationException` with a message built from the request — which is what
-        // `Scaffolded::validation` answers. Both are checked here so the rule holds for
-        // every entry of the map whichever path refuses it.
-        let violations = constraint_violations(&requested);
-        if !violations.is_empty() {
+        // The one MODELLED bound of this map the protocol's boundary walk does not reach:
+        // its KEYS, which that walk treats as a path segment rather than as a constrained
+        // leaf. The map's VALUES are checked against `TagValueType` before this handler
+        // runs, so they are not re-checked here. A constraint the model states is a
+        // protocol-level refusal — HTTP 400 `ValidationException` naming the member, the map
+        // it was handed and what a key of that map has to satisfy — which is what
+        // `Scaffolded::validation` answers.
+        //
+        // The value named is the MEMBER's own, and a member fails one constraint once, so a
+        // map carrying several keys outside the bound is refused for that one failure rather
+        // than once per key.
+        if requested
+            .iter()
+            .any(|(tag_key, _)| {
+                !crate::state::length_is_within(tag_key, &crate::state::TAG_KEY_LENGTH)
+            })
+        {
+            let submitted: ::std::collections::BTreeMap<String, String> = requested
+                .iter()
+                .map(|(tag_key, tag_value)| ((*tag_key).clone(), (*tag_value).clone()))
+                .collect();
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::validation_errors_detected(violations.len(), &violations),
+                crate::state::map_key_constraint_refusal(
+                    TAGS_MEMBER_PATH,
+                    &submitted,
+                    &crate::state::TAG_KEY_LENGTH,
+                    None,
+                ),
             ));
         }
 
@@ -317,34 +336,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> TagResource<Eng> 
     }
 }
 
-/// Every modelled-constraint violation in the request's `Tags`, in key order, each phrased
-/// the way a constraint refusal names the member and the constraint it failed.
-///
-/// The map's KEY and VALUE shapes carry the bounds ([`crate::state::TAG_KEY_LENGTH`] and
-/// [`crate::state::TAG_VALUE_LENGTH`], which every operation of this service reading a tag
-/// shares), so a violation is in one entry of the map rather than in the member as a whole,
-/// and the entry is named in the member path.
-fn constraint_violations(requested: &[(&String, &String)]) -> Vec<String> {
-    let mut violations = Vec::new();
-    for (tag_key, tag_value) in requested {
-        if !crate::state::length_is_within(tag_key, &crate::state::TAG_KEY_LENGTH) {
-            violations.push(format!(
-                "Value '{tag_key}' at 'tags' failed to satisfy constraint: Map keys must have \
-                 length greater than or equal to {} and less than or equal to {}",
-                crate::state::TAG_KEY_LENGTH.start(),
-                crate::state::TAG_KEY_LENGTH.end()
-            ));
-        }
-        if !crate::state::length_is_within(tag_value, &crate::state::TAG_VALUE_LENGTH) {
-            violations.push(format!(
-                "Value '{tag_value}' at 'tags.{tag_key}' failed to satisfy constraint: Member \
-                 must have length less than or equal to {}",
-                crate::state::TAG_VALUE_LENGTH.end()
-            ));
-        }
-    }
-    violations
-}
+/// The member path a refusal names the `Tags` map at: the member's own name, in the
+/// lowerCamel spelling a constraint clause spells a member in.
+const TAGS_MEMBER_PATH: &str = "tags";
 
 /// The modelled refusal for a bad input parameter (HTTP 400), carrying what was wrong with
 /// the request.

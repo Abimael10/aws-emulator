@@ -101,6 +101,10 @@ mod server_side_token_check;
 mod state_roundtrip;
 #[path = "all/stated_collection_order.rs"]
 mod stated_collection_order;
+#[path = "all/tag_map_key_refusal.rs"]
+mod tag_map_key_refusal;
+#[path = "all/tagged_vend_session_tag_grant.rs"]
+mod tagged_vend_session_tag_grant;
 #[path = "all/unlink_developer_identity.rs"]
 mod unlink_developer_identity;
 #[path = "all/unlink_identity.rs"]

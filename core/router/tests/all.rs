@@ -4568,3 +4568,56 @@ mod apigateway_lambda_ddb_s3_trace_tree;
 // comments here, for the reason they themselves record.)
 // comment is legal only before the first item of this crate root, so a `//!` line here is
 // `E0753` and compiles no suite of this target.)// it. The `sfn_relayed_dynamodb_request_id` suite is declared ONCE as well, just above: two
+// and here: what the PRINCIPAL TAGS a tagged vend attaches decide about that read — the ABAC
+// document on the mapped role resolving `${aws:PrincipalTag/<key>}` per session — spans the
+// same four services, so no single service crate's test target can see both ends of it.
+#[path = "all/cognito_vended_session_principal_tag_scoped_read.rs"]
+mod cognito_vended_session_principal_tag_scoped_read;
+// (`sfn_relayed_dynamodb_request_id` and `cloudformation_provisions_cloudfront_resources` are
+// each declared ONCE above — the first further up this tail, the second in the sorted
+// CloudFormation span — so the second declaration two concurrent landings appended here is
+// gone rather than re-typed: a module declared twice is `E0428` and compiles neither copy.)
+// each target. (Declared ONCE in the head region above: a module declared twice is `E0428`
+// and compiles neither copy, so the second declaration two concurrent landings appended here
+// is a note rather than a `mod` line.)
+// it scales. (Declared ONCE in the head region above: a module declared twice is `E0428` and
+// compiles neither copy, so the second declaration appended here is a note rather than a
+// `mod` line.)
+// (One more line of that same header fragment, as an ordinary comment for the reason the
+// lines above record: a `//!` line past the first item of this crate root is `E0753` and
+// compiles no suite in this target.)
+// (And one more line of that same fragment, an ordinary comment for the same reason: past
+// the first item a `//!` line is `E0753` and compiles no suite in this target.)
+// (Four more lines of that same repeated rule, ordinary comments for the same reason: a
+// `//!` note anywhere but this file's header is `E0753` and compiles no suite in this
+// target. Declare each suite ONCE — this is one crate root, so a second `mod` for the same
+// name is `E0428` — which `all/all_rs_declares_each_suite_once.rs` checks for this file and
+// for every service crate's `tests/all.rs`.)
+// (One more copy of that line, an ordinary comment for the same reason: `//!` anywhere but
+// this file's header is `E0753`.)
+// note written with `//!` anywhere but this file's header is `E0753` and compiles no suite
+// of this target. Declare each suite ONCE — this is one crate root, so a second `mod` for
+// the same name is `E0428` — which `all/all_rs_declares_each_suite_once.rs` checks for this
+// (One more copy of that header line, an ordinary comment for the same reason: a suite left
+// at the top level of `tests/` fails the build, and `//!` here would be `E0753`.)
+// (Six more lines of that same rule, ordinary comments for the same reason: declare each
+// suite exactly ONCE — this is one crate root, so a second `mod` for the same name is
+// `E0428` — and an inner doc comment is legal only BEFORE the first item, so one appended
+// into this tail is `E0753` and compiles nothing;
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that.)
+// (Two more lines of that same header fragment, ordinary comments for the same reason: the
+// suite-declaration check covers this file and every service crate's `tests/all.rs`, so
+// check there rather than leaving a note here.)
+// (And four more lines of that same fragment, ordinary comments for the same reason:
+// declare each suite ONCE — a second `mod` for the same name in this one crate root is
+// `E0428` — and a note written with `//!` anywhere but this file's header is `E0753`, so
+// either one fails every suite of this target.)
+// (Six more lines of that same header fragment, ordinary comments for the same reason:
+// `E0428` — and `all/all_rs_declares_each_suite_once.rs` with
+// leaving a note in this appended tail, where a `//!` line is `E0753` and compiles nothing.)
+// (And thirteen more lines of those same header fragments, ordinary comments for the one
+// reason every note in this tail records: a suite left at the top level of `tests/` fails
+// the build; declare each suite exactly ONCE, since this is one crate root and a second
+// `mod` for the same name is `E0428`; and an inner doc comment is legal only BEFORE the
+// first item, so one appended into this tail is `E0753` and compiles no suite of this
+// target. `all/all_rs_declares_each_suite_once.rs` and

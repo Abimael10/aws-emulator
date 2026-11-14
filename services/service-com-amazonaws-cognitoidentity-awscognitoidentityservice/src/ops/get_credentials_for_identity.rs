@@ -29,9 +29,14 @@
 //! keeps one identity pool out of another pool's role — are each answered with the modelled
 //! `InvalidIdentityPoolConfigurationException` (HTTP 400), the error the real service
 //! raises when it has no role it can assume for the request, rather than with a session
-//! that stands for nothing. A role mapping that DENIES the exchange is a different refusal:
-//! the pool's configuration is not at fault, the token presented is simply not authorized
-//! to receive a credential, so that one is the modelled `NotAuthorizedException` (HTTP 403).
+//! that stands for nothing. A TAGGED assume — one for a pool that maps principal tags for
+//! the provider the login was made under — needs one grant more: "To pass session tags, the
+//! principal must have the `sts:TagSession` permission" (`AssumeRole$Tags`, the STS model),
+//! so a role whose trust policy admits only the assume cannot be assumed with tags and the
+//! vend is answered the same configuration refusal. A role mapping that DENIES the exchange
+//! is a different refusal: the pool's configuration is not at fault, the token presented is
+//! simply not authorized to receive a credential, so that one is the modelled
+//! `NotAuthorizedException` (HTTP 403).
 //!
 //! `Logins` selects WHICH flow the exchange is: a request that presents a login is an
 //! authenticated one, and the pool's `authenticated` role is the one assumed where no
@@ -597,6 +602,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
             &resolved.requested_tags,
         ));
         if !crate::state::role_admits_web_identity(&role, &assume_context) {
+            return Err(refused());
+        }
+        // Attaching those tags is a SEPARATE grant from the assume: "To pass session tags,
+        // the principal must have the `sts:TagSession` permission" (`AssumeRole$Tags`, the
+        // STS model), so a role whose trust policy admits only the web-identity assume
+        // cannot be assumed WITH tags — the assume STS is asked for is refused, which is
+        // the "STS returned an error response to the request to assume the … role from the
+        // identity pool" case `InvalidIdentityPoolConfigurationException` states. Asked
+        // only of an exchange that really asks for a tag: a vend whose pool maps none
+        // attaches none and needs no grant to pass one.
+        if !resolved.requested_tags.is_empty()
+            && !crate::state::role_admits_session_tags(&role, &assume_context)
+        {
             return Err(refused());
         }
 

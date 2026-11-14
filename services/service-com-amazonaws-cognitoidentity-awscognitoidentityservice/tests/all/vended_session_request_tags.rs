@@ -60,15 +60,17 @@ const INVALID_POOL_CONFIGURATION_CODE: &str = "InvalidIdentityPoolConfigurationE
 
 /// A trust policy that admits this pool's users ONLY where the assume requests the session
 /// tag `Department` with the value `ADMITTED_DEPARTMENT`: the `Federated` Cognito Identity
-/// principal, the web-identity assume, the `:aud` condition restricting it to `audience`'s
-/// own users, and the `aws:RequestTag/<key>` clause a tagged assume is gated on.
+/// principal, the web-identity assume, the `sts:TagSession` permission a tagged assume needs
+/// beside it ("To pass session tags, the principal must have the `sts:TagSession`
+/// permission", `AssumeRole$Tags`), the `:aud` condition restricting it to `audience`'s own
+/// users, and the `aws:RequestTag/<key>` clause a tagged assume is gated on.
 fn tag_gated_trust_policy(audience: &str) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
             "Effect": "Allow",
             "Principal": {"Federated": COGNITO_PRINCIPAL},
-            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Action": ["sts:AssumeRoleWithWebIdentity", "sts:TagSession"],
             "Condition": {"StringEquals": {
                 format!("{COGNITO_PRINCIPAL}:aud"): audience,
                 format!("aws:RequestTag/{DEPARTMENT_TAG}"): ADMITTED_DEPARTMENT,

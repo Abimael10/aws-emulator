@@ -1214,10 +1214,6 @@ pub fn is_reserved_tag_key(tag_key: &str) -> bool {
 /// Held here so every operation that reads a tag key checks the one bound the model states.
 pub const TAG_KEY_LENGTH: ::std::ops::RangeInclusive<usize> = 1..=128;
 
-/// The MODELLED length bounds of a tag VALUE, `TagValueType` (`len 0..256`), from the same
-/// query.
-pub const TAG_VALUE_LENGTH: ::std::ops::RangeInclusive<usize> = 0..=256;
-
 /// Whether `value` lies inside `bounds`, counted in CHARACTERS, as the `length` trait
 /// measures a string.
 pub fn length_is_within(value: &str, bounds: &::std::ops::RangeInclusive<usize>) -> bool {
@@ -3350,6 +3346,14 @@ pub fn authentication_methods(providers: &[String]) -> Vec<String> {
     methods
 }
 
+/// The IAM action a role's trust policy has to grant BESIDE the assume for an exchange
+/// that attaches session tags to the session it mints: "To pass session tags, the
+/// principal must have the `sts:TagSession` permission" (`AssumeRole$Tags`, the STS
+/// model) — a permission an administrator grants beside the assume itself, which STS's own
+/// mint reads the same constant for.
+pub const TAG_SESSION_ACTION: &str =
+    ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::TAG_SESSION_ACTION;
+
 /// Whether `role`'s trust policy admits the web-identity assume `context` describes.
 ///
 /// The DECISION is [`::service_common::iam_authorization`], the tree's one evaluation of
@@ -3360,19 +3364,41 @@ pub fn authentication_methods(providers: &[String]) -> Vec<String> {
 /// policy, or one this cannot read as a policy, admits nobody: nothing is assumed on
 /// evidence the account does not hold.
 pub fn role_admits_web_identity(role: &ResolvedRole, context: &[(String, String)]) -> bool {
-    let Some(document) = role.trust_policy.as_deref() else {
-        return false;
-    };
+    role_trust_policy_admits(role, ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION, context)
+}
+
+/// Whether `role`'s trust policy admits the SESSION TAGS a tagged exchange asks its assume
+/// to attach — the grant that is separate from the assume itself
+/// ([`TAG_SESSION_ACTION`]), decided over the very context the assume is decided over, so a
+/// clause gating the grant on `aws:RequestTag/<key>` or `aws:TagKeys` is read against the
+/// tags this exchange asks for.
+///
+/// Asked ONLY of an exchange that really asks for a tag: an untagged assume attaches none,
+/// so it needs no grant to pass one.
+pub fn role_admits_session_tags(role: &ResolvedRole, context: &[(String, String)]) -> bool {
+    role_trust_policy_admits(role, TAG_SESSION_ACTION, context)
+}
+
+/// Whether `role`'s trust policy grants `action` to the Cognito Identity service principal
+/// — the `Principal.Federated` spelling an identity pool's users are admitted by — given
+/// the condition keys `context` carries and the keys a vend publishes about its assume
+/// ([`WEB_IDENTITY_PUBLISHED_CONDITION_KEYS`]).
+///
+/// STS's OWN reading of a trust policy ([`ResolvedRole::trust_policy_admits`]), so a grant
+/// this service decides on and the one `sts:AssumeRole` decides on cannot drift apart: a
+/// role carrying no trust policy, or one that cannot be read as a policy, grants nothing.
+fn role_trust_policy_admits(
+    role: &ResolvedRole,
+    action: &str,
+    context: &[(String, String)],
+) -> bool {
     let principals = [COGNITO_IDENTITY_PRINCIPAL.to_string()];
-    let request = ::service_common::iam_authorization::Request::new(
-        ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION,
-        &role.arn,
+    role.trust_policy_admits(
+        action,
         &principals,
+        context,
+        WEB_IDENTITY_PUBLISHED_CONDITION_KEYS,
     )
-    .with_context(context)
-    .with_published_keys(WEB_IDENTITY_PUBLISHED_CONDITION_KEYS);
-    ::service_common::iam_authorization::resource_decision(document, &request)
-        == ::service_common::iam_authorization::Decision::Allowed
 }
 
 /// The session a vend hands back: the credential the caller signs with, and the
