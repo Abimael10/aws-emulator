@@ -247,6 +247,8 @@ mod job_run_execution_role;
 mod job_run_listing;
 #[path = "all/job_run_miss_message.rs"]
 mod job_run_miss_message;
+#[path = "all/job_run_positive_control.rs"]
+mod job_run_positive_control;
 #[path = "all/job_run_rest.rs"]
 mod job_run_rest;
 #[path = "all/job_run_retries.rs"]

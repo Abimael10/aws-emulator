@@ -50,7 +50,7 @@ use crate::wire::{ok, ACCOUNT_ID};
 
 /// The fixed text Glue's script-access failure states, written out here rather than read from
 /// the crate's own constant so this suite pins the wording.
-const SCRIPT_FILE_DOESNT_EXIST: &str = "Script file doesn't exist";
+pub(crate) const SCRIPT_FILE_DOESNT_EXIST: &str = "Script file doesn't exist";
 
 /// The AWS-managed policy a Glue service role is routinely given, which grants
 /// `s3:GetObject` only on the buckets AWS Glue itself owns. Named by its friendly name and
@@ -124,7 +124,7 @@ pub(crate) fn statement(effect: &str, actions: &[&str], resource: &str) -> Value
 }
 
 /// Everything under this suite's bucket, as a policy names it.
-fn every_object() -> String {
+pub(crate) fn every_object() -> String {
     format!("arn:aws:s3:::{BUCKET}/*")
 }
 

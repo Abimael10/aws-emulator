@@ -333,6 +333,37 @@ pub(crate) async fn run_at_rest(
     }
 }
 
+/// Read the run `run_id` of `job_name` back until it has come to rest, leaving the due
+/// instants of its lifecycle WHERE THE SERVICE PUT THEM, and answer the `JobRun` it then
+/// reports.
+///
+/// The non-forcing half of [`run_at_rest`], for a caller that is asking what the run's own
+/// lifecycle took: nothing is made due through the store, so the states the clock owes the run
+/// fall due on the clock and the span between its `StartedOn` and `CompletedOn` is the span it
+/// really spent. The wait is the same poll for the CONDITION — that the run has come to rest —
+/// against the same generous deadline, so it neither sleeps for a fixed time nor asserts
+/// anything about how fast the host ran.
+pub(crate) async fn run_at_rest_on_the_services_own_clock(
+    router: &MultiServiceRouter,
+    case: &str,
+    job_name: &str,
+    run_id: &str,
+) -> Value {
+    let deadline = SystemTime::now() + RUN_AT_REST_DEADLINE;
+    loop {
+        let run = get_run(router, job_name, run_id).await;
+        if at_rest(&run) {
+            return run;
+        }
+        assert!(
+            SystemTime::now() < deadline,
+            "case {case:?}: run {run_id:?} of {job_name:?} must come to rest, and it reports \
+             {run}"
+        );
+        tokio::time::sleep(RUN_POLL_INTERVAL).await;
+    }
+}
+
 /// Read the runs of `job_name` back until every one of them has come to rest, and answer
 /// them as `GetJobRuns` reports them.
 ///
