@@ -146,6 +146,8 @@ mod edge_request_shaping;
 mod edge_response_headers_policy;
 #[path = "all/edge_signed_access.rs"]
 mod edge_signed_access;
+#[path = "all/edge_signed_s3_origin.rs"]
+mod edge_signed_s3_origin;
 #[path = "all/edge_standard_logging_v2.rs"]
 mod edge_standard_logging_v2;
 #[path = "all/edge_web_acl.rs"]

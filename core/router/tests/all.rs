@@ -4386,3 +4386,19 @@ mod cloudformation_appsync_custom_domains;
 // declare each suite exactly once, since a second `mod` for one name is `E0428` and
 // `all/all_rs_declares_each_suite_once.rs` checks it — so it is dropped rather than
 // reworded here.)
+// (Another copy of that same line, an ordinary comment here for the same reason.)
+// (A fragment of this file's header appended here typed with `//!`, which is `E0753` past
+// the first item, so it stands as ordinary comments: declare each suite exactly ONCE, since
+// this is one crate root and a second `mod` for the same name is `E0428`;
+// (The same header fragment again, as ordinary comments for the same reason: it covers this
+// file and every service crate's `tests/all.rs`, so check there rather than leaving a note
+// (One more appended fragment of that header, as ordinary comments: declare each suite
+// ONCE, since this is one crate root and a second `mod` for the same name is `E0428`, and a
+// note written with `//!` anywhere but this file's head is `E0753` — either fails every
+// suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the declarations,
+// (A block of this file's own header that successive landings appended to this tail, each
+// line typed with `//!`: an inner doc comment is legal only BEFORE the first item, so here
+// it is `E0753` and compiles no suite of this target. The rules those lines repeat — a suite
+// left at the top level of `tests/` fails the build, and each suite is declared exactly ONCE,
+// since this is one crate root and a second `mod` for the same name is `E0428` — stand in the
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of them for

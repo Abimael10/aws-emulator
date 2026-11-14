@@ -45,6 +45,11 @@
 //! digest for verification only), so the EMSA-PKCS1-v1_5 encoding is composed here over the
 //! modular exponentiation `num-bigint` provides; the digest, the key and the verification are
 //! all the libraries' own.
+//!
+//! That signer, the policy statements it signs, the query and the viewer request are
+//! `pub(crate)`, so a sibling suite that needs a signed URL (`edge_signed_s3_origin`, which
+//! puts this same decision in front of a private Amazon S3 origin) signs with this one rather
+//! than growing a second copy of CloudFront's signing procedure.
 
 use ::base64::Engine as _;
 use ::num_bigint::BigUint;
@@ -74,16 +79,16 @@ const OPEN_PATH: &str = "/2020-05-31/key-group";
 /// The AWS-managed cache policy `Managed-CachingDisabled`, whose TTLs are all zero: a
 /// behaviour under it caches nothing, so every admitted request goes to the origin and no
 /// case is answered out of another case's entry.
-const CACHING_DISABLED: &str = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad";
+pub(crate) const CACHING_DISABLED: &str = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad";
 
 /// `X-Cache` for an answer the origin produced for this request.
-const MISS: &str = "Miss from cloudfront";
+pub(crate) const MISS: &str = "Miss from cloudfront";
 
 /// `X-Cache` for an answer the edge cache held.
 const HIT: &str = "Hit from cloudfront";
 
 /// `X-Cache` for an answer CloudFront produced itself.
-const ERROR: &str = "Error from cloudfront";
+pub(crate) const ERROR: &str = "Error from cloudfront";
 
 /// A fragment of the ORIGIN's own answer: a request that carries it reached the origin.
 const ORIGIN_BYTES: &str = "DistributionList";
@@ -104,7 +109,7 @@ const PUBLIC_KEY_LABEL: &str = "PUBLIC KEY";
 // ---------------------------------------------------------------------------
 
 /// One RSA key pair, held the way the client that signs a CloudFront URL holds one.
-struct Signer {
+pub(crate) struct Signer {
     /// The public half as the PEM `SubjectPublicKeyInfo` `CreatePublicKey` takes.
     public_key_pem: String,
     /// How many octets the modulus — and so every signature — is long.
@@ -120,7 +125,7 @@ struct Signer {
 impl Signer {
     /// A fresh 2048-bit RSA pair: the modulus width CloudFront's own signed-URL procedure
     /// documents for a key group's public key.
-    fn generate() -> Self {
+    pub(crate) fn generate() -> Self {
         use ::aws_lc_rs::encoding::{AsDer, Pkcs8V1Der, PublicKeyX509Der};
         use ::aws_lc_rs::signature::KeyPair as _;
         use ::pkcs1::der::Decode as _;
@@ -156,7 +161,7 @@ impl Signer {
     /// The CloudFront `Signature` of `statement`: "hash and sign the policy statement … use
     /// SHA-1 to hash and RSA to sign", base64-encoded with the three substitutions that let
     /// the value travel in a URL.
-    fn sign(&self, statement: &str) -> String {
+    pub(crate) fn sign(&self, statement: &str) -> String {
         let digest = ::aws_lc_rs::digest::digest(
             &::aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY,
             statement.as_bytes(),
@@ -196,7 +201,7 @@ impl Signer {
 /// `bytes` in the base64 alphabet CloudFront's signing procedure spells a URL-safe value in:
 /// "replace all occurrences of `+`, `=`, and `/` in the base64-encoded version" with `-`, `_`
 /// and `~`.
-fn url_safe_base64(bytes: &[u8]) -> String {
+pub(crate) fn url_safe_base64(bytes: &[u8]) -> String {
     ::base64::engine::general_purpose::STANDARD
         .encode(bytes)
         .chars()
@@ -211,7 +216,7 @@ fn url_safe_base64(bytes: &[u8]) -> String {
 
 /// A CUSTOM policy statement, as CloudFront's documented JSON: one statement naming
 /// `resource`, with the conditions `expires`, `starts` and `source_ip` state.
-fn custom_policy(
+pub(crate) fn custom_policy(
     resource: &str,
     expires: u64,
     starts: Option<u64>,
@@ -231,7 +236,7 @@ fn custom_policy(
 }
 
 /// A CANNED policy statement, which CloudFront rebuilds from the URL and `Expires` alone.
-fn canned_policy(resource: &str, expires: u64) -> String {
+pub(crate) fn canned_policy(resource: &str, expires: u64) -> String {
     format!(
         "{{\"Statement\":[{{\"Resource\":\"{resource}\",\"Condition\":\
          {{\"DateLessThan\":{{\"AWS:EpochTime\":{expires}}}}}}}]}}"
@@ -239,12 +244,12 @@ fn canned_policy(resource: &str, expires: u64) -> String {
 }
 
 /// A Unix instant well ahead of any run of this suite, for a policy that has not expired.
-fn far_future() -> u64 {
+pub(crate) fn far_future() -> u64 {
     now_seconds() + 3_600
 }
 
 /// A Unix instant well behind any run of this suite, for a policy that has.
-fn far_past() -> u64 {
+pub(crate) fn far_past() -> u64 {
     now_seconds() - 3_600
 }
 
@@ -294,7 +299,7 @@ fn config(caller_reference: &str, origin: &str, key_group: &str) -> String {
 }
 
 /// Upload `signer`'s public half through `CreatePublicKey` and report the id it minted.
-async fn upload_public_key(
+pub(crate) async fn upload_public_key(
     router: &MultiServiceRouter,
     tag: &str,
     signer: &Signer,
@@ -325,7 +330,7 @@ async fn upload_public_key(
 }
 
 /// Create a key group over `keys` and report `(Id, ETag)`.
-async fn create_key_group(
+pub(crate) async fn create_key_group(
     router: &MultiServiceRouter,
     tag: &str,
     keys: &[&str],
@@ -424,21 +429,21 @@ async fn deployed(
 // ---------------------------------------------------------------------------
 
 /// What the edge answered one viewer request with.
-struct Viewed {
-    status: u16,
-    x_cache: String,
-    body: String,
+pub(crate) struct Viewed {
+    pub(crate) status: u16,
+    pub(crate) x_cache: String,
+    pub(crate) body: String,
 }
 
 impl Viewed {
     /// Whether CloudFront's own error body carries the code `code`.
-    fn carries_code(&self, code: &str) -> bool {
+    pub(crate) fn carries_code(&self, code: &str) -> bool {
         self.body.contains(&format!("<Code>{code}</Code>"))
     }
 }
 
 /// Send one VIEWER request: no AWS credential, addressed to `host`, carrying `headers`.
-async fn view(
+pub(crate) async fn view(
     router: &MultiServiceRouter,
     host: &str,
     path_and_query: &str,
@@ -471,7 +476,7 @@ async fn view(
 }
 
 /// The query string of a signed URL carrying a CUSTOM policy.
-fn custom_query(policy: &str, signature: &str, key_pair_id: &str) -> String {
+pub(crate) fn custom_query(policy: &str, signature: &str, key_pair_id: &str) -> String {
     format!(
         "Policy={}&Signature={signature}&Key-Pair-Id={key_pair_id}",
         url_safe_base64(policy.as_bytes())
@@ -479,7 +484,7 @@ fn custom_query(policy: &str, signature: &str, key_pair_id: &str) -> String {
 }
 
 /// The query string of a signed URL carrying a CANNED policy.
-fn canned_query(expires: u64, signature: &str, key_pair_id: &str) -> String {
+pub(crate) fn canned_query(expires: u64, signature: &str, key_pair_id: &str) -> String {
     format!("Expires={expires}&Signature={signature}&Key-Pair-Id={key_pair_id}")
 }
 
