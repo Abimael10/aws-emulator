@@ -511,8 +511,12 @@ async fn a_declared_functions_log_group_is_opened_by_its_first_invocation() {
             "case {case:?}: expected the delivered log to open on its START line, got \
              {delivered:?}"
         );
+        // A node runtime delivers a console line FRAMED — the instant, the invocation's id,
+        // the level, then the text — so what the handler wrote is the line's last field; a
+        // python handler's `print` is delivered as the text it is.
         assert_eq!(
-            delivered[1], row.written,
+            delivered[1].rsplit('\t').next().unwrap_or_default(),
+            row.written,
             "case {case:?}: expected the handler's own line, got {delivered:?}"
         );
         assert!(

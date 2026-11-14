@@ -486,8 +486,11 @@ async fn an_invocation_delivers_its_log_to_the_functions_log_group() {
         );
         for (position, written) in row.written.iter().enumerate() {
             let actual = lines.get(position + 1).cloned().unwrap_or_default();
+            // A node runtime delivers a console line FRAMED — the instant, the invocation's
+            // id, the level, then the text — so what the handler wrote is the last field.
+            let text = actual.rsplit('\t').next().unwrap_or_default();
             assert_eq!(
-                actual, *written,
+                text, *written,
                 "case {case:?}: expected the handler's line {position} to be {written:?}, got \
                  {actual:?}"
             );
@@ -913,7 +916,8 @@ async fn an_asynchronous_run_is_logged_and_a_dry_run_is_not() {
         "case {case:?}: expected the log to open on its START line, got {lines:?}"
     );
     assert_eq!(
-        lines[1], "a queued run",
+        lines[1].rsplit('\t').next().unwrap_or_default(),
+        "a queued run",
         "case {case:?}: expected the handler's own line, got {lines:?}"
     );
     assert!(

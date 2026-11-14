@@ -238,28 +238,15 @@ pub struct AddressedUrl<'r> {
 pub fn addressed_url<'r>(
     addressed: &'r AddressedFunctionUrl<'r>,
 ) -> Option<AddressedUrl<'r>> {
-    // This service's own CONTROL-plane path space is never a function URL's, on any host: a
-    // request whose first segment is one of `crate::ROUTE_PATH_SEGMENTS` is a control-plane
-    // call wherever it arrives, and claiming it here would take `/2015-03-31/functions`
-    // away from the operations that serve it.
-    if first_segment(addressed.path).is_some_and(|first| crate::ROUTE_PATH_SEGMENTS.contains(&first))
-    {
-        return None;
-    }
-    // LOCAL-ENDPOINT style first, because its marker is unambiguous on any host.
-    if let Some((url_id, request_path, region)) = local_endpoint_path(addressed.path) {
-        return named(url_id, request_path, region);
-    }
-    if let Some((url_id, region)) = addressed
-        .host
-        .as_deref()
-        .and_then(function_url_host_parts)
-    {
-        return named(url_id, addressed.path, Some(region));
+    if let Some(named) = named_endpoint(addressed) {
+        return Some(named);
     }
     // PATH-STYLE, on the emulator's own endpoint or on this service's own host only: any
     // other host is another service's, and whatever its path carries is that service's to
     // answer.
+    if names_control_plane(addressed.path) {
+        return None;
+    }
     let names_other_service = addressed
         .host
         .as_deref()
@@ -270,6 +257,47 @@ pub fn addressed_url<'r>(
     }
     let (url_id, request_path) = split_first_segment(addressed.path)?;
     named(url_id, request_path, None)
+}
+
+/// The function URL `addressed` names by one of the two addressings that name THIS plane and
+/// nothing else, or `None` when it names neither.
+///
+/// The two are the ones a caller cannot write by accident: the endpoint HOST
+/// `FunctionUrlConfig$FunctionUrl` documents, whose shape is this plane's own, and the
+/// reserved local-endpoint path, whose marker and plane label are explicit. Both name this
+/// plane whatever this store HOLDS, which is what lets the plane answer for an address of
+/// its own that no configuration sits behind — a URL whose configuration was deleted is
+/// still an address of this service, and what a caller reading it is told is this service's
+/// to say.
+///
+/// PATH-STYLE is deliberately not one of them: its first segment is a url id only because
+/// this store holds one under it, so reading it for an id this store does not hold would
+/// claim every one-segment path on the emulator's own endpoint.
+#[must_use]
+pub fn named_endpoint<'r>(
+    addressed: &'r AddressedFunctionUrl<'r>,
+) -> Option<AddressedUrl<'r>> {
+    // This service's own CONTROL-plane path space is never a function URL's, on any host: a
+    // request whose first segment is one of `crate::ROUTE_PATH_SEGMENTS` is a control-plane
+    // call wherever it arrives, and claiming it here would take `/2015-03-31/functions`
+    // away from the operations that serve it.
+    if names_control_plane(addressed.path) {
+        return None;
+    }
+    // LOCAL-ENDPOINT style first, because its marker is unambiguous on any host.
+    if let Some((url_id, request_path, region)) = local_endpoint_path(addressed.path) {
+        return named(url_id, request_path, region);
+    }
+    let (url_id, region) = addressed
+        .host
+        .as_deref()
+        .and_then(function_url_host_parts)?;
+    named(url_id, addressed.path, Some(region))
+}
+
+/// Whether `path` is in this service's own control-plane path space.
+fn names_control_plane(path: &str) -> bool {
+    first_segment(path).is_some_and(|first| crate::ROUTE_PATH_SEGMENTS.contains(&first))
 }
 
 /// One addressing, once its url id is known to be non-empty — an empty first label names no
@@ -321,6 +349,11 @@ pub struct FunctionUrlTarget {
     pub request_path: String,
     /// The region the ADDRESS named, for the addressings that carry one.
     pub addressed_region: Option<String>,
+    /// The HOST of the address this URL was PUBLISHED at ([`announced_function_url`], as
+    /// stored on the configuration), which is the host a client addressed it by — so it is
+    /// the host the handler is told about, in the event's `headers.host` and
+    /// `requestContext.domainName`.
+    pub endpoint_host: String,
 }
 
 /// The stored function URL `addressed` names, or `None` when this store holds none under
@@ -348,8 +381,22 @@ pub fn held_function_url(
                 cors: config.cors.clone(),
                 request_path: normalized_path(addressed.request_path),
                 addressed_region: addressed.region.map(str::to_string),
+                endpoint_host: announced_host(&config.url, &function.region, &config.url_id),
             })
     })
+}
+
+/// The HOST of an announced function URL: the authority of the address the configuration
+/// holds, or — for a stored value carrying none — the documented endpoint host of that url
+/// id, so a handler is never told about an address that is not one.
+fn announced_host(url: &str, region: &str, url_id: &str) -> String {
+    url.split_once("://")
+        .map(|(_scheme, rest)| rest.split('/').next().unwrap_or(rest))
+        .filter(|authority| !authority.is_empty())
+        .map_or_else(
+            || function_url_endpoint_host(region, url_id),
+            str::to_string,
+        )
 }
 
 /// The path a request names WITHIN the URL: the one it carried, and `/` for a request that

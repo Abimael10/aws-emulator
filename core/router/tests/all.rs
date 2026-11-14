@@ -4546,3 +4546,18 @@ mod apigateway_lambda_ddb_s3_trace_tree;
 // one stays in the HEADER: an inner doc comment past the first item is `E0753`, so the same
 // note appended to the tail of this file compiles no suite of this target — which is why
 // these lines are ordinary comments.
+// (And one more copy of that same line, appended typed with `//!`: an inner doc comment is
+// `E0753` anywhere but the head of a file, so it stands as an ordinary comment here.)
+// (One more copy of that same header fragment, appended into this tail typed with `//!`: an
+// inner doc comment is legal only BEFORE the first item of this crate root, so one here is
+// `E0753` and compiles no suite of this target. The rule it repeats — declare each suite
+// exactly ONCE, since a second `mod` for the same name is `E0428` and fails every suite in
+// this target — stands in the module doc at the HEAD of this file, and
+// it.)
+// (Two more lines of that header fragment, appended typed with `//!` and standing as
+// ordinary comments for the same reason: the suite-declaration check covers this file and
+// every service crate's `tests/all.rs`, so check there rather than leaving a note here.)
+// (And four more lines of that header fragment, appended typed with `//!` and standing as
+// ordinary comments: declare each suite ONCE, since this is one crate root and a second
+// `mod` for the same name is `E0428`, and a note written with `//!` anywhere but the header
+// is `E0753` — either fails every suite in this target.)

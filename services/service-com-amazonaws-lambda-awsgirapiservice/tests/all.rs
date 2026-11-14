@@ -247,10 +247,14 @@ mod function_url_cors;
 mod function_url_data_plane;
 #[path = "all/function_url_deletion.rs"]
 mod function_url_deletion;
+#[path = "all/function_url_error_class.rs"]
+mod function_url_error_class;
 #[path = "all/function_url_listing.rs"]
 mod function_url_listing;
 #[path = "all/function_url_reported_members.rs"]
 mod function_url_reported_members;
+#[path = "all/function_url_response_stream.rs"]
+mod function_url_response_stream;
 #[path = "all/function_url_unauthenticated_refusal.rs"]
 mod function_url_unauthenticated_refusal;
 #[path = "all/function_url_update.rs"]
@@ -487,6 +491,8 @@ mod resource_tags;
 mod response_stream_invocation;
 #[path = "all/response_stream_trailer.rs"]
 mod response_stream_trailer;
+#[path = "all/runtime_api_restore.rs"]
+mod runtime_api_restore;
 #[path = "all/runtime_management_config.rs"]
 mod runtime_management_config;
 #[path = "all/s3_package_source.rs"]

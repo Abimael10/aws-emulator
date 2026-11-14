@@ -760,6 +760,94 @@ async fn a_run_past_the_functions_own_bounds_ends_with_lambdas_error() {
     }
 }
 
+/// Every line a managed node runtime delivers for a `console` call is FRAMED as the text
+/// log format states it: the instant, the invocation's id, the level and the text, tab
+/// separated in that order — one row per console method, which is what the level reports.
+#[tokio::test]
+async fn a_node_console_line_is_delivered_framed_as_a_log_line() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+    let entries: &[(&str, &str)] = &[(
+        "index.js",
+        "exports.handler = async () => { \
+         console.log('wrote log'); \
+         console.info('wrote info'); \
+         console.debug('wrote debug'); \
+         console.warn('wrote warn'); \
+         console.error('wrote error'); \
+         console.trace('wrote trace'); \
+         return { ok: true }; };",
+    )];
+    create_function(&router, &Function::of("probe-node-framing", entries)).await;
+    let answered = invoke(
+        &router,
+        "probe-node-framing",
+        b"{}",
+        &[("x-amz-log-type", "Tail")],
+    )
+    .await;
+    assert_eq!(
+        answered.status,
+        200,
+        "expected 200, got {} {}",
+        answered.status,
+        answered.text()
+    );
+    let request_id = answered
+        .header("x-amzn-requestid")
+        .unwrap_or_else(|| panic!("the invocation must report its id, got {:?}", answered.headers));
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(
+            answered
+                .header("x-amz-log-result")
+                .unwrap_or_else(|| panic!("LogType=Tail must report the log, got {}", answered.text())),
+        )
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .expect("the tail is base64");
+
+    // (the console method's text, the level that method reports)
+    let rows: &[(&str, &str)] = &[
+        ("wrote log", "INFO"),
+        ("wrote info", "INFO"),
+        ("wrote debug", "DEBUG"),
+        ("wrote warn", "WARN"),
+        ("wrote error", "ERROR"),
+        ("wrote trace", "TRACE"),
+    ];
+    for (text, level) in rows {
+        let line = decoded
+            .lines()
+            .find(|line| line.ends_with(text))
+            .unwrap_or_else(|| panic!("case {text:?}: no delivered line carries it: {decoded:?}"));
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            fields.len(),
+            4,
+            "case {text:?}: expected timestamp/request id/level/text, got {line:?}"
+        );
+        assert!(
+            fields[0].ends_with('Z') && fields[0].contains('T') && fields[0].len() >= 20,
+            "case {text:?}: expected an ISO-8601 instant first, got {:?}",
+            fields[0]
+        );
+        assert_eq!(
+            fields[1], request_id,
+            "case {text:?}: expected the invocation's id {request_id:?}, got {:?}",
+            fields[1]
+        );
+        assert_eq!(
+            fields[2], *level,
+            "case {text:?}: expected the level {level:?}, got {:?}",
+            fields[2]
+        );
+        assert_eq!(
+            fields[3], *text,
+            "case {text:?}: expected the text last, got {:?}",
+            fields[3]
+        );
+    }
+}
+
 /// Handler code reaches nothing of the HOST: one row per thing a node program could
 /// otherwise reach a host file, process or library with, each of which resolves to nothing
 /// here — so the run fails the way it would with the dependency missing.

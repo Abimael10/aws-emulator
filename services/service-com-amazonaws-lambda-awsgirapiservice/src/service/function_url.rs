@@ -58,11 +58,11 @@
 //! invoked, and the answer to every other request carries that permission for an origin the
 //! configuration admits. A request whose origin it does not admit is served exactly as one
 //! carrying no origin is — the headers are what a browser enforces with, so nothing of the
-//! function's answer is withheld for them. `InvokeMode` is read only as the stored value the
-//! control plane reports: a `RESPONSE_STREAM` URL is served through the same BUFFERED
-//! mapping, because the response-streaming half of a function URL (the handler wrapper that
-//! writes a stream, and the metadata prelude that shapes it) is a runtime capability this
-//! emulator's engines do not supply yet.
+//! function's answer is withheld for them. `InvokeMode` decides WHAT the run's answer is read
+//! as: a `BUFFERED` URL answers the response the value the handler returned describes, while a
+//! `RESPONSE_STREAM` URL answers the bytes the handler WROTE — "your function streams payload
+//! results as they become available" — shaped by the metadata it announced ahead of them when
+//! it announced any ([`event::mapped_stream`]).
 //!
 //! A preflight carries an `Origin`, and the emulator's front door refuses a request whose
 //! browser-set headers say a browser sent it from another site before any operation of this
@@ -84,7 +84,7 @@ pub mod event;
 /// browser's PREFLIGHT; see the module's own header.
 mod cors;
 
-use event::{mapped_result, url_event, CallerIdentity, Mapped, UrlRequest};
+use event::{mapped_result, mapped_stream, url_event, CallerIdentity, Mapped, UrlRequest};
 
 /// The body of every `502` a function URL answers.
 ///
@@ -230,15 +230,26 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
     /// Whether THIS plane serves the request these parts came from — the half of
     /// `Service::can_handle` that claims a function URL.
     ///
-    /// Narrowed to a function URL this service HOLDS, read from the one shared store, so
-    /// nothing is claimed that this service cannot answer about and exactly one service
-    /// claims a request.
+    /// Narrowed to a function URL this service HOLDS, read from the one shared store, or to
+    /// an address that NAMES this plane and nothing else
+    /// ([`crate::state::function_url::named_endpoint`]) — so nothing is claimed that this
+    /// service cannot answer about and exactly one service claims a request. An address of
+    /// this plane that no configuration sits behind is this service's to answer too: the
+    /// caller was handed that address by this service, and what it is told about it is not
+    /// the router's "no service is registered for this".
     pub fn claims(&self, parts: &smithy_server_runtime::http::request::Parts) -> bool {
-        target_of(
-            &*self.engine,
-            &crate::state::AddressedFunctionUrl::of_parts(parts),
-        )
-        .is_some()
+        let addressed = crate::state::AddressedFunctionUrl::of_parts(parts);
+        crate::state::function_url::named_endpoint(&addressed).is_some()
+            || target_of(&*self.engine, &addressed).is_some()
+    }
+
+    /// Whether the runtime-API request `req` addresses this plane at all — by an addressing
+    /// that names it and nothing else, or by naming a function URL this store HOLDS, which
+    /// is exactly the reading `claims` admitted the request by.
+    pub fn addressed(&self, req: &RtRequest) -> bool {
+        let addressed = crate::state::AddressedFunctionUrl::of_request(req);
+        crate::state::function_url::named_endpoint(&addressed).is_some()
+            || target_of(&*self.engine, &addressed).is_some()
     }
 
     /// The function URL the runtime-API request `req` addresses, or `None` when it
@@ -276,12 +287,11 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
     async fn serve(&self, req: &RtRequest, ctx: &OperationContext<'_>) -> RtResponse {
         let Some(target) = self.target(req) else {
             // The URL was resolved when the request was CLAIMED; a configuration deleted
-            // between the two is a URL that no longer serves, and nothing of the function
-            // is answered for it.
-            return plane_error(
-                NOT_FOUND_STATUS,
-                "The function URL this request addressed does not exist.",
-            );
+            // between the two — and an address of this plane no configuration ever sat
+            // behind — admits no caller at all, so what a client is told is the refusal of
+            // a caller this endpoint does not admit, and nothing of whether a URL was ever
+            // configured there.
+            return unauthorized();
         };
         // The endpoint's own `Cors` settings, which decide the answer to a preflight whole
         // and decorate the answer to everything else. A URL configured with none states no
@@ -401,11 +411,11 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
                 );
                 Some(admitted.slot)
             }
-            Some(Err(throttled)) => {
+            Some(Err(throttled_by)) => {
                 ::tracing::info!(
                     request_id = %request_id,
                     function = %prepared.invocation.function_name,
-                    reason = %throttled.reason,
+                    reason = %throttled_by.reason,
                     "a function URL request found the function's concurrency pool full, so \
                      nothing ran"
                 );
@@ -416,7 +426,7 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
                     &prepared.invocation.function_name,
                     &prepared.resource,
                 );
-                return plane_error(THROTTLED_STATUS, &throttled.message);
+                return throttle_response(throttled_by.reason, &throttled_by.message);
             }
             None => None,
         };
@@ -440,7 +450,10 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
                     "a function URL request found no capacity to run the function, so nothing \
                      ran"
                 );
-                return plane_error(THROTTLED_STATUS, &message);
+                return throttle_response(
+                    crate::state::execution_slot::ACCOUNT_CONCURRENCY_REASON,
+                    &message,
+                );
             }
             Ok(invoked) => invoked,
             Err(why) => {
@@ -454,14 +467,29 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
         // "An unhandled error" is the function's own failure, which a function URL does not
         // pass through: the caller is told the gateway got no usable response, and the error
         // stays in the run's log.
-        if invoked.function_error.is_some() {
+        //
+        // A RESPONSE-STREAMING answer is the exception, and only once bytes have been
+        // WRITTEN: a stream that has been begun cannot be withdrawn, so the response stands
+        // and the failure that cut it short leaves the caller a body that stops where the
+        // handler stopped. A stream that was never begun is no response at all — whether the
+        // handler failed before its first write or returned having written nothing — so it is
+        // the same gateway answer every unusable response is, and never an empty success.
+        let streamed = served_as_a_stream(target);
+        let began = !invoked.chunks.is_empty();
+        if (invoked.function_error.is_some() && !(streamed && began)) || (streamed && !began) {
             ::tracing::info!(
                 request_id = %request_id,
-                "a function URL invocation ended in a function error, answered as a bad gateway"
+                "a function URL invocation produced no usable response, answered as a bad \
+                 gateway"
             );
             return bad_gateway(&request_id);
         }
-        match mapped_result(&invoked.payload) {
+        let mapped = if streamed {
+            mapped_stream(&invoked.payload)
+        } else {
+            mapped_result(&invoked.payload)
+        };
+        match mapped {
             Mapped::Response {
                 status,
                 headers,
@@ -573,7 +601,7 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
                 .unwrap_or_default(),
             zip_bytes: record.code_of(&executed_version).zip_bytes.clone(),
             layer_zips: crate::state::layer_archives(&resolved_config.layers),
-            payload: self.event_for(target, incoming, ctx, &record.region),
+            payload: self.event_for(target, incoming, ctx),
             // A function URL request carries no `ClientContext` and no `TenantId`: both are
             // members of the `Invoke` API, which this plane is not.
             client_context: None,
@@ -632,13 +660,24 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
         target: &crate::state::FunctionUrlTarget,
         incoming: &Incoming<'_>,
         ctx: &OperationContext<'_>,
-        region: &str,
     ) -> Vec<u8> {
         let req = incoming.req;
+        // The host the handler is told about is the function URL's OWN — the host of the
+        // address this service PUBLISHED for it, which is the address a client was handed
+        // and the one `requestContext.domainName` names — rather than the authority the
+        // request happened to reach this process at. A handler reconstructs its own URL
+        // from that header, enforces a host allow-list with it and signs callbacks from it,
+        // so what it has to name is the endpoint and not the socket in between.
+        let domain_name = &target.endpoint_host;
         let headers: Vec<(String, String)> = req
             .headers()
             .iter()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .map(|(name, value)| {
+                if name.eq_ignore_ascii_case(HOST_HEADER) {
+                    return (name.to_string(), domain_name.clone());
+                }
+                (name.to_string(), value.to_string())
+            })
             .collect();
         let content_type = req.headers().get("content-type").map(str::to_string);
         let source_ip = req
@@ -649,7 +688,6 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             .filter(|hop| !hop.is_empty())
             .unwrap_or(LOOPBACK_SOURCE_IP)
             .to_string();
-        let domain_name = function_url_host(region, &target.url_id);
         let request = UrlRequest {
             method: req.method(),
             raw_path: &target.request_path,
@@ -658,7 +696,7 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             body: incoming.body,
             content_type: content_type.as_deref(),
             url_id: &target.url_id,
-            domain_name: &domain_name,
+            domain_name,
             account_id: ::engine::emulator_account_id(),
             request_id: incoming.request_id,
             source_ip: &source_ip,
@@ -733,6 +771,18 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
 
 /// The `AuthType` whose URLs are served to authenticated callers only.
 const AUTH_TYPE_AWS_IAM: &str = "AWS_IAM";
+
+/// The `InvokeMode` whose URLs answer the bytes the handler WROTE rather than the response a
+/// value it returned describes: "RESPONSE_STREAM – Your function streams payload results as
+/// they become available".
+const INVOKE_MODE_RESPONSE_STREAM: &str = "RESPONSE_STREAM";
+
+/// Whether the URL `target` SERVES IN the response-streaming mode, which is the mode stored
+/// on it or the documented default when none ever was
+/// (`crate::state::FunctionUrlConfigRecord::served_invoke_mode`).
+fn served_as_a_stream(target: &crate::state::FunctionUrlTarget) -> bool {
+    target.invoke_mode == INVOKE_MODE_RESPONSE_STREAM
+}
 
 /// The status a request the function's concurrency pool had no room for is answered with:
 /// the throttle AWS answers an invocation past a concurrency limit with.
@@ -809,13 +859,9 @@ fn raw_query(uri: &str) -> &str {
     uri.split_once('?').map_or("", |(_, query)| query)
 }
 
-/// The host the function URL `url_id` publishes in `region`, which the event reports as
-/// `requestContext.domainName` — read off the ONE spelling of a function URL endpoint host
-/// ([`crate::state::function_url::function_url_endpoint_host`]), so the host the event names
-/// is the endpoint the control plane handed the caller.
-fn function_url_host(region: &str, url_id: &str) -> String {
-    crate::state::function_url::function_url_endpoint_host(region, url_id)
-}
+/// The header a request names the host it addressed in, which the event reports as the
+/// endpoint's own ([`FunctionUrlPlane::event_for`]).
+const HOST_HEADER: &str = "host";
 
 /// One served response: the status, headers and body the handler's result described.
 ///
@@ -854,23 +900,127 @@ fn served(
 
 /// The `502` every class of unusable response is answered with: AWS's own sentence, and
 /// nothing of the function's failure.
+///
+/// The sentence is the WHOLE body, unwrapped: a gateway answer is not one of this API's
+/// failures, so it carries neither an envelope member nor an error class naming a modelled
+/// shape — only the status, the request id and the sentence.
 fn bad_gateway(request_id: &str) -> RtResponse {
-    let mut response = plane_error(BAD_GATEWAY_STATUS, BAD_GATEWAY_MESSAGE);
+    let mut response = RtResponse::new(
+        plane_status(BAD_GATEWAY_STATUS),
+        SdkBody::from(BAD_GATEWAY_MESSAGE),
+    );
+    let headers = response.headers_mut();
+    headers.insert("content-type", event::DEFAULT_CONTENT_TYPE);
+    headers.insert(REQUEST_ID_HEADER, request_id.to_string());
     response
-        .headers_mut()
-        .insert(REQUEST_ID_HEADER, request_id.to_string());
+}
+
+/// The `429` an invocation the function's concurrency had no room for is answered with: the
+/// throttle document Lambda words for it.
+///
+/// A function URL request IS an invocation of the function, so what it is refused with is
+/// `TooManyRequestsException` — the sentence of the throttle, the `Reason` naming WHICH
+/// capacity was full (`crate::state::execution_slot`, the same reason `Invoke` reports) and
+/// the class of fault a quota the caller controls makes it
+/// ([`super::fault_class::USER_FAULT`]) — so a client can tell which pool it has to wait for.
+fn throttle_response(reason: &str, message: &str) -> RtResponse {
+    let body = ::serde_json::json!({
+        "message": message,
+        "Reason": reason,
+        "Type": super::fault_class::USER_FAULT,
+    })
+    .to_string();
+    let mut response = RtResponse::new(plane_status(THROTTLED_STATUS), SdkBody::from(body));
+    let headers = response.headers_mut();
+    headers.insert("content-type", event::DEFAULT_CONTENT_TYPE);
+    if let Some(error_type) = error_type_of(THROTTLED_STATUS) {
+        headers.insert(ERROR_TYPE_HEADER, error_type);
+    }
     response
 }
 
 /// One refusal of a function URL request, in the `{"message": …}` envelope a function URL
-/// answers with: the endpoint serves no modelled operation, so there is no modelled error
-/// to render.
+/// answers with, naming the CLASS of the failure in [`ERROR_TYPE_HEADER`].
+///
+/// The endpoint serves no modelled operation, so there is no modelled error document to
+/// render — but the failure still belongs to one of this API's error classes
+/// ([`error_type_of`]), and that class is what a client branches on, so it is named here
+/// exactly as every other answer of this service names the shape its failure is.
 fn plane_error(status: u16, message: &str) -> RtResponse {
     let body = ::serde_json::json!({ "message": message }).to_string();
     let mut response = RtResponse::new(plane_status(status), SdkBody::from(body));
     response
         .headers_mut()
         .insert("content-type", event::DEFAULT_CONTENT_TYPE);
+    if let Some(error_type) = error_type_of(status) {
+        response.headers_mut().insert(ERROR_TYPE_HEADER, error_type);
+    }
+    response
+}
+
+/// The modelled exception a failure this plane answers with `status` belongs to, or `None`
+/// for a status that is not one of this API's failures at all.
+///
+/// `Invoke` — which is what a function URL request IS an invocation through — models each
+/// of these classes against exactly this status
+/// (`smithy_query(query="operation", operation="Invoke")`: `TooManyRequestsException`
+/// `httpError` 429, `ResourceNotFoundException` 404, `RequestTooLargeException` 413,
+/// `ServiceException` 500), so the class a caller is told is the one the model gives that
+/// refusal. A `502` names none: the gateway's own answer stands for no modelled failure of
+/// this API.
+fn error_type_of(status: u16) -> Option<&'static str> {
+    match status {
+        FORBIDDEN_STATUS => Some(FORBIDDEN_ERROR_TYPE),
+        THROTTLED_STATUS => Some("TooManyRequestsException"),
+        NOT_FOUND_STATUS => Some("ResourceNotFoundException"),
+        TOO_LARGE_STATUS => Some("RequestTooLargeException"),
+        NOT_RUN_STATUS => Some("ServiceException"),
+        _ => None,
+    }
+}
+
+/// The class of a refusal of a caller whose SIGNATURE is the reason it was not admitted —
+/// a signature that does not verify, and one scoped to another service or Region.
+pub(super) const INVALID_SIGNATURE_EXCEPTION: &str = "InvalidSignatureException";
+
+/// The class of a refusal of a caller whose credential this emulator does not know.
+pub(super) const UNRECOGNIZED_CLIENT_EXCEPTION: &str = "UnrecognizedClientException";
+
+/// The refusal the URL's OWN AUTHORIZER gives a caller on an address no configuration sits
+/// behind: a URL whose configuration was deleted, and one that never had any.
+///
+/// The same status as every other refusal of this endpoint, with the member AWS answers it
+/// carrying no sentence: a caller is told the request was not admitted and nothing about
+/// whether a URL is configured at that address. The null member is the recorded answer of a
+/// deleted function URL (`lambda.url-deleted-config-stops-serving-the-url`, whose check
+/// asserts the body `{"Message": null}` exactly); it is not the wording of the refusal of a
+/// caller a POLICY does not admit, which is [`forbidden`]'s.
+pub(super) fn unauthorized() -> RtResponse {
+    refusal_document(
+        ::serde_json::json!({ FORBIDDEN_MEMBER: ::serde_json::Value::Null }),
+        FORBIDDEN_ERROR_TYPE,
+    )
+}
+
+/// The refusal a caller is given when its SIGNATURE is why it was not admitted: the class of
+/// that failure and the sentence AWS words for it, which is where a client reads what about
+/// the signature was wrong.
+pub(super) fn signature_refused(error_type: &str, message: &str) -> RtResponse {
+    refusal_document(::serde_json::json!({ "message": message }), error_type)
+}
+
+/// One `403` of this endpoint carrying a document of its own: the body it answers, the class
+/// that body belongs to, and the id of the request it refused — the same two headers
+/// [`forbidden`] names a refusal with.
+fn refusal_document(body: ::serde_json::Value, error_type: &str) -> RtResponse {
+    let mut response = RtResponse::new(
+        plane_status(FORBIDDEN_STATUS),
+        SdkBody::from(body.to_string()),
+    );
+    let headers = response.headers_mut();
+    headers.insert("content-type", event::DEFAULT_CONTENT_TYPE);
+    headers.insert(ERROR_TYPE_HEADER, error_type.to_string());
+    headers.insert(REQUEST_ID_HEADER, crate::state::mint_request_id());
     response
 }
 
@@ -890,12 +1040,12 @@ fn plane_error(status: u16, message: &str) -> RtResponse {
 /// plane minted for the request; a refusal taken before a request reached the plane names a
 /// fresh one, because a front door assigns one to every request it answers.
 ///
-/// It is the ONE wording of that refusal, whichever of the endpoint's two decisions turned
-/// the caller away — the AUTHENTICATION the emulator performs for a URL whose callers sign,
-/// through the seam that words the refusal of a request turned away before this plane could
-/// run ([`super::function_url_refusal`]), and the AUTHORIZATION this plane takes on the
-/// function's own policy ([`FunctionUrlPlane::admits_the_caller`]) — so an endpoint cannot
-/// refuse the same caller two ways.
+/// It is the ONE wording of that refusal for every caller the endpoint turns away without
+/// saying more — the AUTHORIZATION this plane takes on the function's own policy
+/// ([`FunctionUrlPlane::admits_the_caller`]), and the AUTHENTICATION of a caller that
+/// presented no signature at all, through the seam that words a refusal taken before this
+/// plane could run ([`super::function_url_refusal`]). A caller whose SIGNATURE is what did
+/// not hold is told that much beside it ([`signature_refused`]).
 pub(super) fn forbidden(request_id: Option<&str>) -> RtResponse {
     let mut response = refused(request_id);
     response

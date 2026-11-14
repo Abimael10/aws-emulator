@@ -49,6 +49,27 @@ Issue-Commit: bc4720188099afd2bb4f421d1e83533814225f44
 
 # 10 net-new causes: Lambda publishes unreachable data-plane endpoints and its runtime-API/durable-execution surfaces are inert
 
+> _Resolved, cause by cause._ Causes 1, 2, 6, 7, 8 and 9 are closed: 1 and 2 (an announced address the
+> emulator does not serve) by `state::function_url::announced_function_url` and
+> `state::download_location`, which resolve every announced address against the endpoint the request
+> reached; 7 by the sandbox failure frame `RequestId: <id> Error: …` in `state::execution`; 8 by the
+> handler deadline being taken when the INVOKE phase begins in both engines; 9 by the Node runtime's
+> console framer; and 6 by `state::execution::runtime_api`, which serves the runtime API's restore
+> endpoint on the address `AWS_LAMBDA_RUNTIME_API` names. The four causes that are NOT fixed were split
+> out into their own reports, with the replay keys they own, so each is tracked where it can be worked:
+>
+> * causes 3 and 4 (the durable-execution callback plane and its ExecutionTimeout accounting) →
+>   `issues/things-that-do-not-work/20261114T170500Z-lambda-durable-execution-callback-plane-never-fires.md`
+> * cause 5 (the Extensions and Telemetry API on the runtime-API endpoint) →
+>   `issues/things-that-do-not-work/20261114T170500Z-lambda-extensions-and-telemetry-api-are-not-served.md`
+> * cause 10 (the Node runtime's bundled `@aws-sdk/client-sts` exports no commands) →
+>   `issues/things-that-do-not-work/20261114T170500Z-lambda-node-runtime-bundles-no-sts-client-commands.md`
+>
+> Two further function-URL causes the replay exposed once cause 1's keys moved were closed with it: the
+> error CLASS and the refusal, throttle and gateway BODIES a function URL answers, and the
+> RESPONSE_STREAM invoke mode. The remaining failures of these units belong to other open reports
+> (20261111T081112Z cause 6, the cross-origin guard) or to a core constraint recorded there.
+
 > _Note: this issue was identified against the code base at commit `bc4720188099afd2bb4f421d1e83533814225f44`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

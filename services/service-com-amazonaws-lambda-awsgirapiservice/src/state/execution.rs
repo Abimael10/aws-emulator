@@ -113,6 +113,9 @@ mod idempotency_token;
 /// its own.
 pub mod guest_http;
 
+/// The RUNTIME API that seam answers at the address `AWS_LAMBDA_RUNTIME_API` names.
+pub mod runtime_api;
+
 /// The TLS layer of the standard library a running Python handler imports, supplied beside
 /// the socket interface it is built on.
 pub mod guest_tls;
@@ -1025,11 +1028,13 @@ fn answered(
         ),
         // A run the sandbox ended at the function's own `Timeout` is reported as that
         // class of failure: the error names the sandbox timeout, and the message states
-        // the invocation and the timeout it ran past.
+        // the invocation and the timeout it ran past — in the frame every failure the
+        // SANDBOX reports an invocation with carries, `RequestId: <id> Error: <what
+        // happened>`, which is the same frame the runtime's own kill is reported in below.
         Completion::Stopped(Stop::Deadline) => (
             error_document(
                 &format!(
-                    "{request_id} Task timed out after {:.2} seconds",
+                    "RequestId: {request_id} Error: Task timed out after {:.2} seconds",
                     budget.wall_clock.as_secs_f64()
                 ),
                 Some(SANDBOX_TIMEDOUT),
@@ -1395,9 +1400,13 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
         // "AWS_LAMBDA_RUNTIME_API – … The host and port of the runtime API", which a
         // managed runtime's own environment always names. This emulator serves the
         // invocation to the handler in process rather than over that interface, so the
-        // variable names the loopback address the interface is addressed at and nothing
-        // reads it.
-        ("AWS_LAMBDA_RUNTIME_API", "127.0.0.1:9001".to_string()),
+        // variable names the address the interface is addressed at, which is where the
+        // paths of it this emulator can answer are served
+        // (`super::execution::runtime_api`).
+        (
+            "AWS_LAMBDA_RUNTIME_API",
+            runtime_api::RUNTIME_API_ADDRESS.to_string(),
+        ),
         ("LAMBDA_TASK_ROOT", "/var/task".to_string()),
         ("LAMBDA_RUNTIME_DIR", "/var/runtime".to_string()),
         (
@@ -1773,7 +1782,8 @@ mod tests {
                 Some(SANDBOX_TIMEDOUT),
                 "case {case}: expected the sandbox timeout class, got {parsed}"
             );
-            let expected = format!("{request_id} Task timed out after {rendered} seconds");
+            let expected =
+                format!("RequestId: {request_id} Error: Task timed out after {rendered} seconds");
             assert_eq!(
                 parsed
                     .get("errorMessage")

@@ -329,8 +329,11 @@ async fn the_document_carrying_the_logs_grant_does_not_change_what_an_invocation
         );
         for (position, written) in row.written.iter().enumerate() {
             let actual = lines.get(position + 1).cloned().unwrap_or_default();
+            // A node runtime delivers a console line FRAMED, so the text the handler wrote
+            // is the last of the line's tab-separated fields.
+            let text = actual.rsplit('\t').next().unwrap_or_default();
             assert_eq!(
-                actual, *written,
+                text, *written,
                 "case {case:?}: expected the handler's line {position} to be {written:?}, got \
                  {actual:?}"
             );
@@ -380,9 +383,13 @@ async fn the_document_carrying_the_logs_grant_does_not_change_what_an_invocation
 
         // And the reader a client actually polls finds the handler's own lines, and only those.
         let matched = filtered(&router, case, &group, row.marker).await;
+        let texts: Vec<String> = matched
+            .iter()
+            .map(|line| line.rsplit('\t').next().unwrap_or_default().to_string())
+            .collect();
         let expected: Vec<String> = row.written.iter().map(|line| (*line).to_string()).collect();
         assert_eq!(
-            matched, expected,
+            texts, expected,
             "case {case:?}: expected the search {:?} to return the handler's own lines, got \
              {matched:?}",
             row.marker

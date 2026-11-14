@@ -444,25 +444,27 @@ async fn a_function_url_answers_the_response_its_handler_described() {
             b"[1,2]",
             "application/json",
         ),
+        // The gateway's own answer is the bare sentence, not one of this API's error
+        // documents: nothing of the function's failure, and no envelope member.
         (
             "a status outside the HTTP range",
             "/bad-status",
             502,
-            br#"{"message":"Internal Server Error"}"#,
+            b"Internal Server Error",
             "application/json",
         ),
         (
             "a header value no response can carry",
             "/bad-header",
             502,
-            br#"{"message":"Internal Server Error"}"#,
+            b"Internal Server Error",
             "application/json",
         ),
         (
             "a handler that raised",
             "/raise",
             502,
-            br#"{"message":"Internal Server Error"}"#,
+            b"Internal Server Error",
             "application/json",
         ),
     ];
@@ -638,6 +640,44 @@ async fn the_event_carries_the_request_as_payload_format_two_states_it() {
         "case \"the cookie header\": the event reports the request's headers whole, so the \
          `Cookie` header is among them beside the cookies array, got {headers:?}"
     );
+    assert_eq!(
+        headers.get("host"),
+        Some(&json!(endpoint.host)),
+        "case \"the host header\": expected the function URL's own host, got {headers:?}"
+    );
+
+    // The host the handler is told about is the URL's own, whichever addressing the client
+    // reached the endpoint by: a request that arrived on the emulator's own endpoint,
+    // carrying the url id in its path, is still a request to that URL's address.
+    let by_path = send(
+        &router,
+        "GET",
+        OWN_ENDPOINT,
+        &format!("/_aws/lambda-url/{}/echo/two", endpoint.url_id),
+        &[],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        by_path.status,
+        200,
+        "case \"the local-endpoint addressing\": the echo must be served, got {}",
+        by_path.summary()
+    );
+    let reached = by_path.json();
+    for (case, member) in [
+        ("the host header", "/headers/host"),
+        ("the domain name", "/domainName"),
+    ] {
+        let reported = reached.pointer(member).cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            reported,
+            json!(endpoint.host),
+            "case {case:?}: expected the URL's own host {:?} however the endpoint was \
+             reached, got {reported}",
+            endpoint.host
+        );
+    }
 
     // The body travels verbatim under a textual media type and base64 under every other
     // one. The rows span what the rule generalises over: text, JSON, a form body, and
@@ -888,10 +928,17 @@ async fn deleting_the_configuration_stops_the_url_serving() {
         deleted.summary()
     );
     let after = get(&router, &endpoint, "/document").await;
-    assert_ne!(
-        after.status, 200,
-        "case \"after the delete\": the endpoint must serve nothing, got {}",
+    assert_eq!(
+        after.status, 403,
+        "case \"after the delete\": the endpoint must admit nobody, got {}",
         after.summary()
+    );
+    assert_eq!(
+        after.json(),
+        json!({ "Message": Value::Null }),
+        "case \"after the delete\": expected the refusal of a caller this endpoint does not \
+         admit, got {}",
+        after.text()
     );
 }
 
@@ -1086,11 +1133,21 @@ async fn a_none_endpoint_admits_the_public_only_while_the_policy_grants_it() {
             answer.summary()
         );
         if *status == 403 {
+            // The endpoint refused this caller — the function's resource-based policy does
+            // not admit it — with the one sentence it words such a refusal, and the class of
+            // that failure.
+            let document = answer.json();
             assert_eq!(
-                answer.json().get("Message").and_then(Value::as_str),
-                Some("Forbidden"),
-                "case {case:?}: expected the endpoint's refusal sentence, got {}",
+                document,
+                json!({ "Message": "Forbidden" }),
+                "case {case:?}: expected the endpoint's refusal, got {}",
                 answer.text()
+            );
+            assert_eq!(
+                answer.header("x-amzn-errortype").as_deref(),
+                Some("AccessDeniedException"),
+                "case {case:?}: expected the access class, got {:?}",
+                answer.header("x-amzn-errortype")
             );
         }
     }

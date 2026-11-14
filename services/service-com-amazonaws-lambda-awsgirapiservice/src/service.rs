@@ -917,6 +917,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 }
             }
         }
+        // An address of that plane no configuration sits behind is served by it too, by the
+        // mounting that admits every caller: with no stored `AuthType` there is no
+        // restriction to enforce, and the plane answers the one thing there is to say about
+        // such an address (see [`function_url`]).
+        if self.function_urls_anonymous.addressed(req) {
+            return Some(&self.function_urls_anonymous as &dyn ErasedOperation);
+        }
         // And `InvokeWithResponseStream`: its output binds a `@streaming` union, which
         // the generated routing-table entry declines (that entry is still what the router
         // reads the model's auth schemes off, so the operation stays signed exactly as the

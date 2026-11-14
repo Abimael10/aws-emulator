@@ -127,6 +127,13 @@ pub async fn sent(sending: &Sending<'_>) -> Result<Answered, Refusal> {
     if sending.body.len() > MAX_REQUEST_BYTES {
         return Err(Refusal::RequestTooLarge);
     }
+    // The RUNTIME API is answered by the host itself, from the address
+    // `AWS_LAMBDA_RUNTIME_API` names: it is not a service of this emulator and no signature
+    // is put on it, so it is answered before an address is read as one
+    // ([`super::runtime_api`]).
+    if let Some(answered) = super::runtime_api::answered(&method, sending.url) {
+        return Ok(answered);
+    }
     let addressed = addressed(sending.url, sending.default_region)
         .or_else(|| {
             addressed_resource_plane(sending.url, sending.published, sending.default_region)

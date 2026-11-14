@@ -697,18 +697,34 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
 
     var util = requireId('core:util');
 
-    function writeLine(args) {
-        hostLog(util.format.apply(null, Array.prototype.slice.call(args)) + '\n');
+    // The frame a managed node runtime delivers a console line in, under the TEXT log
+    // format: the instant it was written, the invocation it belongs to, the LEVEL of the
+    // console method that wrote it, and the formatted text — four tab-separated fields, in
+    // that order, which is what lets a client correlate a line to an invocation and filter
+    // by level. It is the same frame the runtime's own `Invoke Error` record carries
+    // ([`logInvokeError`]), so one runtime writes one kind of line.
+    //
+    // A line written while NO invocation is bound — at module load, before a request
+    // reaches the handler — belongs to no invocation, so it is delivered as the text it is
+    // rather than attributed to one.
+    function writeLine(level, args) {
+        var text = util.format.apply(null, Array.prototype.slice.call(args));
+        if (state === null || state.requestId === null || state.requestId === undefined) {
+            hostLog(text + '\n');
+            return;
+        }
+        hostLog(new Date().toISOString() + '\t' + state.requestId + '\t' + level + '\t'
+            + text + '\n');
     }
 
     var console = {
-        log: function () { writeLine(arguments); },
-        info: function () { writeLine(arguments); },
-        debug: function () { writeLine(arguments); },
-        dir: function () { writeLine(arguments); },
-        warn: function () { writeLine(arguments); },
-        error: function () { writeLine(arguments); },
-        trace: function () { writeLine(arguments); }
+        log: function () { writeLine('INFO', arguments); },
+        info: function () { writeLine('INFO', arguments); },
+        debug: function () { writeLine('DEBUG', arguments); },
+        dir: function () { writeLine('INFO', arguments); },
+        warn: function () { writeLine('WARN', arguments); },
+        error: function () { writeLine('ERROR', arguments); },
+        trace: function () { writeLine('TRACE', arguments); }
     };
     globalThis.console = console;
 

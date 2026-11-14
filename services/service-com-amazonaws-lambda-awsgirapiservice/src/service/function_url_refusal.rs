@@ -104,11 +104,10 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for FunctionUrlRefusals
         // address that is a function URL of this store. Everything else — every refusal of
         // the modelled API, the emulator's own cross-site guard, and every refusal a handler
         // or this service worded itself — is the generated definition's.
-        if matches!(error, ProtocolError::Unauthenticated { .. })
-            && !sent_cross_site_by_a_browser(req)
-            && self.addresses_function_url(req)
-        {
-            return super::function_url::forbidden(None);
+        if let ProtocolError::Unauthenticated { code, .. } = &error {
+            if !sent_cross_site_by_a_browser(req) && self.addresses_function_url(req) {
+                return self.unadmitted(req, code);
+            }
         }
         self.inner.refusal_response(error, chosen, req)
     }
@@ -117,6 +116,124 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for FunctionUrlRefusals
         self.inner.wire_protocol(req)
     }
 }
+
+/// How a caller the authentication layer did not admit to a function URL is answered.
+///
+/// A Lambda endpoint tells a client WHY in the error CLASS and, where the credential itself
+/// is what was wrong, in the sentence beside it. What divides the two is whether the caller
+/// PRESENTED a signature at all: a request carrying none presented no credential to judge
+/// and reads the front door's own refusal, which names nothing of the request; a request
+/// carrying one is refused as that SIGNATURE, and the sentence says what about it did not
+/// hold — a credential scope naming a service other than the one it reached, a signature
+/// that does not match the request it travelled with, or a credential this emulator does not
+/// know.
+impl<Eng: Send + Sync + 'static> FunctionUrlRefusals<Eng> {
+    fn unadmitted(&self, req: &RtRequest, code: &str) -> RtResponse {
+        if !presented_a_signature(req) {
+            return super::function_url::forbidden(None);
+        }
+        let serving = self.inner.identity().signing_name();
+        if scoped_elsewhere(req, serving) {
+            return super::function_url::signature_refused(
+                super::function_url::INVALID_SIGNATURE_EXCEPTION,
+                &format!("{SCOPED_ELSEWHERE_MESSAGE}'{serving}'. "),
+            );
+        }
+        match code {
+            SIGNATURE_MISMATCH_CODE => super::function_url::signature_refused(
+                super::function_url::INVALID_SIGNATURE_EXCEPTION,
+                SIGNATURE_MISMATCH_MESSAGE,
+            ),
+            // A signature over a credential nothing in this emulator holds: the caller is
+            // told its client was not recognized, which is the class of a credential that
+            // names no identity rather than of a signature that did not match.
+            UNKNOWN_CREDENTIAL_CODE | UNHELD_CREDENTIAL_CODE => {
+                super::function_url::signature_refused(
+                    super::function_url::UNRECOGNIZED_CLIENT_EXCEPTION,
+                    UNKNOWN_CREDENTIAL_MESSAGE,
+                )
+            }
+            // Every other way a signature does not hold: the caller reads the front door's
+            // own refusal, rather than a reason this emulator worded for it.
+            _ => super::function_url::forbidden(None),
+        }
+    }
+}
+
+/// Whether the credential scope `req` signed under names a service other than `serving` —
+/// the service whose endpoint the request reached.
+///
+/// A SigV4 credential is `<key id>/<date>/<region>/<service>/aws4_request`, and the service
+/// label is part of what the signature is computed over, so a scope naming another service
+/// can never match however the request was signed.
+///
+/// The scope is read by the CORE's own single reading of it
+/// ([`::emulator_server::sigv4_credential_scope`], which the router's own service routing
+/// builds on), so what counts as a scope here and what the emulator routed and verified the
+/// request by cannot disagree. That reading takes the header map an `http` request carries,
+/// which the runtime-API request this seam is handed does not, so the one header it reads is
+/// handed over in one.
+fn scoped_elsewhere(req: &RtRequest, serving: &str) -> bool {
+    let Some(presented) = req.headers().get("authorization") else {
+        return false;
+    };
+    let Ok(value) = ::http::HeaderValue::from_str(presented) else {
+        return false;
+    };
+    let mut headers = ::http::HeaderMap::new();
+    headers.insert(::http::header::AUTHORIZATION, value);
+    ::emulator_server::sigv4_credential_scope(&headers)
+        .is_some_and(|scope| scope.service != serving)
+}
+
+/// The code the authentication layer refuses a signature that does not match the request it
+/// travelled with, and the sentence AWS words that refusal.
+const SIGNATURE_MISMATCH_CODE: &str = "SignatureDoesNotMatch";
+/// See [`SIGNATURE_MISMATCH_CODE`].
+const SIGNATURE_MISMATCH_MESSAGE: &str =
+    "The request signature we calculated does not match the signature you provided. Check \
+     your AWS Secret Access Key and signing method. Consult the service documentation for \
+     details.";
+
+/// The sentence AWS words a refusal of a credential scoped to another service, which names
+/// the service the request actually reached.
+const SCOPED_ELSEWHERE_MESSAGE: &str = "Credential should be scoped to correct service: ";
+
+/// The code the authentication layer refuses a credential it does not know, and the sentence
+/// AWS words that refusal.
+const UNKNOWN_CREDENTIAL_CODE: &str = "InvalidClientTokenId";
+/// The code it refuses a signature whose key id nothing in this emulator holds a secret for,
+/// which is the same thing a client did wrong: it signed as an identity that does not exist.
+const UNHELD_CREDENTIAL_CODE: &str = "AccessDenied";
+/// See [`UNKNOWN_CREDENTIAL_CODE`].
+const UNKNOWN_CREDENTIAL_MESSAGE: &str =
+    "The security token included in the request is invalid.";
+
+/// Whether `req` presented a SigV4 signature at all: one in the `Authorization` header, or
+/// one travelling in the query fields of a presigned URL.
+fn presented_a_signature(req: &RtRequest) -> bool {
+    if req
+        .headers()
+        .get("authorization")
+        .is_some_and(|header| header.starts_with(SIGV4_ALGORITHM))
+    {
+        return true;
+    }
+    req.uri().split_once('?').is_some_and(|(_, query)| {
+        query.split('&').any(|field| {
+            field
+                .split_once('=')
+                .map_or(field, |(name, _)| name)
+                .eq_ignore_ascii_case(PRESIGNED_SIGNATURE_FIELD)
+        })
+    })
+}
+
+/// The algorithm every SigV4 `Authorization` header names first.
+const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
+
+/// The query field a presigned URL carries its signature in.
+const PRESIGNED_SIGNATURE_FIELD: &str = "X-Amz-Signature";
 
 /// Whether `req` is a request the emulator's own cross-site guard turns away: one whose
 /// browser-set headers say a browser sent it from another site.

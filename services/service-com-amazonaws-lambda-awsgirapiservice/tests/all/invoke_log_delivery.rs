@@ -163,8 +163,15 @@ async fn a_delivered_log_line_is_selectable_by_filter_pattern() {
         // The quoted term selects the handler's own lines, in the order it wrote them, and
         // nothing of the framing — which is what a client polling for one marker reads.
         let selected = filtered(&router, case, &group, &format!("\"{}\"", row.marker)).await;
+        // A node runtime delivers a console line FRAMED — the instant, the invocation's id,
+        // the level, then the text — so what the pattern selected carries the handler's own
+        // text as its last field.
+        let texts: Vec<String> = selected
+            .iter()
+            .map(|message| message.rsplit('\t').next().unwrap_or_default().to_string())
+            .collect();
         assert_eq!(
-            selected,
+            texts,
             row.written.to_vec(),
             "case {case:?}: expected the pattern {:?} to select {:?}, got {selected:?}",
             row.marker,

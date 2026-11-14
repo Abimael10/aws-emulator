@@ -390,87 +390,15 @@ const CONTENT_TYPE_HEADER: &str = "content-type";
 
 /// The response a result DESCRIBES, member by member, or what about it describes none.
 fn described(result: &Value) -> Mapped {
-    let status = match result.get("statusCode") {
-        None => INFERRED_STATUS,
-        Some(Value::Number(status)) => match status.as_i64().filter(|status| {
-            (MIN_STATUS..=MAX_STATUS).contains(status)
-        }) {
-            Some(status) => u16::try_from(status).unwrap_or(INFERRED_STATUS),
-            None => {
-                return Mapped::Malformed(format!(
-                    "the function's response names the statusCode {status}, which is not an \
-                     HTTP status between {MIN_STATUS} and {MAX_STATUS}"
-                ))
-            }
-        },
-        Some(other) => {
-            return Mapped::Malformed(format!(
-                "the function's response names a statusCode that is not a number: {other}"
-            ))
-        }
+    let status = match status_described(result) {
+        Ok(status) => status,
+        Err(why) => return Mapped::Malformed(why),
     };
-    let mut headers: Vec<(String, String)> = Vec::new();
-    match result.get("headers") {
-        None => {}
-        Some(Value::Object(named)) => {
-            for (name, value) in named {
-                let Some(rendered) = header_text(value) else {
-                    return Mapped::Malformed(format!(
-                        "the function's response names the header {name} with a value no header \
-                         can carry: {value}"
-                    ));
-                };
-                let name = name.to_ascii_lowercase();
-                if !carriable_header(&name, &rendered) {
-                    return Mapped::Malformed(format!(
-                        "the function's response names a header no HTTP response can carry: \
-                         {name}"
-                    ));
-                }
-                headers.push((name, rendered));
-            }
-        }
-        Some(other) => {
-            return Mapped::Malformed(format!(
-                "the function's response names headers that are not an object: {other}"
-            ))
-        }
-    }
-    // "cookies – An array of cookies […] Lambda sends each cookie as a set-cookie header."
-    match result.get("cookies") {
-        None => {}
-        Some(Value::Array(cookies)) => {
-            for cookie in cookies {
-                let Some(rendered) = header_text(cookie) else {
-                    return Mapped::Malformed(format!(
-                        "the function's response names a cookie no set-cookie header can carry: \
-                         {cookie}"
-                    ));
-                };
-                if !carriable_header(SET_COOKIE_HEADER, &rendered) {
-                    return Mapped::Malformed(
-                        "the function's response names a cookie no set-cookie header can carry"
-                            .to_string(),
-                    );
-                }
-                headers.push((SET_COOKIE_HEADER.to_string(), rendered));
-            }
-        }
-        Some(other) => {
-            return Mapped::Malformed(format!(
-                "the function's response names cookies that are not an array: {other}"
-            ))
-        }
-    }
-    if !headers
-        .iter()
-        .any(|(name, _)| name == CONTENT_TYPE_HEADER)
-    {
-        headers.push((
-            CONTENT_TYPE_HEADER.to_string(),
-            DEFAULT_CONTENT_TYPE.to_string(),
-        ));
-    }
+    let mut headers = match headers_described(result) {
+        Ok(headers) => headers,
+        Err(why) => return Mapped::Malformed(why),
+    };
+    with_content_type(&mut headers, DEFAULT_CONTENT_TYPE);
     let base64 = match result.get("isBase64Encoded") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(base64)) => *base64,
@@ -506,6 +434,158 @@ fn described(result: &Value) -> Mapped {
         headers,
         body,
     }
+}
+
+/// The status a result's `statusCode` names, or what about it describes no response.
+fn status_described(result: &Value) -> Result<u16, String> {
+    match result.get("statusCode") {
+        None => Ok(INFERRED_STATUS),
+        Some(Value::Number(status)) => match status
+            .as_i64()
+            .filter(|status| (MIN_STATUS..=MAX_STATUS).contains(status))
+        {
+            Some(status) => Ok(u16::try_from(status).unwrap_or(INFERRED_STATUS)),
+            None => Err(format!(
+                "the function's response names the statusCode {status}, which is not an \
+                 HTTP status between {MIN_STATUS} and {MAX_STATUS}"
+            )),
+        },
+        Some(other) => Err(format!(
+            "the function's response names a statusCode that is not a number: {other}"
+        )),
+    }
+}
+
+/// The headers a result's `headers` and `cookies` name — one `set-cookie` per cookie, in
+/// the order the result named them — or what about them describes no response.
+fn headers_described(result: &Value) -> Result<Vec<(String, String)>, String> {
+    let mut headers: Vec<(String, String)> = Vec::new();
+    match result.get("headers") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(named)) => {
+            for (name, value) in named {
+                let Some(rendered) = header_text(value) else {
+                    return Err(format!(
+                        "the function's response names the header {name} with a value no header \
+                         can carry: {value}"
+                    ));
+                };
+                let name = name.to_ascii_lowercase();
+                if !carriable_header(&name, &rendered) {
+                    return Err(format!(
+                        "the function's response names a header no HTTP response can carry: \
+                         {name}"
+                    ));
+                }
+                headers.push((name, rendered));
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "the function's response names headers that are not an object: {other}"
+            ))
+        }
+    }
+    // "cookies – An array of cookies […] Lambda sends each cookie as a set-cookie header."
+    match result.get("cookies") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(cookies)) => {
+            for cookie in cookies {
+                let Some(rendered) = header_text(cookie) else {
+                    return Err(format!(
+                        "the function's response names a cookie no set-cookie header can carry: \
+                         {cookie}"
+                    ));
+                };
+                if !carriable_header(SET_COOKIE_HEADER, &rendered) {
+                    return Err(
+                        "the function's response names a cookie no set-cookie header can carry"
+                            .to_string(),
+                    );
+                }
+                headers.push((SET_COOKIE_HEADER.to_string(), rendered));
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "the function's response names cookies that are not an array: {other}"
+            ))
+        }
+    }
+    Ok(headers)
+}
+
+/// Add `media_type` as the response's `content-type` unless the result named one itself.
+fn with_content_type(headers: &mut Vec<(String, String)>, media_type: &str) {
+    if !headers.iter().any(|(name, _)| name == CONTENT_TYPE_HEADER) {
+        headers.push((CONTENT_TYPE_HEADER.to_string(), media_type.to_string()));
+    }
+}
+
+/// The `content-type` a RESPONSE-STREAMING answer that announced none carries: the bytes a
+/// stream delivers are opaque, so nothing is claimed about what they are.
+pub const STREAMED_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// The eight NUL bytes that END the metadata prelude of an http-integration response
+/// stream, as the runtime's `HttpResponseStream.from` writes it
+/// (`crate::state::execution::node`).
+const PRELUDE_TERMINATOR: &[u8] = &[0; 8];
+
+/// The response the bytes a RESPONSE-STREAMING handler WROTE describe.
+///
+/// `InvokeMode=RESPONSE_STREAM` means "your function streams payload results as they become
+/// available", so the answer is those bytes and not a value the handler returned: there is no
+/// result document to read a body out of. What SHAPES the answer is the handler's own
+/// announcement — `awslambda.HttpResponseStream.from(stream, metadata)` writes the metadata
+/// document followed by [`PRELUDE_TERMINATOR`] ahead of the first byte of the body — whose
+/// `statusCode`, `headers` and `cookies` are read exactly as a buffered result's are, with
+/// the bytes after the prelude as the body. A stream that announced nothing is the whole
+/// answer, served under the inferred status.
+#[must_use]
+pub fn mapped_stream(written: &[u8]) -> Mapped {
+    let (metadata, body) = match prelude_of(written) {
+        Some((metadata, body)) => (metadata, body),
+        None => {
+            let mut headers = Vec::new();
+            with_content_type(&mut headers, STREAMED_CONTENT_TYPE);
+            return Mapped::Response {
+                status: INFERRED_STATUS,
+                headers,
+                body: written.to_vec(),
+            };
+        }
+    };
+    let status = match status_described(&metadata) {
+        Ok(status) => status,
+        Err(why) => return Mapped::Malformed(why),
+    };
+    let mut headers = match headers_described(&metadata) {
+        Ok(headers) => headers,
+        Err(why) => return Mapped::Malformed(why),
+    };
+    with_content_type(&mut headers, STREAMED_CONTENT_TYPE);
+    Mapped::Response {
+        status,
+        headers,
+        body,
+    }
+}
+
+/// The metadata document a stream announced and the bytes after it, or `None` for a stream
+/// that announced none — one whose first bytes are not a JSON OBJECT followed by the
+/// terminator, which is what the announcement is.
+fn prelude_of(written: &[u8]) -> Option<(Value, Vec<u8>)> {
+    let at = written
+        .windows(PRELUDE_TERMINATOR.len())
+        .position(|window| window == PRELUDE_TERMINATOR)?;
+    // `get` rather than a slice index: the bytes are the HANDLER's, and a position read off
+    // them is checked here rather than trusted.
+    let metadata = ::serde_json::from_slice::<Value>(written.get(..at)?).ok()?;
+    if !metadata.is_object() {
+        return None;
+    }
+    let body = written.get(at + PRELUDE_TERMINATOR.len()..)?.to_vec();
+    Some((metadata, body))
 }
 
 /// Whether `name` and `value` are a header an HTTP response can carry at all.

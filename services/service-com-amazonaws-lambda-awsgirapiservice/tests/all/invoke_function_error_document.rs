@@ -415,10 +415,17 @@ async fn a_timed_out_run_reports_the_sandbox_timeout_class() {
             message.ends_with(&stated),
             "case {case}: expected the message to state {stated:?}, got {message:?}"
         );
-        let leading = message[..message.len() - stated.len()].trim();
+        // The frame AWS states a sandbox failure of an invocation in: the label, the
+        // invocation's own id, and the separator before what happened to it.
+        let leading = message[..message.len() - stated.len()].trim_end();
+        let named = leading
+            .strip_prefix("RequestId: ")
+            .and_then(|rest| rest.strip_suffix(" Error:"))
+            .unwrap_or_default();
         assert!(
-            is_request_id(leading),
-            "case {case}: expected the invocation's id before the message, got {leading:?}"
+            is_request_id(named),
+            "case {case}: expected the invocation's id framed as AWS states it, got \
+             {leading:?}"
         );
         delete_function(&router, case, name).await;
     }
