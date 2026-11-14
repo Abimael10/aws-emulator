@@ -1124,10 +1124,6 @@ mod ipam_internet_registry_associations;
 mod ipam_internet_registry_association_reports;
 #[path = "all/ipam_policies.rs"]
 mod ipam_policies;
-// Which IPAM policy of the account is enabled: the report, and the enable and disable that
-// write what it reports.
-#[path = "all/ipam_policy_enablement.rs"]
-mod ipam_policy_enablement;
 #[path = "all/ipam_pools.rs"]
 mod ipam_pools;
 // Deleting an IPAM pool, what it refuses while the pool still holds resources, and what
@@ -2254,7 +2250,6 @@ mod admission_checks;
 // every call to one is refused HTTP 400 `UnsupportedOperation` with the sentence naming that
 // action, whatever id, storage location, dry run, Region or stored state the call carries, and
 // the refusal writes nothing. Declared at the tail of this file, which is where every new ec2
-// suite lands.
 #[path = "all/retired_bundle_api_actions.rs"]
 mod retired_bundle_api_actions;
 // The WORDING of eight refusal families — a BYOIP range that is no CIDR block, a pagination
@@ -2265,12 +2260,12 @@ mod retired_bundle_api_actions;
 // error class, with only the parts AWS interpolates. Declared at the tail of this file, which
 #[path = "all/aws_worded_refusal_sentences.rs"]
 mod aws_worded_refusal_sentences;
-// What `DeleteTransitGatewayMeteringPolicy` records: the transit gateway metering policy the
-// request names left in the transient delete state its own catalog carries, reported with every
-// other member the store holds for it, with the clock owing it the terminal one — and the ids, the
-// dry run and the second delete it refuses without recording anything. Declared at the tail of
-#[path = "all/delete_transit_gateway_metering_policy.rs"]
-mod delete_transit_gateway_metering_policy;
+// What `CopyImage` mints: the AMI it computes from the stored source, the parent link it
+// records for `GetImageAncestry` to walk, the snapshots it copies for the new AMI's Amazon EBS
+// devices, the `pending` -> `available` move the clock owes it, the tags `CopyImageTags` and
+// the request's own specifications decide, and what it refuses without storing anything.
+#[path = "all/copy_image.rs"]
+mod copy_image;
 // WHICH sentence a value that is no local-gateway-route-table id is refused with: the request
 // boundary's `The local-gateway-route-table ID '<id>' is malformed` for a value that is no
 // identifier at all, and the owning service's `Invalid LocalGateway Route Table id <id>` where
@@ -2286,6 +2281,16 @@ mod event_window_target_kind_refusal;
 // endpoint of one and a peer of an endpoint, in both delete states. Declared beside
 #[path = "all/route_server_incorrect_state_wording.rs"]
 mod route_server_incorrect_state_wording;
+// What `DeleteTransitGatewayMeteringPolicy` records: the transit gateway metering policy the
+// request names left in the transient delete state its own catalog carries, reported with every
+// other member the store holds for it, with the clock owing it the terminal one — and the ids, the
+// dry run and the second delete it refuses without recording anything. Declared at the tail of
+#[path = "all/delete_transit_gateway_metering_policy.rs"]
+mod delete_transit_gateway_metering_policy;
+// Which IPAM policy of the account is enabled: the report, and the enable and disable that
+// write what it reports.
+#[path = "all/ipam_policy_enablement.rs"]
+mod ipam_policy_enablement;
 // What `DeleteTransitGatewayConnectPeer` records: the Connect peer the request names left in the
 // transient delete state of its own catalog with every other member exactly as it was stored, the
 // clock owing it the terminal one, the allocations it held freed once that has settled — and the
@@ -2293,10 +2298,6 @@ mod route_server_incorrect_state_wording;
 #[path = "all/delete_transit_gateway_connect_peer.rs"]
 mod delete_transit_gateway_connect_peer;
 // `UpdateSecurityGroupRuleDescriptionsIngress`: the description it writes onto each inbound
-// rule a request names — by rule id or by the rule's own properties — read back through
-// `DescribeSecurityGroupRules` and `DescribeSecurityGroups`, beside what it refuses and what
-// it leaves alone. Declared at the tail of this file, which is where every new ec2 suite
-// lands.
 #[path = "all/update_security_group_rule_descriptions_ingress.rs"]
 mod update_security_group_rule_descriptions_ingress;
 // What `DeleteTransitGatewayVpcAttachment` records: the stored VPC attachment the request names

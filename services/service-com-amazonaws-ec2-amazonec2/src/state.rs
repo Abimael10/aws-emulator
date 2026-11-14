@@ -987,6 +987,16 @@
 //! date its published name carries, so it is the same across reads and across runs and the
 //! newest image of a name pattern is always the same image.
 //!
+//! An AMI a COPY produces is assembled asynchronously, so it is stored `pending` and the
+//! instant its `available` move falls due is held beside it in
+//! [`ComAmazonawsEc2Amazonec2State::image_available_at`] — the image counterpart of
+//! [`ComAmazonawsEc2Amazonec2State::vpc_available_at`], on the same monotonic clock and the
+//! same [`TRANSITION_DELAY`], applied by
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_image_copies`]. The `ClientToken` such a
+//! call carried names the image it minted in
+//! [`ComAmazonawsEc2Amazonec2State::image_client_tokens`], so a replay of the same request
+//! answers that image and mints nothing more.
+//!
 //! ## Allowed AMIs is an account-and-Region SETTING, not a resource
 //!
 //! [`ComAmazonawsEc2Amazonec2State::allowed_images_settings`] holds the Allowed AMIs
@@ -2829,7 +2839,8 @@ impl ComAmazonawsEc2Amazonec2State {
 
     /// Store an IPAM internet registry association and answer the
     /// `IpamInternetRegistryAssociationId` it was given — or `None` when the store is at
-    /// [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored.
+    /// [`MAX_STORED_RECORDS_PER_STORE`] or has no room for the record's caller-chosen bytes,
+    /// in which case NOTHING was stored.
     ///
     /// The id and the ARN are minted here rather than taken from `view`, exactly as
     /// [`Self::insert_ipam_pool`] mints a pool's, so no path can store an association
@@ -2837,9 +2848,33 @@ impl ComAmazonawsEc2Amazonec2State {
     /// registrations: every registration is made by a request.
     pub fn insert_ipam_internet_registry_association(
         &mut self,
-        mut view: IpamInternetRegistryAssociation,
+        view: IpamInternetRegistryAssociation,
     ) -> Option<String> {
-        if !self.has_ipam_internet_registry_association_capacity() {
+        self.insert_ipam_internet_registry_association_retaining(view, 0)
+    }
+
+    /// [`Self::insert_ipam_internet_registry_association`] with `retained` further
+    /// caller-chosen bytes — a create's `ClientToken`, which the token map keeps for as long
+    /// as the association — counted in the SAME gate, so the write is refused before anything
+    /// is stored rather than charged after it.
+    fn insert_ipam_internet_registry_association_retaining(
+        &mut self,
+        mut view: IpamInternetRegistryAssociation,
+        retained: usize,
+    ) -> Option<String> {
+        // BOTH ceilings, asked before anything is minted or charged, the way
+        // [`Self::insert_ipam_policy`] asks them: a count of records bounds how MANY
+        // associations there are and not how large each one is, and the text members and the
+        // token are the caller's, so without the byte gate repeated creates would grow this
+        // process's memory past the only bound it has. The charge is exactly what
+        // [`ipam_internet_registry_association_payload_bytes`] counts of the view as it will
+        // be stored — the id, the ARN and the owner derived below are the fixed-size part
+        // that definition already covers.
+        let charge =
+            ipam_internet_registry_association_payload_bytes(&view).saturating_add(retained);
+        if !self.has_ipam_internet_registry_association_capacity()
+            || self.would_exceed_stored_bytes(charge)
+        {
             return None;
         }
         let association_id = self.next_id(IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_PREFIX);
@@ -2860,7 +2895,7 @@ impl ComAmazonawsEc2Amazonec2State {
         // association" (`IpamInternetRegistryAssociation$OwnerId`): this emulator serves one
         // account, so the association is owned by it rather than by anything a request says.
         view.owner_id = Some(::engine::emulator_account_id().to_string());
-        self.add_stored_bytes(ipam_internet_registry_association_payload_bytes(&view));
+        self.add_stored_bytes(charge);
         self.ipam_internet_registry_associations.insert(
             association_id.clone(),
             IpamInternetRegistryAssociationRecord {
@@ -2894,8 +2929,11 @@ impl ComAmazonawsEc2Amazonec2State {
         view.state_message =
             Some(IPAM_INTERNET_REGISTRY_ASSOCIATION_CREATE_IN_PROGRESS_MESSAGE.to_string());
         let retained = client_token.unwrap_or_default().len();
-        let association_id = self.insert_ipam_internet_registry_association(view)?;
-        self.add_stored_bytes(retained);
+        // The token's bytes go through the insert's OWN gate rather than being charged after
+        // it has already stored the record, so a create the byte budget has no room for is
+        // refused whole.
+        let association_id =
+            self.insert_ipam_internet_registry_association_retaining(view, retained)?;
         if let Some(record) = self
             .ipam_internet_registry_associations
             .get_mut(&association_id)

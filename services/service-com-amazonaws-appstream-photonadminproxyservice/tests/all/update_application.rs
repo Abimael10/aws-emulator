@@ -197,7 +197,12 @@ async fn update_application_applies_the_members_it_is_given_and_leaves_the_rest(
         let before_members = before.as_object().expect("an application is an object");
         for (member, created_value) in before_members {
             if echoed.contains(&member.as_str())
-                || (moved_icon && member == "IconURL")
+                // `IconURL` is signed against the clock of the call that renders the record
+                // (`crate::applications::without_icon_url` states the rule), so two reports
+                // of the SAME stored icon differ in signing date and signature as soon as a
+                // second elapses between them. The icon is asserted below by the object it
+                // addresses instead, which holds whatever the clock says.
+                || member == "IconURL"
                 || (moved_attributes && member == "Metadata")
             {
                 continue;
@@ -240,6 +245,15 @@ async fn update_application_applies_the_members_it_is_given_and_leaves_the_rest(
                 icon_url.contains("other-icons"),
                 "case {case:?}: the icon URL must address the bucket the update named, got \
                  {icon_url:?}"
+            );
+        } else {
+            // The icon the update left alone: the URL still addresses the object the create
+            // named, whatever the clock says about its signature.
+            let icon_url = after["IconURL"].as_str().unwrap_or_default().to_string();
+            assert!(
+                icon_url.contains("app-icons") && icon_url.contains("icons/before.png"),
+                "case {case:?}: an update that names no icon must leave the icon addressing \
+                 the object the create named, got {icon_url:?}"
             );
         }
 

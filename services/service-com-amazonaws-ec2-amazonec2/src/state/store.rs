@@ -2012,6 +2012,25 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::images`] under the same id, written by the one writer of an image
     /// ([`Self::insert_image`]) and reported by `DescribeImageAttribute`'s `uefiData`.
     pub image_uefi_data: BTreeMap<String, String>,
+    /// When the `pending` -> `available` move an AMI COPY left owing falls due, by the
+    /// `ImageId` of the image that owes it, on the same monotonic clock and for the same
+    /// reason [`Self::vpc_available_at`] holds a `pending` VPC's: the modelled [`Image`]
+    /// carries no member for a due instant, so it is held beside the image under the same id.
+    ///
+    /// Written by `CopyImage`, the one operation of this store that produces an image
+    /// asynchronously, and applied by
+    /// [`Self::materialize_due_image_copies`] — which removes the entry with the move, so an
+    /// image with no entry here owes nothing.
+    pub image_available_at: BTreeMap<String, Instant>,
+    /// The `ClientToken` of each AMI-minting call that carried one, and the `ImageId` that
+    /// call minted: "unique, case-sensitive identifier you provide to ensure idempotency of
+    /// the request" (`CopyImageRequest$ClientToken`), so a replay of the same request answers
+    /// the image the first call minted and mints nothing more.
+    ///
+    /// ONE token space for the account's images, the way
+    /// [`Self::fpga_image_client_tokens`] is one for its AFIs whichever call minted them, so
+    /// two minting calls cannot answer one token with two images.
+    pub image_client_tokens: HashMap<String, String>,
     /// Every AMI of the account that is currently in the Recycle Bin, by `ImageId` — see
     /// the module docs. An image is in EITHER this store or [`Self::images`], never both:
     /// a recycled AMI is not one of the images the account can see until it is restored.
@@ -3568,6 +3587,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             network_insights_analysis_client_tokens: HashMap::new(),
             images: BTreeMap::new(),
             image_uefi_data: BTreeMap::new(),
+            // A fresh account has copied no AMI, so no image owes a move and no token names
+            // one.
+            image_available_at: BTreeMap::new(),
+            image_client_tokens: HashMap::new(),
             images_in_recycle_bin: BTreeMap::new(),
             security_groups: BTreeMap::new(),
             // A fresh account holds exactly the network ACLs its VPCs come with, which

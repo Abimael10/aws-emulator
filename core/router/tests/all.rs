@@ -4302,3 +4302,23 @@ mod cloudformation_appsync_custom_domains;
 // reason the lines around them record.)
 // declarations, for this file and for every service crate's `tests/all.rs`. (Four more
 // lines of that header fragment, ordinary comments for the reason they state.)
+//! ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and a
+//! note written with `//!` anywhere but this header is `E0753` — either fails every
+//! suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the
+//! declarations, for this file and for every service crate's `tests/all.rs`.
+//! this file and for every service crate's `tests/all.rs`, so check there rather than
+//! leaving a note here.
+// each appended a declaration of it here, which is `E0428` and compiles no suite of this
+// target, so the duplicate is gone and the first declaration stands.)
+// leaving a note here. (Written as ordinary comments: an inner doc comment is only legal
+// at the top of a file, so the `//!` form these lines landed in here failed to compile.)
+// declaration of it here, which is `E0428` and compiles no suite of this target, so the
+// duplicate is gone and the first declaration stands.)
+// first item, so landing these lines in this tail as `//!` was `E0753`.)
+// one stays HERE: an inner doc comment past the first item is `E0753`, so the same note
+// appended to the tail of this file would compile no suite of this target.
+// (Two more fragments of that same header landed here, typed with `//!`: past the first
+// item that is `E0753` and compiles no suite of this target, so they are gone rather than
+// re-typed — the rule they repeated stands in the module doc at the HEAD of this file.)
+// (Seven more lines of that header landed here as `//!` too, and are gone for the same
+// reason: an inner doc comment past the first item is `E0753` and compiles nothing.)

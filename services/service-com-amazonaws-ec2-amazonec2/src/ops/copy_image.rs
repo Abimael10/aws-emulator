@@ -1,15 +1,50 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a NEW AMI that is a copy of the stored image the request names,
+//! records the lineage back to it, gives its Amazon EBS devices snapshots of their own, and
+//! answers the id it minted — this is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules this handler keeps:
+//!
+//! 1. THE COPY IS AN AMI IN ITS OWN RIGHT, COMPUTED FROM THE STORED SOURCE: its own id,
+//!    creation date and private launch permission, the REQUEST's name and description, and
+//!    the facts of the image's contents read off the source record — architecture, platform
+//!    and its billing strings, boot mode, IMDS and NitroTPM support, the root device and how
+//!    it is backed, the virtualization, enhanced networking, kernel and RAM disk, the product
+//!    codes a paid image carries and the UEFI variable store — so `DescribeImages` reports
+//!    the copy exactly as it reports a registered AMI and nothing about it is invented here.
+//! 2. THE COPY RECORDS ITS PARENT: "the ID of the source AMI from which the AMI was
+//!    created" (`Image$SourceImageId`) and "the Region of the source AMI"
+//!    (`Image$SourceImageRegion`) are the image the request copied and the Region it named,
+//!    which is the pair `GetImageAncestry` walks a lineage over and `DescribeImages` reports.
+//! 3. EACH BACKING SNAPSHOT IS COPIED TOO: "the specified completion duration applies to
+//!    each of the snapshots associated with the AMI" and "specifies whether to encrypt the
+//!    snapshots of the copied image", so every Amazon EBS device of the copy restores from a
+//!    snapshot of THIS account that this call makes — stored beside the ones `CopySnapshot`
+//!    makes, with the encryption state the request, the source and the destination Region's
+//!    encryption-by-default setting add up to — rather than from the source's own snapshot.
+//! 4. THE COPY IS ASYNCHRONOUS: "initiates an AMI copy operation", so the image is stored
+//!    [`crate::state::IMAGE_STATE_PENDING`] and reaches
+//!    [`crate::state::IMAGE_STATE_AVAILABLE`] on the clock, once the snapshots it is backed
+//!    by have completed ([`crate::state::ComAmazonawsEc2Amazonec2State::image_available_at`]).
+//!    Nothing sleeps for it and no caller moves it.
+//! 5. ONE `ClientToken` NAMES ONE AMI: "unique, case-sensitive identifier you provide to
+//!    ensure idempotency of the request" (`ClientToken`), so a replay of the same request
+//!    answers the image the first call minted and copies nothing more.
+//! 6. A DESTINATION THIS EMULATOR HAS NONE OF IS REFUSED rather than served as a regional
+//!    copy: `DestinationOutpostArn` names an Outpost and `DestinationAvailabilityZone` /
+//!    `DestinationAvailabilityZoneId` a Local Zone, while every Region here reports only
+//!    Availability Zones ([`crate::state::availability_zones_in_region`]) — the same reason
+//!    `CopySnapshot` refuses its own two destination members.
+//!
+//! The SOURCE is resolved out of the account's one image store, which is keyed by `ImageId`
+//! alone: `SourceRegion` is VALIDATED as a Region of the account's partition and then
+//! recorded as the parent's Region, because this emulator holds no per-Region image store to
+//! read another Region's AMIs from — the reading `CopySnapshot` and `CopyFpgaImage` give
+//! their own `SourceRegion`. An id the account can see no image for is refused through the
+//! crate's shared image-id policy ([`crate::state::require_visible_image`]: malformed before
+//! not-found), the pair the describes of the account's images answer.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +178,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::scaffolded::Scaffolded;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -211,18 +248,627 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyImage"))
+        use state::{
+            IMAGE_STATE_PENDING, IMAGE_TAGGABLE_RESOURCE, MAX_IMAGES, MAX_KMS_KEY_ID_CHARS,
+            MAX_STORED_BYTES, MAX_STORED_SNAPSHOTS, MAX_TAGS_PER_RESOURCE, SNAPSHOT_ID_PREFIX,
+            SNAPSHOT_STORAGE_TIER_STANDARD, SNAPSHOT_TAGGABLE_RESOURCE,
+            SNAPSHOT_TRANSFER_TYPE_STANDARD, SNAPSHOT_TRANSFER_TYPE_TIME_BASED, SnapshotView,
+            TRANSITION_DELAY, VOLUME_ID_PREFIX, dry_run_operation, image_name_is_well_formed,
+            image_payload_bytes, invalid_ami_id_not_found, invalid_ami_name_duplicate,
+            invalid_ami_name_malformed, is_catalog_region, iso8601_utc, regions_in_partition_of,
+            request_region, require_service_state, require_visible_image,
+            resource_limit_exceeded, snapshot_limit_exceeded, snapshot_payload_bytes,
+        };
+
+        // "The name of the new AMI" (`Name`) is `@required` but modelled `clientOptional`, so
+        // a request that left it out reaches this handler as an empty string rather than
+        // being refused at the boundary. A parameter the request did not carry is EC2's
+        // `MissingParameter`, the reading `RegisterImage` gives the same member.
+        if input.name.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter name",
+            ));
+        }
+        // The character set an AMI name may use, read through the crate's one definition of
+        // that question. Its LENGTH half is the member's own `@length` constraint, already
+        // refused by the request walk.
+        if !image_name_is_well_formed(&input.name) {
+            return Err(invalid_ami_name_malformed());
+        }
+        // "The ID of the AMI to copy" (`SourceImageId`) and "the name of the Region that
+        // contains the AMI to copy" (`SourceRegion`): both `@required` and modelled
+        // `clientOptional` too, so an absent one arrives empty and names nothing.
+        if input.source_image_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter sourceImageId",
+            ));
+        }
+        if input.source_region.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter sourceRegion",
+            ));
+        }
+
+        // `SourceRegion` is held to the Region catalog of the account's own partition, plus
+        // the Region this call was signed for — which is a Region of that account whichever
+        // partition it belongs to — the same reading `CopySnapshot` and `CopyFpgaImage` give
+        // their own. "The copy operation must be initiated in the destination Region"
+        // (`CopyImage`), so the DESTINATION is the Region this call was made in and no member
+        // names one.
+        let region = request_region(ctx.parts());
+        let source_region = input.source_region.clone();
+        let names_a_region = source_region == region
+            || (is_catalog_region(&source_region)
+                && regions_in_partition_of(&region).contains(&source_region.as_str()));
+        if !names_a_region {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Value ({source_region}) for parameter sourceRegion is invalid. \
+                 This is not a valid Region name."
+            )));
+        }
+
+        // "Only one of DestinationAvailabilityZone, DestinationAvailabilityZoneId, or
+        // DestinationOutpostArn can be specified" (each of the three members says so): two
+        // destinations name two places for one copy, which no copy can honour.
+        let named_destinations = [
+            input.destination_availability_zone.as_deref(),
+            input.destination_availability_zone_id.as_deref(),
+            input.destination_outpost_arn.as_deref(),
+        ]
+        .iter()
+        .filter(|value| value.is_some_and(|value| !value.is_empty()))
+        .count();
+        if named_destinations > 1 {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "Only one of destinationAvailabilityZone, destinationAvailabilityZoneId, \
+                 or destinationOutpostArn can be specified",
+            ));
+        }
+        // "The Amazon Resource Name (ARN) of the Outpost for the new AMI"
+        // (`DestinationOutpostArn`): this emulator has no Outpost in any Region, so the
+        // Outpost the request names is none of this Region's — and a regional copy is not
+        // what such a request asked for.
+        if let Some(outpost_arn) = input
+            .destination_outpost_arn
+            .as_deref()
+            .filter(|arn| !arn.is_empty())
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{outpost_arn}' for destinationOutpostArn. \
+                 The new AMI must be created on an Outpost of this Region, \
+                 and this Region has no Outpost"
+            )));
+        }
+        // "The Local Zone for the new AMI" / "the ID of the Local Zone for the new AMI"
+        // (`DestinationAvailabilityZone`, `DestinationAvailabilityZoneId`): every Region of
+        // this emulator reports Availability Zones only, so it has no Local Zone to copy
+        // into — the same reason `CopySnapshot` refuses its own Local Zone destination.
+        for (parameter, named) in [
+            (
+                "destinationAvailabilityZone",
+                input.destination_availability_zone.as_deref(),
+            ),
+            (
+                "destinationAvailabilityZoneId",
+                input.destination_availability_zone_id.as_deref(),
+            ),
+        ] {
+            if let Some(zone) = named.filter(|zone| !zone.is_empty()) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{zone}' for {parameter}. \
+                     The new AMI is placed in a Local Zone only, \
+                     and this Region has no Local Zone"
+                )));
+            }
+        }
+
+        // The model declares no `@length` on `KmsKeyId`, so the handler is the only place the
+        // bound AWS KMS publishes for a key identifier can be enforced — the same bound
+        // `CopySnapshot` holds its own `KmsKeyId` to.
+        if input
+            .kms_key_id
+            .as_ref()
+            .is_some_and(|key_id| key_id.chars().count() > MAX_KMS_KEY_ID_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "kmsKeyId accepts at most {MAX_KMS_KEY_ID_CHARS} characters"
+            )));
+        }
+        // "If you specify a KMS key, you must also set the encrypted state to true"
+        // (`KmsKeyId`): a key only names HOW the copy's snapshots are encrypted, so naming
+        // one without asking for encryption cannot be honoured.
+        if input.kms_key_id.is_some() && input.encrypted != Some(true) {
+            return Err(Scaffolded::invalid_parameter_value(
+                "kmsKeyId may be specified only when the encrypted state is set to true",
+            ));
+        }
+
+        // "Specify a completion duration, in 15 minute increments, to initiate a time-based
+        // AMI copy" (`SnapshotCopyCompletionDurationMinutes`). The member is a plain `Long`
+        // with no modelled range, so a handler is the only place the published window of the
+        // same time-based copy feature can be enforced.
+        if let Some(duration) = input.snapshot_copy_completion_duration_minutes {
+            let in_window = (COMPLETION_DURATION_INCREMENT_MINUTES
+                ..=MAX_COMPLETION_DURATION_MINUTES)
+                .contains(&duration);
+            if !in_window || duration % COMPLETION_DURATION_INCREMENT_MINUTES != 0 {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{duration}' for snapshotCopyCompletionDurationMinutes. \
+                     A completion duration is specified in \
+                     {COMPLETION_DURATION_INCREMENT_MINUTES} minute increments, from \
+                     {COMPLETION_DURATION_INCREMENT_MINUTES} to \
+                     {MAX_COMPLETION_DURATION_MINUTES} minutes"
+                )));
+            }
+        }
+
+        // "The tags to apply to the new AMI and new snapshots. You can tag the AMI, the
+        // snapshots, or both. […] If you specify other values for ResourceType, the request
+        // fails" (`TagSpecifications`): the two resource kinds this call creates, each read
+        // through the crate's one reader of a create's tag specifications, which holds each
+        // kind's payload to its documented bounds.
+        let requested_image_tags = requested_tags(
+            input.tag_specifications.as_deref(),
+            IMAGE_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+        let snapshot_tags = requested_tags(
+            input.tag_specifications.as_deref(),
+            SNAPSHOT_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+
+        let state_handle = require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+        let now = ::std::time::Instant::now();
+        let started_at = ::std::time::SystemTime::now();
+        let account = ::engine::emulator_account_id().to_string();
+
+        // DryRun asks whether the CALLER MAY make this request — "checks whether you have the
+        // required permissions for the action, without actually making the request"
+        // (`DryRun`) — a question about PERMISSION rather than about the resource, so it is
+        // answered once the request's own members have been read and before the source is
+        // resolved, the token is looked up or anything is written. That is where
+        // `GetImageAncestry` and `CopyFpgaImage` answer the same flag, and either order
+        // answers it before any write, so a probe leaves nothing behind.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        // Idempotency: one token names the one AMI it minted, so a replay reports that AMI
+        // and copies nothing. The request it repeats was already answered, so there is
+        // nothing left to resolve or refuse — the same reading `CopyFpgaImage` gives its own
+        // replay. A token whose AMI has since been DEREGISTERED names an image the account
+        // can no longer see, and that is the answer every reader of an AMI id in this crate
+        // gives for one: the image the token names, reported absent, rather than the copy
+        // being made a second time under a token that already minted one.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.image_client_tokens.get(token).cloned());
+        if let Some(image_id) = replayed {
+            return store
+                .images
+                .get(&image_id)
+                .map(|image| CopyImageOutput {
+                    image_id: image.image_id.clone(),
+                })
+                .ok_or_else(|| invalid_ami_id_not_found(&image_id));
+        }
+
+        // The copy's source is an image of this account's store, resolved through the crate's
+        // shared image-id policy: something that is not an AMI id at all is malformed, and a
+        // well-formed id the account can see no image for does not exist.
+        require_visible_image(&store, &input.source_image_id)?;
+        let Some(source) = store.images.get(&input.source_image_id).cloned() else {
+            return Err(invalid_ami_id_not_found(&input.source_image_id));
+        };
+
+        // "The name must be unique for AMIs in the Region for this account": the one reader
+        // of that question, so the refusal names the AMI that already holds the name.
+        if let Some(image_id) = store.image_named(&input.name) {
+            return Err(invalid_ami_name_duplicate(&input.name, &image_id));
+        }
+
+        let source_mappings = source.block_device_mappings.clone().unwrap_or_default();
+        let source_is_encrypted = source_mappings
+            .iter()
+            .filter_map(|mapping| mapping.ebs.as_ref())
+            .any(|ebs| ebs.encrypted == Some(true));
+        // "You can encrypt a copy of an unencrypted snapshot, but you cannot create an
+        // unencrypted copy of an encrypted snapshot" (`Encrypted`): the member may only ever
+        // RAISE the copy's encryption state, so the one value it cannot carry for an
+        // encrypted source is refused rather than read as "copy this unencrypted".
+        if input.encrypted == Some(false) && source_is_encrypted {
+            return Err(Scaffolded::invalid_parameter_value(
+                "Invalid value 'false' for encrypted. \
+                 You cannot create an unencrypted copy of an encrypted snapshot.",
+            ));
+        }
+        // "The encryption outcome […] depends on the Amazon EBS encryption by default setting
+        // for the destination Region, the encryption status of the source snapshot, and the
+        // encryption parameters you specify in the request" (`CopySnapshot` states the rule
+        // for the snapshots an AMI copy makes too). The setting is read under the guard this
+        // copy is written under, and it is the DESTINATION Region's — this call's own.
+        let encrypted = input.encrypted == Some(true)
+            || source_is_encrypted
+            || store.ebs_encryption_by_default(&region);
+        // "If this parameter is not specified, your Amazon Web Services managed KMS key for
+        // Amazon EBS is used" (`KmsKeyId`) — this emulator models no KMS keys, so an unnamed
+        // default key is reported as no key, the way `CopySnapshot` reports it.
+        let kms_key_id = input.kms_key_id.clone();
+
+        // "Specifies whether to copy your user-defined AMI tags to the new AMI"
+        // (`CopyImageTags`), merged with the tags the request asks the new AMI to carry.
+        let mut image_tags = copied_image_tags(&source, &account, input.copy_image_tags);
+        for tag in requested_image_tags {
+            // "Tag keys must be unique per resource", so a key the request tags the copy with
+            // replaces the copied value rather than being stored beside it.
+            image_tags.retain(|held| held.key != tag.key);
+            image_tags.push(tag);
+        }
+        if image_tags.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "The new AMI would carry {} tags, above the maximum of \
+                 {MAX_TAGS_PER_RESOURCE} per resource",
+                image_tags.len()
+            )));
+        }
+
+        // Every Amazon EBS device of the copy restores from a snapshot of its own. The ids
+        // are minted below, once the ceilings have admitted the write; the placeholder here
+        // has exactly the width a minted id has — every id of this store is its prefix and 17
+        // hexadecimal digits (`next_id`) — so the record the ceilings are asked about is the
+        // one the insert charges for.
+        let placeholder_snapshot_id = format!("{SNAPSHOT_ID_PREFIX}-{:017x}", 0);
+        let mut mappings = copied_mappings(
+            &source_mappings,
+            &placeholder_snapshot_id,
+            encrypted,
+            kms_key_id.as_deref(),
+        );
+        let snapshots_to_copy = mappings
+            .iter()
+            .filter(|mapping| {
+                mapping
+                    .ebs
+                    .as_ref()
+                    .is_some_and(|ebs| ebs.snapshot_id.is_some())
+            })
+            .count();
+
+        let mut spec = state::ImageSpec {
+            name: input.name.clone(),
+            // "A description for the new AMI" (`Description`): the copy's own, which the
+            // request supplies — the source's description is not carried over.
+            description: input.description.clone().unwrap_or_default(),
+            // Everything below is a fact of the image's CONTENTS, so the copy reports exactly
+            // what the source reports for it, read off the stored source record rather than
+            // restated here. A member the source carries nothing for is carried as nothing.
+            architecture: source.architecture.clone().unwrap_or_default(),
+            platform: source.platform.clone(),
+            platform_details: source.platform_details.clone().unwrap_or_default(),
+            usage_operation: source.usage_operation.clone().unwrap_or_default(),
+            boot_mode: source.boot_mode.clone(),
+            imds_support: source.imds_support.clone(),
+            root_device_name: source.root_device_name.clone().unwrap_or_default(),
+            root_device_type: source.root_device_type.clone().unwrap_or_default(),
+            virtualization_type: source.virtualization_type.clone().unwrap_or_default(),
+            sriov_net_support: source.sriov_net_support.clone(),
+            ena_support: source.ena_support,
+            tpm_support: source.tpm_support.clone(),
+            kernel_id: source.kernel_id.clone(),
+            ramdisk_id: source.ramdisk_id.clone(),
+            // "Any product codes associated with the AMI" (`Image$ProductCodes`) are codes of
+            // the image being copied, so the copy carries the source's.
+            product_codes: source.product_codes.clone().unwrap_or_default(),
+            // "Indicates whether the image is eligible for Amazon Web Services Free Tier"
+            // (`Image$FreeTierEligible`): a fact of the image's platform and billing, the way
+            // the product codes above are.
+            free_tier_eligible: source.free_tier_eligible.unwrap_or(false),
+            // "Base64 representation of the non-volatile UEFI variable store"
+            // (`ImageAttribute$UefiData`) is part of what the copy holds, so the variable
+            // store the source was registered with goes with it.
+            uefi_data: store.image_uefi_data.get(&input.source_image_id).cloned(),
+            // "Initiates an AMI copy operation" (`CopyImage`): the copy is still being
+            // assembled when this call answers, so the image is stored `pending` and the
+            // clock owes it its `available` move.
+            state: IMAGE_STATE_PENDING.to_string(),
+            // "The copy operation must be initiated in the destination Region" (`CopyImage`):
+            // the copy belongs to the account that asked for it, is private until something
+            // shares it, and carries no owner alias — an alias names an Amazon-published
+            // image, which a copy of one is not.
+            public: false,
+            owner_id: account.clone(),
+            owner_alias: None,
+            creation_date: iso8601_utc(started_at),
+            // "The date and time to deprecate the AMI" (`Image$DeprecationTime`) is set on an
+            // AMI by `EnableImageDeprecation`, so a newly copied one carries none.
+            deprecation_time: None,
+            // "The name of the public Systems Manager parameter that resolves to this AMI"
+            // (`Image$PublicSsmParameterName`): nothing publishes a parameter for a copy.
+            public_ssm_parameter_name: None,
+            tags: image_tags,
+            block_device_mappings: Some(mappings.clone()),
+            // The lineage rule: the image this copy was made from, and the Region the request
+            // named as holding it.
+            source_image_id: Some(input.source_image_id.clone()),
+            source_image_region: Some(source_region.clone()),
+            ..state::ImageSpec::default()
+        };
+
+        // The ceilings are asked BEFORE anything is minted, so a copy this emulator cannot
+        // hold whole is refused rather than half-written: a count of images, a count of
+        // snapshots, and the caller-chosen bytes both records hold, counted by the ONE
+        // definition of each charge.
+        if !store.has_image_capacity() {
+            return Err(resource_limit_exceeded(format!(
+                "This emulator holds {MAX_IMAGES} images, which is as many as it stores"
+            )));
+        }
+        if !store.has_snapshot_capacity(snapshots_to_copy) {
+            return Err(snapshot_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_SNAPSHOTS} EBS snapshots, \
+                 so it cannot store {snapshots_to_copy} more",
+                store.snapshots.len()
+            )));
+        }
+        // The caller-chosen bytes this copy retains, counted by the ONE definition of each
+        // charge: the image record, the snapshots it is backed by, and the `ClientToken` the
+        // token map keeps for it.
+        let token_bytes = input.client_token.as_deref().map_or(0, str::len);
+        let payload_bytes = image_payload_bytes(&spec)
+            .saturating_add(
+                snapshot_payload_bytes(&snapshot_tags, None).saturating_mul(snapshots_to_copy),
+            )
+            .saturating_add(token_bytes);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(resource_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // The snapshots the copy's devices restore from, each a snapshot of this account in
+        // its own right: stored beside the ones `CopySnapshot` makes, so `DescribeSnapshots`
+        // reports them, and moved from `pending` to `completed` by the clock rather than by a
+        // caller.
+        for mapping in mappings.iter_mut() {
+            let Some(ebs) = mapping.ebs.as_mut() else {
+                continue;
+            };
+            if ebs.snapshot_id.is_none() {
+                continue;
+            }
+            // "Snapshot copies have an arbitrary source volume ID. Do not use this volume ID
+            // for any purpose" (`CopySnapshot`): the copy reports a source volume of its own,
+            // minted out of the store's counter, so nothing reads it as a second snapshot of
+            // the volume the source was taken of.
+            let arbitrary_volume_id = store.next_id(VOLUME_ID_PREFIX);
+            let snapshot_id = store.insert_snapshot(
+                SnapshotView {
+                    // "A description for the EBS snapshot" is the caller's own words, and
+                    // `CopyImage` models a description for the AMI only, so the snapshots it
+                    // makes carry none.
+                    description: None,
+                    // "The same tag is applied to all the new snapshots"
+                    // (`TagSpecifications`).
+                    tags: Some(snapshot_tags.clone()),
+                    encrypted: Some(encrypted),
+                    kms_key_id: kms_key_id.clone().filter(|_| encrypted),
+                    // The copy holds the source device's data, so its volume size is that
+                    // device's.
+                    volume_size: ebs.volume_size,
+                    volume_id: Some(arbitrary_volume_id),
+                    owner_id: Some(account.clone()),
+                    storage_tier: Some(SNAPSHOT_STORAGE_TIER_STANDARD.to_string()),
+                    // "Only for snapshot copies. Indicates whether the snapshot copy was
+                    // created with a standard or time-based snapshot copy operation"
+                    // (`Snapshot$TransferType`), which is exactly whether this request asked
+                    // for a completion duration.
+                    transfer_type: Some(
+                        if input.snapshot_copy_completion_duration_minutes.is_some() {
+                            SNAPSHOT_TRANSFER_TYPE_TIME_BASED
+                        } else {
+                            SNAPSHOT_TRANSFER_TYPE_STANDARD
+                        }
+                        .to_string(),
+                    ),
+                    // "The completion duration requested for the time-based snapshot copy
+                    // operation" (`Snapshot$CompletionDurationMinutes`): "the specified
+                    // completion duration applies to each of the snapshots associated with
+                    // the AMI".
+                    completion_duration_minutes: input
+                        .snapshot_copy_completion_duration_minutes
+                        .and_then(|duration| i32::try_from(duration).ok()),
+                    // The members a regional copy carries nothing for, as `CopySnapshot`
+                    // reads them: no owner alias, no Outpost, no Local Zone, no restore
+                    // expiry, no state message and no data encryption key, with the full size
+                    // and the age-derived members left to the store.
+                    owner_alias: None,
+                    outpost_arn: None,
+                    availability_zone: None,
+                    restore_expiry_time: None,
+                    sse_type: None,
+                    state_message: None,
+                    data_encryption_key_id: None,
+                    full_snapshot_size_in_bytes: None,
+                    snapshot_id: None,
+                    start_time: None,
+                    state: None,
+                    progress: None,
+                    completion_time: None,
+                },
+                started_at,
+            );
+            ebs.snapshot_id = Some(snapshot_id);
+        }
+
+        spec.block_device_mappings = Some(mappings);
+        let image_id = store.insert_image(spec);
+
+        // When the copy finishes: the image is backed by the snapshots minted above, so it
+        // becomes `available` once THEY have completed — one span of the store's own
+        // clock-owed delay per level, the snapshots' own and then the image's. A copy that
+        // restores no snapshot at all (an instance store-backed AMI) owes only its own.
+        let snapshots_complete_at = if snapshots_to_copy == 0 {
+            now
+        } else {
+            now + TRANSITION_DELAY
+        };
+        store
+            .image_available_at
+            .insert(image_id.clone(), snapshots_complete_at + TRANSITION_DELAY);
+        if let Some(token) = input.client_token.clone() {
+            // The token's own bytes are charged where it is stored, so the map cannot hold
+            // caller-chosen bytes the store's budget never counted.
+            store.add_stored_bytes(token_bytes);
+            store.image_client_tokens.insert(token, image_id.clone());
+        }
+
+        // Read the answer back OUT of the store, so the caller is told the id a later
+        // `DescribeImages` will report rather than one held only in this stack frame.
+        store
+            .images
+            .get(&image_id)
+            .map(|image| CopyImageOutput {
+                image_id: image.image_id.clone(),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly copied image '{image_id}' could not be read back"
+                ))
+            })
     }
+}
+
+/// The increment a time-based copy's completion duration is specified in: "specify a
+/// completion duration, in 15 minute increments, to initiate a time-based AMI copy"
+/// (`CopyImageRequest$SnapshotCopyCompletionDurationMinutes`).
+///
+/// It lives in this file rather than in `crate::state` because this is the only operation of
+/// this crate that reads THIS member; `CopySnapshot` keeps the same increment for its own
+/// `CompletionDurationMinutes`, whose modelled `@range` also publishes the window below.
+const COMPLETION_DURATION_INCREMENT_MINUTES: i64 = 15;
+
+/// The longest completion duration a time-based copy may ask for, in minutes: the upper
+/// bound of the modelled `@range` on `CopySnapshotRequest$CompletionDurationMinutes`, which
+/// is the same time-based copy feature applied to one snapshot — this member is a plain
+/// `Long` and carries no range of its own.
+const MAX_COMPLETION_DURATION_MINUTES: i64 = 2_880;
+
+/// The tag prefix that marks a tag shared with the accounts an AMI is shared with: "for
+/// public and shared AMIs, user-defined tags that are attached by other Amazon Web Services
+/// accounts [are not copied], except tags with the `ec2:SharedTag/` prefix"
+/// (`CopyImageRequest$CopyImageTags`).
+const SHARED_TAG_PREFIX: &str = "ec2:SharedTag/";
+
+/// The tags the request asks this copy to put on the resource kind `resource_type`.
+///
+/// "You can tag the AMI, the snapshots, or both. To tag the new AMI, the value for
+/// `ResourceType` must be `image`. To tag the new snapshots, the value for `ResourceType`
+/// must be `snapshot`. If you specify other values for `ResourceType`, the request fails"
+/// (`CopyImageRequest$TagSpecifications`): a specification naming anything else is refused
+/// whichever kind is being read, so the refusal does not depend on which of the two reads
+/// happens first. The specifications of the kind asked for are then handed to the crate's one
+/// reader of a create's tag specifications
+/// ([`crate::state::tags_from_specifications`]), which is what holds that kind's payload to
+/// the documented bounds.
+fn requested_tags(
+    specifications: Option<&[TagSpecification]>,
+    resource_type: &str,
+    operation: &str,
+) -> Result<Vec<Tag>, CopyImageError> {
+    for specification in specifications.unwrap_or_default() {
+        match specification.resource_type.as_deref() {
+            Some(named) if state::IMAGE_TAGGABLE_RESOURCES.contains(&named) => {}
+            Some(other) => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "'{other}' is not a valid resource type for tagging on {operation}"
+                )));
+            }
+            None => {
+                return Err(Scaffolded::missing_parameter(
+                    "Tag specification resource type must have a value",
+                ));
+            }
+        }
+    }
+    let of_this_kind: Vec<TagSpecification> = specifications
+        .unwrap_or_default()
+        .iter()
+        .filter(|specification| specification.resource_type.as_deref() == Some(resource_type))
+        .cloned()
+        .collect();
+    state::tags_from_specifications(Some(&of_this_kind), resource_type, operation)
+}
+
+/// The tags of `source` this copy carries over, for a request that asked for them.
+///
+/// "Specifies whether to copy your user-defined AMI tags to the new AMI. The following tags
+/// are not […] copied: system tags (prefixed with `aws:`). For public and shared AMIs,
+/// user-defined tags that are attached by other Amazon Web Services accounts, except tags
+/// with the `ec2:SharedTag/` prefix. […] Default: your user-defined AMI tags are not copied"
+/// (`CopyImageRequest$CopyImageTags`).
+///
+/// So: nothing at all unless the request asked; never a tag of the reserved namespace; and of
+/// an image this account does not OWN, only the shared-tag ones — this store records no
+/// per-tag attaching account, and the tags of another account's image are that account's
+/// rather than "your user-defined AMI tags".
+fn copied_image_tags(source: &Image, account: &str, copy_image_tags: Option<bool>) -> Vec<Tag> {
+    if copy_image_tags != Some(true) {
+        return Vec::new();
+    }
+    let owned_by_caller = source.owner_id.as_deref() == Some(account);
+    source
+        .tags
+        .iter()
+        .flatten()
+        .filter(|tag| {
+            let key = tag.key.as_deref().unwrap_or_default();
+            !key.starts_with(state::RESERVED_TAG_PREFIX)
+                && (owned_by_caller || key.starts_with(SHARED_TAG_PREFIX))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The copy's block device mappings: the SOURCE's, with each Amazon EBS device restored from
+/// a snapshot of this copy's own and carrying the encryption state the copy was given.
+///
+/// "Initiates an AMI copy operation" — the copy holds the source's data, so it describes the
+/// same devices, and every other member of a mapping (the device name, the virtual name, the
+/// size, the type, the IOPS, the throughput and whether the volume is deleted on instance
+/// termination) is the source's. What a copy does NOT share is the snapshots: each device of
+/// the copy restores from `snapshot_id`, a snapshot of this account that the copy makes, and
+/// "specifies whether to encrypt the snapshots of the copied image" (`Encrypted`) is what
+/// decides their encryption state. A device the source restores from no snapshot (an
+/// ephemeral device, or one a mapping omits) restores from none here either.
+fn copied_mappings(
+    source_mappings: &[BlockDeviceMapping],
+    snapshot_id: &str,
+    encrypted: bool,
+    kms_key_id: Option<&str>,
+) -> Vec<BlockDeviceMapping> {
+    source_mappings
+        .iter()
+        .map(|mapping| {
+            let mut copied = mapping.clone();
+            if let Some(ebs) = copied.ebs.as_mut() {
+                if ebs.snapshot_id.is_some() {
+                    ebs.snapshot_id = Some(snapshot_id.to_string());
+                    ebs.encrypted = Some(encrypted);
+                    ebs.kms_key_id = kms_key_id
+                        .map(str::to_string)
+                        .filter(|_| encrypted)
+                        .or_else(|| ebs.kms_key_id.clone().filter(|_| encrypted));
+                }
+            }
+            copied
+        })
+        .collect()
 }

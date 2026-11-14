@@ -850,6 +850,18 @@ pub const IMAGE_STATE_AVAILABLE: &str = "available";
 /// image is left out of a report unless the request asks for it (`IncludeDisabled`).
 pub const IMAGE_STATE_DISABLED: &str = "disabled";
 
+/// An AMI that is not registered yet: the `ImageState` enum's `pending` member, which is
+/// what an image carries while the work that produces it is still running — "if the state
+/// is `available`, the image is successfully registered and can be used to launch an
+/// instance" (`Image$State`), so an image the service is still assembling is not.
+///
+/// The state an asynchronous AMI copy's image is handed back in: the move to
+/// [`IMAGE_STATE_AVAILABLE`] is owed by the clock
+/// ([`ComAmazonawsEc2Amazonec2State::materialize_due_image_copies`]) rather than by a
+/// caller. An AMI a register stores is `available` at once, a snapshot of the account
+/// already holding its data.
+pub const IMAGE_STATE_PENDING: &str = "pending";
+
 /// "The type of image" (`Image$ImageType`) for an AMI, as opposed to a kernel or a RAM
 /// disk image: the `ImageTypeValues` enum's `machine` member.
 pub const IMAGE_TYPE_MACHINE: &str = "machine";
@@ -1315,6 +1327,14 @@ pub struct ImageSpec {
     /// carries no member for it, so it is held beside the image in
     /// [`ComAmazonawsEc2Amazonec2State::image_uefi_data`].
     pub uefi_data: Option<String>,
+    /// "The ID of the source AMI from which the AMI was created" (`Image$SourceImageId`),
+    /// for an image that was COPIED from another — the parent link `GetImageAncestry` walks.
+    /// `None` for an image nothing was copied from, which is the root of its own chain.
+    pub source_image_id: Option<String>,
+    /// "The Region of the source AMI" (`Image$SourceImageRegion`): the Region the parent
+    /// named by [`Self::source_image_id`] lives in, which is the Region the copy named as its
+    /// source rather than the one the copy itself is in.
+    pub source_image_region: Option<String>,
 }
 
 /// An EBS-backed Linux machine image of the calling account, created now and available:
@@ -1358,6 +1378,10 @@ impl Default for ImageSpec {
             tpm_support: None,
             image_location: None,
             uefi_data: None,
+            // An image nothing was copied from carries no parent link: it is the root of its
+            // own ancestry chain.
+            source_image_id: None,
+            source_image_region: None,
         }
     }
 }
@@ -1416,6 +1440,9 @@ pub fn image_payload_bytes(spec: &ImageSpec) -> usize {
         .saturating_add(optional(spec.tpm_support.as_ref()))
         .saturating_add(optional(spec.image_location.as_ref()))
         .saturating_add(optional(spec.uefi_data.as_ref()))
+        // The parent link a copy records: the source AMI's id and the Region it lives in.
+        .saturating_add(optional(spec.source_image_id.as_ref()))
+        .saturating_add(optional(spec.source_image_region.as_ref()))
 }
 
 /// The caller-chosen bytes a block device mapping list holds: each entry's device name, its
@@ -1569,9 +1596,12 @@ impl ComAmazonawsEc2Amazonec2State {
             // `ImageCriterion` matcher it would need does not exist yet, so nothing writes
             // another value here.
             image_allowed: Some(true),
-            // Set only for an image copied from another (`CopyImage`).
-            source_image_id: None,
-            source_image_region: None,
+            // Set only for an image copied from another (`CopyImage`): "the ID of the source
+            // AMI from which the AMI was created" (`Image$SourceImageId`) and "the Region of
+            // the source AMI" (`Image$SourceImageRegion`), the pair `GetImageAncestry` walks
+            // a lineage over.
+            source_image_id: spec.source_image_id,
+            source_image_region: spec.source_image_region,
             free_tier_eligible: Some(spec.free_tier_eligible),
             public_ssm_parameter_name: spec.public_ssm_parameter_name,
             // No watermark is attached until something attaches one.
@@ -1696,6 +1726,47 @@ impl ComAmazonawsEc2Amazonec2State {
                     .any(|ebs| ebs.snapshot_id.as_deref() == Some(snapshot_id))
             })
             .map(|(image_id, _)| image_id.clone())
+    }
+
+    /// Apply the `pending` -> `available` move the clock owes every AMI whose own due
+    /// instant has passed by `now`.
+    ///
+    /// An AMI a COPY produces is assembled asynchronously — the copy's backing snapshots are
+    /// made first and the image is registered once they hold its data — so the image is
+    /// handed back [`IMAGE_STATE_PENDING`] and reaches [`IMAGE_STATE_AVAILABLE`] at the
+    /// instant the call that started it left owing, whether or not anybody calls again. The
+    /// contract [`Self::vpc_available_at`] has for a `pending` VPC, read off the same
+    /// monotonic clock, and the reason a reporting operation materializes due transitions
+    /// before it reads the store.
+    ///
+    /// The move is applied ONCE: the due instant is dropped with it, so an image whose state
+    /// something else has since changed — disabled, deregistered — is not moved back.
+    ///
+    /// An image the catalogue does not hold is a DIFFERENT case from one whose state has
+    /// moved on: an AMI in the Recycle Bin is restorable ("it can be restored before its
+    /// retention period expires", `DeregisterImage`), so the move it was owed is kept for the
+    /// image it names until that image can no longer come back — a restore after the due
+    /// instant then reports it `available` rather than leaving it `pending` for ever. Once
+    /// neither store holds the id, the entry names nothing and goes with it.
+    pub fn materialize_due_image_copies(&mut self, now: Instant) {
+        let images = &mut self.images;
+        let recycled = &self.images_in_recycle_bin;
+        self.image_available_at.retain(|image_id, due_at| {
+            if now < *due_at {
+                return true;
+            }
+            match images.get_mut(image_id) {
+                Some(image) => {
+                    if image.state.as_deref() == Some(IMAGE_STATE_PENDING) {
+                        image.state = Some(IMAGE_STATE_AVAILABLE.to_string());
+                    }
+                    false
+                }
+                // Kept while the image can still come back out of the Recycle Bin, and
+                // dropped when nothing holds it any more.
+                None => recycled.contains_key(image_id),
+            }
+        });
     }
 
     /// Give the store the public images Amazon publishes ([`published_image_specs`]), and

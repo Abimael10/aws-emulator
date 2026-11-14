@@ -5,8 +5,11 @@
 //! Reports the AMIs the calling account can see out of [`crate::state`]: every image of
 //! the store by default, or the subset the request's `ImageIds`, `Owners`,
 //! `ExecutableUsers` and `Filters` select, one `MaxResults`-sized page at a time. A
-//! reporting operation — it writes nothing at all, images having no clock-owed transition
-//! in this slice.
+//! reporting operation: the ONE thing it writes is the move the clock already made due —
+//! an AMI a copy produced is stored `pending` and reaches `available` at an instant the
+//! call that started the copy fixed ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_image_copies`]),
+//! so that move is applied before this report is built and is owed at the same instant
+//! whether or not anybody called. Nothing else here changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -295,9 +298,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let state = require_service_state(&*self.engine)?;
-        // A read, and only a read: an image has no clock-owed transition in this slice, so
-        // nothing here writes to the store and two calls report the same catalog.
-        let store = state.lock();
+        // A `pending` AMI a copy produced reaches `available` at an instant the call that
+        // started the copy fixed, so that move was owed whether or not anybody called: it is
+        // applied before this report is built, and nothing else here writes to the store —
+        // two calls made after the same instant report the same catalog.
+        let mut store = state.lock();
+        store.materialize_due_transitions();
         let account = ::engine::emulator_account_id();
         let now = ::std::time::SystemTime::now();
 

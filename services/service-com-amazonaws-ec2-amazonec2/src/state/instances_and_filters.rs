@@ -374,7 +374,8 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// An `active` import image task becoming `completed` with the AMI it created is one of
     /// them too; it is documented on [`Self::complete_due_import_image_tasks`], which this
-    /// calls. So is an `active` import SNAPSHOT task reaching `completed` with the EBS
+    /// calls. So is a `pending` AMI a copy produced reaching `available`
+    /// ([`Self::materialize_due_image_copies`]). So is an `active` import SNAPSHOT task reaching `completed` with the EBS
     /// snapshot its disk became ([`Self::complete_due_import_snapshot_conversions`]). So is
     /// the end of an import task cancellation — a `deleting` task of either
     /// import kind reaching `deleted`
@@ -413,6 +414,10 @@ impl ComAmazonawsEc2Amazonec2State {
         // once its own due instant has passed; both were owed whether or not anybody called.
         self.expire_due_image_usage_reports(SystemTime::now());
         self.materialize_due_image_usage_reports(now);
+        // An AMI a copy produces is assembled asynchronously, so the `pending` -> `available`
+        // move `CopyImage` left it owing fell due at its own instant whether or not anybody
+        // called — the same contract as the `pending` VPC below.
+        self.materialize_due_image_copies(now);
         // The primary private addresses the terminations that just COMPLETED release, taken
         // while the moves are applied so each is released exactly ONCE: an instance already
         // at `terminated` has no transition left to apply, so a later sweep collects nothing
