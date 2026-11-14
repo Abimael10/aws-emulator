@@ -1127,6 +1127,10 @@ const MESSAGE_MEMBER: &str = "Message";
 const FUNCTION_NAME_MEMBER: &str = "FunctionName";
 /// See [`QUEUE_URL_MEMBER`].
 const PAYLOAD_MEMBER: &str = "Payload";
+/// See [`QUEUE_URL_MEMBER`]. `Invoke` takes the KIND of invocation beside those two,
+/// and a schedule's function target states one ([`asynchronous_invocation`]) rather
+/// than leaving the API's default, so the member is part of the request that call is.
+const INVOCATION_TYPE_MEMBER: &str = "InvocationType";
 /// See [`QUEUE_URL_MEMBER`].
 const STATE_MACHINE_ARN_MEMBER: &str = "StateMachineArn";
 /// See [`QUEUE_URL_MEMBER`].
@@ -1146,6 +1150,13 @@ const EXECUTION_INPUT_MEMBER: &str = "Input";
 /// universal target's input writes the same call: a templated target's is built here
 /// from the members the schedule states, and a universal target's input already IS the
 /// request, so it is dead-lettered as it stands.
+///
+/// A templated target's document carries EVERY member the attempt set on that request
+/// ([`deliver`]), with the value it was made with — the members the schedule states,
+/// and the ones the target's kind decides rather than the schedule (the kind of
+/// invocation a function target is made with) — because the document is the request a
+/// client resubmits to replay the invocation, and a member missing from it is a member
+/// that replay does not state.
 ///
 /// `region` is the schedule's, for an ARN carrying no Region label of its own — the same
 /// fallback the invocation itself is made in ([`perform`]).
@@ -1185,6 +1196,14 @@ fn failed_event(target: &Target, region: &str, payload: &str) -> String {
         }
         LAMBDA_ARN_NAMESPACE => {
             request.insert(FUNCTION_NAME_MEMBER.to_string(), text(arn));
+            // The invocation the attempt made is the asynchronous one
+            // ([`asynchronous_invocation`]), which `Invoke` is told by a member of its
+            // request rather than by the function it names: the member travels with
+            // the invocation, so it is part of the request that failed.
+            request.insert(
+                INVOCATION_TYPE_MEMBER.to_string(),
+                text(asynchronous_invocation().as_str()),
+            );
             request.insert(PAYLOAD_MEMBER.to_string(), text(payload));
         }
         STATES_ARN_NAMESPACE => {
@@ -1342,8 +1361,7 @@ async fn deliver(
             lambda_client(callback, region)
                 .invoke()
                 .function_name(arn)
-                // A schedule does not wait for its function target's answer.
-                .invocation_type(::aws_sdk_lambda::types::InvocationType::Event)
+                .invocation_type(asynchronous_invocation())
                 .payload(::aws_sdk_lambda::primitives::Blob::new(body.as_bytes()))
                 .send()
                 .await,
@@ -1360,6 +1378,16 @@ async fn deliver(
             "this emulator does not invoke a target of {vendor}"
         )),
     }
+}
+
+/// The `InvocationType` a schedule's function target is invoked with: AWS Lambda's
+/// asynchronous invocation, because a schedule does not wait for its function target's
+/// answer.
+///
+/// Stated once, so the attempt ([`deliver`]) and the request document a failed attempt
+/// is reported as ([`failed_event`]) name the same invocation.
+fn asynchronous_invocation() -> ::aws_sdk_lambda::types::InvocationType {
+    ::aws_sdk_lambda::types::InvocationType::Event
 }
 
 /// What one target API's answer came to: a delivery, or the failure it reported

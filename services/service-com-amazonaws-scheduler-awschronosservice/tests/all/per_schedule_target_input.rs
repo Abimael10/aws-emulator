@@ -61,10 +61,10 @@ const SCHEDULER_PRINCIPAL: &str = "scheduler.amazonaws.com";
 
 /// The IAM action an invocation of a FUNCTION target is authorized by, as
 /// `Target$RoleArn`'s own documentation names the grant a Lambda target needs.
-const INVOKE_FUNCTION: &str = "lambda:InvokeFunction";
+pub(crate) const INVOKE_FUNCTION: &str = "lambda:InvokeFunction";
 
 /// Where Lambda's `CreateFunction` is bound.
-const FUNCTIONS_URI: &str = "/2015-03-31/functions";
+pub(crate) const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// A well-formed Lambda execution role ARN, satisfying the model's `RoleArn` pattern.
 /// The function's OWN role plays no part here: what is under test is the payload the
@@ -409,7 +409,7 @@ async fn payloads_once(
 /// EventBridge Scheduler, Amazon SQS, IAM and Lambda on ONE engine — the shape
 /// `core/router/src/lib.rs` mounts them in — with the engine itself, so a suite can
 /// read the invocation Lambda holds for a function.
-fn emulator_with_lambda() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_lambda() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -433,7 +433,11 @@ fn emulator_with_lambda() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// A function of `name`, and the ARN a schedule names it by.
-async fn given_function(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+pub(crate) async fn given_function(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> String {
     let request = http::Request::builder()
         .method("POST")
         .uri(FUNCTIONS_URI)
@@ -472,7 +476,7 @@ async fn given_function(router: &MultiServiceRouter, case: &str, name: &str) -> 
 
 /// A role EventBridge Scheduler may assume whose inline policy allows each
 /// `(action, resource)` pair and nothing else.
-async fn given_invoking_role(
+pub(crate) async fn given_invoking_role(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -522,7 +526,10 @@ async fn given_invoking_role(
 }
 
 /// The payloads Lambda holds asynchronous invocations of `function` for, as a set.
-fn invoked_payloads(engine: &Arc<engine::InMemoryEngine>, function: &str) -> BTreeSet<String> {
+pub(crate) fn invoked_payloads(
+    engine: &Arc<engine::InMemoryEngine>,
+    function: &str,
+) -> BTreeSet<String> {
     let state = engine.state::<ComAmazonawsLambdaAwsgirapiserviceState>();
     let store = state.lock();
     store

@@ -402,7 +402,7 @@ async fn refusal_code(router: &MultiServiceRouter, case: &str, url: &str) -> Str
 /// The messages the queue at `url` holds once it holds at least `wanted`, or whatever
 /// it holds after `patience` — left on the queue, with every message attribute they
 /// carry.
-async fn messages_once(
+pub(crate) async fn messages_once(
     router: &MultiServiceRouter,
     url: &str,
     wanted: usize,
@@ -435,7 +435,7 @@ async fn stays_empty(router: &MultiServiceRouter, case: &str, url: &str, what: &
 /// Every message waiting on the queue at `url`, with its message attributes, left on
 /// the queue: a report is read for its attributes, and a row that looks again must
 /// still see it.
-async fn received(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
+pub(crate) async fn received(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
     let (status, answered) = sqs(
         router,
         "ReceiveMessage",
@@ -456,7 +456,7 @@ async fn received(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
 
 /// The document a dead-letter message's body IS: a failed event is the request the
 /// invocation attempted, so the body is read as that document rather than as text.
-fn body_document(message: &Value) -> Value {
+pub(crate) fn body_document(message: &Value) -> Value {
     let body = message["Body"].as_str().unwrap_or_default();
     serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.to_string()))
 }
@@ -489,6 +489,9 @@ struct EventRow {
     by_queue_url: bool,
     /// The member of that request the undelivered payload is carried under.
     carried_under: Option<&'static str>,
+    /// The members of that request the TARGET'S KIND states rather than the schedule,
+    /// each with the value every invocation of such a target is made with.
+    fixed_members: &'static [(&'static str, &'static str)],
     /// The FIFO message group `Target.SqsParameters` states, if any.
     message_group_id: Option<&'static str>,
     /// The error code the target's own service answers a call its caller is not
@@ -509,6 +512,7 @@ const EVENT_ROWS: &[EventRow] = &[
         addressed_under: Some("QueueUrl"),
         by_queue_url: true,
         carried_under: Some("MessageBody"),
+        fixed_members: &[],
         message_group_id: None,
         // Amazon SQS is query-compatible, so its answer carries the legacy Query code,
         // and that service names the action case-folded throughout.
@@ -523,6 +527,7 @@ const EVENT_ROWS: &[EventRow] = &[
         addressed_under: Some("QueueUrl"),
         by_queue_url: true,
         carried_under: Some("MessageBody"),
+        fixed_members: &[],
         message_group_id: Some("orders"),
         refused_with: QUEUE_ACCESS_DENIED,
         reported_action: "sqs:sendmessage",
@@ -534,6 +539,7 @@ const EVENT_ROWS: &[EventRow] = &[
         addressed_under: Some("TopicArn"),
         by_queue_url: false,
         carried_under: Some("Message"),
+        fixed_members: &[],
         message_group_id: None,
         // Amazon SNS MODELS its authorization refusal
         // (`AuthorizationErrorException`, Query code `AuthorizationError`).
@@ -549,6 +555,7 @@ const EVENT_ROWS: &[EventRow] = &[
         addressed_under: Some("StateMachineArn"),
         by_queue_url: false,
         carried_under: Some("Input"),
+        fixed_members: &[],
         message_group_id: None,
         refused_with: "AccessDeniedException",
         // AWS's authorization layer answers for this service, naming the action as the
@@ -556,12 +563,16 @@ const EVENT_ROWS: &[EventRow] = &[
         reported_action: "states:StartExecution",
     },
     EventRow {
-        // AWS Lambda's `Invoke`, which takes `FunctionName` and `Payload`.
+        // AWS Lambda's `Invoke`, which takes `FunctionName`, `Payload` and the
+        // `InvocationType` the call is made with.
         case: "a function target",
         target: "arn:aws:lambda:{region}:{account}:function:failed-event-function",
         addressed_under: Some("FunctionName"),
         by_queue_url: false,
         carried_under: Some("Payload"),
+        // A schedule does not wait for its function target's answer, so every such
+        // invocation is the asynchronous one.
+        fixed_members: &[("InvocationType", "Event")],
         message_group_id: None,
         refused_with: "AccessDeniedException",
         reported_action: "lambda:InvokeFunction",
@@ -575,6 +586,7 @@ const EVENT_ROWS: &[EventRow] = &[
         addressed_under: None,
         by_queue_url: false,
         carried_under: None,
+        fixed_members: &[],
         message_group_id: None,
         refused_with: QUEUE_ACCESS_DENIED,
         reported_action: "sqs:sendmessage",
@@ -663,6 +675,9 @@ async fn a_dead_lettered_event_is_the_request_the_invocation_attempted() {
                 };
                 document.insert(address.to_string(), Value::String(addressed));
                 document.insert(member.to_string(), Value::String(input.clone()));
+                for (name, value) in row.fixed_members {
+                    document.insert((*name).to_string(), Value::String((*value).to_string()));
+                }
                 if let Some(group) = row.message_group_id {
                     document.insert(
                         MESSAGE_GROUP_ID_MEMBER.to_string(),

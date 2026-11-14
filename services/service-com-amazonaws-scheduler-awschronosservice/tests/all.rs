@@ -15,6 +15,8 @@
 mod dead_letter_delivery;
 #[path = "all/flexible_time_window_messages.rs"]
 mod flexible_time_window_messages;
+#[path = "all/function_target_dead_letter.rs"]
+mod function_target_dead_letter;
 #[path = "all/list_tags_for_resource_bounds.rs"]
 mod list_tags_for_resource_bounds;
 #[path = "all/occurrence_timing.rs"]
