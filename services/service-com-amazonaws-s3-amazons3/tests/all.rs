@@ -377,6 +377,8 @@ mod refusal_class_fidelity;
 mod refusal_codes;
 #[path = "all/refusal_detail_members.rs"]
 mod refusal_detail_members;
+#[path = "all/request_correlation_token_shape.rs"]
+mod request_correlation_token_shape;
 #[path = "all/request_integrity_headers.rs"]
 mod request_integrity_headers;
 #[path = "all/request_latency_metrics.rs"]

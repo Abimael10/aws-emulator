@@ -7432,3 +7432,13 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // they repeated stands at the HEAD of this file.)
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check the declarations and the
 // notes, for this file and for every service crate's `tests/all.rs`.)
+// Declared here for the reason this entry records: what a
+// (Nothing but notes followed here: fragments of this file's own module header that
+// concurrent landings appended into the tail, several of them typed `//!`, which past the
+// first item is `E0753` and compiles no suite of this target. They are gone rather than
+// re-typed — the rule they repeated stands in the module doc at the HEAD of this file, and
+// `all/all_rs_declares_each_suite_once.rs` plus
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of it, for
+// (And more of the same followed, to the end of this file: header fragments concurrent
+// landings appended here, some as `//!`, which past the first item is `E0753`. The rule
+// they repeated is in the module doc at the HEAD of this file, so they are gone rather

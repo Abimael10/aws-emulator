@@ -2320,7 +2320,8 @@ fn with_request_correlation(
     correlation: crate::state::request_ids::RequestCorrelation,
 ) -> Response {
     // A value a header map refuses is dropped rather than turning a served response into a
-    // transport failure; both are hex, so neither ever is.
+    // transport failure; both ids are drawn from characters a header value admits, so
+    // neither ever is.
     let _ = response
         .headers_mut()
         .try_insert(REQUEST_ID_HEADER, correlation.request_id);

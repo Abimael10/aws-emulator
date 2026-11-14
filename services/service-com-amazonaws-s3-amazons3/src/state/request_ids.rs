@@ -37,9 +37,47 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// A request id "uniquely identifies the request", so two responses may never carry the
 /// same one: the ids are derived from this monotonic counter rather than from anything
 /// about the request, so two identical requests are still told apart. They are correlation
-/// values and not security tokens, which is why a counter-derived digest is the right
-/// shape for them.
+/// values and not security tokens, which is why a counter-derived value is the right thing
+/// for them.
 static MINTED_PAIRS: AtomicU64 = AtomicU64::new(0);
+
+/// The characters an `x-amz-request-id` is written in: the ten digits and the twenty-six
+/// UPPERCASE letters.
+///
+/// The token is opaque, so its ALPHABET and its WIDTH are all of it a client can read, and
+/// both are part of what S3 publishes: every id that header carries is a fixed-width token
+/// of digits and uppercase letters (Amazon S3 API Reference, *Common Response Headers*,
+/// whose `x-amz-request-id` is "a value created by Amazon S3 that uniquely identifies the
+/// request"). A token drawn from a NARROWER alphabet — hexadecimal digits, or the lowercase
+/// and hyphens of a UUID — is one a client that parses, logs or length-checks the id reads
+/// as a different kind of value.
+const REQUEST_ID_ALPHABET: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// How many characters that token carries, and so how wide the `<RequestId>` of an error
+/// document is: the fixed width of S3's own ids.
+const REQUEST_ID_CHARS: u32 = 16;
+
+/// How many distinct tokens [`REQUEST_ID_CHARS`] characters of [`REQUEST_ID_ALPHABET`]
+/// hold.
+const REQUEST_ID_SPACE: u128 = (REQUEST_ID_ALPHABET.len() as u128).pow(REQUEST_ID_CHARS);
+
+/// The stride the mint walks [`REQUEST_ID_SPACE`] in, one draw per request.
+///
+/// [`REQUEST_ID_SPACE`] factors into powers of two and three alone, and this stride is a
+/// multiple of neither, so it is coprime with the space and `draw -> token` is a BIJECTION:
+/// a request id "uniquely identifies the request", and no two draws of this counter can
+/// land on one token. A digest of the draw would only make a collision unlikely. The stride
+/// is large and irregular, so consecutive draws land far apart and the token stays the
+/// opaque value a client treats it as.
+const REQUEST_ID_STRIDE: u128 = 1_442_695_040_888_963_407;
+
+/// How many bytes the `x-amz-id-2` token encodes.
+///
+/// That header carries "a special token that helps Amazon Web Services troubleshoot
+/// problems" (Amazon S3 API Reference, *Common Response Headers*), published as a long
+/// base64 token — the documented one is 64 characters wide, which is what these bytes
+/// encode to, four characters per three bytes and no padding.
+const EXTENDED_REQUEST_ID_BYTES: usize = 48;
 
 thread_local! {
     /// The pair the operation serving this thread's request recorded for its response.
@@ -49,10 +87,50 @@ thread_local! {
 /// The two ids one served request is named by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestCorrelation {
-    /// `x-amz-request-id`: 16 upper-case hex digits, the shape that header carries.
+    /// `x-amz-request-id`: the fixed-width token of digits and uppercase letters that
+    /// header carries — [`REQUEST_ID_CHARS`] characters of [`REQUEST_ID_ALPHABET`].
     pub request_id: String,
-    /// `x-amz-id-2`: 64 lower-case hex digits, the shape that header carries.
+    /// `x-amz-id-2`: the longer base64 token of the pair, [`EXTENDED_REQUEST_ID_BYTES`]
+    /// bytes wide.
     pub extended_request_id: String,
+}
+
+/// The `x-amz-request-id` of the pair drawn at `drawn`: that draw's own point of
+/// [`REQUEST_ID_SPACE`], written in [`REQUEST_ID_ALPHABET`] and zero-padded to the fixed
+/// [`REQUEST_ID_CHARS`] width S3's ids have.
+fn request_id(drawn: u64) -> String {
+    let base = REQUEST_ID_ALPHABET.len() as u128;
+    // A `u64` draw is far below `REQUEST_ID_SPACE` and the stride is coprime with it, so
+    // distinct draws land on distinct points — and the product of two values of those
+    // magnitudes is well inside a `u128`.
+    let mut point = u128::from(drawn) * REQUEST_ID_STRIDE % REQUEST_ID_SPACE;
+    // The characters of the token, least significant first: a remainder of `base` indexes
+    // the alphabet it was taken modulo, so every index is one the alphabet holds.
+    let mut characters: Vec<char> = Vec::with_capacity(REQUEST_ID_CHARS as usize);
+    for _ in 0..REQUEST_ID_CHARS {
+        characters.push(char::from(REQUEST_ID_ALPHABET[(point % base) as usize]));
+        point /= base;
+    }
+    // Written most significant character first, the way any positional notation is, which
+    // is also what pads a small point out to the fixed width.
+    characters.iter().rev().collect()
+}
+
+/// The `x-amz-id-2` of that same draw: the base64 token of [`EXTENDED_REQUEST_ID_BYTES`]
+/// bytes derived from it.
+///
+/// A digest of the draw, rather than the draw itself, because this token carries no
+/// structure a reader reads — it is the opaque value a support request quotes — and the
+/// digest is what makes one draw's two ids tell nothing about each other.
+fn extended_request_id(drawn: u64) -> String {
+    use ::base64::Engine as _;
+    use ::sha2::Digest as _;
+
+    let mut digest = ::sha2::Sha512::new();
+    digest.update(b"s3-extended-request-id:");
+    digest.update(drawn.to_be_bytes());
+    ::base64::engine::general_purpose::STANDARD_NO_PAD
+        .encode(&digest.finalize()[..EXTENDED_REQUEST_ID_BYTES])
 }
 
 impl RequestCorrelation {
@@ -61,16 +139,10 @@ impl RequestCorrelation {
     /// Both ids come from ONE draw on the counter, so the `x-amz-request-id` and the
     /// `x-amz-id-2` of a response name the same request.
     pub fn mint() -> Self {
-        use ::sha2::Digest;
-
         let drawn = MINTED_PAIRS.fetch_add(1, Ordering::Relaxed);
-        let mut digest = ::sha2::Sha256::new();
-        digest.update(b"s3-request-id:");
-        digest.update(drawn.to_be_bytes());
-        let bytes = digest.finalize();
         Self {
-            request_id: ::hex::encode_upper(&bytes[..8]),
-            extended_request_id: ::hex::encode(bytes),
+            request_id: request_id(drawn),
+            extended_request_id: extended_request_id(drawn),
         }
     }
 

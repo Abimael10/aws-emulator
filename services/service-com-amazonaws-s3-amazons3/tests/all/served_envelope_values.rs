@@ -10,8 +10,9 @@
 //!   of ids S3 publishes for it: "`x-amz-request-id`: A value created by Amazon S3 that
 //!   uniquely identifies the request" and "`x-amz-id-2`: A special token that helps Amazon
 //!   Web Services troubleshoot problems" (Amazon S3 API Reference, *Common Response
-//!   Headers*). Each is an OPAQUE TOKEN of its own shape — the request id uppercase
-//!   alphanumeric, the extended one lowercase hexadecimal — the REST-XML error document
+//!   Headers*). Each is an OPAQUE TOKEN of its own shape — the request id a fixed-width
+//!   run of digits and uppercase letters, the extended one a longer base64 token — the
+//!   REST-XML error document
 //!   mirrors them in `<RequestId>` and `<HostId>`, the two have to agree, and no two
 //!   responses are named by the same pair. The shape is the contract: a client, a log
 //!   correlator or a support request reads the token, so a lowercase hyphenated UUID is
@@ -58,8 +59,13 @@ use super::object_retention::put_object_retention;
 pub(crate) const REQUEST_ID_CHARS: usize = 16;
 
 /// How many characters an `x-amz-id-2` carries — the wider token of the pair, which S3
-/// writes in lowercase hexadecimal.
+/// writes in base64 (the width of the token the API reference's own examples carry).
 const EXTENDED_REQUEST_ID_CHARS: usize = 64;
+
+/// How many BYTES that token decodes to, the number [`EXTENDED_REQUEST_ID_CHARS`]
+/// characters of base64 encode: what tells a value of the right width that really is that
+/// codec's output from one that only happens to be as long.
+const EXTENDED_REQUEST_ID_BYTES: usize = 48;
 
 /// Whether `token` is shaped like the id `x-amz-request-id` carries: an opaque
 /// [`REQUEST_ID_CHARS`]-character token of digits and UPPERCASE letters.
@@ -77,12 +83,18 @@ pub(crate) fn is_request_id(token: &str) -> bool {
 }
 
 /// Whether `token` is shaped like the id `x-amz-id-2` carries:
-/// [`EXTENDED_REQUEST_ID_CHARS`] characters of LOWERCASE hexadecimal.
-fn is_extended_request_id(token: &str) -> bool {
+/// [`EXTENDED_REQUEST_ID_CHARS`] characters of base64, decoding to the
+/// [`EXTENDED_REQUEST_ID_BYTES`] bytes that width encodes.
+///
+/// `pub(crate)`: the correlation-token suite beside this one spans the same shape over its
+/// own table, so neither restates the rule.
+pub(crate) fn is_extended_request_id(token: &str) -> bool {
+    use ::base64::Engine as _;
+
     token.len() == EXTENDED_REQUEST_ID_CHARS
-        && token
-            .chars()
-            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+        && ::base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(token)
+            .is_ok_and(|bytes| bytes.len() == EXTENDED_REQUEST_ID_BYTES)
 }
 
 /// The pair `answer` named its request by in its HEADERS, failing the test when it carried
@@ -218,8 +230,8 @@ async fn every_response_names_its_request_by_an_s3_request_id() {
         );
         assert!(
             is_extended_request_id(&extended),
-            "case {case:?}: expected an {EXTENDED_REQUEST_ID_CHARS}-character lowercase \
-             hexadecimal extended request id, got {extended:?}"
+            "case {case:?}: expected an {EXTENDED_REQUEST_ID_CHARS}-character base64 \
+             extended request id of {EXTENDED_REQUEST_ID_BYTES} bytes, got {extended:?}"
         );
         if *refused {
             // The error document mirrors the two headers, so the id a client reads out of
