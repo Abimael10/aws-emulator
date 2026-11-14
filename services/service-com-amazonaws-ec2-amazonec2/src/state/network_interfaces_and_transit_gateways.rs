@@ -661,15 +661,26 @@ pub(super) fn instance_network_interface_view(
     // association id — those belong to the Elastic IP address record `DescribeAddresses`
     // reports — so one association cannot read one way here and another through
     // `DescribeNetworkInterfaces`.
-    let association = |association: &NetworkInterfaceAssociation| InstanceNetworkInterfaceAssociation {
-        carrier_ip: association.carrier_ip.clone(),
-        customer_owned_ip: association.customer_owned_ip.clone(),
-        ip_owner_id: association.ip_owner_id.clone(),
-        public_dns_name: association.public_dns_name.clone(),
-        public_ip: association.public_ip.clone(),
-    };
+    let interface_association =
+        |association: &NetworkInterfaceAssociation| InstanceNetworkInterfaceAssociation {
+            carrier_ip: association.carrier_ip.clone(),
+            customer_owned_ip: association.customer_owned_ip.clone(),
+            ip_owner_id: association.ip_owner_id.clone(),
+            public_dns_name: association.public_dns_name.clone(),
+            public_ip: association.public_ip.clone(),
+        };
+    // The same association as the private ADDRESS it is bound to reports it: the addressing
+    // members alone. The public DNS name belongs to the interface — it is reported once, by
+    // the interface's own association, and by the instance as its `dnsName` — so a per-address
+    // association carries none, and a client walking the addresses reads a name against the
+    // interface rather than against every address of it.
+    let address_association =
+        |association: &NetworkInterfaceAssociation| InstanceNetworkInterfaceAssociation {
+            public_dns_name: None,
+            ..interface_association(association)
+        };
     InstanceNetworkInterface {
-        association: interface.association.as_ref().map(association),
+        association: interface.association.as_ref().map(interface_association),
         attachment: Some(InstanceNetworkInterfaceAttachment {
             attach_time: attachment.attach_time,
             attachment_id: attachment.attachment_id.clone(),
@@ -702,7 +713,7 @@ pub(super) fn instance_network_interface_view(
             addresses
                 .iter()
                 .map(|address| InstancePrivateIpAddress {
-                    association: address.association.as_ref().map(association),
+                    association: address.association.as_ref().map(address_association),
                     primary: address.primary,
                     private_dns_name: address.private_dns_name.clone(),
                     private_ip_address: address.private_ip_address.clone(),

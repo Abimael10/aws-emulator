@@ -548,11 +548,13 @@ fn invalid_block_device_mapping(message: impl Into<String>) -> RegisterImageErro
 /// against this account's snapshots and completed with the defaults `EbsBlockDevice`
 /// documents.
 ///
-/// Every entry is stored as the request gave it except for the two members the model gives a
-/// default for — the volume size of a device restored from a snapshot ("if you specify a
-/// snapshot, the default is the snapshot size") and whether that volume is deleted on
-/// instance termination, which an AMI's own mapping sets so a launch from it has one answer.
-/// A mapping this account cannot back is refused rather than stored:
+/// Every entry is stored as the request gave it except for the members the AMI itself
+/// answers: the volume size of a device restored from a snapshot ("if you specify a
+/// snapshot, the default is the snapshot size"), whether that volume is deleted on instance
+/// termination, which an AMI's own mapping sets so a launch from it has one answer, and the
+/// encryption state the device restores with, which is the snapshot's own
+/// ([`crate::state::restored_device_is_encrypted`]) rather than anything the request may
+/// name. A mapping this account cannot back is refused rather than stored:
 ///
 /// * a snapshot no snapshot of the account has, under the code this operation's own
 ///   validator answers ([`unresolvable_mapping_snapshot_id`]), refused before anything else
@@ -579,7 +581,7 @@ fn registered_mappings<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // The SNAPSHOT first: a mapping that names a snapshot this account does not hold is
         // refused before anything else about the request is read, so the caller learns about
         // the resource it named rather than about the mapping around it.
-        let snapshot_size = match mapping
+        let snapshot_facts = match mapping
             .ebs
             .as_ref()
             .and_then(|ebs| ebs.snapshot_id.as_deref())
@@ -591,7 +593,7 @@ fn registered_mappings<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                 let held_here = store
                     .snapshots
                     .get(snapshot_id)
-                    .map(|record| record.view.volume_size);
+                    .map(|record| (record.view.volume_size, record.view.encrypted));
                 let held_in_direct_api = match held_here {
                     Some(_) => None,
                     None => state::direct_api_snapshot(
@@ -599,10 +601,10 @@ fn registered_mappings<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                         snapshot_id,
                         ::std::time::SystemTime::now(),
                     )
-                    .map(|snapshot| snapshot.volume_size),
+                    .map(|snapshot| (snapshot.volume_size, snapshot.encrypted)),
                 };
                 match held_here.or(held_in_direct_api) {
-                    Some(volume_size) => volume_size,
+                    Some(facts) => Some(facts),
                     // No snapshot of this account under that id, so no AMI can restore a
                     // device from it.
                     None => return Err(unresolvable_mapping_snapshot_id(snapshot_id)),
@@ -610,6 +612,7 @@ fn registered_mappings<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             }
             None => None,
         };
+        let snapshot_size = snapshot_facts.and_then(|(volume_size, _)| volume_size);
         let device_name = mapping
             .device_name
             .as_deref()
@@ -660,6 +663,13 @@ fn registered_mappings<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             if ebs.volume_type.is_none() {
                 ebs.volume_type = Some(state::DEFAULT_VOLUME_TYPE.to_string());
             }
+            // "You can't set the encryption state of the volume using the block device
+            // mapping" — the state is the one the device RESTORES with, read off the snapshot
+            // resolved above, so the AMI reports the encryption state a launch from it will
+            // create the device in whether or not the snapshot is encrypted.
+            ebs.encrypted = Some(state::restored_device_is_encrypted(
+                snapshot_facts.and_then(|(_, encrypted)| encrypted),
+            ));
         }
         mappings.push(stored);
     }

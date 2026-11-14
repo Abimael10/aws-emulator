@@ -13,6 +13,14 @@
 // and inserts its two lines in sorted order, so the sorted neighbourhood of this suite is
 // the contended region of this file — this fix lost several serialized squash merges to
 // exactly that. The lines above are the file header, which no landing edits.
+// The OPTIONAL members a read of an AMI and a read of an instance carry: every Amazon EBS
+// device of an image reports the encryption state it restores with, an image's Free Tier
+// eligibility follows its own billing, and the association reported against one private IPv4
+// address carries no public DNS name. Declared beside `prefix_lists` for the reason the note
+// above gives: the sorted neighbourhood and the tail of this file are where every new ec2
+// suite inserts its lines.
+#[path = "all/read_optional_members.rs"]
+mod read_optional_members;
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
 // Every size of a compute optimized family whose sizes carry local NVMe devices: the EBS

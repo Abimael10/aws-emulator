@@ -381,8 +381,6 @@ const PUBLISHED_IMAGE_METADATA: &[ImageMetadataHierarchy] = &[
 /// ([`super::published_image_specs`]): each carries the `image_id` leaf of its own hierarchy
 /// as its `Image$PublicSsmParameterName`, which is what makes the id a read reports an AMI of
 /// this catalog.
-///
-/// A container-host image is no Free Tier image, unlike the Amazon Linux base images.
 pub fn published_image_metadata_specs() -> Vec<ImageSpec> {
     PUBLISHED_IMAGE_METADATA
         .iter()
@@ -393,7 +391,6 @@ pub fn published_image_metadata_specs() -> Vec<ImageSpec> {
                 .image
                 .requires_imdsv2
                 .then(|| IMDS_SUPPORT_V2.to_string()),
-            free_tier_eligible: false,
             public_ssm_parameter_name: Some(hierarchy.image_id_parameter()),
             ..published_amazon_image(
                 hierarchy.image.name,

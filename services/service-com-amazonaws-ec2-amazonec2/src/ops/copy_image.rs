@@ -566,9 +566,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the image being copied, so the copy carries the source's.
             product_codes: source.product_codes.clone().unwrap_or_default(),
             // "Indicates whether the image is eligible for Amazon Web Services Free Tier"
-            // (`Image$FreeTierEligible`): a fact of the image's platform and billing, the way
-            // the product codes above are.
-            free_tier_eligible: source.free_tier_eligible.unwrap_or(false),
+            // (`Image$FreeTierEligible`) is derived from those codes where the record is
+            // stored, so the copy reports the eligibility its own billing gives it — which,
+            // the codes being the source's, is the source's answer.
             // "Base64 representation of the non-volatile UEFI variable store"
             // (`ImageAttribute$UefiData`) is part of what the copy holds, so the variable
             // store the source was registered with goes with it.

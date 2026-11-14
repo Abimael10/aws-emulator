@@ -1290,8 +1290,10 @@ pub struct ImageSpec {
     /// Marketplace or DevPay codes a PAID image carries, each with its
     /// `ProductCodeValues` type. Empty for an image nobody sells.
     pub product_codes: Vec<ProductCode>,
-    /// "Indicates whether the image is eligible for Amazon Web Services Free Tier".
-    pub free_tier_eligible: bool,
+    // Whether the image "is eligible for Amazon Web Services Free Tier"
+    // (`Image$FreeTierEligible`) is no member of this spec: it is DERIVED from the image's
+    // own billing ([`image_is_free_tier_eligible`]) where the record is built, so no writer
+    // can store an image whose reported eligibility disagrees with what launching it costs.
     /// "The name of the public Systems Manager parameter that resolves to this AMI",
     /// for an image one resolves to.
     pub public_ssm_parameter_name: Option<String>,
@@ -1363,7 +1365,6 @@ impl Default for ImageSpec {
             creation_date: iso8601_utc(SystemTime::now()),
             deprecation_time: None,
             product_codes: Vec::new(),
-            free_tier_eligible: false,
             public_ssm_parameter_name: None,
             tags: Vec::new(),
             block_device_mappings: None,
@@ -1480,7 +1481,69 @@ pub fn product_code_list_bytes(codes: &[ProductCode]) -> usize {
     })
 }
 
+/// Whether an AMI billed through `product_codes` "is eligible for Amazon Web Services Free
+/// Tier" (`Image$FreeTierEligible`).
+///
+/// "If true, the AMI is eligible for Free Tier and can be used to launch instances under the
+/// Free Tier limits" — a fact of what LAUNCHING the image costs on top of the instance hours
+/// the Free Tier covers. An AMI billed through a Marketplace or DevPay product code
+/// (`Image$ProductCodes`, "any product codes associated with the AMI") charges for its
+/// software beside those hours, so it cannot be launched inside the Free Tier's limits; an
+/// image that carries no such code adds nothing to the instance's own bill and can, whoever
+/// published it.
+///
+/// The ONE reading of that question, so every image this store holds reports the eligibility
+/// its own billing gives it rather than a value a writer chose for it.
+pub fn image_is_free_tier_eligible(product_codes: &[ProductCode]) -> bool {
+    product_codes.is_empty()
+}
+
+/// Whether an Amazon EBS device restored from a snapshot whose own encryption state is
+/// `snapshot_encrypted` is itself encrypted.
+///
+/// "Volumes that are created from encrypted snapshots are also automatically encrypted"
+/// (`CreateSnapshot`), so the device follows the snapshot it restores; a device that restores
+/// no snapshot this account holds creates a fresh volume, which is unencrypted unless
+/// something asks for encryption ([`EbsBlockDevice$Encrypted`]'s documented default).
+///
+/// `None` is "this store knows of no such snapshot", not "encrypted": the two readers of this
+/// question — the register that resolves a mapping's snapshot and
+/// [`ComAmazonawsEc2Amazonec2State::report_restored_device_encryption`] — share this one
+/// reading so an AMI's mapping reports the same state whichever path stored it.
+pub fn restored_device_is_encrypted(snapshot_encrypted: Option<bool>) -> bool {
+    snapshot_encrypted.unwrap_or(false)
+}
+
 impl ComAmazonawsEc2Amazonec2State {
+    /// Report the encryption state of every Amazon EBS device `mappings` describes, taking it
+    /// from the snapshot that device restores from where whatever wrote the mapping named
+    /// none.
+    ///
+    /// "Indicates whether the encryption state of an EBS volume is changed while being
+    /// restored from a backing snapshot" (`EbsBlockDevice$Encrypted`): the state is a fact of
+    /// EVERY Amazon EBS device an AMI describes rather than something only an encrypted one
+    /// has, so a mapping this store holds always carries it — a client deciding whether a copy
+    /// of the image needs a KMS key can tell "unencrypted" from "not reported". The state
+    /// follows the snapshot the device restores ([`restored_device_is_encrypted`]).
+    ///
+    /// A mapping that already names its state keeps it: a copy that re-encrypted the
+    /// snapshots it wrote has already recorded what it did, and this only completes what no
+    /// writer answered.
+    pub fn report_restored_device_encryption(&self, mappings: &mut [BlockDeviceMapping]) {
+        for ebs in mappings
+            .iter_mut()
+            .filter_map(|mapping| mapping.ebs.as_mut())
+            .filter(|ebs| ebs.encrypted.is_none())
+        {
+            let snapshot_encrypted = ebs
+                .snapshot_id
+                .as_deref()
+                .and_then(|snapshot_id| self.snapshots.get(snapshot_id))
+                .and_then(|record| record.view.encrypted);
+            ebs.encrypted = Some(restored_device_is_encrypted(snapshot_encrypted));
+        }
+    }
+
     /// Whether another image fits inside the store's ceiling ([`MAX_IMAGES`]).
     ///
     /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
@@ -1508,7 +1571,7 @@ impl ComAmazonawsEc2Amazonec2State {
     /// definition of that charge ([`image_payload_bytes`]) rather than by the tags alone:
     /// a count ceiling ([`MAX_IMAGES`]) is no memory bound on its own, so every string
     /// whose LENGTH a request chose is charged against [`MAX_STORED_BYTES`] too.
-    pub fn insert_image(&mut self, spec: ImageSpec) -> String {
+    pub fn insert_image(&mut self, mut spec: ImageSpec) -> String {
         // Counted BEFORE `spec` is taken apart below, so the charge covers what the
         // caller supplied rather than what survived into the record.
         let payload_bytes = image_payload_bytes(&spec);
@@ -1523,39 +1586,47 @@ impl ComAmazonawsEc2Amazonec2State {
             .owner_alias
             .clone()
             .unwrap_or_else(|| spec.owner_id.clone());
+        // "Any block device mapping entries" (`Image$BlockDeviceMappings`): the ones the
+        // image was REGISTERED with when the spec carries them — each restoring its device
+        // from the snapshot the request named — and otherwise the root volume's, restored
+        // from the snapshot minted above, with none at all for an image whose root device is
+        // the instance store, which restores none.
+        let mut block_device_mappings = spec.block_device_mappings.take().unwrap_or_else(|| {
+            derived_root_snapshot_id
+                .map(|snapshot_id| BlockDeviceMapping {
+                    ebs: Some(EbsBlockDevice {
+                        delete_on_termination: Some(true),
+                        snapshot_id: Some(snapshot_id),
+                        volume_size: Some(spec.root_volume_size),
+                        volume_type: Some(spec.root_volume_type),
+                        // The snapshot was minted for this image by the line above and
+                        // nothing asked for it to be encrypted.
+                        encrypted: Some(false),
+                        iops: None,
+                        kms_key_id: None,
+                        throughput: None,
+                        outpost_arn: None,
+                        availability_zone: None,
+                        volume_initialization_rate: None,
+                        availability_zone_id: None,
+                        ebs_card_index: None,
+                    }),
+                    no_device: None,
+                    device_name: Some(spec.root_device_name.clone()),
+                    virtual_name: None,
+                })
+                .into_iter()
+                .collect()
+        });
+        // Every Amazon EBS device the AMI describes REPORTS the encryption state it restores
+        // with, whichever writer stored the mapping and whether or not that writer named one:
+        // the member is part of the mapping an image reports, not a flag only an encrypted
+        // device carries.
+        self.report_restored_device_encryption(&mut block_device_mappings);
         let image = Image {
             platform_details: Some(spec.platform_details),
             usage_operation: Some(spec.usage_operation),
-            // "Any block device mapping entries" (`Image$BlockDeviceMappings`): the ones the
-            // image was REGISTERED with when the spec carries them — each restoring its
-            // device from the snapshot the request named — and otherwise the root volume's,
-            // restored from the snapshot minted above, with none at all for an image whose
-            // root device is the instance store, which restores none.
-            block_device_mappings: Some(spec.block_device_mappings.unwrap_or_else(|| {
-                derived_root_snapshot_id
-                    .map(|snapshot_id| BlockDeviceMapping {
-                        ebs: Some(EbsBlockDevice {
-                            delete_on_termination: Some(true),
-                            snapshot_id: Some(snapshot_id),
-                            volume_size: Some(spec.root_volume_size),
-                            volume_type: Some(spec.root_volume_type),
-                            encrypted: Some(false),
-                            iops: None,
-                            kms_key_id: None,
-                            throughput: None,
-                            outpost_arn: None,
-                            availability_zone: None,
-                            volume_initialization_rate: None,
-                            availability_zone_id: None,
-                            ebs_card_index: None,
-                        }),
-                        no_device: None,
-                        device_name: Some(spec.root_device_name.clone()),
-                        virtual_name: None,
-                    })
-                    .into_iter()
-                    .collect()
-            })),
+            block_device_mappings: Some(block_device_mappings),
             description: Some(spec.description),
             // "Indicates whether enhanced networking with ENA is enabled"
             // (`Image$EnaSupport`): reported where the image has it enabled, and left out
@@ -1602,7 +1673,11 @@ impl ComAmazonawsEc2Amazonec2State {
             // a lineage over.
             source_image_id: spec.source_image_id,
             source_image_region: spec.source_image_region,
-            free_tier_eligible: Some(spec.free_tier_eligible),
+            // "Indicates whether the image is eligible for Amazon Web Services Free Tier"
+            // (`Image$FreeTierEligible`): derived from what launching this image costs
+            // ([`image_is_free_tier_eligible`]) rather than taken from the writer, so the
+            // answer is the image's own billing.
+            free_tier_eligible: Some(image_is_free_tier_eligible(&spec.product_codes)),
             public_ssm_parameter_name: spec.public_ssm_parameter_name,
             // No watermark is attached until something attaches one.
             image_watermarks: Some(Vec::new()),
@@ -1948,8 +2023,9 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 /// A public AMI Amazon publishes: owned by Amazon's publishing account
-/// ([`AMAZON_IMAGE_OWNER_ID`]) under the `amazon` alias, with public launch permissions,
-/// and eligible for the Free Tier as the Amazon Linux and Windows base images are.
+/// ([`AMAZON_IMAGE_OWNER_ID`]) under the `amazon` alias, with public launch permissions, and
+/// carrying no product code of its own — so it is eligible for the Free Tier
+/// ([`image_is_free_tier_eligible`]), as the Amazon Linux and Windows base images are.
 pub(super) fn published_amazon_image(name: &str, architecture: &str, creation_date: &str) -> ImageSpec {
     ImageSpec {
         name: name.to_string(),
@@ -1958,7 +2034,6 @@ pub(super) fn published_amazon_image(name: &str, architecture: &str, creation_da
         public: true,
         owner_id: AMAZON_IMAGE_OWNER_ID.to_string(),
         owner_alias: Some(IMAGE_OWNER_ALIAS_AMAZON.to_string()),
-        free_tier_eligible: true,
         ..ImageSpec::default()
     }
 }
@@ -2181,9 +2256,6 @@ pub fn pcs_sample_image_specs() -> Vec<ImageSpec> {
                 // Amazon Linux 2023 requires IMDSv2, as its own rows above do; Amazon
                 // Linux 2 declares no such requirement.
                 imds_support: (*os == "al2023").then(|| IMDS_SUPPORT_V2.to_string()),
-                // An HPC compute-node image is no Free Tier image, unlike the Amazon Linux
-                // and Windows base rows above.
-                free_tier_eligible: false,
                 public_ssm_parameter_name: Some(pcs_sample_ami_parameter_name(
                     slurm,
                     os,

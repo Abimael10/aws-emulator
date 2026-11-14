@@ -19,7 +19,7 @@ use ec2::ops::types::{
 };
 use ec2::state::{
     AMAZON_IMAGE_OWNER_ID, ComAmazonawsEc2Amazonec2State as Ec2State, IMAGE_STATE_DISABLED,
-    ImageSpec, published_image_specs,
+    ImageSpec, image_is_free_tier_eligible, published_image_specs,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -194,6 +194,12 @@ fn seeded_specs(account: &str) -> Vec<ImageSpec> {
             public: true,
             owner_id: MARKETPLACE_ACCOUNT.to_string(),
             owner_alias: Some("aws-marketplace".to_string()),
+            // The appliance is billed through the product code it is sold under, which is
+            // what makes it the one seeded image that is NOT Free-Tier launchable.
+            product_codes: vec![ProductCode {
+                product_code_id: Some("abc123prodcode".to_string()),
+                product_code_type: Some("marketplace".to_string()),
+            }],
             ..ImageSpec::default()
         },
         // The account's own image, which this account is not the owner of — every spec
@@ -272,12 +278,18 @@ static DEPRECATED_CATALOG_NAMES: std::sync::LazyLock<Vec<String>> =
             .collect()
     });
 
-/// The catalog images that ARE eligible for the Free Tier, read off the specs rather than
-/// written out, so the row that filters on it cannot drift as the catalog grows.
-fn free_tier_catalog_names() -> Vec<String> {
+/// Every image a `free-tier-eligible` filter must select, read through the crate's one
+/// reading of that question (`image_is_free_tier_eligible`) rather than written out, so the
+/// row cannot drift as the catalog grows: every image this account can SEE whose own billing
+/// adds nothing to the instance's, which is all of them but the Marketplace appliance.
+fn free_tier_names(account: &str) -> Vec<String> {
     published_image_specs()
         .into_iter()
-        .filter(|spec| spec.free_tier_eligible)
+        .chain(seeded_specs(account))
+        // Another account's private image is not visible to this one at all, so no filter
+        // selects it.
+        .filter(|spec| spec.public || spec.owner_id == account)
+        .filter(|spec| image_is_free_tier_eligible(&spec.product_codes))
         .map(|spec| spec.name)
         .collect()
 }
@@ -309,10 +321,9 @@ fn borrowed_with<'a>(catalog: &'a [String], extra: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Write the seeded images into the engine's store, the way a register operation would,
-/// and report the ids they were given. The members no [`ImageSpec`] carries — product
-/// codes, a state reason, an instance-type specification, a watermark, a kernel and RAM
-/// disk — are written onto the stored images here, so every documented filter has
-/// something to select on.
+/// and report the ids they were given. The members no [`ImageSpec`] carries — a state
+/// reason, an instance-type specification, a watermark, a kernel and RAM disk — are written
+/// onto the stored images here, so every documented filter has something to select on.
 fn seed(engine: &engine::InMemoryEngine) -> Seeded {
     let account = engine::emulator_account_id().to_string();
     let store = engine.state::<Ec2State>();
@@ -349,13 +360,6 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
                 ebs.encrypted = Some(true);
             }
         }
-    }
-    // The appliance carries the product code it is billed through.
-    if let Some(image) = guard.images.get_mut(&id_of("vendor-appliance-image")) {
-        image.product_codes = Some(vec![ProductCode {
-            product_code_id: Some("abc123prodcode".to_string()),
-            product_code_type: Some("marketplace".to_string()),
-        }]);
     }
     // The retired image records why it left `available`.
     if let Some(image) = guard.images.get_mut(&id_of("app-retired-image")) {
@@ -632,7 +636,7 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
     let seeded = seed(&engine);
     let account = engine::emulator_account_id().to_string();
     let catalog = catalog_names();
-    let free_tier_catalog = free_tier_catalog_names();
+    let free_tier = free_tier_names(&account);
     // The catalog images each attribute-bound row selects, read off the catalog itself.
     let arm64_catalog = catalog_names_where(|spec| spec.architecture == "arm64");
     let gp2_catalog = catalog_names_where(|spec| spec.root_volume_type == "gp2");
@@ -745,7 +749,13 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
         (
             "free-tier-eligible",
             vec!["true".into()],
-            borrowed(&free_tier_catalog),
+            borrowed(&free_tier),
+        ),
+        // The one image billed through a product code of its own.
+        (
+            "free-tier-eligible",
+            vec!["false".into()],
+            vec!["vendor-appliance-image"],
         ),
         ("hypervisor", vec!["ovm".into()], vec!["legacy-i386-image"]),
         // No account declares Allowed AMIs criteria, so no image fails them.
