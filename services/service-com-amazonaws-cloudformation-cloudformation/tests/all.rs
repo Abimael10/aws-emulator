@@ -339,6 +339,8 @@ mod organizations_access;
 mod out_of_band_resource_scan;
 #[path = "all/parameter_and_change_set_conflicts.rs"]
 mod parameter_and_change_set_conflicts;
+#[path = "all/parameter_constraints_precede_the_template.rs"]
+mod parameter_constraints_precede_the_template;
 #[path = "all/parameter_set_contract.rs"]
 mod parameter_set_contract;
 #[path = "all/processing_pipeline_stack_outputs.rs"]
