@@ -160,7 +160,10 @@ fn stated_from_request<O: Operation>(
         return None;
     }
     let offending = offending_entries(&violations);
-    let restated: Vec<Violation> = violations.iter().map(super::stated_violation).collect();
+    let restated: Vec<Violation> = super::in_stated_clause_order(&violations)
+        .into_iter()
+        .map(super::stated_violation)
+        .collect();
     let stated = aws_validation_refusal_over_elements_stating(
         &Refusal::Invalid(restated),
         // The expression a clause quotes is the one the model declares, anchors and all, as

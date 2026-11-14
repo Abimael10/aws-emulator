@@ -111,6 +111,8 @@ mod pagination_token_refusal;
 mod pattern_constraint_refusals;
 #[path = "all/polled_lifecycles.rs"]
 mod polled_lifecycles;
+#[path = "all/refusal_clause_order_and_subject_precedence.rs"]
+mod refusal_clause_order_and_subject_precedence;
 #[path = "all/refusal_classification_rules.rs"]
 mod refusal_classification_rules;
 #[path = "all/refusal_texts.rs"]
@@ -155,6 +157,8 @@ mod tag_limit_diagnostic;
 mod trust_conflict_message;
 #[path = "all/trust_failure_lifecycle.rs"]
 mod trust_failure_lifecycle;
+#[path = "all/trust_flow_over_provisioned_dns.rs"]
+mod trust_flow_over_provisioned_dns;
 #[path = "all/trust_outcomes.rs"]
 mod trust_outcomes;
 #[path = "all/trust_peer_resolution.rs"]

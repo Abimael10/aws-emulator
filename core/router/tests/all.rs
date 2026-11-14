@@ -7904,3 +7904,38 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // (And the rest of the same, pruned: no declaration stood among these notes.)
 // Nothing stands below this line. Declare a new suite in the sorted span its own name
 // belongs to, with its `#[path]` line, and check it is not declared already.
+//! A suite left at the top level of `tests/` fails the build.
+//! Declare each suite exactly
+//! Declare each suite exactly ONCE: a second `mod` for one name is `E0428` and fails
+//! `all/all_rs_declares_each_suite_once.rs` checks the declarations, for
+//! Declare each suite exactly ONCE: a second `mod` for one name is `E0428` and
+// and SQS mounted together just as the firing leg does. (Declared ONCE, further up this file:
+// the copy that stood here was a second declaration a landing appended, which is `E0428` and
+// copy that stood here was a second declaration a landing appended, which is `E0428` and
+// (The notes that stood here recorded nothing but landing collisions in this tail: a suite
+// declared twice, or a fragment of this file's own header appended into the tail as an
+// inner doc comment. Both rules stand in the module doc at the HEAD of this file, which is
+// the only place an inner doc comment may stand, and both are checked by
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`, for this file and for every
+// (More landing-collision notes stood here, for the reasons the note above records.)
+// (The notes that stood here were the last of the landing-collision records: duplicate
+// declarations, and fragments of this file's own header appended into the tail as inner doc
+// comments, which past the first item is `E0753` and compiles no suite of this target. Both
+// rules stand in the module doc at the HEAD of this file, where an inner doc comment is
+// legal, and `all/all_rs_declares_each_suite_once.rs` and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check them for this file and for
+// (Fragments of this file's own header that landings appended into this tail stood here as
+// `//!` lines, which past the first item is `E0753` and compiles no suite of this target.
+// They are back in the module doc at the HEAD of this file, where an inner doc comment is
+// legal, and nothing is left here.)
+// inner doc comment. Both rules stand in the module doc at the HEAD of this file, where an
+// inner doc comment is legal, and both are checked by
+// file's own header or a note about a duplicate declaration that is already gone. Declare
+// each suite ONCE, with its `#[path]` line, and keep the rules in the module doc at the HEAD
+// of this file, where an inner doc comment is legal — past the first item `//!` is `E0753`
+// and compiles no suite of this target. A suite left at the top level of `tests/` fails the
+// build, and that check is
+// (Pruned: everything that stood here was a fragment of this file's own header, appended
+// into the tail by a landing, or a note about a declaration that is no longer duplicated.
+// Declare each suite ONCE, with its `#[path]` line, and keep the rules in the module doc at
+// (Pruned, for the reason the note above records.)

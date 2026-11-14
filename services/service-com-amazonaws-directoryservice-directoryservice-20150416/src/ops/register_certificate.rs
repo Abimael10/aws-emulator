@@ -16,11 +16,12 @@
 //! ([`crate::state::TRANSITION_SPAN`]) and materialised by `advance_clock`.
 //! `DescribeCertificate` is what reports the registration back.
 //!
-//! A certificate is registered FOR a directory, so a request naming no stored directory
-//! is refused with `DirectoryDoesNotExistException`, and one naming a directory still
-//! being built by the transition its create owes with `DirectoryUnavailableException` —
-//! exactly as `AddIpRoutes` and `CreateComputer` refuse a directory that is not in
-//! service. A directory registers a given certificate once
+//! A certificate is registered FOR a directory, so the directory the request names is
+//! resolved BEFORE the certificate data it carries is decoded: a request naming no stored
+//! directory is refused with `DirectoryDoesNotExistException` whatever its body holds, and
+//! one naming a directory still being built by the transition its create owes with
+//! `DirectoryUnavailableException` — exactly as `AddIpRoutes` and `CreateComputer` refuse a
+//! directory that is not in service. A directory registers a given certificate once
 //! (`CertificateAlreadyExistsException`, compared on the decoded certificate rather
 //! than on the text it arrived as) and at most
 //! [`crate::state::MAX_CERTIFICATES_PER_DIRECTORY`] of them
@@ -161,12 +162,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
-        // The certificate is decoded BEFORE the store is reached, so nothing
-        // caller-sized is parsed under the lock and a PEM this emulator cannot read is
-        // refused the same way whether or not the id names a stored directory — and
-        // before the directory's stage is looked at, so data that is not a certificate is
-        // reported as such whatever state the directory is in. The modelled
-        // `InvalidCertificateException` is exactly this failure, stated as Directory
+        let now = ::std::time::SystemTime::now();
+
+        // The registration hangs off the directory the request NAMES, so that directory is
+        // resolved against this service's state FIRST: an id naming none is refused with the
+        // modelled `DirectoryDoesNotExistException` before anything the request CARRIES is
+        // read, so a caller registering against a directory it has not created yet is told
+        // which of the two is missing rather than that its certificate is bad. Only the
+        // request's own members are judged in front of this (the modelled `DirectoryId` form
+        // and the `CertificateData` bound, both applied at the boundary): the certificate's
+        // CONTENT is this service's judgement about data it was handed for a directory, and
+        // there is none to make for a directory that does not exist.
+        {
+            let mut store = state.lock();
+            store.advance_clock(now);
+            if !store.directories.contains_key(&input.directory_id) {
+                return Err(
+                    RegisterCertificateErrorModeled::DirectoryDoesNotExistException(
+                        crate::state::refusal(crate::state::no_such_directory(
+                            &input.directory_id,
+                        )),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The certificate is decoded with the store UNLOCKED, so nothing caller-sized is
+        // parsed under the lock — and before the directory's STAGE is looked at, so data that
+        // is not a certificate is reported as such whatever state the directory is in. The
+        // modelled `InvalidCertificateException` is exactly this failure, stated as Directory
         // Service words it: the registration it could not perform, for the directory the
         // request named.
         let parsed = crate::state::parse_certificate(&input.certificate_data).ok_or_else(|| {
@@ -181,16 +206,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .r#type
             .unwrap_or_else(|| crate::state::DEFAULT_CERTIFICATE_TYPE.to_string());
 
-        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.advance_clock(now);
 
         // Every refusal is decided on an IMMUTABLE borrow, before the store mints
         // anything: an id and a sequence number are consumed only by a call that goes on
-        // to store a registration, so a refused call leaves no gap in the id space.
+        // to store a registration, so a refused call leaves no gap in the id space. The
+        // directory is read again here because the store was unlocked for the decode above,
+        // and an id whose directory left in between is the same refusal as one that never
+        // named a stored directory.
         let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
-            // The registration hangs off the directory, so an id naming no stored
-            // directory is refused and stores nothing.
             RegisterCertificateErrorModeled::DirectoryDoesNotExistException(
                 crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
             )

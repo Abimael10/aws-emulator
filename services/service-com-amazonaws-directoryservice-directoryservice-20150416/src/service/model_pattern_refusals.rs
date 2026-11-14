@@ -46,8 +46,8 @@
 //!
 //! A request that satisfies every such expression is handed on untouched, so the framework
 //! still words every other refusal, and the clauses of a request that breaks BOTH classes
-//! are counted together in the one envelope: the walk's own violations first, in its order,
-//! then the ones it skipped.
+//! are counted together in the one envelope, stated in this service's own clause order
+//! ([`super::stated_clause_order`]) whichever of the two found them.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -304,11 +304,16 @@ fn stated_from_request<O: Operation>(
     if unseen.is_empty() {
         return None;
     }
-    // The clauses of both classes, counted in ONE envelope: the walk's own violations in
-    // the order it found them, then the ones it skipped.
+    // The clauses of both classes, counted in ONE envelope and stated in the order this
+    // service states them ([`super::stated_clause_order`]): a request that breaks an
+    // expression the walk applies and one it skips is refused with one message whose clause
+    // order does not say which layer found which.
     let mut violations = validate(&input, O::INPUT_SCHEMA);
     violations.extend(unseen);
-    let restated: Vec<Violation> = violations.iter().map(super::stated_violation).collect();
+    let restated: Vec<Violation> = super::in_stated_clause_order(&violations)
+        .into_iter()
+        .map(super::stated_violation)
+        .collect();
     let message = envelope(&restated)?;
     Some((
         violations,

@@ -48,9 +48,10 @@
 //! 501 and a refusal raised while serving it. Everything else about those paths — status,
 //! `__type`, `Message`, the whole success path — stays with the framework.
 //!
-//! A second seam is taken for the one thing this service words differently from the
+//! A second seam is taken for the two things this service words differently from the
 //! framework when it refuses a request at its boundary: see the `override_refusal` body
-//! below and [`stated_enum_values`] (the order an enum's admissible values are listed in). A
+//! below, [`stated_enum_values`] (the order an enum's admissible values are listed in) and
+//! [`stated_clause_order`] (the order the clauses of one refusal are stated in). A
 //! refusal of a constraint a LIST's ELEMENTS break is stated at the list member instead of at
 //! the element, which needs the request as well as the violations and so is answered in that
 //! same operation wrapper ([`list_element_refusals`]) — and so is the one CONSTRAINT the
@@ -65,6 +66,9 @@ pub mod authorization;
 pub mod list_element_refusals;
 pub mod model_pattern_refusals;
 pub mod request_id_header;
+pub mod stated_clause_order;
+
+use stated_clause_order::{in_stated_clause_order, reorders};
 
 use request_id_header::RequestIdHeaderOperation;
 use smithy_server_runtime::{
@@ -101,22 +105,27 @@ fn stated_enum_values(allowed: &[String]) -> Vec<String> {
 /// `refusal` stated the way this service states a boundary constraint refusal, or `None`
 /// to keep the framework's own wording.
 ///
-/// The ONLY thing restated is the one rendering this service's own refusals differ from the
-/// framework's in — the order of an enum's value list ([`stated_enum_values`]); the envelope,
-/// the clause, the member path, the echoed value and every other requirement are the
-/// framework's, built by handing it the violations back
-/// ([`::aws_smithy_schema_server::envelope`]), so a reworded refusal cannot drift from one the
-/// framework words. A refusal about anything else is left alone entirely.
+/// The only things restated are the two renderings this service's own refusals differ from the
+/// framework's in — the order of an enum's value list ([`stated_enum_values`]) and the order
+/// the clauses of one refusal are stated in ([`stated_clause_order`]); the envelope, the
+/// clause, the member path, the echoed value and every other requirement are the framework's,
+/// built by handing it the violations back ([`::aws_smithy_schema_server::envelope`]), so a
+/// reworded refusal cannot drift from one the framework words. A refusal with neither
+/// difference to state is left alone entirely.
 fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
-    if !violations.iter().any(|violation| {
-        matches!(violation.kind, ViolationKind::EnumValue(_))
-    }) {
+    let lists_an_enum = violations
+        .iter()
+        .any(|violation| matches!(violation.kind, ViolationKind::EnumValue(_)));
+    if !lists_an_enum && !reorders(violations) {
         return None;
     }
-    let restated: Vec<Violation> = violations.iter().map(stated_violation).collect();
+    let restated: Vec<Violation> = in_stated_clause_order(violations)
+        .into_iter()
+        .map(stated_violation)
+        .collect();
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_string(),
         message: ::aws_smithy_schema_server::envelope(&restated)?,
@@ -221,12 +230,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this service
         // reword it.
         //
-        // ONE rendering is reworded, inside the framework's own envelope, clause, member
+        // TWO renderings are reworded, inside the framework's own envelope, clause, member
         // path and echoed value: a value outside an enumerated type's value set has the
         // admissible values LISTED the way this service lists them rather than the way the
-        // model declares them (see `stated_enum_values`). The code travels with it, unchanged
-        // from the one the framework picks for this refusal, so a client still branches on
-        // what it branched on before.
+        // model declares them (see `stated_enum_values`), and a refusal about several members
+        // states its clauses in the order this service states them in (see
+        // `stated_clause_order`). The code travels with it, unchanged from the one the
+        // framework picks for this refusal, so a client still branches on what it branched on
+        // before.
         //
         // Everything else — an absent member, a length, a numeric bound, a `@pattern`
         // expression, and an authentication refusal, which is not an input-constraint failure
