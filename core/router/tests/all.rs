@@ -3353,6 +3353,7 @@ mod apigateway_wafv2_waf_log_destination_gate;
 // were landing at once: it belongs at the head of this file or nowhere, so it is a line
 // comment — `all/all_rs_declares_each_suite_once.rs` is what checks this file and every
 // service crate's `tests/all.rs`.)
+// (And one more of its lines landed here the same way; the rule stands in the header.)
 // (Another landing appended five more lines of this file's own header here, typed with
 // `//!`: an inner doc comment is legal only before the first item, so in this tail it is
 // `E0753` and compiles nothing. The header at the top of this file states the rule those
@@ -3414,6 +3415,7 @@ mod all_rs_inner_doc_comments_precede_the_first_item;
 // reason the lines above record.)
 // leaving a note here. (Mid-file, so a plain comment: an inner doc comment is only
 // accepted before the first item of a module.)
+// (The last line of that fragment, a plain comment here for the same reason.)
 // (And one last line of that header, for the reason the notes above record.)
 // (One more fragment of that same header landed here; the rule it states stands in the
 // reason the appended fragments below record.)
@@ -3620,6 +3622,10 @@ mod chime_deleted_meeting_tagging;
 // entry above records.) this file and for every service crate's `tests/all.rs`.
 // appear before the first item of the crate root.)
 // doc comment may only appear before the first item of the crate root.)
+// ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and a
+// note written with `//!` anywhere but this header is `E0753` — either fails every
+// suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the
+// declarations, for this file and for every service crate's `tests/all.rs`.
 // leaving a note here. (Ordinary comments: an inner doc comment `//!` is legal only
 // before the first item of a file, so this fragment of the header cannot keep that form
 // where a merge of two appended tails landed it.)
@@ -3675,10 +3681,6 @@ mod cloudformation_provisions_appsync_resources;
 // leaving a note here. (An ordinary comment: an inner doc comment may only appear before
 // an item, so a `//!` line in this appended tail is `E0753` and compiles no suite.)
 // same reason as the block above: `//!` is only legal before the first item.)
-// ONCE: this is one crate root, so a second `mod` for the same name is `E0428` and a
-// note written with `//!` anywhere but this header is `E0753` — either fails every
-// suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the
-// declarations, for this file and for every service crate's `tests/all.rs`.
 // leaving a note here. (Ordinary comments: the guidance stands as `//!` in this file's
 // header, the one place an inner doc comment is legal.)
 // this file and for every service crate's `tests/all.rs`. (Ordinary comments, for the
@@ -3955,6 +3957,11 @@ mod cloudformation_provisions_redshift_snapshot_copy_grants;
 // repeats stands in the module doc at the HEAD of this file — declare each suite exactly
 // ONCE, since this is one crate root and a second `mod` for the same name is `E0428`, which
 // the neighbouring notes record: `//!` is legal only before the first item of a crate root.)
+// (One more line of that same header fragment, appended here as an INNER doc comment: a
+// `//!` line past the first item of this crate root is `E0753`, so it stands as an ordinary
+// comment. The rule it repeats is in the module doc at the HEAD of this file.)
+// (Another line of that same header fragment, appended as an INNER doc comment and left
+// here as an ordinary comment for the reason the lines above record.)
 // suite left at the top level of `tests/` fails the build. (One more line of that same
 // header fragment, an ordinary comment here: an inner doc comment is legal only before the
 // first item of a crate root, so a `//!` line in this appended tail is `E0753` and compiles

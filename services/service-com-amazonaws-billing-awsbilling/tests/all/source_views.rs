@@ -77,7 +77,7 @@ fn source_view_rows() -> Vec<SourceViewRow> {
 
 /// The `sourceViews` an answer carries. A protocol that omits an empty list and
 /// one that writes `[]` mean the same thing, so both read back as no entries.
-fn source_views(body: &Value) -> Vec<String> {
+pub(crate) fn source_views(body: &Value) -> Vec<String> {
     body.get("sourceViews")
         .and_then(Value::as_array)
         .map(|entries| {
@@ -336,27 +336,31 @@ async fn a_request_the_service_cannot_honour_is_refused_with_a_validation_error(
     )
     .await;
 
-    // Each row breaks one rule: a `nextToken` this read never issued (it
-    // decodes to nothing this read writes), or a `maxResults` outside the
-    // modeled range 1..100.
+    // Each row breaks one rule: a `nextToken` this read never issued (one this
+    // store cannot read back at all, one of this read whose payload names no
+    // view, one naming a view but no reported entry, and one of this read a
+    // caller assembled), or a `maxResults` outside the modeled range 1..100.
     let cases: Vec<(&str, Value)> = vec![
         (
             "a nextToken that is not hex",
             json!({ "arn": arn, "nextToken": "notatoken" }),
         ),
         (
-            "a nextToken that decodes to text, not a position",
+            "a nextToken that decodes to text naming no view",
             json!({ "arn": arn, "nextToken": hex::encode("abc") }),
         ),
         (
-            // The read this token names is this one, but its payload is text
-            // rather than the position this read's page boundary is.
-            "a nextToken of this read whose payload is not a position",
+            // The read this token names is this one, but its payload names no
+            // billing view, which every payload this read mints begins with.
+            "a nextToken of this read whose payload names no view",
             json!({ "arn": arn, "nextToken": token_for_this_read(&engine, "abc") }),
         ),
         (
-            "a nextToken that decodes to a negative position",
-            json!({ "arn": arn, "nextToken": token_for_this_read(&engine, "-1") }),
+            "a nextToken of this read naming a view but no reported entry",
+            json!({
+                "arn": arn,
+                "nextToken": token_for_this_read(&engine, &format!("{arn}#")),
+            }),
         ),
         (
             // A value with the SHAPE of a minted token of this read, whose
@@ -367,7 +371,7 @@ async fn a_request_the_service_cannot_honour_is_refused_with_a_validation_error(
                 "arn": arn,
                 "nextToken": crate::page_token_codec::token_with_a_made_up_authenticator(
                     "ListSourceViewsForBillingView",
-                    "1",
+                    &format!("{arn}#{}", source_arn("src-a")),
                 ),
             }),
         ),
@@ -390,21 +394,30 @@ async fn a_request_the_service_cannot_honour_is_refused_with_a_validation_error(
         );
     }
 
-    // A token past the end of the list is one this service issued for a page
-    // whose entries have since gone: it is the last page, not a bad request.
+    // A token this service issued whose reported entries the view no longer
+    // holds names no entry of the list as it stands, so every entry still
+    // associated is one the walk has not reported: the page carries them rather
+    // than skipping them.
     let (status, listed) = call(
         &router,
         "ListSourceViewsForBillingView",
-        &json!({ "arn": arn, "nextToken": token_for_this_read(&engine, "9") }),
+        &json!({
+            "arn": arn,
+            "nextToken": token_for_this_read(
+                &engine,
+                &format!("{arn}#{}", source_arn("src-gone")),
+            ),
+        }),
     )
     .await;
     assert_eq!(
         status, 200,
-        "case \"a token past the end\": expected 200, got {status} {listed:?}"
+        "case \"a token whose entries are gone\": expected 200, got {status} {listed:?}"
     );
-    assert!(
-        source_views(&listed).is_empty(),
-        "case \"a token past the end\": expected no entries, got {listed:?}"
+    assert_eq!(
+        source_views(&listed),
+        vec![source_arn("src-a"), source_arn("src-b")],
+        "case \"a token whose entries are gone\": expected every entry still associated, got {listed:?}"
     );
 }
 

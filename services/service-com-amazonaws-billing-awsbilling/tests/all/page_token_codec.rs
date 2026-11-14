@@ -7,12 +7,12 @@
 //! `state::encode_page_token` / `state::decode_page_token`: what this suite
 //! pins is that the reads go through that single pair, so one minting rule and
 //! one acceptance rule decide every `nextToken` this service issues and takes
-//! back. Each read adds only its own payload on top — a position in a list for
-//! `ListSourceViewsForBillingView`, the ARN a page ended at for
-//! `ListBillingViews` — which travels beside the NAME of the read that minted
-//! the token, under an authenticator the store computes with a secret of its
-//! own, so a token is taken back only by the read that issued it (see
-//! `token_scope.rs`).
+//! back. Each read adds only its own payload on top — the walked view and the
+//! entries that walk has reported for `ListSourceViewsForBillingView`, the ARN
+//! a page ended at for `ListBillingViews` — which travels beside the NAME of
+//! the read that minted the token, under an authenticator the store computes
+//! with a secret of its own, so a token is taken back only by the read that
+//! issued it (see `token_scope.rs`).
 //!
 //! The rows differ along what the codec generalises over: the SPELLING of the
 //! token bytes a client sends (the token as the read issued it, the same bytes
@@ -258,8 +258,9 @@ async fn walks(
             operation: "ListSourceViewsForBillingView",
             issued: issued_token(router, "ListSourceViewsForBillingView", &sources_base).await,
             base: sources_base,
-            // The positional payload a page of one entry ends at.
-            payload: "1".to_string(),
+            // The payload a page of one entry ends at: the view being walked,
+            // then the one entry that page reported.
+            payload: format!("{view_arn}#{}", sources[0]),
             expected_after: sources[1..].to_vec(),
         },
         Walk {

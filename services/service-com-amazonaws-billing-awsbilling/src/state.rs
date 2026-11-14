@@ -1653,8 +1653,9 @@ const PAGE_TOKEN_SCOPE_SEPARATOR: char = '\u{0}';
 /// The opaque `nextToken` for a page of `minted_by` that ended at `last`, where
 /// the page boundary is a VALUE the store is keyed by (`ListBillingViews` walks
 /// `billing_views`, a map keyed and ordered by ARN). A read whose page boundary
-/// is a position in a list carries its own PAYLOAD through this same pair,
-/// rather than a second codec — see `ops::list_source_views_for_billing_view`.
+/// takes more than one value — the sequence it walks beside the entries already
+/// reported — carries its own PAYLOAD through this same pair, rather than a
+/// second codec; see `ops::list_source_views_for_billing_view`.
 ///
 /// `minted_by` is the name of the read that issued the token, and it travels
 /// IN the token because a payload alone does not say which walk it is a

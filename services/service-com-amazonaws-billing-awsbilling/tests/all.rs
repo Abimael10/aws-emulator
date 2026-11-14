@@ -63,6 +63,8 @@ mod source_account_id;
 mod source_view_disassociation;
 #[path = "all/source_view_existence.rs"]
 mod source_view_existence;
+#[path = "all/source_view_page_cursor.rs"]
+mod source_view_page_cursor;
 #[path = "all/source_views.rs"]
 mod source_views;
 #[path = "all/source_views_tags_and_policy.rs"]

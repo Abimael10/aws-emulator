@@ -4,7 +4,12 @@
 //! Reports the source-view ARNs persisted on the billing view the request names,
 //! in the order that view stores them, paginated with `maxResults` and an opaque
 //! `nextToken` that resumes at the entry after the last one the previous page
-//! returned. A request that names no `maxResults` gets the largest page the
+//! returned — identified by the VALUES the walk has reported and bound to the
+//! view it was minted for, so an association written or removed between two
+//! pages cannot make the walk skip or repeat an entry, and a token minted while
+//! walking another view is refused with the modeled `ValidationException` (400)
+//! rather than taken as a cut point in this view's list.
+//! A request that names no `maxResults` gets the largest page the
 //! model admits, not an unbounded one. The operation is `@readonly`: it only reads
 //! [`crate::state::BillingView::source_views`], so a caller can poll it without
 //! changing what the next caller sees.
@@ -96,6 +101,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::collections::HashMap;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,46 +166,97 @@ const MAX_MAX_RESULTS: usize = 100;
 /// a page rather than the page size a caller sees.
 const DEFAULT_MAX_RESULTS: usize = MAX_MAX_RESULTS;
 
-/// The `nextToken` for a page that ended after `returned` entries of the view's
-/// source-view list.
-///
-/// The token is POSITIONAL rather than the last ARN returned, because
-/// `BillingViewSourceViewsList` is a list in which nothing collapses a repeated
-/// ARN, so an ARN does not identify a page boundary. Only that payload is this
-/// operation's own: the transcoding is the crate's one page-token codec,
-/// [`crate::state::encode_page_token`], which keeps the token inside the modeled
-/// `PageToken` pattern (`^[-a-zA-Z0-9+=/_]+$`) and length (1..4095) and is
-/// shared with this service's other paginated reads, so the minting rule lives
-/// in one place.
-/// It is encoded, not unforgeable: a caller that hand-builds one — naming this
-/// read and a position — resumes at that position of the view it already named,
-/// which is bounded by the slice below and reaches nothing the same caller could
-/// not list page by page.
-fn encode_page_token(
-    key: &crate::state::PageTokenKey,
-    read_by: &str,
-    returned: usize,
-) -> String {
-    crate::state::encode_page_token(key, read_by, &returned.to_string())
+/// Refuse a request member as invalid, in the modeled `ValidationException`
+/// shape (HTTP 400) this operation declares.
+fn invalid_field(member: &str, why: &str) -> ListSourceViewsForBillingViewError {
+    ListSourceViewsForBillingViewErrorModeled::ValidationException(ValidationException {
+        message: format!("{member}: {why}"),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: why.to_string(),
+        }]),
+    })
+    .into()
 }
 
-/// The number of entries a `nextToken` resumes after, or a `ValidationException`
-/// when the token is not one THIS read issued: one this service cannot read
-/// back, one it minted for another of its paginated reads — whose payload is a
-/// cut point of another sequence, not a position in this view's list — and one
-/// whose payload is not a position at all. The transcoding and the refusal's
-/// wording are both the ones in `crate::state`, shared with this service's other
-/// paginated reads so a client sees the same acceptance rule and the same refusal
-/// for an unusable token whichever read answered it; only the decoded payload — a
-/// position in the view's list — is parsed here.
+/// The separator between the fields a `nextToken` carries. The modeled
+/// `BillingViewArn` pattern
+/// (`^arn:aws[a-z-]*:(billing)::[0-9]{12}:billingview/[a-zA-Z0-9/:_\+=\.\-@]{0,75}[a-zA-Z0-9]$`)
+/// admits no `#`, so every ARN the token carries reads back whole.
+const PAGE_TOKEN_SEPARATOR: char = '#';
+
+/// The `nextToken` for a page of the view `arn` after which the walk has
+/// reported `reported` — the source-view entries, in the order the view stores
+/// them, that this walk has already handed back and the view still holds.
+///
+/// Both fields travel in the payload, because both decide what the next page
+/// carries: the ARN names the SEQUENCE being walked, so a token minted while
+/// walking one view is not a cut point in another's list, and the reported
+/// entries are the cursor — identified by VALUE, never by a count or a position,
+/// which an association written or removed between two pages would move. The
+/// walk order is the order a view stores its associations in, which no entry's
+/// own value determines, so a single boundary value could not be placed again
+/// once that entry was disassociated: the whole reported prefix is what survives
+/// such a removal.
+///
+/// Bounded by the view's own list, because an entry the view no longer holds is
+/// dropped from the token rather than carried: at most
+/// [`crate::state::MAX_SOURCE_VIEWS_PER_VIEW`] ARNs of at most 118 characters
+/// each, which the codec's expansion keeps well inside the modeled `PageToken`
+/// length (1..4095).
+///
+/// Only that payload is this operation's own: the transcoding is the crate's one
+/// page-token codec, [`crate::state::encode_page_token`], which authenticates
+/// the cursor under the store's key, binds it to the read that minted it and
+/// keeps the token inside the modeled `PageToken` pattern
+/// (`^[-a-zA-Z0-9+=/_]+$`), so the minting rule lives in one place.
+fn encode_page_token(
+    key: &crate::state::PageTokenKey,
+    minted_by: &str,
+    arn: &str,
+    reported: &[&str],
+) -> String {
+    let mut payload = String::from(arn);
+    for entry in reported {
+        payload.push(PAGE_TOKEN_SEPARATOR);
+        payload.push_str(entry);
+    }
+    crate::state::encode_page_token(key, minted_by, &payload)
+}
+
+/// The entries a `nextToken` says the walk has already reported, or a
+/// `ValidationException` when the token is not one this service issued for this
+/// very walk: one it cannot read back under its own key, one it minted for
+/// another of its paginated reads, and one minted while walking another billing
+/// view, which is a cut point in that view's list and not in this one's.
+///
+/// The transcoding and the unparseable-token wording are the ones in
+/// `crate::state`, shared with this service's other paginated reads so a client
+/// sees the same acceptance rule and the same refusal whichever read answered
+/// it; only the decoded payload is parsed here.
 fn decode_page_token(
     key: &crate::state::PageTokenKey,
     read_by: &str,
     token: &str,
-) -> Result<usize, ListSourceViewsForBillingViewError> {
-    crate::state::decode_page_token(key, read_by, token)
-        .and_then(|text| text.parse::<usize>().ok())
-        .ok_or_else(|| {
+    arn: &str,
+) -> Result<Vec<String>, ListSourceViewsForBillingViewError> {
+    let decoded = crate::state::decode_page_token(key, read_by, token).and_then(|text| {
+        let (stored_arn, rest) = text.split_once(PAGE_TOKEN_SEPARATOR)?;
+        if rest.is_empty() {
+            // Every token this read mints carries at least the entry its page
+            // ended on, so a payload naming none is not one it minted.
+            return None;
+        }
+        Some((
+            stored_arn.to_string(),
+            rest.split(PAGE_TOKEN_SEPARATOR)
+                .map(str::to_string)
+                .collect::<Vec<String>>(),
+        ))
+    });
+    let Some((stored_arn, reported)) = decoded else {
+        return Err(
             ListSourceViewsForBillingViewErrorModeled::ValidationException(ValidationException {
                 message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
                 reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
@@ -207,8 +265,50 @@ fn decode_page_token(
                     message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
                 }]),
             })
-            .into()
-        })
+            .into(),
+        );
+    };
+    if stored_arn != arn {
+        return Err(invalid_field(
+            "nextToken",
+            "the pagination token was issued for another billing view",
+        ));
+    }
+    Ok(reported)
+}
+
+/// The entries of `stored` this walk has yet to report, beside the ones the
+/// token named that the view still holds.
+///
+/// The second is what the next token carries forward, so an entry the view no
+/// longer holds is forgotten instead of growing the token: it cannot be reported
+/// again, because it is not in the list any more.
+///
+/// Each ARN the token names accounts for exactly ONE stored occurrence, so a
+/// view holding the same source ARN twice reports both copies, once each.
+fn split_reported<'views>(
+    stored: &'views [String],
+    reported: &[String],
+) -> (Vec<&'views str>, Vec<&'views str>) {
+    // A multiset of the ARNs the token names: how many stored occurrences of
+    // each the walk has already reported. Nothing reads it in order, so it is a
+    // `HashMap`.
+    let mut outstanding: HashMap<&str, usize> = HashMap::new();
+    for entry in reported {
+        *outstanding.entry(entry.as_str()).or_default() += 1;
+    }
+    let mut already: Vec<&str> = Vec::new();
+    let mut pending: Vec<&str> = Vec::new();
+    for entry in stored {
+        match outstanding.get_mut(entry.as_str()) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                already.push(entry.as_str());
+            }
+            _ => pending.push(entry.as_str()),
+        }
+    }
+    (already, pending)
 }
 
 impl<Eng> ListSourceViewsForBillingView<Eng> {
@@ -280,15 +380,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The page starts where the previous one stopped. An offset past the end
-        // of the list (the entries behind it were disassociated since the token
-        // was issued) leaves nothing to return, which is the last page.
+        // The page resumes strictly AFTER the entries the previous pages
+        // reported, keyed by their VALUES rather than by a position in the list,
+        // so a source view associated or disassociated between two pages cannot
+        // make the walk skip or repeat another one — the rule this service's
+        // other paginated reads follow. A token minted while walking another
+        // view is a cut point in that view's list, so it is refused rather than
+        // applied to this one.
         let page_key = state.page_token_key();
-        let resume_after = match input.next_token.as_deref() {
-            Some(token) => decode_page_token(&page_key, Self::NAME, token)?,
-            None => 0,
+        let reported = match input.next_token.as_deref() {
+            Some(token) => decode_page_token(&page_key, Self::NAME, token, &input.arn)?,
+            None => Vec::new(),
         };
-        let remaining = view.source_views.get(resume_after..).unwrap_or_default();
+        let (already_reported, remaining) = split_reported(&view.source_views, &reported);
 
         // `maxResults` is the page size; a request that names none gets the
         // largest page this read serves, so the answer is always a page and the
@@ -299,19 +403,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
         let (page, next_token) = if remaining.len() > limit {
+            let page = &remaining[..limit];
+            // The next token carries everything the walk has reported and the
+            // view still holds: the entries the previous pages named plus this
+            // page's own.
+            let mut carried = already_reported;
+            carried.extend_from_slice(page);
             (
-                &remaining[..limit],
-                Some(encode_page_token(&page_key, Self::NAME, resume_after + limit)),
+                page,
+                Some(encode_page_token(
+                    &page_key,
+                    Self::NAME,
+                    &input.arn,
+                    &carried,
+                )),
             )
         } else {
-            (remaining, None)
+            (&remaining[..], None)
         };
 
         Ok(ListSourceViewsForBillingViewOutput {
             // Derived on every read from the one stored copy of the view, so a
             // list cannot disagree with what `GetBillingView` reports as
             // `sourceViewCount`.
-            source_views: page.to_vec(),
+            source_views: page.iter().map(|arn| (*arn).to_string()).collect(),
             next_token,
         })
     }
