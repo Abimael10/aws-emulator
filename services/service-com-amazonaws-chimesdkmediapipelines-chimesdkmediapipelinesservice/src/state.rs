@@ -392,6 +392,27 @@ pub const VOICE_ANALYTICS_NOT_ENABLED_MESSAGE: &str = "AWS account is not enable
 /// so a caller's identifier never appears in a 404 body.
 pub const NOT_FOUND_MESSAGE: &str = "Unable to find the requested identifier";
 
+/// The `message` a create is refused with when the NAME it asks for is already held by a
+/// live resource of the same kind; `resource_kind` is how this service names that kind in
+/// its own prose and `name` is the name the request carried.
+///
+/// The model states no text for it, so this is RECORDED behaviour: fixed text around the
+/// requested name, which the refusal carries so a caller can read out WHICH name collided.
+/// Every name-keyed create of this service words the clash through this one helper, so no
+/// handler spells the sentence itself, and the kind noun — not the sentence — is what
+/// differs per resource (see [`STREAM_POOL_KIND`], [`INSIGHTS_CONFIGURATION_KIND`]).
+pub fn name_in_use_message(resource_kind: &str, name: &str) -> String {
+    format!("{resource_kind} already exists with {name} name")
+}
+
+/// How this service names the Kinesis Video Stream POOL kind in a
+/// [`name_in_use_message`].
+pub const STREAM_POOL_KIND: &str = "Media Pipeline Kinesis Video Stream Pool";
+
+/// How this service names the media insights pipeline CONFIGURATION kind in a
+/// [`name_in_use_message`].
+pub const INSIGHTS_CONFIGURATION_KIND: &str = "Media Insights Pipeline Configuration";
+
 /// The modelled 400 `ResourceLimitExceededException`, carrying `message`.
 pub fn resource_limit_exceeded(message: impl Into<String>) -> ResourceLimitExceededException {
     ResourceLimitExceededException {
@@ -450,9 +471,9 @@ pub enum InsightsConfigurationRefused {
     LimitReached,
     /// A configuration with that name already exists. The name is what identifies a
     /// configuration in an account (it is one of the two forms of `Identifier`), so
-    /// a second one under the same name is refused — and since the model declares no
-    /// `ConflictException` for the create, it is the modelled
-    /// `BadRequestException` (HTTP 400).
+    /// a second one under the same name is refused — the modelled `BadRequestException`
+    /// (HTTP 400), worded by [`name_in_use_message`] like every other name-keyed create
+    /// of this service.
     NameInUse,
     /// The configuration carries more than [`MAX_INSIGHTS_CONFIGURATION_ELEMENTS`]
     /// elements; the payload is how many it carried. The model puts no `@length` on the
@@ -490,9 +511,11 @@ pub enum StreamPoolRefused {
     LimitReached,
     /// A pool with that name already exists. The name is one of the two forms of the
     /// `Identifier` every later read, update and delete resolves, so a second pool under
-    /// one name would leave that lookup ambiguous — and the create models
-    /// `ConflictException` (HTTP 409) for exactly a clash with the current state of the
-    /// resource.
+    /// one name would leave that lookup ambiguous. The create models BOTH
+    /// `BadRequestException` (HTTP 400) and `ConflictException` (HTTP 409); a name the
+    /// account already holds is an input the caller must change, so it is reported as the
+    /// modelled `BadRequestException` — the same class every other name-keyed create of
+    /// this service refuses a name in use with.
     NameInUse,
 }
 

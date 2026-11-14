@@ -3,8 +3,8 @@
 //! @op CreateMediaPipelineKinesisVideoStreamPool
 //! Creates a Kinesis Video Stream pool and persists it: the pool is minted with its own
 //! id and ARN, starts in the non-terminal `CREATING` status the clock moves to `ACTIVE`,
-//! and a `PoolName` another live pool already carries is the modelled 409
-//! `ConflictException`.
+//! and a `PoolName` another live pool already carries is the modelled 400
+//! `BadRequestException` naming that name.
 //!
 //! ## Shape of an operation
 //!
@@ -211,11 +211,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::request_region(ctx.parts()),
             &pool_id,
         );
+        // Bound before the record takes it, so the name-in-use refusal below can word
+        // itself with the name the request carried.
+        let pool_name = input.pool_name;
         let pool = crate::state::StreamPool {
             // Replaced by the store, which owns the creation sequence.
             seq: 0,
             pool_id,
-            pool_name: input.pool_name,
+            pool_name: pool_name.clone(),
             pool_arn: pool_arn.clone(),
             // `CREATING` is a non-terminal `KinesisVideoStreamPoolStatus`: the move to
             // `ACTIVE` is the clock's, not a caller's.
@@ -242,14 +245,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            // Admission is serialised by the store lock, so of several concurrent creates
-            // of ONE name exactly one is admitted and every other is refused here.
+            // A name the account already holds is an input the caller must change, so the
+            // refusal is the modelled 400 `BadRequestException` naming the pool kind and
+            // the requested name, not the 409 the operation also models. Admission is
+            // serialised by the store lock, so of several concurrent creates of ONE name
+            // exactly one is admitted and every other is refused here, alike.
             Err(crate::state::StreamPoolRefused::NameInUse) => {
                 return Err(
-                    CreateMediaPipelineKinesisVideoStreamPoolErrorModeled::ConflictException(
-                        crate::state::conflict(
-                            "A Kinesis Video Stream pool with that name already exists.",
-                        ),
+                    CreateMediaPipelineKinesisVideoStreamPoolErrorModeled::BadRequestException(
+                        crate::state::bad_request(crate::state::name_in_use_message(
+                            crate::state::STREAM_POOL_KIND,
+                            &pool_name,
+                        )),
                     )
                     .into(),
                 );

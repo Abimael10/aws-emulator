@@ -227,18 +227,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_media_pipeline_id();
         let created = crate::state::timestamp(now);
+        // Bound before the record takes it, so the name-in-use refusal below can word
+        // itself with the name the request carried.
+        let configuration_name = input.media_insights_pipeline_configuration_name;
         // Bound once and used both for the record and for the tag directory's key, so a
         // create-time tag can never be written under a different ARN than the one the
         // configuration carries — nor be dropped for want of one.
         let configuration_arn = crate::state::media_insights_pipeline_configuration_arn(
             &crate::state::request_region(ctx.parts()),
-            &input.media_insights_pipeline_configuration_name,
+            &configuration_name,
         );
         let configuration = crate::state::InsightsConfiguration {
             // Replaced by the store, which owns the creation sequence.
             seq: 0,
             arn: configuration_arn.clone(),
-            name: input.media_insights_pipeline_configuration_name,
+            name: configuration_name.clone(),
             id,
             resource_access_role_arn: input.resource_access_role_arn,
             real_time_alert_configuration: input.real_time_alert_configuration,
@@ -265,13 +268,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
+            // The same refusal class and the same wording every name-keyed create of this
+            // service uses for a name the account already holds: the modelled 400 naming
+            // the configuration kind and the requested name.
             Err(crate::state::InsightsConfigurationRefused::NameInUse) => {
                 return Err(
                     CreateMediaInsightsPipelineConfigurationErrorModeled::BadRequestException(
-                        crate::state::bad_request(
-                            "A media insights pipeline configuration with that name already \
-                             exists.",
-                        ),
+                        crate::state::bad_request(crate::state::name_in_use_message(
+                            crate::state::INSIGHTS_CONFIGURATION_KIND,
+                            &configuration_name,
+                        )),
                     )
                     .into(),
                 );

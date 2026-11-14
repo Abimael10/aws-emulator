@@ -16,9 +16,9 @@
 //!   every later read renders from the stored record;
 //! * a pool is identified by its NAME or its ARN, and an identifier that resolves to no
 //!   stored pool is this service's modelled 404 `NotFoundException`;
-//! * a `PoolName` another live pool already carries is the modelled 409
-//!   `ConflictException`, however many callers ask for it at once: of N concurrent creates
-//!   of one name exactly one is served;
+//! * a `PoolName` another live pool already carries is the modelled 400
+//!   `BadRequestException` naming that name, however many callers ask for it at once: of N
+//!   concurrent creates of one name exactly one is served;
 //! * a delete is observable by every later read and by the listing, and deleting twice is
 //!   the same 404 as deleting something that never existed;
 //! * `CREATING` is a non-terminal status: a caller reading straight back still sees it,
@@ -62,7 +62,6 @@ const ERROR_CODE_NOT_FOUND: &str = "NotFound";
 
 /// The wire error-shape names restJson1 resolves from `x-amzn-errortype`.
 const NOT_FOUND_EXCEPTION: &str = "NotFoundException";
-const CONFLICT_EXCEPTION: &str = "ConflictException";
 const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 
 /// One request/response round trip through the router.
@@ -174,6 +173,13 @@ impl Emulator {
     async fn list_pools(&self, query: &str) -> Response {
         self.call("GET", &format!("{POOLS}{query}"), None).await
     }
+}
+
+/// The wording a create is refused with when its `PoolName` is already in use: fixed text
+/// around the name the request carried. Written out here rather than taken from the
+/// service's own formatter, so a change to that wording fails this suite.
+pub(crate) fn pool_name_in_use_message(name: &str) -> String {
+    format!("Media Pipeline Kinesis Video Stream Pool already exists with {name} name")
 }
 
 /// A non-greedy `@httpLabel` as a client sends it: the characters an ARN carries that are
@@ -432,9 +438,10 @@ fn assert_not_found(case: &str, response: &Response) {
 }
 
 /// RULE: a pool name is unique among live pools — a second create under a live name is the
-/// modelled 409 `ConflictException`, and the name is free again once the pool is deleted.
+/// modelled 400 `BadRequestException` naming the name that is in use, and the name is free
+/// again once the pool is deleted.
 #[tokio::test]
-async fn a_pool_name_already_in_use_is_the_modelled_conflict() {
+async fn a_pool_name_already_in_use_is_the_modelled_bad_request() {
     for (case, input) in create_rows() {
         let emulator = Emulator::new();
         assert_eq!(emulator.create_pool(input.clone()).await.status, 201);
@@ -446,19 +453,20 @@ async fn a_pool_name_already_in_use_is_the_modelled_conflict() {
         again["StreamConfiguration"] = json!({ "Region": "us-east-1", "DataRetentionInHours": 1 });
         let refused = emulator.create_pool(again.clone()).await;
         assert_eq!(
-            refused.status, 409,
-            "case {case:?}: expected the modelled 409, got {} body {:?}",
+            refused.status, 400,
+            "case {case:?}: expected the modelled 400, got {} body {:?}",
             refused.status, refused.body
         );
         assert_eq!(
             refused.error_code(),
-            CONFLICT_EXCEPTION,
+            BAD_REQUEST_EXCEPTION,
             "case {case:?}: expected the modelled error shape, got {:?}",
             refused.body
         );
-        assert!(
-            !refused.str_at("/Message").is_empty(),
-            "case {case:?}: the refusal must say what clashed: {:?}",
+        assert_eq!(
+            refused.str_at("/Message"),
+            pool_name_in_use_message(&name),
+            "case {case:?}: the refusal must name the pool name that is in use, got {:?}",
             refused.body
         );
 
@@ -486,7 +494,7 @@ async fn a_pool_name_already_in_use_is_the_modelled_conflict() {
 const RACERS: usize = 5;
 
 /// RULE (the uniqueness rule, reached concurrently): of N callers creating one pool name at
-/// the same instant exactly ONE is served and every other is refused the modelled 409 —
+/// the same instant exactly ONE is served and every other is refused the modelled 400 —
 /// the lookup and the insert happen under one lock — and exactly one pool exists after.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exactly_one_of_several_concurrent_creates_of_one_name_is_served() {
@@ -520,17 +528,23 @@ async fn exactly_one_of_several_concurrent_creates_of_one_name_is_served() {
         let (index, reply) = racer.await.expect("the racing create task ran");
         match reply.status {
             201 => winners.push((index, reply)),
-            409 => {
+            400 => {
                 assert_eq!(
                     reply.error_code(),
-                    CONFLICT_EXCEPTION,
-                    "racer {index}: a refused concurrent create is the modelled conflict, got {:?}",
+                    BAD_REQUEST_EXCEPTION,
+                    "racer {index}: a refused concurrent create is the modelled 400, got {:?}",
+                    reply.body
+                );
+                assert_eq!(
+                    reply.str_at("/Message"),
+                    pool_name_in_use_message(name),
+                    "racer {index}: a loser is worded exactly like the serial refusal, got {:?}",
                     reply.body
                 );
                 conflicts.push(index);
             }
             other => panic!(
-                "racer {index}: expected 201 or the modelled 409, got {other} body {:?}",
+                "racer {index}: expected 201 or the modelled 400, got {other} body {:?}",
                 reply.body
             ),
         }
@@ -771,8 +785,14 @@ async fn a_repeated_client_request_token_answers_with_the_pool_the_first_create_
             }))
             .await;
         assert_eq!(
-            refused.status, 409,
-            "case {case:?}: a different token under a live name is a conflict: {:?}",
+            refused.status, 400,
+            "case {case:?}: a different token under a live name is the modelled 400: {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.str_at("/Message"),
+            pool_name_in_use_message("idempotent-pool"),
+            "case {case:?}: the refusal must name the pool name that is in use, got {:?}",
             refused.body
         );
     }

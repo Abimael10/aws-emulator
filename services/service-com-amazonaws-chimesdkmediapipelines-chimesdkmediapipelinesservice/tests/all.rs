@@ -23,6 +23,8 @@ mod media_insights_pipeline_configuration_listing;
 mod media_insights_pipeline_configuration_update;
 #[path = "all/media_insights_pipeline_status.rs"]
 mod media_insights_pipeline_status;
+#[path = "all/name_in_use_refusal.rs"]
+mod name_in_use_refusal;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
 #[path = "all/resource_tagging.rs"]
