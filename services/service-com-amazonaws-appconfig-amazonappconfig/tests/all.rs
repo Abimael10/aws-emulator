@@ -71,6 +71,8 @@ mod environment_state_wire_form;
 mod environment_update;
 #[path = "all/experiment_definition_profile_type.rs"]
 mod experiment_definition_profile_type;
+#[path = "all/experiment_definition_treatments.rs"]
+mod experiment_definition_treatments;
 #[path = "all/experiment_definition_wire_fidelity.rs"]
 mod experiment_definition_wire_fidelity;
 #[path = "all/experiment_definitions.rs"]
@@ -103,6 +105,8 @@ mod final_bake_window_holds_the_deployment;
 mod get_configuration;
 #[path = "all/hosted_configuration_version_content_reuse.rs"]
 mod hosted_configuration_version_content_reuse;
+#[path = "all/hosted_configuration_version_optimistic_lock.rs"]
+mod hosted_configuration_version_optimistic_lock;
 #[path = "all/json_schema_validator_gate.rs"]
 mod json_schema_validator_gate;
 #[path = "all/list_applications.rs"]

@@ -364,18 +364,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `LatestVersionNumber` is the model's optimistic lock: "an optional locking
         // token used to prevent race conditions from overwriting configuration updates
-        // when creating a new version". A caller that names a version other than the
-        // one currently latest lost that race.
+        // when creating a new version". The write reads the version the profile holds
+        // here, demands that it is the one the request named, and creates the version
+        // after it; which of the two ways that can fail this request hit is read off the
+        // profile by [`crate::state::hosted_configuration_version_lock_refusal`], which
+        // owns both sentences.
         if let Some(expected) = input.latest_version_number {
-            let latest = profile.latest_version_number();
-            if expected != latest {
+            if let Some(message) =
+                crate::state::hosted_configuration_version_lock_refusal(profile, expected)
+            {
                 return Err(CreateHostedConfigurationVersionErrorModeled::ConflictException(
                     ConflictException {
-                        message: Some(
-                            crate::state::hosted_configuration_version_stale_lock(
-                                expected, latest,
-                            ),
-                        ),
+                        message: Some(message),
                     },
                 )
                 .into());
@@ -566,6 +566,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The conditional half of the optimistic lock, re-read after the action point was
+        // consulted: the version this write pinned itself to create is only its to create
+        // if nobody took it while that invocation was in flight. A writer that lost it is
+        // refused — with the sentence naming the version it could not create — rather than
+        // silently storing its content under the NEXT free number, which would be exactly
+        // the lost update the lock exists to prevent. An unlocked write pins no version, so
+        // it takes the next one as before.
+        if let Some(expected) = input.latest_version_number {
+            if let Some(message) =
+                crate::state::hosted_configuration_version_lock_refusal(profile, expected)
+            {
+                return Err(CreateHostedConfigurationVersionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         // Byte-identical content REUSES the version the profile already holds: a write
         // whose stored bytes equal those of the profile's newest stored version is answered
         // with THAT version — its number, its bytes and its metadata — and allocates
@@ -670,6 +690,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             content,
             content_type: input.content_type,
             version_label: input.version_label,
+            // Which conditional write produced this version, so a later writer holding the
+            // same lock is told it lost the race for this number rather than that its lock
+            // was stale.
+            created_under_lock: input.latest_version_number,
         };
         // `next_version_number` only ever increases, so the slot is vacant. An occupied
         // one is refused rather than answered from: reporting 201 with another version's

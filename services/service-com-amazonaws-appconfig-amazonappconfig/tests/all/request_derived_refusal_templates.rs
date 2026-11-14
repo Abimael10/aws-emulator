@@ -15,11 +15,14 @@
 //! 2. A paginated listing handed a `NextToken` it did not mint is HTTP 400
 //!    `BadRequestException` with the template `Invalid nextToken parameter <NextToken>.`,
 //!    the submitted token echoed as sent — one sentence for every listing of this service.
-//! 3. `CreateHostedConfigurationVersion` whose `LatestVersionNumber` is not the version the
-//!    profile currently holds is HTTP 409 `ConflictException` with
+//! 3. `CreateHostedConfigurationVersion` whose `LatestVersionNumber` was already stale when
+//!    it was read — the version it would have created was not written by a racer holding
+//!    that same lock — is HTTP 409 `ConflictException` with
 //!    `Expected latest version <submitted> does not match actual latest version <actual>`,
 //!    built from the two numbers alone and with no trailing full stop, and the refused
-//!    write stores nothing.
+//!    write stores nothing. (The other half of that lock, a conditional write that LOST to
+//!    a racer holding the same lock, is asserted in
+//!    `hosted_configuration_version_optimistic_lock`.)
 //! 4. `CreateExperimentDefinition` under a `Name` already in use in that application is
 //!    HTTP 409 `ConflictException` with
 //!    `Experiment definition with name '<Name>' already exists for application <id>` — the
@@ -346,8 +349,8 @@ async fn hosted_version_count(
         .unwrap_or_default()
 }
 
-/// RULE 3: a stale `LatestVersionNumber` is refused with both version numbers in AWS's
-/// template, and the write stores nothing.
+/// RULE 3: a lock that was already stale when it was read is refused with both version
+/// numbers in AWS's template, and the write stores nothing.
 #[tokio::test]
 async fn a_stale_latest_version_number_states_the_expected_and_the_actual_version() {
     let router = router();

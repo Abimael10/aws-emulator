@@ -22,11 +22,12 @@
 //! The tables span what the rule generalises over rather than one recorded request:
 //! WHICH subset of the writable members a patch carries, the VALUE each carries at the
 //! published bounds (`Description` len 0..1024, `Rule` len 1..16384 and
-//! `TreatmentInputList` len 1..5, from
-//! `smithy_query(query="operation",operation="UpdateExperimentDefinition")`) and one past
-//! them, how the treatment list changes length (shrinking, growing, at the modelled
-//! maximum), whether the resources are addressed by id or by name, and which level of the
-//! path is unresolvable.
+//! `TreatmentInputList` len 1.., from
+//! `smithy_query(query="operation",operation="UpdateExperimentDefinition")` — whose modelled
+//! list MAXIMUM AppConfig does not apply on the wire, which
+//! `experiment_definition_treatments` asserts) and one past them, how the treatment list
+//! changes length (shrinking, growing, at the modelled maximum), whether the resources are
+//! addressed by id or by name, and which level of the path is unresolvable.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -753,8 +754,10 @@ async fn an_update_past_a_modelled_bound_is_refused_without_writing() {
     let scope = scope(&router, "bounds").await;
     let (fixed, baseline, _) = create_baseline(&router, &scope).await;
 
-    // One past each published bound: `Description` max 1024, `Rule` min 1 and max 16384,
-    // `TreatmentInputList` min 1 and max 5.
+    // One past each published bound AppConfig applies: `Description` max 1024, `Rule` min 1
+    // and max 16384, `TreatmentInputList` min 1. The list's modelled MAXIMUM is not applied
+    // on the wire, so an update carrying more than five treatments is served; that is
+    // asserted where the rule lives (`experiment_definition_treatments`).
     for (case, patch) in [
         (
             "a hypothesis one character past its upper bound",
@@ -775,14 +778,6 @@ async fn an_update_past_a_modelled_bound_is_refused_without_writing() {
         (
             "an empty treatment list, below the modelled minimum of one",
             json!({ "Treatments": [] }),
-        ),
-        (
-            "six treatments, one past the modelled maximum of five",
-            json!({
-                "Treatments": (1..=6)
-                    .map(|index| treatment(f64::from(index), None, flag(true)))
-                    .collect::<Vec<Value>>(),
-            }),
         ),
     ] {
         let refused = update_definition(&router, &scope.application, &fixed.id, &patch).await;

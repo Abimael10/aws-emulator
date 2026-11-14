@@ -222,6 +222,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = std::time::SystemTime::now();
+        // The treatments are keyed BEFORE the store lock is taken: the list's length is
+        // the caller's (`TreatmentInputList`'s modelled maximum is not applied on the
+        // wire — see `crate::service`'s unenforced-bound judgement), so the one piece of
+        // work this request sizes stays outside the critical section every other request
+        // waits on. `TreatmentInput` carries no key and `Treatment` does, so the key is
+        // minted here from each treatment's place in the definition; a list past the most
+        // one definition may hold allocates nothing and is refused with the quota error
+        // this operation declares.
+        let control = crate::state::keyed_treatment(
+            crate::state::CONTROL_TREATMENT_KEY.to_string(),
+            &input.control,
+        );
+        let Some(treatments) = crate::state::keyed_treatments(&input.treatments) else {
+            return Err(
+                CreateExperimentDefinitionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::too_many_treatments(input.treatments.len())),
+                    },
+                )
+                .into(),
+            );
+        };
         let mut store = state.lock();
 
         // Each of the three identifiers this request carries is an `Identifier`, which
@@ -349,20 +371,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_id();
-        // `TreatmentInput` carries no key and `Treatment` does, so the key is minted
-        // here, from each treatment's place in the definition.
-        let control = crate::state::keyed_treatment(
-            crate::state::CONTROL_TREATMENT_KEY.to_string(),
-            &input.control,
-        );
-        let treatments: Vec<Treatment> = input
-            .treatments
-            .iter()
-            .enumerate()
-            .map(|(index, treatment)| {
-                crate::state::keyed_treatment(crate::state::treatment_key(index), treatment)
-            })
-            .collect();
 
         let definition = crate::state::ExperimentDefinition {
             id,

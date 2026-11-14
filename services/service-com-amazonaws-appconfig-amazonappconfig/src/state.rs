@@ -216,6 +216,17 @@ pub const MAX_CONFIGURATION_PROFILES_PER_APPLICATION: usize = 100;
 pub const MAX_HOSTED_CONFIGURATION_VERSIONS_PER_PROFILE: usize = 100;
 /// See [`MAX_ENVIRONMENTS_PER_APPLICATION`].
 pub const MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION: usize = 100;
+/// The most treatments one experiment definition may hold, which is the EMULATOR's bound
+/// on the one caller-chosen list length no modelled constraint clamps.
+///
+/// `TreatmentInputList` is modelled `@length(min: 1, max: 5)` and AppConfig does not apply
+/// that maximum on the wire (`crate::service`), so the length of the list a create or an
+/// update stores is the caller's. This is what still bounds it: a write past this many
+/// treatments is refused rather than retained, so a single request cannot size the store.
+/// Set well above the modelled maximum — the lists AppConfig is recorded serving are a
+/// handful of treatments — so it bounds the heap without refusing a definition a client
+/// would really write. See [`MAX_ENVIRONMENTS_PER_APPLICATION`] for the shape of the rule.
+pub const MAX_TREATMENTS_PER_EXPERIMENT_DEFINITION: usize = 100;
 /// See [`MAX_ENVIRONMENTS_PER_APPLICATION`]. Enforced by
 /// [`ComAmazonawsAppconfigAmazonappconfigState::try_insert_strategy`], which is the only
 /// way into the created-strategy map.
@@ -1503,8 +1514,10 @@ pub const UNEXPOSED_AUDIENCE: f32 = 0.0;
 /// composes it from the treatment's place in the definition, in LOWER case: the control
 /// is [`CONTROL_TREATMENT_KEY`], `c`, and the treatments compared against it are `t1`,
 /// `t2`, … in the order the request listed them. So it is unique within a definition,
-/// stays within the modelled pattern for every list the model allows
-/// (`TreatmentInputList` holds at most 5), and is stable across every read — which is
+/// stays within the modelled pattern for every list a definition may hold — this service
+/// keeps at most [`MAX_TREATMENTS_PER_EXPERIMENT_DEFINITION`], far fewer entries than the
+/// seven digits the pattern leaves room for, and `TreatmentInputList`'s modelled maximum is
+/// not applied on the wire (`crate::service`) — and is stable across every read, which is
 /// what lets a client assign an entity to a key it read back.
 pub fn treatment_key(index: usize) -> String {
     format!("t{}", index + 1)
@@ -1522,6 +1535,38 @@ pub fn keyed_treatment(key: String, treatment: &TreatmentInput) -> Treatment {
         description: treatment.description.clone(),
         flag_value: treatment.flag_value.clone(),
     }
+}
+
+/// `submitted` treatments keyed as this service keys a definition's list — the key minted
+/// from each treatment's place in it ([`treatment_key`]) — or `None` when the list is
+/// longer than one definition may hold.
+///
+/// The bound is checked HERE, before a single `Treatment` is built, so a list past it
+/// allocates nothing and is never stored: it is the emulator's own cap on the one list
+/// length no modelled constraint clamps ([`MAX_TREATMENTS_PER_EXPERIMENT_DEFINITION`]).
+/// Shared by the create and the update, so the two cannot bound the same list differently,
+/// and callable without the store lock held, so the caller-sized work happens outside the
+/// critical section.
+pub fn keyed_treatments(submitted: &[TreatmentInput]) -> Option<Vec<Treatment>> {
+    if submitted.len() > MAX_TREATMENTS_PER_EXPERIMENT_DEFINITION {
+        return None;
+    }
+    Some(
+        submitted
+            .iter()
+            .enumerate()
+            .map(|(index, treatment)| keyed_treatment(treatment_key(index), treatment))
+            .collect(),
+    )
+}
+
+/// `Message` for a write refused because its treatment list is longer than one experiment
+/// definition may hold: the number submitted and the number this service keeps.
+pub fn too_many_treatments(submitted: usize) -> String {
+    format!(
+        "Cannot store {submitted} treatments on an experiment definition: at most \
+         {MAX_TREATMENTS_PER_EXPERIMENT_DEFINITION} are kept."
+    )
 }
 
 /// An experiment definition: the purpose, scope and treatments of an experiment over
@@ -2486,6 +2531,15 @@ pub struct HostedConfigurationVersion {
     pub content: Vec<u8>,
     pub content_type: String,
     pub version_label: Option<String>,
+    /// The `LatestVersionNumber` the create that wrote this version pinned itself to, or
+    /// `None` when that create supplied no lock at all.
+    ///
+    /// It records which conditional write produced the version, which is what tells another
+    /// writer holding the SAME lock that it lost the race for this version number from a
+    /// writer whose lock was already stale when it read
+    /// ([`hosted_configuration_version_lock_refusal`]). No operation reports it: it is not
+    /// a member of any modelled shape.
+    pub created_under_lock: Option<i32>,
 }
 
 /// A deployment of one configuration version into one environment.
@@ -3653,8 +3707,67 @@ fn environment_state_member_name(environment_state: &str) -> &str {
     }
 }
 
-/// `Message` for a `CreateHostedConfigurationVersion` refused by its optimistic lock: the
-/// `LatestVersionNumber` the request named is not the version the profile currently holds.
+/// Why a `CreateHostedConfigurationVersion` pinned to `expected` is refused by its
+/// optimistic lock, or `None` when the lock holds.
+///
+/// `LatestVersionNumber` is "an optional locking token used to prevent race conditions from
+/// overwriting configuration updates when creating a new version": a write that supplies it
+/// reads the profile's current version, demands that it is the one it named, and then
+/// creates the version AFTER it. Those are two steps, and each can fail on its own — which
+/// is why AppConfig has two sentences for one lock:
+///
+/// * the version the write would have created already exists, because another writer
+///   holding the SAME lock created it first ([`hosted_configuration_version_already_exists`])
+///   — the conditional write lost, and the refusal names the version it could not create;
+/// * the lock does not name the version the profile holds, and the version it would have
+///   created was not written by a racer holding that same lock
+///   ([`hosted_configuration_version_stale_lock`]) — the lock was already out of date when
+///   it was read, and the refusal names both numbers so the caller can re-read and retry.
+///
+/// Which of the two a write gets is therefore read off the version that occupies the number
+/// it wanted: the lock each stored version was created under
+/// ([`HostedConfigurationVersion::created_under_lock`]), and nothing about any one request.
+pub fn hosted_configuration_version_lock_refusal(
+    profile: &ConfigurationProfile,
+    expected: i32,
+) -> Option<String> {
+    let latest = profile.latest_version_number();
+    if expected == latest {
+        return None;
+    }
+    let would_create = hosted_configuration_version_written_after(expected);
+    let lost_the_conditional_write = profile
+        .hosted_versions
+        .get(&would_create)
+        .is_some_and(|version| version.created_under_lock == Some(expected));
+    Some(if lost_the_conditional_write {
+        hosted_configuration_version_already_exists(would_create)
+    } else {
+        hosted_configuration_version_stale_lock(expected, latest)
+    })
+}
+
+/// `Message` for a locked `CreateHostedConfigurationVersion` whose conditional write LOST:
+/// the version it would have created is already there.
+///
+/// AppConfig words that failure about the version the write would have numbered rather than
+/// about the comparison it made — `Hosted configuration version <n> already exists`, with no
+/// trailing full stop and nothing of the application, the profile or the lock in it.
+pub fn hosted_configuration_version_already_exists(version_number: i32) -> String {
+    format!("Hosted configuration version {version_number} already exists")
+}
+
+/// The version number a create pinned to `expected` would write: the one after the lock it
+/// named.
+///
+/// Saturating, so a lock at the `i32` ceiling states the ceiling rather than wrapping to a
+/// negative version no store could hold.
+pub fn hosted_configuration_version_written_after(expected: i32) -> i32 {
+    expected.saturating_add(1)
+}
+
+/// `Message` for a `CreateHostedConfigurationVersion` whose lock was already STALE when it
+/// was read: the `LatestVersionNumber` it named is not the version the profile holds.
 ///
 /// The sentence is built from the two version numbers alone — the one the request EXPECTED
 /// and the one that is ACTUALLY latest — and names neither the application nor the profile:

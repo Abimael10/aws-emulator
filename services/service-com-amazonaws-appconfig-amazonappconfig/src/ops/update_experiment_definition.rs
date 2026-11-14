@@ -183,6 +183,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = std::time::SystemTime::now();
+        // The replacement treatments are keyed BEFORE the store lock is taken, for the
+        // reason the create states: the list's length is the caller's, so the one piece of
+        // work this request sizes stays outside the critical section every other request
+        // waits on, and a list past the most one definition may hold allocates nothing and
+        // is refused. This operation models no quota error
+        // (`smithy_query(query="operation",operation="UpdateExperimentDefinition")` lists
+        // `BadRequestException`, `ConflictException`, `InternalServerException` and
+        // `ResourceNotFoundException`), so the refusal is the bad request every input this
+        // service will not take is refused with.
+        let replacement = match input.treatments.as_deref().map(crate::state::keyed_treatments) {
+            Some(None) => {
+                return Err(UpdateExperimentDefinitionErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::too_many_treatments(
+                            input.treatments.as_ref().map_or(0, Vec::len),
+                        )),
+                        reason: None,
+                        details: None,
+                    },
+                )
+                .into())
+            }
+            Some(Some(keyed)) => Some(keyed),
+            None => None,
+        };
         let mut store = state.lock();
 
         // Both identifiers are `Identifier` members, documented as the resource's "ID or
@@ -282,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Supplying `Control` or `Treatments` replaces the treatment, or the whole list,
         // rather than editing it: the member is the treatment list itself. `TreatmentInput`
-        // carries no key and `Treatment` does, so each key is minted here exactly as a
+        // carries no key and `Treatment` does, so each key was minted above exactly as a
         // create mints it — from the treatment's place in the definition — which keeps a
         // replaced list's keys contiguous from `t1` rather than leaving the keys of a
         // longer previous list behind.
@@ -290,14 +315,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             definition.control =
                 crate::state::keyed_treatment(crate::state::CONTROL_TREATMENT_KEY.to_string(), &control);
         }
-        if let Some(treatments) = input.treatments {
-            definition.treatments = treatments
-                .iter()
-                .enumerate()
-                .map(|(index, treatment)| {
-                    crate::state::keyed_treatment(crate::state::treatment_key(index), treatment)
-                })
-                .collect();
+        if let Some(treatments) = replacement {
+            definition.treatments = treatments;
         }
         // This call wrote the record, so the record was last updated now; `CreatedAt` is
         // the instant the definition was created and does not move.

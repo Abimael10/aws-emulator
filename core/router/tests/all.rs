@@ -4566,3 +4566,5 @@ mod apigateway_lambda_ddb_s3_trace_tree;
 // `E0753` they describe, so they stand as ordinary comments.)
 // leaving a note here. (Ordinary comments: an inner doc comment mid-file is `E0753`.)
 // comments here, for the reason they themselves record.)
+// comment is legal only before the first item of this crate root, so a `//!` line here is
+// `E0753` and compiles no suite of this target.)// it. The `sfn_relayed_dynamodb_request_id` suite is declared ONCE as well, just above: two

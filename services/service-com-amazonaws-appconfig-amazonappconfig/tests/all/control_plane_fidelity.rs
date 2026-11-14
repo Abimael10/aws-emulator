@@ -724,28 +724,25 @@ async fn a_modelled_constraint_violation_is_refused_as_bad_request() {
             requirement: "Member must have value greater than or equal to 0",
         },
         Violation {
-            case: "a required list longer than its maximum, on a stub operation",
+            case: "a required list shorter than its minimum, on a stub operation",
             method: "POST",
             uri: format!("/applications/{application}/experimentdefinitions"),
             body: json!({
-                "Name": "too-many-treatments",
+                "Name": "no-treatments",
                 "ConfigurationProfileIdentifier": profile,
                 "EnvironmentIdentifier": environment,
                 "FlagKey": "myflag",
-                "Treatments": [
-                    { "Weight": 10.0, "FlagValue": { "Enabled": true } },
-                    { "Weight": 10.0, "FlagValue": { "Enabled": true } },
-                    { "Weight": 10.0, "FlagValue": { "Enabled": true } },
-                    { "Weight": 10.0, "FlagValue": { "Enabled": true } },
-                    { "Weight": 10.0, "FlagValue": { "Enabled": true } },
-                    { "Weight": 10.0, "FlagValue": { "Enabled": true } },
-                ],
+                // The MINIMUM is the bound of this list AppConfig applies on the wire; its
+                // modelled maximum is not, so a LONGER list belongs in the suite that
+                // proves such a create is served (`experiment_definition_treatments`)
+                // rather than in this refusal table.
+                "Treatments": [],
                 "Control": { "Weight": 40.0, "FlagValue": { "Enabled": false } },
                 "AudienceRule": "true",
             }),
             headers: Vec::new(),
             member: "treatments",
-            requirement: "Member must have length less than or equal to 5",
+            requirement: "Member must have length greater than or equal to 1",
         },
     ];
 

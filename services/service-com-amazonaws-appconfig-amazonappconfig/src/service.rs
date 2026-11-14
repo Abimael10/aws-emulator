@@ -41,6 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 mod immutable_profile_type;
+mod unenforced_treatments_bound;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
@@ -196,13 +197,14 @@ fn floating_point_member_paths() -> &'static BTreeSet<String> {
     /// The member of an experiment-definition request that targets `TreatmentInput`
     /// directly …
     const CONTROL: &str = "control";
-    /// … and the one that targets a LIST of it, whose elements the walk reports one
-    /// collection step deeper.
-    const TREATMENTS: &str = "treatments";
 
     static PATHS: OnceLock<BTreeSet<String>> = OnceLock::new();
     PATHS.get_or_init(|| {
-        let element = format!("{TREATMENTS}.{ANY_POSITION}.member");
+        // … and the one that targets a LIST of it, whose elements the walk reports one
+        // collection step deeper. The list's own member path is stated once, in the module
+        // that judges the one requirement of it this service does not apply.
+        let treatments = unenforced_treatments_bound::TREATMENTS;
+        let element = format!("{treatments}.{ANY_POSITION}.member");
         service_common::validation_message::floating_point_member_paths(&[
             (
                 "",
@@ -363,7 +365,8 @@ fn with_service_detail_member(mut resp: RtResponse) -> RtResponse {
 /// refusal ([`InServiceDialect`] and [`EmulatedService::override_refusal`]).
 const CONSTRAINT_REFUSAL_CODE: &str = "BadRequestException";
 
-/// This service's answer to the violations `req` broke, or `None` when it broke none.
+/// This service's answer to the `violations` `req` broke, or `None` when there is no
+/// sentence to state them in.
 ///
 /// The sentence is the framework's own `N validation error(s) detected: Value '<v>' at
 /// '<member>' failed to satisfy constraint: …` envelope — already the text AWS states for a
@@ -374,17 +377,18 @@ const CONSTRAINT_REFUSAL_CODE: &str = "BadRequestException";
 /// refusal answers from (`service_common::front_door::worded_rejection`): a constraint
 /// failure is a 400 in every protocol.
 ///
-/// The values it quotes are the bytes the CALLER SENT. `service_common::validation`
-/// re-reads the same built input the constraint walk validated to restore each echo,
-/// because the framework stores a long value already shortened to a prefix plus a
-/// byte-count annotation — text no AWS service emits — and the echoed value is part of the
-/// request-derived rule a caller reads the rejected input back out of.
-fn constraint_refusal<O: Operation>(svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
-    // The protocol is read, used and dropped inside this one function, so nothing borrowed
-    // from the service definition is held across the caller's await: `&dyn
-    // ErasedServiceDefinition` is not `Sync`.
-    let violations =
-        service_common::validation::refusing_violations::<O>(svc.definition().protocol(), req);
+/// The violations are the ones the collecting walk found and this service ENFORCES
+/// ([`unenforced_treatments_bound::judged`], which calls this): the values they quote are
+/// the bytes the CALLER SENT, because `service_common::validation` re-reads the same built
+/// input the constraint walk validated to restore each echo — the framework stores a long
+/// value already shortened to a prefix plus a byte-count annotation, text no AWS service
+/// emits, and the echoed value is part of the request-derived rule a caller reads the
+/// rejected input back out of.
+fn constraint_refusal(
+    svc: &dyn Service,
+    req: &RtRequest,
+    violations: Vec<Violation>,
+) -> Option<RtResponse> {
     let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
     let message = envelope(&stated)?;
     Some(service_common::front_door::worded_rejection(
@@ -425,11 +429,13 @@ fn constraint_refusal<O: Operation>(svc: &dyn Service, req: &RtRequest) -> Optio
 ///
 /// Nothing else is re-implemented. A request this wrapper does not refuse is handed to the
 /// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
-/// serialize, telemetry and every modelled error. The violations come from the framework's
-/// own machinery (the protocol's deserializer and its constraint walk over the built
-/// input), so this cannot find a different set from the walk that follows it; the cost is
-/// that a request it does not refuse is read twice, bounded by the body limits the
-/// framework already enforces.
+/// serialize, telemetry and every modelled error — unless the only requirement it breaks is
+/// one AppConfig does not apply on the wire, which is read, handled and serialized by the
+/// same three steps in front of that walk ([`unenforced_treatments_bound`]). The violations
+/// come from the framework's own machinery (the protocol's deserializer and its constraint
+/// walk over the built input), so this cannot find a different set from the walk that
+/// follows it; the cost is that a request it does not refuse is read twice, bounded by the
+/// body limits the framework already enforces.
 struct InServiceDialect<O> {
     operation: O,
 }
@@ -452,10 +458,30 @@ where
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            if let Some(refused) = constraint_refusal::<O>(svc, req) {
-                return with_service_detail_member(refused);
+            // Which of the three ways this request is served, decided from the framework's
+            // own violations before anything is awaited: refused in this service's dialect,
+            // left to the generated walk, or served past that walk because the only
+            // requirement it breaks is one AppConfig does not apply
+            // ([`unenforced_treatments_bound`]).
+            match unenforced_treatments_bound::judged::<O>(svc, req) {
+                unenforced_treatments_bound::Judgement::Refused(refused) => {
+                    with_service_detail_member(*refused)
+                }
+                unenforced_treatments_bound::Judgement::TheFrameworksSequence => {
+                    with_service_detail_member(self.operation.run(svc, req, ctx).await)
+                }
+                unenforced_treatments_bound::Judgement::ServedPastTheWalk => {
+                    with_service_detail_member(
+                        unenforced_treatments_bound::served_past_the_walk(
+                            &self.operation,
+                            svc,
+                            req,
+                            ctx,
+                        )
+                        .await,
+                    )
+                }
             }
-            with_service_detail_member(self.operation.run(svc, req, ctx).await)
         })
     }
 
