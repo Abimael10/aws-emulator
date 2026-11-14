@@ -373,6 +373,48 @@ impl Emulator {
         }
         bodies
     }
+
+    /// The data of every record still BUFFERED for `stream`, in arrival order — read out of
+    /// the Firehose service's own store, which is the only place a buffered record exists.
+    ///
+    /// Here rather than in one suite, so a sibling suite that has to tell "still waiting for
+    /// the destination" from "delivered" reads the one buffer this harness already owns.
+    pub(crate) fn buffered(&self, stream: &str) -> Vec<Vec<u8>> {
+        let state = self.engine.state::<
+            service_com_amazonaws_firehose_firehose_20150804::ComAmazonawsFirehoseFirehose20150804State,
+        >();
+        let store = state.lock();
+        store
+            .streams
+            .get(stream)
+            .map(|stream| {
+                stream
+                    .records
+                    .iter()
+                    .map(|record| record.data.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Forget that a failed delivery attempt asked for the next one to be held off.
+    ///
+    /// For a suite that drives the delivery itself over a transport of its own: the
+    /// emulator's own delivery clock is attempting the same buffer over the transport of the
+    /// request that started it, so when nothing this emulator serves answers at the
+    /// destination's address each of its attempts fails and holds the next attempt off by the
+    /// retry span. Clearing that backoff right before an attempt is what lets the suite's own
+    /// transport be the one that reaches the destination; the records themselves are
+    /// untouched.
+    pub(crate) fn clear_delivery_backoff(&self, stream: &str) {
+        let state = self.engine.state::<
+            service_com_amazonaws_firehose_firehose_20150804::ComAmazonawsFirehoseFirehose20150804State,
+        >();
+        let mut store = state.lock();
+        if let Some(stream) = store.streams.get_mut(stream) {
+            stream.delivery_retry_at = None;
+        }
+    }
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `service` — the routing key

@@ -8139,3 +8139,7 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // declarations that are no longer duplicated were appended below here by landings. Past
 // the first item a `//!` line is `E0753` and compiles no suite of this target, and the
 // notes annotate nothing, so both are removed rather than re-typed: the rules they
+// (The tail of this file is where concurrent landings append their notes. Keep it to
+// `#[path]`/`mod` declarations: a module may be declared only once, and an inner doc
+// comment (`//!`) is legal only before the first item, so a note belongs in the module doc
+// at the HEAD of this file and never here.)

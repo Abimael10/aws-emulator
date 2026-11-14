@@ -993,8 +993,9 @@ fn backs_up_all_records(mode: Option<&String>) -> bool {
 /// * Every other destination kind keeps its `S3Configuration` for BACKUP, and only the
 ///   mode that backs up all records ([`ALL_RECORDS_BACKUP_MODES`]) makes it a location
 ///   every record reaches; under the failed-records-only modes it takes what the primary
-///   destination rejected, and this emulator delivers to none of those endpoints, so it has
-///   nothing to write there.
+///   destination rejected, which is written by that destination's OWN target once its retry
+///   window is spent ([`HttpEndpointTarget::backup`], [`splunk::SplunkTarget::backup`],
+///   [`SearchTarget::backup`]) and not by a location every record reaches.
 /// * A destination that backs up to Amazon S3 as well ([`ALL_RECORDS_BACKUP_MODES`] with an
 ///   `S3BackupConfiguration`) delivers to that location too.
 #[must_use]
