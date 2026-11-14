@@ -47,6 +47,12 @@ http = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The two text folds `Rerank` measures a document's relevance to a query with: the
+# published English stop list (the query's function words, which distinguish no document)
+# and the Snowball English stemmer (so a query term matches whichever inflection a
+# document spells it in).
+stop-words = "0.8"
+rust-stemmers = "1.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

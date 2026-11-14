@@ -114,7 +114,7 @@ fn seconds(value: &Value) -> Option<f64> {
 
 /// `epoch_seconds` as the RFC 3339 `date-time` string a client sends for a
 /// `@timestampFormat("date-time")` member.
-fn date_time(epoch_seconds: i64) -> String {
+pub(crate) fn date_time(epoch_seconds: i64) -> String {
     ::aws_smithy_types::DateTime::from_secs(epoch_seconds)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .expect("an epoch-seconds instant renders as RFC 3339")

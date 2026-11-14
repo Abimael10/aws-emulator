@@ -213,11 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // invocation. The whole handler holds the store lock, so the check and the
         // insert are one atomic claim and exactly one of N concurrent creates wins.
         if session.invocations.contains_key(&invocation_id) {
-            return Err(CreateInvocationErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Invocation {invocation_id} already exists in session {session_id}."
-                )),
-            })
+            return Err(CreateInvocationErrorModeled::ConflictException(
+                crate::state::invocation_already_exists(&invocation_id),
+            )
             .into());
         }
         if session.invocations.len() >= crate::state::MAX_INVOCATIONS_PER_SESSION {

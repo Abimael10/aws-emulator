@@ -10481,6 +10481,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "rust-stemmers",
  "serde_json",
  "service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda",
  "service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice",
@@ -10490,6 +10491,7 @@ dependencies = [
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
  "sha2 0.10.9",
+ "stop-words",
  "tokio",
  "tracing",
 ]

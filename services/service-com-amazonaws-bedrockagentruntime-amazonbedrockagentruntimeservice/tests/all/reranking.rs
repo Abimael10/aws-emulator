@@ -11,15 +11,16 @@
 //! THE RULE UNDER TEST: `Rerank` answers one permutation of the supplied `sources`,
 //! ordered by each source document's relevance to the single query, highest first —
 //! every source contributing exactly one result carrying its POSITION in the request's
-//! `sources` list, a `relevanceScore` in `[0, 1]` that is a pure function of that one
+//! `sources` list, a `relevanceScore` in `(0, 1]` that is a pure function of that one
 //! (query, document) pair, and `numberOfResults` keeping the leading `n` of that order.
 //!
-//! The scored quantity is the lexical relevance of the pair (the cosine similarity of
-//! their sublinear term-frequency vectors — see the module docs of
+//! The scored quantity is how much of what the query asks about the document carries,
+//! and how concentrated the document is on the query (see the module docs of
 //! `src/ops/rerank.rs`), so the rows below span what that generalises over: how many
 //! sources there are, where in the list the relevant one sits, whether a document is
 //! `TEXT` or `JSON`, its length, its case and punctuation, its script, and how often it
-//! repeats a term.
+//! repeats a term. How the score SEPARATES the ranks, and which `modelArn` values name a
+//! reranker at all, are asserted in `tests/all/reranking_relevance.rs`.
 
 use std::collections::BTreeSet;
 
@@ -29,9 +30,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::sessions::{call, error_code, router};
 
-/// A reranker model named the way a caller usually names one: the bare model id, which
-/// the modelled `BedrockModelArn` pattern admits beside a full ARN.
-const MODEL: &str = "amazon.rerank-v1:0";
+/// A reranker model named the way a request has to name one: the ARN of a Bedrock
+/// foundation model, `arn:<partition>:bedrock:<region>::foundation-model/<model-id>`
+/// (the format `Rerank`'s own refusal for an invalid `modelArn` states).
+pub const MODEL: &str = "arn:aws:bedrock:us-west-2::foundation-model/amazon.rerank-v1:0";
 
 /// How close two scores this emulator computed for the SAME pair must be to count as
 /// the same number: they are reported as the modelled `Float` (32-bit), so a comparison
@@ -39,7 +41,7 @@ const MODEL: &str = "amazon.rerank-v1:0";
 const TOLERANCE: f64 = 1e-6;
 
 /// One `TEXT` source carrying `text`.
-fn text_source(text: &str) -> Value {
+pub(crate) fn text_source(text: &str) -> Value {
     json!({
         "type": "INLINE",
         "inlineDocumentSource": {
@@ -62,7 +64,7 @@ fn json_source(document: Value) -> Value {
 
 /// The `Rerank` request body for one query over `sources`, with `numberOfResults`
 /// omitted the way an SDK omits an absent member when `number_of_results` is `None`.
-fn rerank_body(query: &str, sources: &[Value], number_of_results: Option<i64>) -> Value {
+pub(crate) fn rerank_body(query: &str, sources: &[Value], number_of_results: Option<i64>) -> Value {
     let mut configuration = json!({ "modelConfiguration": { "modelArn": MODEL } });
     if let Some(requested) = number_of_results {
         configuration["numberOfResults"] = json!(requested);
@@ -350,9 +352,10 @@ async fn the_most_relevant_source_is_ranked_first() {
     }
 }
 
-/// RULE: a document whose terms are the query's in the same proportions is maximally
-/// relevant, and one sharing no term with the query is not relevant at all — so the
-/// score's two extremes are reached by the documents that earn them.
+/// RULE: a document that carries the whole query and nothing besides it is maximally
+/// relevant and scores `1.0`; one sharing no term with the query sits at the FLOOR of the
+/// scale — a positive score, the same for every such document, below any document that
+/// shares a term — so the score's two ends are reached by the documents that earn them.
 ///
 /// The rows differ along how the document restates the query: verbatim, reordered,
 /// repeated, padded, and disjoint.
@@ -360,32 +363,76 @@ async fn the_most_relevant_source_is_ranked_first() {
 async fn the_ends_of_the_score_range_are_the_documents_that_earn_them() {
     let router = router();
     const QUERY: &str = "alpha beta gamma";
-    // (case, document text, the score the rule requires, or None for "strictly between")
-    let cases: [(&str, &str, Option<f64>); 5] = [
-        ("the query verbatim", "alpha beta gamma", Some(1.0)),
-        ("the query reordered", "gamma alpha beta", Some(1.0)),
+    /// What the rule requires of one document's score.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Required {
+        /// `1.0`: the document is the query.
+        Top,
+        /// The floor: the document shares no term with the query.
+        Floor,
+        /// Strictly between the two.
+        Between,
+    }
+    let cases: [(&str, &str, Required); 6] = [
+        ("the query verbatim", "alpha beta gamma", Required::Top),
+        ("the query reordered", "gamma alpha beta", Required::Top),
         (
             "every query term repeated equally",
             "alpha beta gamma alpha beta gamma",
-            Some(1.0),
+            Required::Top,
         ),
-        ("no term in common", "delta epsilon", Some(0.0)),
-        ("one query term among others", "alpha delta epsilon", None),
+        ("no term in common", "delta epsilon", Required::Floor),
+        (
+            "another document with no term in common",
+            "zeta eta theta iota",
+            Required::Floor,
+        ),
+        ("one query term among others", "alpha delta epsilon", Required::Between),
     ];
 
-    for (case, document, expected) in cases {
+    let mut floor: Option<(&str, f64)> = None;
+    let mut overlapping: Vec<(&str, f64)> = Vec::new();
+    for (case, document, required) in cases {
         let ranking = ranking(&router, case, QUERY, &[text_source(document)], None).await;
         let (_, score) = ranking[0];
-        match expected {
-            Some(required) => assert!(
-                (score - required).abs() < TOLERANCE,
-                "case {case:?}: expected a relevanceScore of {required}, got {score}"
+        match required {
+            Required::Top => assert!(
+                (score - 1.0).abs() < TOLERANCE,
+                "case {case:?}: expected a relevanceScore of 1.0, got {score}"
             ),
-            None => assert!(
-                score > 0.0 && score < 1.0,
-                "case {case:?}: expected a relevanceScore strictly between 0 and 1, got {score}"
-            ),
+            Required::Floor => {
+                assert!(
+                    score > 0.0 && score < 1.0,
+                    "case {case:?}: expected a positive relevanceScore below 1.0, got {score}"
+                );
+                if let Some((first_case, first)) = floor {
+                    assert!(
+                        (score - first).abs() < TOLERANCE,
+                        "case {case:?}: expected the same floor as case {first_case:?} \
+                         ({first}), got {score}"
+                    );
+                } else {
+                    floor = Some((case, score));
+                }
+            }
+            Required::Between => {
+                assert!(
+                    score > 0.0 && score < 1.0,
+                    "case {case:?}: expected a relevanceScore strictly between 0 and 1, got \
+                     {score}"
+                );
+                overlapping.push((case, score));
+            }
         }
+    }
+
+    let (floor_case, floor) = floor.expect("the table carries a disjoint document");
+    for (case, score) in overlapping {
+        assert!(
+            score > floor,
+            "case {case:?}: expected a score above the floor of case {floor_case:?} \
+             ({floor}), got {score}"
+        );
     }
 }
 

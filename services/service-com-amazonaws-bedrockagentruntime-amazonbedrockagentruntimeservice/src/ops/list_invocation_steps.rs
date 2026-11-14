@@ -195,12 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(invocation) => vec![invocation],
                 None => {
                     return Err(ListInvocationStepsErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(format!(
-                                "Invocation {invocation_id} was not found in session {}.",
-                                session.session_id
-                            )),
-                        },
+                        crate::state::invocation_not_found(invocation_id),
                     )
                     .into());
                 }

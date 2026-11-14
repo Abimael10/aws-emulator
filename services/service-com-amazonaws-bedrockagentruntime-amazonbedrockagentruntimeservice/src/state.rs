@@ -340,6 +340,59 @@ pub fn session_not_found(identifier: &str) -> ResourceNotFoundException {
     }
 }
 
+/// The modelled `ResourceNotFoundException` (HTTP 404) an operation scoped to an
+/// INVOCATION answers when its `invocationIdentifier` names no invocation.
+///
+/// Worded from the REQUEST alone — the fixed template `Invocation with ID
+/// <invocationIdentifier> not found`, interpolating the identifier the caller submitted
+/// and nothing else. The session the lookup ran under is deliberately NOT part of it: a
+/// refusal states what the caller asked for, and a parent identifier resolved out of the
+/// store would both leak state the request did not carry and tell a caller which scope
+/// of the lookup missed. No trailing period: the template is the sentence.
+///
+/// ONE constructor for every operation that resolves an `invocationIdentifier`
+/// (`PutInvocationStep`, `ListInvocationSteps`), so a client matches one rule rather
+/// than one sentence per operation.
+pub fn invocation_not_found(invocation_identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Invocation with ID {invocation_identifier} not found")),
+    }
+}
+
+/// The modelled `ConflictException` (HTTP 409) `CreateInvocation` answers when the
+/// `invocationId` the request supplied is one the session already holds.
+///
+/// Worded from the request alone, like [`invocation_not_found`]: the fixed template
+/// `Invocation with ID <invocationId> already exists`, interpolating the id the caller
+/// chose, naming no session and carrying no trailing period.
+pub fn invocation_already_exists(invocation_id: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!("Invocation with ID {invocation_id} already exists")),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) `GetInvocationStep` answers when
+/// the `(invocationIdentifier, invocationStepId)` pair it addresses resolves to no stored
+/// step.
+///
+/// ONE sentence for every shape the miss can take — no such invocation, or an invocation
+/// holding no such step — so the refusal does not say which of the two scopes missed and
+/// a caller cannot enumerate which ids exist under which parent by reading it. Both
+/// variable parts come from the request; the second noun is spelled the way the service
+/// spells it, so a client matching or logging on the text matches, and there is no
+/// trailing period.
+pub fn invocation_step_not_found(
+    invocation_identifier: &str,
+    invocation_step_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Combination of Invocation with ID {invocation_identifier} and Invcoation Step \
+             with ID {invocation_step_id} not found"
+        )),
+    }
+}
+
 /// The refusal the TAG plane answers when its `resourceArn` names no stored resource.
 ///
 /// The tagging operations are addressed by a `TaggableResourcesArn`, whose pattern admits

@@ -172,13 +172,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // Reporting only: the stored map, read back as it stands.
+        //
+        // `tags` is this operation's whole payload and is ALWAYS served: a resource
+        // carrying no tag reports the member as an EMPTY map, not as an absent member, so
+        // "this resource has no tags" and "this response does not carry the member" stay
+        // the two different answers they are and a client that reads the member
+        // unconditionally keeps working after the last key is removed. The on-disk
+        // `TagsMap` carries `@length(1, 200)`, which would preclude an empty map; what the
+        // service really answers for a resource whose last tag key was removed is
+        // `{"tags": {}}`, so the empty map is served deliberately and is not a bound to
+        // "fix" back to the shape the model declares.
         let tags: ::std::collections::HashMap<String, String> = session
             .tags
             .iter()
             .map(|(tag_key, value)| (tag_key.clone(), value.clone()))
             .collect();
-        Ok(ListTagsForResourceOutput {
-            tags: (!tags.is_empty()).then_some(tags),
-        })
+        Ok(ListTagsForResourceOutput { tags: Some(tags) })
     }
 }

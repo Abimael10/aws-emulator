@@ -208,12 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now();
         let Some(invocation) = session.invocations.get_mut(&input.invocation_identifier) else {
             return Err(PutInvocationStepErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Invocation {} was not found in session {session_id}.",
-                        input.invocation_identifier
-                    )),
-                },
+                crate::state::invocation_not_found(&input.invocation_identifier),
             )
             .into());
         };

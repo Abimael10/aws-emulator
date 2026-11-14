@@ -97,14 +97,18 @@ async fn create_session(router: &MultiServiceRouter, tags: Value) -> (String, St
     )
 }
 
-/// The tags `ListTagsForResource` reports for a session ARN, as a JSON value (`Null` when
-/// the member is absent, which is what a session carrying no tags reports — the model
-/// bounds `tags` at `length {min: 1}`).
+/// The tags `ListTagsForResource` reports for a session ARN, as a JSON value. The member
+/// is ALWAYS present: a session carrying no tag reports an EMPTY map, so "no tags" and
+/// "the member was not served" stay different answers.
 async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Value {
     let (status, out) = call(router, "GET", &format!("/tags/{}", label(arn)), Value::Null).await;
     assert_eq!(
         status, 200,
         "ListTagsForResource({arn}): expected 200, got {status} {out:?}"
+    );
+    assert!(
+        out.get("tags").is_some(),
+        "ListTagsForResource({arn}): expected the tags member to be served, got {out:?}"
     );
     out.get("tags").cloned().unwrap_or(Value::Null)
 }
@@ -200,7 +204,7 @@ async fn tagging_a_session_merges_into_what_it_already_carries() {
 
 /// RULE: `UntagResource` removes exactly the keys it names and leaves every other stored
 /// key; a key the session does not carry is a no-op, because the request asks for that key
-/// to be absent and it is. A session left with no tags reports the member as ABSENT.
+/// to be absent and it is. A session left with no tags reports an EMPTY map.
 #[tokio::test]
 async fn untagging_removes_only_the_keys_it_names() {
     let router = router();
@@ -232,11 +236,11 @@ async fn untagging_removes_only_the_keys_it_names() {
             vec!["c", "never-set"],
             json!({ "d": "4" }),
         ),
-        ("the last stored key", vec!["d"], Value::Null),
+        ("the last stored key", vec!["d"], json!({})),
         (
             "every key again, on a resource with none left",
             vec!["a", "b", "c", "d"],
-            Value::Null,
+            json!({}),
         ),
     ];
 

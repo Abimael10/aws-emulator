@@ -25,6 +25,8 @@ mod document_content;
 mod inline_agent_invocations;
 #[path = "all/inline_agent_return_control.rs"]
 mod inline_agent_return_control;
+#[path = "all/invocation_error_messages.rs"]
+mod invocation_error_messages;
 #[path = "all/invocations.rs"]
 mod invocations;
 #[path = "all/knowledge_base_retrieval.rs"]
@@ -41,6 +43,8 @@ mod prompt_optimization;
 mod pushed_document_retrieval;
 #[path = "all/reranking.rs"]
 mod reranking;
+#[path = "all/reranking_relevance.rs"]
+mod reranking_relevance;
 #[path = "all/retrieve_and_generate.rs"]
 mod retrieve_and_generate;
 #[path = "all/session_error_messages.rs"]

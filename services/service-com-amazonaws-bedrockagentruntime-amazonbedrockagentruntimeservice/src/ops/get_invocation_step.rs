@@ -178,25 +178,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(invocation) = session.invocations.get(&input.invocation_identifier) else {
+        // The step is addressed by the PAIR, so either shape of miss — no such
+        // invocation, or an invocation holding no such step — is the one refusal the
+        // service states for the combination (`state::invocation_step_not_found`).
+        let Some(step) = session
+            .invocations
+            .get(&input.invocation_identifier)
+            .and_then(|invocation| invocation.steps.get(&input.invocation_step_id))
+        else {
             return Err(GetInvocationStepErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Invocation {} was not found in session {}.",
-                        input.invocation_identifier, session.session_id
-                    )),
-                },
-            )
-            .into());
-        };
-        let Some(step) = invocation.steps.get(&input.invocation_step_id) else {
-            return Err(GetInvocationStepErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Invocation step {} was not found in invocation {}.",
-                        input.invocation_step_id, invocation.invocation_id
-                    )),
-                },
+                crate::state::invocation_step_not_found(
+                    &input.invocation_identifier,
+                    &input.invocation_step_id,
+                ),
             )
             .into());
         };

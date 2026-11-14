@@ -16,31 +16,49 @@
 //! * every source contributes exactly ONE result, carrying that source's POSITION in
 //!   the request's `sources` list as `index` — the list is permuted once for the query,
 //!   not once per document;
-//! * `relevanceScore` is a number in `[0, 1]` computed from the query text and that
+//! * `relevanceScore` is a number in `(0, 1]` computed from the query text and that
 //!   source document's own text, and from nothing else: the same (query, document) pair
 //!   scores the same in every call, whatever the rest of the candidate list holds;
 //! * `numberOfResults` keeps the leading `n` of that ordering.
+//!
+//! The `modelArn` the configuration names is RESOLVED before any of that: a reranking
+//! model is addressed by the ARN of a Bedrock foundation model, and a value that is not
+//! one is refused ([`INVALID_MODEL_ARN`]) rather than answered with a ranking produced
+//! by no named model.
 //!
 //! ## How the relevance score is computed
 //!
 //! NO neural reranker model runs inside this emulator, and nothing here invents a score
 //! and presents it as one a model produced (the same position
 //! `service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice`'s `state` module
-//! takes on inference). The score is instead the classic LEXICAL relevance of the pair,
-//! computed from the real text of the query and the document: the cosine similarity of
-//! their sublinear term-frequency vectors — `lnc.lnc` weighting in the SMART notation of
-//! Manning, Raghavan & Schütze, *Introduction to Information Retrieval* §6.4, where a
-//! term's weight in a bag is `1 + ln(tf)` and the vectors are length-normalised.
+//! takes on inference). What a reranker ANSWERS, though, is an ordering by how well a
+//! document answers the query, with a score that falls away sharply down that ordering —
+//! so the two things computed here are exactly those, from the real text of the pair:
 //!
-//! That choice is what makes the properties above hold, and each is a property of the
-//! real service too:
+//! * the RELEVANCE of the pair, in `[0, 1]`: how much of what the query ASKS ABOUT the
+//!   document carries (its share of the query's content-bearing terms, the measure that
+//!   decides the ordering), and how concentrated the document is on those terms (the
+//!   share of the document's own terms they are, which separates a document about the
+//!   query from a long one that merely mentions it). The query's FUNCTION words are not
+//!   what it asks about — they are carried by every document alike — so they are left
+//!   out, through the published list the `stop-words` crate carries, and both sides are
+//!   folded to their Snowball stems so a query about one inflection is answered by a
+//!   document spelling another. The same tokenisation, stop list and stemmer as
+//!   `service-com-amazonaws-kendraranking-awskendrarerankingfrontendservice`'s
+//!   `Rescore`, which ranks documents for a query for the same reason;
+//! * the SCORE, which is that relevance on a LOGARITHMIC scale
+//!   ([`relevance_score`]): a drop in relevance divides the score rather than subtracting
+//!   from it, so a materially better match scores orders of magnitude above a weak one and
+//!   the ranking a caller takes the top-k of is separated instead of being a band of
+//!   near-equal numbers. `1.0` for a document that carries the whole query and nothing
+//!   else; a positive FLOOR ([`relevance_score`] at zero relevance) for one that shares
+//!   no content term, never `0.0`, because the score is a strength of match and no
+//!   document is ruled out by having been reranked.
 //!
-//! * the value is in `[0, 1]`, `1.0` for a document whose terms are the query's in the
-//!   same proportions and `0.0` for one sharing no term;
-//! * it is a pure function of the ONE pair — a cross-encoder reranker scores each
-//!   (query, document) pair independently, so a corpus-relative weighting (BM25's
-//!   inverse document frequency, say) would be the wrong shape: a document's score
-//!   would move when an unrelated candidate joined the list.
+//! Both are a pure function of the ONE pair — a cross-encoder reranker scores each
+//! (query, document) pair independently, so a corpus-relative weighting (BM25's inverse
+//! document frequency, say) would be the wrong shape: a document's score would move when
+//! an unrelated candidate joined the list.
 //!
 //! A `JSON` source document is scored over the text its JSON carries ([`json_text`]),
 //! since that serialisation is what a reranker model is shown.
@@ -233,6 +251,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The reranking model is RESOLVED before anything is ranked: the ranking this
+        // call answers is the one the named model produces, so a `modelArn` that names
+        // no Bedrock foundation model is refused rather than served.
+        let model_arn = &configuration
+            .bedrock_reranking_configuration
+            .model_configuration
+            .model_arn;
+        if !names_foundation_model(model_arn) {
+            return Err(refuse(INVALID_MODEL_ARN.to_string()));
+        }
+
         // `nextToken` names a page of a response this service never splits: a request
         // carries at most 1000 sources (`RerankSourcesList`'s own length bound), so the
         // complete ranking always fits one response and NO call issues a token. A token
@@ -291,29 +320,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Authorization is decided against the reranker model this call runs against —
         // the resource an identity-based policy for `bedrock:Rerank` names — and before
         // the ranking is computed.
-        let resource = model_resource_arn(
-            ctx,
-            &configuration
-                .bedrock_reranking_configuration
-                .model_configuration
-                .model_arn,
-        );
-        if let Err(denied) = crate::state::authorize(&*self.engine, ctx, Self::NAME, &resource) {
+        if let Err(denied) = crate::state::authorize(&*self.engine, ctx, Self::NAME, model_arn) {
             return Err(RerankErrorModeled::AccessDeniedException(denied).into());
         }
 
         // ONE permutation of the source list for the query: every source is scored
         // against it exactly once, and the score of a pair depends on that pair alone.
-        let query_terms = TermVector::of(query_text);
+        let query_terms = QueryTerms::of(query_text);
         let mut ranked: Vec<(usize, f64)> = documents
             .iter()
             .enumerate()
-            .map(|(position, text)| (position, query_terms.similarity(&TermVector::of(text))))
+            .map(|(position, text)| (position, relevance_score(&query_terms, text)))
             .collect();
 
-        // Most relevant first. Sources of equal relevance keep the order they were
-        // given in, so the permutation is total and one request always answers the same
-        // way.
+        // Most relevant first. Two documents score the same only when they carry the
+        // query's terms to the same extent — the measure is of the pair, so two
+        // documents indistinguishable to it cannot be told apart by it either — and
+        // those keep the order they were given in, so the permutation is total and one
+        // request always answers the same way.
         ranked.sort_by(|left, right| {
             right
                 .1
@@ -354,9 +378,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// This operation's modelled `ValidationException` (HTTP 400), naming the member that
-/// was wrong and what it requires — the caller has to fix the request from this text
-/// alone.
+/// This operation's modelled `ValidationException` (HTTP 400). Every refusal it carries
+/// states what the caller has to fix from the text alone: the member that was wrong and
+/// what it requires, or — where the service words the refusal itself — that sentence
+/// ([`INVALID_MODEL_ARN`]).
 fn refuse(message: String) -> RerankError {
     RerankErrorModeled::ValidationException(ValidationException {
         message: Some(message),
@@ -364,27 +389,164 @@ fn refuse(message: String) -> RerankError {
     .into()
 }
 
-/// The resource an identity-based policy for `bedrock:Rerank` names: the reranker model
-/// the call runs against.
+/// The resolution the reranking `modelArn` must satisfy: it names a Bedrock FOUNDATION
+/// MODEL — the resource a reranker is published as, whose ARN carries no account because
+/// the service publishes it rather than an account creating it.
 ///
-/// A `modelArn` that is already an ARN IS that resource. A bare model id — which the
-/// modelled `BedrockModelArn` pattern also admits — names the foundation model of that
-/// name in the region the caller signed for, the same ARN
-/// `service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice`'s
-/// `foundation_model_arn` builds for a base model, so the two planes make the decision
-/// about one resource name.
-fn model_resource_arn(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    model_arn: &str,
-) -> String {
-    if model_arn.starts_with("arn:") {
-        return model_arn.to_string();
+/// The modelled `BedrockModelArn` pattern is far wider than that (it admits a bare model
+/// id, an account-scoped resource and a `sagemaker` ARN), so this is the handler's check
+/// rather than the boundary validator's. Read through the ONE ARN parse this tree has
+/// (`service_common::arn`), so this service cannot disagree with any other about what an
+/// ARN is.
+fn names_foundation_model(model_arn: &str) -> bool {
+    let Some(parsed) = ::service_common::arn::parse(model_arn) else {
+        return false;
+    };
+    if parsed.vendor != crate::state::ARN_NAMESPACE || !parsed.account.is_empty() {
+        return false;
     }
-    ::engine::emulator_arn(
-        crate::state::ARN_NAMESPACE,
-        &crate::state::request_region(ctx),
-        &format!("foundation-model/{model_arn}"),
-    )
+    if ::service_common::arn::region_label(parsed.region).is_none() {
+        return false;
+    }
+    ::service_common::arn::resource_id_of_type(model_arn, FOUNDATION_MODEL_RESOURCE_TYPE)
+        .is_some_and(|model_id| !model_id.is_empty())
+}
+
+/// The resource type a foundation model's ARN addresses.
+const FOUNDATION_MODEL_RESOURCE_TYPE: &str = "foundation-model";
+
+/// The sentence a `modelArn` that names no Bedrock foundation model is refused with, as
+/// AWS words it for this error class: ENTIRELY fixed text, stating the format the value
+/// has to take (the angle-bracketed field names are part of the sentence, not values to
+/// interpolate). The rejected value is not echoed and no member path is named.
+const INVALID_MODEL_ARN: &str = "The provided model ARN for reranking is invalid. Please, use \
+                                 a valid model ARN. Also check the model ARN follows this \
+                                 format: arn:<partition>:bedrock:<region>::foundation-model/\
+                                 <model-id>";
+
+/// How sharply the reported score falls away as relevance does: the number of natural
+/// logarithms between the score of a perfect match and the score of a document that
+/// shares nothing with the query.
+///
+/// It is what puts the ranking on a LOGARITHMIC scale (see the module docs): a drop in
+/// relevance DIVIDES the score rather than subtracting from it, so the gap between two
+/// ranks grows with the gap in their relevance — a materially better match scores orders
+/// of magnitude above a weak one, where a linear score would have crowded both into one
+/// band. The figure is EMULATOR-CHOSEN — no reranker model runs here to publish one — and
+/// only its size matters: it spreads the scale over about five decades.
+const SCORE_DECAY: f64 = 12.0;
+
+/// How much of the relevance is the share of the QUERY the document answers: the larger
+/// part, because that is what the ordering is of — a document that carries more of what
+/// the query asks about is the more relevant one, however long it is.
+const COVERAGE_SHARE: f64 = 0.8;
+
+/// How much of the relevance is the share of the DOCUMENT the query accounts for: the
+/// smaller part, which separates a document that is ABOUT the query from a long one that
+/// merely mentions it. It moves a pair's relevance by at most this much, so it decides
+/// between documents whose coverage of the query is equal or close: a document covering
+/// one more of the query's content terms than another still outranks it as long as the
+/// query carries at most `COVERAGE_SHARE / DENSITY_SHARE` of them.
+const DENSITY_SHARE: f64 = 1.0 - COVERAGE_SHARE;
+
+/// The `relevanceScore` of one (query, document) pair: [`relevance`] on the logarithmic
+/// scale of [`SCORE_DECAY`].
+///
+/// `1.0` exactly for a document that carries the whole query and nothing besides it, and
+/// `exp(-SCORE_DECAY)` — a positive floor, never `0.0` — for one that shares no term with
+/// it.
+fn relevance_score(query: &QueryTerms, document: &str) -> f64 {
+    let relevance = query.relevance(&stemmed_terms(document));
+    (-SCORE_DECAY * (1.0 - relevance)).exp().clamp(0.0, 1.0)
+}
+
+/// The query, as the term set a document's relevance to it is measured against: what the
+/// query ASKS ABOUT — its terms without the function words, which every document carries
+/// alike and so distinguish none of them. A query of nothing BUT function words keeps
+/// them all, so it still ranks its documents by the words it has rather than by none.
+#[derive(Debug)]
+struct QueryTerms {
+    content: ::std::collections::BTreeSet<String>,
+}
+
+impl QueryTerms {
+    /// The term set of `text`.
+    fn of(text: &str) -> Self {
+        let function_words = function_words();
+        let content: ::std::collections::BTreeSet<String> = words(text)
+            .filter(|word| !function_words.contains(word))
+            .map(|word| stem(&word))
+            .collect();
+        let content = if content.is_empty() {
+            stemmed_terms(text)
+        } else {
+            content
+        };
+        Self { content }
+    }
+
+    /// How relevant a document carrying `document` terms is to this query, in `[0, 1]`:
+    /// [`COVERAGE_SHARE`] of the query's content terms the document carries, plus
+    /// [`DENSITY_SHARE`] of the document's own terms that are those content terms. `1.0`
+    /// exactly when the document carries every content term and carries nothing else;
+    /// `0.0` when the two share no content term at all — the query's phrasing alone
+    /// ranks nothing.
+    fn relevance(&self, document: &::std::collections::BTreeSet<String>) -> f64 {
+        if self.content.is_empty() || document.is_empty() {
+            return 0.0;
+        }
+        let covered = self
+            .content
+            .iter()
+            .filter(|term| document.contains(*term))
+            .count();
+        let coverage = covered as f64 / self.content.len() as f64;
+        let density = covered as f64 / document.len() as f64;
+        (COVERAGE_SHARE * coverage + DENSITY_SHARE * density).clamp(0.0, 1.0)
+    }
+}
+
+/// The distinct stemmed terms of `text`.
+fn stemmed_terms(text: &str) -> ::std::collections::BTreeSet<String> {
+    words(text).map(|word| stem(&word)).collect()
+}
+
+/// The words of `text`: its maximal runs of alphanumeric characters, lowercased, so
+/// matching is case- and punctuation-insensitive. Unicode-aware, because a document and
+/// a query are free text in any script. Unstemmed, because a function word is named in
+/// the published list by the word itself.
+fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// One already-lowercased word's Snowball English stem.
+///
+/// A term is compared by its stem on BOTH sides, query and document, so a query term
+/// matches whichever inflected form a document spells it in — a document about
+/// "batteries" answers a query about a "battery".
+fn stem(word: &str) -> String {
+    stemmer().stem(word).into_owned()
+}
+
+/// The Snowball English stemmer, built once and shared.
+fn stemmer() -> &'static ::rust_stemmers::Stemmer {
+    static STEMMER: ::std::sync::OnceLock<::rust_stemmers::Stemmer> = ::std::sync::OnceLock::new();
+    STEMMER.get_or_init(|| ::rust_stemmers::Stemmer::create(::rust_stemmers::Algorithm::English))
+}
+
+/// The English function words, lowercased: the published list the `stop-words` crate
+/// carries, rather than a list written out here. Built once and shared.
+fn function_words() -> &'static ::std::collections::BTreeSet<String> {
+    static FUNCTION_WORDS: ::std::sync::OnceLock<::std::collections::BTreeSet<String>> =
+        ::std::sync::OnceLock::new();
+    FUNCTION_WORDS.get_or_init(|| {
+        ::stop_words::get(::stop_words::LANGUAGE::English)
+            .into_iter()
+            .map(|word| word.to_lowercase())
+            .collect()
+    })
 }
 
 /// The text one source document carries, or the `ValidationException` message owed for
@@ -458,65 +620,4 @@ fn json_text(value: &JsonValue) -> String {
     let mut parts: Vec<String> = Vec::new();
     walk(value, 0, &mut parts);
     parts.join(" ")
-}
-
-/// One text as the weighted bag of terms relevance is computed over: each term's
-/// `1 + ln(tf)` weight (sublinear term frequency: the tenth occurrence of a term says
-/// far less than the second), and the vector's Euclidean norm.
-#[derive(Debug)]
-struct TermVector {
-    /// Term -> weight, keyed so two vectors can be intersected term by term.
-    weights: BTreeMap<String, f64>,
-    /// `sqrt(sum of squared weights)`, the length the cosine divides by. Zero exactly
-    /// when the text carries no term at all.
-    norm: f64,
-}
-
-impl TermVector {
-    /// The vector of `text`.
-    fn of(text: &str) -> Self {
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for term in terms(text) {
-            *counts.entry(term).or_default() += 1;
-        }
-        let weights: BTreeMap<String, f64> = counts
-            .into_iter()
-            .map(|(term, count)| (term, 1.0 + (count as f64).ln()))
-            .collect();
-        let norm = weights.values().map(|weight| weight * weight).sum::<f64>().sqrt();
-        Self { weights, norm }
-    }
-
-    /// The relevance of `document` to this (query) vector: the cosine of the angle
-    /// between them, in `[0, 1]` — `1.0` when the two carry the same terms in the same
-    /// proportions, `0.0` when they share no term (and when either carries no term at
-    /// all, which has no direction to compare).
-    fn similarity(&self, document: &Self) -> f64 {
-        if self.norm == 0.0 || document.norm == 0.0 {
-            return 0.0;
-        }
-        // Walk the shorter side, so the cost is in the query's terms for the long
-        // documents a reranker is given.
-        let (shorter, longer) = if self.weights.len() <= document.weights.len() {
-            (&self.weights, &document.weights)
-        } else {
-            (&document.weights, &self.weights)
-        };
-        let dot: f64 = shorter
-            .iter()
-            .filter_map(|(term, weight)| longer.get(term).map(|other| weight * other))
-            .sum();
-        // Clamped only against floating-point drift at the extremes: the Cauchy-Schwarz
-        // inequality already bounds the quotient by 1, and no weight is negative.
-        (dot / (self.norm * document.norm)).clamp(0.0, 1.0)
-    }
-}
-
-/// The terms of `text`: its maximal runs of alphanumeric characters, lowercased, so
-/// matching is case- and punctuation-insensitive. Unicode-aware, because a document and
-/// a query are free text in any script.
-fn terms(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.split(|character: char| !character.is_alphanumeric())
-        .filter(|term| !term.is_empty())
-        .map(str::to_lowercase)
 }
