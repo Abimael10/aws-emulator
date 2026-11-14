@@ -2,10 +2,14 @@
 
 //! Two rules of this service's vocabulary and tagging state, over the wire:
 //!
-//! 1. A delete in the custom-vocabulary family needs the entity to be there — a name
-//!    this account holds no such resource under is refused with this service's
-//!    absent-resource `BadRequestException`, and the call stores nothing. The other
-//!    refusal on that path is the documented non-terminal-state one (a `PENDING`
+//! 1. A delete in the custom-vocabulary family answers for the record its name
+//!    identifies, each family in its own way about PRESENCE: the vocabulary-filter
+//!    delete needs the entity to be there, so a name this account holds no filter under
+//!    is refused with this service's absent-resource `BadRequestException`, while the
+//!    custom-vocabulary delete is idempotent about presence and answers its empty
+//!    success for a name holding no record (the class is spanned by
+//!    `crate::vocabulary_delete_idempotence`). Either way the call stores nothing. The
+//!    other refusal on that path is the documented non-terminal-state one (a `PENDING`
 //!    vocabulary), which `crate::vocabularies` pins.
 //! 2. A tag set this service REPORTS for a resource it holds is always present:
 //!    `ListTagsForResource` answers an empty `Tags` list for a resource that carries
@@ -15,17 +19,9 @@
 //! dispatches on, reusing the transcription-job suite's harness
 //! (`crate::transcription_jobs`) rather than standing up a second emulator.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use crate::transcription_jobs::{Reply, Transcribe};
-
-/// Long enough for a created vocabulary's `PENDING -> READY` transition to have
-/// fallen due (one `crate::state::VOCABULARY_TRANSITION_DELAY`, 500 ms, with room for
-/// a slow machine), so a delete under test is answered for the resource's presence
-/// rather than refused for its state.
-const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 
 /// Assert `reply` is a SUCCESS, whichever 2xx this protocol puts on the status line.
 ///
@@ -112,6 +108,27 @@ struct Family {
     /// The create members that carry this resource's content, as that operation
     /// models them (`Phrases` for a vocabulary, `Words` for a filter).
     content: fn(&str) -> Value,
+    /// Whether this family's delete is IDEMPOTENT about presence: the recorded answer
+    /// for a name the account holds no record under is this operation's empty success
+    /// for the custom-vocabulary family, and the absent-resource refusal for the filter
+    /// family, whose delete needs the entity to be there.
+    idempotent_absent: bool,
+    /// Whether the family models a BUILD state, so a record of it is `PENDING` until the
+    /// transition the clock owes it has fallen due and a delete has to wait for that
+    /// state. A vocabulary has `VocabularyState`; a vocabulary filter models none.
+    has_build_state: bool,
+}
+
+/// The answer a delete of a name the account holds no record of gets, by family: the
+/// empty success where that family's delete is idempotent about presence, the
+/// absent-resource refusal where it needs the entity.
+fn assert_absent_delete(family: &Family, reply: &Reply, case: &str) {
+    if family.idempotent_absent {
+        succeeded(reply, case);
+        empty_body(reply, case);
+    } else {
+        absent_resource_refusal(reply, case, family.kind);
+    }
 }
 
 /// The two resource families whose delete this suite spans. Both are created and
@@ -133,6 +150,8 @@ fn families() -> Vec<Family> {
                     "Phrases": ["Aardvark", "Transcribe"]
                 })
             },
+            idempotent_absent: true,
+            has_build_state: true,
         },
         Family {
             kind: "vocabulary filter",
@@ -148,6 +167,8 @@ fn families() -> Vec<Family> {
                     "Words": ["crud", "bogus"]
                 })
             },
+            idempotent_absent: false,
+            has_build_state: false,
         },
     ]
 }
@@ -170,10 +191,10 @@ fn absent_names() -> Vec<(&'static str, String)> {
 }
 
 /// RULE 1: a delete of a custom-vocabulary-family resource this account does not hold
-/// is REFUSED, for every family and every form of name — and stores nothing, so the
-/// listing stays empty.
+/// is answered the way that family answers presence — for every family and every form
+/// of name — and stores nothing, so the listing stays empty.
 #[tokio::test]
-async fn deleting_a_resource_this_account_does_not_hold_is_refused() {
+async fn deleting_a_resource_this_account_does_not_hold_stores_nothing() {
     let transcribe = Transcribe::new();
 
     for family in families() {
@@ -182,7 +203,7 @@ async fn deleting_a_resource_this_account_does_not_hold_is_refused() {
             let reply = transcribe
                 .call(family.delete, json!({family.name_member: name}))
                 .await;
-            absent_resource_refusal(&reply, &case, family.kind);
+            assert_absent_delete(&family, &reply, &case);
 
             // The delete must not MINT what it did not find: the resource is still
             // absent to a reader afterwards.
@@ -214,11 +235,11 @@ async fn deleting_a_resource_this_account_does_not_hold_is_refused() {
     );
 }
 
-/// RULE 1, the repeat-delete axis: the delete that removed a resource succeeds ONCE —
-/// every later run of the same call is the absent-resource refusal, however many times
-/// a caller runs it.
+/// RULE 1, the repeat-delete axis: the delete that removed a resource succeeds, and
+/// every later run of the same call answers that family's way about a record that is no
+/// longer there — however many times a caller runs it, the resource stays gone.
 #[tokio::test]
-async fn only_the_first_delete_of_a_resource_succeeds() {
+async fn repeating_the_delete_of_a_resource_keeps_it_gone() {
     let transcribe = Transcribe::new();
 
     for family in families() {
@@ -231,10 +252,14 @@ async fn only_the_first_delete_of_a_resource_succeeds() {
             &case,
         );
 
-        // A vocabulary is PENDING for the span its build is owed, and a delete while
-        // it is still being processed is the documented refusal (pinned by
-        // `crate::vocabularies`), so wait the span out before deleting.
-        std::thread::sleep(PAST_THE_TRANSITION);
+        // A vocabulary is PENDING while its build is owed, and a delete while it is
+        // still being processed is the documented refusal (pinned by
+        // `crate::vocabularies`), so the row waits for the STATE the clock owes that
+        // build — polled through the family's own reader — rather than for a span of the
+        // wall clock. The filter family models no build state and needs no wait.
+        if family.has_build_state {
+            transcribe.vocabulary_ready(&name, None).await;
+        }
 
         for attempt in 1..=3 {
             let case = format!("{case} #{attempt}");
@@ -245,7 +270,7 @@ async fn only_the_first_delete_of_a_resource_succeeds() {
                 succeeded(&reply, &case);
                 empty_body(&reply, &case);
             } else {
-                absent_resource_refusal(&reply, &case, family.kind);
+                assert_absent_delete(&family, &reply, &case);
             }
             refused(
                 &transcribe
@@ -277,7 +302,10 @@ async fn a_delete_only_removes_its_own_resource_family() {
             .await,
         case,
     );
-    std::thread::sleep(PAST_THE_TRANSITION);
+    // The wait is for the STATE the clock owes the vocabulary's build, polled through the
+    // family's own reader (`Transcribe::vocabulary_ready`), never for a span of the wall
+    // clock; the filter family models no build state, so it needs none.
+    transcribe.vocabulary_ready(shared, None).await;
 
     let deleted = transcribe
         .call("DeleteVocabulary", json!({"VocabularyName": shared}))
@@ -290,17 +318,17 @@ async fn a_delete_only_removes_its_own_resource_family() {
         case,
     );
     // The filter of the same name is untouched, and the now-absent vocabulary delete
-    // is refused without touching it.
+    // answers its empty success without touching it.
     transcribe
         .call("GetVocabularyFilter", json!({"VocabularyFilterName": shared}))
         .await
         .ok(case);
-    absent_resource_refusal(
+    assert_absent_delete(
+        &families()[0],
         &transcribe
             .call("DeleteVocabulary", json!({"VocabularyName": shared}))
             .await,
         case,
-        "vocabulary",
     );
     transcribe
         .call("GetVocabularyFilter", json!({"VocabularyFilterName": shared}))

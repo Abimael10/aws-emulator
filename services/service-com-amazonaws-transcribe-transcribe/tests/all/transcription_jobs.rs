@@ -212,7 +212,11 @@ impl Transcribe {
     /// BOTH custom-vocabulary families report the same member for the same reason — a
     /// build is `PENDING` while it runs and settles in one of the terminal values of
     /// that one enum — so the two waits differ in nothing but the reader they poll.
-    async fn vocabulary_state_settled(
+    ///
+    /// `pub(crate)` so a suite that spans BOTH families in one table
+    /// (`crate::vocabulary_delete_idempotence`) waits through this one poll loop, naming
+    /// the reader of the row it is on, rather than keeping a second copy of it.
+    pub(crate) async fn vocabulary_state_settled(
         &self,
         get: &str,
         name: &str,

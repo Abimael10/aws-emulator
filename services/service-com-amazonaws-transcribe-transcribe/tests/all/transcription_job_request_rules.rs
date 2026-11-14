@@ -584,10 +584,11 @@ fn references() -> Vec<Reference> {
 /// be found. Check the job name and try your request again." in the recorded
 /// responses), naming the KIND and never the name the caller asked about.
 ///
-/// The wording belongs to the FAMILY: the Call Analytics category family words the same
-/// condition its own way, which its refusal suite
-/// (`crate::call_analytics_category_refusals`) pins, so that family's sentence is read
-/// from there rather than composed here. The custom MEDICAL vocabulary family shares
+/// The wording belongs to the FAMILY: the Call Analytics category family and the custom
+/// language model family each word the same condition their own way, which their own
+/// suites (`crate::call_analytics_category_refusals`,
+/// `crate::language_model_not_found_sentence`) pin, so those sentences are read from
+/// there rather than composed here. The custom MEDICAL vocabulary family shares
 /// the plain vocabulary family's sentence — the recorded refusal for an absent medical
 /// vocabulary reads "The requested vocabulary couldn't be found. Check the vocabulary
 /// name and try your request again.", with no "medical" in either clause.
@@ -598,6 +599,9 @@ fn references() -> Vec<Reference> {
 pub(crate) fn not_found_message(kind: &str) -> String {
     if kind == "category" {
         return crate::call_analytics_category_refusals::ABSENT_CATEGORY_MESSAGE.to_string();
+    }
+    if kind == "language model" {
+        return crate::language_model_not_found_sentence::ABSENT_MODEL_MESSAGE.to_string();
     }
     let kind = if kind == "medical vocabulary" {
         "vocabulary"

@@ -27,6 +27,7 @@
 
 use serde_json::json;
 
+use crate::language_model_not_found_sentence::ABSENT_MODEL_MESSAGE;
 use crate::language_model_quota::stored_names;
 use crate::language_models::{language_model_request, PAST_THE_TRANSITION};
 use crate::transcription_jobs::{Reply, Transcribe};
@@ -42,11 +43,10 @@ const ABSENT_RESOURCE_SHAPE: &str = "BadRequestException";
 /// (`crate::state::KIND_LANGUAGE_MODEL`).
 const MODEL_KIND: &str = "language model";
 
-/// How this service words "there is no such custom language model"
-/// (`crate::state::not_found_message` for this family's kind): the service's own
-/// sentence, naming the KIND of resource and no value from the request.
-const ABSENT_MODEL_MESSAGE: &str = "The requested language model couldn't be found. \
-     Check the language model name and try your request again.";
+// How this service words "there is no such custom language model"
+// (`crate::state::not_found_message` for this family's kind) is single-homed in the
+// suite over that sentence (`crate::language_model_not_found_sentence`), which is where
+// `ABSENT_MODEL_MESSAGE` above comes from, so the two cannot drift.
 
 /// The Region the calls under test are signed for.
 const SERVING_REGION: &str = "us-east-1";

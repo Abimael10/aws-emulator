@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/absent_record_resolution.rs"]
 mod absent_record_resolution;
+#[path = "all/absent_s3_address_messages.rs"]
+mod absent_s3_address_messages;
 #[path = "all/call_analytics_categories.rs"]
 mod call_analytics_categories;
 #[path = "all/call_analytics_category_listing.rs"]
@@ -77,6 +79,8 @@ mod language_model_delete_requires_the_model;
 mod language_model_encryption_updates;
 #[path = "all/language_model_listing.rs"]
 mod language_model_listing;
+#[path = "all/language_model_not_found_sentence.rs"]
+mod language_model_not_found_sentence;
 #[path = "all/language_model_quota.rs"]
 mod language_model_quota;
 #[path = "all/language_model_training_data.rs"]
@@ -171,6 +175,8 @@ mod transcription_jobs;
 mod vocabularies;
 #[path = "all/vocabulary_delete_and_tag_sets.rs"]
 mod vocabulary_delete_and_tag_sets;
+#[path = "all/vocabulary_delete_idempotence.rs"]
+mod vocabulary_delete_idempotence;
 #[path = "all/vocabulary_download_content.rs"]
 mod vocabulary_download_content;
 #[path = "all/vocabulary_download_isolation.rs"]

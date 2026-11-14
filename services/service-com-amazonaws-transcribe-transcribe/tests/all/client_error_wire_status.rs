@@ -16,10 +16,13 @@
 //! 2. Every success answers HTTP 200.
 //! 3. A request naming a resource this account does not hold is refused with
 //!    `BadRequestException` — the shape whose own model documentation covers "the
-//!    entity you're trying to delete doesn't exist" — and the refusal names the KIND
-//!    of resource, never the name the caller asked about. That holds whether the
-//!    operation reads, writes or DELETES: a delete needs the entity to be there (the
-//!    class is spanned by `crate::vocabulary_delete_and_tag_sets`).
+//!    entity you're trying to delete doesn't exist" — and the refusal carries that
+//!    family's own not-found sentence, which names the KIND of resource and never the
+//!    name the caller asked about. That holds whether the operation reads, writes or
+//!    DELETES — for the delete of a family that needs the entity to be there
+//!    (`crate::delete_requires_the_entity` spans that class; the custom-vocabulary
+//!    deletes are idempotent about presence instead, which
+//!    `crate::vocabulary_delete_idempotence` spans).
 //!
 //! The harness (the emulator, the awsJson1_1 call and the answer accessors) is the
 //! transcription-job suite's, reused rather than stood up a second time.
@@ -296,12 +299,6 @@ async fn a_resource_this_account_does_not_hold_is_a_bad_request() {
             KIND_RESOURCE,
         ),
         (
-            "DeleteVocabulary for a vocabulary that was never created",
-            "DeleteVocabulary",
-            json!({"VocabularyName": "never-created"}),
-            KIND_VOCABULARY,
-        ),
-        (
             "DeleteVocabularyFilter for a filter that was never created",
             "DeleteVocabularyFilter",
             json!({"VocabularyFilterName": "never-created"}),
@@ -319,13 +316,16 @@ async fn a_resource_this_account_does_not_hold_is_a_bad_request() {
         let refused = transcribe.call(operation, request.clone()).await;
         refused.refused(case, 400, "BadRequestException");
 
-        // The refusal names the KIND of resource and does not echo the name or ARN the
-        // caller asked about: these texts are the service's own, not a rendering of
-        // the request.
+        // The refusal carries the family's own not-found sentence, which names the KIND
+        // of resource and does not echo the name or ARN the caller asked about: these
+        // texts are the service's own, not a rendering of the request. The wording is
+        // read from its one home (`crate::transcription_job_request_rules`), which words
+        // it per family.
         let message = refused.error_message(case);
-        assert!(
-            message.contains(&format!("The requested {kind} couldn't be found")),
-            "case {case:?}: the refusal must name the {kind:?} kind, got {message:?}"
+        let expected = crate::transcription_job_request_rules::not_found_message(kind);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the {kind:?} refusal {expected:?}, got {message:?}"
         );
         for asked_about in request.as_object().expect("an object").values() {
             if let Some(asked_about) = asked_about.as_str() {

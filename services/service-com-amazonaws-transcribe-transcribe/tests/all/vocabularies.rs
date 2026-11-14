@@ -381,7 +381,9 @@ async fn a_vocabulary_being_processed_cannot_be_deleted() {
         .await
         .ok("the vocabulary survived the refused delete");
 
-    std::thread::sleep(PAST_THE_TRANSITION);
+    // The wait is for the STATE the clock owes the build, polled through the family's own
+    // reader (`Transcribe::vocabulary_ready`), never for a span of the wall clock.
+    transcribe.vocabulary_ready("pending-delete", None).await;
     transcribe
         .call("DeleteVocabulary", json!({"VocabularyName": "pending-delete"}))
         .await
@@ -390,16 +392,17 @@ async fn a_vocabulary_being_processed_cannot_be_deleted() {
         .call("GetVocabulary", json!({"VocabularyName": "pending-delete"}))
         .await
         .refused("read a deleted vocabulary", 400, "BadRequestException");
-    // A DELETE NEEDS THE ENTITY: a name this account holds no vocabulary under is the
-    // absent-resource refusal, not an already-satisfied delete —
-    // `crate::vocabulary_delete_and_tag_sets` spans that class, this row keeps the
+    // A DELETE OF A NAME THIS ACCOUNT HOLDS NO VOCABULARY UNDER is already satisfied:
+    // it answers this operation's empty success rather than a refusal —
+    // `crate::vocabulary_delete_idempotence` spans that class, this row keeps the
     // lifecycle honest about it.
-    crate::vocabulary_delete_and_tag_sets::absent_resource_refusal(
-        &transcribe
-            .call("DeleteVocabulary", json!({"VocabularyName": "never-created"}))
-            .await,
+    let absent = transcribe
+        .call("DeleteVocabulary", json!({"VocabularyName": "never-created"}))
+        .await;
+    absent.ok_status("delete a vocabulary that does not exist", 200);
+    crate::vocabulary_delete_and_tag_sets::empty_body(
+        &absent,
         "delete a vocabulary that does not exist",
-        "vocabulary",
     );
 }
 

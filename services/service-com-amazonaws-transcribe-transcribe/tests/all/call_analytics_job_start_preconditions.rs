@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use crate::absent_s3_address_messages::S3_BUCKET_DOES_NOT_EXIST;
 use crate::call_analytics_jobs::{
     create_named_resources, get, list, names_of, MODEL_TRAINING_BUCKET, MODEL_TRAINING_KEY,
     PAST_THE_TRANSITION,
@@ -84,8 +85,11 @@ async fn emulator_with_staged_media() -> Transcribe {
 /// wording.
 enum Unmet {
     /// The media the start names is an address the object store reports it does not
-    /// hold.
+    /// hold: a key a bucket that IS there holds none of.
     Media,
+    /// The media the start names is in a BUCKET the object store does not hold at all,
+    /// which the refusal words its own way (`crate::absent_s3_address_messages`).
+    MediaBucket,
     /// A settings member names a custom resource the account does not hold; the word is
     /// the family that member reads, which a refusal names.
     NotHeld(&'static str),
@@ -101,6 +105,7 @@ impl Unmet {
     fn expected_message(&self) -> String {
         match self {
             Self::Media | Self::MediaAndNotHeld => MEDIA_NAMES_NO_OBJECT.to_string(),
+            Self::MediaBucket => S3_BUCKET_DOES_NOT_EXIST.to_string(),
             Self::NotHeld(kind) => not_found_message(kind),
         }
     }
@@ -142,7 +147,7 @@ fn rows() -> Vec<Row> {
             media: || json!({"MediaFileUri": format!("s3://{ABSENT_BUCKET}/call.wav")}),
             served_media: staged_media,
             settings: || Value::Null,
-            unmet: Unmet::Media,
+            unmet: Unmet::MediaBucket,
         },
         Row {
             case: "media at a key nothing was ever written to",

@@ -1071,12 +1071,17 @@ pub fn resource_kind(resource_type: &str) -> &'static str {
 /// side of the same error channel).
 ///
 /// The wording is a property of the FAMILY, not a template over every family: most
-/// families share the sentence above, and the Call Analytics category family words the
-/// same condition its own way ([`CATEGORY_NOT_FOUND_MESSAGE`]), so the text is looked
-/// up per family here rather than composed from the kind word at each call site.
+/// families share the sentence above, while the Call Analytics category family
+/// ([`CATEGORY_NOT_FOUND_MESSAGE`]) and the custom language model family
+/// ([`LANGUAGE_MODEL_NOT_FOUND_MESSAGE`]) each word the same condition their own way, so
+/// the text is looked up per family here rather than composed from the kind word at each
+/// call site.
 pub fn not_found_message(kind: &str) -> String {
     if kind == KIND_CATEGORY {
         return CATEGORY_NOT_FOUND_MESSAGE.to_string();
+    }
+    if kind == KIND_LANGUAGE_MODEL {
+        return LANGUAGE_MODEL_NOT_FOUND_MESSAGE.to_string();
     }
     // The medical vocabulary family words this condition with the PLAIN vocabulary
     // noun: its recorded refusal is the very sentence the non-medical family carries
@@ -1104,6 +1109,17 @@ pub fn not_found_message(kind: &str) -> String {
 /// QUOTATION MARK), as the service writes them, not the ASCII `'`.
 pub const CATEGORY_NOT_FOUND_MESSAGE: &str = "The category that you\u{2019}ve specified \
      couldn\u{2019}t be found. Check the category name and try your request again.";
+
+/// How this service words "there is no such custom language model", for every operation
+/// of that family that looks one up — the read, the update and the delete.
+///
+/// Entirely FIXED text, like [`CATEGORY_NOT_FOUND_MESSAGE`]: the recorded refusal names
+/// the family the way that family's own documentation names it ("the specified custom
+/// language model"), and the `ModelName` the caller asked about appears nowhere in it.
+/// The second clause is the one every family's not-found sentence carries, naming the
+/// kind word this family is known by ([`KIND_LANGUAGE_MODEL`]).
+pub const LANGUAGE_MODEL_NOT_FOUND_MESSAGE: &str = "The specified custom language model \
+     couldn't be found. Check the language model name and try your request again.";
 
 /// How this service words "that Call Analytics category name is already taken", for the
 /// create that claims a category name.
@@ -2758,10 +2774,16 @@ pub enum VocabularyFileVerdict {
     /// The store served the file: these are the terms it holds, in the order it lists
     /// them.
     Read(Vec<String>),
-    /// The object store ITSELF answered that there is no object at that address, or the
+    /// The object store ITSELF answered that there is nothing at that address, or the
     /// URI is of the Amazon S3 scheme and addresses no object of it at all
     /// ([`s3_uri_addresses_no_object`]): the request named a file that is not there, so
     /// it is refused and nothing is recorded ([`URI_NAMES_NO_OBJECT`]).
+    ///
+    /// ONE sentence for every way such an address fails to resolve, unlike the media a
+    /// job start is pointed at ([`MediaVerdict`], which names the bucket when the store
+    /// says it holds none): the members that name this file are about the FILE, and the
+    /// recorded refusal for an address whose bucket the store does not hold is the very
+    /// sentence a key it does not hold gets.
     NoSuchObject,
     /// The file holds more bytes than a custom vocabulary may
     /// ([`MAX_VOCABULARY_CONTENT_BYTES`]), so it is refused rather than built from —
@@ -2879,7 +2901,9 @@ pub async fn resolve_vocabulary_file(
         Err(error) => {
             // S3 itself saying it holds nothing at that address is what makes the file
             // one the request may not name: the vocabulary is not created and the
-            // caller is told so synchronously.
+            // caller is told so synchronously — with the one sentence these members word
+            // an unresolvable file address with, whether the store answered that the
+            // bucket or the key is the part it holds none of.
             if object_is_absent(&error) {
                 return VocabularyFileVerdict::NoSuchObject;
             }

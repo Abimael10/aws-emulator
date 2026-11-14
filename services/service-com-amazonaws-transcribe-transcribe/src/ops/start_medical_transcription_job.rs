@@ -358,8 +358,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await
         .verdict;
-        if media_verdict == crate::state::MediaVerdict::NoSuchObject {
-            return Err(bad_request(crate::state::URI_NAMES_NO_OBJECT));
+        // The refusal states what the object store answered is absent: a BUCKET it does
+        // not hold is a different failure from a key inside one that is there, and the
+        // message is the only thing that tells the caller which.
+        if let crate::state::MediaVerdict::Absent(message) = media_verdict {
+            return Err(bad_request(message));
         }
         // What the clock owes this job instead of a transcript, judged once here from
         // the media the request pointed at: a job the service found nothing wrong with

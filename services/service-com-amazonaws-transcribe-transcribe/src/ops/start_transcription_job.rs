@@ -496,8 +496,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &[input.media.media_file_uri.as_deref().unwrap_or_default()],
         )
         .await;
-        if media_resolution.verdict == crate::state::MediaVerdict::NoSuchObject {
-            return Err(bad_request(crate::state::URI_NAMES_NO_OBJECT));
+        // The refusal states what the object store answered is absent — the bucket, or
+        // an object in a bucket that is there.
+        if let crate::state::MediaVerdict::Absent(message) = media_resolution.verdict {
+            return Err(bad_request(message));
         }
         // What the clock owes this job instead of a transcript, judged once here from
         // the media the request pointed at: a job the service found nothing wrong with

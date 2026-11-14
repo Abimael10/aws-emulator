@@ -9,18 +9,19 @@
 //! names the KIND of resource rather than echoing the request, and nothing is created
 //! or removed. Exactly one delete of such a resource succeeds.
 //!
-//! `DeleteMedicalVocabulary` is the one family this does NOT hold for: its recorded
-//! answer for a name the account holds nothing under is an empty 200, so it is
-//! idempotent about presence and its rows live in `crate::medical_vocabulary_delete`
+//! The two custom-vocabulary families are the ones this does NOT hold for: their
+//! recorded answer for a name the account holds nothing under is an empty 200, so they
+//! are idempotent about presence and their rows live in
+//! `crate::vocabulary_delete_idempotence` (and `crate::medical_vocabulary_delete`)
 //! rather than here.
 //!
 //! The table spans the whole delete class rather than one operation: one row per
-//! family whose delete this emulator serves and refuses an absent name (custom
-//! vocabulary, vocabulary filter, custom language model, transcription job, Call
+//! family whose delete this emulator serves and refuses an absent name (vocabulary
+//! filter, custom language model, transcription job, Call
 //! Analytics category, Call Analytics job, Medical Scribe job), crossed with the forms
 //! of name the name members' shared
 //! `@length(1..200)` / `@pattern(^[0-9a-zA-Z._-]+$)` constraint allows
-//! (`smithy_query(query="operation", operation="DeleteVocabulary")`): the shortest
+//! (`smithy_query(query="operation", operation="DeleteVocabularyFilter")`): the shortest
 //! allowed name, every allowed punctuation character, a plainly spelled one, and a
 //! name at the published 200-character ceiling.
 //!
@@ -71,20 +72,6 @@ struct Deletable {
 /// Every family whose delete this emulator serves.
 fn deletables() -> Vec<Deletable> {
     vec![
-        Deletable {
-            kind: "vocabulary",
-            create: "CreateVocabulary",
-            read: "GetVocabulary",
-            delete: "DeleteVocabulary",
-            name_member: "VocabularyName",
-            create_body: |name| {
-                json!({
-                    "VocabularyName": name,
-                    "LanguageCode": "en-US",
-                    "Phrases": ["Aardvark", "Transcribe"]
-                })
-            },
-        },
         Deletable {
             kind: "vocabulary filter",
             create: "CreateVocabularyFilter",

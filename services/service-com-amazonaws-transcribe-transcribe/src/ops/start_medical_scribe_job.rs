@@ -362,16 +362,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refuses nothing). This family identifies no language — the model admits one
         // `LanguageCode` for it — so nothing here reads what the media evidences about
         // its language.
-        if crate::state::resolve_media_objects(
+        // The refusal states what the object store answered is absent — the bucket, or
+        // an object in a bucket that is there.
+        if let crate::state::MediaVerdict::Absent(message) = crate::state::resolve_media_objects(
             ctx,
             &region,
             &[input.media.media_file_uri.as_deref().unwrap_or_default()],
         )
         .await
         .verdict
-            == crate::state::MediaVerdict::NoSuchObject
         {
-            return Err(bad_request(crate::state::URI_NAMES_NO_OBJECT));
+            return Err(bad_request(message));
         }
 
         let now = ::std::time::SystemTime::now();

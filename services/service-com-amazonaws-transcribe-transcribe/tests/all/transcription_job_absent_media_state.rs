@@ -31,6 +31,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::absent_s3_address_messages::S3_BUCKET_DOES_NOT_EXIST;
 use crate::media_object_resolution::{
     call, emulator, emulator_without_the_object_store, given_staged_media, ABSENT_BUCKET, BUCKET,
     PAST_THE_TRANSITION, STAGED_KEYS,
@@ -60,6 +61,10 @@ struct Row {
     name: &'static str,
     /// The `Media.MediaFileUri` the start carries.
     uri: fn() -> String,
+    /// The sentence the refusal states: it names WHAT is absent — the bucket, or an
+    /// object in a bucket that is there (`crate::absent_s3_address_messages`, the home
+    /// of that rule).
+    absent: &'static str,
 }
 
 /// Rows whose media the object store does not hold: the start is refused, so the name
@@ -70,21 +75,25 @@ fn no_such_object() -> Vec<Row> {
             case: "a bucket the store does not hold",
             name: "absent-bucket",
             uri: || format!("s3://{ABSENT_BUCKET}/dictation.wav"),
+            absent: S3_BUCKET_DOES_NOT_EXIST,
         },
         Row {
             case: "a key nothing was ever written to",
             name: "absent-key",
             uri: || format!("s3://{BUCKET}/never-uploaded.flac"),
+            absent: MEDIA_NAMES_NO_OBJECT,
         },
         Row {
             case: "a key that only prefixes a stored one",
             name: "key.prefixes_a_stored_one",
             uri: || format!("s3://{BUCKET}/clinic/visits"),
+            absent: MEDIA_NAMES_NO_OBJECT,
         },
         Row {
             case: "a key that only extends a stored one",
             name: "key-extends-a-stored-one",
             uri: || format!("s3://{BUCKET}/{}.bak", STAGED_KEYS[0]),
+            absent: MEDIA_NAMES_NO_OBJECT,
         },
     ]
 }
@@ -101,16 +110,19 @@ fn addresses_no_object() -> Vec<Row> {
             case: "a bucket with no key under it",
             name: "bucket-with-no-key",
             uri: || format!("s3://{BUCKET}"),
+            absent: MEDIA_NAMES_NO_OBJECT,
         },
         Row {
             case: "a bucket with an empty key under it",
             name: "bucket-with-an-empty-key",
             uri: || format!("s3://{BUCKET}/"),
+            absent: MEDIA_NAMES_NO_OBJECT,
         },
         Row {
             case: "the scheme with no bucket",
             name: "scheme-with-no-bucket",
             uri: || format!("s3:///{}", STAGED_KEYS[0]),
+            absent: MEDIA_NAMES_NO_OBJECT,
         },
     ]
 }
@@ -167,9 +179,9 @@ async fn a_refused_start_leaves_no_job_for_a_later_list_read_or_delete() {
         answered.refused(row.case, 400, "BadRequestException");
         let message = answered.error_message(row.case);
         assert_eq!(
-            message, MEDIA_NAMES_NO_OBJECT,
-            "case {:?}: expected the service's wording for a media URI that names no \
-             object, got {message:?}",
+            message, row.absent,
+            "case {:?}: expected the service's wording for what is absent at the media \
+             address, got {message:?}",
             row.case
         );
 
@@ -341,7 +353,7 @@ async fn with_no_object_store_a_uri_that_addresses_no_object_is_still_refused() 
         answered.refused(row.case, 400, "BadRequestException");
         let message = answered.error_message(row.case);
         assert_eq!(
-            message, MEDIA_NAMES_NO_OBJECT,
+            message, row.absent,
             "case {:?}: expected the refusal to stand with no store mounted, got \
              {message:?}",
             row.case

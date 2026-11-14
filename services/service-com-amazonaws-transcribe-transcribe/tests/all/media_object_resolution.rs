@@ -36,6 +36,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::absent_s3_address_messages::{S3_BUCKET_DOES_NOT_EXIST, URI_NAMES_NO_OBJECT};
 use crate::transcription_jobs::{dispatch, Reply};
 
 /// The Region both services are addressed in. Amazon S3 places a bucket created with no
@@ -318,6 +319,11 @@ struct MediaCase {
     name: &'static str,
     /// The `Media` the start request carries.
     media: fn() -> Value,
+    /// For an unresolvable row, the sentence the refusal states — which names WHAT the
+    /// store said is absent, the bucket or an object in a bucket that is there
+    /// (`crate::absent_s3_address_messages`, the home of that rule). Empty for a
+    /// resolvable row, which is refused nothing.
+    absent: &'static str,
 }
 
 /// Rows whose media the object store reports it does not hold: the start is refused and
@@ -330,24 +336,28 @@ fn unresolvable() -> Vec<MediaCase> {
             family: Family::Transcription,
             name: "missing-bucket",
             media: || json!({"MediaFileUri": format!("s3://{ABSENT_BUCKET}/dictation.wav")}),
+            absent: S3_BUCKET_DOES_NOT_EXIST,
         },
         MediaCase {
             case: "a medical transcription job whose key nothing was ever written to",
             family: Family::Medical,
             name: "missing-key",
             media: || json!({"MediaFileUri": format!("s3://{BUCKET}/never-uploaded.flac")}),
+            absent: URI_NAMES_NO_OBJECT,
         },
         MediaCase {
             case: "a Call Analytics job whose key only prefixes a stored one",
             family: Family::CallAnalytics,
             name: "prefixes-stored-key",
             media: || json!({"MediaFileUri": format!("s3://{BUCKET}/clinic/visits")}),
+            absent: URI_NAMES_NO_OBJECT,
         },
         MediaCase {
             case: "a Medical Scribe job whose key only extends a stored one",
             family: Family::Scribe,
             name: "extends-stored-key",
             media: || json!({"MediaFileUri": format!("s3://{BUCKET}/dictation.wav.bak")}),
+            absent: URI_NAMES_NO_OBJECT,
         },
         MediaCase {
             case: "a Call Analytics job naming its unresolvable input audio in \
@@ -357,6 +367,7 @@ fn unresolvable() -> Vec<MediaCase> {
             media: || {
                 json!({"RedactedMediaFileUri": format!("s3://{BUCKET}/never-uploaded-redacted.wav")})
             },
+            absent: URI_NAMES_NO_OBJECT,
         },
     ]
 }
@@ -371,12 +382,14 @@ fn resolvable() -> Vec<MediaCase> {
             family: Family::Transcription,
             name: "root-object",
             media: || json!({"MediaFileUri": format!("s3://{BUCKET}/{}", STAGED_KEYS[0])}),
+            absent: "",
         },
         MediaCase {
             case: "a medical transcription job over an object under a nested prefix",
             family: Family::Medical,
             name: "nested-object",
             media: || json!({"MediaFileUri": format!("s3://{BUCKET}/{}", STAGED_KEYS[1])}),
+            absent: "",
         },
         MediaCase {
             case: "a Call Analytics job naming its input audio in RedactedMediaFileUri",
@@ -385,12 +398,14 @@ fn resolvable() -> Vec<MediaCase> {
             media: || {
                 json!({"RedactedMediaFileUri": format!("s3://{BUCKET}/{}", STAGED_KEYS[0])})
             },
+            absent: "",
         },
         MediaCase {
             case: "a Medical Scribe job over an object under a nested prefix",
             family: Family::Scribe,
             name: "scribe-nested-object",
             media: || json!({"MediaFileUri": format!("s3://{BUCKET}/{}", STAGED_KEYS[1])}),
+            absent: "",
         },
         MediaCase {
             case: "a transcription job whose media URI addresses a host rather than an \
@@ -398,6 +413,7 @@ fn resolvable() -> Vec<MediaCase> {
             family: Family::Transcription,
             name: "https-media",
             media: || json!({"MediaFileUri": "https://example.invalid/media/clip.mp4"}),
+            absent: "",
         },
     ]
 }
@@ -423,11 +439,9 @@ async fn a_start_whose_media_the_object_store_does_not_hold_is_refused_and_store
         answered.refused(case.case, 400, "BadRequestException");
         let message = answered.error_message(case.case);
         assert_eq!(
-            message,
-            "The URI that you provided doesn't point to an S3 object. Make sure that the \
-             object exists and try your request again.",
-            "case {:?}: expected the service's wording for a media URI that names no \
-             object, got {message:?}",
+            message, case.absent,
+            "case {:?}: expected the service's wording for what the store said is \
+             absent, got {message:?}",
             case.case
         );
 

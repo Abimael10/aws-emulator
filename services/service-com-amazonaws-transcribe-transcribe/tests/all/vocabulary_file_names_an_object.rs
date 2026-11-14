@@ -40,6 +40,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+// The sentence a refusal about an Amazon S3 address these members name states — fixed
+// text carrying none of the request's own values — read from the home of that rule
+// (`crate::absent_s3_address_messages`) rather than restated here.
+use crate::absent_s3_address_messages::URI_NAMES_NO_OBJECT;
 use crate::media_object_resolution::{call, emulator, given_object, ABSENT_BUCKET};
 use crate::transcription_jobs::Reply;
 
@@ -48,12 +52,6 @@ use crate::transcription_jobs::Reply;
 /// `crate::state::VOCABULARY_TRANSITION_DELAY` (500 ms) even on a slow machine.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const POLLS_FOR_SETTLED: usize = 40;
-
-/// The refusal a request naming an object the store holds none of gets, as Amazon
-/// Transcribe words it — fixed text carrying none of the request's own values.
-const URI_NAMES_NO_OBJECT: &str =
-    "The URI that you provided doesn't point to an S3 object. Make sure that the object \
-     exists and try your request again.";
 
 /// The caller's own bucket, created and uploaded to before calling.
 const FILE_BUCKET: &str = "example-vocabulary-term-files";
@@ -159,7 +157,11 @@ fn staged_uri(key: &str) -> String {
 /// The first five need the store's own answer about [`FILE_BUCKET`] or
 /// [`ABSENT_BUCKET`]; the last two are of the Amazon S3 scheme and address no object at
 /// all, which needs no answer — every example of such a member names a bucket AND a key
-/// (`s3://DOC-EXAMPLE-BUCKET/my-vocab-file.txt`).
+/// (`s3://DOC-EXAMPLE-BUCKET/my-vocab-file.txt`). ONE sentence answers every row,
+/// including the one whose BUCKET the store does not hold: these members are about the
+/// FILE, and their recorded refusal for an address the store holds no bucket for is the
+/// very sentence a key it does not hold gets — unlike the media a job start is pointed
+/// at, whose refusal names the bucket (`crate::absent_s3_address_messages`).
 fn absent_addresses() -> Vec<(&'static str, String)> {
     vec![
         (

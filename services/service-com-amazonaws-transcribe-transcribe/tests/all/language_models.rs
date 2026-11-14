@@ -394,10 +394,14 @@ async fn deleting_a_language_model_removes_exactly_that_record() {
 
     // Once each record has reached a terminal status the delete goes through, and only
     // the named record goes: every row is deleted in turn and the ones not yet deleted
-    // are still readable.
-    std::thread::sleep(PAST_THE_TRANSITION);
-
+    // are still readable. The wait is for the STATUS the clock owes each record, polled
+    // through the family's own reader (`Transcribe::language_model_settled`), never for a
+    // span of the wall clock.
     let names: Vec<String> = rows.iter().map(|(_, request)| name_of(request)).collect();
+    for name in &names {
+        transcribe.language_model_completed(name, None).await;
+    }
+
     for (index, (case, request)) in rows.iter().enumerate() {
         let name = name_of(request);
         transcribe
@@ -418,11 +422,11 @@ async fn deleting_a_language_model_removes_exactly_that_record() {
             .call("DeleteLanguageModel", json!({"ModelName": name}))
             .await;
         again.refused(gone, 400, "BadRequestException");
-        assert!(
-            again
-                .error_message(gone)
-                .contains("The requested language model couldn't be found"),
-            "case {gone:?}: the refusal must name the language model kind, got {:?}",
+        assert_eq!(
+            again.error_message(gone),
+            crate::language_model_not_found_sentence::ABSENT_MODEL_MESSAGE,
+            "case {gone:?}: the refusal must carry this family's not-found sentence, got \
+             {:?}",
             again.body
         );
 
