@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a worker from the fleet it was registered with: this is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +142,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorker"))
+        // The deletion is driven entirely by the path's ids and by the stored worker, so
+        // nothing is read off the request's metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteWorkerErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A worker is reached only through its own fleet and that fleet only through its
+        // own farm, so each missing level is a 404 naming that level and nothing is removed.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(DeleteWorkerErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        if store.fleet(&input.farm_id, &input.fleet_id).is_none() {
+            return Err(DeleteWorkerErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FLEET, &input.fleet_id),
+            )
+            .into());
+        }
+        let Some(worker) = store.worker(&input.farm_id, &input.fleet_id, &input.worker_id) else {
+            return Err(DeleteWorkerErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_WORKER, &input.worker_id),
+            )
+            .into());
+        };
+
+        // A worker that has started is still registered with the fleet's scheduler, so it is
+        // not taken out from under that work: the refusal names the status the worker is in,
+        // read from the store, and removes nothing. A worker that never started, and one
+        // that has reported itself stopped, hold none of it and are removed.
+        if !worker.deletable() {
+            let status = worker.status.clone();
+            return Err(DeleteWorkerErrorModeled::ConflictException(
+                crate::state::worker_not_stopped(&input.worker_id, &status),
+            )
+            .into());
+        }
+
+        // The worker goes, and with it the client token its own registration spent: no
+        // idempotency record outlives the resource it describes. The record removed from the
+        // fleet is what the token is released against, so a removal that found nothing could
+        // not release another resource's token. The fleet's reported worker count is derived
+        // from the workers it holds, so it falls with this removal, which makes room for
+        // another registration.
+        if let Some(removed) =
+            store.remove_worker(&input.farm_id, &input.fleet_id, &input.worker_id)
+        {
+            store.forget_resources(::std::slice::from_ref(&removed.worker_id));
+        }
+
+        Ok(DeleteWorkerOutput {})
     }
 }

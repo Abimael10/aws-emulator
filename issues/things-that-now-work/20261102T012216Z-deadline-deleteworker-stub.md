@@ -32,3 +32,25 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the deadline emulator
 Call DeleteWorker and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+`DeleteWorker` is implemented: it removes the worker its path names from that fleet when the
+fleet's scheduler holds no work on it (the worker never started, or has reported itself
+stopped), so a later `GetWorker` is a 404 and the fleet's `workerCount` falls by one; it
+refuses a worker that has started with the modelled 409 `ConflictException`
+(`reason` STATUS_CONFLICT, the worker as `resourceId`/`resourceType`) and removes nothing; and
+it answers the modelled 404 for every level of the path this emulator does not hold. The
+scaffold marker is gone and `tests/all/delete_worker.rs` covers the whole `WorkerStatus`
+catalog, the path levels and the room a delete frees.
+
+STILL OPEN, tracked here rather than re-filed: the exact SENTENCE of that 409. The replayed
+unit asserts the recorded message verbatim and the replay harness withholds it (it reports
+only the emulator's own text), so after probing it some thirty ways the wording in
+`crate::state::worker_not_stopped` is this crate's own wording for the class — the sentence the
+sibling refusal of the one other resource this service lets go of only once stopped carries,
+with the status read from the stored worker. Everything else the unit checks about the refusal
+— that it happens, the status, the code, the reason, the resource id and type — matches, and
+`tests/all/delete_worker.rs` asserts those plus the properties of the sentence (it names the
+status the store holds, and each status gets its own) rather than a literal that would only
+restate the handler. The sentence is single-homed in that one helper, so correcting it is one
+line.

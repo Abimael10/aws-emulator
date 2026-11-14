@@ -60,6 +60,15 @@ pub const AUTO_SCALING_STATUS_SHRINKING: &str = "SHRINKING";
 /// stays here until a call moves it: nothing about this status is owed by the clock.
 pub const WORKER_STATUS_CREATED: &str = "CREATED";
 
+/// `WorkerStatus` a worker carries once it has been reported stopped.
+///
+/// The TERMINAL value of the statuses a caller can report for a worker: `UpdatedWorkerStatus`
+/// is `STARTED` | `STOPPING` | `STOPPED` (`smithy_query(query="shape",
+/// shape="UpdatedWorkerStatus")`), and `STOPPING` is the worker on its way here. A worker in
+/// any other status is still registered as running the fleet's work, which is what makes this
+/// the one status its deletion is allowed in.
+pub const WORKER_STATUS_STOPPED: &str = "STOPPED";
+
 /// `JobLifecycleStatus` a job carries while the service is still assembling it.
 ///
 /// From `smithy_query(query="shape", shape="JobLifecycleStatus")`.
@@ -596,6 +605,23 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Whether the fleet's scheduler holds no work on this worker, which is what lets a
+    /// delete remove it.
+    ///
+    /// `WorkerStatus` is `CREATED`, `STARTED`, `STOPPING`, `STOPPED`, `NOT_RESPONDING`,
+    /// `NOT_COMPATIBLE`, `RUNNING`, `IDLE` (`smithy_query(query="shape",
+    /// shape="WorkerStatus")`). The two statuses here are the ones in which the worker is
+    /// not started: it has never started ([`WORKER_STATUS_CREATED`]) or has reported itself
+    /// stopped ([`WORKER_STATUS_STOPPED`]). In every other status the worker has started —
+    /// running the fleet's work, waiting for more of it, out of contact with the scheduler,
+    /// or on its way down — so the service does not take it out from under that work.
+    pub fn deletable(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            WORKER_STATUS_CREATED | WORKER_STATUS_STOPPED
+        )
+    }
+
     /// The worker's host properties as a response reports them.
     ///
     /// A request carries only the host's own addresses and name
@@ -1020,6 +1046,21 @@ impl ComAmazonawsDeadlineDeadlineState {
     /// path.
     pub fn worker(&self, farm_id: &str, fleet_id: &str, worker_id: &str) -> Option<&Worker> {
         self.fleet(farm_id, fleet_id)?.workers.get(worker_id)
+    }
+
+    /// Remove the worker `worker_id` names UNDER `farm_id`/`fleet_id` and hand it back, or
+    /// `None` when this emulator holds no such worker under that fleet.
+    ///
+    /// A worker is reached only through its own fleet, so removing it from THAT fleet is the
+    /// whole deletion: the fleet's reported worker count is derived from the workers it
+    /// holds, so it falls with this removal rather than being adjusted separately.
+    pub fn remove_worker(
+        &mut self,
+        farm_id: &str,
+        fleet_id: &str,
+        worker_id: &str,
+    ) -> Option<Worker> {
+        self.fleet_mut(farm_id, fleet_id)?.workers.remove(worker_id)
     }
 
     /// Mutable form of [`queue`](Self::queue).
@@ -1478,6 +1519,31 @@ pub fn queue_fleet_association_not_stopped(
         reason: "STATUS_CONFLICT".to_string(),
         resource_id,
         resource_type: RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION.to_string(),
+        context: None,
+    }
+}
+
+/// The 409 this service answers when a worker that has started is deleted before it has
+/// stopped.
+///
+/// A worker [`Worker::deletable`] is false for is still registered with the fleet's
+/// scheduler, so the worker itself is the resource in conflict and the status it is in is
+/// the one value the message varies on; it is read from the store, never from the request.
+/// Worded the way this crate words the same refusal for the other resource this service only
+/// lets go of once it has stopped (see [`queue_fleet_association_not_stopped`]). One place to
+/// change: the sentence this error class carries is not recoverable from the replay harness,
+/// which reports only what the emulator answered, so it is this crate's own wording for the
+/// class until a recording names it.
+pub fn worker_not_stopped(worker_id: &str, status: &str) -> crate::ops::types::ConflictException {
+    crate::ops::types::ConflictException {
+        message: format!("Worker is in {status} status and cannot be deleted."),
+        // From `smithy_query(query="shape", shape="ConflictExceptionReason")`:
+        // CONFLICT_EXCEPTION, CONCURRENT_MODIFICATION, RESOURCE_ALREADY_EXISTS,
+        // RESOURCE_IN_USE, STATUS_CONFLICT. What conflicts is the status the worker is in,
+        // not another caller's hold on it.
+        reason: "STATUS_CONFLICT".to_string(),
+        resource_id: worker_id.to_string(),
+        resource_type: RESOURCE_TYPE_WORKER.to_string(),
         context: None,
     }
 }

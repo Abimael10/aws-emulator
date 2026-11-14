@@ -36,6 +36,10 @@ fn yaml_template(name: &str) -> String {
 /// instead of each building a second copy of this harness.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The one engine every operation of this emulator reads and writes, kept so a suite
+    /// can set up a stored state no implemented operation reaches yet (see
+    /// [`Emulator::store`]).
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -45,9 +49,23 @@ impl Emulator {
         // These tests sign nothing, so they assert behaviour, not signatures.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_deadline_deadline::EmulatedService::new(engine),
+            service_com_amazonaws_deadline_deadline::EmulatedService::new(engine.clone()),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// This service's store inside the emulator's engine — the very store the handlers
+    /// read and write.
+    ///
+    /// A suite uses it ONLY to arrange a precondition no implemented operation can produce
+    /// yet; the behaviour under test is always driven through a request, as every other
+    /// call here is.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<service_com_amazonaws_deadline_deadline::ComAmazonawsDeadlineDeadlineState>
+    {
+        service_com_amazonaws_deadline_deadline::state::service_state(&*self.engine)
+            .expect("the deadline store lives in this emulator's engine")
     }
 
     /// Dispatch one request and return its status and parsed JSON body (`Value::Null` for

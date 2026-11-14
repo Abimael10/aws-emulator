@@ -4821,3 +4821,31 @@ mod bedrock_agentcore_gateway_mcp_transport_path;
 // notes, for this file and for every service crate's `tests/all.rs`, so check there
 // rather than leaving a note in this file's tail, where an inner doc comment is `E0753`
 // and compiles nothing.
+//! this file and for every service crate's `tests/all.rs`, so check there rather than
+//! leaving a note at the end of this file — an inner doc comment is legal only before the
+//! first item, so one appended to the tail is `E0753` and compiles nothing.
+// `zz_probe` further up this tail: two landings in the same window each appended a second
+// declaration of them here, and a module declared twice loads the same file twice, which
+// compiles neither — so those duplicates are removed and the first declarations stand.)
+// `cloudformation_scripted_queue_deploy` are each declared ONCE, in the head region above:
+// two landings in the same window appended a second declaration of each here, and a module
+// declared twice loads the same file twice, which compiles neither — so those duplicates are
+// removed and the first declarations stand.)
+// (`ses_event_destination_reaches_an_eventbridge_rule_target` and
+// `pricing_plan_subscription_resource_eligibility` are each declared ONCE already — the first
+// further up this file, the second in the sorted head: two landings in the same window each
+// appended a second declaration here, and a module declared twice loads the same file twice,
+// this file: two landings in the same window appended a second declaration of it here, and a
+// this file: two landings in the same window each appended a declaration of it here, and a
+// (`pricing_plan_subscription_resource_eligibility` is declared ONCE, in the sorted head of
+// this file, and `cloudformation_provisions_cloudfront_resources` ONCE further up: two
+// landings in the same window appended a second declaration of each here, and a module
+// (`cloudformation_eventbridge_fan_out_to_lambda_and_sfn` is declared ONCE, further up this
+// file: two landings in the same window declared it here as well, and a module declared twice
+// tail: two landings in the same window appended a second declaration of it here, and a
+// (The "declare each suite exactly ONCE" paragraph belongs to the module doc at the head of
+// this file, where an inner doc comment is legal; appended here as `//!` it is `E0753` and
+// compiles nothing, so these lines are ordinary comments and the paragraph itself is in that
+// header.)
+// (Written with `//` on purpose: an inner doc comment past the first item is `E0753`.)
+// line below is an ordinary comment.)

@@ -25,6 +25,8 @@ mod delete_fleet;
 mod delete_limit;
 #[path = "all/delete_storage_profile.rs"]
 mod delete_storage_profile;
+#[path = "all/delete_worker.rs"]
+mod delete_worker;
 #[path = "all/farm_queue_job.rs"]
 mod farm_queue_job;
 #[path = "all/fleet.rs"]
