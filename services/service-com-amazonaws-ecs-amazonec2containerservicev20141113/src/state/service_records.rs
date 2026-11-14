@@ -108,6 +108,18 @@ pub struct ServiceRecord {
     /// ([`TRANSITION_SPAN`]), so a caller reading in between sees the rollout `FAILED`
     /// before the service is taken back.
     pub deployment_rollback_due_at: Option<SystemTime>,
+    /// When the tasks this rollout is REPLACING are owed their retirement, or `None` when
+    /// none is owed (the rollout has nothing left to retire, or the retirement that was
+    /// owed has been carried out).
+    ///
+    /// The step between a replacement coming up and the task it replaces being stopped. The
+    /// `minimumHealthyPercent` doc: "the service scheduler will wait ... after a task
+    /// reaches a `RUNNING` state before the task is counted towards the minimum healthy
+    /// percent total" — so the scheduler does not retire a task in the same instant its
+    /// replacement comes up, and a caller polling through a rolling update sees the service
+    /// above its desired count while the two overlap ([`super::rolling_update`]). A span the
+    /// CLOCK settles ([`ROLLOUT_OVERLAP_SPAN`]), stored rather than slept on.
+    pub retirement_due_at: Option<SystemTime>,
     /// Whether the current deployment's rollout has reached its steady state at least
     /// once, and so whether that deployment has TAKEN OVER the service: the share of the
     /// service's desired count it is scaled to (`Deployment$scale`) follows from it.

@@ -37,9 +37,14 @@
 //! has just started has its containers running without a further call, and a task
 //! `StopTask` has just asked to stop has its containers signalled at once.
 //!
-//! Nothing here MOVES a task: a container's run only ever records what the run itself
-//! produced — the container's exit code and status — so a reporting operation that drives
-//! this reconcile reports no status the clock had not already made due.
+//! A run records what the run itself produced — the container's exit code and status — and
+//! the ONE task transition that follows from it: a task whose ESSENTIAL container's program
+//! has ended is stopped, because "if the `essential` parameter of a container is marked as
+//! `true`, and that container fails or stops for any reason, all other containers that are
+//! part of the task are stopped". That stop is dated by the instant the program ended, not
+//! by whoever happened to read afterwards, and a task something else has already stopped
+//! keeps the stop that put it there (see
+//! [`ComAmazonawsEcsAmazonec2containerservicev20141113State::record_container_outcome`]).
 //!
 //! # Bounds
 //!
@@ -363,14 +368,23 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
 
     /// Record what one container's program ENDED as: the status it exited with becomes the
     /// container's `exitCode` and the container reports `STOPPED`, because the program the
-    /// container was running is over.
+    /// container was running is over — and a task whose ESSENTIAL container that was is
+    /// stopped with it.
     ///
     /// A run this emulator gave up on records nothing ([`ContainerOutcome::Abandoned`]): no
-    /// exit code was produced, so none is reported. The TASK is not moved here: what a
-    /// stopped container does to the task around it — an essential container's exit
-    /// stopping the whole task — is the scheduler's, and this store does not model it yet,
-    /// so a task whose container has exited keeps the status the clock gave it and reports
-    /// the container exactly as the run left it.
+    /// exit code was produced, so none is reported.
+    ///
+    /// The stop is what a container definition's `essential` member means: "If the
+    /// `essential` parameter of a container is marked as `true`, and that container fails or
+    /// stops for any reason, all other containers that are part of the task are stopped"
+    /// (`ContainerDefinition$essential`), which is the task's own
+    /// [`STOP_CODE_ESSENTIAL_CONTAINER_EXITED`] ("The task stopped because an essential
+    /// container exited"). Only a task something else has not already stopped takes it
+    /// ([`TaskRecord::work_is_running`]), and only one whose end the clock does not already
+    /// owe at an instant of its own: a STANDALONE task was placed to do a piece of work and
+    /// ends when that work is done ([`CONTAINER_WORK_SPAN`], which waits for these same
+    /// programs), while a task a service's or a daemon's scheduler placed is kept in place
+    /// by that scheduler and so ends here, at the instant its essential container exited.
     pub(super) fn record_container_outcome(
         &mut self,
         container_arn: &str,
@@ -383,6 +397,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             return;
         };
         self.end_container_run(container_arn);
+        // The instant the program ended is the instant this records: the run has just
+        // finished, which is when the exit happened.
+        let at = SystemTime::now();
         for task in self.tasks.values_mut() {
             let Some(container) = task
                 .containers
@@ -393,9 +410,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             };
             container.exit_code = Some(status);
             container.advance_to(STATUS_STOPPED);
+            let essential = container.essential;
             // "Every time a task experiences a change ... the version counter is
             // incremented."
             task.version += 1;
+            if essential && task.work_is_running() && task.work_done_due_at.is_none() {
+                task.finish_work(at);
+            }
             return;
         }
     }

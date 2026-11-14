@@ -3957,11 +3957,6 @@ mod cloudformation_provisions_redshift_snapshot_copy_grants;
 // repeats stands in the module doc at the HEAD of this file — declare each suite exactly
 // ONCE, since this is one crate root and a second `mod` for the same name is `E0428`, which
 // the neighbouring notes record: `//!` is legal only before the first item of a crate root.)
-// (One more line of that same header fragment, appended here as an INNER doc comment: a
-// `//!` line past the first item of this crate root is `E0753`, so it stands as an ordinary
-// comment. The rule it repeats is in the module doc at the HEAD of this file.)
-// (Another line of that same header fragment, appended as an INNER doc comment and left
-// here as an ordinary comment for the reason the lines above record.)
 // suite left at the top level of `tests/` fails the build. (One more line of that same
 // header fragment, an ordinary comment here: an inner doc comment is legal only before the
 // first item of a crate root, so a `//!` line in this appended tail is `E0753` and compiles

@@ -293,13 +293,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             }
             // `Deployment$rolloutState`: the rollout completes "when the service reaches
             // a steady state" — which needs BOTH the instant it falls due and the task
-            // set the service wants.
+            // set the service wants, held by the deployment that is rolling out. A service
+            // still holding a task of the deployment being REPLACED has not reached one
+            // however many tasks it is running: those tasks are what the rollout is still
+            // replacing ([`super::rolling_update`]), and the scheduler writes "has reached
+            // a steady state" once they are gone.
             let tally = self.service_tally(&key.0, &key.1);
             let service = &self.services[&key];
+            let rollout = self.deployment_tally(&key.0, &service.deployment_id);
             let settled = service.deployment_steady_due_at.filter(|due| {
                 *due <= now
                     && service.places_tasks()
-                    && tally.running == service.desired_count
+                    && rollout.running == service.desired_count
+                    && rollout.pending == 0
+                    && tally.running == rollout.running
                     && tally.pending == 0
             });
             // `DeleteService`: "After all tasks have transitioned to either STOPPING or
@@ -3181,6 +3188,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// desired count is what the caller asked for and does not move because the scheduler
     /// could not meet it.
     ///
+    /// A service that holds tasks of a SUPERSEDED deployment is mid-rollout, and the two
+    /// percentages of its deployment configuration bound what one pass may do to it
+    /// ([`super::rolling_update`]): the replacements the new deployment wants are started
+    /// up to the ceiling `maximumPercent` allows, and the tasks they replace are stopped
+    /// only down to the floor `minimumHealthyPercent` holds — so a pass that cannot stop
+    /// them yet leaves them running and the pass after the replacements come up does.
+    ///
     /// `Err` means the placement would push this emulator past [`MAX_TASKS`]; nothing is
     /// changed in that case.
     pub fn scale_service(
@@ -3221,21 +3235,93 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 != Some(service.deployment_id.as_str())
         });
         let desired = usize::try_from(service.desired_count).unwrap_or(0);
-        let to_place = desired.saturating_sub(live.len());
+        // The tasks being replaced, split by whether they have reached `RUNNING`: the floor
+        // is a limit on the tasks that "must remain in the RUNNING state", so stopping one
+        // that is still coming up spends none of it.
+        let (replaced_running, replaced_coming_up): (Vec<String>, Vec<String>) =
+            superseded.into_iter().partition(|arn| {
+                self.tasks
+                    .get(arn)
+                    .is_some_and(|task| task.last_status == STATUS_RUNNING)
+            });
+        // The tasks the FLOOR counts: the service's tasks that have reached `RUNNING`,
+        // whichever deployment placed them — they are the service's tasks either way.
+        let counted_running = live
+            .iter()
+            .chain(replaced_running.iter())
+            .filter(|arn| {
+                self.tasks
+                    .get(*arn)
+                    .is_some_and(|task| task.last_status == STATUS_RUNNING)
+            })
+            .count();
+        // What this pass may start and what it may stop, under the two percentages the
+        // service's deployment configuration states ([`super::rolling_update`]): the
+        // ceiling bounds the replacements, so they are started BEFORE the tasks they
+        // replace are stopped, and the floor bounds those stops, so the tasks left running
+        // never fall below the share the caller asked to keep.
+        let room = rolling_update_room(
+            &service.deployment_configuration,
+            service.desired_count,
+            TaskSetCounts {
+                current: live.len(),
+                wanted: live.len() + replaced_running.len() + replaced_coming_up.len(),
+                running: counted_running,
+            },
+        );
+        // A replacement the scheduler has just cleared capacity for is launched one step
+        // after the stop that cleared it ([`Self::awaiting_cleared_capacity`]), so a
+        // ceiling with no surge room takes the service below its desired count while that
+        // capacity is filled rather than swapping one task for another in one instant.
+        let placements = if self.awaiting_cleared_capacity(&service, now) {
+            0
+        } else {
+            room.placements
+        };
         // Nothing is changed when the placement would not fit: the cap is checked before
         // the first task is touched.
-        if self.tasks.len() + to_place > MAX_TASKS {
+        if self.tasks.len() + placements > MAX_TASKS {
             return Err(TaskCapacityExceeded);
+        }
+        // "The scheduler may start four new tasks before stopping the four older tasks
+        // (provided that the cluster resources required to do this are available)": the
+        // replacements come first, and a cluster with nowhere to put them places nothing
+        // and records why on the service's event stream.
+        if placements > 0 {
+            match self.placement_capacity_reason(&service, &placement) {
+                Some(reason) => self.record_placement_failure(key, &reason, now),
+                None => {
+                    for _ in 0..placements {
+                        self.place_service_task(&service, definition, &placement, region, now);
+                    }
+                }
+            }
+        }
+        // A task whose replacement has come up is retired one step after the pass that
+        // first found room for it ([`retirement_step`]), so the two overlap for that span
+        // and a client polling the service observes the surge the ceiling allows.
+        let retirement = retirement_step(room, service.retirement_due_at, now);
+        if let Some(stored) = self.services.get_mut(key) {
+            stored.retirement_due_at = retirement.due;
         }
         // A task of a superseded deployment is one the service no longer wants, so the
         // rollout replaces it — unless its caller has taken it out of the scheduler's reach
-        // ([`Self::stop_unprotected_service_tasks`]).
+        // ([`Self::stop_unprotected_service_tasks`]), or the floor still needs it running.
+        let replacement_reason = format!("Task stopped by deployment {}", service.deployment_id);
         self.stop_unprotected_service_tasks(
-            superseded.iter().rev().map(String::as_str),
-            superseded.len(),
+            replaced_coming_up.iter().rev().map(String::as_str),
+            replaced_coming_up.len(),
             now,
-            &format!("Task stopped by deployment {}", service.deployment_id),
+            &replacement_reason,
         );
+        if retirement.retire {
+            self.stop_unprotected_service_tasks(
+                replaced_running.iter().rev().map(String::as_str),
+                room.running_stops,
+                now,
+                &replacement_reason,
+            );
+        }
         if live.len() > desired {
             // Scaling in stops the newest tasks of the deployment first: nothing here
             // runs on a container instance or in an Availability Zone, so there is no
@@ -3249,17 +3335,6 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     service.deployment_id
                 ),
             );
-            return Ok(());
-        }
-
-        if to_place > 0 {
-            if let Some(reason) = self.placement_capacity_reason(&service, &placement) {
-                self.record_placement_failure(key, &reason, now);
-                return Ok(());
-            }
-        }
-        for _ in 0..to_place {
-            self.place_service_task(&service, definition, &placement, region, now);
         }
         Ok(())
     }

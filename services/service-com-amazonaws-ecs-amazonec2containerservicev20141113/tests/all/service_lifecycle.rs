@@ -130,6 +130,35 @@ async fn describe(
     services[0].clone()
 }
 
+/// Re-read the task set of one service until it holds `wanted` tasks, NONE of which is
+/// one of `previous`, and answer it.
+///
+/// What a rolling update leaves behind: the replacements are started first and the tasks
+/// they replace are retired once they are up, so the inherited set is replaced over
+/// several scheduler steps rather than in the instant the update answers.
+async fn poll_replaced_task_set(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    service_name: &str,
+    case: &str,
+    previous: &[String],
+    wanted: usize,
+) -> Vec<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let tasks = service_task_arns(router, cluster, service_name, case).await;
+        if tasks.len() == wanted && tasks.iter().all(|arn| !previous.contains(arn)) {
+            return tasks;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the rollout to replace the task set {previous:?} with \
+             {wanted} new tasks, got {tasks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn service_create_reads_back_with_the_task_set_its_scheduler_placed() {
     let router = service();
@@ -615,7 +644,6 @@ async fn a_new_deployment_replaces_the_task_set_it_inherited() {
     .await;
     let mut deployment = string(&list(&created["service"], "deployments", "setup")[0], "id", "setup");
     let mut tasks = service_task_arns(&router, "deploying", "web", "setup").await;
-    tokio::time::sleep(ONE_SPAN).await;
 
     // Both of the things that start a deployment, and the member that does not.
     let cases: [(&str, Value, bool); 3] = [
@@ -656,28 +684,41 @@ async fn a_new_deployment_replaces_the_task_set_it_inherited() {
             );
         }
 
-        let now_tasks = service_task_arns(&router, "deploying", "web", case).await;
-        assert_eq!(
-            now_tasks.len(),
-            2,
-            "case {case:?}: the service still wants two tasks, got {now_tasks:?}"
-        );
         if expect_new {
+            // A rolling update REPLACES the task set it inherited: the replacements are
+            // started first and the tasks they replace are retired once they are up, so
+            // the set the rollout leaves behind is polled for rather than read in the
+            // instant the update answered.
+            let now_tasks = poll_replaced_task_set(
+                &router,
+                "deploying",
+                "web",
+                case,
+                &tasks,
+                2,
+            )
+            .await;
             assert!(
                 now_tasks.iter().all(|arn| !tasks.contains(arn)),
                 "case {case:?}: a new deployment replaces the task set it inherited; \
                  before {tasks:?}, after {now_tasks:?}"
             );
+            tasks = now_tasks;
         } else {
+            let now_tasks = service_task_arns(&router, "deploying", "web", case).await;
+            assert_eq!(
+                now_tasks.len(),
+                2,
+                "case {case:?}: the service still wants two tasks, got {now_tasks:?}"
+            );
             assert_eq!(
                 now_tasks, tasks,
                 "case {case:?}: an update that starts no deployment keeps the task set"
             );
+            tasks = now_tasks;
         }
 
         deployment = now_deployment;
-        tasks = now_tasks;
-        tokio::time::sleep(ONE_SPAN).await;
     }
 
     // The service now runs the second revision, and says so.

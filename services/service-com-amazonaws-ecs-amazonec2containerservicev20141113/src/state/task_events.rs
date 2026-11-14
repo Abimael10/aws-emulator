@@ -251,7 +251,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         if !self.pending_task_events.is_empty() {
             return Some(now);
         }
-        match self.next_task_due_at() {
+        // The service scheduler's own next step is an instant the pump waits for too: a
+        // rolling update takes one step per span ([`super::rolling_update`]), and the step
+        // after this one is owed whether or not anybody calls again.
+        let next = [self.next_task_due_at(), self.next_scheduler_step_due_at(now)]
+            .into_iter()
+            .flatten()
+            .min();
+        match next {
             Some(due) => Some(due),
             None => {
                 self.release_task_clock_pump(generation);

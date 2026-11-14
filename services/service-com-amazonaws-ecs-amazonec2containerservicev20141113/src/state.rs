@@ -322,6 +322,11 @@ pub use container_health::*;
 /// and the standalone task that earns none.
 mod service_steady_state;
 
+/// The two bounds a ROLLING UPDATE is held to: the ceiling the replacements it starts are
+/// allowed under, and the floor the tasks they replace are stopped down to.
+mod rolling_update;
+pub use rolling_update::*;
+
 /// The capacity an Amazon EC2 instance launched into a cluster gives it: the registration
 /// the container agent on that instance makes.
 mod ec2_capacity;

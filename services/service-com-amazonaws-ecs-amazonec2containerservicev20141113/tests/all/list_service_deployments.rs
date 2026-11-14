@@ -49,6 +49,13 @@ use crate::ecs_wire::{
 /// due, with margin for a loaded test machine.
 const ONE_SPAN: Duration = Duration::from_millis(900);
 
+/// How often a poll re-reads a service's deployment history.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long a poll keeps re-reading before it gives up. Generous, since every poll stops
+/// the instant its own condition holds.
+const POLL_BUDGET: Duration = Duration::from_secs(60);
+
 /// Every value `ServiceDeploymentStatus` accepts, from the model's enum (smithy_query
 /// query="shape" shape="ServiceDeploymentStatus": PENDING, SUCCESSFUL, STOPPED,
 /// STOP_REQUESTED, IN_PROGRESS, ROLLBACK_REQUESTED, ROLLBACK_IN_PROGRESS,
@@ -107,6 +114,31 @@ fn deployment_arns(deployments: &[Value], case: &str) -> Vec<String> {
         .iter()
         .map(|deployment| string(deployment, "serviceDeploymentArn", case))
         .collect()
+}
+
+/// Re-read the history of the `demo`/`web` service until its NEWEST rollout reports
+/// itself `SUCCESSFUL`, and answer the history it settled as.
+///
+/// A rollout that REPLACES a task set takes one scheduler step per task it replaces — the
+/// replacement is started, comes up, and only then is the task it replaces retired — so
+/// its end is polled for rather than timed.
+async fn poll_settled_history(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + POLL_BUDGET;
+    loop {
+        let history =
+            all_deployments(router, json!({ "cluster": "demo", "service": "web" }), case).await;
+        if history
+            .first()
+            .is_some_and(|newest| string(newest, "status", case) == "SUCCESSFUL")
+        {
+            return history;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the newest rollout to settle, got {history:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// A timestamp member, as the epoch seconds an `awsJson1_1` body renders it as.
@@ -276,10 +308,8 @@ async fn each_release_records_one_service_deployment_and_the_history_reads_newes
 
     // The CLOCK settles the rollout, and the deployment's status is the same rollout the
     // service's own `rolloutState` reports.
-    tokio::time::sleep(ONE_SPAN).await;
     let case = "the rollout the clock settled";
-    let deployments = all_deployments(&router, json!({ "cluster": "demo", "service": "web" }), case)
-        .await;
+    let deployments = poll_settled_history(&router, case).await;
     assert_history_shape(&deployments, &service_arn, case);
     assert_eq!(
         string(&deployments[0], "status", case),
@@ -376,7 +406,7 @@ async fn each_release_records_one_service_deployment_and_the_history_reads_newes
             );
             // Let the clock settle this rollout before the next row, so each row starts
             // from a service at its steady state.
-            tokio::time::sleep(ONE_SPAN).await;
+            poll_settled_history(&router, case).await;
         } else {
             assert_eq!(
                 arns, previous_arns,

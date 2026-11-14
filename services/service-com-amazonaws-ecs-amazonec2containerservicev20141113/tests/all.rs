@@ -93,6 +93,8 @@ mod ecs_wire;
 mod enum_value_refusals;
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/essential_container_exit.rs"]
+mod essential_container_exit;
 #[path = "all/exec_task_role_resolution.rs"]
 mod exec_task_role_resolution;
 #[path = "all/execution_role_trust.rs"]
@@ -167,8 +169,8 @@ mod reserved_tag_prefix;
 mod resource_scoping_and_agent_plane;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
-#[path = "all/service_container_log_delivery.rs"]
-mod service_container_log_delivery;
+#[path = "all/rolling_update_bounds.rs"]
+mod rolling_update_bounds;
 #[path = "all/service_delete_drain.rs"]
 mod service_delete_drain;
 #[path = "all/service_deployment_lifecycle_hooks.rs"]
@@ -261,3 +263,5 @@ mod update_container_instances_state_failures;
 mod update_task_set_refusals;
 #[path = "all/ec2_launched_cluster_capacity.rs"]
 mod ec2_launched_cluster_capacity;
+#[path = "all/service_container_log_delivery.rs"]
+mod service_container_log_delivery;

@@ -27,7 +27,7 @@
 //! Every case goes through the shared wire harness in [`crate::ecs_wire`], the same front
 //! door a client uses, so a member that is not computed from persisted state cannot pass.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -40,6 +40,40 @@ use crate::ecs_wire::{
 /// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to fall
 /// due, with margin for a loaded test machine.
 const ONE_SPAN: Duration = Duration::from_millis(900);
+
+/// How often a poll re-reads a service.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long a poll keeps re-reading before it gives up.
+///
+/// A ROLLING update takes one span per step the tasks it replaces have to go through — the
+/// replacement is placed, comes up, and only then is the task it replaces stopped — so a
+/// rollout is several spans rather than one. Generous, since every poll stops the instant
+/// its own condition holds.
+const POLL_BUDGET: Duration = Duration::from_secs(30);
+
+/// Re-read one service until `settled` holds of it, and answer the service it settled as.
+async fn poll_until(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    service_name: &str,
+    case: &str,
+    what: &str,
+    settled: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let view = describe(router, cluster, service_name, case).await;
+        if settled(&view) {
+            return view;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected {what}, got {view}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
 
 /// Describe one service and return it, asserting it is reported rather than failed.
 async fn describe(
@@ -291,7 +325,17 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
     let definition_arn = register_definition(&router, "rollingfamily", "setup").await;
     let setup = "setup";
     create_service(&router, cluster, "rolled", &definition_arn, 1, setup).await;
-    tokio::time::sleep(ONE_SPAN).await;
+    // The rollout the create started has to have COMPLETED before a write can put the
+    // deployment back to STABILIZING, so it is polled for rather than timed.
+    poll_until(
+        &router,
+        cluster,
+        "rolled",
+        setup,
+        "the created service's rollout to complete",
+        |view| string(&primary(view, setup), "rolloutState", setup) == "COMPLETED",
+    )
+    .await;
 
     // The writes that do NOT roll the service onto a new service revision: each one puts
     // the deployment back to STABILIZING without advancing the version or taking the
@@ -353,8 +397,15 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
             "case {case:?}: the service still holds the tasks it wants, got {updated}"
         );
 
-        tokio::time::sleep(ONE_SPAN).await;
-        let settled = describe(&router, cluster, "rolled", case).await;
+        let settled = poll_until(
+            &router,
+            cluster,
+            "rolled",
+            case,
+            "the scheduler's stability confirmation to fall due",
+            |view| string(&primary(view, case), "stabilityStatus", case) == "STEADY_STATE",
+        )
+        .await;
         assert_eq!(
             string(&primary(&settled, case), "stabilityStatus", case),
             "STEADY_STATE",
@@ -410,9 +461,22 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
     );
 
     // Once the replacement is through, the new deployment holds the service and COUNTS
-    // the task of the old one it replaced.
-    tokio::time::sleep(ONE_SPAN).await;
-    let settled = describe(&router, cluster, "rolled", case).await;
+    // the task of the old one it replaced. The rollout takes as many steps as the task it
+    // replaces does: the replacement is placed and comes up before that task is stopped
+    // ([`state::rolling_update`]), so the settled reading is polled for rather than timed.
+    let settled = poll_until(
+        &router,
+        cluster,
+        "rolled",
+        case,
+        "the new rollout to have taken the service over, with the task it replaced let go",
+        |view| {
+            let deployment = primary(view, case);
+            string(&deployment, "stabilityStatus", case) == "STEADY_STATE"
+                && present_count(&deployment, "replacedTaskCount", case) == Some(1)
+        },
+    )
+    .await;
     let deployment = primary(&settled, case);
     assert_eq!(
         present_count(&settled, "version", case),
@@ -451,7 +515,15 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
     // A scale-out leaves the scheduler work to do, which the run status reports until the
     // tasks it placed are running.
     let case = "a scale-out";
-    tokio::time::sleep(ONE_SPAN).await;
+    poll_until(
+        &router,
+        cluster,
+        "rolled",
+        case,
+        "the forced rollout before it to have settled",
+        |view| string(view, "runStatus", case) == "SteadyState",
+    )
+    .await;
     let scaled = ok(
         &router,
         "UpdateService",
@@ -465,13 +537,15 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
         "MoreWork",
         "case {case:?}: tasks still coming up are work the scheduler owes, got {scaled}"
     );
-    tokio::time::sleep(ONE_SPAN).await;
-    let settled = describe(&router, cluster, "rolled", case).await;
-    assert_eq!(
-        string(&settled, "runStatus", case),
-        "SteadyState",
-        "case {case:?}: the service holds the tasks it wants again, got {settled}"
-    );
+    let settled = poll_until(
+        &router,
+        cluster,
+        "rolled",
+        case,
+        "the service to hold the tasks it wants again",
+        |view| string(view, "runStatus", case) == "SteadyState",
+    )
+    .await;
     assert_eq!(
         present_count(&primary(&settled, case), "healthyTaskCount", case),
         Some(3),

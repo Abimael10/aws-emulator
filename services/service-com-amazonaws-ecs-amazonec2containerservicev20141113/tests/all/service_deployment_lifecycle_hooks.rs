@@ -189,6 +189,54 @@ async fn describe_deployment(router: &MultiServiceRouter, arn: &str, case: &str)
         .clone()
 }
 
+/// Re-read the stored rollout `arn` until a `PAUSE` hook of it is waiting for an action,
+/// and answer it.
+///
+/// The stage a rollout stops at is one the CLOCK brings it to, so it is polled for rather
+/// than timed.
+async fn poll_awaiting_hook(router: &MultiServiceRouter, arn: &str, case: &str) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let deployment = describe_deployment(router, arn, case).await;
+        let waiting = list(&deployment, "lifecycleHookDetails", case)
+            .iter()
+            .any(|hook| hook["status"] == json!(AWAITING_ACTION));
+        if waiting && !deployment["lifecycleStage"].is_null() {
+            return deployment;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the rollout to be waiting at a hook, got {deployment}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Re-read the stored rollout `arn` until its `status` is `wanted`, and answer it.
+///
+/// The rollout that REDEPLOYS a revision replaces the task set the rollout it undid left
+/// behind, which is several scheduler steps (the replacement is started, comes up, and the
+/// task it replaces is retired), so its end is polled for rather than timed.
+async fn poll_deployment_status(
+    router: &MultiServiceRouter,
+    arn: &str,
+    wanted: &str,
+    case: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let deployment = describe_deployment(router, arn, case).await;
+        if deployment["status"] == json!(wanted) {
+            return deployment;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the rollout to reach {wanted}, got {deployment}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// One successful `ContinueServiceDeployment`, with `action` when the request names one.
 async fn continue_deployment(
     router: &MultiServiceRouter,
@@ -517,9 +565,8 @@ async fn rollback_puts_the_service_back_on_the_previous_revision() {
         let first = register_definition(&router, &family, case).await;
         let second = register_definition(&router, &family, case).await;
         let released = create_service(&router, &name, &first, None, case).await;
-        tokio::time::sleep(ONE_SPAN).await;
         let source_revision = {
-            let deployment = describe_deployment(&router, &released, case).await;
+            let deployment = poll_deployment_status(&router, &released, "SUCCESSFUL", case).await;
             string(&deployment["targetServiceRevision"], "arn", case)
         };
 
@@ -534,8 +581,7 @@ async fn rollback_puts_the_service_back_on_the_previous_revision() {
             case,
         )
         .await;
-        tokio::time::sleep(ONE_SPAN).await;
-        let deployment = describe_deployment(&router, &rolled_back, case).await;
+        let deployment = poll_awaiting_hook(&router, &rolled_back, case).await;
         let (hook, _) = awaiting_hook(&deployment, case);
         let hook_id = string(&hook, "hookId", case);
         let answered =
@@ -552,8 +598,8 @@ async fn rollback_puts_the_service_back_on_the_previous_revision() {
             json!("ROLLBACK_IN_PROGRESS"),
             "case {case:?}: expected the rollback to be under way, got {deployment}"
         );
-        tokio::time::sleep(ONE_SPAN).await;
-        let deployment = describe_deployment(&router, &rolled_back, case).await;
+        let deployment =
+            poll_deployment_status(&router, &rolled_back, "ROLLBACK_SUCCESSFUL", case).await;
         assert_eq!(
             deployment["status"],
             json!("ROLLBACK_SUCCESSFUL"),
@@ -611,8 +657,7 @@ async fn rollback_puts_the_service_back_on_the_previous_revision() {
             "case {case:?}: the redeployment of the previous revision waits at no hook of \
              the rollout it undid, got {redeployment}"
         );
-        tokio::time::sleep(ONE_SPAN).await;
-        let redeployment = describe_deployment(&router, &current, case).await;
+        let redeployment = poll_deployment_status(&router, &current, "SUCCESSFUL", case).await;
         assert_eq!(
             redeployment["status"],
             json!("SUCCESSFUL"),

@@ -11,24 +11,27 @@
 //! a rollout that cannot succeed an END: without one the rollout stays `IN_PROGRESS` and a
 //! client polling for a terminal state never converges.
 //!
-//! What the breaker COUNTS is launches that failed. `Deployment$failedTasks`: "The number of
-//! consecutively failed tasks in the deployment. A task is considered a failure if the
-//! service scheduler can't launch the task, the task doesn't transition to a `RUNNING`
-//! state" — and `DeploymentCircuitBreaker$resetOnHealthyTask`: "a task that reaches a
-//! healthy state resets the failure count to `0`", whose "default is `true`". A launch this
-//! emulator cannot make is decided against the placement it was made into
-//! ([`evaluate_image_pulls`]) and the clock then stops the task it produced
-//! ([`TaskRecord::fail_launch`]), so the count is READ OFF the rollout's own task records
+//! What the breaker COUNTS is the tasks the rollout LOST. `Deployment$failedTasks`: "The
+//! number of consecutively failed tasks in the deployment. A task is considered a failure if
+//! the service scheduler can't launch the task, the task doesn't transition to a `RUNNING`
+//! state, or if it fails any of its defined health checks and is stopped" — and
+//! `DeploymentCircuitBreaker$resetOnHealthyTask`: "a task that reaches a healthy state resets
+//! the failure count to `0`", whose "default is `true`". Two stops answer that description
+//! ([`TaskRecord::failed_for_deployment`]): a launch this emulator cannot make is decided
+//! against the placement it was made into ([`evaluate_image_pulls`]) and the clock then stops
+//! the task it produced ([`TaskRecord::fail_launch`]), and a task whose ESSENTIAL container's
+//! program ends is stopped at the instant it ended ([`super::container_runtime`]). Either way
+//! the count is READ OFF the rollout's own task records
 //! ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::deployment_launch_failures`])
 //! and cannot drift from the tasks that exist.
 //!
 //! How many failures it tolerates is [`circuit_breaker_threshold`], which is at least
 //! [`MIN_CIRCUIT_BREAKER_THRESHOLD`] for the bounded percentage type — more failures than a
 //! small service has tasks. The scheduler is what produces the rest: it keeps the service at
-//! its desired count, so a task it loses to a failed launch is replaced
-//! ([`super::service_steady_state`]) and each replacement is another attempt for the breaker
-//! to count. Once the breaker HAS failed the rollout that replacing stops, as the same doc
-//! requires: a deployment in `FAILED` state launches no new task.
+//! its desired count, so a task it loses is replaced ([`super::service_steady_state`]) and
+//! each replacement is another attempt for the breaker to count. Once the breaker HAS failed
+//! the rollout that replacing stops, as the same doc requires: a deployment in `FAILED` state
+//! launches no new task.
 //!
 //! Where the failure leaves the service is the breaker's `rollback`: "If rollback is on,
 //! when a service deployment fails, the service is rolled back to the last deployment that
@@ -98,6 +101,37 @@ fn deployment_failed_event(service_name: &str, deployment_id: &str) -> String {
         "(service {service_name}) (deployment {deployment_id}) deployment failed: tasks \
          failed to start."
     )
+}
+
+impl TaskRecord {
+    /// Whether this task is one the rollout that placed it LOST — a failed task as
+    /// `Deployment$failedTasks` counts them: "A task is considered a failure if the service
+    /// scheduler can't launch the task, the task doesn't transition to a `RUNNING` state, or
+    /// if it fails any of its defined health checks and is stopped."
+    ///
+    /// Two stops answer that description. The stop a launch Amazon ECS could not make earns
+    /// ([`STOP_CODE_TASK_FAILED_TO_START`]) is the task that never transitioned to
+    /// `RUNNING`. The stop a task whose ESSENTIAL container exited earns
+    /// ([`STOP_CODE_ESSENTIAL_CONTAINER_EXITED`]) is a task that did not STAY in that state
+    /// for the service to hold, which is why the same note's reset is worded over the tasks
+    /// a deployment has "successfully running" rather than over the tasks it started at all.
+    /// A stop the SCHEDULER or a caller asked for is neither: the task was running and
+    /// something else wanted it stopped.
+    pub fn failed_for_deployment(&self) -> bool {
+        matches!(
+            self.stop_code.as_deref(),
+            Some(STOP_CODE_TASK_FAILED_TO_START) | Some(STOP_CODE_ESSENTIAL_CONTAINER_EXITED)
+        )
+    }
+
+    /// WHEN the rollout lost it: the instant the stop it earned was recorded at (the task's
+    /// `stoppingAt`), and `None` for a task the rollout did not lose.
+    pub fn deployment_failed_at(&self) -> Option<SystemTime> {
+        self.failed_for_deployment()
+            .then(|| self.stopping_at.or(self.stopped_at))
+            .flatten()
+            .and_then(|at| SystemTime::try_from(at).ok())
+    }
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -178,9 +212,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     }
 
     /// The launches of the rollout `deployment_id` that FAILED, as the circuit breaker counts
-    /// them: the tasks it placed that Amazon ECS could not launch at all
-    /// ([`TaskRecord::failed_to_launch`]), counted since the last task of that rollout
-    /// reached `RUNNING` when the breaker resets on a healthy task.
+    /// them: the tasks it placed that did not reach a running state the service could keep —
+    /// one Amazon ECS could not launch at all ([`TaskRecord::failed_to_launch`]) and one
+    /// whose essential container exited under it ([`TaskRecord::failed_for_deployment`]) —
+    /// counted since the last task of that rollout that DID when the breaker resets on a
+    /// healthy task.
     ///
     /// Derived from the task records, so the count a response reports is the count the
     /// breaker acts on.
@@ -210,10 +246,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .copied()
             .filter(|task| task.started_by.as_deref() == Some(deployment_id))
             .collect();
+        // The task that RESET the count: "Once a service deployment has one or more
+        // successfully running tasks, the failed task count resets to zero"
+        // (`Deployment$failedTasks`), so the start that counts here is the start of a task
+        // the rollout did not then lose — a task that started and failed anyway is the
+        // failure it is counted as, not the healthy task that clears one.
         let healthy_at = resets_on_healthy_task
             .then(|| {
                 placed
                     .iter()
+                    .filter(|task| !task.failed_for_deployment())
                     .filter_map(|task| task.started_at)
                     .filter_map(|at| SystemTime::try_from(at).ok())
                     .max()
@@ -221,8 +263,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .flatten();
         let mut failures: Vec<SystemTime> = placed
             .iter()
-            .filter(|task| task.failed_to_launch())
-            .filter_map(|task| task.launch_failed_at())
+            .filter(|task| task.failed_for_deployment())
+            .filter_map(|task| task.deployment_failed_at())
             .filter(|at| healthy_at.is_none_or(|healthy| *at > healthy))
             .collect();
         failures.sort_unstable();

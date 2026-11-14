@@ -24,7 +24,7 @@
 //! door a client uses, so nothing reaches into the state struct and a response that is
 //! not computed from persisted state cannot pass.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -37,6 +37,16 @@ use crate::ecs_wire::{
 /// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to
 /// fall due, with margin for a loaded test machine.
 const ONE_SPAN: Duration = Duration::from_millis(900);
+
+/// How often a poll re-reads a service.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long a poll keeps re-reading before it gives up.
+///
+/// A rolling update is several steps — the replacement is placed, comes up, and only then
+/// is the task it replaces retired — so the rollout that REPLACES a task set is polled for
+/// rather than timed. Generous, since every poll stops the instant its condition holds.
+const POLL_BUDGET: Duration = Duration::from_secs(30);
 
 /// Describe one service, asserting it is reported (rather than failed) and returning it.
 async fn describe(
@@ -71,6 +81,29 @@ fn event_messages(service: &Value, case: &str) -> Vec<String> {
         .iter()
         .map(|event| string(event, "message", case))
         .collect()
+}
+
+/// Re-read one service until `settled` holds of it, and answer the service it settled as.
+async fn poll_until(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    service_name: &str,
+    case: &str,
+    what: &str,
+    settled: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let view = describe(router, cluster, service_name, case).await;
+        if settled(&view) {
+            return view;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected {what}, got {view}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// One row of the projection table: how the service is created, and what the members AWS
@@ -471,8 +504,15 @@ async fn a_rollout_reaches_its_steady_state_on_the_clock_and_writes_its_events()
             "case {case:?}: reading a service does not settle its rollout, got {early}"
         );
 
-        tokio::time::sleep(ONE_SPAN).await;
-        let settled = describe(&router, "settling", service_name, case).await;
+        let settled = poll_until(
+            &router,
+            "settling",
+            service_name,
+            case,
+            "the rollout to reach its steady state",
+            |view| string(&list(view, "deployments", case)[0], "rolloutState", case) == "COMPLETED",
+        )
+        .await;
         assert_eq!(
             string(&list(&settled, "deployments", case)[0], "rolloutState", case),
             "COMPLETED",
@@ -539,8 +579,17 @@ async fn a_rollout_reaches_its_steady_state_on_the_clock_and_writes_its_events()
         2,
         "case {case:?}: the service keeps the events it already recorded, got {updated}"
     );
-    tokio::time::sleep(ONE_SPAN).await;
-    let settled = describe(&router, "settling", "web1", case).await;
+    // The rollout that REPLACES the task set the service already holds takes one step per
+    // task it replaces, so the second steady state is polled for rather than timed.
+    let settled = poll_until(
+        &router,
+        "settling",
+        "web1",
+        case,
+        "the second steady state to be reached",
+        |view| event_messages(view, case).len() >= 4,
+    )
+    .await;
     assert_eq!(
         event_messages(&settled, case).len(),
         4,
