@@ -128,6 +128,15 @@ const MIN_PASS_WAIT: Duration = Duration::from_millis(1);
 /// that makes a pass due starts a fresh pump.
 const MAX_RECORDING_PASSES: usize = 10_000;
 
+/// How long one pass may run before the pump gives up on it and goes on to the next.
+///
+/// A HOST bound, like the one on the pages one pass reads ([`MAX_QUEUE_PAGES`]): a pass
+/// reads the account's resources through in-process calls into the services that own
+/// them, and a call that never answers would otherwise leave the pump holding its lease
+/// for good — which is how an account that is recording would stop recording. Many
+/// passes' worth of time, so a pass that is merely slow is never given up on.
+const PASS_ANSWERS_WITHIN: Duration = Duration::from_secs(60);
+
 /// The most verdict CHANGES one pass records and publishes.
 ///
 /// A pass re-evaluates every rule over every recorded resource in its scope, so the
@@ -816,7 +825,29 @@ pub fn drive_recorder_clock<Eng: Send + Sync + 'static>(
                 .unwrap_or(MIN_PASS_WAIT)
                 .clamp(MIN_PASS_WAIT, RECORDING_PASS_DUE_AFTER);
             ::tokio::time::sleep(wait).await;
-            run_due_recording_pass(&callback, &*engine, &region, SystemTime::now()).await;
+            // ONE pass runs as its own bounded task, because a recorder that is
+            // recording KEEPS recording: what one pass did not manage to do ends that
+            // pass and not the account's recording, so a pass that panicked or never
+            // answered cannot be what stops a store's passes for good. Nothing a caller
+            // is told depends on which pass recorded what — the next pass observes the
+            // account again from scratch.
+            let pass = {
+                let callback = callback.clone();
+                let engine = ::std::sync::Arc::clone(&engine);
+                let region = region.clone();
+                ::tokio::spawn(async move {
+                    run_due_recording_pass(&callback, &*engine, &region, SystemTime::now()).await;
+                })
+            };
+            let abandon = pass.abort_handle();
+            if ::tokio::time::timeout(PASS_ANSWERS_WITHIN, pass).await.is_err() {
+                abandon.abort();
+                ::tracing::warn!(
+                    budget_seconds = PASS_ANSWERS_WITHIN.as_secs(),
+                    "a recording pass did not answer within its budget; it is given up \
+                     and the next pass is owed as usual"
+                );
+            }
             // Continuous recording owes the next pass as soon as this one is done; an
             // account whose recorders are all stopped owes none, which ends the pump.
             claim.store().lock().owe_recording_pass(SystemTime::now());

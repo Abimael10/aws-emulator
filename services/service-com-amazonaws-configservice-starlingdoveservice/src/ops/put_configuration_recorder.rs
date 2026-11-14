@@ -365,6 +365,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A recorder this call left RECORDING observes this account's resources with no
+        // further call — and it records what the recording group this call just stored
+        // covers — so the guard is released and the pump that runs those passes is
+        // started. An account holding no recording recorder owes no pass, and this
+        // starts no pump for one.
+        drop(store);
+        crate::state::drive_recorder_clock(ctx, &self.engine, &region);
+
         Ok(PutConfigurationRecorderOutput)
     }
 }

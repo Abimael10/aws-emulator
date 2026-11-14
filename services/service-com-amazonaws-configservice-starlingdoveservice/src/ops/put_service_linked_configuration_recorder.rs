@@ -323,6 +323,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name.clone(),
             crate::state::RecorderStatusEntry::started(&name, &arn, &service_principal, now),
         );
+        // A recorder that is RECORDING observes this account's resources with no further
+        // call, and this one is recording from the instant it was created — there is no
+        // start for the caller to make — so the guard is released and the pump that runs
+        // those passes is started here, exactly as a start does it.
+        drop(store);
+        crate::state::drive_recorder_clock(ctx, &self.engine, &region);
 
         Ok(PutServiceLinkedConfigurationRecorderOutput {
             arn: Some(arn),
