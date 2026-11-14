@@ -43,6 +43,8 @@ mod configuration_bundle_version_read;
 mod control_plane_preconditions;
 #[path = "all/credential_provider_external_secret_decryption.rs"]
 mod credential_provider_external_secret_decryption;
+#[path = "all/credential_provider_representation.rs"]
+mod credential_provider_representation;
 #[path = "all/dataset_lifecycle.rs"]
 mod dataset_lifecycle;
 #[path = "all/dataset_metadata_update.rs"]

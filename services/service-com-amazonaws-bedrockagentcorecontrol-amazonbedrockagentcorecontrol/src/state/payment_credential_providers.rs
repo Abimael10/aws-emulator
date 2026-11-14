@@ -39,8 +39,7 @@ use std::collections::HashMap;
 
 use super::api_key_credential_providers::{
     referenced_external_secret_arn, store_managed_secret, ApiKeySecretProblem,
-    CREDENTIAL_PROVIDER_ARN_SERVICE, MANAGED_SECRET_PREFIX, SECRET_SOURCE_EXTERNAL,
-    SECRET_SOURCE_MANAGED,
+    MANAGED_SECRET_PREFIX, SECRET_SOURCE_EXTERNAL, SECRET_SOURCE_MANAGED,
 };
 use super::*;
 use crate::ops::types::{
@@ -132,13 +131,16 @@ const AUTHORIZATION_PRIVATE_KEY_MEMBERS: SecretMembers = SecretMembers {
 /// memory without bound.
 pub const MAX_PAYMENT_CREDENTIAL_PROVIDERS: usize = 1_000;
 
-/// `arn:aws:acps:{region}:{account}:token-vault/{tokenVaultId}/paymentcredentialprovider/{name}`
-/// — `PaymentCredentialProviderArnType`'s pattern, which nests the provider
-/// under the token vault holding its credentials and ends in the name the caller
-/// chose.
+/// `arn:aws:bedrock-agentcore:{region}:{account}:token-vault/{tokenVaultId}/paymentcredentialprovider/{name}`
+/// — the provider nested under the token vault holding its credentials, ending
+/// in the name the caller chose, in the ARN namespace of the service that holds
+/// the vault ([`ARN_SERVICE`]), exactly as every other credential provider of
+/// the vault is addressed ([`api_key_credential_provider_arn`]);
+/// `PaymentCredentialProviderArnType`'s own pattern still spells the legacy
+/// `acps` namespace.
 pub fn payment_credential_provider_arn(region: &str, token_vault_id: &str, name: &str) -> String {
     ::engine::emulator_arn(
-        CREDENTIAL_PROVIDER_ARN_SERVICE,
+        ARN_SERVICE,
         region,
         &format!("token-vault/{token_vault_id}/{PAYMENT_CREDENTIAL_PROVIDER_ARN_TYPE}/{name}"),
     )
@@ -333,8 +335,10 @@ impl RequestedPaymentSecret {
                 Ok(StoredPaymentSecret {
                     secret_arn,
                     // The managed secret carries the value under the member it
-                    // was sent as, which is what a client extracts it with.
-                    json_key: Some(self.members.value.to_string()),
+                    // was sent as, which is the service's own document layout
+                    // and no `SecretReference` the caller supplied: there is no
+                    // JSON key to report for it.
+                    json_key: None,
                     source: SECRET_SOURCE_MANAGED.to_string(),
                 })
             }
@@ -415,9 +419,10 @@ async fn referenced_secret_arn(
 pub struct StoredPaymentSecret {
     /// The ARN Secrets Manager answered with for this secret.
     pub secret_arn: String,
-    /// The JSON key the value is extracted from that secret with: the one the
-    /// caller named for a secret they shaped, and the member's own name for the
-    /// secret this service manages.
+    /// The JSON key the value is extracted from that secret with, as the
+    /// provider reports it: the one the caller's own `SecretReference` named,
+    /// and NONE for the secret this service manages, whose document layout the
+    /// caller never named.
     pub json_key: Option<String>,
     /// The EFFECTIVE [`SECRET_SOURCE_MANAGED`] / [`SECRET_SOURCE_EXTERNAL`].
     pub source: String,

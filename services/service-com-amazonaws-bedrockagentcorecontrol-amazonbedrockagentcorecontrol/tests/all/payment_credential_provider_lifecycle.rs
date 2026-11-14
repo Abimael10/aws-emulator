@@ -199,13 +199,19 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-/// `PaymentCredentialProviderArnType`'s form,
-/// `^arn:(aws|aws-us-gov):acps:…:token-vault/…/paymentcredentialprovider/…$`
-/// (`smithy_query shape=CreatePaymentCredentialProvider`): computed from the request's
-/// Region, the emulator account, the account's default token vault and the name.
+/// The ARN a payment credential provider named `name` carries: the token-vault
+/// path of `PaymentCredentialProviderArnType`
+/// (`^arn:…:token-vault/…/paymentcredentialprovider/…$`, `smithy_query
+/// shape=PaymentCredentialProviderArnType`) in the ARN namespace of the service
+/// that holds the vault — the namespace
+/// `ConsentPortalIdpConfig.credentialProviderArn`'s pattern requires of a
+/// credential provider's ARN, rather than the legacy `acps` one those
+/// provider-ARN shapes still spell. Computed from the request's Region, the
+/// emulator account, the account's default token vault and the name.
 fn provider_arn(name: &str) -> String {
     format!(
-        "arn:aws:acps:{REGION}:000000000000:token-vault/default/paymentcredentialprovider/{name}"
+        "arn:aws:bedrock-agentcore:{REGION}:000000000000:token-vault/default/\
+         paymentcredentialprovider/{name}"
     )
 }
 
@@ -542,17 +548,20 @@ async fn every_vendor_configuration_is_stored_where_its_source_says_and_reported
                 );
             } else {
                 // A secret the SERVICE manages: it really exists in Secrets Manager, and
-                // it holds the value the request handed over, under the JSON key the
-                // provider reports.
+                // it holds the value the request handed over under the member it was sent
+                // as — a layout of the service's own, which no `SecretReference` of the
+                // request named, so the provider reports no JSON key for it.
                 assert_eq!(
-                    json_key, slot.member,
-                    "case {:?} ({}): a managed secret is extracted under the member's own \
-                     name, got {created}",
-                    row.case, slot.member
+                    reported[format!("{}JsonKey", slot.member)],
+                    Value::Null,
+                    "case {:?} ({}): a secret the service manages is reported with no JSON \
+                     key, got {created}",
+                    row.case,
+                    slot.member
                 );
                 let document = emulator.secret_document(&secret_arn, row.case).await;
                 assert_eq!(
-                    document[&json_key],
+                    document[slot.member],
                     json!(slot.value),
                     "case {:?} ({}): the managed secret {secret_arn} holds the value the \
                      create was given, got {document}",

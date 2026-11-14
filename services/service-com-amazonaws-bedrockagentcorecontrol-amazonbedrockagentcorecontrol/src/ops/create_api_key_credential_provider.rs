@@ -264,11 +264,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The secret the provider reports is a secret Secrets Manager really
-        // holds: the one this create puts the caller's key into for a managed
-        // provider, or the one the request references for an external one. The
-        // ARN is `@required` on this operation's own answer, so a provider is not
-        // recorded — and no success is reported — when there is no secret to name.
+        // The secret the provider reports is a secret this emulator's OWN Secrets
+        // Manager really holds: the one this create puts the caller's key into for
+        // a managed provider, or the one the request references for an external
+        // one. The ARN is `@required` on this operation's own answer, so a
+        // provider is not recorded — and no success is reported — when there is no
+        // secret to name.
+        //
+        // WHERE THAT SECRET LIVES. Both calls below go through this request's own
+        // in-process callback (`crate::state::secrets_manager_client`, built on
+        // `ctx.callback()`), which dispatches back into this same emulator's
+        // Secrets Manager service over the in-memory engine: no socket is opened,
+        // nothing leaves this process, and no real account is reached. Only ids
+        // this process holds resolve, so the request cannot learn anything about
+        // any secret outside this emulator.
         //
         // An external provider's secret is the CALLER's: nothing is written into
         // it, so an `apiKey` sent alongside the reference is not stored anywhere.
@@ -295,9 +304,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .await
                 .map_err(|problem| secret_problem(problem, &input.name))?;
-                // A managed secret carries the key under the service's own JSON
-                // key, which is what a client extracts it with.
-                (arn, Some(crate::state::MANAGED_SECRET_JSON_KEY.to_string()))
+                // A secret the SERVICE manages carries the key under a JSON key
+                // of the service's own choosing, which no `SecretReference` of
+                // the request named: there is no caller-supplied JSON key to
+                // report, so the optional member is omitted.
+                (arn, None)
             }
         };
 
@@ -347,12 +358,13 @@ fn name_taken(name: &str) -> CreateApiKeyCredentialProviderErrorModeled {
 }
 
 /// How a create answers when the secret the provider's key lives in could not be
-/// reported: the reference names no secret of this account, which is the modelled
-/// 404 for "a resource referenced by the operation does not exist"; a secret
-/// whose own KMS key will not decrypt it is the modelled `DecryptionFailure`,
-/// which is the one failure the caller recovers from by fixing the key rather
-/// than the request; anything else is this emulator failing to reach Secrets
-/// Manager, which is a server failure rather than a statement about the request.
+/// reported: the reference names no secret of this emulator's own Secrets Manager,
+/// which is the modelled 404 for "a resource referenced by the operation does not
+/// exist"; a secret whose own KMS key will not decrypt it is the modelled
+/// `DecryptionFailure`, which is the one failure the caller recovers from by
+/// fixing the key rather than the request; anything else is this emulator's
+/// in-process Secrets Manager not answering, which is a server failure rather
+/// than a statement about the request.
 fn secret_problem(
     problem: crate::state::ApiKeySecretProblem,
     reference: &str,

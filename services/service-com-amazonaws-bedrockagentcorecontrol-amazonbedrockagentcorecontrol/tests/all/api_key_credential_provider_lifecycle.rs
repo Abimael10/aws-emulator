@@ -4,14 +4,16 @@
 //!
 //! The rule under test: a served create records ONE API key credential provider
 //! of this account's token vault under the `name` the request chose — minting its
-//! `acps` token-vault ARN and reporting the Secrets Manager secret the API key
-//! lives in — and every later read answers from that one record. Where the secret
-//! comes from is the provider's own `apiKeySecretSource`:
+//! token-vault ARN in this service's own ARN namespace and reporting the Secrets
+//! Manager secret the API key lives in — and every later read answers from that
+//! one record. Where the secret comes from is the provider's own
+//! `apiKeySecretSource`:
 //!
 //! * `MANAGED`, the source a request naming none asks for, puts the caller's
 //!   `apiKey` into a secret of the caller's account under a name derived from the
 //!   vault and the provider, as the JSON document a secret's value is, and reports
-//!   that secret's ARN with the JSON key the document carries the key under;
+//!   that secret's ARN — and no JSON key, that document's layout being the
+//!   service's own rather than a secret reference the caller supplied;
 //! * `EXTERNAL`, which the request's `apiKeySecretConfig` asks for, resolves the
 //!   secret the caller already holds and reports its ARN and the `jsonKey` the key
 //!   is extracted with, writing nothing into it.
@@ -65,16 +67,26 @@ const MAX_API_KEY_LEN: usize = 65_536;
 const MANAGED_DOCUMENT_OVERHEAD: usize = 13;
 
 /// The name the secret holding a managed provider's key is created under, and the
-/// JSON key that secret's value carries the key under. Spelled out here rather
-/// than read off the implementation, so a drift in either is a failing test.
+/// JSON key that secret's value carries the key under — the layout of a secret
+/// the SERVICE manages, which is why no response reports it. Spelled out here
+/// rather than read off the implementation, so a drift in either is a failing
+/// test.
 fn managed_secret_name(provider: &str) -> String {
     format!("bedrock-agentcore-identity/{VAULT}/apikey/{provider}")
 }
 const MANAGED_SECRET_JSON_KEY: &str = "apiKey";
 
-/// The ARN a provider named `name` carries in `region`.
+/// The ARN a provider named `name` carries in `region`: the token-vault path of
+/// `ApiKeyCredentialProviderArnType`, in the ARN namespace of the service that
+/// holds the vault — the one `ConsentPortalIdpConfig.credentialProviderArn`'s
+/// pattern requires of a credential provider's ARN (`smithy_query
+/// shape=ConsentPortalIdpConfig`), not the legacy `acps` namespace that shape's
+/// own pattern still spells.
 fn provider_arn(region: &str, name: &str) -> String {
-    format!("arn:aws:acps:{region}:{ACCOUNT}:token-vault/{VAULT}/apikeycredentialprovider/{name}")
+    format!(
+        "arn:aws:bedrock-agentcore:{region}:{ACCOUNT}:token-vault/{VAULT}/\
+         apikeycredentialprovider/{name}"
+    )
 }
 
 /// The prefix the ARN of a secret named `name` carries in `region`: a created
@@ -477,9 +489,9 @@ fn assert_provider_members(
             );
             assert_eq!(
                 body["apiKeySecretJsonKey"],
-                json!(MANAGED_SECRET_JSON_KEY),
-                "case {case:?}: a managed secret reports the JSON key its value carries the API \
-                 key under, got body {body}"
+                Value::Null,
+                "case {case:?}: a provider whose secret the service manages reports no JSON \
+                 key, got body {body}"
             );
         }
         (Source::External { json_key, .. }, Some(arn)) => {

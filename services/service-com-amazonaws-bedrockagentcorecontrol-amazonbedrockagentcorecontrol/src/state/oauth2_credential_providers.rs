@@ -46,12 +46,18 @@ use crate::ops::types::{
 /// (`smithy_query shape=CredentialProviderArnType`).
 pub const OAUTH2_CREDENTIAL_PROVIDER_ARN_TYPE: &str = "oauth2credentialprovider";
 
-/// `arn:aws:acps:{region}:{account}:token-vault/{tokenVaultId}/oauth2credentialprovider/{name}`
-/// — that pattern, which nests the provider under the token vault that holds it
-/// and ends in the name the caller chose.
+/// `arn:aws:bedrock-agentcore:{region}:{account}:token-vault/{tokenVaultId}/oauth2credentialprovider/{name}`
+/// — the provider nested under the token vault that holds it, ending in the name
+/// the caller chose, in the ARN namespace of the service holding the vault
+/// ([`ARN_SERVICE`]), exactly as every other credential provider of the vault is
+/// addressed ([`api_key_credential_provider_arn`]). The namespace is the one
+/// `ConsentPortalIdpConfig.credentialProviderArn` — a consumer of THIS ARN —
+/// requires: `arn:…:bedrock-agentcore:…:token-vault/…/oauth2credentialprovider/…`
+/// (`smithy_query shape=ConsentPortalIdpConfig`), while
+/// `CredentialProviderArnType`'s own pattern still spells the legacy `acps` one.
 pub fn oauth2_credential_provider_arn(region: &str, token_vault_id: &str, name: &str) -> String {
     ::engine::emulator_arn(
-        CREDENTIAL_PROVIDER_ARN_SERVICE,
+        ARN_SERVICE,
         region,
         &format!("token-vault/{token_vault_id}/{OAUTH2_CREDENTIAL_PROVIDER_ARN_TYPE}/{name}"),
     )
@@ -81,11 +87,11 @@ pub const MAX_OAUTH2_CREDENTIAL_PROVIDERS: usize = 1_000;
 /// API key provider's own ([`MANAGED_SECRET_PREFIX`]).
 const MANAGED_SECRET_KIND: &str = "oauth2";
 
-/// The JSON key the service's own managed secret holds the client secret under,
-/// and therefore the `clientSecretJsonKey` a managed provider reports: a
-/// secret's value is a JSON document, so the value is extracted from it by name
-/// exactly as it is from a secret the caller shaped. The key is the member's own
-/// name on the wire.
+/// The JSON key the service's own managed secret holds the client secret under:
+/// a secret's value is a JSON document, so the value sits in it under a name of
+/// the service's choosing — the member's own name on the wire. It is the layout
+/// of a secret this SERVICE manages rather than a secret reference the caller
+/// supplied, so it is not reported as the provider's `clientSecretJsonKey`.
 pub const OAUTH2_MANAGED_SECRET_JSON_KEY: &str = "clientSecret";
 
 /// `Status` for a credential provider whose secret this create has already
@@ -636,7 +642,10 @@ impl RequestedOauth2Configuration {
                 &value,
             )
             .await?,
-            json_key: Some(OAUTH2_MANAGED_SECRET_JSON_KEY.to_string()),
+            // The document's key is the service's own, named by no
+            // `SecretReference` of the request, so the provider reports no JSON
+            // key for a secret it manages.
+            json_key: None,
             source: SECRET_SOURCE_MANAGED.to_string(),
         })
     }
@@ -685,7 +694,9 @@ fn included_discovery(endpoints: IncludedEndpoints<'_>) -> Option<Oauth2Discover
 
 /// The client secret of one provider as every response that reports it carries
 /// it: who manages it, the ARN its owner holds it at and the JSON key the value
-/// is extracted under. The VALUE is not here — it is in Secrets Manager.
+/// is extracted under — the one the caller's own `SecretReference` named, and
+/// none for a secret the service manages. The VALUE is not here — it is in
+/// Secrets Manager.
 #[derive(Debug, Clone)]
 pub struct StoredOauth2Secret {
     pub secret_arn: String,

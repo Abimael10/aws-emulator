@@ -18,10 +18,11 @@
 //!   puts the caller's key into a secret in Secrets Manager, under a name derived
 //!   from the vault and the provider ([`managed_api_key_secret_name`]), as the
 //!   JSON document a secret's value is ([`managed_api_key_secret_value`]), and
-//!   reports that secret's ARN together with the key that document carries the
-//!   API key under. The ARN is part of the create's own answer, so it names a
-//!   secret Secrets Manager really holds: a client that reads the provider and
-//!   then reads the secret finds the key there;
+//!   reports that secret's ARN — and no JSON key, the document's layout being
+//!   the service's own rather than a secret reference the caller supplied. The
+//!   ARN is part of the create's own answer, so it names a secret Secrets
+//!   Manager really holds: a client that reads the provider and then reads the
+//!   secret finds the key there;
 //! * `EXTERNAL` — "you manage the secret yourself in Amazon Web Services Secrets
 //!   Manager" — so the create READS the secret the request's `apiKeySecretConfig`
 //!   names and reports the ARN Secrets Manager answered with, together with the
@@ -45,14 +46,10 @@ use crate::ops::types::{
 
 use super::{timestamp, DEFAULT_REGION};
 
-/// The ARN namespace a credential provider of the token vault carries, which is
-/// NOT this service's own: `ApiKeyCredentialProviderArnType` is
-/// `^arn:(aws|aws-us-gov):acps:…:token-vault/…/apikeycredentialprovider/…$`
-/// (`smithy_query shape=ApiKeyCredentialProviderArnType`).
-pub const CREDENTIAL_PROVIDER_ARN_SERVICE: &str = "acps";
-
 /// The ARN path segment an API key credential provider of a token vault is
-/// addressed under, from that same pattern.
+/// addressed under: `ApiKeyCredentialProviderArnType` nests the provider under
+/// the vault holding it, `token-vault/<vaultId>/apikeycredentialprovider/<name>`
+/// (`smithy_query shape=ApiKeyCredentialProviderArnType`).
 pub const API_KEY_CREDENTIAL_PROVIDER_ARN_TYPE: &str = "apikeycredentialprovider";
 
 /// The resource noun [`super::resource_not_found`] names for a SECRET this
@@ -101,10 +98,12 @@ pub const MANAGED_SECRET_PREFIX: &str = "bedrock-agentcore-identity";
 /// The segment of a managed secret's name that says what is in it.
 const MANAGED_SECRET_KIND: &str = "apikey";
 
-/// The JSON key the service's own managed secret holds the API key under, and
-/// therefore the `apiKeySecretJsonKey` a managed provider reports: a secret's
-/// value is a JSON document, so the key is extracted from it by name exactly as
-/// it is from a secret the caller shaped.
+/// The JSON key the service's own managed secret holds the API key under: a
+/// secret's value is a JSON document, so the key sits in it under a name of its
+/// own. That name is the layout of a secret this SERVICE manages rather than a
+/// secret reference the caller supplied, so it is NOT what the provider reports
+/// as its `apiKeySecretJsonKey` — see
+/// [`ApiKeyCredentialProviderRecord::api_key_secret_json_key`].
 pub const MANAGED_SECRET_JSON_KEY: &str = "apiKey";
 
 /// The value the secret holding a `MANAGED` provider's key is stored with: the
@@ -127,16 +126,24 @@ pub fn managed_api_key_secret_name(token_vault_id: &str, provider_name: &str) ->
     format!("{MANAGED_SECRET_PREFIX}/{token_vault_id}/{MANAGED_SECRET_KIND}/{provider_name}")
 }
 
-/// `arn:aws:acps:{region}:{account}:token-vault/{tokenVaultId}/apikeycredentialprovider/{name}`
-/// — `ApiKeyCredentialProviderArnType`'s pattern, which nests the provider under
-/// the token vault that holds it and ends in the name the caller chose.
+/// `arn:aws:bedrock-agentcore:{region}:{account}:token-vault/{tokenVaultId}/apikeycredentialprovider/{name}`
+/// — the provider nested under the token vault that holds it, ending in the name
+/// the caller chose, in the ARN namespace of the service that holds the vault
+/// ([`super::ARN_SERVICE`]): the namespace every other resource of this service
+/// is addressed in, and the one a consumer of a credential provider's ARN
+/// requires — `ConsentPortalIdpConfig.credentialProviderArn`'s pattern is
+/// `arn:…:bedrock-agentcore:…:token-vault/…/oauth2credentialprovider/…`
+/// (`smithy_query shape=ConsentPortalIdpConfig`).
+///
+/// `ApiKeyCredentialProviderArnType`'s own pattern still spells the legacy `acps`
+/// namespace, which the service no longer issues.
 pub fn api_key_credential_provider_arn(
     region: &str,
     token_vault_id: &str,
     name: &str,
 ) -> String {
     ::engine::emulator_arn(
-        CREDENTIAL_PROVIDER_ARN_SERVICE,
+        super::ARN_SERVICE,
         region,
         &format!("token-vault/{token_vault_id}/{API_KEY_CREDENTIAL_PROVIDER_ARN_TYPE}/{name}"),
     )
@@ -157,9 +164,10 @@ pub struct ApiKeyCredentialProviderRecord {
     /// `MANAGED` provider, or the one Secrets Manager reported for the secret an
     /// `EXTERNAL` provider references.
     pub api_key_secret_arn: String,
-    /// The JSON key the API key is extracted from that secret with: the one the
-    /// caller named for a secret they shaped, and the service's own
-    /// ([`MANAGED_SECRET_JSON_KEY`]) for the secret it manages.
+    /// The JSON key the API key is extracted from that secret with, as every
+    /// response reporting this provider carries it: the one the caller's own
+    /// `SecretReference` named, and NONE for a secret the service manages, whose
+    /// document layout the caller never named.
     pub api_key_secret_json_key: Option<String>,
     /// The effective [`SECRET_SOURCE_MANAGED`] / [`SECRET_SOURCE_EXTERNAL`].
     pub api_key_secret_source: String,
