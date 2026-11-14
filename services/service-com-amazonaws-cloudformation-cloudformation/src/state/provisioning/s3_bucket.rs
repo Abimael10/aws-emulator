@@ -22,7 +22,10 @@
 //!   declaration's tags plus the ones CloudFormation propagates to it, and those change with
 //!   no declaration changing at all;
 //! * `VersioningConfiguration` is a `PutBucketVersioning`, the one call that writes the
-//!   versioning state of a bucket that exists.
+//!   versioning state of a bucket that exists;
+//! * `WebsiteConfiguration` is a `PutBucketWebsite`, or the `DeleteBucketWebsite` that leaves
+//!   a bucket whose declaration dropped the property with no website configuration at all
+//!   ([`put_website`]).
 //!
 //! Every other property is reported as NOT applied, exactly as a type with no update arm at
 //! all is ([`super::Owner::update`]): the change is the caller's and nothing here applied it,
@@ -45,7 +48,9 @@
 use ::serde_json::Value;
 
 use super::{Created, Refusal};
-use crate::state::provisioner::{s3_client, tags_of};
+use crate::state::provisioner::{
+    declared_website_configuration, s3_client, tags_of, WEBSITE_CONFIGURATION,
+};
 use crate::state::StoredResource;
 
 /// The declaration's own tag set, reconciled by [`retag`] rather than by [`update`].
@@ -60,7 +65,7 @@ const VERSIONING_STATUS: &str = "Status";
 /// The properties a changed declaration of a bucket that exists is APPLIED for: the ones
 /// above, each by the one Amazon S3 call that writes it on a live bucket. A declaration that
 /// changes anything else is reported as not applied.
-const APPLIED_PROPERTIES: &[&str] = &[TAGS, VERSIONING_CONFIGURATION];
+const APPLIED_PROPERTIES: &[&str] = &[TAGS, VERSIONING_CONFIGURATION, WEBSITE_CONFIGURATION];
 
 /// The `HandlerErrorCode` class a name already in use falls in
 /// ([`super::HANDLER_ERROR_CLASSES`]), which is what this provider words its own sentence
@@ -88,7 +93,45 @@ pub(super) async fn update(
     if changed.iter().any(|property| property == VERSIONING_CONFIGURATION) {
         put_versioning(ctx, region, &resource.physical_resource_id, declared).await?;
     }
+    if changed.iter().any(|property| property == WEBSITE_CONFIGURATION) {
+        put_website(ctx, region, &resource.physical_resource_id, declared).await?;
+    }
     Ok(Some(Created::default()))
+}
+
+/// "PutBucketWebsite — sets the configuration of the website that is specified in the website
+/// subresource": the configuration the declaration now asks for, sent for the bucket the
+/// stack created, translated out of the template's spelling by the ONE reading the create uses
+/// ([`declared_website_configuration`]).
+///
+/// A declaration that no longer carries the property asks for NO website configuration, and
+/// Amazon S3 publishes a call for exactly that — `DeleteBucketWebsite` "removes the website
+/// configuration for a bucket" — so the deployed bucket ends up in the state the template now
+/// states rather than keeping a website the template dropped.
+async fn put_website(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    declared: &Value,
+) -> Result<(), Refusal> {
+    let client = s3_client(ctx, region);
+    let Some(configuration) = declared_website_configuration(declared)? else {
+        client
+            .delete_bucket_website()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+        return Ok(());
+    };
+    client
+        .put_bucket_website()
+        .bucket(bucket)
+        .website_configuration(configuration)
+        .send()
+        .await
+        .map_err(|error| refusal_of(&error))?;
+    Ok(())
 }
 
 /// "PutBucketVersioning — sets the versioning state of an existing bucket": the state the
@@ -332,11 +375,23 @@ mod tests {
                 false,
             ),
             (
-                "that property beside one this provider does write",
+                "a website configuration added to a bucket that carried none",
+                ::serde_json::json!({}),
+                ::serde_json::json!({"WebsiteConfiguration": {"IndexDocument": "index.html"}}),
+                true,
+            ),
+            (
+                "a website configuration dropped",
+                ::serde_json::json!({"WebsiteConfiguration": {"IndexDocument": "index.html"}}),
+                ::serde_json::json!({}),
+                true,
+            ),
+            (
+                "an unwritten property beside one this provider does write",
                 ::serde_json::json!({}),
                 ::serde_json::json!({
                     "Tags": [{"Key": "owner", "Value": "platform"}],
-                    "WebsiteConfiguration": {"IndexDocument": "index.html"}
+                    "AccessControl": "PublicRead"
                 }),
                 false,
             ),

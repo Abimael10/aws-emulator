@@ -3880,7 +3880,6 @@ mod cloudwatch_cfn_alarm_action_topic_policy;
 // top level of `tests/` fails the build, and each suite is declared exactly ONCE, since
 // this is one crate root and a second `mod` for the same name is `E0428` — stands in the
 // module doc at the HEAD of this file, and `all/all_rs_declares_each_suite_once.rs` and
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` are what check both halves of
 // it for this file and for every service crate's `tests/all.rs`.)
 // this file and for every service crate's `tests/all.rs`. (One more line of that header
 // fragment, a plain comment here: an inner doc comment is only legal before the first
@@ -3920,7 +3919,6 @@ mod cloudwatch_cfn_alarm_action_topic_policy;
 // this tail is `E0753` and compiles no suite of this target.)
 // doc comment is only legal before the first item of this crate root.)
 // (Two more lines of that header fragment, plain comments here for the same reason:
-// `all/all_rs_declares_each_suite_once.rs` checks this file and every service crate's
 // `tests/all.rs`, so check there rather than leaving a note in this tail.)
 // this file and for every service crate's `tests/all.rs`, and
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks that a note like this
@@ -3960,7 +3958,6 @@ mod cloudwatch_cfn_alarm_action_topic_policy;
 // this is one crate root and a second `mod` for one name is `E0428`, and a note written
 // with `//!` anywhere but the header is `E0753` — either fails every suite in this target;
 // `all/all_rs_declares_each_suite_once.rs` checks the declarations, for this file and for
-// every service crate's `tests/all.rs`.)
 // header that a landing appended here: past the first item a `//!` line is `E0753` and
 // compiles no suite in this target, so it stands as an ordinary comment.)
 // an ordinary comment for the reason the lines around it record.)
@@ -4505,3 +4502,6 @@ mod iot_job_cancel_unwinds_the_device_queue;
 // suite left at the top level of `tests/` fails the build. (Ordinary comment: an inner doc
 // this file and for every service crate's `tests/all.rs`. (Ordinary comment, for the reason
 // the line above records.)
+// A suite left at the top level of `tests/` fails the build. (A fragment of this file's own
+// header that a landing appended here typed with `//!`, which is `E0753` anywhere but the
+// head of a crate root, so it stands as an ordinary comment.)

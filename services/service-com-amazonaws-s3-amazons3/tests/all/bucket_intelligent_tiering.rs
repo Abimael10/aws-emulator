@@ -1002,7 +1002,7 @@ async fn the_per_bucket_ceiling_is_the_published_one() {
 /// crate so that a change to the handler's wording fails this suite — the way the
 /// subresource-message suite beside this one pins its published texts.
 const PUBLISHED_INVALID_CONFIG_ID_MESSAGE: &str =
-    "Config Id should not be more than 1 char and less than 64 chars in length";
+    "Config Id should be more than 1 character and less than 64 characters in length.";
 
 /// The published id-length bound, tested at each end and one past it.
 ///

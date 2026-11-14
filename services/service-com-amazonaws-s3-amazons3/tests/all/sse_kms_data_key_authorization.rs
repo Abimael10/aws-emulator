@@ -32,9 +32,10 @@
 //!   which names no key and so asks KMS nothing;
 //! * HOW the encryption reaches the write — the request's own headers, and the bucket's
 //!   DEFAULT encryption configuration for a write that names none;
-//! * the OPERATION that stores the object — `PutObject`, `CopyObject`, the
-//!   `CreateMultipartUpload` that settles an upload's encryption, and the
-//!   `UpdateObjectEncryption` that re-encrypts a stored object under another key;
+//! * the OPERATION that stores the object — `PutObject`, `CopyObject` and the
+//!   `CreateMultipartUpload` that settles an upload's encryption; beside them the
+//!   `UpdateObjectEncryption` that re-encrypts a stored object under another key, which mints
+//!   no data key at all and so is judged against the `kms:Encrypt` it does perform;
 //! * and that the refusal LIFTS the moment the key policy grants the action again, with no
 //!   intervening call, while objects written before the deny stay readable.
 //!
@@ -74,6 +75,11 @@ const GENERATE_DATA_KEY_ACTION: &str = "kms:GenerateDataKey";
 /// The action a READ of such an object is authorized under, which these rows leave alone: an
 /// object written before a deny of the data-key action stays readable.
 const DECRYPT_ACTION: &str = "kms:Decrypt";
+
+/// The action a re-encryption of an object S3 ALREADY holds is authorized under: such a call
+/// mints no data key and serves no plaintext, it moves the stored object's envelope onto
+/// another key.
+const ENCRYPT_ACTION: &str = "kms:Encrypt";
 
 /// The encryption-context ENTRY NAME S3 binds an object's data key to (Amazon S3 User Guide,
 /// *Using server-side encryption with KMS keys*, "Encryption context").
@@ -683,11 +689,11 @@ async fn a_write_inheriting_a_bucket_default_mints_its_data_key_under_that_defau
 }
 
 /// One row of the encryption-update table: the case, and whether the key the object is
-/// re-encrypted TO denies the data-key action.
+/// re-encrypted TO denies the action that re-encryption performs.
 type UpdateRow = (&'static str, bool);
 
 #[tokio::test]
-async fn an_encryption_update_mints_a_data_key_under_the_key_it_re_encrypts_to() {
+async fn an_encryption_update_encrypts_under_the_key_it_re_encrypts_to() {
     let router = router_with_kms();
     let name = "sse-kms-encryption-update";
     bucket(&router, name).await;
@@ -710,7 +716,7 @@ async fn an_encryption_update_mints_a_data_key_under_the_key_it_re_encrypts_to()
     // The deny comes first, so the row that is refused is judged against an object still
     // stored under the key it was written with.
     let rows: [UpdateRow; 2] = [
-        ("a target key that denies the data key", true),
+        ("a target key that denies the encrypt", true),
         ("a target key that permits it", false),
     ];
 
@@ -718,7 +724,7 @@ async fn an_encryption_update_mints_a_data_key_under_the_key_it_re_encrypts_to()
         let document = denied.then(|| {
             policy(vec![
                 allow_account(),
-                account_statement("Deny", json!(GENERATE_DATA_KEY_ACTION), Value::Null),
+                account_statement("Deny", json!(ENCRYPT_ACTION), Value::Null),
             ])
         });
         let (_, target_arn) = key_with(&router, case, document.as_deref()).await;
@@ -745,7 +751,7 @@ async fn an_encryption_update_mints_a_data_key_under_the_key_it_re_encrypts_to()
             );
             assert_eq!(
                 answer.error_message(),
-                Denial::ExplicitDeny.message(GENERATE_DATA_KEY_ACTION, &target_arn),
+                Denial::ExplicitDeny.message(ENCRYPT_ACTION, &target_arn),
                 "case {case:?}: expected KMS's denial sentence, got {:?}",
                 answer.error_message()
             );
@@ -927,6 +933,210 @@ async fn every_write_that_stores_an_sse_kms_object_mints_a_data_key_under_its_ke
                     text(&read)
                 );
             }
+        }
+    }
+}
+
+/// One row of the per-action table: which single KMS action the target key's policy denies, and
+/// whether each of the two calls below is refused under it.
+struct ActionRow {
+    case: &'static str,
+    /// The one action the key policy denies, beside an allow of everything else.
+    denied: &'static str,
+    /// Whether a FRESH write under that key is refused, and the action its denial names.
+    write_refused: bool,
+    /// Whether a re-encryption ONTO that key is refused, and the action its denial names.
+    update_refused: bool,
+}
+
+/// RULE: the KMS action a call is authorized against — and so the action its denial sentence
+/// names — is the one that call actually performs on the key: a write that stores new bytes
+/// mints a data key (`kms:GenerateDataKey`), while a re-encryption of an object S3 ALREADY
+/// holds mints none and moves that object's envelope onto another key (`kms:Encrypt`).
+///
+/// The rows deny exactly ONE action each, so the two calls are told apart by which action the
+/// key withholds rather than by anything about their payloads: a key denying only
+/// `kms:GenerateDataKey` refuses the fresh write and admits the re-encryption, and a key
+/// denying only `kms:Encrypt` does the opposite. A key that denies neither admits both, which is
+/// what keeps the refusals about the actions and not about the key.
+#[tokio::test]
+async fn each_sse_kms_call_is_judged_against_the_action_it_performs_on_the_key() {
+    let router = router_with_kms();
+    let name = "sse-kms-per-action";
+    bucket(&router, name).await;
+    // The object every row re-encrypts: stored under a key whose policy withholds nothing, so a
+    // refusal below is the TARGET key's and not this one's.
+    let object_key = "envelope.bin";
+    let (_, source_arn) = key_with(&router, "the key the object is stored under", None).await;
+    let stored = put_object(
+        &router,
+        name,
+        object_key,
+        BODY,
+        &Headers {
+            algorithm: KMS_ALGORITHMS[0],
+            key_id: Some(source_arn.clone()),
+            bucket_key: false,
+            context: None,
+        }
+        .as_pairs(),
+    )
+    .await;
+    assert_eq!(
+        stored.status, 200,
+        "the object to re-encrypt must be stored first, got {} with body {:?}",
+        stored.status,
+        text(&stored)
+    );
+
+    let rows: [ActionRow; 3] = [
+        ActionRow {
+            case: "a key denying the data-key action alone",
+            denied: GENERATE_DATA_KEY_ACTION,
+            write_refused: true,
+            update_refused: false,
+        },
+        ActionRow {
+            case: "a key denying the encrypt action alone",
+            denied: ENCRYPT_ACTION,
+            write_refused: false,
+            update_refused: true,
+        },
+        ActionRow {
+            case: "a key denying the decrypt action alone",
+            denied: DECRYPT_ACTION,
+            write_refused: false,
+            update_refused: false,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let ActionRow {
+            case,
+            denied,
+            write_refused,
+            update_refused,
+        } = row;
+        let document = policy(vec![
+            allow_account(),
+            account_statement("Deny", json!(denied), Value::Null),
+        ]);
+        let (key_id, target_arn) = key_with(&router, case, Some(&document)).await;
+
+        // A FRESH write under the key: it mints a data key, so only a deny of that action
+        // refuses it, and the sentence names that action.
+        let written = put_object(
+            &router,
+            name,
+            &format!("fresh/{index}.bin"),
+            BODY,
+            &Headers {
+                algorithm: KMS_ALGORITHMS[0],
+                key_id: Some(key_id.clone()),
+                bucket_key: false,
+                context: None,
+            }
+            .as_pairs(),
+        )
+        .await;
+        if *write_refused {
+            assert_eq!(
+                written.status, 403,
+                "case {case:?}/write: expected HTTP 403, got {} with body {:?}",
+                written.status,
+                text(&written)
+            );
+            assert_eq!(
+                written.error_message(),
+                Denial::ExplicitDeny.message(GENERATE_DATA_KEY_ACTION, &target_arn),
+                "case {case:?}/write: expected the denial to name \
+                 {GENERATE_DATA_KEY_ACTION}, got {:?}",
+                written.error_message()
+            );
+        } else {
+            assert_eq!(
+                written.status, 200,
+                "case {case:?}/write: expected the write to be stored, got {} with body {:?}",
+                written.status,
+                text(&written)
+            );
+        }
+
+        // A RE-ENCRYPTION onto the same key: it mints no data key, so only a deny of the
+        // encrypt action refuses it, and the sentence names that action.
+        let updated = send(
+            &router,
+            "PUT",
+            &format!("/{name}/{object_key}?encryption"),
+            &[],
+            &update_payload(&target_arn),
+        )
+        .await;
+        if *update_refused {
+            assert_eq!(
+                updated.status, 403,
+                "case {case:?}/update: expected HTTP 403, got {} with body {:?}",
+                updated.status,
+                text(&updated)
+            );
+            assert_eq!(
+                updated.error_code(),
+                ACCESS_DENIED,
+                "case {case:?}/update: expected the {ACCESS_DENIED:?} code, got {:?}",
+                text(&updated)
+            );
+            assert_eq!(
+                updated.error_message(),
+                Denial::ExplicitDeny.message(ENCRYPT_ACTION, &target_arn),
+                "case {case:?}/update: expected the denial to name {ENCRYPT_ACTION}, got {:?}",
+                updated.error_message()
+            );
+            // The refused re-encryption left the object under the key it was written with,
+            // read through a HEAD: the metadata is S3's own record of the object, so it is
+            // reported whatever the key's policy says about opening the bytes.
+            let head = send_bytes(&router, "HEAD", &format!("/{name}/{object_key}"), &[], b"").await;
+            assert_eq!(
+                head.header("x-amz-server-side-encryption-aws-kms-key-id").as_deref(),
+                Some(source_arn.as_str()),
+                "case {case:?}/update: a refused re-encryption must change nothing, got {:?}",
+                head.header("x-amz-server-side-encryption-aws-kms-key-id")
+            );
+        } else {
+            assert_eq!(
+                updated.status, 200,
+                "case {case:?}/update: expected the re-encryption to be applied, got {} with \
+                 body {:?}",
+                updated.status,
+                text(&updated)
+            );
+            // ...and the object is now under the target key, which is what "applied" means.
+            // Read through a HEAD, which reports S3's own record of the object rather than
+            // anything the key has to open — so the row whose key withholds the DECRYPT is
+            // read the same way as the others.
+            let head = send_bytes(&router, "HEAD", &format!("/{name}/{object_key}"), &[], b"").await;
+            assert_eq!(
+                head.header("x-amz-server-side-encryption-aws-kms-key-id").as_deref(),
+                Some(target_arn.as_str()),
+                "case {case:?}/update: expected the object under {target_arn:?}, got {:?}",
+                head.header("x-amz-server-side-encryption-aws-kms-key-id")
+            );
+            // Put it back under the key whose policy withholds nothing, so the next row starts
+            // from the same state this one did.
+            let restored = send(
+                &router,
+                "PUT",
+                &format!("/{name}/{object_key}?encryption"),
+                &[],
+                &update_payload(&source_arn),
+            )
+            .await;
+            assert_eq!(
+                restored.status, 200,
+                "case {case:?}: the object must be restored to the source key, got {} with \
+                 body {:?}",
+                restored.status,
+                text(&restored)
+            );
         }
     }
 }

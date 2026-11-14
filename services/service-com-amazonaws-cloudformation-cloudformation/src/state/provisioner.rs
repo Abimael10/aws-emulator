@@ -3986,3 +3986,9 @@ use data_and_storage::*;
 /// the same service this catalogue's `AWS::CloudWatch::*` arms write to, so the signing name
 /// and the target prefix are read in ONE place and the two cannot drift apart.
 pub(in crate::state) use data_and_storage::{CLOUDWATCH_SIGNING_NAME, CLOUDWATCH_TARGET_PREFIX};
+
+/// The STATIC-WEBSITE configuration an `AWS::S3::Bucket` declares, read by the per-type
+/// provider's UPDATE half beside this catalogue ([`super::provisioning::s3_bucket`]): the
+/// create and a changed declaration send the SAME translated request, so the template's
+/// spelling is read in ONE place and the two halves cannot drift apart.
+pub(in crate::state) use data_and_storage::{declared_website_configuration, WEBSITE_CONFIGURATION};

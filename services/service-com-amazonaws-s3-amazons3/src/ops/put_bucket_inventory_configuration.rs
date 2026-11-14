@@ -355,10 +355,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `Unit` output: success is the modelled 200 and an empty body.
                 PutBucketInventoryConfigurationOutput,
             ),
-            // "You are attempting to create a new configuration but have already reached the
-            // 1,000-configuration limit" — this operation's own special error, with the
-            // status it documents. A REPLACEMENT never reaches here: it creates no new
-            // configuration.
+            // `TooManyConfigurations` — this operation's own special error, with the status
+            // it documents and the one sentence every configuration family that shares the
+            // code carries ([`crate::state::TOO_MANY_CONFIGURATIONS_MESSAGE`]). A
+            // REPLACEMENT never reaches here: it creates no new configuration.
             crate::state::BucketConfigurationWrite::QuotaReached => {
                 Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::TOO_MANY_CONFIGURATIONS_CODE,

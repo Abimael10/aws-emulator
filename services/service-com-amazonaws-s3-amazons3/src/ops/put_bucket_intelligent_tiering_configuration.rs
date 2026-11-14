@@ -354,13 +354,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // naming the same `AccessTier` describe no plan the service can carry out — one of
         // them could never move the object anywhere. Judged over the whole list rather than
         // pairwise, so the refusal does not depend on the order the document listed them in.
+        // The sentence states the rule in S3's own prose and names the ONE value the request
+        // repeated, which is the only part of it that comes from the request.
         if let Some(repeated) = first_repeated_access_tier(&configuration.tierings) {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::INVALID_ACCESS_TIER_CODE,
                 crate::state::INVALID_ACCESS_TIER_STATUS,
                 format!(
-                    "All AccessTiers in Tierings must be unique. Found duplicate entry for \
-                     {repeated}."
+                    "All Access Tiers in a configuration must be unique. Found duplicate \
+                     entry for {repeated}."
                 ),
             ));
         }

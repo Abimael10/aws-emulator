@@ -469,6 +469,8 @@ mod ssm_association_resources;
 mod ssm_document_resources;
 #[path = "all/ssm_typed_parameters.rs"]
 mod ssm_typed_parameters;
+#[path = "all/stack_bucket_website_configuration.rs"]
+mod stack_bucket_website_configuration;
 #[path = "all/stack_configuration_and_provider_limits.rs"]
 mod stack_configuration_and_provider_limits;
 #[path = "all/stack_declared_function_identity.rs"]

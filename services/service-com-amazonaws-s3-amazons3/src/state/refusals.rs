@@ -1023,19 +1023,20 @@ pub enum IntelligentTieringWrite {
 }
 
 /// The code S3 answers a put that would take a bucket past the configuration limit with:
-/// "TooManyConfigurations … You are attempting to create a new configuration but have
-/// already reached the 1,000-configuration limit"
-/// (`PutBucketIntelligentTieringConfiguration`'s and `PutBucketMetricsConfiguration`'s own
-/// special errors, which publish the same code and text), under "HTTP 400 Bad
-/// Request Error".
+/// `TooManyConfigurations` (`PutBucketIntelligentTieringConfiguration`'s and
+/// `PutBucketMetricsConfiguration`'s own special errors, which publish the same code), under
+/// "HTTP 400 Bad Request Error".
 pub const TOO_MANY_CONFIGURATIONS_CODE: &str = "TooManyConfigurations";
 
-/// See [`TOO_MANY_CONFIGURATIONS_CODE`] — the description AWS documents for that code,
-/// nothing of which comes from the request. The sentence is the one that code's own
-/// "Special errors" entry publishes, word for word, for every family that shares the code.
+/// See [`TOO_MANY_CONFIGURATIONS_CODE`] — the sentence S3 sends beside that code, nothing of
+/// which comes from the request: it states the per-bucket ceiling and names neither the
+/// configuration type nor the id the put asked for, so one sentence serves every family that
+/// shares the code.
+///
+/// The number in it is the ceiling itself, spelled the way the wire refusal spells it (no
+/// thousands separator), so the text and the bound this crate enforces cannot drift apart.
 pub const TOO_MANY_CONFIGURATIONS_MESSAGE: &str =
-    "You are attempting to create a new configuration but have already reached the \
-     1,000-configuration limit.";
+    "You have attempted to create more configurations than the 1000 allowed.";
 
 /// The HTTP status [`TOO_MANY_CONFIGURATIONS_CODE`] is rendered with: 400, from that same
 /// special-errors list.
@@ -1072,7 +1073,7 @@ pub const INVALID_CONFIG_ID_CODE: &str = "InvalidConfigId";
 /// and the shortest id S3 records is one character. Do not narrow the check to match the
 /// prose.
 pub const INVALID_CONFIG_ID_MESSAGE: &str =
-    "Config Id should not be more than 1 char and less than 64 chars in length";
+    "Config Id should be more than 1 character and less than 64 characters in length.";
 
 /// The HTTP status [`INVALID_CONFIG_ID_CODE`] is rendered with: 400, the status S3 gives a
 /// configuration it cannot apply.

@@ -327,18 +327,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(access_denied(FOREIGN_KMS_KEY_MESSAGE));
         }
 
-        // Re-encrypting an object under a customer-managed key needs a data key KMS mints
-        // under THAT key — "to use this operation, you must have the following permissions:
-        // s3:UpdateObjectEncryption kms:Encrypt kms:Decrypt kms:GenerateDataKey kms:ReEncrypt*"
-        // (this operation's own documentation) — so the call performs `kms:GenerateDataKey`
-        // on the key it re-encrypts TO, as this request's caller and through this service's
-        // own path, exactly as a write that stores the object under that key does and through
-        // the same seam ([`crate::state::sse_kms::data_key_refusal`]). A caller the key's
-        // authorities refuse that action to is answered S3's `AccessDenied` — the class this
-        // operation already models — carrying KMS's sentence, and the object's encryption is
-        // left exactly as it was. Asked with NO guard of this service held, because it reads
-        // another service's store through the shared engine.
-        if let Some(denial) = crate::state::sse_kms::data_key_refusal(
+        // Re-encrypting an object S3 already holds moves its ENVELOPE onto the key the
+        // request names: no new data key is minted and no plaintext is served, so what the
+        // call asks of that key is `kms:Encrypt` — "to use this operation, you must have the
+        // following permissions: s3:UpdateObjectEncryption kms:Encrypt kms:Decrypt
+        // kms:GenerateDataKey kms:ReEncrypt*" (this operation's own documentation) — asked as
+        // this request's caller and through this service's own path, through the same seam
+        // every SSE-KMS decision in this crate is taken at
+        // ([`crate::state::sse_kms::encrypt_refusal`]). A caller the key's authorities refuse
+        // that action to is answered S3's `AccessDenied` — the class this operation already
+        // models — carrying KMS's sentence for the action that was asked, and the object's
+        // encryption is left exactly as it was. Asked with NO guard of this service held,
+        // because it reads another service's store through the shared engine.
+        if let Some(denial) = crate::state::sse_kms::encrypt_refusal(
             &*self.engine,
             ctx,
             &region,

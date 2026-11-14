@@ -213,7 +213,7 @@ async fn drive(router: &MultiServiceRouter, row: &Row) {
                             "TemplateBody",
                             &bucket_template(
                                 "one-event-refused-update-store",
-                                r#","WebsiteConfiguration":{"IndexDocument":"index.html"}"#,
+                                r#","AccessControl":"PublicRead""#,
                             ),
                         ),
                     ],

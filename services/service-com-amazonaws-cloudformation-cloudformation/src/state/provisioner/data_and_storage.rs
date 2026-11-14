@@ -17,8 +17,13 @@ mod bucket_replication;
 /// and so are one concern of their own.
 mod bucket_access_controls;
 
+/// The STATIC-WEBSITE configuration that same type declares, whose translation out of the
+/// template's spelling into Amazon S3's request shape is a concern of its own.
+mod bucket_website;
+
 use bucket_access_controls::apply_access_controls;
 use bucket_replication::declared_replication_configuration;
+pub(in crate::state) use bucket_website::{declared_website_configuration, WEBSITE_CONFIGURATION};
 
 /// Amazon Data Firehose's signing name and `X-Amz-Target` prefix, from its model
 /// (`sigv4Name: firehose`, service shape `Firehose_20150804`), which speaks
@@ -2165,6 +2170,12 @@ pub(super) const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 /// `IntelligentTieringConfigurations` with `PutBucketIntelligentTieringConfiguration`
 /// ([`declared_intelligent_tiering_configurations`]).
 ///
+/// `WebsiteConfiguration` is a `PutBucketWebsite` of its own
+/// ([`declared_website_configuration`]) — the one call Amazon S3 publishes for a bucket's
+/// static-website configuration — so a stack that declares an index document deploys a bucket
+/// whose website configuration reads back rather than one the website endpoint serves nothing
+/// for.
+///
 /// `CreateBucket` takes no tag set at all, so the bucket's tags are a `PutBucketTagging` of
 /// its own — "sets the tags for a bucket", the one call S3 publishes for them — carrying
 /// the tags the declaration asks for plus the ones CloudFormation gives the resource
@@ -2422,6 +2433,22 @@ async fn configure_bucket(
                 .put_bucket_replication()
                 .bucket(bucket)
                 .replication_configuration(configuration)
+                .send(),
+        )
+        .await
+        .map_err(|error| s3_refusal_of(&error))?;
+    }
+    // "WebsiteConfiguration — information used to configure the bucket as a static website"
+    // (this type's own property): the whole configuration is ONE `PutBucketWebsite`, the call
+    // Amazon S3 publishes for it, so a bucket a template declares an index document for really
+    // has a website configuration afterwards — which is what `GetBucketWebsite` reports and
+    // what the website endpoint serves the bucket by.
+    if let Some(configuration) = declared_website_configuration(&resource.properties)? {
+        Box::pin(
+            client
+                .put_bucket_website()
+                .bucket(bucket)
+                .website_configuration(configuration)
                 .send(),
         )
         .await

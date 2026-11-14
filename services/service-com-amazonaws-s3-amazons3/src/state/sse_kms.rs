@@ -55,6 +55,13 @@
 //! the write when KMS holds no key for the reference, or will not mint a data key under the
 //! one it holds, for want of a key rather than of permission.
 //!
+//! Which ACTION is asked of the key is the call's own: a write that stores new bytes mints a
+//! data key, a read opens one, and a call that re-encrypts an object S3 ALREADY holds does
+//! neither — it moves that object's envelope onto another key, which is `kms:Encrypt`
+//! ([`encrypt_refusal`]). Each goes through the one decision below, so the sentence a refused
+//! caller reads names the action that was actually asked of the key rather than another of
+//! the three.
+//!
 //! Permission is not the only thing KMS answers about a key. A key's own KEY STATE decides
 //! whether it runs cryptographic operations AT ALL, so a read that would serve an SSE-KMS
 //! object's bytes while its key is in a state that runs none has no plaintext to serve: S3
@@ -83,6 +90,17 @@ const DECRYPT_OPERATION: &str = "Decrypt";
 /// documentation of what an SSE-KMS object needs), the first of the two being what the write
 /// side of that pair performs.
 const GENERATE_DATA_KEY_OPERATION: &str = "GenerateDataKey";
+
+/// The KMS operation a re-encryption of an ALREADY STORED object performs on the key it is
+/// re-encrypted TO.
+///
+/// Such a call mints no data key: the object's bytes stay as they are and what moves under
+/// the new key is the envelope, so the key operation performed is `kms:Encrypt` rather than
+/// the `kms:GenerateDataKey` behind a fresh write — "to use this operation, you must have
+/// the following permissions: s3:UpdateObjectEncryption kms:Encrypt kms:Decrypt
+/// kms:GenerateDataKey kms:ReEncrypt*" (`UpdateObjectEncryption`'s own documentation), and
+/// the denial a key's authorities answer names the action that was asked of them.
+const ENCRYPT_OPERATION: &str = "Encrypt";
 
 /// This service's endpoint prefix, the first label of its regional endpoint
 /// (`smithy_query(query="service_info")` reports `endpointPrefix: "s3"`) — which is what
@@ -219,6 +237,29 @@ pub fn data_key_refusal<Eng: Send + Sync + 'static>(
     object: EncryptedObject<'_>,
 ) -> Option<String> {
     key_use_refusal(engine, ctx, region, object, GENERATE_DATA_KEY_OPERATION)
+}
+
+/// Why KMS refuses to encrypt `object`'s envelope under the key it would be RE-ENCRYPTED to
+/// for the principal this request speaks for, or `None` when the re-encryption may be
+/// applied.
+///
+/// The read's and the fresh write's halves of this module ask about the action each of them
+/// performs — `kms:Decrypt` for the one, `kms:GenerateDataKey` for the other — and a call
+/// that re-encrypts an object ALREADY stored performs neither: no new data key is minted and
+/// no plaintext is served, so what it asks of the target key is `kms:Encrypt`
+/// ([`ENCRYPT_OPERATION`]). Asked through the same one decision, so the refusal a caller
+/// sees is KMS's own sentence and names the action that was actually asked of the key.
+///
+/// `object` is the object as the re-encryption WOULD leave it, so the encryption context the
+/// decision is taken under is the one the stored object would be read back under — exactly as
+/// it is for the write side ([`data_key_refusal`]).
+pub fn encrypt_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    object: EncryptedObject<'_>,
+) -> Option<String> {
+    key_use_refusal(engine, ctx, region, object, ENCRYPT_OPERATION)
 }
 
 /// Why the authorities in force on `object`'s KMS key refuse `operation` to the principal
