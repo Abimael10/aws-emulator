@@ -15,6 +15,8 @@
 mod common;
 #[path = "all/control_plane_registry.rs"]
 mod control_plane_registry;
+#[path = "all/published_cluster_endpoint.rs"]
+mod published_cluster_endpoint;
 #[path = "all/routing_control_toggle.rs"]
 mod routing_control_toggle;
 #[path = "all/safety_rule_enforcement.rs"]

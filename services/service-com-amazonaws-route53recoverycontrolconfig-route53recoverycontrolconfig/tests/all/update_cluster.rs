@@ -3,10 +3,11 @@
 //! `UpdateCluster`, end to end over HTTP.
 //!
 //! The rule under test: `UpdateCluster` writes the network type the request names onto
-//! the stored cluster the ARN identifies — together with the Regional data-plane
-//! endpoints that network type decides — leaves every other member of the record alone,
+//! the stored cluster the ARN identifies, leaves every other member of the record alone,
 //! and answers with the record a later read answers with; an ARN no cluster is stored
-//! under is refused with the modelled not-found error.
+//! under is refused with the modelled not-found error. The data-plane endpoints it
+//! publishes follow the address this emulator is reachable at, so the transition leaves
+//! them as a cluster created on the target network type publishes them.
 //!
 //! The tables span every ordered pair of the `NetworkType` values the model declares
 //! (`smithy_query(query="shape",shape="NetworkType")` -> DUALSTACK | IPV4), including
@@ -43,12 +44,9 @@ async fn update_cluster(
     .await
 }
 
-/// A cluster's endpoints as `Region|URL` strings with the cluster's own id replaced by
-/// `{id}`, so two clusters' endpoint shapes are comparable: this is the part of an
-/// endpoint the network type decides.
+/// A cluster's endpoints as `Region|Endpoint` strings, so two clusters' published
+/// endpoints are comparable.
 fn endpoint_templates(cluster: &Value) -> Vec<String> {
-    let arn = cluster["ClusterArn"].as_str().unwrap_or_default();
-    let id = arn.rsplit_once('/').map_or("", |(_, id)| id);
     cluster["ClusterEndpoints"]
         .as_array()
         .cloned()
@@ -57,7 +55,7 @@ fn endpoint_templates(cluster: &Value) -> Vec<String> {
         .map(|endpoint| {
             let region = endpoint["Region"].as_str().unwrap_or_default();
             let url = endpoint["Endpoint"].as_str().unwrap_or_default();
-            format!("{region}|{}", url.replace(id, "{id}"))
+            format!("{region}|{url}")
         })
         .collect()
 }
@@ -75,9 +73,9 @@ async fn describe_cluster(
     body["Cluster"].clone()
 }
 
-/// An update writes the requested network type and the endpoints it decides onto the
-/// stored cluster, leaves the rest of the record alone, and a later read answers the
-/// same body.
+/// An update writes the requested network type onto the stored cluster, leaves the rest
+/// of the record alone — the endpoints it publishes included — and a later read answers
+/// the same body.
 #[tokio::test]
 async fn update_writes_the_network_type_and_describe_answers_it() {
     let router = router();
@@ -159,8 +157,8 @@ async fn update_writes_the_network_type_and_describe_answers_it() {
         assert_eq!(
             templates.as_slice(),
             reference[target].as_slice(),
-            "case {case}: an updated cluster must publish the endpoints its network type \
-             decides, got {templates:?} instead of {:?}",
+            "case {case}: an updated cluster must publish the endpoints a cluster created \
+             on {target} publishes, got {templates:?} instead of {:?}",
             reference[target]
         );
 

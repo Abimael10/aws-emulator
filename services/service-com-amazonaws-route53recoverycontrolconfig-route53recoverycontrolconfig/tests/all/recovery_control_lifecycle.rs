@@ -119,12 +119,18 @@ async fn create_persists_the_cluster_and_describe_answers_the_same_body() {
             regions, ENDPOINT_REGIONS,
             "case {name}: expected one endpoint per supported Region, got {regions:?}"
         );
+        // `Endpoint` is the address a client SENDS a routing-control state call to, so
+        // every entry is the base this emulator is reachable at — the Region label it is
+        // published under is `Region`, not part of the address. The whole rule, over
+        // several bases, is `crate::cluster_endpoint_addressing`.
         for endpoint in &endpoints {
             let url = endpoint["Endpoint"].as_str().unwrap_or_default();
             let region = endpoint["Region"].as_str().unwrap_or_default();
-            assert!(
-                url.starts_with("https://") && url.contains(region),
-                "case {name}: endpoint for {region} must name its Region, got {url:?}"
+            assert_eq!(
+                url,
+                smithy_server_runtime::UNSERVED_URL_BASE,
+                "case {name}: the endpoint for {region} must be the base this emulator is \
+                 reachable at, got {url:?}"
             );
         }
 

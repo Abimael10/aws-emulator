@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! Implemented: mints a cluster ARN and its five Regional data-plane endpoints,
-//! creates the cluster's default control panel alongside it, and persists both in
-//! [`crate::state`]; `DescribeCluster` projects the same stored record.
+//! Implemented: mints a cluster ARN, creates the cluster's default control panel
+//! alongside it, and persists both in [`crate::state`]; `DescribeCluster` projects the
+//! same stored record, with the five Regional data-plane endpoints it publishes derived
+//! from the base URL this emulator is reachable at
+//! ([`crate::state::cluster_endpoints`]).
 //!
 //! The cluster's `Status` is DERIVED from the instant its deployment became due, so it
 //! reads `PENDING` right after this call and `DEPLOYED` once that instant has passed
@@ -166,7 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The address the created cluster PUBLISHES for its data plane is the base URL
+        // this emulator is reachable at, so the caller's next call reaches this process.
+        let endpoint_base = ctx.endpoint();
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateClusterErrorModeled::InternalServerException(
                 InternalServerException {
@@ -207,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenOutcome::Replay(arn) => {
                 if let Some(record) = guard.clusters.get(&arn) {
                     return Ok(CreateClusterOutput {
-                        cluster: Some(record.to_cluster()),
+                        cluster: Some(record.to_cluster(endpoint_base.as_str())),
                     });
                 }
             }
@@ -267,7 +271,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: cluster_arn.clone(),
                 name: input.cluster_name,
                 owner: owner.clone(),
-                endpoints: crate::state::cluster_endpoints(&cluster_id, &network_type),
                 network_type,
                 tags: crate::state::tags_map(input.tags),
                 default_control_panel_arn: default_panel_arn.clone(),
@@ -304,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster: guard
                 .clusters
                 .get(&cluster_arn)
-                .map(crate::state::ClusterRecord::to_cluster),
+                .map(|record| record.to_cluster(endpoint_base.as_str())),
         })
     }
 }

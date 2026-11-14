@@ -8,13 +8,19 @@
 //! it through [`service_state`] and answers from what is stored here — a describe or a
 //! list never recomputes a body from its own request.
 //!
-//! Two values are DERIVED rather than stored, so no read can see them stale:
+//! Three values are DERIVED rather than stored, so no read can see them stale:
 //!
 //! * `Status` — computed from the instant the create call made the deployment due
 //!   ([`deploy_due`]), so a resource reports `PENDING` until then and `DEPLOYED`
 //!   afterwards without any operation writing it.
 //! * `ControlPanel$RoutingControlCount` — counted from [`routing_controls`] on every
 //!   projection ([`Store::routing_control_count`]).
+//! * `Cluster$ClusterEndpoints` — the data-plane addresses a client DIALS to get or set a
+//!   routing control state, so they are computed from the base URL this emulator is
+//!   reachable at, as the asking request's own context reports it
+//!   ([`cluster_endpoints`]). Stored once at create time they would name wherever the
+//!   emulator was reachable then, which is not where a later caller has to send its
+//!   request.
 //!
 //! The refusals every handler shares are worded here as well, so two operations cannot
 //! say the same thing differently: the sentences a lookup, a reference and a dependent
@@ -122,25 +128,42 @@ pub fn status_at(due: Instant) -> &'static str {
     }
 }
 
-/// The five Regional data-plane endpoints a cluster publishes.
+/// The Regional data-plane endpoints a cluster publishes, one per label in
+/// [`CLUSTER_ENDPOINT_REGIONS`], for an emulator reachable at `endpoint_base`.
 ///
-/// `DUALSTACK` clusters are reached over AWS's dual-stack endpoint suffix
-/// (`<region>.api.aws`); `IPV4` clusters over the IPv4-only one
-/// (`<region>.amazonaws.com`).
-pub fn cluster_endpoints(cluster_id: &str, network_type: &str) -> Vec<(String, String)> {
-    let suffix = if network_type == "DUALSTACK" {
-        "api.aws"
-    } else {
-        "amazonaws.com"
-    };
+/// `ClusterEndpoint$Endpoint` is not a label a client reads: it is the address the client
+/// then SENDS its `GetRoutingControlState` / `UpdateRoutingControlState(s)` /
+/// `ListRoutingControls` call to ("Specify an endpoint and Amazon Web Services Region when
+/// you want to set or retrieve a routing control state in the cluster"), and the cluster
+/// API has no generic regional endpoint to fall back on. So what is published is the one
+/// address this emulator answers on — `endpoint_base`, the base URL
+/// [`::smithy_server_runtime::OperationContext::endpoint`] reports ("the base URL a later
+/// request addresses… Callers send normally signed requests to it") — and never a host
+/// beneath AWS's own domain, which nothing here serves and which would send the call to
+/// the real service.
+///
+/// The model names no hostname of its own, and the cluster data plane this emulator serves
+/// is served at that one base for every Region label, so the five entries differ in
+/// `Region` alone: AWS documents a cluster as "a set of five redundant Regional endpoints"
+/// against which the same routing controls are read and written, and here the one endpoint
+/// is redundantly reachable under each label.
+///
+/// `NetworkType` takes no part in it either. It says which IP families the published
+/// endpoints answer on (`IPV4` / `DUALSTACK`), which on AWS is a difference of hostname;
+/// this emulator answers on exactly the address it is reachable at, whatever family that
+/// address belongs to, so there is no second host to name.
+///
+/// The member's `@pattern ^[A-Za-z0-9:.\/_-]*$` describes the DNS names AWS itself vends
+/// and admits no brackets, so an emulator bound to an IPv6 address cannot be named inside
+/// it: RFC 3986 requires the brackets in an authority, and an address a client has to DIAL
+/// is published as the client must dial it rather than trimmed into the pattern and left
+/// unreachable. Every other base — a name, an IPv4 address, with or without a port — is
+/// inside both the pattern and the `@length 1..128`.
+pub fn cluster_endpoints(endpoint_base: &str) -> Vec<(String, String)> {
+    let endpoint = endpoint_base.trim_end_matches('/');
     CLUSTER_ENDPOINT_REGIONS
         .iter()
-        .map(|region| {
-            (
-                (*region).to_string(),
-                format!("https://{cluster_id}.route53-recovery-cluster.{region}.{suffix}/v1"),
-            )
-        })
+        .map(|region| ((*region).to_string(), endpoint.to_string()))
         .collect()
 }
 
@@ -155,8 +178,6 @@ pub struct ClusterRecord {
     /// The account that owns the cluster — this emulator's account id.
     pub owner: String,
     pub network_type: String,
-    /// `(Region, Endpoint)` pairs, in the order `ClusterEndpoints` reports them.
-    pub endpoints: Vec<(String, String)>,
     pub tags: BTreeMap<String, String>,
     /// The control panel AWS creates together with the cluster, and the one
     /// `CreateRoutingControl` attaches to when the request names none.
@@ -166,23 +187,14 @@ pub struct ClusterRecord {
 }
 
 impl ClusterRecord {
-    /// The cluster's id: the resource tail of its ARN, which is the host label its
-    /// data-plane endpoints are published under.
-    pub fn cluster_id(&self) -> &str {
-        self.arn
-            .rsplit_once('/')
-            .map_or(self.arn.as_str(), |(_, id)| id)
-    }
-
-    /// Move the cluster onto `network_type`, re-deriving the Regional data-plane
-    /// endpoints that network type decides and making the deployment of those endpoints
-    /// due again — so a caller cannot write one half of the transition without the
-    /// other.
+    /// Move the cluster onto `network_type`, making the deployment of its data-plane
+    /// endpoints due again — so a caller cannot write one half of the transition without
+    /// the other.
     ///
-    /// A request naming the network the cluster is already on writes NOTHING: there is
-    /// no endpoint to re-derive and no deployment to redo. The endpoints are stored
-    /// rather than projected so that one function ([`cluster_endpoints`]) decides them
-    /// for a created and for an updated cluster alike.
+    /// A request naming the network the cluster is already on writes NOTHING: there is no
+    /// deployment to redo. The endpoints themselves are not written either way: they are
+    /// projected from the address this emulator is reachable at ([`cluster_endpoints`]),
+    /// which the network type does not decide here.
     ///
     /// Answers whether the record changed, so a caller can tell a redeploy from a
     /// no-op.
@@ -190,24 +202,28 @@ impl ClusterRecord {
         if self.network_type == network_type {
             return false;
         }
-        let endpoints = cluster_endpoints(self.cluster_id(), &network_type);
-        self.endpoints = endpoints;
         self.network_type = network_type;
         self.deploy_due = deploy_due();
         true
     }
 
-    /// This record as the modelled `Cluster` shape — the single projection create and
-    /// describe both answer with.
-    pub fn to_cluster(&self) -> Cluster {
+    /// This record as the modelled `Cluster` shape — the single projection create,
+    /// describe, list and update all answer with.
+    ///
+    /// `endpoint_base` is the base URL this emulator is reachable at
+    /// (`smithy_server_runtime::OperationContext::endpoint`), from which the cluster's
+    /// published data-plane endpoints are derived ([`cluster_endpoints`]): the address a
+    /// client has to send a routing-control state call to is where this emulator answers,
+    /// not where it answered when the cluster was created.
+    pub fn to_cluster(&self, endpoint_base: &str) -> Cluster {
         Cluster {
             cluster_arn: Some(self.arn.clone()),
             cluster_endpoints: Some(
-                self.endpoints
-                    .iter()
+                cluster_endpoints(endpoint_base)
+                    .into_iter()
                     .map(|(region, endpoint)| ClusterEndpoint {
-                        endpoint: Some(endpoint.clone()),
-                        region: Some(region.clone()),
+                        endpoint: Some(endpoint),
+                        region: Some(region),
                     })
                     .collect(),
             ),
@@ -1258,11 +1274,16 @@ fn splitmix64(state: u64) -> u64 {
 mod tests {
     use super::*;
 
-    /// Changing a cluster's network type re-derives its endpoints and makes the
-    /// deployment due again; requesting the network it is already on writes nothing.
+    /// Changing a cluster's network type makes its deployment due again; requesting the
+    /// network it is already on writes nothing. The published endpoints follow the
+    /// address this emulator is reachable at either way, so the transition leaves them
+    /// alone.
     #[test]
     fn setting_the_network_type_redeploys_only_when_it_changes() {
         let arn = "arn:aws:route53-recovery-control::000000000000:cluster/abc";
+        // The base this emulator is reachable at, as `OperationContext::endpoint`
+        // reports it to a handler.
+        let base = "https://127.0.0.1:9297";
         // Rows: every ordered pair of the values `NetworkType` declares
         // (`smithy_query(query="shape",shape="NetworkType")` -> DUALSTACK | IPV4).
         for from in ["DUALSTACK", "IPV4"] {
@@ -1274,7 +1295,6 @@ mod tests {
                     name: "c".to_string(),
                     owner: "000000000000".to_string(),
                     network_type: from.to_string(),
-                    endpoints: cluster_endpoints("abc", from),
                     tags: BTreeMap::new(),
                     default_control_panel_arn: String::new(),
                     deploy_due: Instant::now(),
@@ -1294,10 +1314,12 @@ mod tests {
                     "case {case}: expected the requested network type, got {}",
                     record.network_type
                 );
+                let published = record.to_cluster(base);
                 assert_eq!(
-                    record.endpoints,
-                    cluster_endpoints("abc", to),
-                    "case {case}: the endpoints must be the ones its network type decides"
+                    endpoint_values(&published),
+                    vec![base.to_string(); CLUSTER_ENDPOINT_REGIONS.len()],
+                    "case {case}: the published endpoints must stay the address the \
+                     emulator is reachable at"
                 );
                 assert_eq!(
                     record.deploy_due > was_due,
@@ -1306,6 +1328,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The `Endpoint` of every entry of a projected cluster, in the order it reports
+    /// them.
+    fn endpoint_values(cluster: &Cluster) -> Vec<String> {
+        cluster
+            .cluster_endpoints
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| entry.endpoint.clone().unwrap_or_default())
+            .collect()
     }
 
     /// A record the capacity tests can store without going through a handler.

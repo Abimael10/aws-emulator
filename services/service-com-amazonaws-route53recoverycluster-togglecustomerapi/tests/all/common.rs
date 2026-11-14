@@ -33,7 +33,10 @@ pub const REGION: &str = "us-east-1";
 /// A SigV4 `Authorization` header whose credential scope names `signing_name`, which is
 /// how every signed SDK request routes. Request authentication is off in these tests, so
 /// only the scope matters.
-fn authorization(signing_name: &str) -> String {
+///
+/// `pub` because a suite that builds its own request — one addressed at an endpoint the
+/// control plane published, say — signs it the same way.
+pub fn authorization(signing_name: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 \
          Credential=AKIDEMULATORTEST/20260101/{REGION}/{signing_name}/aws4_request, \
@@ -46,9 +49,29 @@ fn authorization(signing_name: &str) -> String {
 /// plane reads is the store the control plane writes, so a test that creates a resource
 /// through one plane addresses it through the other.
 pub fn emulator() -> MultiServiceRouter {
+    mounted(None)
+}
+
+/// The same emulator, reachable at `base` instead of the unserved default
+/// ([`smithy_server_runtime::UNSERVED_URL_BASE`]): `base` is what `ctx.endpoint()`
+/// answers, and so the address the control plane PUBLISHES for this data plane.
+///
+/// `crate::published_cluster_endpoint` dials what that publication names, which only an
+/// emulator reachable at a dialable base can be asked for.
+pub fn emulator_at(base: &str) -> MultiServiceRouter {
+    mounted(Some(base))
+}
+
+fn mounted(url_base: Option<&str>) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
+    if let Some(base) = url_base {
+        router.set_url_base(
+            smithy_server_runtime::EndpointUrl::parse(base)
+                .unwrap_or_else(|| panic!("{base:?} is a usable emulator base URL")),
+        );
+    }
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     router.register_service(ControlPlaneService::new(engine));
     router

@@ -36,6 +36,23 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     (router, engine)
 }
 
+/// The same router, reachable at `base` instead of the unserved default
+/// ([`smithy_server_runtime::UNSERVED_URL_BASE`]): `base` is what `ctx.endpoint()`
+/// answers, and so what an address a handler PUBLISHES for a client to dial is built
+/// from.
+///
+/// `tests/all/cluster_endpoint_addressing.rs` drives several bases through one request
+/// path, because an address that named a fixed host rather than the emulator's own would
+/// pass against only one of them.
+pub fn router_at(base: &str) -> MultiServiceRouter {
+    let (mut router, _engine) = router_with_engine();
+    router.set_url_base(
+        smithy_server_runtime::EndpointUrl::parse(base)
+            .unwrap_or_else(|| panic!("{base:?} is a usable emulator base URL")),
+    );
+    router
+}
+
 /// An ARN as one path segment or query value: every character an ARN can hold that is
 /// not safe there (`:` and `/`) is percent-encoded, which is how an SDK sends it.
 pub fn enc(arn: &str) -> String {

@@ -150,7 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The data-plane address every listed cluster reports is where the emulator is
+        // reachable NOW; see `crate::state::cluster_endpoints`.
+        let endpoint_base = ctx.endpoint();
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListClustersErrorModeled::InternalServerException(
                 InternalServerException {
@@ -179,7 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(ListClustersOutput {
-            clusters: Some(page.items.iter().map(|c| c.to_cluster()).collect()),
+            clusters: Some(
+                page.items
+                    .iter()
+                    .map(|c| c.to_cluster(endpoint_base.as_str()))
+                    .collect(),
+            ),
             next_token: page.next_token,
         })
     }

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCluster
-//! Implemented: writes the stored cluster's network type and the five Regional
-//! data-plane endpoints that network type decides, then answers with the SAME stored
-//! record `DescribeCluster` projects.
+//! Implemented: writes the stored cluster's network type, then answers with the SAME
+//! stored record `DescribeCluster` projects — including the five Regional data-plane
+//! endpoints that projection derives from the address this emulator is reachable at.
 //!
 //! Everything else about the cluster (its ARN, name, owner and tags) is untouched: the
 //! model's `UpdateClusterRequest` carries no other member, and the operation's own
@@ -156,7 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The data-plane address the updated cluster reports is where the emulator is
+        // reachable NOW; see `crate::state::cluster_endpoints`.
+        let endpoint_base = ctx.endpoint();
         // The authorization check this service's ARN-addressed operations share: decided
         // from the request alone, so it runs before the ARN is looked up.
         crate::state::authorize_resource_arn(Self::NAME, &input.cluster_arn)
@@ -207,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answer from the STORED record, so this body is what `DescribeCluster` answers
         // with afterwards.
         Ok(UpdateClusterOutput {
-            cluster: Some(record.to_cluster()),
+            cluster: Some(record.to_cluster(endpoint_base.as_str())),
         })
     }
 }

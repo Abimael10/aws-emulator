@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/body_enum_refusals.rs"]
 mod body_enum_refusals;
+#[path = "all/cluster_endpoint_addressing.rs"]
+mod cluster_endpoint_addressing;
 #[path = "all/common.rs"]
 mod common;
 #[path = "all/create_safety_rule_rule_choice.rs"]

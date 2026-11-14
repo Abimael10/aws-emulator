@@ -151,7 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The data-plane address this reports is where the emulator is reachable NOW; see
+        // `crate::state::cluster_endpoints`.
+        let endpoint_base = ctx.endpoint();
         // Whether the caller may act on the resource an ARN names is decided from the
         // request alone, so it is decided BEFORE the ARN is looked up: an ARN of another
         // account is refused without the answer saying whether a cluster is stored there.
@@ -183,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(DescribeClusterOutput {
-            cluster: Some(record.to_cluster()),
+            cluster: Some(record.to_cluster(endpoint_base.as_str())),
         })
     }
 }
