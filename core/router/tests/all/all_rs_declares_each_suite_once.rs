@@ -225,6 +225,28 @@ pub(crate) fn declaration_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Every suite file the declaration root `declaration_root` points a module at, as a path
+/// under that crate's `tests/` directory.
+///
+/// These are the files, beside the root itself, that the crate's `all` target compiles, so a
+/// sibling suite checking a rule about what such a file may contain reads them from here
+/// rather than walking `tests/all/` — a file no root declares is compiled nowhere, and
+/// [`every_declaration_names_a_suite_file_that_exists`] is what reports a declaration whose
+/// file is absent, so one is skipped here instead of panicking.
+pub(crate) fn declared_suite_files(declaration_root: &Path) -> Vec<PathBuf> {
+    let source = fs::read_to_string(declaration_root)
+        .unwrap_or_else(|error| panic!("read {}: {error}", declaration_root.display()));
+    let tests = declaration_root
+        .parent()
+        .expect("a tests/all.rs has a tests/ parent");
+    declarations(&source)
+        .into_iter()
+        .filter_map(|declaration| declaration.path)
+        .map(|path| tests.join(path))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
 #[test]
 fn every_crate_in_the_workspace_declares_each_suite_once() {
     let root = workspace_root();

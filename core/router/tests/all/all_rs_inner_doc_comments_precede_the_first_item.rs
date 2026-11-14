@@ -10,6 +10,12 @@
 //! above its `#[path]`/`mod` pair, so a block typed with `//!` instead of `//` in the
 //! middle of the list is the break this suite pins.
 //!
+//! The rule is about a FILE rather than about a declaration list, so it is read here for
+//! every file an `all` target compiles: each root, and every suite file a root declares.
+//! A suite file holds items of its own, and a module inside one may carry its own inner
+//! doc comment legally, so in those files only a `//!` in column one — where it can
+//! document nothing but the file itself — is a break.
+//!
 //! It reads files only; it starts no router and reaches no network.
 
 use std::fs;
@@ -20,7 +26,9 @@ use std::fs;
 // crate, and the crate that breaks it cannot pin it itself: a misplaced inner doc comment
 // makes that crate's own `all` target fail to compile, so no suite inside it ever runs to
 // report the break. This target is the one that links every service crate.
-use crate::all_rs_declares_each_suite_once::{declaration_roots, workspace_root};
+use crate::all_rs_declares_each_suite_once::{
+    declaration_roots, declared_suite_files, workspace_root,
+};
 
 /// The 1-based line the first item of `source` starts on, if it has one.
 ///
@@ -40,14 +48,30 @@ fn first_item_line(source: &str) -> Option<usize> {
     })
 }
 
-/// One report per inner doc comment in `source` that sits after the first item, each
-/// naming the line it is on and the line the item starts at.
+/// Which inner doc comments a class of file is read for — the one way the rule differs
+/// between the two classes of file an `all` target compiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InnerDocComments {
+    /// Every inner doc comment, however deeply it is indented. This is the declaration
+    /// root's reading, and deliberately the conservative one: a root holds nothing but
+    /// comments and `#[path]`/`mod` pairs, so a note indented inside a later item is
+    /// reported rather than argued about.
+    Anywhere,
+    /// Only one in column one, which is where `//!` can document nothing but the file
+    /// itself. This is a suite file's reading: such a file holds items of its own, and a
+    /// module nested in one may carry its own inner doc comment legally — the header of an
+    /// inline `#[cfg(test)] mod tests { ... }` block is one, and the tree is full of them.
+    InColumnOne,
+}
+
+/// One report per inner doc comment in `source` that sits after the first item and that
+/// `read` covers, each naming the line it is on and the line the item starts at.
 ///
-/// The rule read here is the declaration root's: no `//!` anywhere after the first item.
-/// It is deliberately the conservative reading — one of those lines is `E0753` where it
-/// stands at a module's top level, and a declaration root holds nothing else — so a note
-/// indented inside a later item is reported too rather than argued about.
-fn misplaced_inner_doc_comments(source: &str) -> Vec<String> {
+/// The reading is line-based, as the rule itself is: a `//!` is read wherever it opens a
+/// line, including inside a multi-line string literal — a file that holds one of those in
+/// column one would be reported though it compiles. Nothing in the tree does, and a
+/// declaration root cannot, so the reader stays as simple as the rule.
+fn misplaced_inner_doc_comments(source: &str, read: InnerDocComments) -> Vec<String> {
     let Some(item_line) = first_item_line(source) else {
         return Vec::new();
     };
@@ -55,7 +79,10 @@ fn misplaced_inner_doc_comments(source: &str) -> Vec<String> {
         .lines()
         .enumerate()
         .filter_map(|(index, line)| {
-            let line = line.trim_start();
+            let line = match read {
+                InnerDocComments::Anywhere => line.trim_start(),
+                InnerDocComments::InColumnOne => line,
+            };
             let is_inner_doc = line.starts_with("//!") || line.starts_with("/*!");
             (is_inner_doc && index + 1 > item_line).then(|| {
                 format!(
@@ -88,7 +115,7 @@ fn every_declaration_root_keeps_its_inner_doc_comments_ahead_of_its_first_item()
             .to_string();
         let source = fs::read_to_string(declaration_root)
             .unwrap_or_else(|error| panic!("read {}: {error}", declaration_root.display()));
-        for report in misplaced_inner_doc_comments(&source) {
+        for report in misplaced_inner_doc_comments(&source, InnerDocComments::Anywhere) {
             reports.push(format!("case {crate_root}: {report}"));
         }
     }
@@ -99,6 +126,99 @@ fn every_declaration_root_keeps_its_inner_doc_comments_ahead_of_its_first_item()
          first item, got {} report(s), each of which fails that target with E0753: \
          {reports:#?}",
         roots.len(),
+        reports.len()
+    );
+}
+
+#[test]
+fn the_reader_of_a_suite_file_reports_only_a_comment_the_target_cannot_compile() {
+    // One synthetic suite file per place an inner doc comment can land, with how many
+    // reports it owes. The rows differ in comment style, in column, in how many lines the
+    // block runs to, and in whether an item has opened above it.
+    let head = "// SPDX-License-Identifier: CC0-1.0\n\n//! The suite.\n//!\n//! Its second paragraph.\n";
+    let item = "use std::fs;\n\n#[test]\nfn it_holds() {}\n";
+    let inline_tests = "#[cfg(test)]\nmod tests {\n    //! The pure rules this module owns.\n    //!\n    //! Over a set of inputs.\n}\n";
+    let cases: [(&str, String, usize); 8] = [
+        ("an empty file", String::new(), 0),
+        ("a head doc comment only", head.to_string(), 0),
+        ("a head doc comment above the items", format!("{head}{item}"), 0),
+        (
+            "an indented inner doc comment heading an inline test module",
+            format!("{head}{item}{inline_tests}"),
+            0,
+        ),
+        (
+            "a file-level inner doc comment after the first item",
+            format!("{head}{item}//! A note appended below the items.\n"),
+            1,
+        ),
+        (
+            // The shape this rule exists for: a fragment of the file's own header landing
+            // below its items while two branches merge.
+            "a three-line header fragment after the first item",
+            format!("{head}{item}//! The suite.\n//!\n//! Its second paragraph.\n"),
+            3,
+        ),
+        (
+            "an inner block doc comment after the first item",
+            format!("{head}{item}/*! A note. */\n"),
+            1,
+        ),
+        (
+            "the same note written as a plain comment",
+            format!("{head}{item}// A note appended below the items.\n"),
+            0,
+        ),
+    ];
+
+    for case in &cases {
+        let (name, source, expected) = case;
+        let reports = misplaced_inner_doc_comments(source, InnerDocComments::InColumnOne);
+        assert_eq!(
+            reports.len(),
+            *expected,
+            "case {name:?}: expected {expected} report(s), got {reports:#?}"
+        );
+    }
+}
+
+#[test]
+fn every_declared_suite_file_keeps_its_inner_doc_comments_ahead_of_its_first_item() {
+    // The rule holds for every file an `all` target compiles, not only for the root that
+    // declares them: a `//!` line past the first item of a suite file is the same `E0753`
+    // and fails that whole target too.
+    let root = workspace_root();
+    let roots = declaration_roots();
+    let suite_files: Vec<_> = roots.iter().flat_map(|r| declared_suite_files(r)).collect();
+    assert!(
+        suite_files.len() > roots.len(),
+        "expected the {} declaration roots under {} to declare at least one suite file each, \
+         read {} of them",
+        roots.len(),
+        root.display(),
+        suite_files.len()
+    );
+
+    let mut reports = Vec::new();
+    for suite_file in &suite_files {
+        let name = suite_file
+            .strip_prefix(&root)
+            .unwrap_or(suite_file)
+            .display()
+            .to_string();
+        let source = fs::read_to_string(suite_file)
+            .unwrap_or_else(|error| panic!("read {}: {error}", suite_file.display()));
+        for report in misplaced_inner_doc_comments(&source, InnerDocComments::InColumnOne) {
+            reports.push(format!("case {name}: {report}"));
+        }
+    }
+
+    assert!(
+        reports.is_empty(),
+        "expected each of the {} declared suite files to carry no file-level inner doc \
+         comment after its first item, got {} report(s), each of which fails its target with \
+         E0753: {reports:#?}",
+        suite_files.len(),
         reports.len()
     );
 }
@@ -170,7 +290,7 @@ fn the_reader_reports_an_inner_doc_comment_the_target_cannot_compile() {
 
     for case in &cases {
         let (name, source, expected) = case;
-        let reports = misplaced_inner_doc_comments(source);
+        let reports = misplaced_inner_doc_comments(source, InnerDocComments::Anywhere);
         assert_eq!(
             reports.len(),
             *expected,

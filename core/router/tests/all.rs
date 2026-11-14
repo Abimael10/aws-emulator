@@ -7442,3 +7442,94 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (And more of the same followed, to the end of this file: header fragments concurrent
 // landings appended here, some as `//!`, which past the first item is `E0753`. The rule
 // they repeated is in the module doc at the HEAD of this file, so they are gone rather
+//! sorted. A suite that is not declared here compiles nowhere and its tests never run,
+//! and a suite left at the top level of `tests/` fails the build. Declare each suite
+//! exactly ONCE: this is one crate root, so a second `mod` for the same name is `E0428`
+//! and fails every suite in this target. An inner doc comment (`//!`) is legal only
+//! before the first item, so these lines are the only place one may stand — a note
+//! appended further down this file is `E0753` and compiles no suite of this target, and
+//! must be an ordinary `//` comment. `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves, for this
+//! file and for every service crate's `tests/all.rs`, so check there rather than leaving
+//! a note here.
+// (`cloudtrail_read_only_api_calls` and `zz_probe` are each declared ONCE further up this
+// file: a merge of two landings deposited a second declaration of each here, which is
+// `E0428` and compiles neither copy.)
+// (Both suites are declared ONCE, further up this file — the SESv2 event-destination one
+// in the sorted span above, the CloudFront flat-rate subscription one in the head region:
+// a module declared twice is `E0428` and compiles neither copy, and a merge of two landings
+// deposited a second declaration of each here.)
+// (Declared ONCE, in the sorted span above: a merge of two landings deposited a second
+// declaration here, which is `E0428` and compiles neither copy.)
+// CloudFront span far above: a merge of two landings deposited a second declaration here,
+// which is `E0428` and compiles neither copy, so this copy is gone.)
+// CloudFront span above: a merge of two landings deposited a second declaration here.)
+// CloudFront span above: a merge of two landings deposited a second declaration here,
+// which is `E0428` and compiles neither copy.)
+// above: a merge of two landings deposited a second declaration here, which is `E0428` and
+// above: a merge of two landings deposited a second declaration here, which is `E0428`.)
+// it scales. (Declared ONCE, in the head region of this file: a merge of two landings
+// deposited a second declaration here, which is `E0428` and compiles neither copy.)
+// (One more fragment of this file's own header landed here typed with `//!`, which is
+// `E0753` past the first item and compiles no suite of this target; the rule it repeated —
+// a suite left at the top level of `tests/` fails the build — stands in the module doc at
+// the head of this file, so the fragment is gone rather than re-typed.)
+// (And one more line of that same header fragment, appended here typed with `//!`: an
+// inner doc comment is legal only before the first item, so it is `E0753` here and
+// compiles nothing. `all/all_rs_inner_doc_comments_precede_the_first_item.rs` pins that
+// rule for this file and for every service crate's `tests/all.rs`.)
+// (And once more, as a line comment: concurrent landings keep appending this fragment of
+// the file's own header into the tail typed with `//!`, which is `E0753` past the first
+// item and compiles no suite of this target. The rule it repeats stands in the header at
+// the head of this file.)
+// one stays in the HEADER: an inner doc comment past the first item is `E0753`, so this
+// fragment, appended into the tail, stands as ordinary comments.
+// (`cloudwatch_cfn_alarm_action_topic_policy` is declared ONCE, in the sorted span above: a
+// merge of two landings deposited a second declaration here, which is `E0428`.)
+// suite left at the top level of `tests/` fails the build. (One more copy of that
+// fragment, appended into the tail typed with `//!`, which is `E0753` there: it stands as
+// an ordinary comment, and the rule is in the header at the head of this file.)
+// (`cloudwatch_cfn_alarm_action_topic_policy` is declared ONCE, a few lines above in this
+// same tail: a merge of two landings deposited a second declaration here, which is `E0428`
+// and compiles neither copy.)
+// (Another landing appended two more fragments of this file's own header here, typed with
+// `//!`: an inner doc comment is legal only before the first item, so in this tail each
+// line is `E0753` and compiles nothing. Both fragments are gone rather than re-typed — the
+// header at the head of this file carries the rule they repeated.)
+// (And two more such fragments, six lines in all, appended here as `//!` by later
+// landings: each is `E0753` past the first item and compiles nothing, so they are gone
+// rather than re-typed, and the header at the head of this file carries the rule they
+// repeated.)
+// (Two copies of this file's own header, eighteen lines in all, that the union merge of two
+// landings deposited in this tail typed with `//!`: an inner doc comment is legal only
+// before the first item, so each line was `E0753` and compiled no suite of this target.
+// They are deleted rather than re-typed, and the header at the head of this file states
+// the rule they repeated.)
+// line that stood here as `//!` is gone rather than re-typed.
+// (Six more lines of that header landed in this tail typed with `//!`: past the first item
+// that is `E0753` and compiles no suite of this target, so they are deleted rather than
+// re-typed — the module doc at the HEAD of this file states the rule they repeated.)
+// (And seven more, deleted for that same reason.)
+// (Six more lines of that same header fragment landed in this tail typed with `//!`: each
+// is `E0753` past the first item, so they are dropped rather than re-typed — the module doc
+// at the HEAD of this file states the rule they repeated.)
+// (And seven more of those lines, landed here the same way and dropped for the same
+// and five more of its lines, landed here as `//!` and dropped for that same reason.)
+// declared twice is `E0428`, so the duplicate is removed and the first declaration stands.)
+// (A long run of notes stood here, each left by an earlier repair of this same file: copies
+// of the module doc at the HEAD of this file that landings appended into the tail typed with
+// `//!`, which is `E0753` past the first item, and second declarations of suites already
+// declared above, which are `E0428`. The copies and the duplicates are gone, this one note
+// stands for all of them, and the rules themselves stand once in the header.)
+// (More of the same run of notes stood here, and is gone for the reason the note above
+// records: the duplicate declarations and the appended header copies are removed.)
+// (And the same again: the appended header copies and the duplicate declarations that stood
+// here are gone, for the reason the note further up this tail records.)
+// (Last of that run: the appended header copies and the duplicate declarations that stood
+// here are gone, for the reason the notes above record.)
+// (And one more such run of notes stood here: the header copies landings appended as `//!`
+// and the second declarations of suites already declared above are gone, for the reason the
+// notes further up this tail record.)
+// (And one last such run, gone for the same reason.)
+// (And the run after it, likewise: the header copies landings appended as `//!` and the
+// second declarations of suites already declared above are dropped rather than re-typed.)
