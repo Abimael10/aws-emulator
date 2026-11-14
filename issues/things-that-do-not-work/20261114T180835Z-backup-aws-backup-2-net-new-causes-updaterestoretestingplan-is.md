@@ -1,0 +1,54 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: backup.concurrent-update-restore-testing-plan-conflict backup.create-restore-testing-plan-duplicate-name-rejected
+Issue-Shape-Id: com.amazonaws.backup#CryoControllerUserManager
+Issue-Key: backup.concurrent-update-restore-testing-plan-conflict|run#12|AssertionError|assert len(successes) >= 1, "no concurrent UpdateRestoreTestingPlan call succeeded"
+Issue-Key: backup.create-restore-testing-plan-duplicate-name-rejected|run#12|AssertionError|assert message == (
+Issue-Commit: 925fe565299dec6eb0f742dd224c6e41f11f8969
+
+# AWS Backup: 2 net-new causes — UpdateRestoreTestingPlan is still a 501 scaffold stub so no update ever succeeds (and no loser gets ConflictException), and CreateRestoreTestingPlan's duplicate-name refusal re-words AWS's AlreadyExistsException message
+
+> _Note: this issue was identified against the code base at commit `925fe565299dec6eb0f742dd224c6e41f11f8969`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UpdateRestoreTestingPlan
+
+## Description
+Two net-new root causes on the AWS Backup restore-testing-plan surface, found by the behavioral suite. Neither failing check is marked ALREADY FILED or OWNED by an open issue in the suite report.
+
+Cause 1 of 2: UpdateRestoreTestingPlan is unimplemented, so every update of a restore testing plan is refused and the concurrent-update contract is unobservable.
+AWS: Smithy UpdateRestoreTestingPlan — PUT /restore-testing/plans/{RestoreTestingPlanName}, success 200, input RestoreTestingPlanForUpdate {RecoveryPointSelection, ScheduleExpression, ScheduleExpressionTimezone, StartWindowHours}, output {RestoreTestingPlanName, RestoreTestingPlanArn, CreationTime, UpdateTime} all required; modeled errors ConflictException (409), InvalidParameterValueException (400), MissingParameterValueException (400), ResourceNotFoundException (400), ServiceUnavailableException (500). A valid update of an existing plan therefore succeeds with 200. Under several simultaneous updates of one plan, AWS serializes them: at least one call wins with 200, and a loser is refused with ConflictException whose Message is the fixed text 'Failed to update restore testing plan [' + <RestoreTestingPlanName from the request> + '] due to an attempt to update it concurrently.' (the bracketed part is the request's plan name, not a literal from any one run), and the plan's stored ScheduleExpression afterwards is a WINNER's submitted value — never a refused racer's value and never a corrupted one.
+Emulator: six simultaneous UpdateRestoreTestingPlan calls on one freshly created plan are ALL refused — zero succeeded ('no concurrent UpdateRestoreTestingPlan call succeeded'). The handler is still the untouched scaffold: services/service-com-amazonaws-backup-cryocontrollerusermanager/src/ops/update_restore_testing_plan.rs carries the '//! SCAFFOLDED, NOT IMPLEMENTED' marker and its handle() body ends in Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRestoreTestingPlan")), i.e. HTTP 501 with error code NotImplemented and message 'operation UpdateRestoreTestingPlan is scaffolded but not implemented in this emulator' — not any of the five modeled errors, and never a 200. Note this contradicts the already-open WIRE issue 20261114T123121Z-backup-aws-backup-restore-testing-plan-reads-omit-lastupdatetime.md, whose Cause 3 records the update being ACCEPTED (200) but not persisted at commit 89c7045; at the commit replayed here the operation does not answer at all, so that issue's cause does not describe (or cover) this one.
+Why: a client cannot modify a restore testing plan by any route. Rather than a silent no-op it now gets a 501 whose code is not in the operation's modeled error set, so SDK error handling that branches over ConflictException / ResourceNotFoundException falls through to a generic failure; retry/backoff logic written for the documented concurrent-update ConflictException never engages, and no last-writer-wins ordering can be exercised or asserted.
+Fix: the UpdateRestoreTestingPlan handler (services/service-com-amazonaws-backup-cryocontrollerusermanager/src/ops/update_restore_testing_plan.rs) must be implemented against the shared restore-testing-plan state (crate::state RestoreTestingPlanRecord / restore_testing module): resolve the named plan or refuse ResourceNotFoundException, merge the submitted members into the stored record and stamp the update time under the store lock so one simultaneous caller wins, and refuse a loser with ConflictException carrying AWS's concurrent-update message template. The SCAFFOLDED marker line must be deleted once it is written.
+Traces: behavioral check backup.concurrent-update-restore-testing-plan-conflict.
+
+Cause 2 of 2: CreateRestoreTestingPlan's duplicate-name refusal carries emulator-authored wording instead of AWS's AlreadyExistsException message.
+AWS: Smithy CreateRestoreTestingPlan models AlreadyExistsException (client, HTTP 400) for a create naming a plan the account already holds; its members are Code, Message, CreatorRequestId, Arn, Type, Context. AWS's Message for this refusal is the template 'Restore testing plan [' + <RestoreTestingPlanName from the request> + '] already exists in account [' + <the caller's account id> + '].' — that bracketing is the fixed text, and the plan name comes from the request while the account id comes from the caller's identity (values from any single run fill the template and are not part of it).
+Emulator: the error class and status are right (AlreadyExistsException / 400), but Message is 'Restore testing plan with the same name already exists' — wording that names neither the plan nor the account. It comes from crate::state::restore_testing_plan_already_exists() (services/service-com-amazonaws-backup-cryocontrollerusermanager/src/state.rs, ~line 1534, constant MESSAGE_RESTORE_TESTING_PLAN_ALREADY_EXISTS), used by the duplicate-name branch of services/service-com-amazonaws-backup-cryocontrollerusermanager/src/ops/create_restore_testing_plan.rs (~line 223).
+Why: an operator or client that parses or logs the refusal gets no plan name and no account id, so a duplicate-plan collision is indistinguishable from any other already-exists condition in the same account, and assertions on AWS's documented message text fail even though the status and error class match.
+Fix: the duplicate-name refusal builder in the backup service's state module (restore_testing_plan_already_exists) and its CreateRestoreTestingPlan caller — the message must be built from AWS's template with the request's plan name and the caller's account id. The open WIRE issue 20261114T123121Z-backup-aws-backup-restore-testing-plan-refusals-omit-the.md records the same wording fault (plus the omitted body Code) from wire fixtures; it carries none of this suite's check keys, so this behavioral check is filed here and that issue is named for cross-reference rather than relied on.
+Traces: behavioral check backup.create-restore-testing-plan-duplicate-name-rejected.
+
+## Evidence
+Behavioral suite simparity-behavioral-aws-v1 replayed against the emulator built from this checkout: 79/127 passed; service 'backup' 31/51, 20 failed. Neither check below is marked ALREADY FILED or OWNED in the report.
+
+Cause 1 — [mismatch] backup.concurrent-update-restore-testing-plan-conflict:
+  check_backup_concurrent_update_restore_testing_plan_conflict.py line 60:
+  AssertionError: no concurrent UpdateRestoreTestingPlan call succeeded
+  The check creates one plan, then fires 6 simultaneous UpdateRestoreTestingPlan calls (each submitting a distinct ScheduleExpression 'cron(0 <i> ? * * *)'). Expected: >=1 call returns 200, every loser returns ConflictException with Message 'Failed to update restore testing plan [<plan-name>] due to an attempt to update it concurrently.', and a later GetRestoreTestingPlan reports a winner's ScheduleExpression. Actual: successes == 0 — all six were refused.
+  Source evidence for the refusal: services/service-com-amazonaws-backup-cryocontrollerusermanager/src/ops/update_restore_testing_plan.rs lines 3-6 ('SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 NotImplemented') and line 175 (Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRestoreTestingPlan"))).
+  Model (services/service-com-amazonaws-backup-cryocontrollerusermanager/smithy-model/com-amazonaws-backup-cryocontrollerusermanager.json): UpdateRestoreTestingPlan PUT /restore-testing/plans/{RestoreTestingPlanName} success 200; output CreationTime/RestoreTestingPlanArn/RestoreTestingPlanName/UpdateTime all required; errors {ConflictException 409, InvalidParameterValueException 400, MissingParameterValueException 400, ResourceNotFoundException 400, ServiceUnavailableException 500} — NotImplemented is not among them.
+
+Cause 2 — [mismatch] backup.create-restore-testing-plan-duplicate-name-rejected:
+  check_backup_create_restore_testing_plan_duplicate_name_rejected.py line 56:
+  AssertionError: actual_message='Restore testing plan with the same name already exists'
+  Expected Message: 'Restore testing plan [<plan-name>] already exists in account [<account-id>].' (fixed text 'Restore testing plan [' / '] already exists in account [' / '].'; plan name from the request, account id from the caller's identity). Error code assertion passed (AlreadyExistsException), so only the message diverges on this leg.
+  Model: CreateRestoreTestingPlan PUT /restore-testing/plans success 201; errors {AlreadyExistsException 400, ConflictException 409, InvalidParameterValueException 400, LimitExceededException 400, MissingParameterValueException 400, ServiceUnavailableException 500}; AlreadyExistsException members {Code, Message, CreatorRequestId, Arn, Type, Context}.
+
+## Steps to Reproduce
+1. git clone the repo and build/boot the emulator from this checkout.
+2. Replay the behavioral suite simparity-behavioral-aws-v1.
+3. Cause 1: run check backup.concurrent-update-restore-testing-plan-conflict — CreateRestoreTestingPlan a plan, then issue 6 simultaneous UpdateRestoreTestingPlan calls on that name, each with a different ScheduleExpression. Every call is refused (501 NotImplemented from the scaffolded handler); no call returns 200 and no loser returns ConflictException with 'Failed to update restore testing plan [<name>] due to an attempt to update it concurrently.'
+4. Cause 2: run check backup.create-restore-testing-plan-duplicate-name-rejected — CreateRestoreTestingPlan with a name that already exists. The 400 AlreadyExistsException body's Message is 'Restore testing plan with the same name already exists' instead of 'Restore testing plan [<name>] already exists in account [<account-id>].'
