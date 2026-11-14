@@ -1097,7 +1097,7 @@ impl TransitGatewayAttachmentView {
     /// the gate and this charge cannot drift.
     pub(super) fn payload_bytes(&self) -> usize {
         match self {
-            Self::Vpc(attachment) => tag_list_bytes(attachment.tags.as_deref().unwrap_or_default()),
+            Self::Vpc(attachment) => transit_gateway_vpc_attachment_payload_bytes(attachment),
             Self::Peering(attachment) => {
                 tag_list_bytes(attachment.tags.as_deref().unwrap_or_default())
             }
@@ -2646,6 +2646,21 @@ pub fn transit_gateway_attachment_deleted_or_absent<E>(attachment_id: &str) -> S
     )
 }
 
+/// The `<Resource>` [`transit_gateway_attachment_resource_deleted_or_absent`] names for an action
+/// whose subject is the VPC attachment itself (`ModifyTransitGatewayVpcAttachment`).
+pub const TRANSIT_GATEWAY_VPC_ATTACHMENT_RESOURCE_NAME: &str = "Transit Gateway VPC Attachment";
+
+/// Refuse a well-formed transit gateway attachment id this account holds no VPC attachment for,
+/// for an action whose subject IS that VPC attachment: the family's one sentence
+/// ([`transit_gateway_attachment_resource_deleted_or_absent`]) naming
+/// [`TRANSIT_GATEWAY_VPC_ATTACHMENT_RESOURCE_NAME`], with the id taken from the request.
+pub fn transit_gateway_vpc_attachment_deleted_or_absent<E>(attachment_id: &str) -> Scaffolded<E> {
+    transit_gateway_attachment_resource_deleted_or_absent(
+        TRANSIT_GATEWAY_VPC_ATTACHMENT_RESOURCE_NAME,
+        attachment_id,
+    )
+}
+
 /// Refuse something that is not a transit gateway attachment id at all: HTTP 400
 /// [`INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED`], BEFORE the id is looked up, so "not an
 /// id of this kind" is never reported as "no such attachment".
@@ -2739,5 +2754,248 @@ impl ComAmazonawsEc2Amazonec2State {
     /// [`Self::has_transit_gateway_attachment_capacity`].
     pub fn has_ipam_pool_capacity(&self) -> bool {
         self.ipam_pools.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+}
+
+// =============================================================================
+// Modifying a stored VPC attachment
+// =============================================================================
+
+/// An attachment whose subnets or options are being changed: the
+/// `TransitGatewayAttachmentState` enum's `modifying` member
+/// (`smithy_query(query="shape",shape="TransitGatewayAttachmentState")`).
+pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_MODIFYING: &str = "modifying";
+
+/// `InvalidSubnetID.NotFound` (HTTP 400) in the wording the transit gateway family answers a
+/// subnet it cannot reach with: "Subnet <id> was deleted or does not exist.", the template
+/// [`invalid_transit_gateway_id_not_found`] and
+/// [`invalid_transit_gateway_route_table_id_not_found`] use for the gateway and its route
+/// tables.
+///
+/// ONE sentence for both ways a subnet of a transit gateway VPC attachment can fail to resolve —
+/// an id the store holds no subnet under, and a subnet that exists outside the VPC the
+/// attachment attaches, which is not a subnet that attachment can use at all: it is the TRANSIT
+/// GATEWAY that answers the request either way, and this is how it words that refusal. The id
+/// comes from the REQUEST.
+///
+/// A second wording of that code beside the VPC surface's own
+/// [`invalid_subnet_id_not_found`] ("The subnet ID '<id>' does not exist"), which is what the
+/// operations of the VPC surface answer; `CreateTransitGatewayVpcAttachment` still answers that
+/// one for an id naming no subnet at all, which the open report
+/// `20261103T021956Z-ec2-route-server-transit-gateway-and-resource-arn` records as a divergence
+/// of the create and owns the change to.
+pub fn transit_gateway_subnet_deleted_or_absent<E>(subnet_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SUBNET_ID_NOT_FOUND,
+        400,
+        format!("Subnet {subnet_id} was deleted or does not exist."),
+    )
+}
+
+/// Refuse a request that would leave one VPC attachment with two subnets of one Availability
+/// Zone: HTTP 400 [`DUPLICATE_SUBNETS_IN_SAME_ZONE`], the code EC2 answers a second subnet of a
+/// zone with, naming the zone and both subnets.
+///
+/// Worded here rather than by [`duplicate_subnets_in_same_zone`], whose sentence is the VPC
+/// endpoint's own: a VPC attachment "uses one IP address from each specified subnet" and takes
+/// "only one subnet per Availability Zone"
+/// (`CreateTransitGatewayVpcAttachmentRequest$SubnetIds`,
+/// `ModifyTransitGatewayVpcAttachmentRequest$AddSubnetIds`), so this refusal names the zone the
+/// two subnets share. One definition for the create and the modification alike, which hold the
+/// attachment's subnet set to the same rule.
+pub fn duplicate_transit_gateway_attachment_subnet_zone<E>(
+    held: &str,
+    requested: &str,
+    availability_zone: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        DUPLICATE_SUBNETS_IN_SAME_ZONE,
+        400,
+        format!(
+            "The subnets {held} and {requested} are both in the Availability Zone \
+             {availability_zone}; you can specify only one subnet per Availability Zone"
+        ),
+    )
+}
+
+/// What `ModifyTransitGatewayVpcAttachment` asks of one stored VPC attachment: the subnets the
+/// request adds and removes, and the option members it carries — each absent when the request
+/// left it out, which leaves the stored value as it was rather than returning it to a default.
+///
+/// Every option value here has already been read by the one reader this crate holds an
+/// `enable`/`disable` option to ([`transit_gateway_option_value`]), so a modification and a
+/// create cannot disagree about which values an option admits.
+#[derive(Debug, Clone, Default)]
+pub struct TransitGatewayVpcAttachmentModification {
+    /// "The ID of the attachment" the modification applies to.
+    pub transit_gateway_attachment_id: String,
+    /// "The IDs of one or more subnets to add", in the order the request names them.
+    pub add_subnet_ids: Vec<String>,
+    /// "The IDs of one or more subnets to remove".
+    pub remove_subnet_ids: Vec<String>,
+    /// "Enable or disable DNS support" for the attachment.
+    pub dns_support: Option<String>,
+    /// Whether a security group may be referenced across the VPCs attached to the gateway.
+    pub security_group_referencing_support: Option<String>,
+    /// "Specifies whether IPv6 support is enabled for the attachment".
+    pub ipv6_support: Option<String>,
+    /// "Enable or disable support for appliance mode".
+    pub appliance_mode_support: Option<String>,
+}
+
+impl TransitGatewayVpcAttachmentModification {
+    /// The attachment `held` becomes under this modification: its subnets after the adds and
+    /// removes ([`Self::subnets_after`]) and each option member the request carries, with every
+    /// other member — its id, its gateway, its VPC and that VPC's owner, when it was created and
+    /// its tags — left exactly as it was.
+    ///
+    /// The ONE definition of what this modification DOES to an attachment, so the record a
+    /// handler weighs before writing and the record
+    /// [`ComAmazonawsEc2Amazonec2State::modify_transit_gateway_vpc_attachment`] stores cannot
+    /// differ. The state is NOT set here: only the store's writer decides it, so no path can
+    /// report an attachment in a state the store does not hold.
+    pub fn applied_to(&self, held: &TransitGatewayVpcAttachment) -> TransitGatewayVpcAttachment {
+        let mut view = held.clone();
+        view.subnet_ids = Some(self.subnets_after(held.subnet_ids.as_deref().unwrap_or_default()));
+        let mut options = view.options.take().unwrap_or_default();
+        for (stored, requested) in [
+            (&mut options.dns_support, &self.dns_support),
+            (
+                &mut options.security_group_referencing_support,
+                &self.security_group_referencing_support,
+            ),
+            (&mut options.ipv6_support, &self.ipv6_support),
+            (
+                &mut options.appliance_mode_support,
+                &self.appliance_mode_support,
+            ),
+        ] {
+            if let Some(value) = requested {
+                *stored = Some(value.clone());
+            }
+        }
+        view.options = Some(options);
+        view
+    }
+
+    /// The subnets the attachment carries after this modification: those it `held` that the
+    /// request does not remove, in the order it held them, followed by those the request adds
+    /// that it does not already carry, in the order the request names them.
+    ///
+    /// A subnet the attachment already carries needs no second address in it, so naming it again
+    /// adds nothing; a subnet named in both lists is removed and then added, which is what the
+    /// two lists together ask for.
+    pub fn subnets_after(&self, held: &[String]) -> Vec<String> {
+        // Membership is asked of SETS rather than of the vectors, so the work one request costs
+        // grows with the ids it names rather than with their product: a request may name up to
+        // [`MAX_RESOURCE_IDS`] ids and a stored attachment carries up to
+        // [`MAX_TRANSIT_GATEWAY_ATTACHMENT_SUBNETS`] of them.
+        let removed: BTreeSet<&str> = self
+            .remove_subnet_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut subnets: Vec<String> = held
+            .iter()
+            .filter(|subnet_id| !removed.contains(subnet_id.as_str()))
+            .cloned()
+            .collect();
+        let mut carried: BTreeSet<String> = subnets.iter().cloned().collect();
+        for subnet_id in &self.add_subnet_ids {
+            if carried.insert(subnet_id.clone()) {
+                subnets.push(subnet_id.clone());
+            }
+        }
+        subnets
+    }
+}
+
+/// How many subnets ONE stored transit gateway VPC attachment carries before a modification of it
+/// is refused.
+///
+/// A CHOSEN ceiling, in the spirit of [`MAX_STORED_RECORDS_PER_STORE`]: the attachment takes "at
+/// most one subnet per Availability Zone"
+/// (`ModifyTransitGatewayVpcAttachmentRequest$AddSubnetIds`), so no real Region admits anywhere
+/// near this many, and nothing in this emulator shrinks a record that repeated modifications have
+/// grown. It is well above the zone count of any Region this emulator serves, so it bounds the
+/// memory one attachment can hold without standing in the way of a faithful request.
+pub const MAX_TRANSIT_GATEWAY_ATTACHMENT_SUBNETS: usize = 64;
+
+/// The caller-chosen bytes one stored VPC attachment holds: its tags, the subnet ids a create or a
+/// modification put on it, and its four option values.
+///
+/// Beside the view's own [`TransitGatewayAttachmentView::payload_bytes`], which delegates its VPC
+/// arm to this, the way [`transit_gateway_connect_payload_bytes`] serves the Connect arm: the
+/// create that asks the byte budget whether its attachment FITS and the modification that asks
+/// about its NET change both weigh the record with the very function the store then charges by, so
+/// a gate and a charge cannot drift.
+pub fn transit_gateway_vpc_attachment_payload_bytes(
+    attachment: &TransitGatewayVpcAttachment,
+) -> usize {
+    let subnet_bytes: usize = attachment
+        .subnet_ids
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|subnet_id| subnet_id.len())
+        .sum();
+    let options = attachment.options.as_ref();
+    let option_bytes: usize = [
+        options.and_then(|options| options.dns_support.as_deref()),
+        options.and_then(|options| options.security_group_referencing_support.as_deref()),
+        options.and_then(|options| options.ipv6_support.as_deref()),
+        options.and_then(|options| options.appliance_mode_support.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::len)
+    .sum();
+    tag_list_bytes(attachment.tags.as_deref().unwrap_or_default())
+        .saturating_add(subnet_bytes)
+        .saturating_add(option_bytes)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Apply `modification` to the stored VPC attachment it names and answer the attachment as
+    /// it NOW stands — `None` when this store holds no VPC attachment under that id.
+    ///
+    /// The one way a stored VPC attachment is modified, so what
+    /// `ModifyTransitGatewayVpcAttachment` answers and what a later
+    /// `DescribeTransitGatewayVpcAttachments` reports cannot differ: what it hands back is the
+    /// stored record itself. Which members the call changes is
+    /// [`TransitGatewayVpcAttachmentModification::applied_to`]'s one definition; what only this
+    /// function decides is the attachment's state — it is left in the TRANSIENT
+    /// [`TRANSIT_GATEWAY_ATTACHMENT_STATE_MODIFYING`] state with the clock owing it
+    /// `available` [`TRANSITION_DELAY`] later, exactly as
+    /// [`Self::modify_transit_gateway`] leaves a modified gateway `modifying`. The span is never
+    /// zero, so a caller acting straight after this call still sees the change being carried out.
+    ///
+    /// The caller-chosen bytes the record holds are RE-CHARGED across the write — the record this
+    /// replaces is refunded and the record it becomes is charged, both weighed by
+    /// [`transit_gateway_vpc_attachment_payload_bytes`] — so repeated modifications of one
+    /// attachment cannot grow the store past [`MAX_STORED_BYTES`]; a handler asks
+    /// [`Self::would_exceed_stored_bytes_after_refund`] about that net change, and holds the
+    /// resulting subnet count to [`MAX_TRANSIT_GATEWAY_ATTACHMENT_SUBNETS`], first.
+    pub fn modify_transit_gateway_vpc_attachment(
+        &mut self,
+        modification: &TransitGatewayVpcAttachmentModification,
+    ) -> Option<TransitGatewayVpcAttachment> {
+        let record = self
+            .transit_gateway_attachments
+            .get_mut(&modification.transit_gateway_attachment_id)?;
+        let TransitGatewayAttachmentView::Vpc(held) = &record.view else {
+            return None;
+        };
+        let refund = transit_gateway_vpc_attachment_payload_bytes(held);
+        let mut view = modification.applied_to(held);
+        view.state = Some(TRANSIT_GATEWAY_ATTACHMENT_STATE_MODIFYING.to_string());
+        let charge = transit_gateway_vpc_attachment_payload_bytes(&view);
+        record.view = TransitGatewayAttachmentView::Vpc(view.clone());
+        record.pending = Some(PendingStateMove::starting_now(
+            TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE,
+        ));
+        self.release_stored_bytes(refund);
+        self.add_stored_bytes(charge);
+        Some(view)
     }
 }

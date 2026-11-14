@@ -236,14 +236,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(state::invalid_subnet_id_not_found(subnet_id));
             };
             if subnet.vpc_id.as_deref() != Some(input.vpc_id.as_str()) {
-                return Err(subnet_was_deleted_or_does_not_exist(subnet_id));
+                return Err(state::transit_gateway_subnet_deleted_or_absent(subnet_id));
             }
             if subnet_ids.iter().any(|named| named == subnet_id) {
                 continue;
             }
             let zone = subnet.availability_zone.clone().unwrap_or_default();
             if let Some((_, held)) = zones.iter().find(|(named_zone, _)| *named_zone == zone) {
-                return Err(duplicate_subnets_in_same_zone(held, subnet_id, &zone));
+                return Err(state::duplicate_transit_gateway_attachment_subnet_zone(
+                    held, subnet_id, &zone,
+                ));
             }
             zones.push((zone, subnet_id.clone()));
             subnet_ids.push(subnet_id.clone());
@@ -378,9 +380,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         // The very number the insert then charges, asked of the budget before anything is
-        // written: the record's own overhead plus the caller-chosen bytes it holds, which for
-        // a VPC attachment are its tags.
-        let payload_bytes = state::STORED_RECORD_OVERHEAD_BYTES + state::tag_list_bytes(&tags);
+        // written: the record's own overhead plus the caller-chosen bytes it holds, weighed by
+        // the ONE function the store charges a VPC attachment by, so the gate and the charge
+        // cannot drift.
+        let payload_bytes = state::STORED_RECORD_OVERHEAD_BYTES
+            + state::transit_gateway_vpc_attachment_payload_bytes(&view);
         if store.would_exceed_stored_bytes(payload_bytes) {
             return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
                 "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
@@ -462,48 +466,9 @@ fn duplicate_transit_gateway_attachment(
     )
 }
 
-/// `InvalidSubnetID.NotFound` (HTTP 400) in the wording the transit gateway family answers a
-/// resource of it that it cannot reach with: "Subnet <id> was deleted or does not exist.",
-/// the template [`crate::state::invalid_transit_gateway_id_not_found`] and
-/// [`crate::state::invalid_transit_gateway_route_table_id_not_found`] use for the gateway and
-/// its route tables.
-///
-/// A second wording of that code beside [`crate::state::invalid_subnet_id_not_found`], and a
-/// named function here rather than a literal at the call site, because WHICH of the two this
-/// operation answers is a fact of the REQUEST: an id the store holds no subnet under is
-/// answered the VPC surface's "The subnet ID '<id>' does not exist", while a subnet that
-/// exists outside the VPC being attached is not a subnet this attachment can use at all, and
-/// the transit gateway service — which is what answers that — words it this way. The id comes
-/// from the REQUEST.
-fn subnet_was_deleted_or_does_not_exist(
-    subnet_id: &str,
-) -> CreateTransitGatewayVpcAttachmentError {
-    crate::scaffolded::Scaffolded::service_error(
-        state::INVALID_SUBNET_ID_NOT_FOUND,
-        400,
-        format!("Subnet {subnet_id} was deleted or does not exist."),
-    )
-}
-
-/// Refuse a request naming two subnets of one Availability Zone: HTTP 400
-/// [`crate::state::DUPLICATE_SUBNETS_IN_SAME_ZONE`], the code EC2 answers a second subnet of a
-/// zone with, naming the zone and both subnets.
-///
-/// Worded here rather than by [`crate::state::duplicate_subnets_in_same_zone`], whose sentence
-/// is the VPC endpoint's own: the attachment "uses one IP address from each specified subnet"
-/// and takes "only one subnet per Availability Zone" (`SubnetIds`), so this refusal names the
-/// zone the two subnets share.
-fn duplicate_subnets_in_same_zone(
-    held: &str,
-    requested: &str,
-    availability_zone: &str,
-) -> CreateTransitGatewayVpcAttachmentError {
-    crate::scaffolded::Scaffolded::service_error(
-        state::DUPLICATE_SUBNETS_IN_SAME_ZONE,
-        400,
-        format!(
-            "The subnets {held} and {requested} are both in the Availability Zone \
-             {availability_zone}; you can specify only one subnet per Availability Zone"
-        ),
-    )
-}
+// The two refusals this operation answers about the subnets of the VPC it attaches — a subnet
+// outside that VPC and a second subnet of one Availability Zone — are worded in
+// `crate::state` ([`crate::state::transit_gateway_subnet_deleted_or_absent`],
+// [`crate::state::duplicate_transit_gateway_attachment_subnet_zone`]), because
+// `ModifyTransitGatewayVpcAttachment` holds an attachment's subnet set to the very same rule
+// and answers the very same sentences.

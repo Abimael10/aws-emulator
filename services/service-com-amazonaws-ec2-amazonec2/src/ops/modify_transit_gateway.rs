@@ -169,35 +169,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|options| options.amazon_side_asn)
                 .map(|asn| state::private_amazon_side_asn(Some(asn)))
                 .transpose()?,
-            auto_accept_shared_attachments: option_value(
+            auto_accept_shared_attachments: state::transit_gateway_option_value_opt(
                 requested.and_then(|options| options.auto_accept_shared_attachments.as_deref()),
                 "autoAcceptSharedAttachments",
             )?,
-            default_route_table_association: option_value(
+            default_route_table_association: state::transit_gateway_option_value_opt(
                 requested.and_then(|options| options.default_route_table_association.as_deref()),
                 "defaultRouteTableAssociation",
             )?,
             association_default_route_table_id: requested
                 .and_then(|options| options.association_default_route_table_id.clone()),
-            default_route_table_propagation: option_value(
+            default_route_table_propagation: state::transit_gateway_option_value_opt(
                 requested.and_then(|options| options.default_route_table_propagation.as_deref()),
                 "defaultRouteTablePropagation",
             )?,
             propagation_default_route_table_id: requested
                 .and_then(|options| options.propagation_default_route_table_id.clone()),
-            vpn_ecmp_support: option_value(
+            vpn_ecmp_support: state::transit_gateway_option_value_opt(
                 requested.and_then(|options| options.vpn_ecmp_support.as_deref()),
                 "vpnEcmpSupport",
             )?,
-            dns_support: option_value(
+            dns_support: state::transit_gateway_option_value_opt(
                 requested.and_then(|options| options.dns_support.as_deref()),
                 "dnsSupport",
             )?,
-            security_group_referencing_support: option_value(
+            security_group_referencing_support: state::transit_gateway_option_value_opt(
                 requested.and_then(|options| options.security_group_referencing_support.as_deref()),
                 "securityGroupReferencingSupport",
             )?,
-            encryption_support: option_value(
+            encryption_support: state::transit_gateway_option_value_opt(
                 requested.and_then(|options| options.encryption_support.as_deref()),
                 "encryptionSupport",
             )?,
@@ -334,20 +334,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// One `enable`/`disable` option a modification carries, or `None` when the request carried
-/// none — which leaves the stored value as it was rather than returning it to a default.
-///
-/// The VALUE itself is read by the one reader every one of these members goes through
-/// ([`crate::state::transit_gateway_option_value`]), so a modification and a create cannot
-/// disagree about which values an option admits.
-fn option_value(
-    requested: Option<&str>,
-    member: &str,
-) -> Result<Option<String>, ModifyTransitGatewayError> {
-    requested
-        .map(|value| crate::state::transit_gateway_option_value(value, member))
-        .transpose()
-}
+// This operation's option members are read through the one lift the transit gateway family
+// shares, `crate::state::transit_gateway_option_value_opt`: `None` for a member the request
+// left out, which leaves the stored value as it was, and otherwise the value as the one reader
+// of an `enable`/`disable` option admits it.
 
 /// Refuse a modification of the Amazon-side ASN of a gateway that still holds an attachment
 /// of a kind the model says blocks one: HTTP 400 `IncorrectState`, naming the gateway, the

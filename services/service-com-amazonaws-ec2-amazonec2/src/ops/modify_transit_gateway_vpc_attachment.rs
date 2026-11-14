@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyTransitGatewayVpcAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyTransitGatewayVpcAttachment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the members the request carries to the stored VPC attachment it names
+//! — the subnets it adds and removes, and each of the four attachment options — leaving every
+//! member the request does not carry as it was, answers the attachment in the transient
+//! `modifying` state with the instant the clock owes it `available` recorded beside it, and
+//! hands back the record
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::modify_transit_gateway_vpc_attachment`]
+//! stored, which is the very record `DescribeTransitGatewayVpcAttachments` reads.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyTransitGatewayVpcAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Every subnet the request adds has to be a subnet of the VPC the attachment attaches: an id
+//! the store holds no subnet under and one of another VPC are both refused with the sentence the
+//! transit gateway family answers a subnet it cannot reach with, and a subnet of a zone the
+//! attachment is already served in is refused rather than stored — the one subnet per
+//! Availability Zone rule the create holds the same set to. A subnet the attachment does not
+//! carry cannot be removed, the last one cannot be removed at all, an attachment that is not in
+//! service is refused for the state it is in, and a request that carries no change at all is
+//! told which parameters carry one.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +150,255 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyTransitGatewayVpcAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyTransitGatewayVpcAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyTransitGatewayVpcAttachment"))
+        // `ctx` carries request metadata only; this operation reads none of it — the attachment
+        // is named by id and the subnets it names are resolved against the store, which is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The request's own form first, before anything is resolved, so "not an id of this
+        // kind" never reads as "no such resource" and is never answered by the DryRun arm
+        // below either.
+        state::require_well_formed_transit_gateway_attachment_id(
+            &input.transit_gateway_attachment_id,
+        )?;
+
+        // The model publishes no bound on either subnet list and every id named is resolved
+        // against the store, so the number of ids one request may name is capped here — the
+        // same ceiling the rest of this crate puts on a caller-chosen id list — before any work
+        // proportional to it is done.
+        let add_subnet_ids = input.add_subnet_ids.clone().unwrap_or_default();
+        let remove_subnet_ids = input.remove_subnet_ids.clone().unwrap_or_default();
+        for (member, named) in [
+            ("AddSubnetIds", &add_subnet_ids),
+            ("RemoveSubnetIds", &remove_subnet_ids),
+        ] {
+            if named.len() > state::MAX_RESOURCE_IDS {
+                return Err(state::invalid_parameter_value(format!(
+                    "{member} carries {supplied} ids, above the maximum of {maximum}",
+                    supplied = named.len(),
+                    maximum = state::MAX_RESOURCE_IDS,
+                )));
+            }
+            // `InvalidSubnetID.Malformed` is the refusal EC2's error catalogue documents for a
+            // subnet id of the wrong form. Both lists have been capped above, so this scan is
+            // bounded.
+            if let Some(subnet_id) = named.iter().find(|subnet_id| {
+                !state::prefixed_id_is_well_formed(state::SUBNET_ID_PREFIX, subnet_id)
+            }) {
+                return Err(state::invalid_subnet_id_malformed(subnet_id));
+            }
+        }
+
+        // "The new VPC attachment options" (`Options`), read BEFORE anything is looked up or
+        // written, so a value outside the published enums is refused whatever the store holds —
+        // by the same reader `CreateTransitGatewayVpcAttachment` holds the same members to, so
+        // the two cannot disagree about which values an option admits. A member the request
+        // leaves out stays absent here, which is what leaves the stored value as it was.
+        let requested = input.options.as_ref();
+        let modification = state::TransitGatewayVpcAttachmentModification {
+            transit_gateway_attachment_id: input.transit_gateway_attachment_id.clone(),
+            add_subnet_ids,
+            remove_subnet_ids,
+            dns_support: state::transit_gateway_option_value_opt(
+                requested.and_then(|options| options.dns_support.as_deref()),
+                "dnsSupport",
+            )?,
+            security_group_referencing_support: state::transit_gateway_option_value_opt(
+                requested.and_then(|options| options.security_group_referencing_support.as_deref()),
+                "securityGroupReferencingSupport",
+            )?,
+            ipv6_support: state::transit_gateway_option_value_opt(
+                requested.and_then(|options| options.ipv6_support.as_deref()),
+                "ipv6Support",
+            )?,
+            appliance_mode_support: state::transit_gateway_option_value_opt(
+                requested.and_then(|options| options.appliance_mode_support.as_deref()),
+                "applianceModeSupport",
+            )?,
+        };
+
+        // "Modifies the specified VPC attachment": every member but the id and the dry run IS
+        // the modification, so a request carrying none asks for nothing and is told which
+        // parameters carry a modification rather than answered with an untouched attachment —
+        // the refusal `ModifyManagedPrefixList` and `ModifyLaunchTemplate` answer a
+        // modification that names nothing to change with.
+        if modification.add_subnet_ids.is_empty()
+            && modification.remove_subnet_ids.is_empty()
+            && modification.dns_support.is_none()
+            && modification.security_group_referencing_support.is_none()
+            && modification.ipv6_support.is_none()
+            && modification.appliance_mode_support.is_none()
+        {
+            return Err(state::missing_parameter(
+                "The request must contain at least one of the parameters addSubnetIds, \
+                 removeSubnetIds and options",
+            ));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the named
+        // resource, so it is answered once the request's own form has been read and before
+        // anything is resolved — the order every operation of this attachment family answers it
+        // in — and every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether the attachment admits this call is asked of the state it is
+        // ACTUALLY in rather than of the one its last writer left it in.
+        store.materialize_due_transitions();
+
+        // "The IDs of one or more subnets to add" (`AddSubnetIds`): each one has to name a
+        // subnet before it can be a subnet of anything, so the subnets the request names are
+        // resolved BEFORE the attachment they would be added to — a value that names no subnet
+        // is a fact of the request, not of the attachment. The sentence is the one the transit
+        // gateway family answers a subnet it cannot reach with
+        // ([`crate::state::transit_gateway_subnet_deleted_or_absent`]), which is what this
+        // family answers both for a subnet that is not there and for one outside the attached
+        // VPC.
+        if let Some(subnet_id) = modification
+            .add_subnet_ids
+            .iter()
+            .find(|subnet_id| !store.subnets.contains_key(subnet_id.as_str()))
+        {
+            return Err(state::transit_gateway_subnet_deleted_or_absent(subnet_id));
+        }
+
+        // "The ID of the attachment" (`TransitGatewayAttachmentId`): every attachment kind
+        // shares one id space, so an id naming an attachment of another kind names no VPC
+        // attachment this operation can modify and is refused as unknown — in the wording the
+        // transit gateway family answers a resource of its OWN that it cannot reach with, which
+        // names the resource this operation acts on: its VPC attachment
+        // ([`crate::state::transit_gateway_vpc_attachment_deleted_or_absent`]).
+        let Some(state::TransitGatewayAttachmentView::Vpc(held)) = store
+            .transit_gateway_attachments
+            .get(&input.transit_gateway_attachment_id)
+            .map(|record| record.view.clone())
+        else {
+            return Err(state::transit_gateway_vpc_attachment_deleted_or_absent(
+                &input.transit_gateway_attachment_id,
+            ));
+        };
+
+        // An attachment is modified while it is IN SERVICE: one still being set up, being
+        // taken away, or waiting for the owner of the VPC to accept it is not carrying traffic
+        // this call could change, so the request is refused for the state the attachment is in
+        // — the one refusal the attachment family answers a call that came at the wrong time
+        // with, whichever state the attachment had reached.
+        if held.state.as_deref() != Some(state::TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE) {
+            return Err(state::transit_gateway_attachment_invalid_state(
+                &input.transit_gateway_attachment_id,
+            ));
+        }
+
+        // "The IDs of one or more subnets to remove" (`RemoveSubnetIds`): a subnet the
+        // attachment does not carry has no address in it to give back, so the request is
+        // refused rather than quietly serving a removal of nothing.
+        let carried = held.subnet_ids.clone().unwrap_or_default();
+        if let Some(subnet_id) = modification
+            .remove_subnet_ids
+            .iter()
+            .find(|subnet_id| !carried.iter().any(|held| held == *subnet_id))
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({subnet_id}) for parameter RemoveSubnetIds is invalid. Subnet \
+                 {subnet_id} is not attached to transit gateway attachment {attachment_id}.",
+                attachment_id = input.transit_gateway_attachment_id,
+            )));
+        }
+
+        // The subnets the attachment would carry, by the ONE definition of what this
+        // modification does to a subnet set, so what is checked here is exactly what the write
+        // stores.
+        let subnets_after = modification.subnets_after(&carried);
+        // "You must specify at least one subnet" (`CreateTransitGatewayVpcAttachmentRequest$
+        // SubnetIds`): a transit gateway reaches a VPC through the address it holds in a subnet
+        // of it, so an attachment cannot be left with none.
+        if subnets_after.is_empty() {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({removed}) for parameter RemoveSubnetIds is invalid. You must specify \
+                 at least one subnet.",
+                removed = modification.remove_subnet_ids.join(", "),
+            )));
+        }
+        // Nothing in this emulator shrinks a record that repeated modifications have grown, so
+        // how many subnets ONE attachment carries is capped — the ceiling the store holds a VPC
+        // attachment's subnet set to — before the set is weighed or written.
+        if subnets_after.len() > state::MAX_TRANSIT_GATEWAY_ATTACHMENT_SUBNETS {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator carries at most {max} subnets on one transit gateway VPC \
+                 attachment, so it cannot carry the {requested} this modification asks for",
+                max = state::MAX_TRANSIT_GATEWAY_ATTACHMENT_SUBNETS,
+                requested = subnets_after.len(),
+            )));
+        }
+
+        // "You can specify at most one subnet per Availability Zone" (`AddSubnetIds`): the
+        // transit gateway uses one IP address from each subnet of the attachment, so every
+        // subnet the request adds has to be a subnet of the VPC this attachment attaches — one
+        // outside it is not a subnet this attachment can reach — and no two subnets of the set
+        // may share a zone, the removals having been applied first.
+        let mut zones: Vec<(String, String)> = Vec::with_capacity(subnets_after.len());
+        for subnet_id in &subnets_after {
+            let added = !carried.iter().any(|held| held == subnet_id);
+            let Some(subnet) = store.subnets.get(subnet_id) else {
+                // A subnet the attachment ALREADY carried and the store no longer holds keeps
+                // its place: it is not what this request asked about, and dropping it would
+                // change the attachment by more than the request asked for. Every subnet the
+                // request ADDS was resolved above.
+                continue;
+            };
+            if added && subnet.vpc_id.as_deref() != held.vpc_id.as_deref() {
+                return Err(state::transit_gateway_subnet_deleted_or_absent(subnet_id));
+            }
+            let zone = subnet.availability_zone.clone().unwrap_or_default();
+            if let Some((_, taken)) = zones.iter().find(|(named_zone, _)| *named_zone == zone) {
+                return Err(state::duplicate_transit_gateway_attachment_subnet_zone(
+                    taken, subnet_id, &zone,
+                ));
+            }
+            zones.push((zone, subnet_id.clone()));
+        }
+
+        // What this call would leave behind, weighed by the ONE definition of what a modification
+        // does to an attachment, so the figure checked here is exactly the one the write charges.
+        // The budget is asked about the NET change: this call stores no further record, so the
+        // record ceiling cannot bound it, while the subnet ids and option values it writes are
+        // caller-chosen text.
+        let refund = state::transit_gateway_vpc_attachment_payload_bytes(&held);
+        let charge = state::transit_gateway_vpc_attachment_payload_bytes(&modification.applied_to(&held));
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store this modification's {charge} bytes",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // Written through the store's ONE writer of this modification, so what this answers is
+        // the stored record a later `DescribeTransitGatewayVpcAttachments` of the same
+        // attachment reports.
+        let Some(attachment) = store.modify_transit_gateway_vpc_attachment(&modification) else {
+            // Unreachable: the attachment was resolved above and the store is locked throughout.
+            return Err(state::internal_error(format!(
+                "the transit gateway VPC attachment '{}' could not be read back after its \
+                 modification",
+                input.transit_gateway_attachment_id
+            )));
+        };
+        Ok(ModifyTransitGatewayVpcAttachmentOutput {
+            transit_gateway_vpc_attachment: Some(attachment),
+        })
     }
 }
+
+// This operation's option members are read through the one lift the transit gateway family
+// shares, `crate::state::transit_gateway_option_value_opt`: `None` for a member the request
+// left out, which leaves the stored value as it was, and otherwise the value as the one reader
+// of an `enable`/`disable` option admits it.

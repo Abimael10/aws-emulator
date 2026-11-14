@@ -1615,6 +1615,23 @@ pub fn transit_gateway_option_value<E>(value: &str, member: &str) -> Result<Stri
     )))
 }
 
+/// One `enable`/`disable` transit gateway option a MODIFICATION carries, or `None` when the
+/// request carried none — which leaves the stored value as it was rather than returning it to a
+/// default.
+///
+/// The value itself is read by [`transit_gateway_option_value`], the one reader of such a value,
+/// so a modification and a create cannot disagree about which values an option admits. ONE copy
+/// of that lift for the whole family: `ModifyTransitGateway` reads the gateway's own option
+/// members through it and `ModifyTransitGatewayVpcAttachment` its attachment's.
+pub fn transit_gateway_option_value_opt<E>(
+    requested: Option<&str>,
+    member: &str,
+) -> Result<Option<String>, Scaffolded<E>> {
+    requested
+        .map(|value| transit_gateway_option_value(value, member))
+        .transpose()
+}
+
 /// What `ModifyTransitGateway` asks of one stored transit gateway: the members the REQUEST
 /// carried, each absent when the request left it out — "the modified options are applied to
 /// new transit gateway attachments only" (`ModifyTransitGateway`), so a member the request

@@ -5227,3 +5227,48 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // compiles nothing. The rule it repeats — declare each suite exactly ONCE, since this is one
 // crate root and a second `mod` for the same name is `E0428` — stands in the module doc at
 // the head of this file, and `all/all_rs_declares_each_suite_once.rs` plus
+//! declarations and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks the
+//! notes, for this file and for every service crate's `tests/all.rs`, so check there
+// (That SESv2 event-destination suite is declared ONCE, a few dozen lines above in this same
+// tail, and the flat-rate CloudFront subscription suite ONCE in the head region: two branches
+// landing in the same window each appended their own copy here, and a module declared twice is
+// `E0428` and compiles neither.)
+// (So that copy is gone; the one that stands is the one further up.)
+// (And it is declared ONCE, in the head region of this file: the copy two branches landing at
+// once appended here is gone, a module declared twice being `E0428`.)
+// (`cloudformation_kms_encrypted_sns_sqs_pipeline` is declared ONCE as well, in the head
+// region of this file: the copy appended here while two branches landed at once is gone.)
+// (The scaling-plan policy suite is declared ONCE, in the head region of this file: the copy a
+// concurrent landing appended here is gone, a module declared twice being `E0428`.)
+// header that a landing appended here as an INNER doc comment: past the first item of a crate
+// root that is `E0753` and compiles no suite in this target, so it stands as an ordinary
+// appended header fragment, an ordinary comment for the reason the lines above record: a
+// `//!` line past the first item is `E0753`.)
+// header a landing appended here as an INNER doc comment, which is `E0753` past the first
+// item of a crate root, so it stands as an ordinary comment.)
+// (Two more fragments of this file's own header were appended here typed with `//!`: an inner
+// doc comment is legal only before the first item, so in this tail they are `E0753` and
+// compile nothing. The header at the top of this file states the rule they repeated — declare
+// each suite exactly ONCE, and keep a note like this out of the tail — and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of it, so the
+// fragments are gone rather than re-typed.)
+// (Three further fragments of that same header were appended here with `//!` while branches
+// were landing at once — a suite left at the top level of `tests/` fails the build, each suite
+// is declared exactly ONCE, and both halves are checked by
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`. Past the first item of this crate
+// root a `//!` line is `E0753` and compiles no suite of this target, so they are gone rather
+// than re-typed; the header at the top of this file carries all of it.)
+// service crate's `tests/all.rs`. (Two more copies of that same header fragment were
+// appended here typed with `//!`; past the first item of a crate root that is `E0753` and
+// compiles no suite of this target, so they are gone rather than re-typed — the header at
+// the top of this file carries the rule and the two guard suites check both halves of it.)
+// same fragment appended here once more is gone rather than re-typed.
+// (Six further lines of that same header fragment landed here typed with `//!`: past the
+// first item of a crate root that is `E0753` and compiles no suite of this target, so they
+// are gone rather than re-typed — the header at the top of this file carries the rule.)
+// (And one more such line, gone for the same reason.)
+// item, so they are gone rather than re-typed; the header at the top of this file and the
+// two guard suites carry the rule they repeated.)
+// item of a crate root that is `E0753` and compiles no suite of this target, so they are gone
+// rather than re-typed \u2014 the header at the top of this file carries the rule, and the two
+// guard suites check both halves of it.)
