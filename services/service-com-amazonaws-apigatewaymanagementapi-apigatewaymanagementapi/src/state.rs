@@ -7,20 +7,28 @@
 //!
 //! `ApiGatewayManagementApi` models exactly three operations — `PostToConnection`,
 //! `GetConnection` and `DeleteConnection` — and all three address one WebSocket
-//! connection by its id. Two refusals come out of this state, split along the SHAPE of
+//! connection by its id. Two refusals come out of this state, split along the ENCODING of
 //! the id the request sent:
 //!
-//! * a `ConnectionId` that is not of the shape API Gateway mints
+//! * a `ConnectionId` that is not of the shape API Gateway ISSUES
 //!   ([`is_well_formed_connection_id`]) identifies no connection anywhere, so it is
 //!   refused as an invalid `ConnectionId` (HTTP 400 `BadRequestException`,
 //!   [`invalid_connection_id`]) from the value alone — before the registry is consulted
 //!   at all;
-//! * a WELL-FORMED id the
+//! * an id OF that shape which the
 //!   [`connections`](ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState::connections)
 //!   registry does not hold for the endpoint the request was addressed at is
 //!   `GoneException` ("The connection with the provided id no longer exists"), **so a
-//!   missing `connections` entry for a well-formed id is the single source of truth for
-//!   that error** — whether the id was never minted, or minted and since closed.
+//!   missing `connections` entry for an id of that shape is the single source of truth for
+//!   that error** — whether the id was never issued, or issued and since closed.
+//!
+//! WHY the split matters: a caller that pushes to a connection prunes its own record of
+//! that connection when it is told 410, so the 410 has to mean "this connection ended" and
+//! nothing else, and it is the answer for an id API Gateway could have issued that nothing
+//! here holds — one a sibling process minted, one a client kept across a restart. A value
+//! API Gateway's own encoding could never have produced is a defect in the request instead,
+//! and the 400 says so in a sentence ([`invalid_connection_id_message`]) where the modelled
+//! `GoneException` is memberless and can carry no sentence at all.
 //!
 //! # One endpoint's connections
 //!
@@ -58,8 +66,8 @@
 //!   stops existing the moment `DeleteConnection` removes it. There is deliberately
 //!   NO auto-registration on first reference: auto-registration would make
 //!   `GetConnection` answer 200 for an id that never existed, which is the one
-//!   answer the real service never gives. A well-formed id no connection owns is
-//!   `GoneException`, which is the answer the real service does give.
+//!   answer the real service never gives. An id of the shape API Gateway issues that no
+//!   connection owns is `GoneException`, which is the answer the real service does give.
 //! * `ConnectedAt` is fixed when the connection is registered and never moves
 //!   again — re-registering an id that is already present changes nothing.
 //! * `LastActiveAt` moves only when data actually flows to the connection, i.e. on a
@@ -86,21 +94,73 @@ pub use crate::ops::types::Identity;
 /// and the ids these operations accept cannot drift apart.
 pub const CONNECTION_ID_BYTES: usize = 11;
 
-/// Whether `connection_id` is a connection identifier of the shape API Gateway mints:
-/// standard base64, padded, decoding to exactly [`CONNECTION_ID_BYTES`] bytes.
+/// Where API Gateway's connection-id encoding carries its FORMAT marker: the 9th of the
+/// [`CONNECTION_ID_BYTES`] bytes a `ConnectionId` decodes to.
+pub const CONNECTION_ID_FORMAT_OFFSET: usize = 8;
+
+/// The value that byte carries in every `ConnectionId` API Gateway hands out.
+///
+/// A connection id is not an arbitrary token: it is a fixed-width encoded value, and every
+/// id AWS issues decodes to 11 bytes whose [`CONNECTION_ID_FORMAT_OFFSET`]th is this
+/// marker — the documented `L0SM9cOFyjUCIhA=` and each id a recorded `@connections` caller
+/// addressed alike (ids of the SAME encoding family that are not connection ids, such as the
+/// `RequestID` an AWS error envelope carries, hold a different value there, which is what
+/// makes the byte a format marker rather than payload). A value whose decoding does not
+/// carry it could not have been produced by that encoding, so it names no connection: see
+/// [`is_well_formed_connection_id`], which is what the three operations read off the value,
+/// and [`connection_id_for`], which is how an id is MINTED so the two cannot disagree.
+///
+/// The model declares no syntax for the member, so the marker is READ OFF the ids AWS hands
+/// out rather than from a published rule: it is an inference from every connection id
+/// observed so far, and an id AWS issues whose format byte is something else would be
+/// refused here where AWS answers `GoneException`. Revisit this constant, not the split it
+/// decides, if such an id is ever recorded.
+pub const CONNECTION_ID_FORMAT_MARKER: u8 = 0x02;
+
+/// Whether `connection_id` is a connection identifier of the shape API Gateway issues:
+/// standard base64, padded, decoding to exactly [`CONNECTION_ID_BYTES`] bytes that carry
+/// [`CONNECTION_ID_FORMAT_MARKER`] at [`CONNECTION_ID_FORMAT_OFFSET`].
 ///
 /// This is the whole of what the three operations read off the VALUE: a token of that shape
-/// may name a connection (and is `GoneException` when it names none), while anything else —
-/// a single character, text that is not base64, an unpadded token, a 200-character one —
-/// could never have been minted, so it is refused as an invalid `ConnectionId` before the
-/// registry is consulted.
+/// may name a connection (and is `GoneException` when it names none — it could have been
+/// issued by another process, or by this one before a restart), while anything else — a
+/// single character, text that is not base64, an unpadded token, a 200-character one, a
+/// token of 11 bytes whose format marker is absent — could never have been issued, so it is
+/// refused as an invalid `ConnectionId` before the registry is consulted.
 ///
 /// Decoded by the maintained base64 implementation rather than by a hand-written alphabet
 /// or length rule, so padding and the alphabet are that crate's to decide.
 pub fn is_well_formed_connection_id(connection_id: &str) -> bool {
     ::base64::engine::general_purpose::STANDARD
         .decode(connection_id)
-        .is_ok_and(|bytes| bytes.len() == CONNECTION_ID_BYTES)
+        .is_ok_and(|bytes| {
+            bytes.len() == CONNECTION_ID_BYTES
+                && bytes
+                    .get(CONNECTION_ID_FORMAT_OFFSET)
+                    .is_some_and(|marker| *marker == CONNECTION_ID_FORMAT_MARKER)
+        })
+}
+
+/// The `ConnectionId` that carries `token`: its bytes, with API Gateway's format marker
+/// stamped where the encoding carries it, rendered as the 16-character single-padded base64
+/// token an `@connections` endpoint hands out.
+///
+/// The one place an id is BUILT, so every id this emulator issues is one
+/// [`is_well_formed_connection_id`] accepts. A `token` shorter than
+/// [`CONNECTION_ID_BYTES`] is zero-filled and a longer one truncated, so the answer is a
+/// well-formed id whatever the caller had to mix it from.
+pub fn connection_id_for(token: &[u8]) -> String {
+    let mut bytes = [0u8; CONNECTION_ID_BYTES];
+    let carried = token.len().min(CONNECTION_ID_BYTES);
+    if let (Some(slots), Some(carried_bytes)) =
+        (bytes.get_mut(..carried), token.get(..carried))
+    {
+        slots.copy_from_slice(carried_bytes);
+    }
+    if let Some(marker) = bytes.get_mut(CONNECTION_ID_FORMAT_OFFSET) {
+        *marker = CONNECTION_ID_FORMAT_MARKER;
+    }
+    ::base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// The ENDPOINT a request was addressed at: the authority its `Host` field names, or the one
@@ -341,16 +401,19 @@ pub fn invalid_connection_id_message(connection_id: &str) -> String {
     format!("Invalid connectionId: {connection_id}")
 }
 
-/// The refusal for a `ConnectionId` that is not of the shape this service mints, as the
+/// The refusal for a `ConnectionId` that is not of the shape API Gateway ISSUES, as the
 /// error channel of any of the three operations.
 ///
-/// A value that could never have been minted ([`is_well_formed_connection_id`]) is not a
+/// A value that could never have been issued ([`is_well_formed_connection_id`]: the shape,
+/// and the format marker API Gateway's own encoding stamps into every id) is not a
 /// connection identifier at all, so it is a bad request (HTTP 400 `BadRequestException`)
 /// rather than a connection that is gone: HTTP 410 `GoneException` is "The connection with
 /// the provided id no longer exists", which says the id could have named one. A caller
-/// branches on the two differently — the 410 says "stop writing to this connection", the
-/// 400 says "this request is malformed" — so a malformed id answered 410 would have the
-/// caller prune a connection record over a typo.
+/// branches on the two differently — the 410 says "stop writing to this connection" and has
+/// it prune its own record of the connection, the 400 says "this request is wrong" — so a
+/// value that could never have named a connection answered 410 would have the caller delete
+/// a record it should keep. The 400 also carries a sentence, which the memberless
+/// `GoneException` cannot.
 pub fn invalid_connection_id<E>(connection_id: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::bad_request(invalid_connection_id_message(connection_id))
 }
@@ -465,7 +528,7 @@ pub fn serve_connections_at(
 /// ([`register_connection`]).
 ///
 /// Returns `true` when the connection was registered, and `false` without touching anything
-/// when `connection_id` is not of the shape this service mints (such an id addresses no
+/// when `connection_id` is not of the shape this service issues (such an id addresses no
 /// connection, so registering one would hold a record no caller could reach) or when the id
 /// is already registered, so `ConnectedAt` cannot be reset.
 pub fn open_connection(

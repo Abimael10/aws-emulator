@@ -4,7 +4,7 @@
 //! that api announces as its `ApiEndpoint` — driven over a real connection.
 //!
 //! The rule these cases assert, one level above the recorded case (one deployed stage, one
-//! well-formed id nothing had minted):
+//! token of the issued shape nothing had minted):
 //!
 //! > A WebSocket api's endpoint carries TWO things: the RFC 6455 opening handshake a client
 //! > dials, and the `@connections` management API a backend calls, which AWS publishes on
@@ -13,13 +13,14 @@
 //! > answered with a complete HTTP response — the modelled answer of the service that owns
 //! > the `@connections` path space, computed from the connection registry this socket
 //! > registers its connections in: `200`/`204` for a connection open on this socket, `410`
-//! > `GoneException` for a well-formed id that names none (never minted, closed, or another
-//! > api's), `400` `BadRequestException` for an id that could never have been minted, and a
-//! > bare `413` for a payload past the modelled maximum. Never a closed connection with no
-//! > status line, which every SDK retries.
+//! > `GoneException` for an id of the shape API Gateway issues that names none here (never
+//! > minted, closed, or another api's), `400` `BadRequestException` for a value that could
+//! > never have been issued, and a bare `413` for a payload past the modelled maximum.
+//! > Never a closed connection with no status line, which every SDK retries.
 //!
 //! The rows span what the rule generalises over: the operation (all three), the
-//! connection-id form (the minted shape, and malformed by alphabet, padding and length),
+//! connection-id form (the issued shape, and refused by alphabet, padding, length and the
+//! format marker),
 //! the connection's state (live, closed, another api's), the payload size (empty, short,
 //! exactly the modelled maximum, one byte past it) and the payload's bytes (text and
 //! non-UTF-8).
@@ -335,17 +336,14 @@ async fn next_frame(case: &str, socket: &mut ClientSocket) -> Message {
     }
 }
 
-/// A `ConnectionId` of the shape API Gateway mints — base64 of
-/// `CONNECTION_ID_BYTES` bytes — carrying `label`, so each case names its own.
+/// A `ConnectionId` of the shape API Gateway issues — base64 of
+/// `CONNECTION_ID_BYTES` bytes carrying the format marker its encoding stamps — carrying
+/// `label`, so each case names its own. Built by the `@connections` registry's own encoder,
+/// the one place such a token is rendered.
 fn minted(label: &str) -> String {
-    use base64::Engine as _;
-
-    let mut bytes = label.as_bytes().to_vec();
-    bytes.resize(
-        service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::state::CONNECTION_ID_BYTES,
-        b'-',
-    );
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+    service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::state::connection_id_for(
+        label.as_bytes(),
+    )
 }
 
 /// Every `@connections` call on a deployed stage's own socket is ANSWERED, and the answer is
@@ -357,18 +355,18 @@ async fn a_connections_call_on_the_apis_socket_is_answered_from_the_registry() {
     let well_formed = minted("unknown-id");
     let rows: [(&str, String, String, u16, &str); 6] = [
         (
-            "a well-formed id nothing minted",
+            "an id of the issued shape that names no connection",
             well_formed.clone(),
             well_formed,
             410,
             "GoneException",
         ),
         (
-            "an all-A id of the minted shape",
+            "an all-A id: eleven zero bytes, so no format marker",
             "AAAAAAAAAAAAAAA=".to_string(),
             "AAAAAAAAAAAAAAA=".to_string(),
-            410,
-            "GoneException",
+            400,
+            "BadRequestException",
         ),
         (
             "a single character",

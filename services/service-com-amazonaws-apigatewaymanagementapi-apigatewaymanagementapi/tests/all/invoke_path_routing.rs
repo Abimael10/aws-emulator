@@ -383,7 +383,8 @@ async fn the_modelled_failures_answer_the_same_under_an_invoke_prefix() {
         );
 
         // A well-formed id naming no open connection is the modelled Gone, whatever the
-        // prefix.
+        // prefix — while a value API Gateway's encoding could never have produced earns the
+        // 400 above.
         let (status, headers, body) = call_with_headers(
             &engine,
             row.host,

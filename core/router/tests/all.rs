@@ -7113,3 +7113,5 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // Below this line the tail held nothing but those same notes, repeated once per landing.
 // They are gone: the rules stand in the module doc at the HEAD of this file, and
 // (One note, in place of the repetitions this tail collected.)
+// note written as an inner doc comment anywhere but this header is `E0753` — either fails
+// every suite in this target. `all/all_rs_declares_each_suite_once.rs` checks the

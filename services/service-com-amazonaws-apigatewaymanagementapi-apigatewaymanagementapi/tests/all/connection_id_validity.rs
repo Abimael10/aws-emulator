@@ -3,18 +3,19 @@
 //! How the three `@connections` operations read the `ConnectionId` a request sent, driven
 //! over HTTP through the same `MultiServiceRouter` the production emulator serves with.
 //!
-//! The rule these cases assert, one level above the recorded case (one well-formed token
-//! nothing had minted, and four malformed ones):
+//! The rule these cases assert, one level above the recorded cases (one token of 11 bytes
+//! carrying no format marker, one token carrying it, and four malformed ones):
 //!
-//! > A connection id is not an arbitrary string: API Gateway MINTS it when a client's
-//! > handshake completes — standard base64 of `CONNECTION_ID_BYTES` bytes, the
-//! > 16-character single-padded token — and the three `@connections` operations address a
-//! > connection BY it. So the answer is decided by the id's SHAPE first: a value that could
-//! > never have been minted is refused, from the value alone and before the registry is
-//! > consulted, with HTTP 400 `BadRequestException` and the message `Invalid connectionId: `
-//! > plus the `ConnectionId` the request sent; a value of that shape naming no open
-//! > connection is the modelled `GoneException` (HTTP 410, memberless, so it carries no
-//! > message at all) — whether it was never minted or minted and since closed.
+//! > A connection id is not an arbitrary string: API Gateway ISSUES it when a client's
+//! > handshake completes — standard base64 of `CONNECTION_ID_BYTES` bytes carrying the
+//! > format marker its encoding stamps, the 16-character single-padded token — and the
+//! > three `@connections` operations address a connection BY it. So the answer is decided by
+//! > the id's ENCODING first: a value that encoding could never have produced is refused,
+//! > from the value alone and before the registry is consulted, with HTTP 400
+//! > `BadRequestException` and the message `Invalid connectionId: ` plus the `ConnectionId`
+//! > the request sent; a value of that encoding naming no open connection is the modelled
+//! > `GoneException` (HTTP 410, memberless, so it carries no message at all) — whether it
+//! > was issued elsewhere or issued here and since closed.
 //!
 //! WHY the two are not interchangeable: a caller that pushes to a connection prunes its
 //! own record of that connection on the 410, which is the right thing to do for a socket
@@ -23,10 +24,10 @@
 //! shape has no members), so nothing would say what was wrong with the request.
 //!
 //! The rows span what the rule generalises over: the FORM of the `ConnectionId` (the padded
-//! base64 shape AWS mints, an all-`A` one of that same shape, and — malformed — an unpadded
+//! base64 shape AWS issues, an all-`A` one of that same shape, and — malformed — an unpadded
 //! token, a dashed one, a single character, a very long one, text that is not base64 at all,
-//! base64 of the wrong number of bytes), the operation (all three), and the connection id's
-//! history (never minted, open, closed).
+//! base64 of the wrong number of bytes, base64 of 11 bytes carrying no format marker), the
+//! operation (all three), and the connection id's history (never registered, open, closed).
 //!
 //! The router, request builder and response readers live in `crate::support`.
 
@@ -39,41 +40,41 @@ use service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi as mgm
 
 use crate::support::{
     call, call_with_headers, error_code, error_message, ids_api_gateway_does_not_mint, minted,
-    rendered, register, HOST, MINTED_IDS,
+    rendered, register, ALL_A_MARKED_ID, HOST, MINTED_IDS,
 };
 
 /// The status and code API Gateway refuses a `ConnectionId` that could never have been
-/// minted with, and the fixed text of its message.
+/// issued with, and the fixed text of its message.
 const INVALID_STATUS: u16 = 400;
 const INVALID_TYPE: &str = "BadRequestException";
 const INVALID_MESSAGE: &str = "Invalid connectionId: ";
 
-/// The modelled refusal for a well-formed id that names no open connection
+/// The modelled refusal for an id this service ISSUED whose connection it no longer holds
 /// (`@httpError(410)`).
 const GONE_STATUS: u16 = 410;
 const GONE_TYPE: &str = "GoneException";
 
-/// `ConnectionId` forms that ARE of the shape API Gateway mints: standard base64 of
-/// `mgmt::state::CONNECTION_ID_BYTES` bytes.
+/// `ConnectionId` forms that ARE of the shape API Gateway issues: standard base64 of
+/// `mgmt::state::CONNECTION_ID_BYTES` bytes carrying the format marker its encoding stamps.
 fn well_formed_ids() -> Vec<(&'static str, String)> {
     vec![
         ("the padded base64 shape AWS mints", minted("validity-1")),
         ("another token of that same shape", minted("validity-2")),
         (
-            "an all-A id of that same shape",
-            "AAAAAAAAAAAAAAA=".to_string(),
+            "an all-A token but for the format marker",
+            ALL_A_MARKED_ID.to_string(),
         ),
     ]
 }
 
-/// `ConnectionId` forms that could never have been minted, and so are refused from the
+/// `ConnectionId` forms that could never have been issued, and so are refused from the
 /// value alone: the form, the token as the request SENDS it (percent-encoded where a path
 /// segment has to be), and the value the service reads back out of the path.
 ///
-/// The rows span the ways a value fails the shape: the alphabet, the padding, the decoded
-/// length (too few bytes, too many), length extremes, and a token whose characters a path
-/// segment carries encoded.
-const MALFORMED_IDS: [(&str, &str, &str); 8] = [
+/// The rows span the ways a value fails the encoding: the alphabet, the padding, the decoded
+/// length (too few bytes, too many), length extremes, a token whose characters a path
+/// segment carries encoded, and a token of the right length carrying no format marker.
+const MALFORMED_IDS: [(&str, &str, &str); 9] = [
     ("a single character", "x", "x"),
     (
         "text that is not base64, percent-encoded as a path segment carries it",
@@ -97,6 +98,11 @@ const MALFORMED_IDS: [(&str, &str, &str); 8] = [
         "base64 of too many bytes",
         "0123456789abcdef",
         "0123456789abcdef",
+    ),
+    (
+        "base64 of eleven zero bytes, so no format marker",
+        "AAAAAAAAAAAAAAA=",
+        "AAAAAAAAAAAAAAA=",
     ),
 ];
 
@@ -199,7 +205,8 @@ async fn a_malformed_connection_id_is_refused_as_an_invalid_connection_id() {
 
 /// A WELL-FORMED id the registry does not hold reaches the store and is the modelled
 /// `GoneException` — whether it was never registered here at all, or was registered and then
-/// deleted. Nothing about this emulator's own mint log enters the decision.
+/// deleted. Nothing about this emulator's own mint log enters the decision: the value could
+/// have been issued, which is all the refusal turns on.
 #[tokio::test]
 async fn a_well_formed_id_that_names_no_open_connection_is_gone() {
     for (id_form, connection_id) in well_formed_ids() {

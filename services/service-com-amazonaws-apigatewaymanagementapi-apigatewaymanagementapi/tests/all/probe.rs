@@ -91,9 +91,9 @@ async fn get_connection_renders_iso8601_date_times_and_the_modeled_json_names() 
 
 /// Each failure this service answers in its own envelope renders in the restJson1 error
 /// envelope with its own status: one row per such failure. The two refusals of a
-/// `ConnectionId` differ — an id that could never have been minted is the 400
-/// `BadRequestException`, a well-formed id naming no open connection is the modelled 410
-/// `GoneException` — so both are pinned here.
+/// `ConnectionId` differ — a value API Gateway's encoding could never have produced is the
+/// 400 `BadRequestException`, a value it could have issued that names no open connection is
+/// the modelled 410 `GoneException` — so both are pinned here.
 #[tokio::test]
 async fn modeled_errors_render_with_their_own_status_and_type() {
     /// Which connection id a row addresses.
@@ -101,6 +101,9 @@ async fn modeled_errors_render_with_their_own_status_and_type() {
     enum Target {
         /// An id that could never have been minted.
         Malformed,
+        /// A token of 11 bytes carrying no connection-id format marker, so it could never
+        /// have been issued either.
+        NoFormatMarker,
         /// A well-formed id no connection was ever opened for.
         NeverMinted,
         /// An id whose connection the row deletes first.
@@ -108,7 +111,7 @@ async fn modeled_errors_render_with_their_own_status_and_type() {
     }
 
     // (case, method, request body length, target, expected status, expected error shape)
-    let table: [(&str, &str, usize, Target, u16, &str); 6] = [
+    let table: [(&str, &str, usize, Target, u16, &str); 7] = [
         (
             "get on an id that could never have been minted",
             "GET",
@@ -130,6 +133,14 @@ async fn modeled_errors_render_with_their_own_status_and_type() {
             "DELETE",
             0,
             Target::Malformed,
+            400,
+            "BadRequestException",
+        ),
+        (
+            "get on eleven bytes with no format marker",
+            "GET",
+            0,
+            Target::NoFormatMarker,
             400,
             "BadRequestException",
         ),
@@ -167,6 +178,8 @@ async fn modeled_errors_render_with_their_own_status_and_type() {
 
         let connection_id = match target {
             Target::Malformed => "not-registered".to_string(),
+            // Eleven zero bytes: the right length, no format marker.
+            Target::NoFormatMarker => "AAAAAAAAAAAAAAA=".to_string(),
             Target::NeverMinted => minted("probe-never"),
             Target::Deleted => {
                 let gone = minted("probe-gone");

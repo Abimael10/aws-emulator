@@ -152,29 +152,40 @@ pub fn rendered(body: &Bytes) -> String {
     String::from_utf8_lossy(body).to_string()
 }
 
-/// Connection-id forms of the shape API Gateway MINTS: the standard-alphabet base64,
-/// canonically padded, of an 11-byte token — the 16-character single-padded form its own
-/// ids have (`mgmt::state::CONNECTION_ID_BYTES`). Named once here so every suite drives the
-/// same catalog; `connections_error_layer` asserts each one IS well formed.
+/// The `ConnectionId` a recorded `@connections` caller addressed, and the all-`A` token with
+/// the format marker in place: named here so a suite that needs one of them does not address
+/// a catalog ROW BY POSITION, which reordering the catalog would silently change.
+pub const RECORDED_ID: &str = "Fabc1cWIPHcCJ7A=";
+pub const ALL_A_MARKED_ID: &str = "AAAAAAAAAAACAAA=";
+
+/// Connection-id forms of the shape API Gateway ISSUES: the standard-alphabet base64,
+/// canonically padded, of an 11-byte token carrying the format marker API Gateway's
+/// connection-id encoding stamps (`mgmt::state::is_well_formed_connection_id`). Named once
+/// here so every suite drives the same catalog; `connections_error_layer` asserts each one
+/// IS well formed.
+///
+/// The first and last rows are tokens recorded `@connections` callers addressed; the rest
+/// spell the character classes a token may use, each with the marker in place.
 ///
 /// None of these carries `+` or `/`, so a suite can write one into a request path as it
 /// stands; the percent-encoded form is driven by `connections_error_layer`.
 pub const MINTED_IDS: [(&str, &str); 6] = [
     ("the padded base64 form AWS mints", "Lx9ZKcvPmjQCJhA="),
-    ("an all-A token", "AAAAAAAAAAAAAAA="),
-    ("an all-z token", "zzzzzzzzzzzzzz8="),
-    ("a token of digits and letters", "0123456789abcQ4="),
-    ("an upper-case token", "ZZZZZZZZZZZZZZw="),
-    ("the form the recorded calls use", "Fabc1cWIPHcCJ7A="),
+    ("an all-A token but for the marker", ALL_A_MARKED_ID),
+    ("an all-z token but for the marker", "zzzzzzzzzzwCzz8="),
+    ("a token of digits and letters", "0123456789cCQ4A="),
+    ("an upper-case token", "ZZZZZZZZZZYCZZw="),
+    ("the form the recorded calls use", RECORDED_ID),
 ];
 
 /// How long an "overlong" malformed id is: far past the 16 characters a minted id has, so no
 /// decoding of it can produce an 11-byte token.
 const OVERLONG_ID_CHARS: usize = 200;
 
-/// `ConnectionId` values that are NOT the form API Gateway mints, each with the way it
+/// `ConnectionId` values that are NOT the form API Gateway issues, each with the way it
 /// differs: too short, outside the base64 alphabet, unpadded, a base64url spelling, a token
-/// of the wrong length, and an overlong value.
+/// of the wrong length, an overlong value, and tokens of the right length whose decoding
+/// carries no connection-id format marker (the all-`A` token decodes to eleven zero bytes).
 pub fn ids_api_gateway_does_not_mint() -> Vec<(String, String)> {
     [
         ("a single character", "x".to_string()),
@@ -185,6 +196,8 @@ pub fn ids_api_gateway_does_not_mint() -> Vec<(String, String)> {
         ("base64 of a longer token", "AAAAAAAAAAAAAAAAAAAA".to_string()),
         ("an overlong id", "A".repeat(OVERLONG_ID_CHARS)),
         ("the empty-looking padding alone", "====".to_string()),
+        ("eleven zero bytes, so no format marker", "AAAAAAAAAAAAAAA=".to_string()),
+        ("eleven bytes carrying another format byte", "zzzzzzzzzzzzzz8=".to_string()),
     ]
     .into_iter()
     .map(|(case, id)| (case.to_string(), id))
@@ -223,17 +236,16 @@ pub fn register(
     );
 }
 
-/// A `ConnectionId` of the shape API Gateway mints — standard base64 of
-/// `mgmt::state::CONNECTION_ID_BYTES` bytes, which is the 16-character single-padded token
-/// its endpoints hand out — carrying `label`, so each case addresses a connection of its own
-/// and nothing here spells a token out by hand.
+/// A `ConnectionId` of the shape API Gateway issues — standard base64 of
+/// `mgmt::state::CONNECTION_ID_BYTES` bytes carrying the format marker its own encoding
+/// stamps, which is the 16-character single-padded token its endpoints hand out — carrying
+/// `label`, so each case addresses a connection of its own and nothing here spells a token
+/// out by hand.
 ///
-/// `label` is folded into exactly those bytes: a shorter one is padded, a longer one
-/// truncated, so every answer is a well-formed id whatever the case called itself.
+/// `label` is folded into exactly those bytes by the service's own encoder
+/// (`mgmt::state::connection_id_for`): a shorter one is zero-filled, a longer one
+/// truncated, and the marker is stamped either way, so every answer is a well-formed id
+/// whatever the case called itself.
 pub fn minted(label: &str) -> String {
-    use base64::Engine as _;
-
-    let mut bytes = label.as_bytes().to_vec();
-    bytes.resize(mgmt::state::CONNECTION_ID_BYTES, b'-');
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+    mgmt::state::connection_id_for(label.as_bytes())
 }

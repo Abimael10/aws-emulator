@@ -16,12 +16,12 @@
 //!    `https://{api-id}.execute-api.{region}.amazonaws.com/{stage}/@connections/{id}`,
 //!    and answer from the API Gateway Management API's connection registry: the modelled
 //!    200/200/204 for a registered connection, the modelled `GoneException` (410) once it
-//!    is deleted or for a well-formed id the registry does not hold, and the
-//!    invalid-`ConnectionId` refusal (400 `BadRequestException`) for an id that could
-//!    never have been minted. A request through a stage the api never DEPLOYED is refused
-//!    403 `ForbiddenException` instead, which is the one answer that needs both services:
-//!    the stages are API Gateway V2's records and the refusal is the management API's
-//!    envelope.
+//!    is deleted or for an id of the shape API Gateway issues that the registry does not
+//!    hold, and the invalid-`ConnectionId` refusal (400 `BadRequestException`) for a value
+//!    that could never have been issued. A request through a stage the api never DEPLOYED is
+//!    refused 403 `ForbiddenException` instead, which is the one answer that needs both
+//!    services: the stages are API Gateway V2's records and the refusal is the management
+//!    API's envelope.
 //!
 //! Two services, one engine, one router, so this is a router suite: the deploy half is
 //! served by the API Gateway V2 crate (signing name `apigateway`) and the data-plane
@@ -89,8 +89,9 @@ struct Row {
 /// The rows differ along the api's route set, whether the deployment carries a
 /// description, the stage the client addresses, the connection-id form and the payload.
 ///
-/// Every `connection_id` is of the shape API Gateway MINTS — standard base64 of
-/// `mgmt::state::CONNECTION_ID_BYTES` bytes, the 16-character single-padded token — since
+/// Every `connection_id` is of the shape API Gateway ISSUES — standard base64 of
+/// `mgmt::state::CONNECTION_ID_BYTES` bytes carrying the format marker its encoding stamps,
+/// the 16-character single-padded token — since
 /// that is the only shape a connection can be registered under, and the shape the three
 /// `@connections` operations read an id by.
 const ROWS: &[Row] = &[
@@ -124,7 +125,7 @@ const ROWS: &[Row] = &[
         route_keys: &["$connect"],
         deployment: || json!({ "description": "the first cut" }),
         stage: "dev",
-        connection_id: "EzCyjTUad5uklZ0=",
+        connection_id: "EzCyjTUad5wClZ0=",
         source_ip: "2001:db8::2:1",
         user_agent: "curl/8.4.0",
         payload: b"",
@@ -480,29 +481,55 @@ fn a_websocket_api_deploys_and_its_connections_endpoint_serves_the_registry() {
                         row.case
                     );
 
-                    // A WELL-FORMED id the registry does not hold is the modelled Gone
-                    // instead: it could have named a connection, and a caller prunes its
-                    // own record on that answer.
+                    // A WELL-FORMED id of the shape API Gateway ISSUES that the registry
+                    // does not hold is the modelled Gone instead: it could have named a
+                    // connection, and a caller prunes its own record on that answer.
                     let (status, headers, text) = call_with_headers(
                         &router,
                         EXECUTE_API_AUTHORIZATION,
                         &host,
                         "GET",
-                        &format!("/{}/@connections/AAAAAAAAAAAAAAA=", row.stage),
+                        &format!("/{}/@connections/Fabc1cWIPHcCJ7A%3D", row.stage),
                         Vec::new(),
                     )
                     .await;
                     assert_eq!(
                         status, 410,
-                        "case {:?}: a well-formed id naming no connection must answer 410, \
-                         got {status} {text}",
+                        "case {:?}: an id of the issued shape naming no connection must \
+                         answer 410, got {status} {text}",
                         row.case
                     );
                     assert_eq!(
                         error_code(&headers),
                         "GoneException",
-                        "case {:?}: a well-formed id naming no connection must answer \
-                         GoneException, got {text}",
+                        "case {:?}: an id of the issued shape naming no connection must \
+                         answer GoneException, got {text}",
+                        row.case
+                    );
+
+                    // An id of the right LENGTH whose decoding carries no format marker
+                    // could not have been issued either, so it earns the same 400: the
+                    // endpoint is answering from the value and not from the registry.
+                    let (status, headers, text) = call_with_headers(
+                        &router,
+                        EXECUTE_API_AUTHORIZATION,
+                        &host,
+                        "GET",
+                        &format!("/{}/@connections/AAAAAAAAAAAAAAA%3D", row.stage),
+                        Vec::new(),
+                    )
+                    .await;
+                    assert_eq!(
+                        status, 400,
+                        "case {:?}: eleven bytes with no format marker must answer 400, \
+                         got {status} {text}",
+                        row.case
+                    );
+                    assert_eq!(
+                        error_code(&headers),
+                        "BadRequestException",
+                        "case {:?}: eleven bytes with no format marker must answer \
+                         BadRequestException, got {text}",
                         row.case
                     );
 

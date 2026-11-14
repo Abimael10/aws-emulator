@@ -27,9 +27,9 @@
 //! Each row of each table differs along what the rule generalises over: the operation
 //! (all three), the endpoint form the caller addresses (the modelled path, a deployed
 //! stage's invoke path, a custom domain's two-segment base path, on three different
-//! hosts), the connection-id form, the failure class (`GoneException` for a well-formed id
-//! naming no open connection, `BadRequestException` for an id that could never have been
-//! minted) and the payload size.
+//! hosts), the connection-id form, the failure class (`GoneException` for an id of the shape
+//! API Gateway issues naming no open connection, `BadRequestException` for a value that
+//! could never have been issued) and the payload size.
 //!
 //! The ONE answer of this surface that is NOT in this envelope is the refusal of an
 //! over-limit `PostToConnection` payload, which the endpoint in front of the modelled
@@ -55,7 +55,7 @@ use crate::support::{call_with_headers, minted, register, HOST};
 const GONE_STATUS: u16 = 410;
 const GONE_TYPE: &str = "GoneException";
 
-/// The refusal of a `ConnectionId` that could never have been minted. The model declares no
+/// The refusal of a `ConnectionId` that could never have been issued. The model declares no
 /// client-input error for these operations, so the status and code are the ones API
 /// Gateway words such a refusal in (`crate::state::invalid_connection_id`), and the
 /// envelope is the service's own restJson1 one, exactly as a modelled failure's is.
@@ -101,33 +101,35 @@ const ENDPOINTS: [(&str, &str, &str); 3] = [
     ),
 ];
 
-/// Connection-id forms of the shape API Gateway MINTS.
+/// Connection-id forms of the shape API Gateway ISSUES.
 ///
 /// `GetConnectionRequest.ConnectionId` targets `__string` with `@httpLabel` and
 /// `@required` and NO `@pattern` or `@length`
 /// (`smithy_query(query="shape",shape="GetConnectionRequest")`), so what decides the answer
-/// is the shape API Gateway MINTS an id in (`crate::state::is_well_formed_connection_id`).
-/// These rows are of that shape — the token this service hands out — since every row here
-/// addresses a connection that exists or existed.
+/// is the shape API Gateway ISSUES an id in (`crate::state::is_well_formed_connection_id`:
+/// base64 of 11 bytes carrying its encoding's format marker). These rows are of that shape
+/// — the token this service hands out — since every row here addresses a connection that
+/// exists or existed.
 fn id_forms() -> Vec<(&'static str, String)> {
     vec![
         ("a token carrying this case's name", minted("envelope-1")),
         ("another token of that shape", minted("envelope-2")),
         (
-            "an all-A token of that shape",
-            "AAAAAAAAAAAAAAA=".to_string(),
+            "an all-A token but for the format marker",
+            "AAAAAAAAAAACAAA=".to_string(),
         ),
     ]
 }
 
-/// Connection-id forms that could never have been minted, which is what the 400 refusal is
-/// about: a single character, text that is not base64, an unpadded token and base64 of the
-/// wrong number of bytes.
-const MALFORMED_ID_FORMS: [(&str, &str); 4] = [
+/// Connection-id forms that could never have been issued, which is what the 400 refusal is
+/// about: a single character, text that is not base64, an unpadded token, base64 of the
+/// wrong number of bytes, and a token of the right length carrying no format marker.
+const MALFORMED_ID_FORMS: [(&str, &str); 5] = [
     ("a single character", "x"),
     ("a dashed id", "cid-with-dashes"),
     ("an unpadded token", "Fabc1cWIPHcCJ7A"),
     ("base64 of too many bytes", "0123456789abcdef"),
+    ("eleven zero bytes, so no format marker", "AAAAAAAAAAAAAAA="),
 ];
 
 /// A registration instant in the past, so an instant the service writes later is
@@ -189,7 +191,7 @@ fn assert_modelled_envelope(
     );
 }
 
-/// An id that could never have been minted names no connection anywhere, so it is refused
+/// An id that could never have been issued names no connection anywhere, so it is refused
 /// as an invalid `ConnectionId` — HTTP 400 `BadRequestException` — in the SAME envelope the
 /// modelled failures travel in, for every operation, every endpoint form and every id
 /// form.

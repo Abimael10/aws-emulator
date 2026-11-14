@@ -106,8 +106,11 @@ impl WebSocketTransport {
     /// client sends chooses it. The bytes are derived from the counter through the tree's
     /// one derived-id mixer, so consecutive ids do not spell consecutive numbers — a
     /// connection id is opaque to its holder.
+    ///
+    /// Rendered by the `@connections` registry's own encoder, which stamps the format marker
+    /// API Gateway's connection-id encoding carries, so an id minted here is one those
+    /// operations address rather than refuse.
     pub fn mint_connection_id(&mut self) -> String {
-        use ::base64::Engine as _;
         self.connection_seed = self.connection_seed.wrapping_add(1);
         let seed = self.connection_seed.to_string();
         // Two mixings, because one carries 8 bytes and a 16-character base64 id is 11: the
@@ -119,19 +122,11 @@ impl WebSocketTransport {
             ::service_common::stable_hex_id(&[CONNECTION_ID_MIX_DOMAIN, &seed, CONNECTION_ID_MIX_DOMAIN]),
         );
         let bytes = ::hex::decode(mixed).unwrap_or_default();
-        ::base64::engine::general_purpose::STANDARD
-            .encode(&bytes[..CONNECTION_ID_BYTES.min(bytes.len())])
+        ::service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::state::connection_id_for(
+            &bytes,
+        )
     }
 }
-
-/// How many bytes a minted `ConnectionId` carries before base64: the length the
-/// `@connections` registry reads an id by
-/// (`service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::state::CONNECTION_ID_BYTES`,
-/// 11 bytes), which is what encodes to the 16-character single-padded form API Gateway's own
-/// ids have. Read from there so a minted id and an id those operations accept cannot drift
-/// apart.
-const CONNECTION_ID_BYTES: usize =
-    ::service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::state::CONNECTION_ID_BYTES;
 
 /// What the id mixing is domain-separated by, so a connection id cannot coincide with
 /// another id this service derives from the same counter.

@@ -7,10 +7,11 @@
 //! (in send order) and advances its `LastActiveAt` — data flowed, so the connection was
 //! active.
 //!
-//! A `ConnectionId` of the shape API Gateway mints whose connection is not open at the
+//! A `ConnectionId` of the shape API Gateway ISSUES whose connection is not open at the
 //! endpoint the request reached answers the modeled `GoneException` (HTTP 410) and delivers
-//! nothing. A `ConnectionId` that could never have been minted is refused HTTP 400
-//! `BadRequestException`; see [`crate::state`] for the shape rule, for the endpoint a
+//! nothing. A `ConnectionId` that could never have been issued is refused HTTP 400
+//! `BadRequestException` naming the id;
+//! see [`crate::state`] for the encoding rule, for the endpoint a
 //! connection is addressed through, and for why the two refusals are split. A
 //! payload past the modeled `@length` maximum is refused by the endpoint in front of this
 //! operation — see [`MAX_DATA_BYTES`] and `crate::service::OversizedPayload` for where
@@ -190,11 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::access_denied(denied));
         }
-        // A `ConnectionId` that is not of the shape this service mints names no connection
+        // A `ConnectionId` that is not of the shape this service issues names no connection
         // anywhere, so the request is refused from the VALUE alone, before the registry is
         // consulted: a caller prunes its own record of a connection on the 410, so
-        // answering that for a malformed id would make it delete a record it should keep
-        // (`crate::state::invalid_connection_id`).
+        // answering that for a value that could never have been issued would make it delete
+        // a record it should keep (`crate::state::invalid_connection_id`).
         if !crate::state::is_well_formed_connection_id(&input.connection_id) {
             return Err(crate::state::invalid_connection_id(&input.connection_id));
         }
@@ -206,8 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(connection) =
             guard.connection_at_mut(&input.connection_id, addressed_at.as_deref())
         else {
-            // Nothing is recorded for a connection that is not open at this endpoint: it
-            // was never minted, it was deleted, or it belongs to another api.
+            // Nothing is recorded for a connection that is not open at this endpoint: the id
+            // was never issued, it was deleted, or it belongs to another api.
             return Err(PostToConnectionErrorModeled::GoneException(GoneException {}).into());
         };
         // DELIVER it first, where the connection is carried on a live socket: a post is

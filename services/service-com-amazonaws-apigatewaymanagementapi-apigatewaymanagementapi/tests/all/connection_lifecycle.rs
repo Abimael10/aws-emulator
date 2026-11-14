@@ -7,10 +7,10 @@
 //! The rule under test, stated once: **every response is computed from the connection
 //! registry in this service's engine state** — a connection exists only from the moment
 //! the registration seam registered it until `DeleteConnection` removes it, each
-//! operation reads or writes that one record, a well-formed `ConnectionId` the registry no
-//! longer holds is `GoneException` (HTTP 410) for all three operations, and one that could
-//! never have been minted is refused as an invalid `ConnectionId` (HTTP 400
-//! `BadRequestException`).
+//! operation reads or writes that one record, a `ConnectionId` of the shape API Gateway
+//! issues that the registry no longer holds is `GoneException` (HTTP 410) for all three
+//! operations, and one that could never have been issued is refused as an invalid
+//! `ConnectionId` (HTTP 400 `BadRequestException`).
 //!
 //! Each test asserts that rule over a TABLE of inputs rather than over one recorded
 //! call: the rows differ along connection-id form, identity values, registration
@@ -499,12 +499,12 @@ async fn delete_connection_removes_the_record_and_every_later_call_is_gone() {
     }
 }
 
-/// A `ConnectionId` that could never have been minted names no connection anywhere, so all
+/// A `ConnectionId` that could never have been ISSUED names no connection anywhere, so all
 /// three operations refuse it as an invalid `ConnectionId` (HTTP 400 `BadRequestException`
 /// naming the id) — never a 200, never a 501, never the `GoneException` that would claim
 /// the id once named a live connection, and never an auto-registration that would make
-/// the next `GetConnection` succeed. A WELL-FORMED id nothing minted is that
-/// `GoneException`, which is the other half of the rule.
+/// the next `GetConnection` succeed. An id of the shape API Gateway issues that nothing here
+/// holds is that `GoneException`, which is the other half of the rule.
 #[tokio::test]
 async fn an_unknown_connection_id_is_refused_by_its_shape_for_every_operation() {
     let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
@@ -521,16 +521,15 @@ async fn an_unknown_connection_id_is_refused_by_its_shape_for_every_operation() 
     );
 
     // (the id, the status and code it must be refused with). The malformed rows span the
-    // alphabet, the padding, the decoded length and length extremes — the shared catalog of
-    // values API Gateway does not mint, plus the well-formed tokens that name no open
-    // connection.
+    // alphabet, the padding, the decoded length, length extremes and the format marker — the
+    // shared catalog of values API Gateway does not issue — plus tokens of the shape it does
+    // issue that name no open connection.
     let mut unknown: Vec<(String, u16, &str)> = ids_api_gateway_does_not_mint()
         .into_iter()
         .map(|(_case, id)| (id, 400u16, "BadRequestException"))
         .collect();
     unknown.extend([
         (minted("never-minted"), 410, "GoneException"),
-        ("AAAAAAAAAAAAAAA=".to_string(), 410, "GoneException"),
         (minted("Registered"), 410, "GoneException"),
     ]);
 

@@ -113,13 +113,16 @@ This service's whole state is a registry of WebSocket connections, keyed by
 `ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState::connections`, beside
 the set of addresses that are a data-plane ENDPOINT of an api whose connections it holds
 (`::endpoints`). All three modelled operations address one entry of the registry, and the
-two refusals are split along the SHAPE of the id the request sent: **a missing entry for a
-well-formed id is the single source of truth for `GoneException` (HTTP 410)** — never
-minted, closed, or another api's — while an id that could never have been minted
-(`state::is_well_formed_connection_id`: standard base64 of `state::CONNECTION_ID_BYTES`
-bytes, the 16-character single-padded token API Gateway mints) names no connection
-anywhere and is refused `400 BadRequestException` with `Invalid connectionId: <id>` from
-the value alone, before the registry is consulted.
+two refusals are split along the ENCODING of the id the request sent: **a missing entry
+for an id of the shape API Gateway ISSUES is the single source of truth for `GoneException`
+(HTTP 410)** — never minted here, closed, or another api's — while a value that encoding
+could never have produced names no connection anywhere and is refused
+`400 BadRequestException` with `Invalid connectionId: <id>` from the value alone, before the
+registry is consulted. The shape is `state::is_well_formed_connection_id`: standard base64
+of `state::CONNECTION_ID_BYTES` bytes — the 16-character single-padded token — carrying
+`state::CONNECTION_ID_FORMAT_MARKER` at `state::CONNECTION_ID_FORMAT_OFFSET`, the format
+marker every id AWS hands out carries. `state::connection_id_for` is the one place such a
+token is built, so a minted id and an accepted id cannot drift apart.
 
 None of the three CREATES a connection: in real AWS a connection exists because a
 client completed a WebSocket handshake against the API's own invoke endpoint, which
@@ -141,7 +144,7 @@ service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::state::re
   `DeleteConnection` that removes it. There is deliberately **no auto-registration on
   first reference**: that would make `GetConnection` answer `200` for an id that never
   existed, which the real service never does.
-* Only an id of the shape the service mints can be registered, so the shape check above
+* Only an id of the shape the service issues can be registered, so the shape check above
   can never hide a connection the registry holds.
 * A connection is addressed through the ENDPOINT it was established at (`::endpoint`, told
   to the registry by the data plane that opened the socket through

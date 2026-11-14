@@ -7,11 +7,11 @@
 //! in particular it does NOT bump `LastActiveAt`, which moves only when data actually
 //! flows to the connection.
 //!
-//! A `ConnectionId` of the shape API Gateway mints whose connection is not open at the
+//! A `ConnectionId` of the shape API Gateway ISSUES whose connection is not open at the
 //! endpoint the request reached answers the modeled `GoneException` (HTTP 410), and a
-//! `ConnectionId` that could never have been minted is refused HTTP 400
-//! `BadRequestException`; see [`crate::state`] for the shape rule, for the endpoint a
-//! connection is addressed through, and for why the two refusals are split.
+//! `ConnectionId` that could never have been issued is refused HTTP 400
+//! `BadRequestException` naming the id; see [`crate::state`] for the encoding rule, for
+//! the endpoint a connection is addressed through, and for why the two refusals are split.
 //!
 //! ## Shape of an operation
 //!
@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::access_denied(denied));
         }
-        // A `ConnectionId` that is not of the shape this service mints names no connection
+        // A `ConnectionId` that is not of the shape this service issues names no connection
         // anywhere, so it is refused from the VALUE alone, before the registry is consulted
         // (`crate::state::invalid_connection_id`).
         if !crate::state::is_well_formed_connection_id(&input.connection_id) {
@@ -175,9 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .connection_at(&input.connection_id, addressed_at.as_deref())
             .cloned();
         let Some(connection) = connection else {
-            // No open connection of that id at this endpoint: it was never minted, it was
-            // deleted, or it belongs to another api — in each case it "no longer exists" as
-            // far as this endpoint is concerned.
+            // No open connection of that id at this endpoint: the id was never issued, it
+            // was deleted, or it belongs to another api — in each case it "no longer exists"
+            // as far as this endpoint is concerned.
             return Err(GetConnectionErrorModeled::GoneException(GoneException {}).into());
         };
 

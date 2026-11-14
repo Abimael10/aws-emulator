@@ -418,9 +418,10 @@ async fn an_addressing_nothing_judges_is_served() {
 #[tokio::test]
 async fn a_percent_encoded_connection_id_is_judged_on_its_decoded_value() {
     // The standard base64 alphabet's two non-alphanumeric characters and the padding, which
-    // a client percent-encodes in a path segment.
-    let decoded = "ab+/efghij1234Q=";
-    let encoded = "ab%2B%2Fefghij1234Q%3D";
+    // a client percent-encodes in a path segment, in a token that carries the connection-id
+    // format marker.
+    let decoded = "ab+/efghijwC12Q=";
+    let encoded = "ab%2B%2FefghijwC12Q%3D";
     assert!(
         mgmt::state::is_well_formed_connection_id(decoded),
         "the case's id {decoded:?} must be the form API Gateway mints"

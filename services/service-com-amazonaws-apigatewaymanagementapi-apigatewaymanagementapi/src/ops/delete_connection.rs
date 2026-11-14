@@ -7,11 +7,12 @@
 //!
 //! Removal is what makes the connection gone: every later `GetConnection`,
 //! `PostToConnection` and `DeleteConnection` on the same id answers the modeled
-//! `GoneException` (HTTP 410), since a missing entry for a well-formed id is this service's
-//! single source of truth for that error. A `ConnectionId` that could never have been
-//! minted names no connection to delete and is refused HTTP 400 `BadRequestException`
-//! instead. See [`crate::state`] for the shape rule, for the endpoint a connection is
-//! addressed through, and for why the two refusals are split.
+//! `GoneException` (HTTP 410), since a missing entry for an id of the shape API Gateway
+//! issues is this service's single source of truth for that error. A `ConnectionId` that
+//! could never have been issued names no connection to delete and is refused HTTP 400
+//! `BadRequestException` naming the id instead. See [`crate::state`] for the encoding rule,
+//! for the endpoint a connection is addressed through, and for why the two refusals are
+//! split.
 //!
 //! ## Shape of an operation
 //!
@@ -173,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::access_denied(denied));
         }
-        // A `ConnectionId` that is not of the shape this service mints names no connection
+        // A `ConnectionId` that is not of the shape this service issues names no connection
         // anywhere, so it is refused from the VALUE alone, before anything is removed
         // (`crate::state::invalid_connection_id`).
         if !crate::state::is_well_formed_connection_id(&input.connection_id) {
