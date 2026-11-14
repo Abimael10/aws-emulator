@@ -20,6 +20,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::settled_stack_status;
 use crate::stack_lifecycle::{
     call, create_stack, describe_stack, member, resource_event_reason, router,
     wait_for_the_transition, xml_text, ACCOUNT_ID, REGION,
@@ -395,6 +396,338 @@ async fn a_policy_granting_to_a_role_the_stack_creates_is_set_on_the_repository(
     assert!(
         text.contains(&role_arn),
         "expected the policy to grant to {role_arn}, got {text:?}"
+    );
+}
+
+/// Deploy `template` as stack `name` and answer the status it SETTLES on, through the
+/// suite-wide waiter: what a case asserts is the CONDITION, never how long the emulator
+/// took to reach it.
+async fn deploy_until_settled(
+    case: &str,
+    router: &MultiServiceRouter,
+    name: &str,
+    template: &str,
+) -> (String, Option<String>) {
+    let (status, body) = create_stack(router, name, template, &[]).await;
+    assert_eq!(status, 200, "CreateStack({name}) answered {status}: {body}");
+    let settled = settled_stack_status(case, router, REGION, name).await;
+    let (_, body) = describe_stack(router, name).await;
+    (settled, xml_text(&body, "StackStatusReason"))
+}
+
+/// The lifecycle policy Amazon ECR holds for `name`, or the refusal code it answers with.
+async fn lifecycle_policy(router: &MultiServiceRouter, name: &str) -> Result<Value, String> {
+    let (status, body) = ecr(
+        router,
+        "GetLifecyclePolicy",
+        &json!({"repositoryName": name}),
+    )
+    .await;
+    if status == 200 {
+        let text = body["lifecyclePolicyText"].as_str().unwrap_or_default();
+        return Ok(serde_json::from_str(text).unwrap_or(Value::Null));
+    }
+    Err(body["__type"]
+        .as_str()
+        .unwrap_or_default()
+        .rsplit('#')
+        .next()
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// One rule of a lifecycle policy document, as the format spells one: the members every
+/// rule carries, with `selection` taking whichever count the rule counts by.
+///
+/// Source: the two forms of a `selection` the lifecycle policy format publishes — an
+/// `imageCountMoreThan` keeping a number of images, and a `sinceImagePushed` counting in
+/// days — read off ECR's own policy parse
+/// (`smithy_query(query="doc",shape="LifecyclePolicyText")` carries the member's own text).
+fn lifecycle_rule(priority: i64, description: &str, selection: Value) -> Value {
+    json!({
+        "rulePriority": priority,
+        "description": description,
+        "selection": selection,
+        "action": {"type": "expire"},
+    })
+}
+
+/// RULE: a nested settings document a resource's declaration carries that the owning
+/// service configures through a call of its own is applied to the resource the stack
+/// created — for a repository's `LifecyclePolicy`, through `PutLifecyclePolicy` — so a
+/// read of that configuration after the deployment answers what the template declared,
+/// and a declaration carrying none leaves the resource with none.
+#[tokio::test]
+async fn a_declared_lifecycle_policy_is_put_on_the_created_repository() {
+    // The rows differ along how a template spells the property — the document itself, the
+    // JSON TEXT of one, the registry it names, and the YAML spelling — and along the rule
+    // forms the policy format publishes, from one rule to several.
+    let untagged = lifecycle_rule(
+        1,
+        "Expire untagged images after 14 days",
+        json!({
+            "tagStatus": "untagged",
+            "countType": "sinceImagePushed",
+            "countUnit": "days",
+            "countNumber": 14,
+        }),
+    );
+    let tagged = lifecycle_rule(
+        2,
+        "Keep the last 10 release images",
+        json!({
+            "tagStatus": "tagged",
+            "tagPrefixList": ["release"],
+            "countType": "imageCountMoreThan",
+            "countNumber": 10,
+        }),
+    );
+    let one_rule = json!({"rules": [untagged.clone()]});
+    let two_rules = json!({"rules": [untagged, tagged]});
+
+    // (case, the template, the repository's name where the template declares one, the
+    // policy it must hold)
+    let rows: Vec<(&str, String, Option<&str>, Option<Value>)> = vec![
+        (
+            "json, the policy written as the document itself",
+            json!({
+                "Resources": {"Registry": {
+                    "Type": "AWS::ECR::Repository",
+                    "Properties": {
+                        "RepositoryName": "cfn-lifecycle-images",
+                        "LifecyclePolicy": {"LifecyclePolicyText": one_rule.clone()},
+                    },
+                }},
+            })
+            .to_string(),
+            "cfn-lifecycle-images".into(),
+            Some(one_rule.clone()),
+        ),
+        (
+            "json, the policy written as JSON text, under the registry it names",
+            json!({
+                "Resources": {"Registry": {
+                    "Type": "AWS::ECR::Repository",
+                    "Properties": {
+                        "RepositoryName": "cfn-lifecycle-text-images",
+                        "LifecyclePolicy": {
+                            "LifecyclePolicyText": two_rules.to_string(),
+                            "RegistryId": ACCOUNT_ID,
+                        },
+                    },
+                }},
+            })
+            .to_string(),
+            "cfn-lifecycle-text-images".into(),
+            Some(two_rules.clone()),
+        ),
+        (
+            // A registry id is twelve digits, which a template may spell as the number it
+            // is rather than as text; this emulator's own registry id is twelve ZEROS,
+            // which no number can spell, so the number's path is graded by the refusal row
+            // of the next test instead.
+            "json, the policy written as the document itself, under the registry it names",
+            json!({
+                "Resources": {"Registry": {
+                    "Type": "AWS::ECR::Repository",
+                    "Properties": {
+                        "RepositoryName": "cfn-named-registry-images",
+                        "LifecyclePolicy": {
+                            "LifecyclePolicyText": two_rules.clone(),
+                            "RegistryId": ACCOUNT_ID,
+                        },
+                    },
+                }},
+            })
+            .to_string(),
+            "cfn-named-registry-images".into(),
+            Some(two_rules),
+        ),
+        (
+            "yaml, the policy written as JSON text on a repository whose name \
+             CloudFormation generated",
+            format!(
+                concat!(
+                    "Resources:\n",
+                    "  Registry:\n",
+                    "    Type: AWS::ECR::Repository\n",
+                    "    Properties:\n",
+                    "      LifecyclePolicy:\n",
+                    "        LifecyclePolicyText: '{}'\n",
+                ),
+                one_rule
+            ),
+            // CloudFormation generates the name, so the row reads the policy under the
+            // physical id the stack reports rather than a value fixed here.
+            None,
+            Some(one_rule),
+        ),
+        (
+            "json, a repository declaring no lifecycle policy at all",
+            json!({
+                "Resources": {"Registry": {
+                    "Type": "AWS::ECR::Repository",
+                    "Properties": {"RepositoryName": "cfn-unpoliced-images"},
+                }},
+            })
+            .to_string(),
+            "cfn-unpoliced-images".into(),
+            None,
+        ),
+    ];
+
+    for (index, (case, template, declared_name, expected)) in rows.iter().enumerate() {
+        let router = router();
+        let stack = format!("ecr-lifecycle-stack-{index}");
+        let (status, reason) = deploy_until_settled(case, &router, &stack, template).await;
+        assert_eq!(
+            status, "CREATE_COMPLETE",
+            "case {case:?}: expected the create to complete, got {status:?} ({reason:?})"
+        );
+        // The repository the policy must sit on is the one the stack reports, which is the
+        // name `PutLifecyclePolicy` was asked for.
+        let name = match declared_name {
+            Some(declared) => (*declared).to_string(),
+            None => physical_id(&router, &stack, "Registry").await,
+        };
+        let held = lifecycle_policy(&router, &name).await;
+        match expected {
+            Some(policy) => assert_eq!(
+                held.as_ref().ok(),
+                Some(policy),
+                "case {case:?}: expected the declared lifecycle policy on {name}, got {held:?}"
+            ),
+            // A repository with no policy is NOT a repository that does not exist: the
+            // registry holds it, and the read answers only that it carries no policy.
+            None => assert_eq!(
+                held.as_ref().err().map(String::as_str),
+                Some("LifecyclePolicyNotFoundException"),
+                "case {case:?}: expected no lifecycle policy on {name}, got {held:?}"
+            ),
+        }
+    }
+}
+
+/// RULE: a `LifecyclePolicy` this provider cannot build a `PutLifecyclePolicy` from, or
+/// one Amazon ECR refuses, FAILS the resource rather than completing with that part of the
+/// declaration dropped — and the repository is not left behind.
+#[tokio::test]
+async fn a_lifecycle_policy_declaring_no_document_fails_the_deployment() {
+    // A policy document every row below is otherwise free to carry, so each row's refusal
+    // is the one thing it varies.
+    let document = json!({"rules": [lifecycle_rule(
+        1,
+        "Expire untagged images after 30 days",
+        json!({
+            "tagStatus": "untagged",
+            "countType": "sinceImagePushed",
+            "countUnit": "days",
+            "countNumber": 30,
+        }),
+    )]});
+    // (case, the declared `LifecyclePolicy`, what the failed resource's event must name)
+    let rows: [(&str, Value, &str); 3] = [
+        (
+            "the property declares no LifecyclePolicyText",
+            json!({}),
+            "LifecyclePolicy",
+        ),
+        (
+            "the property is not a settings document",
+            json!("{\"rules\":[]}"),
+            "LifecyclePolicy",
+        ),
+        (
+            "the property declares a RegistryId that is no registry id",
+            json!({"LifecyclePolicyText": document, "RegistryId": [ACCOUNT_ID]}),
+            "RegistryId",
+        ),
+    ];
+
+    for (index, (case, declared, named)) in rows.iter().enumerate() {
+        let template = json!({
+            "Resources": {"Registry": {
+                "Type": "AWS::ECR::Repository",
+                "Properties": {
+                    "RepositoryName": "cfn-undocumented-lifecycle-images",
+                    "LifecyclePolicy": declared,
+                },
+            }},
+        })
+        .to_string();
+
+        let router = router();
+        let stack = format!("ecr-lifecycle-refused-stack-{index}");
+        let (status, reason) = deploy_until_settled(case, &router, &stack, &template).await;
+        assert_eq!(
+            status, "ROLLBACK_COMPLETE",
+            "case {case:?}: expected the failed create to be rolled back, got {status:?} \
+             ({reason:?})"
+        );
+        let on_the_resource =
+            resource_event_reason(&router, &stack, "Registry", resource_status::CREATE_FAILED)
+                .await;
+        assert!(
+            on_the_resource.contains(named),
+            "case {case:?}: expected the failed resource's event to name {named:?}, got \
+             {on_the_resource:?}"
+        );
+        assert!(
+            repository(&router, "cfn-undocumented-lifecycle-images")
+                .await
+                .is_none(),
+            "case {case:?}: a refused declaration must leave no repository in Amazon ECR"
+        );
+    }
+}
+
+/// RULE: a declared `RegistryId` reaches `PutLifecyclePolicy` as its one textual spelling,
+/// whether the template writes it as text or as the twelve-digit number it is — so a
+/// declaration naming ANOTHER account's registry is refused by Amazon ECR itself, which is
+/// what shows the declared value was forwarded rather than dropped.
+#[tokio::test]
+async fn a_lifecycle_policy_naming_another_registry_is_refused_by_ecr() {
+    // Written as a number, which is how a template may spell a twelve-digit account id,
+    // and not this emulator's registry.
+    let other_registry = 123_456_789_012_u64;
+    let template = json!({
+        "Resources": {"Registry": {
+            "Type": "AWS::ECR::Repository",
+            "Properties": {
+                "RepositoryName": "cfn-foreign-registry-images",
+                "LifecyclePolicy": {
+                    "LifecyclePolicyText": {"rules": [lifecycle_rule(
+                        1,
+                        "Expire untagged images after 30 days",
+                        json!({
+                            "tagStatus": "untagged",
+                            "countType": "sinceImagePushed",
+                            "countUnit": "days",
+                            "countNumber": 30,
+                        }),
+                    )]},
+                    "RegistryId": other_registry,
+                },
+            },
+        }},
+    })
+    .to_string();
+
+    let case = "a lifecycle policy named for another account's registry";
+    let router = router();
+    let stack = "ecr-foreign-registry-stack";
+    let (status, reason) = deploy_until_settled(case, &router, stack, &template).await;
+    assert_eq!(
+        status, "ROLLBACK_COMPLETE",
+        "case {case:?}: expected the failed create to be rolled back, got {status:?} \
+         ({reason:?})"
+    );
+    let on_the_resource =
+        resource_event_reason(&router, stack, "Registry", resource_status::CREATE_FAILED).await;
+    assert!(
+        on_the_resource.contains(&other_registry.to_string()),
+        "case {case:?}: expected the owning service's refusal to name the declared registry \
+         {other_registry}, got {on_the_resource:?}"
     );
 }
 

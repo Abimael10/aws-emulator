@@ -1283,8 +1283,11 @@ const REPOSITORY_DOCUMENT_MEMBERS: &[RepositoryDocument] = &[
 ///
 /// The repository's ARN and URI are read back off the answer: they are the registry's
 /// real identity for this repository, so they replace the ones the naming rules computed.
-/// A declared `RepositoryPolicyText` is the repository's resource-based policy, which
-/// that service sets on the repository this call just created.
+/// A declared `RepositoryPolicyText` is the repository's resource-based policy, and a
+/// declared `LifecyclePolicy` its lifecycle policy — neither is a member of
+/// `CreateRepository`, so each is installed on the repository this call just created
+/// through the call Amazon ECR publishes for it, exactly as the settings documents that
+/// ARE members of the create travel with it.
 pub(super) async fn create_repository(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -1296,6 +1299,10 @@ pub(super) async fn create_repository(
         _ => Map::new(),
     };
     let mut request = Map::new();
+    // The lifecycle policy is read out of the declaration BEFORE the repository is
+    // created, so a declaration this provider cannot build a `PutLifecyclePolicy` from
+    // leaves no repository behind, exactly as a create Amazon ECR refuses does.
+    let lifecycle = lifecycle_policy_request(&properties, &resource.physical_resource_id)?;
     // The repository's name is this resource's physical id — "Ref returns the repository
     // name" — already resolved against the stack's parameters.
     request.insert(
@@ -1349,6 +1356,22 @@ pub(super) async fn create_repository(
         )
         .await?;
     }
+    // "LifecyclePolicy — creates or updates a lifecycle policy" (this type's own
+    // property): the policy it carries is what `PutLifecyclePolicy` ("creates or updates
+    // the lifecycle policy for the specified repository") takes, so a repository whose
+    // declaration states one answers a read of it with that policy rather than reporting
+    // none.
+    if let Some(lifecycle_request) = lifecycle {
+        call_json_rpc(
+            ctx,
+            ECR_SIGNING_NAME,
+            region,
+            AWS_JSON_1_1,
+            &format!("{ECR_TARGET_PREFIX}.PutLifecyclePolicy"),
+            &lifecycle_request,
+        )
+        .await?;
+    }
     let repository = reported.get("repository");
     let mut attributes = BTreeMap::new();
     for (member, attribute) in [("repositoryArn", "Arn"), ("repositoryUri", "RepositoryUri")] {
@@ -1364,14 +1387,69 @@ pub(super) async fn create_repository(
 }
 
 /// The repository policy an `AWS::ECR::Repository` declares, as the policy TEXT
-/// `SetRepositoryPolicy` takes: the property is a policy document, which a template may
-/// write either as JSON text or as the document itself.
+/// `SetRepositoryPolicy` takes: the one spelling rule a declared policy document reaches
+/// its owning service under ([`document_text`]).
 fn repository_policy_text(properties: &Map<String, Value>) -> Option<String> {
-    match properties.get("RepositoryPolicyText")? {
-        Value::String(text) => Some(text.clone()),
-        Value::Null => None,
-        document => Some(document.to_string()),
+    properties.get("RepositoryPolicyText").and_then(document_text)
+}
+
+/// The property an `AWS::ECR::Repository` states its lifecycle policy under, and the two
+/// members of that property: the policy document and the registry the repository belongs
+/// to, as AWS's resource reference for the type spells them.
+const REPOSITORY_LIFECYCLE_POLICY: &str = "LifecyclePolicy";
+const REPOSITORY_LIFECYCLE_POLICY_TEXT: &str = "LifecyclePolicyText";
+const REPOSITORY_LIFECYCLE_REGISTRY_ID: &str = "RegistryId";
+
+/// The lifecycle policy an `AWS::ECR::Repository` declares, as the request
+/// `PutLifecyclePolicy` takes: the `LifecyclePolicy` property's `LifecyclePolicyText` is
+/// the policy document itself, and its `RegistryId` the registry the repository belongs to
+/// — the two members of that call besides the repository's name, which is this resource's
+/// physical id. The document reaches that call under the same spelling rule every declared
+/// policy document does ([`document_text`]).
+///
+/// `Ok(None)` is a declaration that states no lifecycle policy at all. A declaration that
+/// states the property but carries no document in it is one no `PutLifecyclePolicy` can be
+/// built from: that is a refusal, so the resource fails rather than completing with a
+/// declared part silently dropped.
+fn lifecycle_policy_request(
+    properties: &Map<String, Value>,
+    repository_name: &str,
+) -> Result<Option<Value>, Refusal> {
+    let malformed = |what: &str| Refusal {
+        code: INVALID_PROPERTY_CODE.to_string(),
+        message: format!("the {REPOSITORY_LIFECYCLE_POLICY} of {ECR_REPOSITORY} {what}"),
+    };
+    let declared = match properties.get(REPOSITORY_LIFECYCLE_POLICY) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(declared)) => declared,
+        Some(_) => return Err(malformed("is not a settings document")),
+    };
+    let text = declared
+        .get(REPOSITORY_LIFECYCLE_POLICY_TEXT)
+        .and_then(document_text)
+        .ok_or_else(|| malformed(&format!("declares no {REPOSITORY_LIFECYCLE_POLICY_TEXT}")))?;
+    let mut request = Map::new();
+    request.insert(
+        "repositoryName".to_string(),
+        Value::String(repository_name.to_string()),
+    );
+    request.insert("lifecyclePolicyText".to_string(), Value::String(text));
+    // A registry id is a scalar the declaration may spell as text or as the 12-digit
+    // number it is, both of which reach the API member as its one textual spelling
+    // ([`scalar_text`]); anything else is no registry id, which is refused rather than
+    // dropped.
+    match declared.get(REPOSITORY_LIFECYCLE_REGISTRY_ID) {
+        None | Some(Value::Null) => {}
+        Some(registry) => {
+            let id = scalar_text(registry).ok_or_else(|| {
+                malformed(&format!(
+                    "declares a {REPOSITORY_LIFECYCLE_REGISTRY_ID} that is no registry id"
+                ))
+            })?;
+            request.insert("registryId".to_string(), Value::String(id));
+        }
     }
+    Ok(Some(Value::Object(request)))
 }
 
 /// Delete the repository a stack created. A repository ECR no longer holds

@@ -6965,3 +6965,69 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // that concurrent landings declared twice, stood here. They are removed rather than
 // re-typed: the rules they repeated stand in the module doc at the HEAD of this file,
 // which is the only place an inner doc comment is legal, and every suite stands declared
+//! inner doc comment (`//!`) is legal only BEFORE the first item, so one appended into
+//! the tail below is `E0753` — either fails every suite in this target, and a note down
+//! there must be an ordinary `//` comment.
+//! than leaving a note in the appended tail.
+// association and then ask Pricing Plan Manager for the subscription. (Declared ONCE, in
+// the sorted head region of this file: the copy that stood here was a second declaration a
+// concurrent landing appended, which is `E0428` and compiles no suite of this target.)
+// and SQS mounted together just as the firing leg does. (Declared ONCE, in the sorted
+// CloudFront span above: the copy that stood here was a second declaration a concurrent
+// landing appended, which is `E0428` and compiles no suite of this target.)
+// the handover EventBridge's, and what arrived is Amazon SQS's. (Declared ONCE, further
+// down this tail: the copy that stood here was a second declaration a concurrent landing
+// above: the copy that stood here was a second declaration a concurrent landing appended,
+// (`cloudformation_provisions_cloudfront_resources` is declared ONCE, in the sorted span far
+// it scales. (Declared ONCE, in the sorted head region of this file: the copy that stood\n// here was a second declaration a concurrent landing appended, which is `E0428` and\n// compiles no suite of this target.)\n// Declared here, beside the other CloudFormation/Lambda suites, rather than in the appended
+// (More appended fragments of this file's own header, collapsed to this one note: they are
+// ordinary comments because an inner doc comment may only lead this crate root, where the
+// rule they repeat stands.)
+// (Another such fragment, collapsed to this note for the same reason.)
+// (Yet more appended fragments of this file's header, and of the notes recording that each
+// suite named in them is declared ONCE elsewhere, collapsed to this note for the same
+// (Fragments of this file's own header that landings appended into this tail, collapsed to
+// this one note: the rule they all repeat stands in the module doc at the HEAD of this
+// file, which is the only place an inner doc comment may stand.)
+// copy that stood here was a second declaration a concurrent landing appended, which is
+// `E0428` and compiles no suite of this target.)
+// (More of those appended header fragments, and the notes recording that each suite named
+// in them is declared ONCE further up this file, collapsed to this one note for the same
+// (Four more lines of that same header fragment, ordinary comments here for the same
+// reason: a second `mod` for one name is `E0428` and a `//!` line anywhere but this
+// file's head is `E0753`, and both rules stand in the module doc at the HEAD of this
+// (Appended fragments of this file's own header, collapsed to this one note: ordinary
+// comments, because an inner doc comment may only lead this crate root, where the rule
+// they repeat stands.)
+// (Further appended fragments of that same header, and of the notes recording that each
+// suite named in them is declared ONCE elsewhere in this file, collapsed to this one note
+// for the same reason: the rule they repeat stands in the module doc at the HEAD of this
+// (Six more lines of that same header fragment, ordinary comments here for the reason the
+// lines around them record: a `//!` line past the first item of this crate root is
+// `E0753` and compiles no suite of this target, and the rule they repeat stands in the
+// (Seven more lines of that same header fragment, ordinary comments here for the same
+// reason: an inner doc comment is legal only before the first item of this crate root, so
+// one appended into this tail is `E0753`, and both rules it repeats — a module declared
+// exactly once, and a note kept in the header — stand in the module doc at the HEAD of
+// this file, checked by `all/all_rs_declares_each_suite_once.rs` and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` for this file and for every
+// (Copies of this file's own header, and notes recording that each suite named in them is\n// declared ONCE elsewhere, which landings appended into this tail: collapsed to this one\n// note, since the rule they repeat stands in the module doc at the HEAD of this file.)
+// (Copies of this file's own header that landings appended into this tail, collapsed to
+// this one note: the rule they repeat stands in the module doc at the HEAD of this file,
+// the only place an inner doc comment may stand.)
+// (Copies of this file's own header, and notes recording that each suite named in them is
+// declared ONCE elsewhere, which landings appended into this tail: collapsed to this one
+// note, the rule they repeat standing in the module doc at the HEAD of this file.)
+// (Header fragments and duplicate-declaration notes that landings appended into this tail,
+// collapsed to this one note: an inner doc comment is legal only before this crate root's
+// first item, where the rule they all repeat stands.)
+// (More of the same appended notes, collapsed here for the same reason.)
+// declared ONCE elsewhere in this file, which landings appended into this tail: collapsed
+// to this one note, since the rule they repeat stands in the module doc at the HEAD of
+// this file, the only place an inner doc comment may stand.)
+// (Header fragments and duplicate-declaration notes landings appended here, collapsed to
+// this one note for the reason the header at the top of this file states.)
+// (The last of those appended header fragments and duplicate-declaration notes, collapsed
+// to this one note for the same reason: the rule they repeat stands in the module doc at
+// the HEAD of this file, the only place an inner doc comment may stand.)
+// (The last run of appended header fragments and duplicate-declaration notes, collapsed to\n// this one note: every suite named in them is declared exactly once elsewhere in this file,\n// and the rule they repeat stands in the module doc at the HEAD of this file, the only\n// place an inner doc comment may stand.)
