@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSubnetGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSubnetGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSubnetGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the subnet groups [`crate::state`] holds — the one this
+//! request names (folded, as the store is keyed) or every one of them in name order —
+//! paged by `MaxResults`/`NextToken` through the one rule every listing of this service
+//! pages by. A name this store holds no group for is the modelled
+//! `SubnetGroupNotFoundFault`, answered with the status this service gives every fault
+//! about a resource that is not in state (`tests/all/fault_http_status.rs` pins that rule
+//! for the service as a whole).
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +150,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSubnetGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSubnetGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSubnetGroups"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); the request is refused rather than answered
+            // with a canned subnet group list.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        if let Some(message) =
+            crate::state::SUBNET_GROUP_PAGE_SIZE_WINDOW.rejection(input.max_results)
+        {
+            // A page size outside the window this surface serves names no page. This
+            // operation models no invalid-value error, so it is refused as a bad request
+            // rather than served as an empty page.
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+        // A subnet-group name is a case-insensitive identifier, so the name this request
+        // asks about is folded exactly as the store is keyed.
+        let subnet_group_name = input.subnet_group_name.as_deref().map(crate::state::fold_name);
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        // The writes a describe makes, neither of them asked for by this caller: the
+        // status transitions the clock already owed the stored clusters and ACLs at this
+        // instant, and the resources the account ALREADY HAD before any call, which this
+        // store materialises on first touch because the engine hands every service an
+        // empty one.
+        state.settle(std::time::Instant::now());
+        state.ensure_builtins(&region);
+
+        let entries: Vec<(String, SubnetGroup)> = match subnet_group_name.as_deref() {
+            Some(name) => {
+                let Some(group) = state.subnet_groups.get(name) else {
+                    return Err(
+                        DescribeSubnetGroupsErrorModeled::SubnetGroupNotFoundFault(
+                            SubnetGroupNotFoundFault {
+                                message: Some(crate::state::not_found_message(
+                                    crate::state::ResourceKind::SubnetGroup,
+                                    name,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                vec![(group.name.clone(), group.to_api())]
+            }
+            None => state
+                .subnet_groups
+                .values()
+                .map(|group| (group.name.clone(), group.to_api()))
+                .collect(),
+        };
+
+        let (subnet_groups, next_token) = crate::state::paginate(
+            entries,
+            crate::state::page_limit(input.max_results),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(
+                "NextToken does not name a position in this listing.",
+            )
+        })?;
+        Ok(DescribeSubnetGroupsOutput {
+            subnet_groups: Some(subnet_groups),
+            next_token,
+        })
     }
 }

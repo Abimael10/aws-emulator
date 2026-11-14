@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the subnet group [`crate::state`] holds under the FOLDED
+//! `SubnetGroupName` and answers with the record as the caller last had it, so no later
+//! call reports it. A group still named by a cluster is refused with the modelled
+//! `SubnetGroupInUseFault` ("You cannot delete a default subnet group or one that is
+//! associated with any clusters" — the DEFAULT half of that rule has nothing to refuse
+//! here: this store starts with no subnet group at all, for the reason
+//! [`crate::state::ComAmazonawsMemorydbAmazonmemorydbState::subnet_groups`] records), and
+//! a name this store holds no group for with the modelled `SubnetGroupNotFoundFault`. The
+//! group's tags go with it, and the deletion
+//! is recorded as a `subnet-group` event, which `DescribeEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +142,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSubnetGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); the request is refused rather than reported
+            // as a delete nothing performed.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        let region = crate::state::request_region(ctx);
+        // THE IDENTIFIER'S SYNTAX FIRST, exactly as the parameter group's delete reads
+        // it: `SubnetGroupName` is an unconstrained `String` in the model, and a name
+        // that is not a well-formed identifier is refused with the rule it broke rather
+        // than looked up.
+        if let Some(message) = crate::state::resource_name_rejection(
+            crate::state::ResourceKind::SubnetGroup,
+            &input.subnet_group_name,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+        let subnet_group_name = crate::state::fold_name(&input.subnet_group_name);
+        let mut state = state.lock();
+        state.settle(std::time::Instant::now());
+        state.ensure_builtins(&region);
+
+        // WHICH GROUP NEXT: a name that IS a well-formed identifier but that state holds
+        // no group for is answered not-found, whatever else is wrong with the request.
+        let Some(group) = state.subnet_groups.get(&subnet_group_name) else {
+            return Err(DeleteSubnetGroupErrorModeled::SubnetGroupNotFoundFault(
+                SubnetGroupNotFoundFault {
+                    message: Some(crate::state::not_found_message(
+                        crate::state::ResourceKind::SubnetGroup,
+                        &subnet_group_name,
+                    )),
+                },
+            )
+            .into());
+        };
+        // The response describes the group as the caller last had it, built from the
+        // record this call removes.
+        let response = group.to_api();
+        let arn = group.arn.clone();
+        // "You cannot delete a default subnet group or one that is associated with any
+        // clusters": a cluster's nodes sit in the subnets of the group it names, so a
+        // group still named by one cannot go away under it. The list is derived from the
+        // clusters in state, so the refusal names exactly the clusters a caller reads in
+        // `Cluster$SubnetGroupName`.
+        let clusters = state.clusters_using_subnet_group(&subnet_group_name);
+        if !clusters.is_empty() {
+            return Err(DeleteSubnetGroupErrorModeled::SubnetGroupInUseFault(
+                SubnetGroupInUseFault {
+                    message: Some(format!(
+                        "Subnet group {subnet_group_name} is currently in use by cluster(s) \
+                         {} and cannot be deleted.",
+                        clusters.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+        // Gone from the store, so no later call reports it and the readers answer the
+        // modelled not-found fault for its name.
+        state.subnet_groups.remove(&subnet_group_name);
+        // Its tags go with it: a tag set keyed by an ARN nothing resolves would be read
+        // by a later `ListTags` for a resource that no longer exists.
+        state.tags.remove(&arn);
+        // The change this call made, recorded against the resource it made it to, so
+        // `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::SUBNET_GROUP,
+            &subnet_group_name,
+            crate::state::EventKind::Deleted,
+        );
+        Ok(DeleteSubnetGroupOutput {
+            subnet_group: Some(response),
+        })
     }
 }

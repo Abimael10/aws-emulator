@@ -1040,6 +1040,15 @@ pub(super) enum Provisioner {
     /// and the rule id the type publishes, so both are read off that service's own read of
     /// the rule.
     ConfigConfigRule,
+    /// `AWS::MemoryDB::ParameterGroup` and `AWS::MemoryDB::SubnetGroup`: the two
+    /// configuration groups an Amazon MemoryDB cluster is assembled from, which that
+    /// service's own `CreateParameterGroup`/`CreateSubnetGroup` make under the name the
+    /// template states and the matching `Delete…` removes. The name IS the handle every
+    /// call on a group takes, so it is the physical id the naming rules already compute for
+    /// the type; the ARN each type publishes is the one that service minted, read off its
+    /// own answer. Which group it is travels with the variant
+    /// ([`memorydb_groups::Group`]).
+    MemoryDbGroup(memorydb_groups::Group),
     /// `AWS::Events::EventBus`: an Amazon EventBridge event bus, which `CreateEventBus`
     /// creates under the name the template states and `DeleteEventBus` deletes. The name is
     /// the identifier every EventBridge call on a bus takes, so it is the physical id the
@@ -1218,6 +1227,12 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CONFIG_CONFIGURATION_RECORDER => Some(Provisioner::ConfigConfigurationRecorder),
         CONFIG_DELIVERY_CHANNEL => Some(Provisioner::ConfigDeliveryChannel),
         CONFIG_CONFIG_RULE => Some(Provisioner::ConfigConfigRule),
+        // Each MemoryDB group names which of the two it is, so the one pair of arms serves
+        // both types; the catalogue still lists every provisioned type here.
+        MEMORYDB_PARAMETER_GROUP => {
+            Some(Provisioner::MemoryDbGroup(memorydb_groups::Group::Parameter))
+        }
+        MEMORYDB_SUBNET_GROUP => Some(Provisioner::MemoryDbGroup(memorydb_groups::Group::Subnet)),
         _ => None,
     }
 }
@@ -1839,6 +1854,12 @@ impl Provisioner {
             }
             Self::ConfigDeliveryChannel => put_delivery_channel(ctx, region, resource).await,
             Self::ConfigConfigRule => put_config_rule(ctx, region, resource).await,
+            // Each group's create takes a `Tags` list of its own, so a parameter group and
+            // a subnet group a stack creates each carry the tags CloudFormation gives them
+            // beside the ones their declaration asks for.
+            Self::MemoryDbGroup(group) => {
+                create_memorydb_group(ctx, region, group, resource, propagated).await
+            }
         }
     }
 
@@ -1972,6 +1993,12 @@ impl Provisioner {
                 // the one check its own crate's tag validation makes — so a grant carries the
                 // stack's own tags without the three.
                 | Self::RedshiftSnapshotCopyGrant
+                // Amazon MemoryDB refuses a tag key in the reserved namespace on every call
+                // that takes tags — the `Tags` member of each group create and `TagResource`
+                // alike, in the one check its own crate's tag validation makes — so a
+                // parameter group and a subnet group each carry the stack's own tags without
+                // the three.
+                | Self::MemoryDbGroup(_)
         );
         propagated
             .iter()
@@ -2789,6 +2816,12 @@ impl Provisioner {
             // minted for it, the app's name included, so a changed declaration is applied to
             // that app rather than replacing it.
             Self::AmplifyApp => update_amplify_app(ctx, region, resource, declared).await,
+            // What a MemoryDB group's own service can change reaches it: a parameter group's
+            // declared values, and a subnet group's description and subnets
+            // ([`memorydb_groups::update_memorydb_group`]).
+            Self::MemoryDbGroup(group) => {
+                update_memorydb_group(ctx, region, group, resource, declared).await
+            }
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -3424,6 +3457,11 @@ impl Provisioner {
             Self::ConfigConfigRule => {
                 delete_config_rule(ctx, region, physical_resource_id).await
             }
+            // Each group is addressed by its own name, which is this resource's physical
+            // id.
+            Self::MemoryDbGroup(group) => {
+                delete_memorydb_group(ctx, region, group, physical_resource_id).await
+            }
         }
     }
 
@@ -3949,6 +3987,10 @@ impl Provisioner {
             Self::ElastiCacheCacheCluster => {
                 Box::pin(read_cache_cluster(ctx, region, physical_resource_id)).await
             }
+            // Amazon MemoryDB's own read of the group, by the name it was created under.
+            Self::MemoryDbGroup(group) => {
+                describe_memorydb_group(ctx, region, group, physical_resource_id).await
+            }
         }
     }
 }
@@ -4019,6 +4061,11 @@ pub(super) mod redshift_parameter_groups;
 /// `AWS::Redshift::SnapshotCopyGrant` declares, created in the service that owns it so a
 /// client's own read of that service resolves the name the stack publishes.
 pub(super) mod redshift_snapshot_copy_grants;
+/// The Amazon MemoryDB group arms: the parameter group and the subnet group a cluster's
+/// configuration is declared with, created in the service that owns them so a client's own
+/// read of that service resolves the names and ARNs the stack publishes.
+pub(super) mod memorydb_groups;
+use memorydb_groups::*;
 use elasticache_caches::*;
 use rds_db_clusters::*;
 use redshift_parameter_groups::*;

@@ -290,6 +290,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         STEP_FUNCTIONS_STATE_MACHINE => &["Arn", "Name"],
         SCHEDULER_SCHEDULE_GROUP | SCHEDULER_SCHEDULE => &["Arn"],
         RESOURCE_GROUPS_GROUP => &["Arn"],
+        // Each Amazon MemoryDB group publishes its own ARN, under the upper-case member
+        // name that service's model spells it with (`ParameterGroup$ARN`,
+        // `SubnetGroup$ARN`).
+        MEMORYDB_PARAMETER_GROUP | MEMORYDB_SUBNET_GROUP => {
+            &[crate::state::template::UPPER_CASE_ARN_ATTRIBUTE]
+        }
         _ => &[],
     }
 }

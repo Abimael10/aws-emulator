@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: inserts the subnet group into [`crate::state`] keyed by its FOLDED
+//! `SubnetGroupName` (a MemoryDB resource name is a case-insensitive identifier, refused
+//! outright when it breaks the service's name rule) and answers with the stored record —
+//! including the default `Description` the service gives a group created without one — so
+//! `DescribeSubnetGroups` reports exactly what was persisted. The creation is also
+//! recorded as a `subnet-group` event, which `DescribeEvents` reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The subnets are recorded as the request listed them, each identifier held to the
+//! Amazon EC2 form ([`crate::state::subnet_id_rejection`]); which VPC and Availability
+//! Zone a subnet is in is that service's to report, so those members are answered absent
+//! rather than invented (see [`crate::state::StoredSubnetGroup`]).
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +164,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSubnetGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than answered with a fabricated group.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        let region = crate::state::request_region(ctx);
+        // A subnet-group name is the same case-insensitive identifier a parameter-group
+        // name is, bounded by the same rule, so it is checked and folded before anything
+        // is persisted. This operation models no invalid-value error, so a name that
+        // breaks the rule is refused as a bad request rather than with one of the subnet
+        // faults, none of which is about the name.
+        if let Some(message) = crate::state::resource_name_rejection(
+            crate::state::ResourceKind::SubnetGroup,
+            &input.subnet_group_name,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+        // The request's tag keys are refused before the group is created: `Tag$Key` may
+        // not be null, and the `aws:` prefix is reserved for AWS.
+        if let Some(message) = crate::state::tags_rejection(input.tags.as_ref()) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+        // `Description` is free text this group will carry and every describe of it will
+        // report, so its length is bounded before anything is persisted — through the one
+        // rule every write path that takes a description reads.
+        if let Some(message) = crate::state::description_rejection(input.description.as_deref())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+        // Each subnet the group places a cluster in has to be addressable as an Amazon
+        // EC2 subnet at all: a value of another form names no subnet, which is the
+        // condition `InvalidSubnet` is modelled for.
+        if let Some(message) = input
+            .subnet_ids
+            .iter()
+            .find_map(|subnet_id| crate::state::subnet_id_rejection(subnet_id))
+        {
+            return Err(CreateSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                message: Some(message),
+            })
+            .into());
+        }
+        // The group itself is bounded: one request cannot grow a stored group without
+        // end, which is the condition `SubnetQuotaExceededFault` is modelled for.
+        if input.subnet_ids.len() > crate::state::MAX_SUBNETS_PER_GROUP {
+            return Err(CreateSubnetGroupErrorModeled::SubnetQuotaExceededFault(
+                SubnetQuotaExceededFault {
+                    message: Some(format!(
+                        "The maximum number of subnets per subnet group ({}) has been \
+                         reached.",
+                        crate::state::MAX_SUBNETS_PER_GROUP
+                    )),
+                },
+            )
+            .into());
+        }
+        let subnet_group_name = crate::state::fold_name(&input.subnet_group_name);
+        // WHERE the group places a cluster is the owning service's to report: the subnets
+        // are resolved against Amazon EC2 before anything is persisted, so a stored group
+        // never lists a subnet that service holds none for and never reports a VPC or a
+        // zone nothing read ([`crate::state::subnet_placement`]). The read is made before
+        // the store is locked, since it is a call into this emulator.
+        let placement = match crate::state::subnet_placement::resolve_subnets(
+            ctx,
+            &region,
+            &input.subnet_ids,
+        )
+        .await
+        {
+            crate::state::SubnetPlacement::Resolved(placement) => placement,
+            crate::state::SubnetPlacement::Refused(crate::state::SubnetRefusal::Invalid(
+                message,
+            )) => {
+                return Err(CreateSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                    message: Some(message),
+                })
+                .into());
+            }
+            crate::state::SubnetPlacement::Refused(crate::state::SubnetRefusal::NotAllowed(
+                message,
+            )) => {
+                return Err(CreateSubnetGroupErrorModeled::SubnetNotAllowedFault(
+                    SubnetNotAllowedFault {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        };
+        let mut state = state.lock();
+        // Besides this create's own insert, the only writes: the status transitions the
+        // clock already owed the stored clusters and ACLs at this instant, and the
+        // resources the account ALREADY HAD before any call, materialised on first touch
+        // because the engine hands every service an empty store.
+        state.settle(std::time::Instant::now());
+        state.ensure_builtins(&region);
+
+        if state.subnet_groups.contains_key(&subnet_group_name) {
+            return Err(CreateSubnetGroupErrorModeled::SubnetGroupAlreadyExistsFault(
+                SubnetGroupAlreadyExistsFault {
+                    message: Some(crate::state::already_exists_message(
+                        crate::state::ResourceKind::SubnetGroup,
+                        &subnet_group_name,
+                    )),
+                },
+            )
+            .into());
+        }
+        // The store itself is bounded: one caller cannot grow it without end.
+        if state.subnet_groups.len() >= crate::state::MAX_RESOURCES_PER_KIND {
+            return Err(CreateSubnetGroupErrorModeled::SubnetGroupQuotaExceededFault(
+                SubnetGroupQuotaExceededFault {
+                    message: Some(format!(
+                        "The maximum number of subnet groups ({}) has been reached.",
+                        crate::state::MAX_RESOURCES_PER_KIND
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let arn = crate::state::subnet_group_arn(&region, &subnet_group_name);
+        let group = crate::state::StoredSubnetGroup {
+            name: subnet_group_name.clone(),
+            // A group created without a description gets the service's own default
+            // rather than no description at all, so the create and every later describe
+            // report the member.
+            description: input
+                .description
+                .unwrap_or_else(|| crate::state::DEFAULT_SUBNET_GROUP_DESCRIPTION.to_string()),
+            subnets: placement.subnets,
+            vpc_id: placement.vpc_id,
+            arn: arn.clone(),
+        };
+
+        // The request's tags, under the ARN the tagging operations resolve this resource
+        // by. An empty set leaves NO entry, so the subnet group starts with exactly the
+        // tags this request gave it.
+        state.set_tags(&arn, crate::state::tag_map(input.tags.as_ref()));
+        let response = group.to_api();
+        state.subnet_groups.insert(subnet_group_name.clone(), group);
+        // The change this call made, recorded against the subnet group it made it to, so
+        // `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::SUBNET_GROUP,
+            &subnet_group_name,
+            crate::state::EventKind::Created,
+        );
+        Ok(CreateSubnetGroupOutput {
+            subnet_group: Some(response),
+        })
     }
 }

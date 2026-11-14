@@ -2345,9 +2345,10 @@ fn attach_attributes(
 ///
 /// Every resource type publishes its own "Return values" section, and [`return_values`]
 /// carries the ones whose values do not follow from the resource's identity. Across those
-/// sections the NAMES are uniform, though: a type's `Arn`/`<Type>Arn` attribute is the
-/// resource's ARN, its `Id`/`<Type>Id` the physical id `Ref` returns, and its
-/// `Name`/`<Type>Name` the resource's name. A resource of a type this service carries no
+/// sections the NAMES are uniform, though: a type's `Arn`/`<Type>Arn` attribute — or the
+/// `ARN`/`<Type>ARN` spelling of it ([`arn_attributes`]) — is the resource's ARN, its
+/// `Id`/`<Type>Id` the physical id `Ref` returns, and its `Name`/`<Type>Name` the resource's
+/// name. A resource of a type this service carries no
 /// catalogue entry for therefore still answers those, so an output over it resolves
 /// instead of being reported with a key and no value.
 ///
@@ -2404,15 +2405,26 @@ fn conventional_attributes(
 }
 
 /// The attributes the uniform convention reads a resource's ARN off: its `Arn`/`<Type>Arn`
-/// names, which are "the resource's ARN" ([`conventional_attributes`]).
+/// names and the UPPER-CASE `ARN`/`<Type>ARN` spellings of them, each of which is "the
+/// resource's ARN" ([`conventional_attributes`]).
+///
+/// Both spellings, because a resource type's own "Return values" section uses whichever one
+/// the owning service's model uses for the member: `AWS::MemoryDB::ParameterGroup` and its
+/// siblings publish `ARN` (their model's `ParameterGroup$ARN`, `SubnetGroup$ARN`,
+/// `Cluster$ARN`) and `AWS::S3Tables::TableBucket` publishes `TableBucketARN`, where
+/// `AWS::SQS::Queue` publishes `Arn` and `AWS::ElasticLoadBalancingV2::TargetGroup`
+/// `TargetGroupArn`. One resource has one ARN whatever the name reading it is spelled like,
+/// so every one of these names answers that ARN — which is what keeps `Fn::GetAtt` over a
+/// published ARN from resolving to nothing for a type that spells it the other way.
 ///
 /// Public for the same reason [`identity_attributes`] is: an ARN is not always
 /// CloudFormation's own to compute. Where the OWNING service MINTS it — WAF answers
 /// `CreateWebACL` with the `ARN` it built from the scope, the name and the id it assigned —
 /// the ARN is the one that service reported, which only
 /// [`super::provisioning`](crate::state::provisioning) learns. It re-points these
-/// attributes through this one function, so the ARN a resource reports under either name is
-/// the same string and neither can be left holding a value the owning service does not know.
+/// attributes through this one function, so the ARN a resource reports under any of these
+/// names is the same string and none can be left holding a value the owning service does not
+/// know.
 pub fn arn_attributes(resource_type: &str, arn: &str) -> Vec<(String, String)> {
     let Some((_, segment)) = type_segments(resource_type) else {
         return Vec::new();
@@ -2420,7 +2432,24 @@ pub fn arn_attributes(resource_type: &str, arn: &str) -> Vec<(String, String)> {
     vec![
         ("Arn".to_string(), arn.to_string()),
         (format!("{segment}Arn"), arn.to_string()),
+        (UPPER_CASE_ARN_ATTRIBUTE.to_string(), arn.to_string()),
+        (
+            format!("{segment}{UPPER_CASE_ARN_ATTRIBUTE}"),
+            arn.to_string(),
+        ),
     ]
+}
+
+/// The upper-case spelling of the attribute that carries a resource's ARN, which several
+/// services' models spell the member with ([`arn_attributes`]). Named for the SPELLING
+/// rather than for the member, because the mixed-case `Arn` is the other spelling of the
+/// same thing and two constants called `ARN_ATTRIBUTE` would invite the wrong import.
+pub const UPPER_CASE_ARN_ATTRIBUTE: &str = "ARN";
+
+/// Whether an attribute NAME is one of the names a resource's ARN is published under:
+/// `Arn`/`<Type>Arn` and `ARN`/`<Type>ARN` ([`arn_attributes`]).
+fn names_an_arn(attribute: &str) -> bool {
+    attribute.ends_with("Arn") || attribute.ends_with(UPPER_CASE_ARN_ATTRIBUTE)
 }
 
 /// Give a resource the physical id `identity` and bring the attributes read off that id
@@ -2495,7 +2524,7 @@ fn known_arn(resource: &StoredResource) -> Option<String> {
     let mut published = resource
         .attributes
         .iter()
-        .filter(|(attribute, value)| attribute.ends_with("Arn") && value.starts_with("arn:"));
+        .filter(|(attribute, value)| names_an_arn(attribute) && value.starts_with("arn:"));
     let (_, only) = published.next()?;
     // Two published ARNs and no rule for which is "the" ARN: the convention mints the
     // resource's own rather than choosing one of them.
@@ -2699,6 +2728,13 @@ pub fn name_property(resource_type: &str, properties: &Value) -> Option<String> 
 pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
     match resource_type {
         IAM_ACCESS_KEY => &["Serial", "UserName"],
+        // A MemoryDB parameter group's engine FAMILY and its description are fixed when
+        // Amazon MemoryDB makes it: both are members of `CreateParameterGroup`, and the one
+        // call that changes a group afterwards (`UpdateParameterGroup`) takes nothing but
+        // the group's parameter values — so a declaration restating either asks for a
+        // different group, which CloudFormation replaces. (A subnet group needs no entry:
+        // both of its properties beside the name are `UpdateSubnetGroup`'s own members.)
+        MEMORYDB_PARAMETER_GROUP => &["Description", "Family"],
         // A spending limit is a cost control ABOUT one device: `UpdateSpendingLimit` takes
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
@@ -3113,6 +3149,10 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     MQ_BROKER,
     MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER,
+    // The two Amazon MemoryDB groups, each publishing the ARN its own service reports for
+    // the group of that name.
+    MEMORYDB_PARAMETER_GROUP,
+    MEMORYDB_SUBNET_GROUP,
     MWAA_ENVIRONMENT,
     "AWS::RDS::DBCluster",
     "AWS::RDS::DBInstance",
@@ -4007,14 +4047,27 @@ pub fn body_declared_transforms(body: &str) -> Vec<String> {
     let Some(Value::Object(root)) = document(body) else {
         return Vec::new();
     };
-    root.get(TRANSFORM).map(transform_names).unwrap_or_default()
+    root.get(TRANSFORM)
+        .map(|node| transform_names(node, 0))
+        .unwrap_or_default()
 }
 
-/// The transform names one `Transform` node declares.
-fn transform_names(node: &Value) -> Vec<String> {
+/// The transform names one `Transform` node declares, refusing below
+/// [`MAX_EXPANSION_DEPTH`] like every other walk over a caller-supplied document in this
+/// module: the node comes out of a request body that is bounded in SIZE, not in depth, and
+/// a native recursion a request can drive as deep as it likes is one that takes the whole
+/// process down rather than failing the one request. A node nested past the bound is a
+/// declaration this service cannot read, which is what [`UNREADABLE_TRANSFORM`] names.
+fn transform_names(node: &Value, depth: usize) -> Vec<String> {
+    if depth > MAX_EXPANSION_DEPTH {
+        return vec![UNREADABLE_TRANSFORM.to_string()];
+    }
     match node {
         Value::String(name) => vec![name.clone()],
-        Value::Array(items) => items.iter().flat_map(transform_names).collect(),
+        Value::Array(items) => items
+            .iter()
+            .flat_map(|item| transform_names(item, depth + 1))
+            .collect(),
         // A macro invoked with parameters: `{"Name": "MyMacro", "Parameters": {..}}`.
         Value::Object(map) => match map.get("Name").and_then(Value::as_str) {
             Some(name) => vec![name.to_string()],
@@ -4124,15 +4177,35 @@ pub fn process_with_parameters(body: &str, supplied: &BTreeMap<String, String>) 
 /// put in key order here — the order CloudFormation's own processed template comes back
 /// in.
 fn in_key_order(value: Value) -> Value {
+    in_key_order_within(value, 0)
+}
+
+/// [`in_key_order`] below `depth`, refusing to descend past [`MAX_EXPANSION_DEPTH`] as every
+/// other walk over a caller-supplied document in this module does.
+///
+/// The document is a request body, which is bounded in SIZE and not in depth, so a native
+/// recursion over it has to stop somewhere: a subtree nested deeper than any reading of a
+/// template is held to is answered AS IT STANDS rather than re-ordered, which keeps the
+/// ordering guarantee for every document this service will deploy and keeps one request from
+/// driving the stack out from under the process.
+fn in_key_order_within(value: Value, depth: usize) -> Value {
+    if depth > MAX_EXPANSION_DEPTH {
+        return value;
+    }
     match value {
-        Value::Array(items) => Value::Array(items.into_iter().map(in_key_order).collect()),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| in_key_order_within(item, depth + 1))
+                .collect(),
+        ),
         Value::Object(map) => {
             let mut members: Vec<(String, Value)> = map.into_iter().collect();
             members.sort_by(|(left, _), (right, _)| left.cmp(right));
             Value::Object(
                 members
                     .into_iter()
-                    .map(|(key, member)| (key, in_key_order(member)))
+                    .map(|(key, member)| (key, in_key_order_within(member, depth + 1)))
                     .collect(),
             )
         }

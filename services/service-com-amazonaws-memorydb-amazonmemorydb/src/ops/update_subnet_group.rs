@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the members this request carries to the subnet group
+//! [`crate::state`] holds under the FOLDED `SubnetGroupName` — its `Description`, the
+//! `SubnetIds` it places a cluster in, or both — and answers with the stored record as it
+//! now stands, so `DescribeSubnetGroups` reports exactly what was persisted. A member the
+//! request leaves out is left as it was. The change is recorded as a `subnet-group` event,
+//! which `DescribeEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +146,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSubnetGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); the request is refused rather than reported
+            // as a change nothing applied.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        let region = crate::state::request_region(ctx);
+        // THE IDENTIFIER'S SYNTAX FIRST, exactly as the create and the delete read it.
+        if let Some(message) = crate::state::resource_name_rejection(
+            crate::state::ResourceKind::SubnetGroup,
+            &input.subnet_group_name,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+        // Then the VALUES this request would store: a description longer than the service
+        // keeps, and a subnet identifier that is no Amazon EC2 subnet id, are refused
+        // before the stored group is touched.
+        if let Some(message) = crate::state::description_rejection(input.description.as_deref())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+        if let Some(message) = input
+            .subnet_ids
+            .iter()
+            .flatten()
+            .find_map(|subnet_id| crate::state::subnet_id_rejection(subnet_id))
+        {
+            return Err(UpdateSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                message: Some(message),
+            })
+            .into());
+        }
+        if input
+            .subnet_ids
+            .as_ref()
+            .is_some_and(|subnet_ids| subnet_ids.len() > crate::state::MAX_SUBNETS_PER_GROUP)
+        {
+            return Err(UpdateSubnetGroupErrorModeled::SubnetQuotaExceededFault(
+                SubnetQuotaExceededFault {
+                    message: Some(format!(
+                        "The maximum number of subnets per subnet group ({}) has been \
+                         reached.",
+                        crate::state::MAX_SUBNETS_PER_GROUP
+                    )),
+                },
+            )
+            .into());
+        }
+        let subnet_group_name = crate::state::fold_name(&input.subnet_group_name);
+        // The subnets a change states are resolved against the service that owns them,
+        // exactly as the create resolves the ones it is given, so an updated group reports
+        // the VPC and the zones Amazon EC2 holds for its new placement.
+        let placement = match &input.subnet_ids {
+            Some(subnet_ids) => {
+                match crate::state::subnet_placement::resolve_subnets(ctx, &region, subnet_ids)
+                    .await
+                {
+                    crate::state::SubnetPlacement::Resolved(placement) => Some(placement),
+                    crate::state::SubnetPlacement::Refused(
+                        crate::state::SubnetRefusal::Invalid(message),
+                    ) => {
+                        return Err(UpdateSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                            message: Some(message),
+                        })
+                        .into());
+                    }
+                    crate::state::SubnetPlacement::Refused(
+                        crate::state::SubnetRefusal::NotAllowed(message),
+                    ) => {
+                        return Err(UpdateSubnetGroupErrorModeled::SubnetNotAllowedFault(
+                            SubnetNotAllowedFault {
+                                message: Some(message),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+            None => None,
+        };
+        let mut state = state.lock();
+        state.settle(std::time::Instant::now());
+        state.ensure_builtins(&region);
+
+        let Some(group) = state.subnet_groups.get_mut(&subnet_group_name) else {
+            return Err(UpdateSubnetGroupErrorModeled::SubnetGroupNotFoundFault(
+                SubnetGroupNotFoundFault {
+                    message: Some(crate::state::not_found_message(
+                        crate::state::ResourceKind::SubnetGroup,
+                        &subnet_group_name,
+                    )),
+                },
+            )
+            .into());
+        };
+        // Each member the request carries replaces what the group held; one it leaves out
+        // is not a change, so the stored value stays.
+        if let Some(description) = input.description {
+            group.description = description;
+        }
+        if let Some(placement) = placement {
+            group.subnets = placement.subnets;
+            group.vpc_id = placement.vpc_id;
+        }
+        let response = group.to_api();
+        // The change this call made, recorded against the subnet group it made it to, so
+        // `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::SUBNET_GROUP,
+            &subnet_group_name,
+            crate::state::EventKind::Modified,
+        );
+        Ok(UpdateSubnetGroupOutput {
+            subnet_group: Some(response),
+        })
     }
 }

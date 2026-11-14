@@ -26,6 +26,12 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Renders that digest as the hex label, rather than re-deriving the encoding here.
 hex = { workspace = true }
+# Resolves the VPC subnets a subnet group places a cluster in against the service that OWNS
+# them: `DescribeSubnets` over the emulator's own in-process callback, which is where the
+# VPC and the Availability Zone a stored subnet group reports come from
+# (`state::subnet_placement`). No network client feature: the transport is the emulator's
+# own.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -349,6 +349,8 @@ mod provider_answer_follow_up;
 mod provisioned_ecr_repository;
 #[path = "all/provisioned_resources.rs"]
 mod provisioned_resources;
+#[path = "all/published_arn_attribute_names.rs"]
+mod published_arn_attribute_names;
 #[path = "all/public_extension_arn_versions.rs"]
 mod public_extension_arn_versions;
 #[path = "all/public_extension_arns.rs"]

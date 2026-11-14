@@ -18,10 +18,14 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Authentication, AuthenticationMode, Cluster, Endpoint, EngineVersionInfo, Event, Node,
-    Parameter, ParameterGroup, SecurityGroupMembership, Shard, Tag, User, ACL,
-    ACLPendingChanges,
+    Authentication, AuthenticationMode, AvailabilityZone, Cluster, Endpoint, EngineVersionInfo,
+    Event, Node, Parameter, ParameterGroup, SecurityGroupMembership, Shard, Subnet, SubnetGroup,
+    Tag, User, ACL, ACLPendingChanges,
 };
+
+/// Where a subnet group places a cluster, read off the service that owns the subnets.
+pub mod subnet_placement;
+pub use subnet_placement::{Placement, StoredSubnet, SubnetPlacement, SubnetRefusal};
 
 /// The region an ARN or endpoint carries when the request is unsigned, matching the
 /// region every generated emulator defaults to (see `engine::emulator_arn`).
@@ -193,6 +197,14 @@ pub const PARAMETER_PAGE_SIZE_WINDOW: PageSizeWindow = PageSizeWindow {
     noun: "max results",
 };
 
+/// The window the SUBNET-GROUP listing serves — `DescribeSubnetGroups`.
+///
+/// No refusal of THAT listing's page size is recorded, so it is held to the window its
+/// sibling group listing publishes ([`PARAMETER_PAGE_SIZE_WINDOW`]): a parameter group
+/// and a subnet group are the two configuration groups a cluster is assembled from, and
+/// their listings are the one surface rather than two.
+pub const SUBNET_GROUP_PAGE_SIZE_WINDOW: PageSizeWindow = PARAMETER_PAGE_SIZE_WINDOW;
+
 /// The number of hash slots a cluster spreads over its shards. Fixed by the Redis
 /// OSS / Valkey cluster protocol MemoryDB implements (slots `0..=16383`).
 pub const TOTAL_SLOTS: i32 = 16_384;
@@ -280,15 +292,15 @@ pub const MAX_EVENTS_RETAINED: usize = 2_000;
 /// `crate::ops::types::SOURCE_TYPE_VALUES` (`acl`, `cluster`, `node`,
 /// `parameter-group`, `subnet-group`, `user`), which is also what `DescribeEvents`
 /// validates a requested `SourceType` against, so neither can drift from the model.
-/// The catalog's other two tokens are recorded by nothing: a subnet group has no
-/// implemented write path in this service (every subnet-group operation still answers
-/// 501), and a node has no lifecycle of its own here — nodes exist only as the layout
-/// of the cluster whose own events already report the change.
+/// The catalog's other token is recorded by nothing: a node has no lifecycle of its own
+/// here — nodes exist only as the layout of the cluster whose own events already report
+/// the change.
 pub mod event_source_type {
     pub const CLUSTER: &str = "cluster";
     pub const ACL: &str = "acl";
     pub const USER: &str = "user";
     pub const PARAMETER_GROUP: &str = "parameter-group";
+    pub const SUBNET_GROUP: &str = "subnet-group";
 }
 
 /// What a call did, as the event recording it reports — the operation that was
@@ -347,6 +359,7 @@ fn source_type_noun(source_type: &str) -> &str {
         event_source_type::ACL => "ACL",
         event_source_type::USER => "user",
         event_source_type::PARAMETER_GROUP => "parameter group",
+        event_source_type::SUBNET_GROUP => "subnet group",
         other => other,
     }
 }
@@ -1714,6 +1727,58 @@ pub const MIN_ENGINE_VERSION_IAM_AUTH: &str = "7.0";
 /// all.
 pub const DEFAULT_PARAMETER_GROUP_DESCRIPTION: &str = " ";
 
+/// The description MemoryDB gives a SUBNET group created without one, which is the same
+/// single space a parameter group created without one carries
+/// ([`DEFAULT_PARAMETER_GROUP_DESCRIPTION`]): the member is reported rather than left
+/// out, so a describe of the group answers a `Description` either way.
+pub const DEFAULT_SUBNET_GROUP_DESCRIPTION: &str = DEFAULT_PARAMETER_GROUP_DESCRIPTION;
+
+/// The prefix of an Amazon EC2 subnet identifier, which is what a `SubnetIdentifierList`
+/// entry carries (`CreateSubnetGroup$SubnetIds`: "A list of VPC subnet IDs for the subnet
+/// group").
+const SUBNET_ID_PREFIX: &str = "subnet-";
+
+/// How many hexadecimal characters an Amazon EC2 subnet identifier carries after its
+/// prefix: the 8 of the original form and the 17 of the long one AWS mints now.
+const SUBNET_ID_HEX_DIGITS: [usize; 2] = [8, 17];
+
+/// Why `subnet_id` is not a VPC subnet identifier, or `None` when it is one.
+///
+/// Read by every write path that takes `SubnetIds` before the group is persisted, so a
+/// stored subnet group never lists a value no Amazon EC2 subnet could be addressed by.
+/// Whether a WELL-FORMED identifier names a subnet that exists is Amazon EC2's to say,
+/// which [`subnet_placement::resolve_subnets`] asks it — and both halves are refused in
+/// the SAME words ([`invalid_subnet_message`]), because they are the one modelled
+/// `InvalidSubnet` condition. The caller maps the message onto that fault.
+pub fn subnet_id_rejection(subnet_id: &str) -> Option<String> {
+    let well_formed = subnet_id
+        .strip_prefix(SUBNET_ID_PREFIX)
+        .is_some_and(|digits| {
+            SUBNET_ID_HEX_DIGITS.contains(&digits.chars().count())
+                && digits
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit() && !character.is_uppercase())
+        });
+    (!well_formed).then(|| invalid_subnet_message(subnet_id))
+}
+
+/// The sentence the modelled `InvalidSubnet` carries, about the identifier the request
+/// named: the fault's own sentence
+/// (`smithy_query(query="shape",shape="InvalidSubnet")` — "The specified subnet is not
+/// valid.") with the value it is about, so a caller learns WHICH of the subnets it listed
+/// was refused. The one wording for the condition, whichever half of it refused the value.
+pub fn invalid_subnet_message(subnet_id: &str) -> String {
+    format!("The specified subnet is not valid: {subnet_id}")
+}
+
+/// The most subnets this service stores in one subnet group.
+///
+/// A ceiling THIS EMULATOR chooses — the model puts no `@length` on
+/// `SubnetIdentifierList` — so that one request cannot grow a stored group without
+/// bound; a longer list is refused with the modelled `SubnetQuotaExceededFault`, which is
+/// the fault the service publishes for exactly that condition.
+pub const MAX_SUBNETS_PER_GROUP: usize = 20;
+
 /// `AuthenticationType` (`password` | `no-password` | `iam`): the built-in user
 /// authenticates without a password, so it carries no password count.
 pub const NO_PASSWORD_AUTHENTICATION: &str = "no-password";
@@ -1751,6 +1816,14 @@ pub struct ComAmazonawsMemorydbAmazonmemorydbState {
     /// Parameter groups by `ParameterGroupName`, in name order like the maps above,
     /// so a listing over them pages stably.
     pub parameter_groups: BTreeMap<String, StoredParameterGroup>,
+    /// Subnet groups by `SubnetGroupName`, in name order like the maps above, so a
+    /// listing over them pages stably.
+    ///
+    /// The account starts with NONE: a default subnet group is the one MemoryDB would own,
+    /// and its subnets are the default VPC's, which the Amazon EC2 state this emulator
+    /// serves does not start with either — a group listing subnets no describe resolves
+    /// would be a worse answer than an account whose groups are the ones a caller made.
+    pub subnet_groups: BTreeMap<String, StoredSubnetGroup>,
     /// Tags by resource ARN: the tags of each tagged resource, under the ARN that
     /// resource's create minted. Written by the `Tags` member of a create and by
     /// `TagResource`/`UntagResource`, read by `ListTags` — one map, so no two of them
@@ -1961,6 +2034,25 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
             .collect()
     }
 
+    /// The names of the clusters currently referencing `subnet_group_name`, in name
+    /// order — the clusters a subnet group is in use by, which is what
+    /// `DeleteSubnetGroup` ("You cannot delete a default subnet group or one that is
+    /// associated with any clusters") refuses on. DERIVED from the clusters in state,
+    /// exactly as [`Self::clusters_using_parameter_group`] is, so the refusal names the
+    /// clusters a caller reads in `Cluster$SubnetGroupName`.
+    pub fn clusters_using_subnet_group(&self, subnet_group_name: &str) -> Vec<String> {
+        self.clusters
+            .values()
+            .filter(|cluster| {
+                cluster
+                    .subnet_group_name
+                    .as_deref()
+                    .is_some_and(|name| name == subnet_group_name)
+            })
+            .map(|cluster| cluster.name.clone())
+            .collect()
+    }
+
     /// The same membership for EVERY ACL, in ONE pass over the clusters.
     ///
     /// A listing uses this rather than [`Self::clusters_using_acl`] per ACL, so the
@@ -2069,12 +2161,14 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
                 .parameter_groups
                 .get(name)
                 .map(|group| group.arn.as_str()),
-            // Snapshots, subnet groups and the multi-Region resources have no store in
-            // this service yet (their creates are still scaffolded), so no ARN of those
-            // kinds can name a resource that exists — which is exactly what their
-            // not-found faults say.
+            ResourceKind::SubnetGroup => self
+                .subnet_groups
+                .get(name)
+                .map(|group| group.arn.as_str()),
+            // Snapshots and the multi-Region resources have no store in this service yet
+            // (their creates are still scaffolded), so no ARN of those kinds can name a
+            // resource that exists — which is exactly what their not-found faults say.
             ResourceKind::Snapshot
-            | ResourceKind::SubnetGroup
             | ResourceKind::MultiRegionCluster
             | ResourceKind::MultiRegionParameterGroup => None,
         };
@@ -2192,6 +2286,59 @@ pub struct StoredNode {
     pub endpoint_address: String,
     pub port: i32,
     pub created_at: SystemTime,
+}
+
+/// A subnet group as this emulator persists it: the members `CreateSubnetGroup`
+/// accepted, plus the ARN the service itself mints and the placement the service that owns
+/// the subnets reported for them.
+///
+/// A subnet group has NO status member in the model (`SubnetGroup` is
+/// `Name`/`Description`/`VpcId`/`Subnets`/`ARN`/`SupportedNetworkTypes`), so there is no
+/// transient status to settle and nothing for the clock to owe it.
+#[derive(Debug, Clone)]
+pub struct StoredSubnetGroup {
+    pub name: String,
+    /// `SubnetGroup$Description`. NOT optional in the store: a group created without one
+    /// gets the service's own default ([`DEFAULT_SUBNET_GROUP_DESCRIPTION`]), so every
+    /// stored group has a description to report.
+    pub description: String,
+    /// The subnets the group places a cluster in, as the request listed them, each with
+    /// the Availability Zone Amazon EC2 reports it in
+    /// ([`subnet_placement::resolve_subnets`]).
+    pub subnets: Vec<StoredSubnet>,
+    /// `SubnetGroup$VpcId` — "The Amazon Virtual Private Cloud identifier (VPC ID) of the
+    /// subnet group": the VPC Amazon EC2 reports those subnets in, and `None` where no EC2
+    /// answered about them, because the VPC is that service's to report rather than this
+    /// one's to invent.
+    pub vpc_id: Option<String>,
+    pub arn: String,
+}
+
+impl StoredSubnetGroup {
+    /// The modelled `SubnetGroup` for this stored subnet group.
+    pub fn to_api(&self) -> SubnetGroup {
+        SubnetGroup {
+            name: Some(self.name.clone()),
+            description: Some(self.description.clone()),
+            vpc_id: self.vpc_id.clone(),
+            subnets: Some(
+                self.subnets
+                    .iter()
+                    .map(|subnet| Subnet {
+                        identifier: Some(subnet.identifier.clone()),
+                        availability_zone: subnet.availability_zone.as_ref().map(|name| {
+                            AvailabilityZone {
+                                name: Some(name.clone()),
+                            }
+                        }),
+                        supported_network_types: None,
+                    })
+                    .collect(),
+            ),
+            arn: Some(self.arn.clone()),
+            supported_network_types: None,
+        }
+    }
 }
 
 /// A parameter group as this emulator persists it: the three members
@@ -3245,6 +3392,11 @@ pub fn user_arn(region: &str, name: &str) -> String {
 /// `arn:aws:memorydb:<region>:<account>:parametergroup/<name>`.
 pub fn parameter_group_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("parametergroup/{name}"))
+}
+
+/// `arn:aws:memorydb:<region>:<account>:subnetgroup/<name>`.
+pub fn subnet_group_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("subnetgroup/{name}"))
 }
 
 /// The per-cluster label AWS puts between the cluster name and the service domain in

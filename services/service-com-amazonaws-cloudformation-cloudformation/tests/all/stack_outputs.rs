@@ -799,32 +799,33 @@ fn output_cases() -> Vec<OutputCase> {
             // — and `Fn::GetAtt Arn` answers the resource's ARN under CloudFormation's
             // uniform naming (the type's service segment as the ARN namespace, its type
             // segment as the resource path), rather than leaving a declared output of a
-            // CREATE_COMPLETE stack valueless. (The EventBridge Scheduler types this row
-            // used to be written with are catalogued and provisioned now, so they are
-            // exercised end to end against that service in
+            // CREATE_COMPLETE stack valueless. The two MemoryDB types here are both in that
+            // position; their sibling GROUP types are catalogued and provisioned now, for
+            // the one-word `parametergroup`/`subnetgroup` paths their own service writes, so
+            // those are exercised against that service in
+            // `core/router/tests/all/cloudformation_provisions_memorydb_groups.rs`. (The
+            // EventBridge Scheduler types this row used to be written with went the same
+            // way, into
             // `core/router/tests/all/cloudformation_provisions_scheduler_schedules.rs`.)
             case: "an uncatalogued type: Ref is its physical name, GetAtt Arn its arn",
             stack_name: "uncatalogued",
             template: r#"{"Resources":{
-                   "G":{"Type":"AWS::MemoryDB::ParameterGroup",
-                     "Properties":{"ParameterGroupName":"probe-group"}},
+                   "G":{"Type":"AWS::MemoryDB::User",
+                     "Properties":{"UserName":"probe-user"}},
                    "S":{"Type":"AWS::MemoryDB::Cluster","Properties":{"ClusterName":"probe-cluster",
-                     "ParameterGroupName":{"Ref":"G"}}}},
-                 "Outputs":{"GroupName":{"Value":{"Ref":"G"}},
+                     "ACLName":{"Ref":"G"}}}},
+                 "Outputs":{"UserName":{"Value":{"Ref":"G"}},
                    "ClusterName":{"Value":{"Ref":"S"}},
-                   "ClusterParameterGroup":{"Value":{"Fn::GetAtt":["S","ParameterGroupName"]}},
+                   "ClusterAcl":{"Value":{"Fn::GetAtt":["S","ACLName"]}},
                    "ClusterArn":{"Value":{"Fn::GetAtt":["S","Arn"]}}}}"#
                 .to_string(),
             parameters: vec![],
             expected: vec![
-                ("GroupName", Expected::Value("probe-group".to_string())),
+                ("UserName", Expected::Value("probe-user".to_string())),
                 ("ClusterName", Expected::Value("probe-cluster".to_string())),
                 // The attribute IS the property the template declared for it, and that
                 // property names another resource of the same template.
-                (
-                    "ClusterParameterGroup",
-                    Expected::Value("probe-group".to_string()),
-                ),
+                ("ClusterAcl", Expected::Value("probe-user".to_string())),
                 (
                     "ClusterArn",
                     Expected::Value(format!(

@@ -876,3 +876,29 @@ pub const APPCONFIG_APPLICATION: &str = "AWS::AppConfig::Application";
 pub const APPCONFIG_ENVIRONMENT: &str = "AWS::AppConfig::Environment";
 pub const APPCONFIG_CONFIGURATION_PROFILE: &str = "AWS::AppConfig::ConfigurationProfile";
 pub const APPCONFIG_DEPLOYMENT_STRATEGY: &str = "AWS::AppConfig::DeploymentStrategy";
+
+/// The types of the two Amazon MemoryDB GROUPS a cluster is configured out of (that
+/// model's `awsService.cloudFormationName: MemoryDB`): the parameter group that carries
+/// the engine settings, and the subnet group that places a cluster in a VPC.
+///
+/// "Ref returns the name" for each — the `ParameterGroupName`/`SubnetGroupName` the
+/// declaration states, which is the identifier every MemoryDB call on one takes
+/// (`DescribeParameterGroups$ParameterGroupName`, `DescribeSubnetGroups$SubnetGroupName`)
+/// — so neither identity is service-assigned. Each publishes its own ARN, under the
+/// upper-case member name that model spells it with (`ParameterGroup$ARN`,
+/// `SubnetGroup$ARN`: "the Amazon Resource Name (ARN) of the parameter group" / "of the
+/// subnet group").
+pub const MEMORYDB_PARAMETER_GROUP: &str = "AWS::MemoryDB::ParameterGroup";
+pub const MEMORYDB_SUBNET_GROUP: &str = "AWS::MemoryDB::SubnetGroup";
+
+/// Amazon MemoryDB's ARN namespace, which is its model's own `awsService.arnNamespace`
+/// (`memorydb`) rather than the `MemoryDB` its resource types are spelled with.
+pub const MEMORYDB_ARN_NAMESPACE: &str = "memorydb";
+
+/// The resource-type segments an Amazon MemoryDB ARN spells these two groups with:
+/// `parametergroup/<name>` and `subnetgroup/<name>`, written as ONE word rather than the
+/// hyphenated `parameter-group` the uniform convention would give them — the segments that
+/// service's own ARNs carry, which is what its `DescribeParameterGroups` and
+/// `DescribeSubnetGroups` report in each group's `ARN` member.
+pub const MEMORYDB_PARAMETER_GROUP_SEGMENT: &str = "parametergroup";
+pub const MEMORYDB_SUBNET_GROUP_SEGMENT: &str = "subnetgroup";

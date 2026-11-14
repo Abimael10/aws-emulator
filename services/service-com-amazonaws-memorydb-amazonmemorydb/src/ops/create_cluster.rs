@@ -485,19 +485,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A cluster runs in the subnets of a subnet group that exists:
         // `SubnetGroupName` names a resource too, so it is resolved against the store
-        // before the ACL as well. This service keeps no subnet groups (every subnet
-        // group write path is still scaffolded, so none can ever have been created), so
-        // no name names one. The refusal is the service's own for this reference — the
+        // before the ACL as well, folded the way that store is keyed. The refusal for a
+        // name no stored group matches is the service's own for this reference — the
         // modelled COMBINATION fault, stating the rule rather than quoting the name.
-        if input.subnet_group_name.is_some() {
-            return Err(
-                CreateClusterErrorModeled::InvalidParameterCombinationException(
-                    InvalidParameterCombinationException {
-                        message: Some(crate::state::SUBNET_GROUP_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                )
-                .into(),
-            );
+        let subnet_group_name = input.subnet_group_name.as_deref().map(crate::state::fold_name);
+        if let Some(subnet_group_name) = subnet_group_name.as_deref() {
+            if !state.subnet_groups.contains_key(subnet_group_name) {
+                return Err(
+                    CreateClusterErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(
+                                crate::state::SUBNET_GROUP_NOT_FOUND_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
         // The cluster's access control list must already exist: `ACLName` names a
         // resource, so an unknown one is resolved against state, not accepted.
@@ -543,7 +547,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             acl_name,
             multi_region_cluster_name: input.multi_region_cluster_name,
             parameter_group_name,
-            subnet_group_name: input.subnet_group_name,
+            // Stored FOLDED, the way the subnet-group store is keyed, so the group a
+            // cluster reports and the group a later delete of that group finds in use
+            // are the one record.
+            subnet_group_name,
             security_group_ids: input.security_group_ids.unwrap_or_default(),
             maintenance_window: input.maintenance_window,
             snapshot_window: input.snapshot_window,

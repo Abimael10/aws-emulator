@@ -159,6 +159,17 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Amazon SQS `CreateQueue.QueueName`: "A queue name can have up to 80 characters"
         // (Amazon SQS API reference) — SQS's model carries no `@length` for it.
         SQS_QUEUE => rules(80, Characters::AsGenerated),
+        // Amazon MemoryDB `CreateParameterGroup.ParameterGroupName` and
+        // `CreateSubnetGroup.SubnetGroupName`: that service's model carries no `@length` for
+        // either, and its own rule for a resource name — the one its refusal states — is at
+        // most 40 characters, beginning with a letter, letters, digits and inner hyphens
+        // only (`crate::state::provisioner::memorydb_groups`). A MemoryDB name is also a
+        // CASE-INSENSITIVE identifier, stored folded, so a generated name is fitted to the
+        // lower-case spelling the group will exist under rather than to one that only
+        // resolves to it.
+        MEMORYDB_PARAMETER_GROUP | MEMORYDB_SUBNET_GROUP => {
+            rules(40, Characters::LowercaseAlphanumeric)
+        }
         // Amazon SNS `CreateTopic.Name`: topic names "must be between 1 and 256 characters
         // long" (Amazon SNS API reference) — SNS's model carries no `@length` for it.
         SNS_TOPIC => rules(256, Characters::AsGenerated),

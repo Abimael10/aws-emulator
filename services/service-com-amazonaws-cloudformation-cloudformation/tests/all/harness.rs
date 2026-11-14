@@ -253,6 +253,13 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // Amazon MemoryDB, for the `AWS::MemoryDB::ParameterGroup` and `AWS::MemoryDB::SubnetGroup`
+    // a stack really creates there, so a suite that deploys the configuration of a MemoryDB
+    // estate reads both groups back through that service's own wire, by the names and ARNs the
+    // stack publishes.
+    router.register_service(
+        service_com_amazonaws_memorydb_amazonmemorydb::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
 }
 

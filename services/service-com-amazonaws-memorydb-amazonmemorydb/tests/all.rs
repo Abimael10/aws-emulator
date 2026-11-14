@@ -59,6 +59,8 @@ mod request_level_guards;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subnet_groups.rs"]
+mod subnet_groups;
 #[path = "all/user_deletion.rs"]
 mod user_deletion;
 #[path = "all/user_lifecycle.rs"]

@@ -1946,6 +1946,36 @@ pub(crate) fn return_values(
             attributes.insert("HookArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // The two Amazon MemoryDB groups a cluster is configured out of. "Ref returns the
+        // name" for each, which is the `ParameterGroupName`/`SubnetGroupName` the declaration
+        // states and the identifier every MemoryDB call on one takes, and each publishes its
+        // own ARN under the upper-case member name that service's model spells it with
+        // ([`UPPER_CASE_ARN_ATTRIBUTE`], `ParameterGroup$ARN` / `SubnetGroup$ARN`).
+        //
+        // The arm exists for the ARN's RESOURCE PATH: Amazon MemoryDB writes these two
+        // segments as one word (`parametergroup/<name>`, `subnetgroup/<name>` — the segments
+        // its own `ListTags`/`TagResource` resolve and its describes report in the `ARN`
+        // member), where the uniform convention
+        // ([`super::super::conventional_attributes`]) would hyphenate the type's segment into
+        // `parameter-group`/`subnet-group`. The ARN computed here is therefore the one that
+        // service reports for the group of this name, and the conventional `Arn`/`<Type>Arn`
+        // names are read off it rather than minted beside it.
+        MEMORYDB_PARAMETER_GROUP | MEMORYDB_SUBNET_GROUP => {
+            let segment = if resource_type == MEMORYDB_PARAMETER_GROUP {
+                MEMORYDB_PARAMETER_GROUP_SEGMENT
+            } else {
+                MEMORYDB_SUBNET_GROUP_SEGMENT
+            };
+            attributes.insert(
+                UPPER_CASE_ARN_ATTRIBUTE.to_string(),
+                ::emulator_server::emulator_arn(
+                    MEMORYDB_ARN_NAMESPACE,
+                    region,
+                    &format!("{segment}/{name}"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
         // "Ref returns the record name"; the type publishes no `Fn::GetAtt` attribute. The
         // record name CloudFormation reports is the DNS name WITHOUT its terminal dot: a
         // zone's own names are fully qualified in Route 53 ("Route 53 treats
