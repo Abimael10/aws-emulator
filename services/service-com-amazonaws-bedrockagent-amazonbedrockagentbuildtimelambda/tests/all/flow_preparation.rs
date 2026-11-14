@@ -895,9 +895,16 @@ async fn prepare_flow_refuses_an_identifier_that_names_no_flow() {
         prepared.status, 202,
         "case stored flow: expected PrepareFlow -> 202, got {prepared:?}"
     );
-    // Either modelled identifier form names the same flow.
+    // Either modelled identifier form names the same flow. The preparation just
+    // accepted is settled first, because a flow is prepared by one preparation at
+    // a time and a second claim while one is in flight is refused.
+    emulator.make_preparation_due("stored flow", &stored_id);
     let arn = created.string(&["arn"]);
     let by_arn = emulator.prepare_flow(&arn).await;
+    assert_eq!(
+        by_arn.status, 202,
+        "case flow ARN: expected PrepareFlow -> 202, got {by_arn:?}"
+    );
     assert_eq!(
         by_arn.string(&["id"]),
         stored_id,

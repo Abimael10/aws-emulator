@@ -4913,3 +4913,7 @@ mod logs_subscription_delivery_role_scope;
 // and compiles nothing. (Five ordinary comments, for the reason they state.)
 #[path = "all/cloudformation_provisions_event_buses_and_bus_policies.rs"]
 mod cloudformation_provisions_event_buses_and_bus_policies;
+// suite left at the top level of `tests/` fails the build. (A plain comment: an inner
+// doc comment is `E0753` past this crate root's first item.)
+// leaving a note here. (Six more lines of that header fragment, ordinary comments
+// for the reason they state.)

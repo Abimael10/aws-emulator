@@ -77,6 +77,8 @@ mod knowledge_base_listing;
 mod knowledge_base_name_conflict;
 #[path = "all/managed_connector_defaults.rs"]
 mod managed_connector_defaults;
+#[path = "all/preparation_mutual_exclusion.rs"]
+mod preparation_mutual_exclusion;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

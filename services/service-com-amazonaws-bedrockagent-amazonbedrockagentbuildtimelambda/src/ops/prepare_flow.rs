@@ -12,6 +12,13 @@
 //!
 //! A following `GetFlow` observes `Preparing` and then that outcome.
 //!
+//! A flow is prepared by ONE preparation at a time: while the preparation an
+//! accepted call put in flight has not reached its outcome, a further call for
+//! the same flow is refused with the modelled `ConflictException` (409) instead
+//! of claiming the packaging a second time. The claim is taken under the state
+//! guard that decides it, so of any number of callers racing for one flow
+//! exactly one is accepted.
+//!
 //! The response reports the status the flow is in once the call is ACCEPTED, which
 //! is what the modelled 202 and the `FlowStatus` member's own documentation name:
 //! "Preparing – The flow is being prepared so that the DRAFT version contains the
@@ -206,6 +213,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // Packaging a DRAFT is one unit of work the service runs for the flow,
+        // and a flow is prepared by one preparation at a time: while a
+        // preparation this operation already accepted is unfinished, a request
+        // to start another on the same flow is the conflict this operation
+        // models, not a second claim that would discard the first's outcome. The
+        // check and the claim below both happen under the same state guard, so
+        // of any number of callers racing for one flow exactly one claims it and
+        // every other is refused.
+        if record.preparation_in_flight() {
+            return Err(PrepareFlowErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::concurrent_update_conflict_message(Self::NAME)),
+            })
+            .into());
+        }
 
         // What is packaged is the DRAFT version's stored definition, so the
         // outcome follows from that definition alone. A flow carrying no

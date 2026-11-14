@@ -320,6 +320,16 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
+    /// Whether a preparation this agent has already accepted is still UNFINISHED:
+    /// the DRAFT version is being prepared and has not reached its outcome.
+    ///
+    /// Asked after what the clock owes has been materialised, so a preparation
+    /// whose instant has passed no longer counts as in flight.
+    pub fn preparation_in_flight(&self) -> bool {
+        self.agent_status == AgentStatus::Preparing
+            || matches!(self.pending_status, Some((_, AgentStatus::Prepared)))
+    }
+
     /// This record as the modelled `Agent` shape: every required member is
     /// populated from the stored record, never from the request being served.
     pub fn to_agent(&self) -> Agent {
@@ -505,6 +515,17 @@ pub struct FlowRecord {
 }
 
 impl FlowRecord {
+    /// Whether a preparation this flow has already accepted is still UNFINISHED:
+    /// the DRAFT is being packaged and the outcome is not reported yet.
+    ///
+    /// A preparation whose instant the clock has reached is no longer in flight,
+    /// and [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::materialise_due_transitions`]
+    /// is what retires it, so an operation asks this after materialising what the
+    /// clock owes.
+    pub fn preparation_in_flight(&self) -> bool {
+        self.pending_preparation.is_some() || self.status == FlowStatus::Preparing
+    }
+
     /// This record as the `CreateFlow` response: every member comes from the
     /// stored record, never from the request being served.
     pub fn to_create_output(&self) -> CreateFlowOutput {
@@ -711,6 +732,21 @@ pub fn resource_status_conflict_message(operation: &str, status: &str) -> String
         "Couldn't perform {operation} operation. The resource that you specified is \
          currently in status {status}. Retry your request after the resource changes \
          to a valid status."
+    )
+}
+
+/// The `ConflictException` message an operation answers when the resource it
+/// addresses already has a change of its own in flight, so the work this call
+/// asks for cannot be claimed as well.
+///
+/// The sentence is this service's, with ONE variable part: `operation`, the
+/// operation the caller invoked. Nothing else in it comes from the request or
+/// from state — the caller is told only that another request owns the resource
+/// and that retrying after it finishes is what serves this one.
+pub fn concurrent_update_conflict_message(operation: &str) -> String {
+    format!(
+        "Couldn't perform {operation} operation. The resource is being updated by a \
+         concurrent request. Retry your request after the other request has completed."
     )
 }
 

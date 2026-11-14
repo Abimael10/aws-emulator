@@ -5,6 +5,13 @@
 //! Moves the stored agent's DRAFT version into `PREPARING`, which the clock then
 //! carries to `PREPARED`; a following `GetAgent` observes both.
 //!
+//! An agent is prepared by ONE preparation at a time: while the preparation an
+//! accepted call put in flight has not reached `PREPARED`, a further call for the
+//! same agent is refused with the modelled `ConflictException` (409) rather than
+//! claiming the preparation a second time. The claim is taken under the state
+//! guard that decides it, so of any number of callers racing for one agent
+//! exactly one is accepted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -180,6 +187,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // Preparing an agent is one unit of work the service runs for it, and an
+        // agent is prepared by one preparation at a time: while a preparation
+        // this operation already accepted is unfinished, a request to start
+        // another on the same agent is the conflict this operation models. The
+        // check and the claim below both happen under the same state guard, so of
+        // any number of callers racing for one agent exactly one claims it.
+        if record.preparation_in_flight() {
+            return Err(PrepareAgentErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::concurrent_update_conflict_message(Self::NAME)),
+            })
+            .into());
+        }
 
         // Preparation is accepted now and completes on the clock: the agent reports
         // PREPARING until `PREPARE_SPAN` has elapsed, then PREPARED.
