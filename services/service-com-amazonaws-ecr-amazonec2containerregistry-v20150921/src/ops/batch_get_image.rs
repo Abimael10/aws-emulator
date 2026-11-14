@@ -9,6 +9,18 @@
 //! when the repository itself is not here, or when the request names another registry.
 //! Each manifest is served in a schema the request's `acceptedMediaTypes` accepts.
 //!
+//! This call is also where a pull through cache rule CACHES: "when an image is pulled, the
+//! BatchGetImage API is called once to retrieve the image manifest", and a repository name
+//! under a registered rule's `ecrRepositoryPrefix` is served by caching the upstream image
+//! on demand, so the first read of one creates the mirrored repository and reports the
+//! image it stored ([`crate::state::registry_pull::import_covered_image`]). A read of a name
+//! no rule covers writes nothing. A batch over a covered name that nothing could be cached
+//! for is refused as a WHOLE — `UnableToGetUpstreamImageException` when the rule's upstream
+//! cannot be reached, `LimitExceededException` when this registry is at one of its own
+//! bounds — because the model declares both on the operation rather than as an
+//! `ImageFailureCode` of one entry, and a batch that reported `images` for the entries it
+//! held would say nothing at all about the one the rule was supposed to cache.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -127,6 +139,27 @@ impl From<BatchGetImageErrorModeled> for BatchGetImageError {
     }
 }
 
+/// What this operation refuses a batch with when no image could be pulled through the rule
+/// covering the repository: `UnableToGetUpstreamImageException`'s own two sentences, as the
+/// model words that error class (smithy_query shape=UnableToGetUpstreamImageException). Why
+/// THIS registry could not is read off the stored rule
+/// ([`crate::state::pull_through_cache_upstream_failure`], which is also what
+/// `ValidatePullThroughCacheRule` reports as the rule's `failure`) and logged rather than
+/// written into the client's message, which carries the service's wording alone.
+const UNABLE_TO_GET_UPSTREAM_IMAGE_MESSAGE: &str =
+    "The image or images were unable to be pulled using the pull through cache rule. This is \
+     usually caused because of an issue with the Secrets Manager secret containing the \
+     credentials for the upstream registry.";
+
+/// What it refuses a batch with when a cached copy would push this registry past one of its
+/// own bounds: `LimitExceededException`'s own two sentences, as the model words that error
+/// class (smithy_query shape=LimitExceededException). Which bound was reached is this
+/// emulator's own fact, so it is logged rather than reported as the service's wording.
+const LIMIT_EXCEEDED_MESSAGE: &str =
+    "The operation did not succeed because it would have exceeded a service limit for your \
+     account. For more information, see Amazon ECR service quotas in the Amazon Elastic \
+     Container Registry User Guide.";
+
 /// Map a shared-state failure onto this operation's own modelled errors.
 fn fault_error(fault: crate::state::Fault) -> BatchGetImageErrorModeled {
     let message = Some(fault.message().to_string());
@@ -222,7 +255,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `imageIds` is modelled `@length(1..100)`, so a batch asking for nothing, or
         // for more than the batch maximum, was already refused at the boundary.
-        let store = state.lock();
+        //
+        // "A pull through cache rule provides a way to cache images from an upstream
+        // registry source in your Amazon ECR private registry"
+        // (`CreatePullThroughCacheRule`), and "when an image is pulled, the BatchGetImage
+        // API is called once to retrieve the image manifest": a repository name under a
+        // registered rule's prefix is served by caching the upstream image, so an
+        // identifier this registry does not hold yet is imported here — which is also what
+        // creates the mirrored repository — before anything is reported on it. This is the
+        // ONE thing this operation writes, and only for a name a rule covers; every other
+        // read of it reports what is already stored.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Why nothing was cached for an identifier a rule DOES cover, when nothing was: the
+        // whole call is refused with it. A rule whose upstream cannot be reached is the class
+        // `UnableToGetUpstreamImageException` words, and a registry at one of its own bounds
+        // is a limit of this account's registry rather than anything about the upstream, so
+        // it is the class `LimitExceededException` words; the model declares both as errors of
+        // the OPERATION (smithy_query operation=BatchGetImage), and each carries the sentences
+        // its own shape documents. The per-ENTRY upstream codes `ImageFailureCode` carries
+        // (`UpstreamAccessDenied`, `UpstreamTooManyRequests`, `UpstreamUnavailable`) report on
+        // an upstream that answered, which is nothing this registry observes: it contacts no
+        // upstream.
+        let mut refusal: Option<BatchGetImageErrorModeled> = None;
+        for id in &input.image_ids {
+            let held = store
+                .repository(&input.repository_name)
+                .is_ok_and(|repo| repo.lookup_image(id).is_ok());
+            if held {
+                continue;
+            }
+            // An identifier carrying a digest addresses CONTENT, and an import has none to
+            // match: what it would cache under the tag is this registry's own record, whose
+            // digest is not the one that was asked for, so such an entry is answered from
+            // what is stored.
+            let tag = id
+                .image_tag
+                .as_deref()
+                .filter(|_| id.image_digest.is_none());
+            match crate::state::registry_pull::import_covered_image(
+                &mut store,
+                &region,
+                &input.repository_name,
+                tag,
+                now,
+            ) {
+                crate::state::registry_pull::CacheImport::Imported(_)
+                | crate::state::registry_pull::CacheImport::NotCovered => {}
+                crate::state::registry_pull::CacheImport::Unavailable(reason) => {
+                    ::tracing::info!(
+                        repository = %input.repository_name,
+                        reason = %reason,
+                        "no image could be pulled through the covering pull through cache rule"
+                    );
+                    refusal.get_or_insert_with(|| {
+                        BatchGetImageErrorModeled::UnableToGetUpstreamImageException(
+                            UnableToGetUpstreamImageException {
+                                message: Some(UNABLE_TO_GET_UPSTREAM_IMAGE_MESSAGE.to_string()),
+                            },
+                        )
+                    });
+                }
+                crate::state::registry_pull::CacheImport::AtCapacity(reason) => {
+                    ::tracing::warn!(
+                        repository = %input.repository_name,
+                        reason = %reason,
+                        "this registry is at a bound a cached copy would push it past"
+                    );
+                    refusal.get_or_insert_with(|| {
+                        BatchGetImageErrorModeled::LimitExceededException(LimitExceededException {
+                            message: Some(LIMIT_EXCEEDED_MESSAGE.to_string()),
+                        })
+                    });
+                }
+            }
+        }
+        if let Some(refusal) = refusal {
+            return Err(refusal.into());
+        }
         let repo = store
             .repository(&input.repository_name)
             .map_err(fault_error)?;

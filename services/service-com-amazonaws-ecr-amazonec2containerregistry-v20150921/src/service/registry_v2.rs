@@ -251,7 +251,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 
     /// Serve the manifest `reference` addresses in `repository_name` — and, for a `GET`,
-    /// record the pull it is.
+    /// cache what a pull through cache rule covers and record the pull it is.
     ///
     /// The reference is a digest when it is written as content is addressed
     /// (`<algorithm>:<hex>`) and a tag otherwise, which is how a registry reads the one
@@ -259,6 +259,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// schema the request's `Accept` list admits — the same negotiation `BatchGetImage`
     /// makes for the same stored image (`crate::state::negotiated_manifest`), so the API
     /// and the registry endpoint cannot answer two different documents for one pull.
+    ///
+    /// A `GET` of a reference under a registered pull through cache rule's prefix is the
+    /// pull that CACHES the upstream image, through the one import this registry makes
+    /// whichever plane the pull arrives on
+    /// (`crate::state::registry_pull::import_covered_image`) — so the first `docker pull`
+    /// of a cached path creates the mirrored repository here exactly as `BatchGetImage`
+    /// does. A `HEAD` is a client checking whether a manifest is there and caches nothing.
     fn serve_manifest(
         &self,
         state: &::engine::ServiceState<
@@ -273,7 +280,28 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let identifier = addressed_image(reference);
         let accepted = accepted_media_types(req);
         let served = {
-            let store = state.lock();
+            // ONE lock over the import and the read it is for, so the document served is the
+            // one the import stored: a repository another request pushes to or deletes
+            // between the two cannot make this pull answer that it found nothing it had just
+            // cached.
+            let mut store = state.lock();
+            let held = store
+                .repository(repository_name)
+                .is_ok_and(|repo| repo.lookup_image(&identifier).is_ok());
+            // A `GET` of a manifest IS the pull, and the first pull of a reference a rule
+            // covers is what caches the upstream image. A reference addressing a digest names
+            // CONTENT an import has none to match against, so only a tag is cached; a rule
+            // that covers nothing here, or one the upstream cannot be reached through, leaves
+            // the refusals below to answer.
+            if !held && req.method() == "GET" {
+                crate::state::registry_pull::import_covered_image(
+                    &mut store,
+                    &cache_repository_region(req),
+                    repository_name,
+                    identifier.image_tag.as_deref(),
+                    now,
+                );
+            }
             let Ok(repo) = store.repository(repository_name) else {
                 return registry_error(404, "NAME_UNKNOWN", NAME_UNKNOWN_MESSAGE);
             };
@@ -415,6 +443,26 @@ fn accepted_media_types(req: &RtRequest) -> Option<Vec<String>> {
         }
     }
     (!accepted.is_empty()).then_some(accepted)
+}
+
+/// The Region the cache repository a pull through cache rule's first pull CREATES records
+/// in its ARN.
+///
+/// A registry request carries no SigV4 credential scope to read a Region out of — what
+/// authorises one is a Basic credential — so it is the Region the registry HOST the client
+/// dialled names, read through the one reading of that host this service states
+/// (`crate::state::registry_pull::host_region`), on the endpoint read through this crate's
+/// one reading of a request's own ([`super::request_authority`], which also covers an HTTP/2
+/// request carrying its authority on the URI). A client that reached this registry at any
+/// other address — the emulator's own socket, which names no Region — gets this registry's
+/// default one. A Region is a label the repository's ARN carries rather than an address: one
+/// endpoint serves every Region here
+/// (`crate::state::announced_registry_endpoint`).
+fn cache_repository_region(req: &RtRequest) -> String {
+    let authority = super::request_authority(req).to_ascii_lowercase();
+    let host = authority.split(':').next().unwrap_or_default();
+    crate::state::registry_pull::host_region(host)
+        .unwrap_or_else(|| crate::state::DEFAULT_REGION.to_string())
 }
 
 /// The `docker login` password a request presents, or `None` when it presents no Basic

@@ -3331,6 +3331,54 @@ pub fn is_iam_role_arn(value: &str) -> bool {
 pub fn pull_through_cache_rule_failure(rule: &PullThroughCacheRule) -> Option<String> {
     let prefix = rule.ecr_repository_prefix.as_deref().unwrap_or_default();
     let url = rule.upstream_registry_url.as_deref().unwrap_or_default();
+    if let Some(failure) = pull_through_cache_upstream_failure(rule) {
+        return Some(failure);
+    }
+
+    let credential = rule.credential_arn.as_deref().filter(|arn| !arn.is_empty());
+    let role = rule.custom_role_arn.as_deref().filter(|arn| !arn.is_empty());
+    if credential.is_none()
+        && role.is_none()
+        && upstream_needs_credential(rule.upstream_registry.as_deref(), url)
+    {
+        return Some(format!(
+            "the upstream registry '{}' requires authentication and the pull through \
+             cache rule for '{prefix}' stores neither a credentialArn nor a customRoleArn",
+            rule.upstream_registry.as_deref().unwrap_or(url)
+        ));
+    }
+
+    None
+}
+
+/// The reason an image cannot be pulled THROUGH the stored `rule` at all, or `None` when it
+/// can: the part of a rule's verdict that decides whether the upstream named on it is
+/// reachable, which is what an on-demand import reports
+/// `UnableToGetUpstreamImageException` for.
+///
+/// Two things make a rule one no image can be pulled through, and both are read off the
+/// stored record:
+///
+/// * it names no upstream to cache from — a rule with no `upstreamRegistryUrl` addresses
+///   no registry at all;
+/// * the credential reference it carries cannot be READ — "This is usually caused because
+///   of an issue with the Secrets Manager secret containing the credentials for the
+///   upstream registry" (`UnableToGetUpstreamImageException`): a `credentialArn` outside
+///   the [`CREDENTIAL_SECRET_NAME_PREFIX`] secret namespace names no secret to retrieve a
+///   credential from, and a `customRoleArn` that is no IAM role names no role to assume to
+///   read one, so the import has nothing to authenticate with.
+///
+/// Whether an upstream that authenticates its callers was given a credential at all is a
+/// verdict on the rule rather than a failure to reach the upstream, so it is
+/// [`pull_through_cache_rule_failure`]'s to report and not this one's: ECR attempts the pull
+/// either way, and this emulator contacts no upstream registry to be refused by (see
+/// [`registry_pull`]).
+///
+/// An empty `customRoleArn` is no credential: the member is modelled `@length(0..2048)`, so
+/// the empty string is a legal value that stores no role.
+pub fn pull_through_cache_upstream_failure(rule: &PullThroughCacheRule) -> Option<String> {
+    let prefix = rule.ecr_repository_prefix.as_deref().unwrap_or_default();
+    let url = rule.upstream_registry_url.as_deref().unwrap_or_default();
     if url.trim().is_empty() {
         return Some(format!(
             "the pull through cache rule for '{prefix}' stores no upstreamRegistryUrl, \
@@ -3338,8 +3386,7 @@ pub fn pull_through_cache_rule_failure(rule: &PullThroughCacheRule) -> Option<St
         ));
     }
 
-    let credential = rule.credential_arn.as_deref().filter(|arn| !arn.is_empty());
-    if let Some(credential) = credential {
+    if let Some(credential) = rule.credential_arn.as_deref().filter(|arn| !arn.is_empty()) {
         if !is_pull_through_cache_credential_arn(credential) {
             return Some(format!(
                 "the credentialArn '{credential}' stored on the pull through cache rule \
@@ -3350,8 +3397,7 @@ pub fn pull_through_cache_rule_failure(rule: &PullThroughCacheRule) -> Option<St
         }
     }
 
-    let role = rule.custom_role_arn.as_deref().filter(|arn| !arn.is_empty());
-    if let Some(role) = role {
+    if let Some(role) = rule.custom_role_arn.as_deref().filter(|arn| !arn.is_empty()) {
         if !is_iam_role_arn(role) {
             return Some(format!(
                 "the customRoleArn '{role}' stored on the pull through cache rule for \
@@ -3359,17 +3405,6 @@ pub fn pull_through_cache_rule_failure(rule: &PullThroughCacheRule) -> Option<St
                  read the upstream credential"
             ));
         }
-    }
-
-    if credential.is_none()
-        && role.is_none()
-        && upstream_needs_credential(rule.upstream_registry.as_deref(), url)
-    {
-        return Some(format!(
-            "the upstream registry '{}' requires authentication and the pull through \
-             cache rule for '{prefix}' stores neither a credentialArn nor a customRoleArn",
-            rule.upstream_registry.as_deref().unwrap_or(url)
-        ));
     }
 
     None

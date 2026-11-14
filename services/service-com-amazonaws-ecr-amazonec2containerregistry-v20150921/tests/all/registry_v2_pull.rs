@@ -89,22 +89,25 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// What a registry request was answered: the status, the headers a registry answer carries,
 /// the raw bytes and the body as text.
-struct Fetched {
-    status: u16,
-    content_type: String,
+///
+/// `pub(crate)` where another suite of this target reads one: the registry plane is reached
+/// through this suite's own request helper rather than through a second copy of it.
+pub(crate) struct Fetched {
+    pub(crate) status: u16,
+    pub(crate) content_type: String,
     content_length: String,
-    content_digest: String,
+    pub(crate) content_digest: String,
     api_version: String,
     challenge: String,
     allow: String,
     bytes: Bytes,
-    body: String,
+    pub(crate) body: String,
 }
 
 impl Fetched {
     /// The error code the registry's error document states, or the empty string when the
     /// answer is not one.
-    fn code(&self) -> String {
+    pub(crate) fn code(&self) -> String {
         serde_json::from_str::<Value>(&self.body)
             .ok()
             .and_then(|document| {
@@ -131,7 +134,7 @@ impl Fetched {
 /// One request to the registry endpoint, exactly as a container client makes it: the
 /// method, the `/v2` path, the registry host, and whatever credential and `Accept` the row
 /// presents — never a SigV4 signature, which is the whole point of this plane.
-async fn fetch(
+pub(crate) async fn fetch(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -185,7 +188,7 @@ async fn fetch(
 /// The `docker login` credential this registry issues, as a client presents it: the token
 /// IS the base64 of `AWS:<password>`, so `Basic <token>` is the header `docker login`
 /// sends.
-async fn given_credential(router: &MultiServiceRouter) -> String {
+pub(crate) async fn given_credential(router: &MultiServiceRouter) -> String {
     let issued = ok(router, "credential", "GetAuthorizationToken", &json!({})).await;
     let token = at(&issued, "/authorizationData/0/authorizationToken")
         .as_str()

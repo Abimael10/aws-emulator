@@ -81,6 +81,8 @@ mod policy_document_principal_forms;
 mod policy_document_refusal_messages;
 #[path = "all/policy_document_scope.rs"]
 mod policy_document_scope;
+#[path = "all/pull_through_cache_import.rs"]
+mod pull_through_cache_import;
 #[path = "all/pull_through_cache_rule_deletion.rs"]
 mod pull_through_cache_rule_deletion;
 #[path = "all/pull_through_cache_rule_validation.rs"]

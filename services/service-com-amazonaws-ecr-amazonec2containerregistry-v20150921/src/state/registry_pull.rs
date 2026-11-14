@@ -27,6 +27,13 @@
 //!    and stores the image under the tag that was asked for, and every later read of that
 //!    repository — `DescribeImages`, `ListImages`, `BatchGetImage` — reports it.
 //!
+//! That import is [`import_covered_image`], and it is reached by every plane a pull of a
+//! covered reference arrives on — an in-process pull through [`serve_pull`], the
+//! `BatchGetImage` call a client makes to fetch a manifest, and the manifest `GET` of the
+//! registry endpoint a `docker pull` talks to — so the registry caches one pull the same way
+//! however it is asked, and a repository under a rule's prefix is never reported absent
+//! while the rule could have cached it.
+//!
 //! What an import stores is the registry's own record of the cached image: a manifest this
 //! registry writes, describing one configuration blob it also stores, with the digest of
 //! each computed over the bytes held ([`content_digest`]). No upstream registry is
@@ -172,9 +179,20 @@ pub fn serve_pull<Eng: Send + Sync + 'static>(
             return Ok(());
         }
     }
-    match import_through_cache_rule(&mut store, reference, now) {
-        Some(_) => Ok(()),
-        None => Err(PullRefusal::NotFound {
+    match import_covered_image(
+        &mut store,
+        &reference.region,
+        &reference.repository_name,
+        reference.tag.as_deref(),
+        now,
+    ) {
+        CacheImport::Imported(_) => Ok(()),
+        // A rule covers the repository and nothing was cached through it: the container
+        // cannot start either way, and what it is told is why.
+        CacheImport::Unavailable(message) | CacheImport::AtCapacity(message) => {
+            Err(PullRefusal::NotFound { message })
+        }
+        CacheImport::NotCovered => Err(PullRefusal::NotFound {
             message: not_found_message(&store, reference),
         }),
     }
@@ -231,8 +249,9 @@ pub fn parse_reference(image: &str) -> Option<RegistryReference> {
 /// The host layout itself is read by the one walk of it this service states
 /// ([`ecr_registry_host_parts`]); what this adds is that the account has to be the account
 /// this registry serves — a repository of another account's registry is not ours to pull
-/// from.
-fn host_region(host: &str) -> Option<String> {
+/// from. It is the one reading of "which Region did this client dial" every plane of this
+/// registry takes, the data plane included (`crate::service`'s registry endpoint).
+pub fn host_region(host: &str) -> Option<String> {
     let (account, region) = ecr_registry_host_parts(host)?;
     (account == registry_id()).then(|| region.to_string())
 }
@@ -435,34 +454,86 @@ pub fn service_pull_denied_by_repository_policy<Eng: Send + Sync + 'static>(
     None
 }
 
-/// Import the image `reference` names into the cache repository, when a pull through cache
-/// rule of this registry covers that repository — answering the digest the import stored.
+/// What a pull through cache rule answered for an image this registry does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheImport {
+    /// Nothing was cached because nothing was to be: no rule of this registry covers the
+    /// repository name, or the reference addresses a digest rather than a tag — an import
+    /// has no upstream manifest here to match a digest against, so only a tag is cached.
+    NotCovered,
+    /// The upstream image was cached, under the digest this registry stores it at.
+    Imported(String),
+    /// A rule DOES cover the repository and the upstream cannot be reached THROUGH it:
+    /// why, read off the stored rule ([`pull_through_cache_upstream_failure`]).
+    Unavailable(String),
+    /// A rule DOES cover the repository and this REGISTRY is at one of its own bounds, so
+    /// nothing was cached: which bound, in this emulator's own words. It is a local limit
+    /// rather than anything about the upstream, so a caller is told so.
+    AtCapacity(String),
+}
+
+/// Import the image `tag` names in `repository_name` into the cache repository, when a pull
+/// through cache rule of this registry covers that repository.
 ///
-/// `None` when no rule covers the repository, so there is nothing to cache, and when the
-/// registry is at a bound that a cached copy would push it past: an import stores a
-/// repository, an image, a tag and the one blob that image references, so it is held to the
-/// cap on each of them. EVERY bound is checked before ANYTHING is written, so a rejected
-/// import leaves the store exactly as it found it — a client pulling tag after tag under a
-/// cache rule is bounded by those caps rather than growing this process without end.
-fn import_through_cache_rule(
+/// "A pull through cache rule provides a way to cache images from an upstream registry
+/// source in your Amazon ECR private registry" (`CreatePullThroughCacheRule`): a repository
+/// name under a registered rule's `ecrRepositoryPrefix` is served by caching the upstream
+/// image, so the FIRST read of a reference under it CREATES the cache repository and stores
+/// the image under the tag that was asked for, and every later read of that repository
+/// reports it. This is the one place that import happens, so the API operations and the
+/// registry endpoint cache one pull the same way.
+///
+/// [`CacheImport::Unavailable`] for a rule the upstream cannot be reached THROUGH
+/// ([`pull_through_cache_upstream_failure`]), and [`CacheImport::AtCapacity`] for a registry
+/// at a bound a cached copy would push it past: an import stores a repository, an image, a
+/// tag and the one blob that image references, so it is held to the cap on each of them.
+/// EVERY bound is checked before ANYTHING is written, so a refused import leaves the store
+/// exactly as it found it — a client pulling tag after tag under a cache rule is bounded by
+/// those caps rather than growing this process without end.
+///
+/// `region` names the cache repository's ARN, and `now` is the instant it and the image it
+/// holds record as theirs.
+pub fn import_covered_image(
     store: &mut ComAmazonawsEcrAmazonec2containerregistryV20150921State,
-    reference: &RegistryReference,
+    region: &str,
+    repository_name: &str,
+    tag: Option<&str>,
     now: SystemTime,
-) -> Option<String> {
-    let rule = covering_cache_rule(store, &reference.repository_name)?;
+) -> CacheImport {
+    let Some(rule) = covering_cache_rule(store, repository_name) else {
+        return CacheImport::NotCovered;
+    };
     // A pull addressing a DIGEST names content, and an import has none to match: the
     // upstream manifest is not here to be digested, so only a tag is cached.
-    let tag = reference.tag.clone()?;
-    let upstream = upstream_reference(&rule, &reference.repository_name, &tag);
-    match store.repositories.get(&reference.repository_name) {
+    let Some(tag) = tag else {
+        return CacheImport::NotCovered;
+    };
+    // The rule is what the upstream is reached THROUGH, so a rule whose stored credential
+    // reference cannot be read caches nothing: "This is usually caused because of an issue
+    // with the Secrets Manager secret containing the credentials for the upstream registry"
+    // (`UnableToGetUpstreamImageException`), read off the rule by the one walk of it this
+    // service states ([`pull_through_cache_upstream_failure`]).
+    if let Some(reason) = pull_through_cache_upstream_failure(&rule) {
+        return CacheImport::Unavailable(reason);
+    }
+    let upstream = upstream_reference(&rule, repository_name, tag);
+    match store.repositories.get(repository_name) {
         // A cached copy the registry has no room for is not cached at all.
-        None if store.repositories.len() >= MAX_REPOSITORIES => return None,
+        None if store.repositories.len() >= MAX_REPOSITORIES => {
+            return CacheImport::AtCapacity(format!(
+                "this registry already holds the maximum of {MAX_REPOSITORIES} repositories, \
+                 so no cache repository is created for '{repository_name}'"
+            ))
+        }
         Some(repository)
             if repository.images.len() >= MAX_IMAGES_PER_REPOSITORY
                 || repository.tag_index.len() >= MAX_TAGS_PER_REPOSITORY
                 || repository.layer_blobs.len() >= MAX_IMPORTED_BLOBS_PER_REPOSITORY =>
         {
-            return None
+            return CacheImport::AtCapacity(format!(
+                "the cache repository '{repository_name}' already holds as many images, tags \
+                 or layers as this registry caches into one, so '{upstream}' is not cached"
+            ))
         }
         _ => {}
     }
@@ -471,8 +542,8 @@ fn import_through_cache_rule(
     let config_digest = content_digest(config.as_bytes());
     let repository = store
         .repositories
-        .entry(reference.repository_name.clone())
-        .or_insert_with(|| cache_repository(&reference.region, &reference.repository_name, now));
+        .entry(repository_name.to_string())
+        .or_insert_with(|| cache_repository(region, repository_name, now));
     // The configuration document the imported manifest describes is held as the blob it
     // describes, under the digest of its own bytes, so the manifest references nothing the
     // repository does not have.
@@ -494,9 +565,9 @@ fn import_through_cache_rule(
             now,
         )
     });
-    repository.move_tag(&tag, &digest);
+    repository.move_tag(tag, &digest);
     repository.refresh_image_sizes();
-    Some(digest)
+    CacheImport::Imported(digest)
 }
 
 /// The pull through cache rule that covers `repository_name`: the one whose
@@ -788,16 +859,13 @@ mod tests {
                 ..PullThroughCacheRule::default()
             },
         );
-        let reference = |tag: &str| RegistryReference {
-            region: "us-east-1".to_string(),
-            repository_name: repository_name.to_string(),
-            tag: Some(tag.to_string()),
-            digest: None,
-        };
         let now = SystemTime::UNIX_EPOCH;
         let case = "the first pull of a covered reference";
         assert!(
-            import_through_cache_rule(&mut store, &reference("1"), now).is_some(),
+            matches!(
+                import_covered_image(&mut store, "us-east-1", repository_name, Some("1"), now),
+                CacheImport::Imported(_)
+            ),
             "case {case:?}: expected the upstream image to be cached"
         );
 
@@ -828,7 +896,10 @@ mod tests {
 
         let case = "a pull past the blob cap";
         assert!(
-            import_through_cache_rule(&mut store, &reference("2"), now).is_none(),
+            matches!(
+                import_covered_image(&mut store, "us-east-1", repository_name, Some("2"), now),
+                CacheImport::AtCapacity(_)
+            ),
             "case {case:?}: expected no image to be cached"
         );
         let repository = store
