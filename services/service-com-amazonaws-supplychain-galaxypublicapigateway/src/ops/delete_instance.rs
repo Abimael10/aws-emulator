@@ -186,11 +186,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every data-lake dataset is addressed by its instance, so this instance's
         // datasets go with it rather than staying reachable under an instance the store
-        // no longer holds. Its data-lake namespaces and data-integration flows go for the
-        // same reason.
+        // no longer holds. Its data-lake namespaces, its data-integration flows and its
+        // data-integration events go for the same reason — which is also what keeps each
+        // of those per-instance bounds counted over LIVE instances only.
         store.drop_instance_datasets(&record.instance_id);
         store.drop_instance_namespaces(&record.instance_id);
         store.drop_instance_flows(&record.instance_id);
+        store.drop_instance_events(&record.instance_id);
 
         record.state = crate::state::INSTANCE_STATE_DELETING.to_string();
         // Wire-only: the record is already out of the store, so this bump shapes the

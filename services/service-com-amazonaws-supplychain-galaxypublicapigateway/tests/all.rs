@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/bill_of_materials_import_jobs.rs"]
 mod bill_of_materials_import_jobs;
+#[path = "all/data_integration_events.rs"]
+mod data_integration_events;
 #[path = "all/data_integration_flows.rs"]
 mod data_integration_flows;
 #[path = "all/data_lake_dataset_refusal_wording.rs"]

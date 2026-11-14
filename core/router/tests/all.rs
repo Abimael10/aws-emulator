@@ -4263,3 +4263,10 @@ mod cloudformation_appsync_custom_domains;
 // further lines of that header which landed here as `//!` while branches were merging are
 // gone for the same reason: past the first item `//!` is `E0753`, and the header already
 // states the rule once.)
+// leaving a note here. (Ordinary comments: an inner doc comment in this appended tail is
+// (An ordinary comment: an inner doc comment anywhere but this file's head is `E0753`.)
+// is legal only BEFORE the first item, so one appended into the tail is `E0753` and
+// compiles nothing. `all/all_rs_declares_each_suite_once.rs` and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that,
+// which is why this note stands as an ordinary comment rather than a doc comment.
+// leaving a note here. (An ordinary comment: a `//!` line in this tail is `E0753`.)

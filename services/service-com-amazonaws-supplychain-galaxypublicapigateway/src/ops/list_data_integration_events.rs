@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataIntegrationEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataIntegrationEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataIntegrationEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the data-integration events the shared store ([`crate::state`])
+//! holds for the addressed instance, keeping only the ones whose `eventType` the request
+//! named, and emits an opaque `nextToken` that names the event the next page resumes at.
+//! The store is a `BTreeMap` keyed by (`instanceId`, `eventId`), so one instance's events
+//! are contiguous and the order a page is cut from is stable — which is what keeps a token
+//! meaningful across calls.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +152,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataIntegrationEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataIntegrationEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataIntegrationEvents"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListDataIntegrationEventsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the supplychain data integration event store is unavailable on this \
+                             engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `maxResults` carries `@range(1..20)` and `@default(10)`, both applied before
+        // this handler runs, so the value is already in range here. Stating the bound
+        // where it is relied on keeps a page size of zero (which would hand a client a
+        // token that cannot advance) out of the paging loop: it is refused as the
+        // modelled `ValidationException` instead.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(size))
+            .ok_or_else(|| {
+                ListDataIntegrationEventsError::from(
+                    ListDataIntegrationEventsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "maxResults must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}, \
+                                 got {}",
+                                input.max_results
+                            )),
+                        },
+                    ),
+                )
+            })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read performs: the instance transition the clock owed at
+        // `now`, which was due whether or not anybody read anything.
+        store.materialize_due_transitions(now);
+
+        // Same gateway rule as every instance-scoped call: an `instanceId` naming no
+        // instance of this account is refused by the authorization step, before the
+        // addressed resources are looked up at all.
+        if !store.instances.contains_key(&input.instance_id) {
+            return Err(ListDataIntegrationEventsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::instance_authorization_failure_message(
+                        input.instance_id.as_str(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Where this page resumes, read AFTER the authorization step so an unknown
+        // instance is answered as the authorization failure it is rather than as a bad
+        // token. The token is opaque on the wire (hex), so a client cannot read a store
+        // key out of it, and one it did not get from a previous page of THIS query is a
+        // bad request rather than a silently truncated or restarted page.
+        let resume_at = match input.next_token.as_deref() {
+            Some(token) => Some(
+                decode_page_token(token, &input.instance_id, input.event_type.as_deref())
+                    .ok_or_else(|| {
+                        ListDataIntegrationEventsError::from(
+                            ListDataIntegrationEventsErrorModeled::ValidationException(
+                                ValidationException {
+                                    message: Some(
+                                        "nextToken is not a pagination token this service issued \
+                                         for this query"
+                                            .to_string(),
+                                    ),
+                                },
+                            ),
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+
+        let mut events = Vec::new();
+        let mut next_token = None;
+        for record in store.instance_events(&input.instance_id) {
+            if resume_at
+                .as_deref()
+                .is_some_and(|resume| record.event_id.as_str() < resume)
+            {
+                continue;
+            }
+            // `eventType` is a filter, not a page boundary: an event of another type is
+            // skipped wherever it sits in the order.
+            if input
+                .event_type
+                .as_deref()
+                .is_some_and(|event_type| record.event_type != event_type)
+            {
+                continue;
+            }
+            if events.len() >= page_size {
+                // One more event matches than fits: the token names it, so the next page
+                // resumes exactly where this one stopped.
+                next_token = Some(encode_page_token(
+                    &input.instance_id,
+                    input.event_type.as_deref(),
+                    &record.event_id,
+                ));
+                break;
+            }
+            events.push(record.to_wire());
+        }
+
+        Ok(ListDataIntegrationEventsOutput { events, next_token })
     }
+}
+
+/// The published bounds of `DataIntegrationEventMaxResults` (`@range(min: 1, max: 20)`),
+/// which is what one page of this listing holds.
+const MIN_PAGE_SIZE: usize = 1;
+const MAX_PAGE_SIZE: usize = 20;
+
+/// The stamp every token this operation issues carries: this service, the token format
+/// version, and the list it is a boundary for.
+const PAGE_STAMP: &str = "scn:1:data-integration-event:";
+
+/// The page token naming the event keyed `event_id`, for the query it was cut from: the
+/// instance addressed and the `eventType` filter in effect (empty when the request named
+/// none).
+///
+/// `DataIntegrationEventNextToken` is modelled as an opaque string of length 1..65535 and
+/// nothing else, so the token is the stamped payload hex-encoded: opaque to a client (it
+/// carries no readable store key), a little over 200 characters — well inside the modelled
+/// bound — and readable only through [`decode_page_token`]. Carrying the query identity is
+/// what lets a forged value, or one issued for another instance or another filter, be
+/// refused instead of honoured as a boundary for THIS query.
+///
+/// `:` separates the three fields because none of them can contain one: an `instanceId`
+/// and an `eventId` are hyphenated hex UUIDs, and every value of the modelled
+/// `DataIntegrationEventType` enum is dotted lowercase.
+fn encode_page_token(instance_id: &str, event_type: Option<&str>, event_id: &str) -> String {
+    ::hex::encode(
+        format!(
+            "{PAGE_STAMP}{instance_id}:{}:{event_id}",
+            event_type.unwrap_or_default()
+        )
+        .as_bytes(),
+    )
+}
+
+/// The resume key a token names, or `None` when `token` is not one this operation issued
+/// for this instance and this filter — which the caller is told as a `ValidationException`,
+/// never as a silently truncated or restarted page.
+fn decode_page_token(token: &str, instance_id: &str, event_type: Option<&str>) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let mut fields = decoded.strip_prefix(PAGE_STAMP)?.split(':');
+    let token_instance = fields.next()?;
+    let token_filter = fields.next()?;
+    let token_key = fields.next()?;
+    // Every key this operation pages on is an `eventId` of the instance and filter the
+    // page was cut from, so anything else is a boundary this service could not have
+    // issued for this query.
+    (fields.next().is_none()
+        && token_instance == instance_id
+        && token_filter == event_type.unwrap_or_default()
+        && crate::state::is_modelled_uuid(token_key))
+    .then(|| token_key.to_string())
 }

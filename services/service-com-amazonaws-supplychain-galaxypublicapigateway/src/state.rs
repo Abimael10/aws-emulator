@@ -11,9 +11,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    DataIntegrationFlow, DataIntegrationFlowSource, DataIntegrationFlowTarget,
-    DataIntegrationFlowTransformation, DataLakeDataset, DataLakeDatasetPartitionSpec,
-    DataLakeDatasetSchema, DataLakeNamespace, Instance,
+    DataIntegrationEvent, DataIntegrationEventDatasetTargetDetails, DataIntegrationFlow,
+    DataIntegrationFlowSource, DataIntegrationFlowTarget, DataIntegrationFlowTransformation,
+    DataLakeDataset, DataLakeDatasetPartitionSpec, DataLakeDatasetSchema, DataLakeNamespace,
+    Instance,
 };
 
 /// The sentence AWS Supply Chain refuses the Product Bill Of Materials (BOM) import API
@@ -459,6 +460,74 @@ pub fn namespace_key(instance_id: &str, name: &str) -> (String, String) {
     (instance_id.to_string(), name.to_string())
 }
 
+/// How many data-integration events one instance holds in this store.
+///
+/// The same reasoning as [`MAX_DATASETS_PER_INSTANCE`]: the store keeps every event for
+/// the life of the process, so the entry COUNT per instance is the growth term a caller
+/// controls (each record's size is already bounded by the modelled `@length` constraints
+/// on its members, and the event's payload is not stored at all). The bound belongs at
+/// the one site that ADDS an event — `SendDataIntegrationEvent`, which declares the
+/// modelled `ServiceQuotaExceededException` (HTTP 402) that a send past the cap is refused
+/// with, and which no read declares — so a growth site checks
+/// [`ComAmazonawsSupplychainGalaxypublicapigatewayState::data_integration_events_at_capacity`]
+/// before inserting. Together with the reclamation on instance deletion
+/// ([`ComAmazonawsSupplychainGalaxypublicapigatewayState::drop_instance_events`]) this is
+/// a bound counted per LIVE instance, so instances coming and going cannot grow the store
+/// past [`MAX_INSTANCES`] times this number. The number is the emulator's own bound, not a
+/// published AWS value: AWS quotas data-integration throughput as an adjustable limit, so
+/// no single number is the contract, and this one is far above any ordinary workflow.
+pub const MAX_DATA_INTEGRATION_EVENTS_PER_INSTANCE: usize = 500;
+
+/// The key one data-integration event is stored under: its instance, then its `eventId`
+/// — the two members `GetDataIntegrationEvent`'s URI carries as `@httpLabel`s, in that
+/// order.
+///
+/// A `BTreeMap` over this pair keeps one instance's events contiguous and in `eventId`
+/// order, so `ListDataIntegrationEvents` pages through one stable order and a page token
+/// can name the key to resume at.
+pub type DataIntegrationEventKey = (String, String);
+
+/// The [`DataIntegrationEventKey`] for one event, so every handler builds the key the
+/// same way.
+pub fn data_integration_event_key(instance_id: &str, event_id: &str) -> DataIntegrationEventKey {
+    (instance_id.to_string(), event_id.to_string())
+}
+
+/// One persisted data-integration event — the whole record, not the wire shape.
+/// [`DataIntegrationEventRecord::to_wire`] projects it onto the modelled
+/// `DataIntegrationEvent` structure, so every handler answers from exactly these stored
+/// values.
+///
+/// The event's `data` payload is deliberately NOT part of the record: the modelled
+/// `DataIntegrationEvent` shape carries no member for it (the payload is the sensitive
+/// input of the send, and the reads report only the event's metadata and the load
+/// execution it drove), so nothing a read answers could come from it.
+#[derive(Debug, Clone)]
+pub struct DataIntegrationEventRecord {
+    pub instance_id: String,
+    pub event_id: String,
+    pub event_type: String,
+    pub event_group_id: String,
+    pub event_timestamp: SystemTime,
+    /// Set only for the event type that targets a data-lake dataset directly; the model
+    /// makes the member optional for exactly that reason.
+    pub dataset_target_details: Option<DataIntegrationEventDatasetTargetDetails>,
+}
+
+impl DataIntegrationEventRecord {
+    /// This record as the modelled `DataIntegrationEvent` shape the event reads return.
+    pub fn to_wire(&self) -> DataIntegrationEvent {
+        DataIntegrationEvent {
+            instance_id: self.instance_id.clone(),
+            event_id: self.event_id.clone(),
+            event_type: self.event_type.clone(),
+            event_group_id: self.event_group_id.clone(),
+            event_timestamp: as_date_time(self.event_timestamp),
+            dataset_target_details: self.dataset_target_details.clone(),
+        }
+    }
+}
+
 /// How a data-integration flow is addressed: `(instanceId, name)` — the two `@httpLabel`
 /// members every flow operation's URI carries, in that order.
 ///
@@ -648,6 +717,11 @@ pub struct ComAmazonawsSupplychainGalaxypublicapigatewayState {
     /// Every live data-lake dataset, keyed by [`DatasetKey`]. A `BTreeMap` so an
     /// instance's datasets are contiguous and in namespace-then-name order.
     pub datasets: BTreeMap<DatasetKey, DataLakeDatasetRecord>,
+    /// Every data-integration event the service holds, keyed by
+    /// [`DataIntegrationEventKey`] (`instanceId` then `eventId`) — the pair an event read
+    /// addresses one by. A `BTreeMap` so one instance's events are contiguous and in
+    /// `eventId` order, which is the order `ListDataIntegrationEvents` pages through.
+    pub events: BTreeMap<DataIntegrationEventKey, DataIntegrationEventRecord>,
     /// Every live data-integration flow, keyed by [`FlowKey`] (`instanceId` then `name`)
     /// — the pair that identifies one flow, as every flow operation's two `@httpLabel`
     /// members do.
@@ -733,6 +807,40 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
     pub fn drop_instance_datasets(&mut self, instance_id: &str) {
         self.datasets
             .retain(|(instance, _, _), _| instance != instance_id);
+    }
+
+    /// How many data-integration events `instance_id` holds — one range scan over the
+    /// contiguous span its events occupy.
+    pub fn data_integration_event_count(&self, instance_id: &str) -> usize {
+        self.instance_events(instance_id).count()
+    }
+
+    /// Every stored event of `instance_id`, in `eventId` order: the contiguous span of
+    /// the key space that instance's events occupy.
+    pub fn instance_events<'a>(
+        &'a self,
+        instance_id: &'a str,
+    ) -> impl Iterator<Item = &'a DataIntegrationEventRecord> + 'a {
+        self.events
+            .range(data_integration_event_key(instance_id, "")..)
+            .take_while(move |((instance, _), _)| instance == instance_id)
+            .map(|(_, record)| record)
+    }
+
+    /// Whether a further event for `instance_id` would push its store past
+    /// [`MAX_DATA_INTEGRATION_EVENTS_PER_INSTANCE`]. For the one site that adds an event
+    /// to check before inserting, as the other growth sites of this store do.
+    pub fn data_integration_events_at_capacity(&self, instance_id: &str) -> bool {
+        self.data_integration_event_count(instance_id) >= MAX_DATA_INTEGRATION_EVENTS_PER_INSTANCE
+    }
+
+    /// Drop every data-integration event of `instance_id`: an event is addressed by its
+    /// instance (and by nothing else), so none of them outlives the instance whose
+    /// deletion removed it — the same rule, and the same reason, as
+    /// [`Self::drop_instance_datasets`] and [`Self::drop_instance_namespaces`].
+    pub fn drop_instance_events(&mut self, instance_id: &str) {
+        self.events
+            .retain(|(instance, _), _| instance != instance_id);
     }
 
     /// Drop every namespace of `instance_id`, for the same reason as
