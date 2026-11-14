@@ -165,7 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(view) = guard.views.get(&input.view_arn) else {
             return Err(AssociateDefaultViewErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("View not found: {}", input.view_arn)),
+                    // The ARN resolves to no view this account holds, which is the
+                    // view-not-found class: the service's one wording for it, carrying
+                    // the ARN the request named.
+                    message: Some(crate::state::view_not_found_message(&input.view_arn)),
                 },
             )
             .into());

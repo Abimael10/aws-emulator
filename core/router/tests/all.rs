@@ -7973,3 +7973,10 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // lines of that same header fragment, ordinary comments for the reason they state: the two
 // guard suites check the declarations and the notes, so check there rather than leaving a
 // note in this appended tail.)
+//! one stays HERE, ahead of the first item: lower down it is `E0753` and compiles nothing.
+// head of this file: two branches landing in the same window declared each of them here as
+// well, which is `E0428` and compiled no suite of this target.)
+// above: two branches landing in the same window each appended a declaration of it here,
+// which is `E0428` and compiled no suite of this target.)
+// copy that stood here was a second declaration two concurrent landings each appended.)
+// appended.)

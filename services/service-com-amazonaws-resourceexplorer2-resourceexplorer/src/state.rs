@@ -1015,16 +1015,32 @@ pub fn is_well_formed_view_name(name: &str) -> bool {
         .is_match(name)
 }
 
+/// The FIXED text of the refusal that reports no view exists for the ARN a request
+/// named: AWS states the class and then the ARN it was given, which is the only
+/// variable part. Held in one place so every operation that resolves a `ViewArn`
+/// against the store words that fact identically.
+pub const VIEW_NOT_FOUND_PREFIX: &str = "Views Not Found for provided arn: ";
+
+/// How this service words "the ARN you gave names no view I hold": the fixed text of
+/// [`VIEW_NOT_FOUND_PREFIX`] followed by the ARN the REQUEST carried, verbatim — not a
+/// value re-rendered from the store, which a lookup miss has none of.
+pub fn view_not_found_message(view_arn: &str) -> String {
+    format!("{VIEW_NOT_FOUND_PREFIX}{view_arn}")
+}
+
 /// The `ResourceNotFoundException` message for an own-namespace ARN that this account
 /// holds no resource for, worded with the kind of resource the ARN names — the two kinds
 /// this service owns are `index/<id>` and `view/<name>/<id>`.
+///
+/// A view ARN is worded by [`view_not_found_message`], so an operation that resolves
+/// either kind of ARN says the same thing about a missing view as one that resolves only
+/// views.
 pub fn resource_not_found_message(arn: &str) -> String {
-    let kind = match ::service_common::arn::resource_type(arn) {
-        Some("index") => "Index",
-        Some("view") => "View",
-        _ => "Resource",
-    };
-    format!("{kind} not found: {arn}")
+    match ::service_common::arn::resource_type(arn) {
+        Some("view") => view_not_found_message(arn),
+        Some("index") => format!("Index not found: {arn}"),
+        _ => format!("Resource not found: {arn}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

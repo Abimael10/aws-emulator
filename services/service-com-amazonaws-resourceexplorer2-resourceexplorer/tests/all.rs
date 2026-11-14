@@ -31,3 +31,5 @@ mod state_roundtrip;
 mod update_view;
 #[path = "all/update_index_type.rs"]
 mod update_index_type;
+#[path = "all/view_not_found_wording.rs"]
+mod view_not_found_wording;
