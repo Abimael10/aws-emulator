@@ -67,6 +67,10 @@ percent-encoding = "2"
 # Writes the account's credential report as the `text/csv` artifact `GetCredentialReport`
 # serves, so the quoting of a cell is RFC 4180's and not hand-rolled.
 csv = "1"
+# Reads a policy document while PRESERVING the text position of every value, which is what
+# locates the statement a simulation reports as having determined its decision
+# (`Statement$StartPosition` / `$EndPosition`).
+jsonc-parser = "0.26"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -26,6 +26,8 @@ use crate::ops::types::{
     PermissionsBoundaryDecisionDetail, ResourceSpecificResult, Statement,
 };
 
+use super::statement_positions::StatementSpan;
+
 use super::authorization::{DECISION_ALLOWED, DECISION_EXPLICIT_DENY, DECISION_IMPLICIT_DENY};
 
 /// The resource a simulation is about when the request names none: "if this parameter
@@ -94,6 +96,28 @@ const MAX_CONTEXT_KEY_NAME_CHARACTERS: usize = 256;
 /// Bounded for the same reason the other axes are: the keys the documents test are
 /// looked up among them.
 const MAX_SIMULATED_CONTEXT_VALUES: usize = 1_000;
+
+/// How many statements one PAGE may report as having determined its results
+/// (`EvaluationResult$MatchedStatements`), counted over every result it carries together
+/// with the per-resource results inside them.
+///
+/// The report is the part of the response whose size the request chooses TWICE over: the
+/// statements come out of the documents it supplies, and a report is carried for every pair
+/// it asks to have decided — so what bounds it has to be the PRODUCT rather than either
+/// factor, which are bounded on their own ([`MAX_SIMULATED_DOCUMENTS`],
+/// [`MAX_EVALUATIONS_PER_PAGE`]) while a document small enough for the evaluation to read
+/// (`service_common::iam_authorization::MAX_POLICY_BYTES`, 64 KiB) can still state hundreds
+/// of statements. Past the bound the request is REFUSED rather than answered with a
+/// truncated report, exactly as the context keys one page may report are
+/// ([`MAX_SIMULATED_CONTEXT_KEYS`]): a short list would read as "these are the only
+/// statements that determined the result".
+///
+/// It binds on the product alone, so it refuses no simulation whose documents are within the
+/// sizes AWS itself bounds a policy document by: a page deciding ONE pair reports every
+/// statement those documents state, and a page deciding the most pairs it may (1,000) is
+/// still answered where each of its results names the statements a managed policy document's
+/// own quota can hold (6,144 characters, so some tens of them) — twice over.
+const MAX_REPORTED_STATEMENTS_PER_PAGE: usize = 100_000;
 
 /// How a `MatchedStatements` entry names an identity-based policy the simulation decided
 /// from (`Statement$SourcePolicyType`, "the type of the policy").
@@ -485,6 +509,14 @@ pub struct Simulated<'a> {
     /// How the response names each of those documents, one per entry of
     /// [`Self::documents`].
     pub sources: &'a [String],
+    /// Where each statement of each of those documents sits in the text it was read from,
+    /// one entry per entry of [`Self::documents`]
+    /// ([`super::statement_positions::statement_spans_of`]): what locates a statement the
+    /// report names as having determined the decision.
+    pub document_spans: &'a [Vec<StatementSpan>],
+    /// Where each statement of the resource-based policy sits in the text it was read
+    /// from; empty when the request supplied no resource-based policy.
+    pub resource_policy_spans: &'a [StatementSpan],
     /// The simulated permissions boundary's documents; empty when no boundary takes part
     /// in the simulation at all.
     pub boundary: &'a [PreparedDocument],
@@ -531,6 +563,12 @@ pub async fn evaluate_page(
 ) -> Result<Vec<EvaluationResult>, String> {
     let mut results: Vec<EvaluationResult> = Vec::new();
     let mut decided_pairs = 0usize;
+    // How many statements the page has reported so far, over every result it has built and
+    // the per-resource results inside them: what the bound on the report is taken against
+    // ([`MAX_REPORTED_STATEMENTS_PER_PAGE`]), counted as each report is folded rather than
+    // over the finished page, so the request is refused at the entry that reaches the bound
+    // and nothing is retained for a page that cannot be answered.
+    let mut reported_statements = 0usize;
     for action in actions {
         let mut per_resource: Vec<ResourceSpecificResult> = Vec::new();
         // The hierarchy allowed the ACTION only where it allowed it on every resource
@@ -555,7 +593,12 @@ pub async fn evaluate_page(
         let mut missing: ::std::collections::BTreeMap<String, String> =
             ::std::collections::BTreeMap::new();
         for resource in resources {
-            let decided = decide(simulated, action, resource);
+            let decided = decide(
+                simulated,
+                action,
+                resource,
+                MAX_REPORTED_STATEMENTS_PER_PAGE.saturating_sub(reported_statements),
+            );
             if let Some(allowed) = decided.allowed_by_organizations {
                 allowed_by_organizations =
                     Some(allowed && allowed_by_organizations.unwrap_or(true));
@@ -581,6 +624,15 @@ pub async fn evaluate_page(
                      no value for, and at most that many may be reported in one simulation"
                 ));
             }
+            // The statements the pair reports count against what the whole page may report
+            // ([`MAX_REPORTED_STATEMENTS_PER_PAGE`]): the pair stopped folding one entry
+            // past what was left of that bound ([`decide`]), which is the length refused
+            // here.
+            reported_statements = reported_statements
+                .saturating_add(decided.result.matched_statements.as_ref().map_or(0, Vec::len));
+            if reported_statements > MAX_REPORTED_STATEMENTS_PER_PAGE {
+                return Err(too_many_reported_statements());
+            }
             per_resource.push(decided.result);
             decided_pairs += 1;
             // The evaluation is synchronous work inside an async handler, so it hands the
@@ -599,21 +651,44 @@ pub async fn evaluate_page(
         let first = per_resource.first().cloned().unwrap_or_default();
         // "In the top-level result, this field contains the union of matched statements
         // across all requested resources" — so the statements the action's own result
-        // reports are every resource's, each named once.
-        let mut matched: Vec<Statement> = Vec::new();
-        for result in &per_resource {
+        // reports are every resource's, each named once. The union counts against what the
+        // page may report the way each pair's own report does.
+        let mut matched = Reported::within(
+            MAX_REPORTED_STATEMENTS_PER_PAGE.saturating_sub(reported_statements),
+        );
+        let mut folded = 0usize;
+        'union: for result in &per_resource {
             for entry in result.matched_statements.iter().flatten() {
-                report_once(&mut matched, entry.clone());
+                if !matched.report(entry.clone()) {
+                    break 'union;
+                }
+                folded += 1;
+                // The union is synchronous work inside an async handler, as the decisions
+                // above it are: it hands the executor back periodically, so aggregating one
+                // action's resources never holds a worker for its whole run either.
+                if folded.is_multiple_of(EVALUATIONS_PER_YIELD) {
+                    ::tokio::task::yield_now().await;
+                }
             }
+        }
+        reported_statements = reported_statements.saturating_add(matched.len());
+        if reported_statements > MAX_REPORTED_STATEMENTS_PER_PAGE {
+            return Err(too_many_reported_statements());
         }
         results.push(EvaluationResult {
             eval_action_name: action.clone(),
             eval_resource_name: Some(first.eval_resource_name.clone()),
             eval_decision: most_restrictive(&per_resource),
-            missing_context_values: (!missing.is_empty()).then_some(missing),
+            // "In the top-level result, this field contains the deduplicated set of
+            // missing context values across all requested resources": the member is what
+            // the result reports about the keys the decision needed, so it is REPORTED
+            // whatever that set is — empty when the decision needed a value for none.
+            // Absent would be a third answer the member does not have: a caller could not
+            // tell "no key was missing" from "the keys were not reported".
+            missing_context_values: Some(missing),
             permissions_boundary_decision_detail: boundary_detail(&per_resource),
             resource_specific_results: reports_each_resource.then_some(per_resource),
-            matched_statements: Some(matched),
+            matched_statements: Some(matched.into_entries()),
             // "Specifies whether the simulated operation is allowed by the Organizations
             // service control policies that impact the simulated user's account"
             // (`OrganizationsDecisionDetail$AllowedByOrganizations`): reported for a
@@ -651,10 +726,19 @@ pub async fn evaluate_page(
 /// `MissingContextValues` is what the evaluation says it needed a value for and did not
 /// get.
 ///
+/// `may_report` is how many statements are left of what the whole page may report
+/// ([`MAX_REPORTED_STATEMENTS_PER_PAGE`]): this pair's own report stops one entry past it,
+/// which is the length [`evaluate_page`] refuses on.
+///
 /// A pair the action cannot be performed as at all — an action published with no resource
 /// type, asked about one concrete resource — is decided before any document is read: see
 /// [`super::action_resource_types`].
-fn decide(simulated: &Simulated<'_>, action: &str, resource: &str) -> Decided {
+fn decide(
+    simulated: &Simulated<'_>,
+    action: &str,
+    resource: &str,
+    may_report: usize,
+) -> Decided {
     // An action published with no resource type is performed on no resource, so a pair
     // naming one concrete resource is a request that action could not have been made as:
     // no statement of any document in force is about it — not in the identity policies,
@@ -746,24 +830,39 @@ fn decide(simulated: &Simulated<'_>, action: &str, resource: &str) -> Decided {
     } else {
         None
     };
-    let mut matched: Vec<Statement> = Vec::new();
+    // The report stops folding one entry PAST what is left of the bound the page is
+    // answered under ([`MAX_REPORTED_STATEMENTS_PER_PAGE`]), which is the length
+    // [`evaluate_page`] refuses on: the statements come out of the documents the request
+    // supplies, so without this the pair's retention would be what those documents carry
+    // rather than a constant of this module.
+    let mut matched = Reported::within(may_report);
     if let Some(contributing) = contributing {
         if identity.decision == contributing {
             for entry in &identity.matched {
-                report_once(
-                    &mut matched,
-                    statement_entry(
-                        simulated.sources.get(entry.document).cloned(),
-                        IDENTITY_POLICY_SOURCE,
-                    ),
-                );
+                let within = matched.report(statement_entry(
+                    simulated.sources.get(entry.document).cloned(),
+                    IDENTITY_POLICY_SOURCE,
+                    simulated
+                        .document_spans
+                        .get(entry.document)
+                        .and_then(|spans| spans.get(entry.statement)),
+                ));
+                if !within {
+                    break;
+                }
             }
         }
-        if from_resource.decision == contributing && !from_resource.matched.is_empty() {
-            report_once(
-                &mut matched,
-                statement_entry(Some(RESOURCE_POLICY_ID.to_string()), RESOURCE_POLICY_SOURCE),
-            );
+        if from_resource.decision == contributing && !matched.is_past_budget() {
+            for entry in &from_resource.matched {
+                let within = matched.report(statement_entry(
+                    Some(RESOURCE_POLICY_ID.to_string()),
+                    RESOURCE_POLICY_SOURCE,
+                    simulated.resource_policy_spans.get(entry.statement),
+                ));
+                if !within {
+                    break;
+                }
+            }
         }
     }
 
@@ -794,7 +893,7 @@ fn decide(simulated: &Simulated<'_>, action: &str, resource: &str) -> Decided {
                 );
                 (!missing.is_empty()).then_some(missing)
             },
-            matched_statements: Some(matched),
+            matched_statements: Some(matched.into_entries()),
             eval_decision_details: None,
             permissions_boundary_decision_detail: (!no_boundary).then_some(
                 PermissionsBoundaryDecisionDetail {
@@ -957,33 +1056,122 @@ fn boundary_detail(
         )
 }
 
-/// One `MatchedStatements` entry: which policy a contributing statement is in, and of
-/// which kind.
+/// One `MatchedStatements` entry: which policy a contributing statement is in, of which
+/// kind, and WHERE in that policy's text the statement is.
 ///
 /// `StartPosition`/`EndPosition` are "the row and column of the beginning/end of the
-/// Statement in an IAM policy", which nothing here measures — reporting a position that
-/// was not measured would be worse than reporting none, so they stay absent, and the
-/// source identification they are reported beside does not depend on them.
-fn statement_entry(source_policy_id: Option<String>, source_policy_type: &str) -> Statement {
+/// Statement in an IAM policy", which is the span the statement occupies in the document
+/// it was read from ([`super::statement_positions`]) — so the entry points a caller at the
+/// statement that determined the decision and not merely at the policy carrying it. A
+/// statement whose span was not measured carries none: reporting a position nothing
+/// measured would be worse than reporting none, and the source identification beside it
+/// does not depend on it.
+fn statement_entry(
+    source_policy_id: Option<String>,
+    source_policy_type: &str,
+    span: Option<&StatementSpan>,
+) -> Statement {
     Statement {
         source_policy_id,
         source_policy_type: Some(source_policy_type.to_string()),
-        start_position: None,
-        end_position: None,
+        start_position: span.map(|span| span.start.clone()),
+        end_position: span.map(|span| span.end.clone()),
     }
 }
 
-/// Append `entry` to `into` unless the same policy is already named there.
+/// The `MatchedStatements` report of one result, as it is built.
 ///
-/// Without the statement positions, two contributing statements of ONE policy are the
-/// same entry — the policy they are in and its kind — and the member is a list of what
-/// determined the result, so naming that policy twice would report a distinction the
-/// response does not carry.
-fn report_once(into: &mut Vec<Statement>, entry: Statement) {
-    if !into.iter().any(|held| {
-        held.source_policy_id == entry.source_policy_id
-            && held.source_policy_type == entry.source_policy_type
-    }) {
-        into.push(entry);
+/// `MatchedStatements` is "a list of the STATEMENTS in the input policies that determine
+/// the result", so each contributing statement is its own entry, told apart from another of
+/// the same policy by the span it occupies in that policy. What is folded is the SAME
+/// statement reported twice: the action's own result is the union of its resources'
+/// ([`evaluate_page`]), and a statement that decided two of them determined one result.
+/// Two statements whose span was not measured at all are one entry, the way they were
+/// before any position was: the response then carries no distinction between them.
+///
+/// The statements already reported are held as a SET beside the entries, so folding one
+/// report of many pieces costs a lookup per entry rather than a scan of everything reported
+/// so far — the entries come from the documents the request supplies, so a scan would make
+/// the fold quadratic in what those documents carry.
+#[derive(Debug)]
+struct Reported {
+    /// The entries, in report order.
+    entries: Vec<Statement>,
+    /// The identity of each of them, for the fold above.
+    held: ::std::collections::BTreeSet<ReportedStatement>,
+    /// The most entries this report may hold for the page carrying it to be answered at
+    /// all: what is left of [`MAX_REPORTED_STATEMENTS_PER_PAGE`] when the report is started.
+    budget: usize,
+}
+
+impl Reported {
+    /// A report that may hold `budget` entries.
+    fn within(budget: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            held: ::std::collections::BTreeSet::new(),
+            budget,
+        }
     }
+
+    /// Report `entry` unless the same statement is already reported, answering whether the
+    /// report may still take another: it may not once it is one entry PAST its budget, which
+    /// is the length its caller refuses on — so nothing is retained for a page that cannot
+    /// be answered.
+    fn report(&mut self, entry: Statement) -> bool {
+        if self.held.insert(reported_statement(&entry)) {
+            self.entries.push(entry);
+        }
+        !self.is_past_budget()
+    }
+
+    /// Whether the report is already past that budget.
+    fn is_past_budget(&self) -> bool {
+        self.entries.len() > self.budget
+    }
+
+    /// How many statements the report names.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The entries themselves, as the member carries them.
+    fn into_entries(self) -> Vec<Statement> {
+        self.entries
+    }
+}
+
+/// What makes one `MatchedStatements` entry the same statement as another: the policy it is
+/// in, of which kind, and where in that policy it is — each position as the pair of numbers
+/// it is, since the modelled structure carries neither equality nor an order of its own.
+type ReportedStatement = (
+    Option<String>,
+    Option<String>,
+    Option<(i32, i32)>,
+    Option<(i32, i32)>,
+);
+
+/// The identity of one entry, for [`Reported`] to fold a report by.
+fn reported_statement(entry: &Statement) -> ReportedStatement {
+    (
+        entry.source_policy_id.clone(),
+        entry.source_policy_type.clone(),
+        entry.start_position.as_ref().map(position_of),
+        entry.end_position.as_ref().map(position_of),
+    )
+}
+
+/// One `Position` as the pair of numbers it is.
+fn position_of(position: &crate::ops::types::Position) -> (i32, i32) {
+    (position.line, position.column)
+}
+
+/// How a request whose results are determined by more statements than one page may report
+/// is refused ([`MAX_REPORTED_STATEMENTS_PER_PAGE`]).
+fn too_many_reported_statements() -> String {
+    format!(
+        "Invalid value for PolicyInputList: the policies in force determine the results of \
+         this page with more than {MAX_REPORTED_STATEMENTS_PER_PAGE} statements, and at most \
+         that many may be reported in one simulation"
+    )
 }

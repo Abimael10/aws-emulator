@@ -452,25 +452,36 @@ async fn the_actions_result_reports_the_most_restrictive_resource_decision() {
             "case {case:?}: expected the action's result to report {expected}, got {body}"
         );
         // "In the top-level result, this field contains the union of matched statements
-        // across all requested resources": the one document decided every resource the
-        // statements are about, so it is named once — and not at all where no statement
-        // was about any of them.
-        let expected_matched: Vec<(String, String)> = if per_resource
-            .iter()
-            .all(|decision| *decision == IMPLICIT_DENY)
-        {
-            Vec::new()
-        } else {
-            vec![(
+        // across all requested resources": the member lists the STATEMENTS that determined
+        // the result, so the union names the statement that allowed (where any resource
+        // was allowed) and the one that denied (where any was denied) — two statements of
+        // this one document, each located by its own span in it — and names nothing where
+        // no statement was about any resource.
+        let named = usize::from(per_resource.contains(&ALLOWED))
+            + usize::from(per_resource.contains(&EXPLICIT_DENY));
+        let expected_matched: Vec<(String, String)> = std::iter::repeat_n(
+            (
                 user_inline_policy_id(AGGREGATE_USER, AGGREGATE_POLICY_NAME),
                 IDENTITY_POLICY.to_string(),
-            )]
-        };
+            ),
+            named,
+        )
+        .collect();
         let (top, _) = parts(&body);
         assert_eq!(
             attribution(top),
             expected_matched,
             "case {case:?}: expected the action's result to name {expected_matched:?}, got {body}"
+        );
+        // Each of those entries is a different statement, which is what the span it
+        // carries says: two entries of one document are told apart by where they are in it.
+        let spans = elements(top, "Column");
+        let distinct: std::collections::BTreeSet<&String> = spans.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            spans.len(),
+            "case {case:?}: expected every named statement to carry its own span, got \
+             {spans:?} in {body}"
         );
     }
 }

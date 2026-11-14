@@ -396,6 +396,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|at| format!("{}.{at}", simulation::SUPPLIED_POLICY_ID))
             .collect();
         let prepared = ::service_common::iam_authorization::prepare_documents(&supplied);
+        // Where each statement of each supplied document sits in the text the request
+        // carried it as: measured once per request, since the span a report names a
+        // statement by is a fact about the document and not about the pair being decided
+        // (`crate::state::statement_positions`).
+        let document_spans = crate::state::statement_spans_of(&supplied);
         let prepared_boundary = ::service_common::iam_authorization::prepare_documents(&boundary);
         let prepared_levels: Vec<Vec<::service_common::iam_authorization::PreparedDocument>> =
             organization_levels
@@ -409,6 +414,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resource_policy
             .as_deref()
             .map(::service_common::iam_authorization::PreparedDocument::read);
+        let resource_policy_spans = input
+            .resource_policy
+            .as_deref()
+            .map(crate::state::statement_spans)
+            .unwrap_or_default();
         // The identity a resource-based statement's `Principal` element is matched
         // against. A request that supplies no resource-based policy names no caller
         // either, and then nothing in the simulation is about a principal: an
@@ -428,6 +438,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let simulated = simulation::Simulated {
             documents: &prepared,
             sources: &sources,
+            document_spans: &document_spans,
+            resource_policy_spans: &resource_policy_spans,
             boundary: &prepared_boundary,
             organization_levels: &prepared_levels,
             resource_policy: prepared_resource_policy.as_ref(),

@@ -14404,6 +14404,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "http",
+ "jsonc-parser",
  "md-5 0.10.6",
  "percent-encoding",
  "pkcs1",

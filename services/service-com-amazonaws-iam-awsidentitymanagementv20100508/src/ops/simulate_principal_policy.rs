@@ -531,6 +531,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = simulation::page_size(input.max_items, resources.len());
 
         let prepared = ::service_common::iam_authorization::prepare_documents(&documents);
+        // Where each statement of each document in force sits in the text it is held as:
+        // measured once per request, since the span a report names a statement by is a fact
+        // about the document and not about the pair being decided
+        // (`crate::state::statement_positions`).
+        let document_spans = crate::state::statement_spans_of(&documents);
         let prepared_boundary = ::service_common::iam_authorization::prepare_documents(&boundary);
         // "A resource-based policy to include in the simulation provided as a string.
         // Each resource in the simulation is treated as if it had this policy attached":
@@ -539,6 +544,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resource_policy
             .as_deref()
             .map(::service_common::iam_authorization::PreparedDocument::read);
+        let resource_policy_spans = input
+            .resource_policy
+            .as_deref()
+            .map(crate::state::statement_spans)
+            .unwrap_or_default();
         // "The ARN of the IAM user, group, or role that you want to specify as the
         // simulated caller of the API operations. If you do not specify a CallerArn, it
         // defaults to the ARN of the user, group, or role that you specify in
@@ -565,6 +575,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let simulated = simulation::Simulated {
             documents: &prepared,
             sources: &sources,
+            document_spans: &document_spans,
+            resource_policy_spans: &resource_policy_spans,
             boundary: &prepared_boundary,
             // This operation takes no SCP hierarchy, so no service control policy takes
             // part in the decision and nothing about an organization is reported.
