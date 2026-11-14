@@ -46,18 +46,22 @@ use super::outcome::{Bounce, RecipientOutcome};
 /// document carries for it, and the `detail-type` an event of it carries on an event bus.
 /// The modelled value is what a destination's `MatchingEventTypes` names (see
 /// `crate::ops::types::EVENT_TYPE_VALUES`); the published spelling is the one the
-/// notification document uses; the bus spelling is the email event the envelope is named
-/// after ([`super::event_bridge`]).
-const SEND: (&str, &str, &str) = ("SEND", "Send", "Email Send");
+/// notification document uses; the bus spelling is the one Amazon SES's event-publishing
+/// documentation gives that event type for an EventBridge destination
+/// ([`super::event_bridge`]), which names WHAT HAPPENED to the message rather than
+/// repeating the event type's own spelling — the acceptance is "Email Sent", not "Email
+/// Send" — and is what a rule over one email event matches on.
+const SEND: (&str, &str, &str) = ("SEND", "Send", "Email Sent");
 
 /// The same triple for a message that reached a recipient.
-const DELIVERY: (&str, &str, &str) = ("DELIVERY", "Delivery", "Email Delivery");
+const DELIVERY: (&str, &str, &str) = ("DELIVERY", "Delivery", "Email Delivered");
 
 /// The same triple for a message that failed for a recipient.
-const BOUNCE: (&str, &str, &str) = ("BOUNCE", "Bounce", "Email Bounce");
+const BOUNCE: (&str, &str, &str) = ("BOUNCE", "Bounce", "Email Bounced");
 
-/// The same triple for a message a recipient reported as unwanted.
-const COMPLAINT: (&str, &str, &str) = ("COMPLAINT", "Complaint", "Email Complaint");
+/// The same triple for a message a recipient reported as unwanted: the event is the
+/// RECEIPT of the recipient's report, which is what its documented name says.
+const COMPLAINT: (&str, &str, &str) = ("COMPLAINT", "Complaint", "Email Complaint Received");
 
 /// The message tag SES applies to every send made through a configuration set: the set
 /// itself. A destination publishes it as a CloudWatch dimension only where its own

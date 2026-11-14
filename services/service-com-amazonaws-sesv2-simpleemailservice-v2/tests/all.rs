@@ -127,6 +127,8 @@ mod email_template_updates;
 mod email_templates;
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
+#[path = "all/event_bridge_email_event_detail_types.rs"]
+mod event_bridge_email_event_detail_types;
 #[path = "all/event_bridge_event_destination_delivery.rs"]
 mod event_bridge_event_destination_delivery;
 #[path = "all/event_bridge_rule_invokes_a_lambda_target.rs"]

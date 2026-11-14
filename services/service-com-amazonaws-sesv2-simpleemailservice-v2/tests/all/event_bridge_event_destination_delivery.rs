@@ -36,7 +36,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every call below is signed for, and so the Region of the bus, the queue and
 /// the rule.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The sender every send is from, and the domain identity that authorises it.
 const SENDER: &str = "sender@senders.example.com";
@@ -47,7 +47,7 @@ const SUBJECT: &str = "a message under test";
 
 /// The `source` Amazon SES publishes a configuration set's email events under, which is
 /// what the rule below matches on.
-const SES_EVENT_SOURCE: &str = "aws.ses";
+pub(crate) const SES_EVENT_SOURCE: &str = "aws.ses";
 
 /// The message tag SES applies to every send made through a configuration set, which the
 /// published document reports under `mail.tags`.
@@ -55,7 +55,7 @@ const CONFIGURATION_SET_TAG: &str = "ses:configuration-set";
 
 /// Every value of the `EventType` enum
 /// (`smithy_query(query="shape",shape="EventType",model_path="services/service-com-amazonaws-sesv2-simpleemailservice-v2/smithy-model/com-amazonaws-sesv2-simpleemailservice-v2.json")`).
-const EVERY_EVENT_TYPE: &[&str] = &[
+pub(crate) const EVERY_EVENT_TYPE: &[&str] = &[
     "BOUNCE",
     "CLICK",
     "COMPLAINT",
@@ -71,9 +71,9 @@ const EVERY_EVENT_TYPE: &[&str] = &[
 /// The mailbox-simulator addresses a send below is addressed to, and what each does with the
 /// message (`state::event_publication::outcome`): `success` takes it, `bounce` is an unknown
 /// user, `complaint` takes it and reports it.
-const SUCCESS: &str = "success@simulator.amazonses.com";
-const BOUNCING: &str = "bounce@simulator.amazonses.com";
-const COMPLAINING: &str = "complaint@simulator.amazonses.com";
+pub(crate) const SUCCESS: &str = "success@simulator.amazonses.com";
+pub(crate) const BOUNCING: &str = "bounce@simulator.amazonses.com";
+pub(crate) const COMPLAINING: &str = "complaint@simulator.amazonses.com";
 const ALSO_SUCCESS: &str = "ooto@simulator.amazonses.com";
 
 /// The `x-amz-target` prefixes and JSON versions the two other surfaces serve (each
@@ -100,13 +100,13 @@ const SETTLED_READS: usize = 64;
 /// One event a row expects on the bus: the `detail-type` its envelope carries, the
 /// `eventType` its detail is of, and the addresses the detail itself names.
 #[derive(Clone, Copy)]
-struct Expected {
-    detail_type: &'static str,
-    event_type: &'static str,
+pub(crate) struct Expected {
+    pub(crate) detail_type: &'static str,
+    pub(crate) event_type: &'static str,
     /// The recipients the detail's own list is about, in the order the send addressed them.
-    addresses: &'static [&'static str],
+    pub(crate) addresses: &'static [&'static str],
     /// `(bounceType, bounceSubType)` for a failure, `None` for every other event.
-    bounce: Option<(&'static str, &'static str)>,
+    pub(crate) bounce: Option<(&'static str, &'static str)>,
 }
 
 /// One row of the table.
@@ -133,13 +133,13 @@ const ROWS: &[Row] = &[
         recipients: &[BOUNCING],
         expected: &[
             Expected {
-                detail_type: "Email Send",
+                detail_type: "Email Sent",
                 event_type: "Send",
                 addresses: &[BOUNCING],
                 bounce: None,
             },
             Expected {
-                detail_type: "Email Bounce",
+                detail_type: "Email Bounced",
                 event_type: "Bounce",
                 addresses: &[BOUNCING],
                 bounce: Some(("Permanent", "General")),
@@ -154,13 +154,13 @@ const ROWS: &[Row] = &[
         recipients: &[SUCCESS],
         expected: &[
             Expected {
-                detail_type: "Email Send",
+                detail_type: "Email Sent",
                 event_type: "Send",
                 addresses: &[SUCCESS],
                 bounce: None,
             },
             Expected {
-                detail_type: "Email Delivery",
+                detail_type: "Email Delivered",
                 event_type: "Delivery",
                 addresses: &[SUCCESS],
                 bounce: None,
@@ -175,19 +175,19 @@ const ROWS: &[Row] = &[
         recipients: &[COMPLAINING],
         expected: &[
             Expected {
-                detail_type: "Email Send",
+                detail_type: "Email Sent",
                 event_type: "Send",
                 addresses: &[COMPLAINING],
                 bounce: None,
             },
             Expected {
-                detail_type: "Email Delivery",
+                detail_type: "Email Delivered",
                 event_type: "Delivery",
                 addresses: &[COMPLAINING],
                 bounce: None,
             },
             Expected {
-                detail_type: "Email Complaint",
+                detail_type: "Email Complaint Received",
                 event_type: "Complaint",
                 addresses: &[COMPLAINING],
                 bounce: None,
@@ -202,19 +202,19 @@ const ROWS: &[Row] = &[
         recipients: &[BOUNCING, SUCCESS],
         expected: &[
             Expected {
-                detail_type: "Email Send",
+                detail_type: "Email Sent",
                 event_type: "Send",
                 addresses: &[BOUNCING, SUCCESS],
                 bounce: None,
             },
             Expected {
-                detail_type: "Email Bounce",
+                detail_type: "Email Bounced",
                 event_type: "Bounce",
                 addresses: &[BOUNCING],
                 bounce: Some(("Permanent", "General")),
             },
             Expected {
-                detail_type: "Email Delivery",
+                detail_type: "Email Delivered",
                 event_type: "Delivery",
                 addresses: &[SUCCESS],
                 bounce: None,
@@ -228,7 +228,7 @@ const ROWS: &[Row] = &[
         matching: &["DELIVERY"],
         recipients: &[SUCCESS, ALSO_SUCCESS],
         expected: &[Expected {
-            detail_type: "Email Delivery",
+            detail_type: "Email Delivered",
             event_type: "Delivery",
             addresses: &[SUCCESS, ALSO_SUCCESS],
             bounce: None,
@@ -241,7 +241,7 @@ const ROWS: &[Row] = &[
         matching: &["BOUNCE"],
         recipients: &[BOUNCING],
         expected: &[Expected {
-            detail_type: "Email Bounce",
+            detail_type: "Email Bounced",
             event_type: "Bounce",
             addresses: &[BOUNCING],
             bounce: Some(("Permanent", "General")),
@@ -255,13 +255,13 @@ const ROWS: &[Row] = &[
         recipients: &[SUCCESS],
         expected: &[
             Expected {
-                detail_type: "Email Send",
+                detail_type: "Email Sent",
                 event_type: "Send",
                 addresses: &[SUCCESS],
                 bounce: None,
             },
             Expected {
-                detail_type: "Email Delivery",
+                detail_type: "Email Delivered",
                 event_type: "Delivery",
                 addresses: &[SUCCESS],
                 bounce: None,
@@ -306,13 +306,13 @@ impl Reply {
 
 /// The emulator under test: this service, EventBridge and Amazon SQS on ONE engine, the
 /// shape `core/router/src/lib.rs` mounts every service in.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These cases exercise handler behaviour, not SigV4.
@@ -409,7 +409,7 @@ impl Emulator {
     }
 
     /// The account with a verified sending domain, so every send below is authorised.
-    async fn given_verified_sender(&self, case: &str) {
+    pub(crate) async fn given_verified_sender(&self, case: &str) {
         self.ses_ok(
             case,
             "POST",
@@ -434,7 +434,7 @@ impl Emulator {
 
     /// A configuration set carrying one EventBridge event destination, onto the account's
     /// default bus.
-    async fn given_destination(
+    pub(crate) async fn given_destination(
         &self,
         case: &str,
         set: &str,
@@ -465,7 +465,7 @@ impl Emulator {
     }
 
     /// A queue whose own policy admits the EventBridge delivery; answers its url.
-    async fn given_queue(&self, case: &str, name: &str) -> String {
+    pub(crate) async fn given_queue(&self, case: &str, name: &str) -> String {
         let created = self.sqs(case, "CreateQueue", &json!({"QueueName": name})).await;
         let url = created["QueueUrl"]
             .as_str()
@@ -507,7 +507,7 @@ impl Emulator {
 
     /// A rule of the default bus matching `pattern`, with the queue at `queue_arn` as its
     /// one target.
-    async fn given_rule(&self, case: &str, name: &str, pattern: &Value, queue_arn: &str) {
+    pub(crate) async fn given_rule(&self, case: &str, name: &str, pattern: &Value, queue_arn: &str) {
         self.events(
             case,
             "PutRule",
@@ -532,7 +532,7 @@ impl Emulator {
     }
 
     /// `SendEmail` through `set` to `recipients`, answering the `MessageId` it minted.
-    async fn send(&self, case: &str, set: &str, recipients: &[&str]) -> String {
+    pub(crate) async fn send(&self, case: &str, set: &str, recipients: &[&str]) -> String {
         let request = json!({
             "FromEmailAddress": SENDER,
             "Destination": {"ToAddresses": recipients},
@@ -556,7 +556,7 @@ impl Emulator {
 
     /// Every message waiting on the queue at `url` right now, as the parsed envelope each
     /// body carries.
-    async fn received(&self, case: &str, url: &str) -> Vec<Value> {
+    pub(crate) async fn received(&self, case: &str, url: &str) -> Vec<Value> {
         let answered = self
             .sqs(
                 case,
@@ -590,9 +590,18 @@ fn authorization(signing_name: &str) -> String {
 
 /// The ARN of the account's default event bus in this Region, which is the only bus an
 /// `EventBridgeDestination` supports (`EventBridgeDestination$EventBusArn`).
-fn default_bus_arn() -> String {
+pub(crate) fn default_bus_arn() -> String {
     format!(
         "arn:aws:events:{REGION}:{}:event-bus/default",
+        engine::emulator_account_id()
+    )
+}
+
+/// The ARN of the queue named `name` in this account and Region, which is what a rule's
+/// target is addressed by.
+pub(crate) fn queue_arn(name: &str) -> String {
+    format!(
+        "arn:aws:sqs:{REGION}:{}:{name}",
         engine::emulator_account_id()
     )
 }
@@ -630,7 +639,13 @@ fn addresses_of(event_type: &str, detail: &Value) -> Vec<String> {
 
 /// Assert ONE delivered envelope against the event `expected` describes, for the send that
 /// minted `message_id` through `set`.
-fn assert_event(case: &str, expected: &Expected, envelope: &Value, set: &str, message_id: &str) {
+pub(crate) fn assert_event(
+    case: &str,
+    expected: &Expected,
+    envelope: &Value,
+    set: &str,
+    message_id: &str,
+) {
     let detail = &envelope["detail"];
     assert_eq!(
         envelope["source"],
@@ -689,7 +704,7 @@ fn assert_event(case: &str, expected: &Expected, envelope: &Value, set: &str, me
 
 /// The envelopes the queue holds once the events `wanted` many are all there, and then once
 /// what it holds has settled.
-async fn settled_envelopes(
+pub(crate) async fn settled_envelopes(
     emulator: &Emulator,
     case: &str,
     url: &str,
@@ -724,10 +739,7 @@ async fn a_send_publishes_one_bus_event_per_matched_email_event() {
             .given_destination(case, row.set, row.enabled, row.matching)
             .await;
         let url = emulator.given_queue(case, "ses-events-queue").await;
-        let arn = format!(
-            "arn:aws:sqs:{REGION}:{}:ses-events-queue",
-            engine::emulator_account_id()
-        );
+        let arn = queue_arn("ses-events-queue");
         emulator
             .given_rule(
                 case,
@@ -783,15 +795,12 @@ async fn a_rule_matching_one_detail_type_receives_only_that_email_event() {
         .given_destination(case, set, true, EVERY_EVENT_TYPE)
         .await;
     let url = emulator.given_queue(case, "bounce-only-queue").await;
-    let arn = format!(
-        "arn:aws:sqs:{REGION}:{}:bounce-only-queue",
-        engine::emulator_account_id()
-    );
+    let arn = queue_arn("bounce-only-queue");
     emulator
         .given_rule(
             case,
             "bounce-only-rule",
-            &json!({"source": [SES_EVENT_SOURCE], "detail-type": ["Email Bounce"]}),
+            &json!({"source": [SES_EVENT_SOURCE], "detail-type": ["Email Bounced"]}),
             &arn,
         )
         .await;
@@ -806,7 +815,7 @@ async fn a_rule_matching_one_detail_type_receives_only_that_email_event() {
     assert_event(
         case,
         &Expected {
-            detail_type: "Email Bounce",
+            detail_type: "Email Bounced",
             event_type: "Bounce",
             addresses: &[BOUNCING],
             bounce: Some(("Permanent", "General")),
@@ -838,10 +847,7 @@ async fn a_send_without_a_configuration_set_publishes_nothing() {
         )
         .await;
     let url = emulator.given_queue(case, "quiet-queue").await;
-    let arn = format!(
-        "arn:aws:sqs:{REGION}:{}:quiet-queue",
-        engine::emulator_account_id()
-    );
+    let arn = queue_arn("quiet-queue");
     emulator
         .given_rule(
             case,

@@ -118,11 +118,11 @@ const ROWS: &[Row] = &[
         recipient: "bounce@simulator.amazonses.com",
         expected: &[
             Relayed {
-                detail_type: "Email Send",
+                detail_type: "Email Sent",
                 event_type: "Send",
             },
             Relayed {
-                detail_type: "Email Bounce",
+                detail_type: "Email Bounced",
                 event_type: "Bounce",
             },
         ],
@@ -133,11 +133,11 @@ const ROWS: &[Row] = &[
         recipient: "success@simulator.amazonses.com",
         expected: &[
             Relayed {
-                detail_type: "Email Send",
+                detail_type: "Email Sent",
                 event_type: "Send",
             },
             Relayed {
-                detail_type: "Email Delivery",
+                detail_type: "Email Delivered",
                 event_type: "Delivery",
             },
         ],
