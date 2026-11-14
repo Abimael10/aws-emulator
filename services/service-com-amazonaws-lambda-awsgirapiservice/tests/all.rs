@@ -311,6 +311,8 @@ mod handler_dynamodb_resource;
 mod handler_image_analysis_sdk;
 #[path = "all/handler_email_sdk.rs"]
 mod handler_email_sdk;
+#[path = "all/handler_object_and_item_store_sdk.rs"]
+mod handler_object_and_item_store_sdk;
 #[path = "all/handler_object_encryption_members.rs"]
 mod handler_object_encryption_members;
 #[path = "all/handler_object_storage_sdk.rs"]

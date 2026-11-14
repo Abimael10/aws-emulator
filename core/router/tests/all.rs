@@ -7882,3 +7882,25 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // deploy it and then read what each leg received.
 // declarations and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` the notes,
 // than leaving a note in the appended tail below.
+// (Notes from concurrent landings stood here, each recording a declaration one of them had
+// appended a second time; every declaration they record stands once, in the sorted span its
+// own name belongs to.)
+// (More such notes stood here: fragments of this file's own header that landings appended
+// into the tail, where `//!` is `E0753`, and records of declarations appended twice. The
+// rule they repeated is in the module doc at the head of this file.)
+// (And more of the same, now gone: the two guard suites named in the header check both
+// halves of the rule for this file and for every service crate's `tests/all.rs`.)
+// (And more of the same again, now gone for the same reason.)
+// The tail ends here. Declare a new suite in the sorted span its name belongs to, and
+// check it is not declared already: a module declared twice is `E0428` and compiles no
+// suite of this target, and a note written with `//!` past the first item is `E0753` and
+// does the same, so a note down here is an ordinary comment.
+// (Pruned here: copies of this file's own header that concurrent landings appended into
+// this tail, and notes about declarations that are no longer duplicated. An inner doc
+// comment is legal only before the first item, so a `//!` line in this tail is `E0753` and
+// compiles no suite of this target; the rules themselves stand in the module doc at the
+// (Pruned for the same two reasons: more copies of that header, and more bookkeeping about
+// declarations that stand once already.)
+// (And the rest of the same, pruned: no declaration stood among these notes.)
+// Nothing stands below this line. Declare a new suite in the sorted span its own name
+// belongs to, with its `#[path]` line, and check it is not declared already.
