@@ -10,10 +10,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 mod blueprint_format;
+mod ingest_delivery;
+mod ingest_endpoint;
+mod pipeline_configuration;
 
 pub use blueprint_format::{
-    BlueprintFormat, UnrenderableBlueprint, BLUEPRINT_FORMATS, BLUEPRINT_FORMAT_JSON,
-    BLUEPRINT_FORMAT_PATTERN, BLUEPRINT_FORMAT_YAML,
+    document_as_json, BlueprintFormat, UnrenderableBlueprint, BLUEPRINT_FORMATS,
+    BLUEPRINT_FORMAT_JSON, BLUEPRINT_FORMAT_PATTERN, BLUEPRINT_FORMAT_YAML,
+};
+pub use ingest_delivery::{
+    delivered, object_bytes, object_key, DeliveredObject, UndeliveredRecords,
+};
+pub use ingest_endpoint::{
+    addressed_pipeline, aws_ingest_endpoint_host, emulator_authority, ingest_endpoint_urls,
+    ingest_plane_base, DATA_PLANE_SEGMENT,
+};
+pub use pipeline_configuration::{
+    ingest_routes, normalized_path, route_at, IngestRoute, PipelineSink, S3Sink, SinkCodec,
+    DEFAULT_HTTP_SOURCE_PATH, HTTP_SOURCE, S3_SINK,
 };
 
 use crate::ops::types::{
@@ -272,9 +286,12 @@ impl StoredPipeline {
             buffer_options: self.buffer_options.clone(),
             encryption_at_rest_options: self.encryption_at_rest_options.clone(),
             // The VPC endpoint service name and the service-managed VPC endpoints belong
-            // to VPC attachment modes this emulator does not model yet; `Destinations` is
-            // read out of the Data Prepper configuration body, which nothing parses yet.
-            // Absent is the honest answer for all three.
+            // to VPC attachment modes this emulator does not model yet. `Destinations`
+            // reports "destinations to which the pipeline writes data": the sinks of the
+            // configuration body are read now (`super::pipeline_configuration`), but the
+            // `ServiceName` label and `Endpoint` form AWS reports for each sink kind are not
+            // in the model or its docs, so inventing them would report a destination nothing
+            // derived. Absent is the honest answer for all three.
             vpc_endpoint_service: None,
             service_vpc_endpoints: None,
             destinations: None,
@@ -753,19 +770,6 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// (`^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):osis:.+:pipeline/.+$`) requires.
 pub fn pipeline_arn(region: &str, pipeline_name: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("pipeline/{pipeline_name}"))
-}
-
-/// The ingestion endpoint host of a pipeline.
-///
-/// OpenSearch Ingestion publishes one host per pipeline, shaped
-/// `<pipeline-name>-<pipeline-id>.<region>.osis.amazonaws.com`. The id segment is
-/// content-derived (a digest of the pipeline's own ARN, so it is stable across reads,
-/// differs between two pipelines, and never leaks a clock or a request id) and uses the
-/// same alphabet AWS's does.
-pub fn ingest_endpoint_urls(region: &str, pipeline_name: &str, pipeline_arn: &str) -> Vec<String> {
-    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(pipeline_arn.as_bytes());
-    let id = ::hex::encode(&digest[..5]);
-    vec![format!("{pipeline_name}-{id}.{region}.{ARN_SERVICE}.amazonaws.com")]
 }
 
 /// The id of the VPC interface endpoint the service creates for a VPC-attached pipeline.

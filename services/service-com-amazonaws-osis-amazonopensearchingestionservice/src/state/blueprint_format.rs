@@ -9,9 +9,12 @@
 //! `@pattern("^(YAML|JSON)$")`), so the JSON form is COMPUTED from the stored YAML rather
 //! than kept as a second copy that could drift from it.
 //!
-//! The document read here is the service's OWN published data — the catalog constant in
-//! [`crate::state`] — never a caller's: no operation writes a blueprint, so nothing in a
-//! request decides how large or how deeply nested the text handed to the parser is.
+//! The document this module renders is the service's OWN published data — the catalog
+//! constant in [`crate::state`] — so nothing in a request decides how large or how deeply
+//! nested the text it hands the parser is. The reading itself ([`document_as_json`]) is also
+//! what [`super::pipeline_configuration`] reads a CALLER's pipeline configuration with; that
+//! caller bounds its own text's nesting before asking, because the shape of a caller's
+//! document is the caller's to choose.
 
 /// `BlueprintFormat`'s YAML value, and the value the response echoes when a request names
 /// no format: the stored document is YAML, so it is what the service renders by default.
@@ -85,6 +88,17 @@ impl BlueprintFormat {
             }
         }
     }
+}
+
+/// The one YAML document `text` holds, as the JSON value that states the same thing.
+///
+/// The crate's ONE reading of a Data Prepper configuration document, for every caller that
+/// has to look inside one: this module renders a blueprint's document in the format a
+/// request asks for, and [`super::pipeline_configuration`] reads a pipeline's own document
+/// for the ingest surface it declares. Both go through the same loader and the same mapping,
+/// so two readers cannot disagree about what a document says.
+pub fn document_as_json(text: &str) -> Result<::serde_json::Value, UnrenderableBlueprint> {
+    as_json(&sole_document(text)?)
 }
 
 /// The one YAML document `text` holds.

@@ -33,9 +33,30 @@ hex = { workspace = true }
 # JSON format a caller may ask for. yaml-rust2 is the pure-Rust YAML 1.2 implementation the
 # other services in this workspace read YAML with (no `unsafe`, no C bindings).
 yaml-rust2 = { version = "0.10", default-features = false }
+# `data_plane_addressing`: the tree's one reading of which address a resource's data plane is
+# published at, so the ingestion endpoint a pipeline reports is the emulator's own.
+# `s3_client`: the in-process Amazon S3 client the records an ingestion endpoint accepted are
+# written to the configured bucket through. `arn`: the Region of the pipeline's own ARN, which
+# is where that bucket is addressed. `yaml_nesting`: the bound on a caller-supplied
+# configuration body's nesting, taken before it is parsed. `request_path`: the path of a
+# runtime-API request, read the one way every data plane reads it.
+service-common = { path = "../common" }
+# The Amazon S3 request types that delivery builds (the object's body stream), from the SDK
+# the shared client is constructed from. Only the generated client is needed: the emulator
+# supplies the transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-s3 = { version = "1", default-features = false }
+# The UTC calendar fields a delivered object's name carries (the second it was written), from
+# the maintained calendar crate rather than by slicing a rendered timestamp.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# `tests/all/ingest_data_plane.rs` asserts where the records a pipeline's ingestion endpoint
+# accepted really ARRIVE, so the sink bucket is created through the wire of the service that
+# OWNS it and the delivered object is read back through that service's own reader. DEV-ONLY.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

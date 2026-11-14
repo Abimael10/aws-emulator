@@ -272,7 +272,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut tags = Vec::new();
         crate::state::merge_tags(&mut tags, input.tags.unwrap_or_default());
         let record = crate::state::StoredPipeline {
+            // The ingestion endpoint a client POSTs records to: an address THIS emulator
+            // answers on, resolved once here, so every reporter of this pipeline answers
+            // the one address the ingest plane serves.
             ingest_endpoint_urls: crate::state::ingest_endpoint_urls(
+                ctx.parts(),
+                ctx.endpoint().as_str(),
                 &region,
                 &pipeline_name,
                 &arn,

@@ -17,6 +17,8 @@ mod blueprint_catalog;
 mod blueprint_retrieval;
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/ingest_data_plane.rs"]
+mod ingest_data_plane;
 #[path = "all/pattern_messages.rs"]
 mod pattern_messages;
 #[path = "all/pipeline_lifecycle.rs"]

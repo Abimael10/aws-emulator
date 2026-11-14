@@ -17,19 +17,20 @@
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
-//!   request's resolved route key against this service's signing name. Edit it
-//!   for anything the model does not express: a signing name shared by several
-//!   services, or routing that keys on the access-key id.
+//!   request's resolved route key against this service's signing name; EDITED HERE to
+//!   claim a PIPELINE's own ingest traffic too (see [`ingest_plane`]).
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   generated routing table. EDITED HERE to serve a request addressed to the ingestion
+//!   endpoint a pipeline published, so the router verifies the credential it carries.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   404, …). EDITED HERE for an ingest address naming a pipeline this service does not
+//!   hold: nothing is served there, which is not an operation it fails to implement.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -39,11 +40,25 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Three of those seams are taken for one reason: a PIPELINE this service creates publishes
+//! the address records are sent to (`Pipeline$IngestEndpointUrls`, "the ingestion endpoints
+//! for the pipeline, which you can send data to"), and what is spoken there is the pipeline's
+//! own Data Prepper `http` source — which this model does not describe, so a POST to that
+//! address named no modelled operation of this service. The address a pipeline publishes is
+//! now one this emulator answers on ([`crate::state::ingest_plane_base`]), and
+//! [`ingest_plane`] is what claims and serves it.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The PIPELINE's own ingest data plane: the surface served at the address a pipeline
+/// publishes as its `IngestEndpointUrls`, which this service's model does not describe and
+/// which no modelled route names. See that module for why three of the seams below take it
+/// into account.
+pub mod ingest_plane;
 
 mod validation;
 
@@ -54,6 +69,18 @@ mod validation;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because a PIPELINE's own ingest traffic ([`ingest_plane`]) is claimed by
+    /// `can_handle` and served from `override_operation`, neither of which is an operation
+    /// with a `self.engine` of its own: both must read the one store the control-plane
+    /// operations write, not a second copy.
+    engine: Arc<Eng>,
+    /// The ingest plane as an [`ErasedOperation`], so the router verifies the SigV4
+    /// credential a signed ingest request carries before any record is accepted. Held in a
+    /// field, built once, because `override_operation` hands back a reference borrowed from
+    /// `&self`.
+    ingest: ingest_plane::IngestPlane<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -62,7 +89,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            ingest: ingest_plane::IngestPlane::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -79,10 +108,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
+        let claims_control_plane = match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
             None => false,
-        }
+        };
+        claims_control_plane
+            // And a PIPELINE's own ingest traffic: a request addressed to the ingestion
+            // endpoint a pipeline this service holds published
+            // ([`ingest_plane::claims_parts`]). Such a request names no modelled operation —
+            // its path is the pipeline's own Data Prepper source path — so one carrying no
+            // credential scope of this service could resolve no claimant at all, for the one
+            // address this service told the caller to send data to.
+            //
+            // The claim is narrowed to a pipeline this service HOLDS, read from the one
+            // shared store, rather than to a path shape alone, so one request keeps one
+            // claimant.
+            || ingest_plane::claims_parts(&*self.engine, parts)
     }
 
     fn override_operation(
@@ -93,7 +134,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        //
+        // A request to a pipeline's own ingestion endpoint is named as an operation here, so
+        // the router verifies the SigV4 credential it carries before any record is accepted
+        // — the router authenticates only what it names an operation for, and an ingest
+        // request to this service is signed exactly as every other call to it is.
+        if self.ingest.claims(req) {
+            return Some(&self.ingest);
+        }
         None
     }
 
@@ -124,8 +172,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        //
+        // A path-style INGEST address naming a pipeline this service does not hold is
+        // exactly that case by construction — the plane's claim is narrowed to a pipeline
+        // the store holds — so this is where it is answered: nothing is served there.
+        ingest_plane::serve_unclaimed(req)
     }
 
     fn override_framework_error(
