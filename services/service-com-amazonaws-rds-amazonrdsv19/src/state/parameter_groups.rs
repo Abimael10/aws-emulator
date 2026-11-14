@@ -68,14 +68,18 @@ pub fn db_parameter_group_not_found_message(named: &str) -> String {
     format!("DBParameterGroup not found: {named}")
 }
 
-/// How Amazon RDS reports that the SOURCE of a parameter-group copy does not exist: ONE
-/// fixed sentence, which is why it is a constant — it names neither the group nor the
-/// member, so the same text answers whichever value the request carried.
+/// How Amazon RDS reports that a DB CLUSTER parameter group a request would set the
+/// PARAMETERS of does not exist: ONE fixed sentence, which is why it is a constant — it names
+/// neither the group nor the member, so the same text answers whichever value the request
+/// carried.
 ///
-/// A copy is the one parameter-group operation that answers this way: the reads and the
-/// delete name the group they could not find
-/// ([`db_parameter_group_not_found_message`]), while the copy reports only that the source
-/// is not a group that exists.
+/// The parameter-group COPY answers it too, for a source that is not there, which is why one
+/// constant serves both: the text belongs to "the group whose parameters this request is
+/// about is not there". The reads, the reset and the delete, and every operation that
+/// RESOLVES a group another resource's request named, report the group they could not find by
+/// name ([`db_parameter_group_not_found_message`] and
+/// [`db_cluster_parameter_group_not_found_message`]) — as does the instance-level modify,
+/// whose own sentence nothing recorded here states otherwise.
 pub const PARAMETER_GROUP_DOES_NOT_EXIST_MESSAGE: &str = "Parameter group does not exist";
 
 /// Refuse a `DBParameterGroupFamily` that is not a parameter group family at all.

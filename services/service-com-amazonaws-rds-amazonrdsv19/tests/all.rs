@@ -21,6 +21,8 @@ mod aurora_engine_parameterised_row_locks;
 mod aurora_engine_row_locks;
 #[path = "all/aws_managed_group_catalog.rs"]
 mod aws_managed_group_catalog;
+#[path = "all/boolean_parameter_value.rs"]
+mod boolean_parameter_value;
 #[path = "all/ca_certificate_material.rs"]
 mod ca_certificate_material;
 #[path = "all/certificate_override.rs"]

@@ -28,7 +28,7 @@
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
     family_parameters, published_db_parameters, ClusterParameterSpec, APPLY_METHOD_IMMEDIATE,
-    APPLY_METHOD_PENDING_REBOOT, APPLY_TYPE_DYNAMIC,
+    APPLY_METHOD_PENDING_REBOOT, APPLY_TYPE_DYNAMIC, DATA_TYPE_BOOLEAN,
     IMMEDIATE_APPLY_METHOD_FOR_A_STATIC_PARAMETER_MESSAGE, MAX_PARAMETERS_PER_GROUP,
     MAX_PARAMETERS_PER_MODIFY, MAX_RECORDS_RANGE, PARAMETER_SOURCE_ENGINE_DEFAULT,
     PARAMETER_SOURCE_SYSTEM, PARAMETER_SOURCE_USER,
@@ -501,8 +501,21 @@ async fn a_parameter_value_outside_the_published_set_is_refused() {
                     400,
                     INVALID_PARAMETER_VALUE,
                 );
+                let message = text(&answered, "Message");
+                if spec.data_type == DATA_TYPE_BOOLEAN && spec.is_modifiable {
+                    // A boolean parameter's domain is its own data type, so the refusal is
+                    // about that type and echoes the value alone. A parameter the engine
+                    // protects is refused before its value is read, which names the
+                    // parameter and is the branch below.
+                    assert_eq!(
+                        message,
+                        format!("Invalid boolean value: {value}"),
+                        "case {case:?}: expected the boolean refusal, got {answered}"
+                    );
+                    continue;
+                }
                 assert!(
-                    text(&answered, "Message").contains(spec.name),
+                    message.contains(spec.name),
                     "case {case:?}: the refusal must name the parameter, got {answered}"
                 );
             }

@@ -373,7 +373,9 @@ async fn a_caller_set_force_ssl_is_reported_over_the_families_default() {
             "case {case:?}: expected the value the caller set, got {entry:?}"
         );
 
-        // A value outside the published domain is refused, naming that domain.
+        // A value outside the published domain is refused. `rds.force_ssl` is a BOOLEAN
+        // parameter, so what the value failed is that data type, and the refusal is worded
+        // about the type rather than about the parameter's enumeration.
         let answered = expect_error(
             case,
             call(
@@ -390,8 +392,7 @@ async fn a_caller_set_force_ssl_is_reported_over_the_families_default() {
             INVALID_PARAMETER_VALUE,
         );
         let message = text(&answered, "Message");
-        let expected =
-            format!("Invalid parameter value: on for: {FORCE_SSL} allowed values are: 0,1");
+        let expected = "Invalid boolean value: on".to_string();
         assert_eq!(
             message, expected,
             "case {case:?}: expected {expected:?}, got {message:?}"

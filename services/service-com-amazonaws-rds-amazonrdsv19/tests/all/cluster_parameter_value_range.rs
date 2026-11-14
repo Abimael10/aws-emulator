@@ -18,7 +18,7 @@
 //! recorded request used.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    published_cluster_parameters, ClusterParameterSpec, PARAMETER_SOURCE_USER,
+    published_cluster_parameters, ClusterParameterSpec, DATA_TYPE_BOOLEAN, PARAMETER_SOURCE_USER,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -73,12 +73,15 @@ async fn user_value(router: &MultiServiceRouter, group: &str, name: &str) -> Opt
         .map(|parameter| text(&parameter, "ParameterValue"))
 }
 
-/// The refusal a value outside a parameter's published domain is answered with, in the two
-/// wordings the two FORMS of that domain take: a numeric range names the range, an
-/// enumeration names the values. Both are built from the request and that parameter's own
-/// catalog entry.
+/// The refusal a value outside a parameter's published domain is answered with, in the three
+/// wordings the domain it fell outside takes: a BOOLEAN parameter's data type is its domain,
+/// so the refusal is about that type and names nothing else; a numeric range names the range,
+/// and an enumeration names the values. All three are built from the request and that
+/// parameter's own catalog entry.
 fn expected_message(spec: &ClusterParameterSpec, value: &str) -> String {
-    if spec.publishes_a_range() {
+    if spec.data_type == DATA_TYPE_BOOLEAN {
+        format!("Invalid boolean value: {value}")
+    } else if spec.publishes_a_range() {
         format!(
             "Value: {value} is outside of range: {} for parameter: {}",
             spec.allowed_values, spec.name

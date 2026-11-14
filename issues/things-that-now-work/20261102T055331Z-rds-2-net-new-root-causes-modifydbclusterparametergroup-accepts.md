@@ -52,3 +52,36 @@ Cause 2 — check rds.subnet-group-vpc-and-arn-round-trip [mismatch]:
 2. Replay the behavioral suite (simparity-behavioral-aws-v1) and re-run exactly the checks in trace_ids.
 3. Cause 1 — rds.modify-cluster-parameter-invalid-value-rejected. By hand: aws rds describe-db-engine-versions --engine aurora-postgresql --default-only to get the DBParameterGroupFamily; aws rds create-db-cluster-parameter-group --db-cluster-parameter-group-name <pg> --db-parameter-group-family <family> --description d; pick a boolean, modifiable parameter P from aws rds describe-db-cluster-parameters --db-cluster-parameter-group-name <pg>; then aws rds modify-db-cluster-parameter-group --db-cluster-parameter-group-name <pg> --parameters ParameterName=P,ParameterValue=sim2real-not-a-valid-value-xyz,ApplyMethod=pending-reboot. The emulator answers 200; AWS answers 400 InvalidParameterValue "Invalid boolean value: sim2real-not-a-valid-value-xyz". Then aws rds describe-db-cluster-parameters --db-cluster-parameter-group-name <pg> and observe P now reports Source=user with the bogus value.
 4. Cause 2 — rds.subnet-group-vpc-and-arn-round-trip. By hand: aws ec2 create-vpc, aws ec2 create-subnet twice in two Availability Zones of that VPC, then aws rds create-db-subnet-group --db-subnet-group-name <name> --db-subnet-group-description d --subnet-ids <subnet-a> <subnet-b> and compare DBSubnetGroup.VpcId with the VpcId returned by create-vpc; then aws rds describe-db-subnet-groups --db-subnet-group-name <name> twice and compare VpcId and DBSubnetGroupArn for byte-identity.
+
+## Resolution
+
+Cause 1 was closed in two steps, both inside ModifyDBClusterParameterGroup, because the check
+asserts two refusals in sequence:
+
+1. The out-of-domain VALUE. The refusal is now worded by the parameter's published `DataType`
+   rather than by the shape of its `AllowedValues` column: a value a boolean parameter cannot
+   carry is refused with the fixed text "Invalid boolean value: " followed by the
+   `ParameterValue` the request carried, while a value that does carry the parameter's type and
+   falls outside its published domain keeps the range and enumeration wordings. The rule lives
+   in the shared validator (`service_common::rds_cluster_parameters::validate_known_setting`),
+   so both parameter-group levels and every model of this front door read it.
+2. The MISSING group, which the same check asserts on its next step (behavioral check
+   `rds.modify-cluster-parameter-invalid-value-rejected`, step `run#28`, whose recorded
+   assertion is `modify_err.get("Message") == "Parameter group does not exist"`): a cluster
+   parameter group whose parameters the request would set and that does not exist is refused
+   with that fixed, parameter-less sentence — no name echoed — which is also what the
+   parameter-group copy answers for a source that is not there. The operations that READ a
+   group, reset it, delete it or resolve a group another resource's request named keep the
+   sentence that names the group, and so does the instance-level modify, which no recording
+   covers.
+
+Cause 2 needed no change: `CreateDBSubnetGroup` already resolves the supplied `SubnetIds`
+through EC2's own records and takes the group's `VpcId` from the VPC those records name as the
+subnets' owner, persisting it so repeated describes answer the identical value.
+
+Tests: `services/service-com-amazonaws-rds-amazonrdsv19/tests/all/boolean_parameter_value.rs`
+drives every modifiable boolean parameter of every published catalog, at both parameter-group
+levels, over the ways a value can fail that type; the refusal wording table in
+`tests/all/guard_order_and_refusal_classes.rs` covers the missing-group sentence; and
+`services/common/src/rds_cluster_parameters.rs` carries a unit table over the data types and
+the wording each refusal takes.

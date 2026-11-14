@@ -198,7 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // RDS is regional, and `DBParameterGroupName` is "stored as a lowercase string", so
         // the group is looked up by the lowercased name in the region the request was signed
-        // for; a name that matches none is the modelled 404.
+        // for; a name that matches none is the modelled 404, naming the group the request
+        // spelled (`crate::state::db_parameter_group_not_found_message`).
         let key = (region, input.db_parameter_group_name.to_ascii_lowercase());
         let Some(group) = store.db_parameter_groups.get(&key) else {
             return Err(

@@ -39,6 +39,12 @@ pub const APPLY_METHOD_IMMEDIATE: &str = "immediate";
 /// `Parameter$ApplyMethod` ("indicates when to apply parameter updates") carries it back.
 pub const APPLY_METHOD_PENDING_REBOOT: &str = "pending-reboot";
 
+/// `Parameter$DataType` ("the valid data type for the parameter") of a parameter that is a
+/// SWITCH: the engines publish its two values as that parameter's `AllowedValues`, and a
+/// value outside them failed the data type rather than an enumeration, so it is refused as
+/// such ([`invalid_boolean_value_message`]).
+pub const DATA_TYPE_BOOLEAN: &str = "boolean";
+
 /// `Parameter$ApplyType` for a parameter that takes effect only after the instances in the
 /// cluster are rebooted.
 pub const APPLY_TYPE_STATIC: &str = "static";
@@ -98,8 +104,9 @@ pub struct ClusterParameterSpec {
     pub name: &'static str,
     /// `Parameter$ApplyType`; see [`APPLY_TYPE_STATIC`].
     pub apply_type: &'static str,
-    /// `Parameter$DataType`: `string`, `integer` or `float`, which is also how
-    /// [`Self::admits`] reads [`Self::allowed_values`].
+    /// `Parameter$DataType`: `string`, `integer`, `float` or [`DATA_TYPE_BOOLEAN`], which is
+    /// also how [`Self::admits`] reads [`Self::allowed_values`] and which of the refusal
+    /// wordings a value outside them carries ([`validate_known_setting`]).
     pub data_type: &'static str,
     /// `Parameter$AllowedValues`: either a comma-separated enumeration of the admitted
     /// values, or a `<low>-<high>` range for a numeric parameter.
@@ -480,13 +487,16 @@ pub fn validate_setting_in_catalog(
 /// [`parameter_cannot_be_modified_message`] is that refusal, and it names the parameter
 /// alone.
 ///
-/// There are TWO such wordings, and which one a refusal carries is decided by the FORM of
-/// the domain the value fell outside ([`ClusterParameterSpec::publishes_a_range`]): a value
+/// Which WORDING a refusal carries is decided by what the value fell outside of. A
+/// parameter whose published `DataType` is [`DATA_TYPE_BOOLEAN`] is bounded by that type —
+/// its domain is the two values a switch has — so the refusal is about the TYPE and names
+/// nothing else: [`invalid_boolean_value_message`]. For every other data type the FORM of
+/// the published domain decides ([`ClusterParameterSpec::publishes_a_range`]): a value
 /// outside a numeric range is "outside of range", while a value that is not one of an
 /// enumerated set is an invalid parameter value for which the admitted values are listed.
-/// Both name the same three things — the rejected value, the parameter and its published
-/// `AllowedValues` — and both come from the request and from that parameter's own catalog
-/// entry.
+/// Those two name the same three things — the rejected value, the parameter and its
+/// published `AllowedValues` — and all three wordings come from the request and from that
+/// parameter's own catalog entry.
 pub fn validate_known_setting(
     catalog: Option<&'static [ClusterParameterSpec]>,
     name: &str,
@@ -499,7 +509,9 @@ pub fn validate_known_setting(
         return Err(parameter_cannot_be_modified_message(name));
     }
     if !spec.admits(value) {
-        return Err(if spec.publishes_a_range() {
+        return Err(if spec.data_type == DATA_TYPE_BOOLEAN {
+            invalid_boolean_value_message(value)
+        } else if spec.publishes_a_range() {
             format!(
                 "Value: {value} is outside of range: {} for parameter: {name}",
                 spec.allowed_values
@@ -512,6 +524,18 @@ pub fn validate_known_setting(
         });
     }
     Ok(())
+}
+
+/// How this front door refuses a value a parameter whose published `DataType` is
+/// [`DATA_TYPE_BOOLEAN`] cannot carry: it states that the value is not a boolean one and
+/// echoes the value the request carried, and says nothing about the parameter, its group or
+/// the two values it admits — a boolean parameter's domain IS its data type, so what the
+/// caller got wrong is the type.
+///
+/// Everything but the value is fixed text, and the value is the one the request carried,
+/// verbatim. The caller answers it with the Query API's `InvalidParameterValue`.
+pub fn invalid_boolean_value_message(value: &str) -> String {
+    format!("Invalid boolean value: {value}")
 }
 
 /// How this front door refuses a request that would SET a parameter the engine does not let
@@ -803,6 +827,115 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    /// One parameter of the table below: `parameter` builds a spec of the given data type
+    /// and domain, so one catalog carries a parameter per data type under test.
+    const fn probe(
+        name: &'static str,
+        data_type: &'static str,
+        allowed_values: &'static str,
+    ) -> ClusterParameterSpec {
+        ClusterParameterSpec {
+            name,
+            apply_type: APPLY_TYPE_DYNAMIC,
+            data_type,
+            allowed_values,
+            default_value: "",
+            is_modifiable: true,
+            minimum_engine_version: "",
+            description: "a parameter under test",
+        }
+    }
+
+    /// A catalog carrying one parameter per data type a published entry can have, which the
+    /// wording table below reads.
+    const WORDING_CATALOG: &[ClusterParameterSpec] = &[
+        probe("a_boolean_parameter", DATA_TYPE_BOOLEAN, "0,1"),
+        probe("a_string_parameter", "string", "none,ddl,mod,all"),
+        probe("an_integer_parameter", "integer", "1-100"),
+        probe("a_float_parameter", "float", "0.0-1.0"),
+    ];
+
+    /// A refused value is worded by what it fell outside of: a boolean parameter's own data
+    /// type, a numeric range, or an enumeration of admitted values.
+    ///
+    /// The table spans the data types a published parameter carries, each with a value its
+    /// domain does not admit, and asserts both the wording — as the LITERAL sentence, so a
+    /// wrong text cannot assert itself — and that every value the domain DOES publish is
+    /// taken.
+    #[test]
+    fn a_refused_value_is_worded_by_the_domain_it_fell_outside() {
+        // (case, parameter, a refused value, the expected refusal)
+        let rows: [(&str, &str, &str, &str); 6] = [
+            (
+                "a boolean parameter, a value of no type",
+                "a_boolean_parameter",
+                "not-a-valid-value",
+                "Invalid boolean value: not-a-valid-value",
+            ),
+            (
+                "a boolean parameter, a value past the switch",
+                "a_boolean_parameter",
+                "2",
+                "Invalid boolean value: 2",
+            ),
+            (
+                "a boolean parameter, another engine's spelling of it",
+                "a_boolean_parameter",
+                "on",
+                "Invalid boolean value: on",
+            ),
+            (
+                "a string enumeration",
+                "a_string_parameter",
+                "some",
+                "Invalid parameter value: some for: a_string_parameter allowed values are: \
+                 none,ddl,mod,all",
+            ),
+            (
+                "an integer range",
+                "an_integer_parameter",
+                "101",
+                "Value: 101 is outside of range: 1-100 for parameter: an_integer_parameter",
+            ),
+            (
+                "a float range",
+                "a_float_parameter",
+                "1.5",
+                "Value: 1.5 is outside of range: 0.0-1.0 for parameter: a_float_parameter",
+            ),
+        ];
+
+        for (case, name, refused, expected) in rows {
+            let answered = validate_known_setting(Some(WORDING_CATALOG), name, refused);
+            assert_eq!(
+                answered,
+                Err(expected.to_string()),
+                "case {case:?}: expected the refusal {expected:?}, got {answered:?}"
+            );
+            // Every value the published domain names is still taken.
+            let spec = spec_in_catalog(Some(WORDING_CATALOG), name)
+                .unwrap_or_else(|| panic!("case {case:?}: {name} must be in the catalog"));
+            if spec.allowed_values.contains(',') {
+                for admitted in spec.allowed_values.split(',') {
+                    let answered = validate_known_setting(Some(WORDING_CATALOG), name, admitted);
+                    assert_eq!(
+                        answered,
+                        Ok(()),
+                        "case {case:?}: {admitted:?} is published for it, so it must be \
+                         admitted, got {answered:?}"
+                    );
+                }
+            }
+        }
+
+        // The helper the handlers word that refusal with carries exactly that sentence.
+        assert_eq!(
+            invalid_boolean_value_message("not-a-valid-value"),
+            "Invalid boolean value: not-a-valid-value",
+            "the boolean refusal's fixed text is \"Invalid boolean value: \" and the value"
+        );
     }
 
     /// A family the catalog covers validates values; one it does not covers nothing, so it

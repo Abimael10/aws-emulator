@@ -52,6 +52,13 @@ const CEV_DENIAL: &str = "The custom engine version you requested may not exist 
 /// The sentence Amazon RDS refuses a change to one of its own parameter groups with.
 const CANNOT_MODIFY_DEFAULT: &str = "Cannot modify a default parameter group.";
 
+/// The sentence Amazon RDS answers a CLUSTER parameter group modify whose group does not
+/// exist with: ONE fixed text with no variable part, so every absent name — in any spelling
+/// — gets the same message and the name the request carried is not echoed back. The
+/// instance-level modify names the group it could not find instead, which the row below
+/// pins.
+const PARAMETER_GROUP_DOES_NOT_EXIST: &str = "Parameter group does not exist";
+
 /// The sentence Amazon RDS refuses event categories carrying no source type with.
 const CATEGORIES_NEED_A_SOURCE_TYPE: &str = "If SourceType is null, Categories must also be null.";
 
@@ -521,8 +528,9 @@ struct ProtectedGroupCase {
 
 /// The rows of that table: both modify operations, over the default groups of several
 /// engine-version families (and one named in another case, since a group name is matched
-/// without case), beside the names that are NOT RDS's own and are therefore still reported
-/// as missing.
+/// without case), beside the names that are NOT RDS's own and are therefore reported as
+/// missing — the cluster-level modify in the fixed sentence it answers for a group that does
+/// not exist, which echoes no name at all, and the instance-level one naming the group.
 const PROTECTED_GROUP_CASES: &[ProtectedGroupCase] = &[
     ProtectedGroupCase {
         case: "the MySQL family's default DB parameter group",
@@ -587,7 +595,16 @@ const PROTECTED_GROUP_CASES: &[ProtectedGroupCase] = &[
         // The fault `ModifyDBClusterParameterGroup` models is the DB-parameter-group one,
         // so its wire code is that fault's.
         code: "DBParameterGroupNotFound",
-        message: "DBClusterParameterGroup not found: emu-absent-cluster-pg",
+        message: PARAMETER_GROUP_DOES_NOT_EXIST,
+    },
+    ProtectedGroupCase {
+        case: "another absent cluster group name, in mixed case",
+        action: "ModifyDBClusterParameterGroup",
+        member: "DBClusterParameterGroupName",
+        name: "Emu-Absent-Cluster-PG-Two",
+        status: 404,
+        code: "DBParameterGroupNotFound",
+        message: PARAMETER_GROUP_DOES_NOT_EXIST,
     },
 ];
 

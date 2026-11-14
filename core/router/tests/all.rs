@@ -4374,3 +4374,15 @@ mod cloudformation_appsync_custom_domains;
 // tails landed down here; ordinary comments, because an inner doc comment may only appear
 // before any item.)
 // comment is only legal before the first item, so this fragment landed in the tail as `//!`
+// (`cloudfront_edge_4xx_share_decides_the_alarm` is declared ONCE, further up this file: the
+// line appended here while two branches landed at once declared it twice, and a module
+// declared twice compiles neither copy.)
+// this file: the line appended here while two branches landed at once declared it twice, and
+// a module declared twice compiles neither copy.)
+// file: the line appended here while two branches landed at once declared it twice, and a
+// (`autoscaling_plans_policies_reach_application_auto_scaling` is declared ONCE, at the head
+// of this file: the line appended here while two branches landed at once declared it twice,
+// of the suites in this target. The note itself said only what the header already says —
+// declare each suite exactly once, since a second `mod` for one name is `E0428` and
+// `all/all_rs_declares_each_suite_once.rs` checks it — so it is dropped rather than
+// reworded here.)

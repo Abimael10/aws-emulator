@@ -206,10 +206,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyDBClusterParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
                     DBParameterGroupNotFoundFault {
+                        // The sentence RDS answers for a group whose PARAMETERS a request
+                        // addresses is the fixed, parameter-less one
+                        // (`crate::state::PARAMETER_GROUP_DOES_NOT_EXIST_MESSAGE`): it names
+                        // neither the group nor the member. The behavioral check this
+                        // operation's out-of-domain value leg comes from
+                        // (`rds.modify-cluster-parameter-invalid-value-rejected`) asserts
+                        // that text on its next step, `run#28`, against a group nothing
+                        // created, and the parameter-group COPY answers the same sentence
+                        // for a source that is not there. The reads and the operations that
+                        // RESOLVE a group another resource's request named report the name
+                        // instead.
                         message: Some(
-                            crate::state::db_cluster_parameter_group_not_found_message(
-                                &input.db_cluster_parameter_group_name,
-                            ),
+                            crate::state::PARAMETER_GROUP_DOES_NOT_EXIST_MESSAGE.to_string(),
                         ),
                     },
                 )
@@ -241,9 +250,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // family publishes for it in the very catalog `DescribeDBClusterParameters`
             // reports, whichever engine's family it is — and the parameter one the engine
             // lets a caller modify: anything else is the AWS Query `InvalidParameterValue`,
-            // whose message names the rejected value, what the parameter admits and the
-            // parameter itself. Checked here, before anything is written, so a request
-            // carrying one out-of-range value leaves the group exactly as it was.
+            // worded by what the value fell outside of — that parameter's own `DataType`
+            // where the type is what bounds it, and otherwise its published range or its
+            // enumeration (`crate::state::validate_known_setting`). Checked here, before
+            // anything is written, so a request carrying one refused value leaves the group
+            // exactly as it was.
             crate::state::validate_cluster_parameter_setting(&family, name, value)
                 .map_err(ModifyDBClusterParameterGroupError::invalid_parameter_value)?;
             // A STATIC parameter cannot be applied immediately — "changes to static
