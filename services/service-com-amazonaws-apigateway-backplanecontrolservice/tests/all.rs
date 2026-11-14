@@ -740,6 +740,11 @@ mod dynamodb_integration_template_written_item;
 // refusal that states them.
 #[path = "all/rest_api_import_model_reference_warnings.rs"]
 mod rest_api_import_model_reference_warnings;
+// Appended for the reason the note above gives: the DESCRIPTION a VPC link reports beside
+// its provisioning status — the service's fixed sentence for that status on every
+// projection of the link.
+#[path = "all/vpc_link_status_message.rs"]
+mod vpc_link_status_message;
 // Appended for the reason the note above gives: what `DeleteDomainName` takes WITH the
 // custom domain name it removes — the base path mappings that record holds, which are
 // subordinate to it and never hold it back.

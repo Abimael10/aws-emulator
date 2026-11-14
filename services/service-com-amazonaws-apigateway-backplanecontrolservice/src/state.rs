@@ -996,16 +996,24 @@ impl VpcLinkEntry {
         }
     }
 
-    /// The `statusMessage` this link reports now: the reason it could not be provisioned,
-    /// once it has settled [`VPC_LINK_FAILED`].
+    /// The `statusMessage` this link reports now: "a description about the VPC link
+    /// status" (`VpcLink$statusMessage`), the description that goes with the `status`
+    /// [`Self::status`] reports at the same instant.
     ///
-    /// A link that is still [`VPC_LINK_PENDING`], or that provisioned, reports none: AWS
-    /// publishes no sentence a provisioning or provisioned link carries, so nothing is
-    /// reported rather than a message this emulator made up.
+    /// A link the clock is still provisioning, and one it provisioned, carry the service's
+    /// fixed sentence for that status ([`VPC_LINK_PENDING_MESSAGE`] and
+    /// [`VPC_LINK_AVAILABLE_MESSAGE`]) — the same text for every link in it, interpolating
+    /// nothing from the request or from the record, so a reader polling for readiness is
+    /// told the same thing about two links in one status. A link that could NOT be
+    /// provisioned describes the cause of ITS OWN failure instead ([`Self::failure`]), the
+    /// one value a caller has to act on.
     pub fn status_message(&self) -> Option<String> {
-        (self.status() == VPC_LINK_FAILED)
-            .then(|| self.failure.clone())
-            .flatten()
+        match self.status() {
+            VPC_LINK_PENDING => Some(VPC_LINK_PENDING_MESSAGE.to_string()),
+            VPC_LINK_FAILED => self.failure.clone(),
+            // `VPC_LINK_AVAILABLE`: the only other status a stored record reports.
+            _ => Some(VPC_LINK_AVAILABLE_MESSAGE.to_string()),
+        }
     }
 }
 
@@ -2434,6 +2442,25 @@ pub const VPC_LINK_AVAILABLE: &str = "AVAILABLE";
 /// The `status` of a VPC link whose provisioning could not succeed; see
 /// [`VPC_LINK_PENDING`] and [`VpcLinkEntry::failure`].
 pub const VPC_LINK_FAILED: &str = "FAILED";
+
+/// The `statusMessage` of a VPC link that is provisioned ([`VPC_LINK_AVAILABLE`]).
+///
+/// `VpcLink$statusMessage` is "a description about the VPC link status", and API Gateway
+/// serves THIS sentence for a provisioned link, verbatim and in full, on either of the two
+/// API surfaces a VPC link is projected on: it interpolates nothing from the request or
+/// from the link's own record — no name, id, target, account, Region or timestamp — so it
+/// is fixed text for that status rather than a description this emulator composes. See
+/// [`VpcLinkEntry::status_message`].
+pub const VPC_LINK_AVAILABLE_MESSAGE: &str = "VPC link is ready to route traffic";
+
+/// The `statusMessage` of a VPC link that is still being provisioned
+/// ([`VPC_LINK_PENDING`]).
+///
+/// Unlike [`VPC_LINK_AVAILABLE_MESSAGE`] this is not verified text: no response of the
+/// service has been observed describing a link in this status and the model states none, so
+/// it is written in the form the observed one takes — the status summarised, with nothing
+/// interpolated from the request or from state.
+pub const VPC_LINK_PENDING_MESSAGE: &str = "VPC link is being provisioned";
 
 /// How long a VPC link stays [`VPC_LINK_PENDING`] after `CreateVpcLink`, after which it
 /// reports [`VPC_LINK_AVAILABLE`]. API Gateway documents no duration for it

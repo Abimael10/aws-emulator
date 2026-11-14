@@ -25,21 +25,14 @@
 //! another vendor's namespace), how many targets a link carries and which of them is
 //! unusable, and the forms a delete can be refused or accepted in.
 
-use std::time::Duration;
-
 use serde_json::json;
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    VPC_LINK_AVAILABLE, VPC_LINK_FAILED, VPC_LINK_PENDING, VPC_LINK_PROVISION_SPAN,
+    VPC_LINK_AVAILABLE, VPC_LINK_AVAILABLE_MESSAGE, VPC_LINK_FAILED, VPC_LINK_PENDING,
 };
 
 use crate::method_integration::{put_method, resource_with_a_method};
 use crate::rest_api_lifecycle::{assert_failure, create_api, string_member, Gateway};
-use crate::vpc_links::{create_vpc_link, get_vpc_link, target_arn};
-
-/// Slack added to a stored span before asserting the state it is due in, so a loaded
-/// machine does not read the record one tick early. The sibling `vpc_links` suite waits
-/// the same way.
-const MARGIN: Duration = Duration::from_millis(100);
+use crate::vpc_links::{create_vpc_link, get_vpc_link, settled_link, target_arn};
 
 /// A created VPC link's id, asserting the modelled 202 on the way.
 async fn created_link(gateway: &Gateway, name: &str, targets: &[String]) -> String {
@@ -147,10 +140,13 @@ async fn a_vpc_link_settles_failed_unless_every_target_names_a_network_load_bala
         links.push(((*case).to_string(), id, (*expected).to_string()));
     }
 
-    // The transition is one the CLOCK owes: once the provisioning span has passed every
-    // link reports the state its targets decided — for every reader, not just the first,
-    // because nothing about the read moves it.
-    tokio::time::sleep(VPC_LINK_PROVISION_SPAN + MARGIN).await;
+    // The transition is one the CLOCK owes, so each link is LOOKED AT AGAIN until it
+    // reports a settled state — never waited out — and once it has settled it reports the
+    // state its targets decided for every reader, not just the first, because nothing
+    // about the read moves it.
+    for (case, id, _) in &links {
+        settled_link(&gateway, id, case).await;
+    }
     for round in 0..2 {
         for (case, id, expected) in &links {
             let read = get_vpc_link(&gateway, id).await;
@@ -165,8 +161,9 @@ async fn a_vpc_link_settles_failed_unless_every_target_names_a_network_load_bala
                 "case {case} (round {round}): expected the link to settle {expected}, got {:?}",
                 read.body
             );
-            // A failed link says WHICH target it could not be provisioned against, and a
-            // provisioned one carries no description of its status at all.
+            // A failed link says WHICH target it could not be provisioned against — the one
+            // value the caller has to change — and a provisioned one carries the service's
+            // fixed description of that status.
             let status_message = read.body["statusMessage"].as_str();
             if expected == VPC_LINK_FAILED {
                 let stated = status_message.unwrap_or_default();
@@ -177,9 +174,10 @@ async fn a_vpc_link_settles_failed_unless_every_target_names_a_network_load_bala
                 );
             } else {
                 assert_eq!(
-                    status_message, None,
-                    "case {case} (round {round}): expected no status description, got \
-                     {status_message:?}"
+                    status_message,
+                    Some(VPC_LINK_AVAILABLE_MESSAGE),
+                    "case {case} (round {round}): expected the provisioned link to report \
+                     {VPC_LINK_AVAILABLE_MESSAGE:?}, got {status_message:?}"
                 );
             }
         }

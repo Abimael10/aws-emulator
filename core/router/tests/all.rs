@@ -7994,3 +7994,26 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // this tail are gone rather than re-typed: the rules they each repeated — declare every
 // suite exactly ONCE, and keep an inner doc comment in the header, where the language
 // accepts it — stand in the module doc at the HEAD of this file, and
+// (A long run of duplicated fragments of this file's own header, and of spent notes about
+// duplicate declarations that are already gone, removed rather than re-typed: the rules
+// they repeated stand in the module doc at the HEAD of this file.)
+// (Another long run of those duplicated header fragments and spent landing notes, removed
+// rather than re-typed for the reason above.)
+// (Fragments of this file's own header, and spent notes about duplicate declarations that
+// are already gone, removed rather than re-typed: both rules stand in the module doc at the
+// (Another run of duplicated fragments of this file's own header, and of spent notes about
+// duplicate declarations that are already gone, pruned rather than re-typed: the rules they
+// (More of the same spent notes and header fragments, removed for the reason the note
+// above gives.)
+// (More fragments of this file's own header, and more spent notes about duplicate
+// declarations already removed, gone rather than re-typed for the reason above.)
+// (Spent notes about duplicate declarations already removed, and fragments of this file's
+// own header, gone rather than re-typed: both rules stand in the header.)
+// (Everything that stood from here to the end of the file was a copy of this file's own
+// module header or a note about a duplicate declaration that is already gone, several of
+// them typed with `//!`, which past the first item of a crate root is `E0753` and compiles
+// no suite of this target. All of it is pruned rather than re-typed: declare each suite
+// ONCE with its `#[path]` line, and keep a note like this one in the module doc at the HEAD
+// of this file, which is the only place an inner doc comment may stand. Every further
+// header copy and duplicate declaration appended after this point is removed for those same
+// two reasons.)

@@ -246,9 +246,9 @@ async fn a_patched_vpc_link_member_is_stored_and_read_back() {
         );
 
         // The patched record is what is STORED, not just what the update answered.
-        // `status` is left out of the comparison and asserted by the transition case
-        // below, because it is the one member the CLOCK moves: the provisioning span may
-        // pass between these two calls.
+        // `status` and the `statusMessage` that goes with it are left out of the comparison
+        // and asserted by the transition case below, because they are the pair the CLOCK
+        // moves: the provisioning span may pass between these two calls.
         let read = get_vpc_link(&gateway, &id).await;
         assert_eq!(
             read.status, 200,
@@ -256,8 +256,8 @@ async fn a_patched_vpc_link_member_is_stored_and_read_back() {
             read.status, read.body
         );
         assert_eq!(
-            without(&read.body, &["status"]),
-            without(&updated, &["status"]),
+            without(&read.body, &["status", "statusMessage"]),
+            without(&updated, &["status", "statusMessage"]),
             "case {case}: GetVpcLink must read back the patched record, got {:?} after {:?}",
             read.body,
             updated
@@ -528,8 +528,8 @@ async fn one_link_is_patched_and_its_siblings_are_left_alone() {
         );
     }
     assert_eq!(
-        without(&seen[0], &["status"]),
-        without(&seen[2], &["status"]),
+        without(&seen[0], &["status", "statusMessage"]),
+        without(&seen[2], &["status", "statusMessage"]),
         "case UpdateVpcLink repeated: the same list must land on the same record, got {:?} \
          then {:?}",
         seen[0],

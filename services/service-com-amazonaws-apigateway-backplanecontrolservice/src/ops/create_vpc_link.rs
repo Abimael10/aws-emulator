@@ -96,7 +96,8 @@ use crate::state::VpcLinkEntry;
 ///
 /// `status` and `statusMessage` are computed from the stored record (see
 /// [`VpcLinkEntry::status`] and [`VpcLinkEntry::status_message`]): a link reports the
-/// provisioning state the clock owes it, and a description only where it has one.
+/// provisioning state the clock owes it, and the description that goes with that state —
+/// so every operation projecting a link reports the one pair.
 pub fn vpc_link_body(entry: &VpcLinkEntry) -> CreateVpcLinkOutput {
     CreateVpcLinkOutput {
         id: Some(entry.id.clone()),

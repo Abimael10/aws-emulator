@@ -29,18 +29,25 @@
 //! in once the provisioning span has passed is decided by what it targets, which is the
 //! sibling `vpc_link_provisioning` suite's rule.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
     MAX_VPC_LINKS, VPC_LINK_AVAILABLE, VPC_LINK_PENDING, VPC_LINK_PROVISION_SPAN,
 };
 
-use crate::rest_api_lifecycle::{assert_failure, string_member, Answer, Gateway};
+use crate::rest_api_lifecycle::{assert_failure, string_member, without, Answer, Gateway};
 
-/// Slack added to a stored span before asserting the state it is due in, so a loaded
-/// machine does not read the record one tick early.
-const MARGIN: Duration = Duration::from_millis(100);
+/// How long [`settled_link`] looks for a created link to settle before a run is called a
+/// defect. Generous: the settling is a transition the CLOCK owes, so it is polled for rather
+/// than waited out, and the deadline is only what stops a test whose premise never arrives.
+///
+/// This and [`SETTLE_POLL`] are the polling policy every suite that waits for a link to
+/// settle uses, so it lives HERE beside [`settled_link`] rather than once per suite.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How often [`settled_link`] looks again; see [`SETTLE_DEADLINE`].
+const SETTLE_POLL: Duration = Duration::from_millis(10);
 
 /// A network-load-balancer ARN of the shape `targetArns` documents ("The ARN of the
 /// network load balancer of the VPC targeted by the VPC link"), numbered so a row can
@@ -60,14 +67,43 @@ pub(crate) async fn create_vpc_link(gateway: &Gateway, request: Value) -> Answer
     gateway.call("POST", "/vpclinks", Some(request)).await
 }
 
-/// A `VpcLink` body without its `status`: the members a create and a read must agree on
-/// member for member, where `status` is the one the clock moves on its own.
-fn without_status(body: &Value) -> Value {
-    let mut without = body.clone();
-    if let Some(members) = without.as_object_mut() {
-        members.remove("status");
+/// A `VpcLink` body without the members the CLOCK moves: the members a create and a read
+/// must agree on member for member, where `status` and the `statusMessage` that goes with
+/// it are the pair the provisioning span moves on its own.
+fn without_clock_members(body: &Value) -> Value {
+    without(body, &["status", "statusMessage"])
+}
+
+/// Read `GetVpcLink` for `vpc_link_id` until it reports a SETTLED `status` — anything other
+/// than [`VPC_LINK_PENDING`] — and answer that read.
+///
+/// The settling is a transition the CLOCK owes, so this LOOKS AGAIN until the record
+/// reports it instead of waiting the span out: nothing is nudged between reads, and a link
+/// that only ever settled because somebody called again would not satisfy this either. The
+/// polling policy is [`SETTLE_DEADLINE`] and [`SETTLE_POLL`], held here rather than passed
+/// in, so every suite waits the one way; `pub(crate)` because the sibling
+/// `vpc_link_provisioning` and `vpc_link_status_message` suites wait for the same condition.
+pub(crate) async fn settled_link(gateway: &Gateway, vpc_link_id: &str, case: &str) -> Answer {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let read = get_vpc_link(gateway, vpc_link_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: expected 200 from GetVpcLink({vpc_link_id}), got {} with {:?}",
+            read.status, read.body
+        );
+        let status = string_member(&read.body, "status", case);
+        if status != VPC_LINK_PENDING {
+            return read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: expected the clock to settle {vpc_link_id} out of \
+             {VPC_LINK_PENDING}, last read {:?}",
+            read.body
+        );
+        tokio::time::sleep(SETTLE_POLL).await;
     }
-    without
 }
 
 /// `GetVpcLink` for `vpc_link_id`.
@@ -192,8 +228,8 @@ async fn a_created_vpc_link_is_persisted_and_read_back_member_for_member() {
             read.status, read.body
         );
         assert_eq!(
-            without_status(&read.body),
-            without_status(&created.body),
+            without_clock_members(&read.body),
+            without_clock_members(&created.body),
             "case {case}: GetVpcLink must report the created link, got {:?} after {:?}",
             read.body,
             created.body
@@ -252,12 +288,14 @@ async fn a_new_vpc_link_is_pending_until_the_provisioning_span_has_passed() {
     let read = get_vpc_link(&gateway, &id).await;
     assert_owed_status(&read, started.elapsed(), "GetVpcLink within the span");
 
-    // The transition is one the clock owes: once the span has passed the link is
-    // available — for every reader, not just the first, because nothing about the read
-    // moves it.
-    tokio::time::sleep(VPC_LINK_PROVISION_SPAN + MARGIN).await;
-    for round in 0..2 {
-        let read = get_vpc_link(&gateway, &id).await;
+    // The transition is one the clock owes: the link is LOOKED AT AGAIN until it has
+    // settled — never waited out — and it is then available for every reader, not just the
+    // first, because nothing about the read moves it.
+    let settled = settled_link(&gateway, &id, "GetVpcLink after the span").await;
+    for (round, read) in [settled, get_vpc_link(&gateway, &id).await]
+        .iter()
+        .enumerate()
+    {
         assert_eq!(
             read.body["status"].as_str(),
             Some(VPC_LINK_AVAILABLE),
