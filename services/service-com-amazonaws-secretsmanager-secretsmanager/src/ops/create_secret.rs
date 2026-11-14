@@ -669,18 +669,33 @@ fn answer_existing(
     // @idempotencyToken: a repeat naming a version that already holds
     // exactly this value is the same request, so it is answered from
     // what is stored rather than refused.
-    let replay = value.and_then(|value| {
-        client_request_token
-            .and_then(|token| existing.version(token))
-            .filter(|version| version.holds_same_value(value))
-    });
-    match replay {
-        Some(version) => Ok(CreateSecretOutput {
+    //
+    // A create that carries no value creates no version, so its token names none
+    // either, and the only thing taken is the NAME.
+    let staked = client_request_token
+        .zip(value)
+        .and_then(|(token, value)| {
+            existing
+                .version(token)
+                .map(|version| (token, version, version.holds_same_value(value)))
+        });
+    match staked {
+        Some((_, version, true)) => Ok(CreateSecretOutput {
             arn: Some(existing.arn.clone()),
             name: Some(existing.name.clone()),
             version_id: Some(version.version_id.clone()),
             replication_status: existing.replication_status_out(),
         }),
+        // The token already names a version of this secret holding ANOTHER value,
+        // so what this create cannot have is the TOKEN, not the name: the same
+        // token with another value would modify an existing version, which no
+        // operation of this service does. The refusal says so, naming the token
+        // the request carried and the secret the version belongs to, exactly as
+        // the other version-creating writes do
+        // ([`crate::state::token_in_use_message`]) — a caller that has to decide
+        // between re-reading the existing secret and minting a new token can only
+        // tell the two apart from the message.
+        Some((token, _, false)) => Err(token_in_use(token, &existing.arn)),
         None => Err(already_exists(&existing.name)),
     }
 }
@@ -698,11 +713,28 @@ fn missing_client_request_token() -> CreateSecretError {
 
 /// `ResourceExistsException` for a name this service already holds a secret
 /// under, naming the secret the caller asked to create.
+///
+/// This is the NAME collision: the create could not have the name. A create whose
+/// `ClientRequestToken` is what it cannot have is refused for the token instead
+/// ([`token_in_use`]).
 fn already_exists(name: &str) -> CreateSecretError {
     CreateSecretErrorModeled::ResourceExistsException(ResourceExistsException {
         message: Some(format!(
             "The operation failed because the secret {name} already exists."
         )),
+    })
+    .into()
+}
+
+/// `ResourceExistsException` for a `ClientRequestToken` that already names a
+/// version of the secret this create is addressed to, holding another value.
+///
+/// The same sentence every version-creating write of this service refuses a reused
+/// token with ([`crate::state::token_in_use_message`]): the token from the request
+/// and the ARN of the secret whose version already carries it.
+fn token_in_use(token: &str, arn: &str) -> CreateSecretError {
+    CreateSecretErrorModeled::ResourceExistsException(ResourceExistsException {
+        message: Some(crate::state::token_in_use_message(token, arn)),
     })
     .into()
 }
