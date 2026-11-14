@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyTransitGatewayPrefixListReference
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyTransitGatewayPrefixListReference`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: points the route the request names — the reference to one prefix list in
+//! one transit gateway route table
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::transit_gateway_prefix_list_references`])
+//! — at a new target, and answers the stored record in `modifying`, with the clock owing it
+//! `available`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyTransitGatewayPrefixListReference::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +138,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyTransitGatewayPrefixListReference` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyTransitGatewayPrefixListReferenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyTransitGatewayPrefixListReference"))
+        // `ctx` carries request metadata only; this operation reads none of it — the route
+        // table, the prefix list and the attachment it acts on are all named by id. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // The request's own form first, exactly as the create and the delete of a reference
+        // read it: an id that is not an id of its kind at all is refused as malformed, so "not
+        // an id of this kind" never reads as "no such resource" and is never answered by the
+        // DryRun arm below either.
+        state::require_well_formed_transit_gateway_route_table_id(
+            &input.transit_gateway_route_table_id,
+        )?;
+        state::require_well_formed_id(
+            state::PREFIX_LIST_ID_PREFIX,
+            &input.prefix_list_id,
+            state::INVALID_PREFIX_LIST_ID_MALFORMED,
+        )?;
+        if let Some(attachment_id) = input.transit_gateway_attachment_id.as_deref() {
+            state::require_well_formed_transit_gateway_attachment_id(attachment_id)?;
+        }
+
+        // What the modified route DOES with the traffic that matches it: "the attachment to
+        // which traffic is routed" (`$TransitGatewayAttachmentId`) or "drop traffic that
+        // matches this route" (`$Blackhole`). A modify REPLACES that target, so a request that
+        // asks for neither has not said where the matching traffic is to go instead, and one
+        // that asks for both has asked for two different things — each is refused rather than
+        // silently resolved one way, exactly as the create refuses it.
+        let blackhole = input.blackhole.unwrap_or(false);
+        match (blackhole, input.transit_gateway_attachment_id.as_deref()) {
+            (false, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "The request must name the attachment traffic matching this route is \
+                     routed to as transitGatewayAttachmentId, or set blackhole to drop it",
+                ));
+            }
+            (true, Some(attachment_id)) => {
+                return Err(Scaffolded::invalid_parameter_combination(format!(
+                    "A blackhole route drops the traffic that matches it, so it cannot also \
+                     route that traffic to the attachment '{attachment_id}'"
+                )));
+            }
+            _ => {}
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`$DryRun`): the flag asks about PERMISSION, not about the
+        // named resources, so it is answered before anything is resolved or written and every
+        // caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first: which routes the table actually holds is asked of the state they
+        // are in NOW rather than the one they were left in — a reference whose own removal had
+        // already fallen due is gone before this modify looks for it.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway route table" the route belongs to: a route table this
+        // account does not hold has no routes to change, which is a different answer from
+        // "that table holds no such route" below.
+        if !store
+            .transit_gateway_route_tables
+            .contains_key(&input.transit_gateway_route_table_id)
+        {
+            return Err(state::invalid_transit_gateway_route_table_id_not_found(
+                &input.transit_gateway_route_table_id,
+            ));
+        }
+
+        // The route itself: a modify changes a route that is already there, so a (route table,
+        // prefix list) pair the table does not reference has nothing to modify — creating one
+        // is `CreateTransitGatewayPrefixListReference`'s job. The `PrefixListId` is what this
+        // operation could not resolve — a prefix list the named route table routes — so the
+        // refusal carries the prefix list's own not-found class, worded the way EC2 words it
+        // for this surface, and not the route table's or a route's.
+        let Some(existing) = store
+            .transit_gateway_prefix_list_references
+            .get(&(
+                input.transit_gateway_route_table_id.clone(),
+                input.prefix_list_id.clone(),
+            ))
+            .map(|record| record.view.clone())
+        else {
+            return Err(state::transit_gateway_prefix_list_not_referenced(
+                &input.transit_gateway_route_table_id,
+                &input.prefix_list_id,
+            ));
+        };
+
+        // A route on its way out of its table is not a route there is anything left to point
+        // somewhere else: the reference exists, in a state that does not admit this call,
+        // which is what `IncorrectState` says ([`crate::state::incorrect_state_of`] words it
+        // the way every refusal made SOLELY for the state of the named resource does). EC2's
+        // model declares no error shape for this operation at all
+        // (`smithy_query(query="operation",operation="ModifyTransitGatewayPrefixListReference")`
+        // answers an empty `errors` list), so the code is this crate's one code for that
+        // class.
+        if existing.state.as_deref() == Some(state::PREFIX_LIST_REFERENCE_STATE_DELETING) {
+            return Err(state::incorrect_state_of(
+                "Prefix list reference",
+                &input.prefix_list_id,
+                state::PREFIX_LIST_REFERENCE_STATE_DELETING,
+            ));
+        }
+
+        // "Information about the transit gateway attachment"
+        // (`TransitGatewayPrefixListReference$TransitGatewayAttachment`) is read off the
+        // STORED attachment, so the resource the modified route forwards to is the one the
+        // store holds rather than anything the request said about it.
+        let attachment = match input.transit_gateway_attachment_id.as_deref() {
+            None => None,
+            Some(attachment_id) => {
+                let stored = store
+                    .transit_gateway_attachments
+                    .get(attachment_id)
+                    .ok_or_else(|| {
+                        state::id_not_found(
+                            state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+                            "transit gateway attachment ID",
+                            attachment_id,
+                        )
+                    })?;
+                Some(TransitGatewayPrefixListAttachment {
+                    transit_gateway_attachment_id: Some(attachment_id.to_string()),
+                    resource_type: Some(stored.view.resource_type().to_string()),
+                    resource_id: stored.view.resource_id().map(str::to_string),
+                })
+            }
+        };
+
+        // The write, through the one place a reference's route is changed: the record goes
+        // into `modifying` with its `available` owed to the clock, and the answer is the
+        // record as it now stands — so this modify and
+        // `GetTransitGatewayPrefixListReferences` cannot drift apart. The `else` arm cannot be
+        // reached — the pair was resolved above under the SAME lock, which nothing else can
+        // write while it is held — and stands only because the writer answers an `Option`: it
+        // refuses exactly what the resolution above refuses rather than inventing a second
+        // answer for one condition.
+        let Some(reference) = store.modify_transit_gateway_prefix_list_reference(
+            &input.transit_gateway_route_table_id,
+            &input.prefix_list_id,
+            blackhole,
+            attachment,
+        ) else {
+            return Err(state::transit_gateway_prefix_list_not_referenced(
+                &input.transit_gateway_route_table_id,
+                &input.prefix_list_id,
+            ));
+        };
+
+        // "Information about the prefix list reference" (`$TransitGatewayPrefixListReference`).
+        Ok(ModifyTransitGatewayPrefixListReferenceOutput {
+            transit_gateway_prefix_list_reference: Some(reference),
+        })
     }
 }

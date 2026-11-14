@@ -1298,7 +1298,10 @@
 //! other end of that life: the reference answers `deleting`
 //! ([`PREFIX_LIST_REFERENCE_STATE_DELETING`]) and the clock owes its REMOVAL
 //! ([`PrefixListReferenceMove::Removed`]) one span later, because a pair the table no longer
-//! routes is not a route of it at all.
+//! routes is not a route of it at all. A modify rewrites the route's TARGET — where the
+//! traffic it matches goes — in place: the reference answers `modifying`
+//! ([`PREFIX_LIST_REFERENCE_STATE_MODIFYING`]) and the clock owes it `available` again, the
+//! pair it is keyed by being what the request names rather than what it changes.
 //!
 //! ## Transit gateway metering policies
 //!

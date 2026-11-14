@@ -675,6 +675,13 @@ mod transit_gateway_prefix_list_references;
 // the create-and-read suite above, its topical neighbour, for the reason those lines give.
 #[path = "all/delete_transit_gateway_prefix_list_reference.rs"]
 mod delete_transit_gateway_prefix_list_reference;
+// What `ModifyTransitGatewayPrefixListReference` changes about a route of a transit gateway
+// route table: the target of the one route the request names, answered in `modifying` with the
+// clock owing it `available`, and the ids, targets and states it refuses without writing
+// anything. Declared beside the create-and-read and delete suites above, its topical
+// neighbours, for the reason those lines give.
+#[path = "all/modify_transit_gateway_prefix_list_reference.rs"]
+mod modify_transit_gateway_prefix_list_reference;
 // What `DescribeTransitGatewayRouteTableAnnouncements` reports out of the announcement store,
 // and how the id list, the filters and the page size narrow it. Declared beside the transit
 // gateway suite above rather than in sorted position or at the tail, for the reason this

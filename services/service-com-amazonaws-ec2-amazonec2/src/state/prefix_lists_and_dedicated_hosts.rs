@@ -738,6 +738,11 @@ pub const PREFIX_LIST_REFERENCE_STATE_AVAILABLE: &str = "available";
 /// until the removal falls due.
 pub const PREFIX_LIST_REFERENCE_STATE_DELETING: &str = "deleting";
 
+/// A prefix list reference whose route the service is changing: that enum's `modifying`
+/// member, which is what `ModifyTransitGatewayPrefixListReference` answers with until the
+/// changed route is in force again.
+pub const PREFIX_LIST_REFERENCE_STATE_MODIFYING: &str = "modifying";
+
 /// What the clock owes one stored prefix list reference next.
 ///
 /// The `deleting` member of `TransitGatewayPrefixListReferenceState` is deliberately not a
@@ -765,6 +770,12 @@ pub type PrefixListReferenceTransition = ClockTransition<PrefixListReferenceMove
 /// resolve in a route table that DOES exist, which is a different answer from the route
 /// table's own `.NotFound` and lets a client tell "no such route table" from "no such route
 /// in it". The counterpart of [`local_gateway_route_not_found`] on the transit gateway side.
+///
+/// `DeleteTransitGatewayPrefixListReference`'s answer for that pair, and only its answer:
+/// `ModifyTransitGatewayPrefixListReference` is recorded answering the PREFIX LIST's
+/// not-found code for the same pair instead
+/// ([`transit_gateway_prefix_list_not_referenced`]), so each operation takes the code and the
+/// sentence its own recording pins and neither helper is the other's default.
 pub fn transit_gateway_prefix_list_reference_not_found<E>(
     route_table_id: &str,
     prefix_list_id: &str,
@@ -775,6 +786,32 @@ pub fn transit_gateway_prefix_list_reference_not_found<E>(
         format!(
             "The route to the prefix list '{prefix_list_id}' does not exist in the transit \
              gateway route table '{route_table_id}'"
+        ),
+    )
+}
+
+/// Refuse a request whose `PrefixListId` is not a reference (route) of the transit gateway
+/// route table it names: HTTP 400 [`INVALID_PREFIX_LIST_ID_NOT_FOUND`].
+///
+/// The prefix list is what such a request could not resolve — a list the named route table
+/// routes — so this is the PREFIX LIST's not-found code rather than the route table's or a
+/// route's, worded the way EC2 words it for this surface: the member the request filled, the
+/// route table it is not a route of, and nothing more. Both values come from the request, so
+/// it is the sentence that is fixed here and not any one id.
+///
+/// `ModifyTransitGatewayPrefixListReference`'s answer for a pair the named route table does
+/// not route. The DELETE of the same pair is recorded answering a route's own not-found code
+/// and sentence instead ([`transit_gateway_prefix_list_reference_not_found`]).
+pub fn transit_gateway_prefix_list_not_referenced<E>(
+    route_table_id: &str,
+    prefix_list_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PREFIX_LIST_ID_NOT_FOUND,
+        400,
+        format!(
+            "PrefixListId {prefix_list_id} is not referenced in Transit Gateway Route Table \
+             {route_table_id}."
         ),
     )
 }
@@ -902,6 +939,46 @@ impl ComAmazonawsEc2Amazonec2State {
                 PrefixListReferenceMove::Removed,
             ));
         }
+        Some(record.view.clone())
+    }
+
+    /// Point the reference to `prefix_list_id` in `route_table_id` at a new target — where
+    /// the traffic it matches goes — and answer it as it now stands, or `None` when the store
+    /// holds no reference for that pair.
+    ///
+    /// The ONE place a prefix list reference's route is changed, the counterpart of
+    /// [`Self::begin_transit_gateway_prefix_list_reference_delete`]: the route's own members
+    /// are rewritten NOW, the reference goes into [`PREFIX_LIST_REFERENCE_STATE_MODIFYING`]
+    /// and the clock owes it [`PREFIX_LIST_REFERENCE_STATE_AVAILABLE`] one
+    /// [`TRANSITION_DELAY`] later ([`PrefixListReferenceMove::Available`], applied by
+    /// [`Self::materialize_due_transitions`] — the same move a create owes). The span is
+    /// never zero, so a caller reading straight after the modify still sees the reference
+    /// being changed rather than in force.
+    ///
+    /// The pair this is keyed by is NOT rewritten — a modify names the route table and the
+    /// prefix list of a route that already exists — so the bytes the record was charged for
+    /// those two ids stand unchanged and nothing is charged or released here.
+    pub fn modify_transit_gateway_prefix_list_reference(
+        &mut self,
+        route_table_id: &str,
+        prefix_list_id: &str,
+        blackhole: bool,
+        attachment: Option<TransitGatewayPrefixListAttachment>,
+    ) -> Option<TransitGatewayPrefixListReference> {
+        let record = self
+            .transit_gateway_prefix_list_references
+            .get_mut(&(route_table_id.to_string(), prefix_list_id.to_string()))?;
+        // "Indicates whether traffic that matches this route is dropped"
+        // (`TransitGatewayPrefixListReference$Blackhole`) and "Information about the transit
+        // gateway attachment" (`$TransitGatewayAttachment`) are the route's target: the
+        // modify REPLACES it, so a route that forwarded and now blackholes names no
+        // attachment any more and the other way round.
+        record.view.blackhole = Some(blackhole);
+        record.view.transit_gateway_attachment = attachment;
+        record.view.state = Some(PREFIX_LIST_REFERENCE_STATE_MODIFYING.to_string());
+        record.pending = Some(PrefixListReferenceTransition::starting_now(
+            PrefixListReferenceMove::Available,
+        ));
         Some(record.view.clone())
     }
 
