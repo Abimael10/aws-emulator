@@ -40,8 +40,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
-# The ingestion-location suite mounts the object store beside this service on one engine,
-# because a submission's Amazon S3 locations are resolved by calling S3 in process.
+# Amazon S3 is mounted beside this service on one engine — the way the assembled emulator
+# runs them — so the locations a submission names are staged in, and resolved against, the
+# store that really owns them.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]

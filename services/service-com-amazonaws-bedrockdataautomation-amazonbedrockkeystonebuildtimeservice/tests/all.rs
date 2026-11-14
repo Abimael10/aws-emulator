@@ -43,6 +43,8 @@ mod project_effective_configuration;
 mod project_not_found_wording;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/s3_uri_validation.rs"]
+mod s3_uri_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]

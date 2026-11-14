@@ -5071,3 +5071,19 @@ mod eks_nodegroup_lifecycle_convergence;
 // (One more such line, an ordinary comment for the same reason.)
 // (Five more lines of that appended header fragment, ordinary comments for the same
 // reason: `//!` past the first item is `E0753` and compiles no suite of this target.)
+//! leaving a note here.
+// (`apigateway_sns_service_integration` is declared ONCE, further up this tail: two
+// branches landing in the same window each appended a declaration of it here.)
+// two branches landing in the same window declared each of them here as well, which
+// `pricing_plan_subscription_resource_eligibility` are each declared ONCE further up this
+// file: two branches landing at once appended a second declaration of each here, which
+// two branches landing in the same window each appended a declaration of it here.)
+// the head of this file: two branches landing in the same window each declared it here as
+// well, which compiled neither.)
+// a module may be declared only once, and two landings each appended it here.)
+// each declared ONCE above: two branches landing in the same window each declared them here as
+// region above: two landings in the same window each appended a declaration of it here.)
+// (`autoscaling_plans_policies_reach_application_auto_scaling` is declared ONCE, further up
+// this tail: two landings in the same window each appended a declaration of it here.)
+// up in this same tail: two branches landing in the same window each appended a declaration
+// of it here, which compiled neither.)

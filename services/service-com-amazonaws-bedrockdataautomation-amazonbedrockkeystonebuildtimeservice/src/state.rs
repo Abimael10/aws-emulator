@@ -44,6 +44,11 @@ pub mod tagging;
 /// `InvokeBlueprintOptimizationAsync`.
 pub mod data_automation_profile;
 
+/// Which S3 location a submission can name, beyond the shape the modelled `S3Uri`
+/// `@pattern` decides. Used by `InvokeBlueprintOptimizationAsync` and
+/// `InvokeDataAutomationLibraryIngestionJob`.
+pub mod s3_location;
+
 /// The data automation library ingestion job record, its clock-owed status and the two
 /// projections a read and a listing serve. Used by
 /// `InvokeDataAutomationLibraryIngestionJob`, `GetDataAutomationLibraryIngestionJob` and
@@ -182,6 +187,18 @@ pub const OPTIMIZATION_STAGE_SPAN: Duration = Duration::from_secs(3);
 /// account's adjustments, so this is the emulator's OWN bound on the store — what stops
 /// a caller submitting jobs from growing the state without end.
 pub const OPTIMIZATION_JOB_QUOTA: usize = 1_000;
+
+/// The sentence `InvokeBlueprintOptimizationAsync` refuses a submission past
+/// [`OPTIMIZATION_JOB_QUOTA`] with, single-homed so the two places that assert that bound
+/// — before the submission's locations are resolved, and again under the lock that inserts
+/// — cannot drift into two sentences for one refusal.
+#[must_use]
+pub fn optimization_job_quota_message() -> String {
+    format!(
+        "the quota of {OPTIMIZATION_JOB_QUOTA} blueprint optimization jobs per account has \
+         been reached"
+    )
+}
 
 /// What this service answers when an `invocationArn` names no blueprint-optimization
 /// job this store holds.

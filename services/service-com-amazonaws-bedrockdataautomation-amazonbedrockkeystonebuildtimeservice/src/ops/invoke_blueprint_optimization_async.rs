@@ -3,10 +3,11 @@
 //! @op InvokeBlueprintOptimizationAsync
 //!
 //! Accepts one blueprint-optimization submission: it resolves the blueprint the
-//! submission references, mints an `invocationArn` for the job, PERSISTS the submission
-//! under it (see [`crate::state::BlueprintOptimizationJobRecord`]) and answers with that
-//! ARN, which `GetBlueprintOptimizationStatus` reads the job back through. A create, so
-//! writing is what the operation does.
+//! submission references and the S3 locations it points at, mints an `invocationArn` for
+//! the job, PERSISTS the submission under it (see
+//! [`crate::state::BlueprintOptimizationJobRecord`]) and answers with that ARN, which
+//! `GetBlueprintOptimizationStatus` reads the job back through. A create, so writing is
+//! what the operation does.
 //!
 //! The record IS the job: nothing here optimizes a schema, and an accepted job reaching
 //! [`crate::state::OPTIMIZATION_SUCCESS`] says the job RECORD reached its terminal
@@ -188,21 +189,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let mut store = state.lock();
+        // What the submission NAMES is resolved first, inside ONE critical section that
+        // ends before anything leaves this process: the S3 resolution below calls another
+        // emulated service, and this service's store is never held across such a call.
+        {
+            let store = state.lock();
 
-        // A submission runs under the Data Automation profile its `dataAutomationProfileArn`
-        // names, and AWS publishes those profiles rather than an account creating them: an
-        // ARN whose resource id names none of them resolves to nothing, so there is no
-        // profile to run the job under. Refused with the modelled `ValidationException`
-        // BEFORE anything is minted, so a refused submission leaves the store — and the
-        // blueprint it referenced — exactly as it was.
-        if !crate::state::data_automation_profile::resolves(&input.data_automation_profile_arn) {
+            // A submission runs under the Data Automation profile its
+            // `dataAutomationProfileArn` names, and AWS publishes those profiles rather
+            // than an account creating them: an ARN whose resource id names none of them
+            // resolves to nothing, so there is no profile to run the job under. Refused
+            // with the modelled `ValidationException` BEFORE anything is minted, so a
+            // refused submission leaves the store — and the blueprint it referenced —
+            // exactly as it was.
+            if !crate::state::data_automation_profile::resolves(
+                &input.data_automation_profile_arn,
+            ) {
+                return Err(
+                    InvokeBlueprintOptimizationAsyncErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::data_automation_profile::INVALID_PROFILE_MESSAGE
+                                    .to_string(),
+                            ),
+                            field_list: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The job optimizes the blueprint its submission references, so a reference
+            // this store cannot resolve describes no job: the blueprint's stored schema IS
+            // what such a job reads. Refused BEFORE anything is minted, so a refused
+            // submission leaves no record behind.
+            if store.names_unknown_blueprint(
+                &input.blueprint.blueprint_arn,
+                input.blueprint.stage.as_deref(),
+            ) {
+                return Err(
+                    InvokeBlueprintOptimizationAsyncErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(
+                                crate::state::BLUEPRINT_ARN_NOT_FOUND_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The store is bounded: past the quota a submission is refused rather than
+            // allowed to grow the state without end. Asserted again under the lock that
+            // inserts, below.
+            if store.optimization_jobs.len() >= crate::state::OPTIMIZATION_JOB_QUOTA {
+                return Err(
+                    InvokeBlueprintOptimizationAsyncErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(crate::state::optimization_job_quota_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Every S3 location the submission carries has to be THERE: the samples are
+        // objects the job reads and the output location is where it writes, so a location
+        // the account's object storage does not hold describes work that cannot be carried
+        // out. Asked of this emulator's own Amazon S3, with NO lock held — it calls another
+        // emulated service — and BEFORE anything is minted, so a refused submission leaves
+        // no record behind. This operation is asynchronous, so this refusal is the only
+        // moment a client can learn its locations are unusable.
+        //
+        // The walk is BOUNDED, in the order the request names its locations: each DISTINCT
+        // location is asked about at most once, at most
+        // `MAX_RESOLVED_SUBMISSION_LOCATIONS` of the distinct sample locations are resolved
+        // at all, and the walk stops at the first one that is not there — so one submission
+        // drives at most that many reads plus the one for its output location, whatever the
+        // length of its `samples` list.
+        let region = crate::state::request_region(ctx);
+        let callback = ctx.callback();
+        let mut unusable_location = crate::state::s3_location::location_is_absent(
+            callback,
+            &region,
+            &input.output_configuration.s3_object.s3_uri,
+        )
+        .await;
+        let mut resolved: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for s3_uri in input.samples.iter().flat_map(|sample| {
+            [
+                sample.asset_s3_object.s3_uri.as_str(),
+                sample.ground_truth_s3_object.s3_uri.as_str(),
+            ]
+        }) {
+            if unusable_location
+                || resolved.len() >= crate::state::s3_location::MAX_RESOLVED_SUBMISSION_LOCATIONS
+            {
+                break;
+            }
+            if !resolved.insert(s3_uri) {
+                continue;
+            }
+            unusable_location =
+                crate::state::s3_location::object_is_absent(callback, &region, s3_uri).await;
+        }
+        if unusable_location {
             return Err(
                 InvokeBlueprintOptimizationAsyncErrorModeled::ValidationException(
                     ValidationException {
                         message: Some(
-                            crate::state::data_automation_profile::INVALID_PROFILE_MESSAGE
-                                .to_string(),
+                            crate::state::s3_location::INVALID_S3_URI_MESSAGE.to_string(),
                         ),
                         field_list: None,
                     },
@@ -211,45 +308,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The job optimizes the blueprint its submission references, so a reference this
-        // store cannot resolve describes no job: the blueprint's stored schema IS what
-        // such a job reads. Refused BEFORE anything is minted, so a refused submission
-        // leaves no record behind.
-        if store.names_unknown_blueprint(
-            &input.blueprint.blueprint_arn,
-            input.blueprint.stage.as_deref(),
-        ) {
-            return Err(
-                InvokeBlueprintOptimizationAsyncErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::BLUEPRINT_ARN_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                )
-                .into(),
-            );
-        }
+        let mut store = state.lock();
 
-        // The store is bounded: past the quota a submission is refused rather than
-        // allowed to grow the state without end.
+        // The quota is asserted again in the critical section that INSERTS, because the
+        // resolution above released the first one: the store is bounded by this check, so
+        // the check that matters is the one holding the lock the insert holds.
         if store.optimization_jobs.len() >= crate::state::OPTIMIZATION_JOB_QUOTA {
             return Err(
                 InvokeBlueprintOptimizationAsyncErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "the quota of {} blueprint optimization jobs per account has \
-                             been reached",
-                            crate::state::OPTIMIZATION_JOB_QUOTA
-                        )),
+                        message: Some(crate::state::optimization_job_quota_message()),
                     },
                 )
                 .into(),
             );
         }
-
         let (submitted_at, submitted_at_timestamp) = crate::state::now_pair();
         let sequence = store.take_arn_sequence();
         let invocation_arn = crate::state::mint_blueprint_optimization_invocation_arn(
-            &crate::state::request_region(ctx),
+            &region,
             submitted_at_timestamp,
             sequence,
         );

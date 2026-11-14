@@ -43,9 +43,6 @@ const DEFAULT_PARTITION: &str = "aws";
 /// The service label an Amazon S3 endpoint's host carries.
 const S3_HOST_LABEL: &str = "s3";
 
-/// The scheme of the `s3://` spelling of a location, whose authority is the bucket.
-const S3_SCHEME: &str = "s3";
-
 /// The scheme of the `https://` spelling, whose authority is an Amazon S3 endpoint.
 const HTTPS_SCHEME: &str = "https";
 
@@ -61,14 +58,6 @@ const HOST_SERVICE_LABEL_DASH: &str = ".s3-";
 /// `length 0..1024`), so an explanation naming a long role ARN and a long location stays
 /// inside the member it is reported in.
 pub const MAX_BLOCKED_REASON: usize = 1024;
-
-/// `path` with its percent-escapes resolved: a URL path's escaping is the URL's, while what
-/// it names here is an Amazon S3 key.
-fn decoded(path: &str) -> String {
-    ::percent_encoding::percent_decode_str(path)
-        .decode_utf8_lossy()
-        .into_owned()
-}
 
 /// Where one feature group's records are replicated to, as the shared feature-group
 /// directory records it for the data plane that writes them.
@@ -126,11 +115,11 @@ impl OfflineStoreLocation {
     #[must_use]
     pub fn parse(s3_uri: &str) -> Option<Self> {
         let url = ::url::Url::parse(s3_uri.trim()).ok()?;
-        let path = decoded(url.path());
+        let path = crate::s3_uri::decoded_key(url.path());
         let host = url.host_str()?;
         match url.scheme() {
             // In an `s3://` URI the bucket IS the authority and the key is the path.
-            S3_SCHEME => Self::of(host, &path),
+            crate::s3_uri::S3_SCHEME => Self::of(host, &path),
             HTTPS_SCHEME => {
                 // Virtual-hosted: the bucket is the label ahead of the service name in the
                 // host, whether the endpoint spells the Region with a `.` or the legacy `-`.

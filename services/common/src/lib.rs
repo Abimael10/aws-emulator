@@ -598,6 +598,10 @@ pub mod rpc_target;
 /// The ONE reading of what an Amazon S3 BUCKET NAME has to be, for every service that
 /// takes one as a caller-supplied string and points a resource of its own at it.
 pub mod s3_bucket_name;
+/// The ONE reading of what an `s3://` URI a caller supplied NAMES, and of whether this
+/// emulator's own Amazon S3 holds that object or bucket, for every service that is pointed
+/// at an S3 location and has to resolve it before it can accept the work.
+pub mod s3_uri;
 /// The account's EMAIL IDENTITY registry, shared by the two SES surfaces: the set of
 /// identities one account holds and the verification state of each, written by
 /// whichever surface records or deletes one and read by both.

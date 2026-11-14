@@ -8,6 +8,10 @@
 //! `ListDataAutomationLibraryIngestionJobs` enumerates. The job is accepted in flight and
 //! completes when the clock makes that transition due (`crate::state::library_ingestion`).
 //!
+//! The library it ingests into, and the S3 locations it reads from and writes to, are
+//! resolved before the job is minted (`crate::state::ingestion_locations`): a submission
+//! naming one that is not there is refused instead.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
