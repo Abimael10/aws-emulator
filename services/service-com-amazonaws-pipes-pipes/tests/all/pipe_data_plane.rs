@@ -98,6 +98,16 @@ const SUPPRESS_DEFINITION: &str = r#"{
 /// over the wire (`tests/all/pipe_filter_body_format.rs`) stands the same emulator up
 /// rather than copying it.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same three services, with the engine they share handed back beside the router.
+///
+/// A suite whose question is about a fact NO client call reports — whether the data-plane
+/// poller of a deleted pipe has ended, which is the pipe's own poller claim
+/// (`tests/all/pipe_deletion_stops_delivery.rs`) — reads the store directly and so needs
+/// the engine the services were mounted on.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -110,7 +120,7 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     router.register_service(
         service_com_amazonaws_sfn_awsstepfunctions::EmulatedService::new(Arc::clone(&engine)),
     );
-    router
+    (router, engine)
 }
 
 /// One `awsJson` RPC call against the service whose signing name is `signing_name`.
@@ -233,7 +243,10 @@ pub(crate) async fn send(router: &MultiServiceRouter, url: &str, markers: &[Stri
 
 /// The markers one row sends: `<case>-0`, `<case>-1`, … — distinct per row and per
 /// record, so a delivery can be attributed.
-fn markers(case: &str, count: usize) -> Vec<String> {
+///
+/// `pub(crate)` so a suite over another question about the same queues
+/// (`tests/all/pipe_deletion_stops_delivery.rs`) names its records the one way.
+pub(crate) fn markers(case: &str, count: usize) -> Vec<String> {
     (0..count).map(|index| format!("{case}-{index}")).collect()
 }
 
