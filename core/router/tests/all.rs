@@ -4917,3 +4917,23 @@ mod cloudformation_provisions_event_buses_and_bus_policies;
 // doc comment is `E0753` past this crate root's first item.)
 // leaving a note here. (Six more lines of that header fragment, ordinary comments
 // for the reason they state.)
+// above record: a `//!` line past the first item of this crate root is `E0753`.) A
+// (Six more lines of that same header, appended into this tail as `//!` by a landing and
+// standing as ordinary comments for the reason the lines above record.) Declare each
+// `E0428` and fails every suite in this target, and an inner doc comment is legal only
+// BEFORE the first item, so one appended into the tail is `E0753` and compiles nothing.
+// (Two more lines of that header, as ordinary comments for the same reason.) Both halves
+// are checked for this file and for every service crate's `tests/all.rs`, so check there
+// (Four more lines of that header, as ordinary comments for the same reason.) Declare
+// each suite exactly ONCE: this is one crate root, so a second `mod` for the same name is
+// `E0428` and a note written with `//!` anywhere but this file's head is `E0753` — either
+// same note appended here would compile no suite of this target. A suite left at the top
+// level of `tests/` fails the build.
+// (Six further lines of the same header fragment landed here typed with `//!`: past the
+// first item that is `E0753` and compiles no suite of this target, so they are gone rather
+// than re-typed — the rule they repeated stands in the module doc at the HEAD of this
+// (Five last lines of that fragment landed here as `//!` as well, and are gone for the
+// same reason: an inner doc comment is legal only before the first item of a crate root.)
+// (Six more lines of that same header arrived here typed with `//!`, which is `E0753` past
+// the first item: they are dropped rather than re-typed, the rule they repeated standing in
+// (And thirteen more lines of it arrived here typed with `//!` as well, dropped for the

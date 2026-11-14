@@ -57,6 +57,8 @@ mod contributor_insights_cloudwatch_rules;
 mod create_backup_source_table;
 #[path = "all/delete_table_description_projection.rs"]
 mod delete_table_description_projection;
+#[path = "all/derived_key_schema_missing_key_wording.rs"]
+mod derived_key_schema_missing_key_wording;
 #[path = "all/describe_continuous_backups_reads.rs"]
 mod describe_continuous_backups_reads;
 #[path = "all/describe_contributor_insights_reports.rs"]
