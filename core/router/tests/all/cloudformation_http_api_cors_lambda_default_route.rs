@@ -6,8 +6,9 @@
 //! The rule under test: **an HTTP api's `CorsConfiguration` decides the CORS HEADERS on the
 //! answer and nothing else about a request the route serves, so the same request answered
 //! with and without an `Origin` header is answered by the same run of the same function —
-//! while the PREFLIGHT a user agent sends instead of the request is answered by the GATEWAY
-//! itself, from that configuration, with no run of the function at all.** CloudFormation provisions the function and the api, API Gateway v2
+//! and the PREFLIGHT a user agent sends instead of the request is matched against the api's
+//! routes like any other request, so the `$default` route that catches everything catches it
+//! too and the function runs for it.** CloudFormation provisions the function and the api, API Gateway v2
 //! resolves the stage and the route and performs the proxy integration, and AWS Lambda runs
 //! the deployment package — four crates, so the suite lives here rather than in any one of
 //! them.
@@ -51,10 +52,6 @@ const OTHER_METHOD: &str = "DELETE";
 /// The three response headers a CORS answer carries, as Fetch names them.
 const ALLOW_ORIGIN_HEADER: &str = "access-control-allow-origin";
 const ALLOW_METHODS_HEADER: &str = "access-control-allow-methods";
-
-/// The status the GATEWAY answers a preflight of a CORS-configured api with: it answers the
-/// preflight itself, so the route's integration is not reached and there is no body.
-const PREFLIGHT_STATUS: u16 = 204;
 
 /// How long one invocation of this handler is given, as the function's own `Timeout`.
 const FUNCTION_TIMEOUT: u64 = 30;
@@ -340,21 +337,23 @@ struct Row {
     allow_origin: Option<&'static str>,
     /// `access-control-allow-methods` the answer must carry, likewise.
     allow_methods: Option<&'static str>,
-    /// Whether the answer is the INTEGRATION's — the handler's own 200 and body — rather than
-    /// the gateway's own answer to a preflight it handled itself, which carries the
-    /// configuration's headers on [`PREFLIGHT_STATUS`] and no body at all.
+    /// Whether the answer is the INTEGRATION's — the handler's own 200 and body. Every row
+    /// here is: the api's one route is `$default`, which catches a preflight as it catches
+    /// everything else, so the function runs for it and the configuration decides only the
+    /// headers on what it answered.
     served_by_the_function: bool,
 }
 
 impl Row {
-    /// The status this row's answer must carry: the handler's own `200` for a request it
-    /// served, and the gateway's own [`PREFLIGHT_STATUS`] for a preflight it answered itself.
+    /// The status this row's answer must carry: the handler's own `200`, because every row is
+    /// served through the api's `$default` route.
     fn status(&self) -> u16 {
-        if self.served_by_the_function {
-            200
-        } else {
-            PREFLIGHT_STATUS
-        }
+        assert!(
+            self.served_by_the_function,
+            "case {:?}: every row of this suite is served through the $default route",
+            self.case
+        );
+        200
     }
 }
 
@@ -393,7 +392,7 @@ const ROWS: &[Row] = &[
         asked_about: Some(ALLOWED_METHOD),
         allow_origin: Some(ALLOWED_ORIGIN),
         allow_methods: Some(ALLOWED_METHOD),
-        served_by_the_function: false,
+        served_by_the_function: true,
     },
     Row {
         case: "a preflight from an allowed Origin, about a method the configuration does not \
@@ -403,7 +402,7 @@ const ROWS: &[Row] = &[
         asked_about: Some(OTHER_METHOD),
         allow_origin: None,
         allow_methods: None,
-        served_by_the_function: false,
+        served_by_the_function: true,
     },
     Row {
         case: "a preflight from an Origin the configuration does not allow",
@@ -412,7 +411,7 @@ const ROWS: &[Row] = &[
         asked_about: Some(ALLOWED_METHOD),
         allow_origin: None,
         allow_methods: None,
-        served_by_the_function: false,
+        served_by_the_function: true,
     },
 ];
 

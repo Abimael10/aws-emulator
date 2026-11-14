@@ -168,12 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The token for the next page of results" (`GetCoipPoolUsageRequest$NextToken`) —
         // anything else is refused rather than read as an allocation id, and it is refused
         // before any other member is looked at, so whether a bogus token is caught never
-        // depends on the rest of the request.
+        // depends on the rest of the request. Like `DescribeCoipPools`, the CoIP pool plane
+        // QUOTES the token it could not read
+        // (`crate::state::quoted_pagination_token_message`).
         let start_at = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
                 state::decode_page_token(token)
-                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+                    .ok_or_else(|| state::invalid_pagination_token_quoting(token))?,
             ),
         };
 

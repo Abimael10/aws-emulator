@@ -15,7 +15,7 @@
 //! member, page size, name form), never a single recorded case.
 
 use crate::cache_cluster_lifecycle::{
-    create_available_cluster, create_cluster, describe_cluster,
+    create_available_cluster, create_cluster, describe_cluster, poll_cluster_status,
 };
 use crate::harness::{params, poll_until, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
 
@@ -793,7 +793,7 @@ async fn a_snapshot_is_the_cluster_as_it_stood_when_it_was_taken() {
     // `CreateSnapshot` answers with the snapshot rather than the cluster, so
     // what shows the cluster is transient is the state gate — a second snapshot
     // of it, straight after, is refused with the status it has. The read that
-    // follows is answered once the cluster is available again.
+    // follows is polled until the cluster is available again.
     let while_snapshotting = create_snapshot(&emulator, "during", "copied", &[]).await;
     assert_eq!(
         while_snapshotting.error_code(),
@@ -806,7 +806,7 @@ async fn a_snapshot_is_the_cluster_as_it_stood_when_it_was_taken() {
         "case before-change: the refusal must name the status the cluster has, got {:?}",
         while_snapshotting.error_message()
     );
-    let settled = describe_cluster(&emulator, "copied").await;
+    let settled = poll_cluster_status(&emulator, "before-change", "copied", "available").await;
     assert_eq!(
         settled.text("CacheClusterStatus"),
         Some("available"),
@@ -866,9 +866,10 @@ async fn a_snapshot_is_the_cluster_as_it_stood_when_it_was_taken() {
 
     // Deleting the source cluster leaves its snapshots: a snapshot outlives the
     // cluster it was taken from, and the describe still resolves that id. The
-    // read first, because a delete needs the cluster settled and the read is
-    // answered once the snapshot it was taking is over.
-    let settled_again = describe_cluster(&emulator, "copied").await;
+    // read first, because a delete needs the cluster settled, and it is polled
+    // until the snapshot it was taking is over.
+    let settled_again =
+        poll_cluster_status(&emulator, "after-change", "copied", "available").await;
     assert_eq!(
         settled_again.text("CacheClusterStatus"),
         Some("available"),
@@ -1204,13 +1205,13 @@ async fn an_immediate_settings_modify_leaves_the_cluster_snapshotable() {
             "case {case}: a cluster doing node work refuses the state-gated call, got {} {}",
             refused.status, refused.body
         );
-        // A read is answered once the node work the clock owed is done, and the
-        // same call is accepted from then on.
-        let described = describe_cluster(&emulator, cluster).await;
+        // A read reports the cluster as the record stands; once the node work the
+        // clock owed is done the same call is accepted from then on.
+        let described = poll_cluster_status(&emulator, case, cluster, "available").await;
         assert_eq!(
             described.text("CacheCluster/CacheClusterStatus"),
             Some("available"),
-            "case {case}: the read is answered once the node work is done, got {:?}",
+            "case {case}: the cluster must settle once the node work is done, got {:?}",
             described.text("CacheCluster/CacheClusterStatus")
         );
         let accepted = create_snapshot(&emulator, &format!("{cluster}-snap"), cluster, &[]).await;

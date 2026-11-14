@@ -23,7 +23,7 @@
 //! applied immediately or deferred, the shape of the group it is applied to),
 //! and a single `SnapshotRetentionLimit` change is only one row.
 
-use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
 
 /// An `AuthToken` that satisfies every documented constraint (16 to 128
 /// printable characters, only the permitted specials).
@@ -99,6 +99,25 @@ async fn describe_group(emulator: &Emulator, case: &str, id: &str) -> Reply {
         described.status, described.body
     );
     described
+}
+
+/// Read one replication group back until it reports `available`, and answer with
+/// that reply.
+///
+/// A report of this service answers from the record as it stands, so the status
+/// the clock owes a group is reached by looking again rather than by waiting a
+/// fixed time.
+async fn poll_group_available(emulator: &Emulator, case: &str, id: &str) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        case,
+        &format!("the replication group {id} settling at available"),
+        "DescribeReplicationGroups",
+        &params(&[("ReplicationGroupId", id)]),
+        |reply| reply.text("ReplicationGroup/Status") == Some("available"),
+    )
+    .await
 }
 
 /// Read one cache cluster back, asserting the describe itself succeeded.
@@ -793,14 +812,14 @@ async fn an_asynchronous_change_leaves_the_group_transient_and_a_settings_change
     for (case, pairs, asynchronous) in cases {
         let emulator = Emulator::new();
         create_group(&emulator, case, "transient", &[("NumCacheClusters", "2")]).await;
-        // Read the group back: this is answered once the create has settled it,
-        // which is what lets the modify below be accepted.
-        describe_group(&emulator, case, "transient").await;
+        // Poll the group back: once the create has settled it, the modify below
+        // is accepted.
+        poll_group_available(&emulator, case, "transient").await;
 
         let answered = modify_accepted(&emulator, case, "transient", pairs).await;
         let expected = if asynchronous { "modifying" } else { "available" };
-        // The call that starts the work answers with the transient status; a
-        // report of the group is answered once that work is done.
+        // The call that starts the work answers with the transient status; the
+        // clock then carries the group back to `available`.
         assert_eq!(
             answered.text("ReplicationGroup/Status"),
             Some(expected),
@@ -825,7 +844,7 @@ async fn an_asynchronous_change_leaves_the_group_transient_and_a_settings_change
             second.text("ReplicationGroup/Description")
         );
 
-        let settled = describe_group(&emulator, case, "transient").await;
+        let settled = poll_group_available(&emulator, case, "transient").await;
         assert_eq!(
             settled.text("ReplicationGroup/Status"),
             Some("available"),

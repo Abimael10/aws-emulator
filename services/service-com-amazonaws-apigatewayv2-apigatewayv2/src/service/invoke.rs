@@ -84,12 +84,16 @@
 //! own CORS headers are passed on untouched.
 //!
 //! A PREFLIGHT of a configured api — the `OPTIONS` request carrying
-//! `Access-Control-Request-Method` — is answered by the GATEWAY: once the stage it addressed
-//! is serving (steps 1-3), the configuration's decoration on [`PREFLIGHT_STATUS`] is the
-//! whole answer, and steps 4-7 are not reached at all, so no route is matched, no authorizer
-//! runs and no integration is invoked for it. That is what makes a preflight answerable for
-//! an api whose routes match no `OPTIONS` request. An `OPTIONS` request naming no method is
-//! not a preflight and is served like any other request.
+//! `Access-Control-Request-Method` — is answered by the GATEWAY only where no route of the
+//! served deployment matches it: once the stage it addressed is serving (steps 1-3) and step
+//! 4 has matched nothing, the configuration's decoration on [`PREFLIGHT_STATUS`] is the
+//! whole answer, so no authorizer runs and no integration is invoked for it. That is what
+//! makes a preflight answerable for an api whose routes match no `OPTIONS` request. A
+//! preflight a route DOES match — an `OPTIONS` route, an `ANY` route, or the `$default` route
+//! that catches what nothing else matches — is served THROUGH that route like any other
+//! request, so its authorization and its integration decide the answer and the configuration
+//! governs only the `Access-Control-*` headers on it. An `OPTIONS` request naming no method
+//! is not a preflight and is served like any other request.
 //!
 //! An origin and a method are both matched EXACTLY against the collection that admits them
 //! (or through its wildcard entry): `AllowOrigins` is "a collection of allowed origins", and
@@ -976,11 +980,12 @@ enum Answer {
 /// The answer for a request whose api this data plane HAS resolved: the stage, the
 /// deployment released to it, the route and its authorization, then the integration.
 ///
-/// `gateway_answers_preflight` is the one step that skips the rest: a CORS preflight against
-/// an api that carries a `CorsConfiguration` is answered BY THE GATEWAY
-/// ([`CorsDecoration::preflight`]) once the stage it addressed is serving, so no route is
-/// matched, no authorization is applied and no integration is reached for it — the
-/// configuration's own headers ([`decorated`]) are the whole answer.
+/// `gateway_answers_preflight` is what a request NO ROUTE MATCHES is answered with when it
+/// is a CORS preflight against an api that carries a `CorsConfiguration`
+/// ([`CorsDecoration::preflight`]): the configuration's own headers ([`decorated`]) on
+/// [`PREFLIGHT_STATUS`] are the whole answer, in place of the `404` such a request is
+/// otherwise answered with. A preflight a route DOES match takes that route like any other
+/// request, authorization and integration included.
 fn resolve_answer(
     resolved: &Resolved<'_, '_>,
     addressed: &Addressed<'_>,
@@ -1018,21 +1023,22 @@ fn resolve_answer(
         );
         return Answer::Now(Box::new(forbidden()));
     };
-    // The PREFLIGHT the api's own configuration answers: the stage is serving, so the
-    // gateway states the configuration's decoration and nothing of the api's routes is
-    // read — "API Gateway automatically sends a response to preflight OPTIONS requests",
-    // which is why a preflight is answered even where the api holds no OPTIONS route.
-    if gateway_answers_preflight {
-        tracing::debug!(
-            api_id = %api.api_id,
-            stage = %stage.stage_name,
-            "answering a CORS preflight from this api's own configuration, so no route of it \
-             is reached"
-        );
-        return Answer::Now(Box::new(preflight_answer()));
-    }
-    let Some(route) = matching_route(&deployment.configuration.routes, addressed.method, &route_path)
-    else {
+    // The route the request is served by, which is also what decides whether the api's own
+    // configuration answers a PREFLIGHT: route matching comes first, and the gateway
+    // answers the preflight itself only for a request no route of the served deployment
+    // matches — which is what makes a preflight answerable for an api whose routes match no
+    // `OPTIONS` request.
+    let matched = matching_route(&deployment.configuration.routes, addressed.method, &route_path);
+    let Some(route) = matched else {
+        if gateway_answers_preflight {
+            tracing::debug!(
+                api_id = %api.api_id,
+                stage = %stage.stage_name,
+                "answering a CORS preflight from this api's own configuration, because no route \
+                 of it matches the request"
+            );
+            return Answer::Now(Box::new(preflight_answer()));
+        }
         tracing::debug!(
             api_id = %api.api_id,
             stage = %stage.stage_name,
@@ -1181,7 +1187,7 @@ fn cors_decoration(api: &Api, req: &RtRequest) -> CorsDecoration {
         .map(str::trim)
         .filter(|method| !method.is_empty());
     // The api carries a configuration, so the gateway owns these headers on whatever is
-    // answered — and answers the preflight itself.
+    // answered — and answers the preflight itself where no route matches it.
     let mut decoration = CorsDecoration {
         governed: true,
         preflight: asked_about.is_some(),
@@ -1239,7 +1245,7 @@ fn cors_decoration(api: &Api, req: &RtRequest) -> CorsDecoration {
 /// `Cors` is a member of the API (`Api$CorsConfiguration`, "a CORS configuration. Supported
 /// only for HTTP APIs"), so for such an api the gateway states every
 /// [`CORS_RESPONSE_HEADERS`] entry on the answer and removes whatever the backend returned
-/// for them, and it answers a PREFLIGHT itself without reaching a route at all. An api
+/// for them, and it answers a PREFLIGHT itself where no route of the api matches it. An api
 /// carrying no configuration governs nothing: the answer is passed on exactly as the
 /// integration produced it, CORS headers of its own included.
 #[derive(Debug, Default)]
@@ -1247,9 +1253,9 @@ struct CorsDecoration {
     /// Whether the api carries a `CorsConfiguration`, which is what makes these headers the
     /// gateway's to state.
     governed: bool,
-    /// Whether this request is a preflight the gateway answers itself — an
-    /// [`PREFLIGHT_METHOD`] request carrying [`REQUEST_METHOD_HEADER`] against an api that
-    /// carries a configuration.
+    /// Whether this request is a preflight the gateway answers itself where no route of
+    /// the api matches it — an [`PREFLIGHT_METHOD`] request carrying
+    /// [`REQUEST_METHOD_HEADER`] against an api that carries a configuration.
     preflight: bool,
     /// The headers the configuration states for THIS request, which is nothing at all for a
     /// request it admits no origin (or no asked-about method) for.
@@ -1823,9 +1829,9 @@ fn api_region(api: &Api) -> String {
 }
 
 /// The answer the GATEWAY gives a CORS preflight of an api that carries a
-/// `CorsConfiguration`: [`PREFLIGHT_STATUS`] with no body, carrying only the decoration
-/// [`decorated`] puts on it. Nothing of the api's routes answered it, so there is nothing
-/// else to report.
+/// `CorsConfiguration` and whose served deployment holds no route matching that request:
+/// [`PREFLIGHT_STATUS`] with no body, carrying only the decoration [`decorated`] puts on it.
+/// No route of the api answered it, so there is nothing else to report.
 ///
 /// It states no framing header either: "a server MUST NOT send a Content-Length header field
 /// in any response with a status code of … 204" (RFC 9110 §15.3.5), and the answer carries no

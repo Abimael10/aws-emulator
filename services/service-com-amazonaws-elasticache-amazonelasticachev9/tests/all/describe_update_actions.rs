@@ -23,6 +23,7 @@
 //! action has been carried to, and the refused value).
 
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
@@ -31,6 +32,27 @@ use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 use crate::cache_cluster_lifecycle::create_available_cluster;
 use crate::harness::{params, poll_until, Emulator, Reply, REGION};
 use crate::service_updates::{epoch_secs, now_secs};
+
+/// How far out the next step of an update action is held while the suite reads the action
+/// back inside the span the apply started: far longer than any span this service schedules,
+/// so that read lands inside it however fast or slow the host runs.
+const NEXT_STEP_HELD: Duration = Duration::from_secs(60 * 60);
+
+/// Move the step the clock owes every stored update action to `due_in` from now.
+///
+/// Only the DUE INSTANT moves: the status the clock owes each action, and everything else
+/// on the record, is the handler's own. `Duration::ZERO` puts the chain back in reach, so
+/// the reads that follow walk it to `complete`.
+fn hold_the_next_step_out_of_reach(emulator: &Emulator, due_in: Duration) {
+    let due = SystemTime::now() + due_in;
+    emulator.with_state(|store| {
+        for action in store.update_actions.values_mut() {
+            if let Some(pending) = action.pending_status.as_mut() {
+                pending.due = due;
+            }
+        }
+    });
+}
 
 /// One published service update, as `DescribeServiceUpdates` reports it: the
 /// members an update action repeats, plus the dates the SLA and the time-range
@@ -316,8 +338,8 @@ fn wire_time(at: i64) -> String {
         .expect("an instant this century renders")
 }
 
-/// Create one replication group running `engine`, named `id`, and wait out the
-/// span after which the clock owes it `available`.
+/// Create one replication group running `engine`, named `id`, and poll until the
+/// clock has carried it to `available`.
 async fn create_group(emulator: &Emulator, id: &str, engine: &str) {
     let created = emulator
         .call(
@@ -335,20 +357,20 @@ async fn create_group(emulator: &Emulator, id: &str, engine: &str) {
         "case {id}: CreateReplicationGroup must succeed, got {} {}",
         created.status, created.body
     );
-    // Read it back: the read is answered once the create has settled the group,
-    // which is the state an update action is applied to.
-    let described = emulator
-        .call(
-            "DescribeReplicationGroups",
-            &params(&[("ReplicationGroupId", id)]),
-        )
-        .await;
-    assert_eq!(
-        described.text("ReplicationGroup/Status"),
-        Some("available"),
-        "case {id}: the read after the create must report the group available, got {}",
-        described.body
-    );
+    // Read it back until the create has settled the group, which is the state an
+    // update action is applied to: a report answers from the record as it stands,
+    // so the settled state is reached by looking again rather than by waiting a
+    // fixed time.
+    poll_until(
+        emulator,
+        REGION,
+        id,
+        "the replication group settling at available",
+        "DescribeReplicationGroups",
+        &params(&[("ReplicationGroupId", id)]),
+        |reply| reply.text("ReplicationGroup/Status") == Some("available"),
+    )
+    .await;
 }
 
 /// Apply one published service update to one cache cluster, answering with the
@@ -837,9 +859,12 @@ async fn an_applied_action_is_reported_as_the_clock_carries_it() {
     );
 
     // Applied, the action is under way: the apply's own answer reports
-    // `waiting-to-start`, and the report that follows is answered once the clock
-    // has carried the action its next step, with every node reporting the
-    // customer as the initiator.
+    // `waiting-to-start`, and so does the report that follows it — a report
+    // answers from the record as it stands, and the clock has not carried the
+    // action its next step yet — with every node reporting the customer as the
+    // initiator. The next step is held out of reach for that read, so what it
+    // asserts does not depend on how fast the host runs, and is then put back so
+    // the clock walks the chain to `complete` below.
     let applied_reply = apply(&emulator, &update.name, "ua-memcached").await;
     let applied_at = now_secs();
     let case = "just applied";
@@ -850,11 +875,12 @@ async fn an_applied_action_is_reported_as_the_clock_carries_it() {
         applied_reply.body
     );
     let case = "under way";
+    hold_the_next_step_out_of_reach(&emulator, NEXT_STEP_HELD);
     let (applied, reply) = action_and_nodes(&emulator, case, &pairs).await;
     assert_eq!(
         member(&applied, case, "UpdateActionStatus"),
-        state::UPDATE_ACTION_IN_PROGRESS,
-        "case {case}: the clock must carry the action to its next status, got {}",
+        state::UPDATE_ACTION_WAITING_TO_START,
+        "case {case}: the report carries the status the apply recorded, got {}",
         reply.body
     );
     assert_eq!(
@@ -882,6 +908,7 @@ async fn an_applied_action_is_reported_as_the_clock_carries_it() {
     // finished before the recommended apply-by date. An action walks a chain of
     // statuses, so this waits for the CONDITION — looking again until the action
     // reports complete — rather than for a time.
+    hold_the_next_step_out_of_reach(&emulator, Duration::ZERO);
     let mut completion = pairs.clone();
     completion.push((
         "ShowNodeLevelUpdateStatus".to_string(),

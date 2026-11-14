@@ -22,7 +22,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
 
 /// One access-string row: the case name, the `AccessString` the create sends, and the
 /// expanded form the service must store and report for it.
@@ -254,10 +254,27 @@ async fn a_deleted_user_is_reported_deleting_and_then_is_gone() {
             );
         }
 
-        // The read that follows is answered once the removal the clock owed has happened,
-        // so the lookup is the modelled not-found — the answer a revoked credential must
-        // get.
-        let gone = emulator.call("DescribeUsers", &params(&[("UserId", id)])).await;
+        // A read inside the span still finds the user, on its way out; once the removal
+        // the clock owed has happened the lookup is the modelled not-found — the answer a
+        // revoked credential must get.
+        let leaving = emulator.call("DescribeUsers", &params(&[("UserId", id)])).await;
+        assert_eq!(
+            leaving.text("Status"),
+            Some(state::USER_STATUS_DELETING),
+            "case {case}: a read inside the span reports the user deleting, got {} {}",
+            leaving.status,
+            leaving.body
+        );
+        let gone = poll_until(
+            &emulator,
+            REGION,
+            case,
+            "the user being removed by the clock",
+            "DescribeUsers",
+            &params(&[("UserId", id)]),
+            |reply| reply.status == 404,
+        )
+        .await;
         assert_eq!(
             (gone.status, gone.error_code()),
             (404, "UserNotFound"),

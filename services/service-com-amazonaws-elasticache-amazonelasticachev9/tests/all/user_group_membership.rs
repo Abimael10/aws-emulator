@@ -17,7 +17,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
 
 /// The engine every group in this suite is created with, so a row that changes
 /// the engine changes it to the other member of the published set
@@ -206,6 +206,30 @@ pub async fn describe_user_group(emulator: &Emulator, case: &str, group: &str) -
     described
 }
 
+/// Read one group back until it reports `status`, and answer with that reply.
+///
+/// A report of this service answers from the record as it stands, so a status
+/// the clock owes a group is observed by LOOKING AGAIN rather than by waiting a
+/// fixed time — which is what a client waiting for a group to become usable
+/// does.
+pub async fn poll_user_group_status(
+    emulator: &Emulator,
+    case: &str,
+    group: &str,
+    status: &str,
+) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        case,
+        &format!("the user group {group} reporting {status:?}"),
+        "DescribeUserGroups",
+        &params(&[("UserGroupId", group)]),
+        |reply| reply.text("Status") == Some(status),
+    )
+    .await
+}
+
 /// Wait out the span this service publishes for a user group's transition, so
 /// the clock owes it its next status. Only the test waits; nothing sleeps in a
 /// handler.
@@ -234,12 +258,18 @@ async fn a_membership_change_is_reported_pending_and_then_settled() {
         }
         create_user_group(&emulator, row.case, "mod-group", row.start).await;
         // A created group is not ready yet, and an inactive one takes no
-        // change: this read is answered once the create has settled it active.
-        let created = describe_user_group(&emulator, row.case, "mod-group").await;
+        // change: this polls the read until the create has settled it active.
+        let created = poll_user_group_status(
+            &emulator,
+            row.case,
+            "mod-group",
+            state::USER_STATUS_ACTIVE,
+        )
+        .await;
         assert_eq!(
             created.text("Status"),
             Some(state::USER_STATUS_ACTIVE),
-            "case {}: the read after the create must report the group active, got {}",
+            "case {}: the group must settle active before it is changed, got {}",
             row.case,
             created.body
         );
@@ -299,9 +329,15 @@ async fn a_membership_change_is_reported_pending_and_then_settled() {
         );
 
         // The change is persisted on the ONE copy of the group rather than only
-        // reported: the reader is answered once the clock has applied it,
+        // reported: the reader reports it once the clock has applied it,
         // together with `active`.
-        let settled = describe_user_group(&emulator, row.case, "mod-group").await;
+        let settled = poll_user_group_status(
+            &emulator,
+            row.case,
+            "mod-group",
+            state::USER_STATUS_ACTIVE,
+        )
+        .await;
         assert_eq!(
             settled.text("Status"),
             Some(state::USER_STATUS_ACTIVE),

@@ -26,7 +26,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{params, poll_until, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
 
 /// One row of the snapshot table: a serverless cache to create, and the snapshot
 /// taken of it.
@@ -322,19 +322,23 @@ async fn every_stored_cache_can_be_snapshotted_and_the_snapshot_is_read_back() {
                 }),
         );
     }
-    // A snapshot is taken of a settled cache, so each cache is read back first:
-    // that read is answered once the create has settled it.
+    // A snapshot is taken of a settled cache, so each cache is polled until the
+    // create has settled it.
     for case in CASES {
-        let described = emulator
-            .call(
-                "DescribeServerlessCaches",
-                &params(&[("ServerlessCacheName", case.cache_request_name)]),
-            )
-            .await;
+        let described = poll_until(
+            &emulator,
+            REGION,
+            case.case,
+            "the serverless cache settling at available",
+            "DescribeServerlessCaches",
+            &params(&[("ServerlessCacheName", case.cache_request_name)]),
+            |reply| reply.text("Status") == Some("available"),
+        )
+        .await;
         assert_eq!(
             described.text("Status"),
             Some("available"),
-            "case {}: the read after the create must report the cache available, got {}",
+            "case {}: the cache must settle available before it is snapshotted, got {}",
             case.case,
             described.body
         );
@@ -357,11 +361,11 @@ async fn every_stored_cache_can_be_snapshotted_and_the_snapshot_is_read_back() {
         assert_snapshot(case, &created, state::STATUS_CREATING, version);
 
         // Read straight back: the stored record is the one the create answered
-        // with, and the read is answered once the snapshot the clock owed is
-        // available.
+        // with, and inside the span it is still the transient status the create
+        // reported.
         let immediately =
             describe_snapshot(&emulator, case.case, case.snapshot_request_name).await;
-        assert_snapshot(case, &immediately, state::STATUS_AVAILABLE, version);
+        assert_snapshot(case, &immediately, state::STATUS_CREATING, version);
         assert_eq!(
             immediately.text("CreateTime"),
             created.text("CreateTime"),
@@ -395,9 +399,19 @@ async fn every_stored_cache_can_be_snapshotted_and_the_snapshot_is_read_back() {
         );
     }
 
-    // Every snapshot stays available, with the rest of what it reports
-    // unchanged.
+    // Every snapshot settles available on the clock, with the rest of what it
+    // reports unchanged.
     for (case, version) in CASES.iter().zip(&versions) {
+        poll_until(
+            &emulator,
+            REGION,
+            case.case,
+            "the serverless cache snapshot settling at available",
+            "DescribeServerlessCacheSnapshots",
+            &params(&[("ServerlessCacheSnapshotName", case.snapshot_request_name)]),
+            |reply| reply.text("Status") == Some(state::STATUS_AVAILABLE),
+        )
+        .await;
         let settled = describe_snapshot(&emulator, case.case, case.snapshot_request_name).await;
         assert_snapshot(case, &settled, state::STATUS_AVAILABLE, version);
     }

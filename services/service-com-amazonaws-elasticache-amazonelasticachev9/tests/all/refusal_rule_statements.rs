@@ -38,7 +38,7 @@
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::cache_cluster_lifecycle::create_available_cluster;
-use crate::harness::{params, Emulator, Reply, REGION};
+use crate::harness::{params, poll_until, Emulator, Reply, REGION};
 use crate::resource_tags::{add_tags, list_tags, remove_tags};
 
 /// The account id every generated emulator presents, which every ARN it mints
@@ -605,16 +605,23 @@ async fn the_snapshot_creator_words_an_unresolved_cluster_as_the_service_words_i
     );
 }
 
-/// The `Status` `DescribeUserGroups` reports for `group`.
-async fn user_group_status(emulator: &Emulator, group: &str) -> String {
-    let described = emulator
-        .call("DescribeUserGroups", &params(&[("UserGroupId", group)]))
-        .await;
-    assert_eq!(
-        described.status, 200,
-        "DescribeUserGroups must answer 200, got {} {}",
-        described.status, described.body
-    );
+/// The `Status` `DescribeUserGroups` reports for `group` once it reports
+/// `status`.
+///
+/// A report of this service answers from the record as it stands, so a status
+/// the clock owes is reached by looking again rather than by waiting a fixed
+/// time.
+async fn polled_user_group_status(emulator: &Emulator, group: &str, status: &str) -> String {
+    let described = poll_until(
+        emulator,
+        REGION,
+        group,
+        &format!("the user group reporting {status:?}"),
+        "DescribeUserGroups",
+        &params(&[("UserGroupId", group)]),
+        |reply| reply.text("Status") == Some(status),
+    )
+    .await;
     described
         .text("Status")
         .unwrap_or_else(|| panic!("no Status in {}", described.body))
@@ -673,9 +680,8 @@ async fn a_user_group_that_cannot_be_deleted_states_the_statuses_a_delete_admits
     // already on its way out. Each row reads the status out of the answer of the
     // call that PUT the group in it, so the message's variable part is the
     // group's own and not a literal, and the delete under test follows that
-    // answer straight away: a report of the group is answered only once the span
-    // has passed, so a read between the two would wait the group out of the
-    // status the row is about.
+    // answer straight away: the status a report carries is the one the record
+    // holds, so the delete arrives while the group is still in it.
     for (case, group) in [
         ("still creating", "creating-group"),
         ("still modifying", "modifying-group"),
@@ -685,10 +691,9 @@ async fn a_user_group_that_cannot_be_deleted_states_the_statuses_a_delete_admits
         let status = match case {
             "still creating" => answered_status(case, &created),
             _ => {
-                // Reading the group back is answered once the create has
-                // settled it `active`, which is what lets the next change be
-                // accepted.
-                user_group_status(&emulator, group).await;
+                // Polling the group until the create has settled it `active` is
+                // what lets the next change be accepted.
+                polled_user_group_status(&emulator, group, state::USER_STATUS_ACTIVE).await;
                 let action = if case == "still modifying" {
                     "ModifyUserGroup"
                 } else {
@@ -731,9 +736,9 @@ async fn a_user_group_that_cannot_be_deleted_states_the_statuses_a_delete_admits
     // deleted, which is what makes the refusals above the state rule speaking.
     create_user_group(&emulator, "deletable-group").await;
     assert_eq!(
-        user_group_status(&emulator, "deletable-group").await,
+        polled_user_group_status(&emulator, "deletable-group", state::USER_STATUS_ACTIVE).await,
         state::USER_STATUS_ACTIVE,
-        "the read after the create must report the group active"
+        "the group must settle active before it is deleted"
     );
     let deleted = emulator
         .call(

@@ -165,12 +165,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The token for the next page of results" (`DescribeCoipPoolsRequest$NextToken`) —
         // anything else is refused rather than read as an id, and it is refused before any
         // other member is looked at, so whether a bogus token is caught never depends on
-        // the rest of the request.
+        // the rest of the request. This read's pagination layer QUOTES the token it could
+        // not read (`crate::state::quoted_pagination_token_message`).
         let start_at = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
                 crate::state::decode_page_token(token)
-                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+                    .ok_or_else(|| crate::state::invalid_pagination_token_quoting(token))?,
             ),
         };
 

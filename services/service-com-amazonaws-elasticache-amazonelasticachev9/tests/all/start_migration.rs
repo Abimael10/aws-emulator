@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
 
 /// A span far longer than any transition this service publishes, for a record a
 /// row holds in a non-terminal status on purpose.
@@ -257,11 +257,19 @@ async fn a_start_into_a_replication_group_records_the_migration_and_moves_the_gr
             started.text("Status")
         );
         // The answer is not a value the handler made up for this response: the
-        // stored group carries the migration, and the read that follows is
-        // answered once the sync the clock owed is done — the migration it
-        // carries stays open, so a second start is still refused once it has
-        // settled.
-        let settled = describe_group(&emulator, case.id).await;
+        // stored group carries the migration, and the clock carries the group
+        // back to `available` — the migration it carries stays open, so a second
+        // start is still refused once it has settled.
+        let settled = poll_until(
+            &emulator,
+            REGION,
+            case.case,
+            "the replication group settling at available",
+            "DescribeReplicationGroups",
+            &params(&[("ReplicationGroupId", case.id)]),
+            |reply| reply.text("Status") == Some(state::STATUS_AVAILABLE),
+        )
+        .await;
         assert_eq!(
             settled.text("Status"),
             Some(state::STATUS_AVAILABLE),

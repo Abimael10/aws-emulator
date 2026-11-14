@@ -20,7 +20,7 @@
 //! holds, which shard is named, which part of the request is wrong), and the
 //! recorded two-node case is one row.
 
-use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
 
 /// Create one replication group and assert the create itself was accepted.
 async fn create_group(emulator: &Emulator, case: &str, id: &str, extra: &[(&str, &str)]) {
@@ -64,6 +64,22 @@ async fn describe_group(emulator: &Emulator, case: &str, id: &str) -> Reply {
         described.status, described.body
     );
     described
+}
+
+/// Read one replication group back until it reports `available`, and answer
+/// with that reply: a report answers from the record as it stands, so the
+/// status the clock owes is reached by looking again.
+async fn poll_group_available(emulator: &Emulator, case: &str, id: &str) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        case,
+        &format!("the replication group {id} settling at available"),
+        "DescribeReplicationGroups",
+        &params(&[("ReplicationGroupId", id)]),
+        |reply| reply.text("ReplicationGroup/Status") == Some("available"),
+    )
+    .await
 }
 
 /// The member cluster ids of the shard `node_group_id` of the group `id`, in
@@ -176,10 +192,10 @@ async fn test_failover_moves_the_primary_role_to_a_replica_of_the_named_shard() 
         let emulator = Emulator::new();
         create_group(&emulator, case.id, case.id, case.extra).await;
 
-        // Before: the first member of the shard is its primary. This read is
-        // answered once the create has settled the group, which is what lets
-        // the failover below be accepted.
-        let described = describe_group(&emulator, case.id, case.id).await;
+        // Before: the first member of the shard is its primary. The group is
+        // polled until the create has settled it, which is what lets the
+        // failover below be accepted.
+        let described = poll_group_available(&emulator, case.id, case.id).await;
         assert_eq!(
             shard_members(&described, case.id, case.node_group_id, case.sharded),
             case.members_before.to_vec(),
@@ -205,17 +221,17 @@ async fn test_failover_moves_the_primary_role_to_a_replica_of_the_named_shard() 
         // The promotion: the shard's first replica now holds the primary role
         // and the primary it had is a replica. `TestFailover`'s own answer and a
         // later describe must agree, because both are built from the one stored
-        // group; the describe is answered once the failover the clock owed is
+        // group; the describe is polled until the failover the clock owed is
         // over.
         let promoted = case.members_before[1];
         let demoted = case.members_before[0];
         let mut expected_after = vec![promoted, demoted];
         expected_after.extend(case.members_before.iter().skip(2).copied());
-        let settled = describe_group(&emulator, case.id, case.id).await;
+        let settled = poll_group_available(&emulator, case.id, case.id).await;
         assert_eq!(
             settled.text("ReplicationGroup/Status"),
             Some("available"),
-            "case {case:?}: the read after the failover is answered once it is over, got {:?}",
+            "case {case:?}: the group must settle once the failover is over, got {:?}",
             settled.text("ReplicationGroup/Status")
         );
         for (source, reply) in [("the answer", &answered), ("the describe", &settled)] {

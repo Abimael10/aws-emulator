@@ -21,7 +21,7 @@
 //! mounts, with the shared `harness` request builder and XML reader; nothing reaches into
 //! the service's state struct.
 
-use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, Reply, REGION};
 
 /// The transient status a resource whose creation is under way reports.
 const CREATING: &str = "creating";
@@ -58,6 +58,30 @@ async fn describe_cache(emulator: &Emulator, name: &str) -> Reply {
         .await
 }
 
+/// Poll one read until its answer satisfies `holds`, which is how a client
+/// learns of a transition the clock owes: a report answers from the record as it
+/// stands, so the settled value is reached by looking again rather than by
+/// waiting a fixed time.
+async fn poll_read(
+    emulator: &Emulator,
+    case: &str,
+    description: &str,
+    action: &str,
+    pairs: &[(&str, &str)],
+    holds: impl Fn(&Reply) -> bool,
+) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        case,
+        description,
+        action,
+        &params(pairs),
+        holds,
+    )
+    .await
+}
+
 /// Assert `reply` reports `expected` as the resource's `Status`.
 fn assert_status(case: &str, where_from: &str, reply: &Reply, expected: &str) {
     assert_eq!(
@@ -89,12 +113,26 @@ async fn a_serverless_cache_reports_its_lifecycle_in_the_wire_spelling() {
         let created = create_cache(&emulator, case, name, engine).await;
         // The create's own answer is the transient status: the span is never zero.
         assert_status(case, "the create's answer", &created, CREATING);
-        // A read is answered once the work the clock owed is done, which is the
-        // value a waiter polls for.
+        // A read inside the span reports the cache as it stands, and the clock
+        // carries it to the value a waiter polls for.
         assert_status(
             case,
-            "a read after the create",
+            "a read inside the create's span",
             &describe_cache(&emulator, name).await,
+            CREATING,
+        );
+        assert_status(
+            case,
+            "a read once the clock has settled it",
+            &poll_read(
+                &emulator,
+                case,
+                "the cache settling at available",
+                "DescribeServerlessCaches",
+                &[("ServerlessCacheName", name)],
+                |reply| reply.text("Status") == Some(AVAILABLE),
+            )
+            .await,
             AVAILABLE,
         );
 
@@ -117,8 +155,16 @@ async fn a_serverless_cache_reports_its_lifecycle_in_the_wire_spelling() {
         assert_status(case, "the modify's answer", &modified, MODIFYING);
         assert_status(
             case,
-            "a read after the modify",
-            &describe_cache(&emulator, name).await,
+            "a read once the modify has settled",
+            &poll_read(
+                &emulator,
+                case,
+                "the cache settling at available again",
+                "DescribeServerlessCaches",
+                &[("ServerlessCacheName", name)],
+                |reply| reply.text("Status") == Some(AVAILABLE),
+            )
+            .await,
             AVAILABLE,
         );
 
@@ -135,12 +181,27 @@ async fn a_serverless_cache_reports_its_lifecycle_in_the_wire_spelling() {
             deleted.status, deleted.body
         );
         assert_status(case, "the delete's answer", &deleted, DELETING);
-        // The read after it is answered once the deletion the clock owed has
-        // been carried through, so there is no cache left to report.
-        let gone = describe_cache(&emulator, name).await;
+        // A read inside the span still finds the cache, on its way out, and the
+        // clock then takes it away.
+        assert_status(
+            case,
+            "a read inside the delete's span",
+            &describe_cache(&emulator, name).await,
+            DELETING,
+        );
+        let gone = poll_read(
+            &emulator,
+            case,
+            "the cache being removed by the clock",
+            "DescribeServerlessCaches",
+            &[("ServerlessCacheName", name)],
+            |reply| reply.status == 404,
+        )
+        .await;
         assert_eq!(
             gone.status, 404,
-            "case {case:?}: a read after the delete must not find the cache, got {} {}",
+            "case {case:?}: once the clock has removed it, a read must not find the cache, got \
+             {} {}",
             gone.status, gone.body
         );
     }
@@ -152,7 +213,15 @@ async fn a_serverless_cache_reports_its_lifecycle_in_the_wire_spelling() {
 async fn a_serverless_cache_snapshot_reports_its_lifecycle_in_the_wire_spelling() {
     let emulator = Emulator::new();
     create_cache(&emulator, "a cache to snapshot", "snapshot-source", "valkey").await;
-    std::thread::sleep(PAST_TRANSITION);
+    poll_read(
+        &emulator,
+        "a cache to snapshot",
+        "the cache settling at available",
+        "DescribeServerlessCaches",
+        &[("ServerlessCacheName", "snapshot-source")],
+        |reply| reply.text("Status") == Some(AVAILABLE),
+    )
+    .await;
 
     // The rows span the snapshot taken of a cache by name and the snapshot a second take
     // of the same cache produces, which is what a client that snapshots on a schedule
@@ -177,13 +246,15 @@ async fn a_serverless_cache_snapshot_reports_its_lifecycle_in_the_wire_spelling(
         );
         assert_status(case, "the create's answer", &created, CREATING);
 
-        std::thread::sleep(PAST_TRANSITION);
-        let described = emulator
-            .call(
-                "DescribeServerlessCacheSnapshots",
-                &params(&[("ServerlessCacheSnapshotName", snapshot_name)]),
-            )
-            .await;
+        let described = poll_read(
+            &emulator,
+            case,
+            "the snapshot settling at available",
+            "DescribeServerlessCacheSnapshots",
+            &[("ServerlessCacheSnapshotName", snapshot_name)],
+            |reply| reply.text("Status") == Some(AVAILABLE),
+        )
+        .await;
         assert_eq!(
             described.status, 200,
             "case {case:?}: DescribeServerlessCacheSnapshots must answer 200, got {} {}",
@@ -271,8 +342,15 @@ async fn every_resource_kind_reports_the_same_lifecycle_spelling() {
             created.text(element),
             created.body
         );
-        std::thread::sleep(PAST_TRANSITION);
-        let described = emulator.call(describe, &params(describe_params)).await;
+        let described = poll_read(
+            &emulator,
+            case,
+            "the resource settling at available",
+            describe,
+            describe_params,
+            |reply| reply.text(element) == Some(AVAILABLE),
+        )
+        .await;
         assert_eq!(
             described.status, 200,
             "case {case:?}: {describe} must answer 200, got {} {}",

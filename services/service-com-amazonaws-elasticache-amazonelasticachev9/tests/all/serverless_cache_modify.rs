@@ -23,7 +23,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
 
 /// The configuration every row that does not create its own cache starts from,
 /// so one stored baseline is what each modify is measured against.
@@ -278,6 +278,23 @@ async fn describe_cache(emulator: &Emulator, name: &str) -> Reply {
         .await
 }
 
+/// Read one cache back until it reports `status`, which is how a client learns
+/// of a transition the clock owes: a report answers from the record as it
+/// stands, so the settled status is reached by looking again rather than by
+/// waiting a fixed time.
+async fn poll_cache_status(emulator: &Emulator, case: &str, name: &str, status: &str) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        case,
+        &format!("the serverless cache {name} reporting {status:?}"),
+        "DescribeServerlessCaches",
+        &params(&[("ServerlessCacheName", name)]),
+        |reply| reply.text("Status") == Some(status),
+    )
+    .await
+}
+
 /// Assert `reply` reports every member `case` expects, naming the case, the
 /// member and the actual value on every failure. `where_from` says which
 /// response is under test.
@@ -333,9 +350,15 @@ async fn a_modify_applies_every_member_it_names_and_leaves_the_rest() {
             case.create
         };
         create_cache(&emulator, case.case, case.name, create).await;
-        // A cache is reconfigured from its settled, usable status, and reading it
-        // back is answered once the create has settled it.
-        let created = describe_cache(&emulator, case.request_name).await;
+        // A cache is reconfigured from its settled, usable status, so the create
+        // is followed by polling the read until the clock has settled it.
+        let created = poll_cache_status(
+            &emulator,
+            case.case,
+            case.request_name,
+            state::SERVERLESS_STATUS_AVAILABLE,
+        )
+        .await;
         assert_eq!(
             created.text("Status"),
             Some(state::SERVERLESS_STATUS_AVAILABLE),
@@ -377,10 +400,16 @@ async fn a_modify_applies_every_member_it_names_and_leaves_the_rest() {
             modified.text("Status")
         );
 
-        // The read that follows is answered once the work is done, so the cache
+        // The read that follows is polled until the work is done, so the cache
         // is available again and still reports exactly what the modify stored:
         // the change is persisted, not echoed.
-        let settled = describe_cache(&emulator, case.request_name).await;
+        let settled = poll_cache_status(
+            &emulator,
+            case.case,
+            case.request_name,
+            state::SERVERLESS_STATUS_AVAILABLE,
+        )
+        .await;
         assert_eq!(
             settled.text("Status"),
             Some(state::SERVERLESS_STATUS_AVAILABLE),

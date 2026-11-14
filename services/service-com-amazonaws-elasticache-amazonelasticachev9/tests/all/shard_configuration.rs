@@ -33,7 +33,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, Reply, REGION};
 
 /// One row of the failover-default table: the case, the group id, the pairs beside the
 /// required ones, and how many shards the group must end up with.
@@ -74,7 +74,23 @@ async fn create_settled_group(emulator: &Emulator, case: &str, id: &str, extra: 
         "case {case:?}: the create must answer 200, got {} {}",
         created.status, created.body
     );
-    std::thread::sleep(PAST_TRANSITION);
+    poll_group_available(emulator, case, id).await;
+}
+
+/// Read one replication group back until it reports `available`, and answer with that
+/// reply: a report of this service answers from the record as it stands, so the status the
+/// clock owes is reached by looking again rather than by waiting a fixed time.
+async fn poll_group_available(emulator: &Emulator, case: &str, id: &str) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        case,
+        &format!("the replication group {id} settling at available"),
+        "DescribeReplicationGroups",
+        &params(&[("ReplicationGroupId", id)]),
+        |reply| reply.text("Status") == Some(state::STATUS_AVAILABLE),
+    )
+    .await
 }
 
 /// `ModifyReplicationGroupShardConfiguration` with the pairs a row sends.
@@ -341,8 +357,9 @@ async fn a_reshard_writes_the_shards_a_later_read_reports() {
             resharded.text("Status")
         );
 
-        // The read that follows is answered once that work is done.
-        let described = describe_group(&emulator, "reshard-group").await;
+        // The clock then carries the group back to `available`, which the client
+        // learns by looking again.
+        let described = poll_group_available(&emulator, case, "reshard-group").await;
         assert_eq!(
             described.text("Status"),
             Some(state::STATUS_AVAILABLE),
@@ -442,8 +459,7 @@ async fn only_one_of_two_reshards_of_a_group_wins() {
     );
 
     // Only the winner's change is in the store.
-    std::thread::sleep(PAST_TRANSITION);
-    let described = describe_group(&emulator, "concurrent-group").await;
+    let described = poll_group_available(&emulator, "concurrent reshards", "concurrent-group").await;
     assert_eq!(
         described.all("NodeGroups/NodeGroup/NodeGroupId").len(),
         3,

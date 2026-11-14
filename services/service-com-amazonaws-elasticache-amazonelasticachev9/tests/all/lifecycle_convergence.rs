@@ -1,46 +1,70 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What a REPORT answers while the clock still owes the resource a change it has already
-//! scheduled.
+//! scheduled, and how a client reaches the settled state.
 //!
 //! The rule under test: the call that STARTS work answers with the transient status the
-//! service documents for that phase, and the FIRST report issued after it is answered with
-//! the state the clock owes the resource — the transition already scheduled to fall due
-//! within the emulator's transition span is waited for and materialised, so a client
-//! polling on an AWS-sized interval converges on its first poll instead of paying a whole
-//! interval per wait. A MUTATION arriving inside the span is a different matter: it is
-//! answered from the record as it stands and so is still refused by the state gate that
-//! goes with the transient status (asserted in the suites that own those gates).
+//! service documents for that phase, and a REPORT issued inside that span answers from the
+//! record as it stands — the same transient status, and for a resource on its way out the
+//! resource itself, still there and `deleting`. No call of this service waits for a span it
+//! has scheduled, so the transient phase is observable to a client that reads straight
+//! after the call that started the work, which is exactly what makes the state gates
+//! observable (a mutation arriving inside the span is refused with the status the record
+//! carries). The clock then carries the record to its settled state — a status, or the
+//! resource's absence — which a client reaches by LOOKING AGAIN.
+//!
+//! One resource has no such span to report: `DeleteCacheCluster` takes the cluster's record
+//! away at the call, so there is nothing left to report it `deleting` from, and its
+//! absence is asserted by the round trip below rather than by a row of the table.
 //!
 //! The tables below span what the rule generalises over — WHICH resource the report is
 //! about (cache cluster, snapshot, replication group, serverless cache, RBAC user, user
-//! group, reservation), WHICH phase it is in (being created, being changed, being
-//! restarted, going away) and whether the settled state is a STATUS or the resource's
-//! ABSENCE. The snapshot round trip of the recorded flow — create, copy, delete the
-//! source, delete the copy, delete the cluster — is one row of that class, driven here
-//! with exactly ONE read per wait, which is what a client that converges on its first poll
-//! does.
+//! group), WHICH phase it is in (being created, being changed, being restarted, going
+//! away) and whether the settled state is a STATUS or the resource's ABSENCE. The snapshot
+//! round trip of the recorded flow — create, copy, delete the source, delete the copy,
+//! delete the cluster — is one row of that class, driven here the way a client drives it:
+//! by polling each wait out.
 //!
-//! Every assertion goes over the wire through the same router the production emulator
-//! mounts, and nothing here sleeps: the whole point of the rule is that a client does not
-//! have to.
+//! The transient half of each row is asserted with the record's due instant held out of
+//! reach, so what it asserts does not depend on how fast the host runs; the settled half
+//! then makes every outstanding change due and polls for it. Both halves go over the wire
+//! through the same router the production emulator mounts.
 
-use crate::harness::{params, Emulator, Reply};
+use std::time::{Duration, SystemTime};
 
-/// What the first report issued after the starting call must show.
+use service_com_amazonaws_elasticache_amazonelasticachev9::state;
+
+use crate::harness::{params, poll_until, Emulator, Reply, REGION};
+
+/// A span far longer than any transition this service schedules, for the half of a row
+/// that reads a record while the clock still owes it a change.
+const HELD_OUT_OF_REACH: Duration = Duration::from_secs(60 * 60);
+
+/// What the report issued inside the span must show, and what the clock must then settle.
 #[derive(Debug, Clone, Copy)]
 enum Settled {
-    /// The resource reports this value under `path`.
+    /// The resource reports `transient` under `path` inside the span, and `value` once the
+    /// clock has carried it.
     Status { path: &'static str, value: &'static str },
-    /// The resource is gone: the lookup answers this HTTP status and error code.
-    Absent { status: u16, code: &'static str },
-    /// The resource is gone from a reader that answers a name it holds nothing for with
-    /// an empty page rather than a fault: no node is reported under `path`.
-    AbsentFromPage { path: &'static str },
+    /// The resource is gone once the clock has carried the removal: the lookup answers this
+    /// HTTP status and error code. Inside the span it is still reported, under `path`, with
+    /// the transient status the starting call answered.
+    Absent {
+        path: &'static str,
+        status: u16,
+        code: &'static str,
+    },
+    /// The resource is gone from a reader that answers a name it holds nothing for with an
+    /// empty page rather than a fault: no node is reported under `absent_path` once the
+    /// clock has carried the removal, while inside the span it still is, under `path`.
+    AbsentFromPage {
+        path: &'static str,
+        absent_path: &'static str,
+    },
 }
 
-/// One row: a call that starts work on a resource, the transient status its own answer
-/// must carry, and the report that follows it.
+/// One row: a call that starts work on a resource, the transient status its own answer must
+/// carry, and the reports that follow it.
 struct Phase {
     case: &'static str,
     /// The call that starts the work, and the request it is made with.
@@ -50,14 +74,79 @@ struct Phase {
     /// must report.
     transient_path: &'static str,
     transient: &'static str,
-    /// The report issued straight after it, and what it must be answered with.
+    /// The report issued after it, and what it must be answered with.
     report: &'static str,
     report_request: Vec<(String, String)>,
     settled: Settled,
 }
 
-/// Drive one row: the starting call, then exactly one report.
-async fn assert_converges(emulator: &Emulator, phase: &Phase) {
+/// Move every change the clock owes this store to `due_in` from now.
+///
+/// Every record that carries a due instant is rewritten, so a row can hold its resource in
+/// the transient phase whatever it is (`HELD_OUT_OF_REACH`) and then make the whole
+/// outstanding set due at once (`Duration::ZERO`). Only the DUE INSTANT moves: the status
+/// the clock owes, and everything else the record carries, is the handler's own.
+fn every_pending_change_due_in(emulator: &Emulator, due_in: Duration) {
+    let due = SystemTime::now() + due_in;
+    emulator.with_state(|store| {
+        for cluster in store.cache_clusters.values_mut() {
+            if let Some(pending) = cluster.pending_status.as_mut() {
+                pending.due = due;
+            }
+        }
+        for group in store.replication_groups.values_mut() {
+            if let Some(pending) = group.pending_status.as_mut() {
+                pending.due = due;
+            }
+        }
+        for group in store.global_replication_groups.values_mut() {
+            if let Some(pending) = group.pending_status.as_mut() {
+                pending.due = due;
+            }
+        }
+        for snapshot in store.snapshots.values_mut() {
+            if let Some(pending) = snapshot.pending_status.as_mut() {
+                pending.due = due;
+            }
+            if snapshot.pending_removal.is_some() {
+                snapshot.pending_removal = Some(due);
+            }
+        }
+        for cache in store.serverless_caches.values_mut() {
+            if let Some(pending) = cache.pending_status.as_mut() {
+                pending.due = due;
+            }
+            if cache.pending_deletion.is_some() {
+                cache.pending_deletion = Some(due);
+            }
+        }
+        for snapshot in store.serverless_cache_snapshots.values_mut() {
+            if let Some(pending) = snapshot.pending_status.as_mut() {
+                pending.due = due;
+            }
+        }
+        for user in store.users.values_mut() {
+            if let Some(pending) = user.pending_status.as_mut() {
+                pending.due = due;
+            }
+            if user.pending_removal.is_some() {
+                user.pending_removal = Some(due);
+            }
+        }
+        for group in store.user_groups.values_mut() {
+            if let Some(pending) = group.pending_status.as_mut() {
+                pending.due = due;
+            }
+            if group.pending_removal.is_some() {
+                group.pending_removal = Some(due);
+            }
+        }
+    });
+}
+
+/// Drive one row: the starting call, a report inside the span, then the report a client
+/// polls until the clock has settled the record.
+async fn assert_reports_the_transient_phase_then_settles(emulator: &Emulator, phase: &Phase) {
     let started = emulator.call(phase.start, &phase.start_request).await;
     assert_eq!(
         started.status, 200,
@@ -74,53 +163,97 @@ async fn assert_converges(emulator: &Emulator, phase: &Phase) {
         started.text(phase.transient_path)
     );
 
-    let reported = emulator.call(phase.report, &phase.report_request).await;
+    // Inside the span: the report answers from the record as it stands. The due instant is
+    // held out of reach first, so this half of the row is about the rule and not about how
+    // fast the host runs.
+    every_pending_change_due_in(emulator, HELD_OUT_OF_REACH);
+    let inside = emulator.call(phase.report, &phase.report_request).await;
+    assert_eq!(
+        inside.status, 200,
+        "case {}: a {} inside the span must answer 200, got {} {}",
+        phase.case, phase.report, inside.status, inside.body
+    );
+    let transient_in_report = match phase.settled {
+        Settled::Status { path, .. } => path,
+        Settled::Absent { path, .. } | Settled::AbsentFromPage { path, .. } => path,
+    };
+    assert_eq!(
+        inside.text(transient_in_report),
+        Some(phase.transient),
+        "case {}: a {} inside the span must report the record as it stands ({:?}), got {:?} \
+         in {}",
+        phase.case,
+        phase.report,
+        phase.transient,
+        inside.text(transient_in_report),
+        inside.body
+    );
+
+    // And then the clock's own change, which a client reaches by looking again.
+    every_pending_change_due_in(emulator, Duration::ZERO);
     match phase.settled {
         Settled::Status { path, value } => {
-            assert_eq!(
-                reported.status, 200,
-                "case {}: the first {} must answer 200, got {} {}",
-                phase.case, phase.report, reported.status, reported.body
-            );
+            let reported = poll_until(
+                emulator,
+                REGION,
+                phase.case,
+                &format!("the resource reporting {value:?}"),
+                phase.report,
+                &phase.report_request,
+                |reply| reply.text(path) == Some(value),
+            )
+            .await;
             assert_eq!(
                 reported.text(path),
                 Some(value),
-                "case {}: the first {} must be answered with {value:?}, got {:?}",
+                "case {}: the clock must carry the resource to {value:?}, got {:?}",
                 phase.case,
-                phase.report,
                 reported.text(path)
             );
         }
-        Settled::Absent { status, code } => {
+        Settled::Absent { status, code, .. } => {
+            let reported = poll_until(
+                emulator,
+                REGION,
+                phase.case,
+                &format!("the resource answering {status} {code}"),
+                phase.report,
+                &phase.report_request,
+                |reply| reply.status == status,
+            )
+            .await;
             assert_eq!(
                 (reported.status, reported.error_code()),
                 (status, code),
-                "case {}: the first {} must find the resource gone ({status} {code}), got {} {}",
+                "case {}: the clock must take the resource away ({status} {code}), got {} {}",
                 phase.case,
-                phase.report,
                 reported.status,
                 reported.body
             );
         }
-        Settled::AbsentFromPage { path } => {
-            assert_eq!(
-                reported.status, 200,
-                "case {}: the first {} must answer 200, got {} {}",
-                phase.case, phase.report, reported.status, reported.body
-            );
-            assert!(
-                reported.all(path).is_empty(),
-                "case {}: the first {} must report nothing under {path}, got {}",
+        Settled::AbsentFromPage { absent_path, .. } => {
+            let reported = poll_until(
+                emulator,
+                REGION,
                 phase.case,
+                "the resource dropping out of the page",
                 phase.report,
+                &phase.report_request,
+                |reply| reply.all(absent_path).is_empty(),
+            )
+            .await;
+            assert!(
+                reported.all(absent_path).is_empty(),
+                "case {}: the clock must take the resource away, got {}",
+                phase.case,
                 reported.body
             );
         }
     }
 }
 
-/// Create a cluster and read it back once, which is the row the table below repeats: the
-/// read is answered with the settled cluster, so the cluster is usable from here on.
+/// Create a cluster and poll it until the clock has settled it `available`, which is the
+/// state the rows below act from.
 async fn available_cluster(emulator: &Emulator, id: &str, extra: &[(&str, &str)]) {
     let mut request = params(&[
         ("CacheClusterId", id),
@@ -135,15 +268,16 @@ async fn available_cluster(emulator: &Emulator, id: &str, extra: &[(&str, &str)]
         "the cluster {id} must be creatable, got {} {}",
         created.status, created.body
     );
-    let described = emulator
-        .call("DescribeCacheClusters", &params(&[("CacheClusterId", id)]))
-        .await;
-    assert_eq!(
-        described.text("CacheCluster/CacheClusterStatus"),
-        Some("available"),
-        "the first read of {id} must be answered with the settled cluster, got {}",
-        described.body
-    );
+    poll_until(
+        emulator,
+        REGION,
+        id,
+        "the cluster settling at available",
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", id)]),
+        |reply| reply.text("CacheCluster/CacheClusterStatus") == Some(state::STATUS_AVAILABLE),
+    )
+    .await;
 }
 
 /// Create one RBAC user with a password, asserting the create succeeded.
@@ -168,14 +302,13 @@ async fn create_user(emulator: &Emulator, id: &str, password: &str) {
 }
 
 #[tokio::test]
-async fn the_first_report_after_a_call_that_starts_work_is_answered_settled() {
+async fn a_report_inside_a_transition_span_answers_from_the_record_and_then_the_clock_settles() {
     let emulator = Emulator::new();
 
-    // The resources the phase rows act on, each already read back once.
+    // The resources the phase rows act on, each already settled.
     available_cluster(&emulator, "converge-modify", &[]).await;
     available_cluster(&emulator, "converge-reboot", &[]).await;
     available_cluster(&emulator, "converge-snapshot", &[]).await;
-    available_cluster(&emulator, "converge-delete", &[]).await;
     create_user(&emulator, "converge-user", "a-password-of-sixteen-plus").await;
     create_user(&emulator, "converge-doomed", "another-password-of-sixteen").await;
     let group = emulator
@@ -193,18 +326,16 @@ async fn the_first_report_after_a_call_that_starts_work_is_answered_settled() {
         "the user group must be creatable, got {} {}",
         group.status, group.body
     );
-    let group_active = emulator
-        .call(
-            "DescribeUserGroups",
-            &params(&[("UserGroupId", "converge-group")]),
-        )
-        .await;
-    assert_eq!(
-        group_active.text("Status"),
-        Some("active"),
-        "the first read of the group must be answered with it active, got {}",
-        group_active.body
-    );
+    poll_until(
+        &emulator,
+        REGION,
+        "converge-group",
+        "the user group settling at active",
+        "DescribeUserGroups",
+        &params(&[("UserGroupId", "converge-group")]),
+        |reply| reply.text("Status") == Some(state::USER_STATUS_ACTIVE),
+    )
+    .await;
     // The snapshot the copy row copies and the delete row deletes.
     let taken = emulator
         .call(
@@ -220,18 +351,28 @@ async fn the_first_report_after_a_call_that_starts_work_is_answered_settled() {
         "the source snapshot must be creatable, got {} {}",
         taken.status, taken.body
     );
-    let available = emulator
-        .call(
-            "DescribeSnapshots",
-            &params(&[("SnapshotName", "converge-source")]),
-        )
-        .await;
-    assert_eq!(
-        available.text("Snapshot/SnapshotStatus"),
-        Some("available"),
-        "the first read of the snapshot must be answered with it available, got {}",
-        available.body
-    );
+    poll_until(
+        &emulator,
+        REGION,
+        "converge-source",
+        "the snapshot settling at available",
+        "DescribeSnapshots",
+        &params(&[("SnapshotName", "converge-source")]),
+        |reply| reply.text("Snapshot/SnapshotStatus") == Some(state::STATUS_AVAILABLE),
+    )
+    .await;
+    // The cluster the source snapshot was taken of is `snapshotting` until the clock
+    // carries it back, and the rows below take their own snapshots of it.
+    poll_until(
+        &emulator,
+        REGION,
+        "converge-snapshot",
+        "the snapshotted cluster settling at available",
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", "converge-snapshot")]),
+        |reply| reply.text("CacheCluster/CacheClusterStatus") == Some(state::STATUS_AVAILABLE),
+    )
+    .await;
 
     // The axis: the resource the report is about, the phase it is in, and whether the
     // settled state is a status or the resource's absence.
@@ -328,20 +469,8 @@ async fn the_first_report_after_a_call_that_starts_work_is_answered_settled() {
             report: "DescribeSnapshots",
             report_request: params(&[("SnapshotName", "converge-source")]),
             settled: Settled::AbsentFromPage {
-                path: "Snapshot/SnapshotName",
-            },
-        },
-        Phase {
-            case: "a cache cluster going away",
-            start: "DeleteCacheCluster",
-            start_request: params(&[("CacheClusterId", "converge-delete")]),
-            transient_path: "CacheCluster/CacheClusterStatus",
-            transient: "deleting",
-            report: "DescribeCacheClusters",
-            report_request: params(&[("CacheClusterId", "converge-delete")]),
-            settled: Settled::Absent {
-                status: 404,
-                code: "CacheClusterNotFound",
+                path: "Snapshot/SnapshotStatus",
+                absent_path: "Snapshot/SnapshotName",
             },
         },
         Phase {
@@ -376,6 +505,20 @@ async fn the_first_report_after_a_call_that_starts_work_is_answered_settled() {
             settled: Settled::Status {
                 path: "Status",
                 value: "available",
+            },
+        },
+        Phase {
+            case: "a serverless cache going away",
+            start: "DeleteServerlessCache",
+            start_request: params(&[("ServerlessCacheName", "converge-serverless")]),
+            transient_path: "Status",
+            transient: "deleting",
+            report: "DescribeServerlessCaches",
+            report_request: params(&[("ServerlessCacheName", "converge-serverless")]),
+            settled: Settled::Absent {
+                path: "Status",
+                status: 404,
+                code: "ServerlessCacheNotFoundFault",
             },
         },
         Phase {
@@ -419,6 +562,7 @@ async fn the_first_report_after_a_call_that_starts_work_is_answered_settled() {
             report: "DescribeUsers",
             report_request: params(&[("UserId", "converge-doomed")]),
             settled: Settled::Absent {
+                path: "Status",
                 status: 404,
                 code: "UserNotFound",
             },
@@ -426,7 +570,7 @@ async fn the_first_report_after_a_call_that_starts_work_is_answered_settled() {
     ];
 
     for phase in &phases {
-        assert_converges(&emulator, phase).await;
+        assert_reports_the_transient_phase_then_settles(&emulator, phase).await;
     }
 
     // The membership change the user-group row started is applied together with the
@@ -450,6 +594,103 @@ async fn the_first_report_after_a_call_that_starts_work_is_answered_settled() {
     );
 }
 
+/// The state gate a resource's transient phase goes with: a MUTATION arriving inside the
+/// span is refused with the status the record carries, which is only observable because no
+/// report of this service waits a scheduled change out.
+///
+/// The rows span the resources that carry such a gate and the call each one refuses.
+#[tokio::test]
+async fn a_mutation_arriving_inside_the_span_is_refused_with_the_status_the_record_carries() {
+    // Each row: the case, the create and its request, the gated call and its request, and
+    // the error code the gate answers.
+    type Row = (
+        &'static str,
+        &'static str,
+        Vec<(String, String)>,
+        &'static str,
+        Vec<(String, String)>,
+        &'static str,
+    );
+    let rows: Vec<Row> = vec![
+        (
+            "a cache cluster still being created",
+            "CreateCacheCluster",
+            params(&[
+                ("CacheClusterId", "gated-cluster"),
+                ("Engine", "redis"),
+                ("CacheNodeType", "cache.t4g.micro"),
+                ("NumCacheNodes", "1"),
+            ]),
+            "DeleteCacheCluster",
+            params(&[("CacheClusterId", "gated-cluster")]),
+            "InvalidCacheClusterState",
+        ),
+        (
+            "a user group still being created",
+            "CreateUserGroup",
+            params(&[
+                ("UserGroupId", "gated-group"),
+                ("Engine", "redis"),
+                ("UserIds.member.1", "default"),
+            ]),
+            "DeleteUserGroup",
+            params(&[("UserGroupId", "gated-group")]),
+            "InvalidUserGroupState",
+        ),
+        (
+            "a serverless cache still being created",
+            "CreateServerlessCache",
+            params(&[
+                ("ServerlessCacheName", "gated-serverless"),
+                ("Engine", "valkey"),
+            ]),
+            "DeleteServerlessCache",
+            params(&[("ServerlessCacheName", "gated-serverless")]),
+            "InvalidServerlessCacheStateFault",
+        ),
+    ];
+
+    for (case, create, create_request, gated, gated_request, code) in rows {
+        // One emulator per row, so the row's gate is the only thing outstanding.
+        let emulator = Emulator::new();
+        let created = emulator.call(create, &create_request).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: {create} must answer 200, got {} {}",
+            created.status, created.body
+        );
+        // Held out of reach, so the gated call below arrives inside the span however fast
+        // or slow the host runs.
+        every_pending_change_due_in(&emulator, HELD_OUT_OF_REACH);
+        let refused = emulator.call(gated, &gated_request).await;
+        assert_eq!(
+            (refused.status, refused.error_code()),
+            (400, code),
+            "case {case:?}: {gated} inside the span must be refused 400 {code}, got {} {}",
+            refused.status,
+            refused.body
+        );
+        // And the same call is accepted once the clock has settled the record, which is
+        // what makes the refusal the state rule speaking rather than a blanket refusal.
+        every_pending_change_due_in(&emulator, Duration::ZERO);
+        let accepted = poll_until(
+            &emulator,
+            REGION,
+            case,
+            &format!("{gated} being accepted once the record has settled"),
+            gated,
+            &gated_request,
+            |reply: &Reply| reply.status == 200,
+        )
+        .await;
+        assert_eq!(
+            accepted.status, 200,
+            "case {case:?}: {gated} must be accepted once the record has settled, got {} {}",
+            accepted.status, accepted.body
+        );
+    }
+}
+
 /// `DescribeSnapshots` for one snapshot by name.
 async fn snapshot(emulator: &Emulator, name: &str) -> Reply {
     emulator
@@ -457,11 +698,24 @@ async fn snapshot(emulator: &Emulator, name: &str) -> Reply {
         .await
 }
 
+/// Poll `DescribeSnapshots` for `name` until it reports `status`.
+async fn snapshot_reporting(emulator: &Emulator, name: &str, status: &str) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        name,
+        &format!("the snapshot reporting {status:?}"),
+        "DescribeSnapshots",
+        &params(&[("SnapshotName", name)]),
+        |reply| reply.text("Snapshot/SnapshotStatus") == Some(status),
+    )
+    .await
+}
+
 #[tokio::test]
-async fn the_snapshot_round_trip_converges_with_one_read_per_wait() {
+async fn the_snapshot_round_trip_converges_by_polling_each_wait_out() {
     let emulator = Emulator::new();
-    // The recorded flow, driven with ONE read per wait: a client that converges on its
-    // first poll never issues a second.
+    // The recorded flow, driven the way a client drives it: each wait is polled out.
     available_cluster(&emulator, "round-trip", &[("SnapshotRetentionLimit", "0")]).await;
 
     let source = emulator
@@ -478,11 +732,11 @@ async fn the_snapshot_round_trip_converges_with_one_read_per_wait() {
         "CreateSnapshot must answer 200, got {} {}",
         source.status, source.body
     );
-    let settled_source = snapshot(&emulator, "round-trip-source").await;
+    let settled_source = snapshot_reporting(&emulator, "round-trip-source", "available").await;
     assert_eq!(
         settled_source.text("Snapshot/SnapshotStatus"),
         Some("available"),
-        "the first read must find the source snapshot available, got {}",
+        "the source snapshot must settle available, got {}",
         settled_source.body
     );
     // A snapshot of a cluster records the cluster it was taken from, with one
@@ -522,11 +776,11 @@ async fn the_snapshot_round_trip_converges_with_one_read_per_wait() {
         copied.text("Snapshot/SnapshotStatus"),
         copied.body
     );
-    let settled_copy = snapshot(&emulator, "round-trip-copy").await;
+    let settled_copy = snapshot_reporting(&emulator, "round-trip-copy", "available").await;
     assert_eq!(
         settled_copy.text("Snapshot/SnapshotStatus"),
         Some("available"),
-        "the first read must find the copy available, got {}",
+        "the copy must settle available, got {}",
         settled_copy.body
     );
     assert_eq!(
@@ -565,10 +819,19 @@ async fn the_snapshot_round_trip_converges_with_one_read_per_wait() {
         "DeleteSnapshot must answer with the snapshot on its way out, got {}",
         deleted.body
     );
-    let gone = snapshot(&emulator, "round-trip-source").await;
+    let gone = poll_until(
+        &emulator,
+        REGION,
+        "round-trip-source",
+        "the snapshot being removed by the clock",
+        "DescribeSnapshots",
+        &params(&[("SnapshotName", "round-trip-source")]),
+        |reply| reply.all("Snapshot/SnapshotName").is_empty(),
+    )
+    .await;
     assert!(
         gone.all("Snapshot/SnapshotName").is_empty(),
-        "the first read after the delete must not find the source, got {} {}",
+        "once the clock has removed it, a read must not find the source, got {} {}",
         gone.status,
         gone.body
     );
@@ -599,13 +862,34 @@ async fn the_snapshot_round_trip_converges_with_one_read_per_wait() {
         "DeleteSnapshot must answer with the copy on its way out, got {}",
         deleted_copy.body
     );
-    let copy_gone = snapshot(&emulator, "round-trip-copy").await;
+    let copy_gone = poll_until(
+        &emulator,
+        REGION,
+        "round-trip-copy",
+        "the copy being removed by the clock",
+        "DescribeSnapshots",
+        &params(&[("SnapshotName", "round-trip-copy")]),
+        |reply| reply.all("Snapshot/SnapshotName").is_empty(),
+    )
+    .await;
     assert!(
         copy_gone.all("Snapshot/SnapshotName").is_empty(),
-        "the first read after the delete must not find the copy, got {} {}",
+        "once the clock has removed it, a read must not find the copy, got {} {}",
         copy_gone.status,
         copy_gone.body
     );
+    // A delete needs the cluster settled, and taking a snapshot of it left it
+    // `snapshotting` for a span.
+    poll_until(
+        &emulator,
+        REGION,
+        "round-trip",
+        "the cluster settling at available",
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", "round-trip")]),
+        |reply| reply.text("CacheCluster/CacheClusterStatus") == Some(state::STATUS_AVAILABLE),
+    )
+    .await;
     let removed = emulator
         .call(
             "DeleteCacheCluster",
@@ -618,16 +902,20 @@ async fn the_snapshot_round_trip_converges_with_one_read_per_wait() {
         "DeleteCacheCluster must answer with the cluster on its way out, got {}",
         removed.body
     );
-    let cluster_gone = emulator
-        .call(
-            "DescribeCacheClusters",
-            &params(&[("CacheClusterId", "round-trip")]),
-        )
-        .await;
+    let cluster_gone = poll_until(
+        &emulator,
+        REGION,
+        "round-trip",
+        "the cluster being removed by the clock",
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", "round-trip")]),
+        |reply| reply.status == 404,
+    )
+    .await;
     assert_eq!(
         (cluster_gone.status, cluster_gone.error_code()),
         (404, "CacheClusterNotFound"),
-        "the first read after the delete must not find the cluster, got {} {}",
+        "once the clock has removed it, a read must not find the cluster, got {} {}",
         cluster_gone.status,
         cluster_gone.body
     );

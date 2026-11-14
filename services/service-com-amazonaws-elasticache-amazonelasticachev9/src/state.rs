@@ -5,10 +5,11 @@
 //! The transient statuses this service reports — a cluster `creating`, a snapshot
 //! `copying`, a group `modifying` — are held for a span the EMULATOR chooses, not
 //! one AWS documents: [`CLUSTER_TRANSITION`] and its siblings compress what
-//! ElastiCache takes minutes over into half a second, and
-//! [`SETTLE_WAIT_CAP`] is how long a report waits for such a span to pass before
-//! it answers ([`await_settled`]). Both are this emulator's deliberate choice,
-//! stated here beside the durations it does take from AWS — a maintenance
+//! ElastiCache takes minutes over into half a second. No call waits for such a
+//! span: the due instant is stored on the record and whichever later call reads
+//! it materialises what the clock owed, so a read issued inside the span reports
+//! the transient status. The span is this emulator's deliberate choice, stated
+//! here beside the durations it does take from AWS — a maintenance
 //! window's minimum, a snapshot's retention, a reservation's term — which are
 //! kept as the service publishes them.
 //!
@@ -206,7 +207,6 @@ mod migrations;
 mod network_types;
 mod settle_wait;
 mod snapshots;
-pub use settle_wait::*;
 pub use network_types::*;
 pub use snapshots::*;
 pub use migrations::*;
@@ -421,9 +421,8 @@ pub fn maintenance_window_refusal(value: &str) -> Option<String> {
 /// transient status and a MUTATION arriving inside the span is still refused by
 /// the state gate that goes with it. The due instant is stored on the record and
 /// materialised by whichever later call reads it; a REPORT issued inside the
-/// span is answered once the transition has fallen due
-/// ([`await_settled`]), so a client polling on an AWS-sized interval converges
-/// on its first poll.
+/// span answers with the transient status, because nothing of this service
+/// sleeps for a transition it has scheduled.
 pub const CLUSTER_TRANSITION: Duration = Duration::from_millis(500);
 
 /// How long a snapshot stays in the status the call that started the work

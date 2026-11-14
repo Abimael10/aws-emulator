@@ -723,7 +723,8 @@ async fn max_results_is_accepted_at_its_bounds_and_refused_past_them() {
 }
 
 /// A `NextToken` this service did not issue is refused with `InvalidPaginationToken`,
-/// rather than read as a cursor.
+/// rather than read as a cursor — and the CoIP plane's sentence QUOTES the token it was
+/// passed.
 #[tokio::test]
 async fn a_next_token_this_service_did_not_issue_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
@@ -751,18 +752,20 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
             "InvalidPaginationToken",
             "case {token:?}: expected InvalidPaginationToken, got {body}"
         );
-        // EC2's message for this refusal is one fixed sentence: it does not repeat the token
-        // the request sent back.
+        // This read's message is EC2's sentence for the CoIP plane, written out here as a
+        // literal rather than taken from the helper the handler calls, so a change of
+        // wording fails: the token the request sent is quoted in it, in full up to the
+        // crate's echo ceiling.
         let message = unescaped(&element(&body, "Message").unwrap_or_default());
         assert_eq!(
             message,
-            ec2::state::INVALID_PAGINATION_TOKEN_MESSAGE,
-            "case {token:?}: expected EC2's own pagination-token sentence, got {message:?}"
+            format!("Next token '{token}' is invalid"),
+            "case {token:?}: expected the CoIP plane's quoted sentence, got {message:?}"
         );
     }
 
-    // A token far longer than any this service mints earns the same fixed sentence, so a
-    // request's own bytes are never reflected at all.
+    // A token far longer than any this service mints is echoed only up to that ceiling, so
+    // a request's own bytes are never reflected in full.
     let oversize = "z".repeat(MAX_ECHOED_PAGE_TOKEN_CHARS * 4);
     let params = vec![("NextToken".to_string(), oversize.clone())];
     let (status, body) = describe(&router, &params).await;
@@ -771,10 +774,16 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
         "an oversize token: expected HTTP 400, got {status} with body {body}"
     );
     let message = unescaped(&element(&body, "Message").unwrap_or_default());
+    let echoed: String = oversize.chars().take(MAX_ECHOED_PAGE_TOKEN_CHARS).collect();
     assert_eq!(
         message,
-        ec2::state::INVALID_PAGINATION_TOKEN_MESSAGE,
-        "an oversize token: expected EC2's own pagination-token sentence, got {message:?}"
+        format!("Next token '{echoed}' is invalid"),
+        "an oversize token: expected the quoted sentence held to the echo ceiling, got \
+         {message:?}"
+    );
+    assert!(
+        !message.contains(&"z".repeat(MAX_ECHOED_PAGE_TOKEN_CHARS + 1)),
+        "an oversize token: no more than the ceiling may be echoed, got {message:?}"
     );
 }
 

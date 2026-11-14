@@ -103,8 +103,33 @@ pub(crate) async fn describe_cluster(emulator: &Emulator, id: &str) -> Reply {
         .await
 }
 
-/// Create a cluster and wait out the span after which the clock owes it
-/// `available`, so a test about modify / delete starts from a settled cluster.
+/// Read the cluster `id` back until it reports `status`, and answer with that
+/// reply.
+///
+/// A report of this service answers from the record as it stands, so the
+/// transition the clock owes a cluster is observed by LOOKING AGAIN rather than
+/// by waiting a fixed time — which is what a client polling the status does, and
+/// what keeps this suite independent of how fast the host runs.
+pub(crate) async fn poll_cluster_status(
+    emulator: &Emulator,
+    case: &str,
+    id: &str,
+    status: &str,
+) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        case,
+        &format!("the cluster {id} reporting {status:?}"),
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", id), ("ShowCacheNodeInfo", "true")]),
+        |reply| reply.text("CacheCluster/CacheClusterStatus") == Some(status),
+    )
+    .await
+}
+
+/// Create a cluster and poll until the clock has carried it to `available`, so a
+/// test about modify / delete starts from a settled cluster.
 pub(crate) async fn create_available_cluster(emulator: &Emulator, id: &str, extra: &[(&str, &str)]) {
     let created = create_cluster(emulator, id, extra).await;
     assert_eq!(
@@ -112,7 +137,7 @@ pub(crate) async fn create_available_cluster(emulator: &Emulator, id: &str, extr
         "case {id}: create must succeed, got {}",
         created.body
     );
-    std::thread::sleep(PAST_TRANSITION);
+    poll_cluster_status(emulator, id, id, state::STATUS_AVAILABLE).await;
 }
 
 /// One row of the create/round-trip table.
@@ -383,7 +408,7 @@ async fn cache_nodes_are_reported_only_when_the_caller_asks_for_them() {
         .await;
     // A cluster in the `creating` state reports cluster-level information only,
     // so this test starts from a settled one.
-    std::thread::sleep(PAST_TRANSITION);
+    poll_cluster_status(&emulator, "node-info", "node-info", state::STATUS_AVAILABLE).await;
 
     for (show, expected_nodes) in [("true", 2), ("false", 0)] {
         let reply = emulator
@@ -438,15 +463,21 @@ async fn a_cluster_reaches_available_on_the_clock_and_not_before() {
             created.body
         );
 
-        // The next read is answered once the provisioning the clock owed the
-        // cluster is done, so it reports the settled cluster and the nodes that
-        // came up with it — the first read a client issues after its create
-        // converges rather than costing it a poll interval.
-        let settled = describe_cluster(&emulator, &id).await;
+        // A read issued inside the span reports the cluster as it stands — still
+        // `creating` — and the clock carries it to `available`, which the client
+        // learns by looking again.
+        let transient = describe_cluster(&emulator, &id).await;
+        assert_eq!(
+            transient.text("CacheCluster/CacheClusterStatus"),
+            Some("creating"),
+            "case {engine}: a read inside the span reports the cluster as it stands, got {:?}",
+            transient.text("CacheCluster/CacheClusterStatus")
+        );
+        let settled = poll_cluster_status(&emulator, engine, &id, state::STATUS_AVAILABLE).await;
         assert_eq!(
             settled.text("CacheCluster/CacheClusterStatus"),
             Some("available"),
-            "case {engine}: the read is answered once the cluster is available, got {:?}",
+            "case {engine}: the cluster must settle at available, got {:?}",
             settled.text("CacheCluster/CacheClusterStatus")
         );
         let node_statuses = settled.all("CacheNodes/CacheNode/CacheNodeStatus");
@@ -801,7 +832,10 @@ async fn modify_applies_immediately_or_records_pending_modified_values() {
             modified.body
         );
 
-        let described = describe_cluster(&emulator, &id).await;
+        // The cluster is read back once the clock has carried it through the span
+        // an immediate modify started, which a client learns by looking again
+        // rather than by waiting a fixed time.
+        let described = poll_cluster_status(&emulator, label, &id, state::STATUS_AVAILABLE).await;
         // A member `PendingModifiedValues` does NOT model has nowhere to be
         // pending, so it is applied whatever `ApplyImmediately` says.
         assert_eq!(
@@ -1277,11 +1311,10 @@ async fn node_placement_follows_the_zones_the_request_asked_for() {
     }
     // A creating cluster reports cluster-level information only, so the
     // per-node zones are read once every cluster has settled.
-    std::thread::sleep(PAST_TRANSITION);
 
     for (case, _, distinct_zones, preferred) in cases {
         let id = format!("zones-{case}").replace(' ', "-");
-        let described = describe_cluster(&emulator, &id).await;
+        let described = poll_cluster_status(&emulator, case, &id, state::STATUS_AVAILABLE).await;
         let mut zones = described.all("CacheNodes/CacheNode/CustomerAvailabilityZone");
         zones.sort_unstable();
         zones.dedup();
@@ -1586,10 +1619,12 @@ async fn modify_refuses_a_member_that_names_no_change_it_can_make() {
         grown.body
     );
 
-    // A later read is answered once the work the clock owed is done: the new
-    // node landed in the named zone, the existing nodes stayed where they were,
-    // and every node reports its endpoint.
-    let described = describe_cluster(&emulator, "modify-refusals").await;
+    // Once the clock has carried the cluster back to `available`, the new node
+    // landed in the named zone, the existing nodes stayed where they were, and
+    // every node reports its endpoint.
+    let described =
+        poll_cluster_status(&emulator, "modify-refusals", "modify-refusals", state::STATUS_AVAILABLE)
+            .await;
     let zones = described.all("CacheNodes/CacheNode/CustomerAvailabilityZone");
     assert_eq!(
         zones,
@@ -1818,8 +1853,9 @@ async fn an_unrelated_immediate_modify_leaves_an_earlier_pending_value_pending()
         described.text("CacheCluster/NumCacheNodes")
     );
 
-    // A later modify that DOES name the count applies it and clears it.
-    std::thread::sleep(PAST_TRANSITION);
+    // A later modify that DOES name the count applies it and clears it, once the
+    // clock has carried the cluster back to a state a modify is admitted in.
+    poll_cluster_status(&emulator, "pending-kept", "pending-kept", state::STATUS_AVAILABLE).await;
     let applied = emulator
         .call(
             "ModifyCacheCluster",
@@ -1945,9 +1981,7 @@ async fn an_unknown_or_unsettled_cluster_is_refused() {
     // The state gate: a call that CHANGES a cluster still being created is
     // refused with the status the cluster has. Each case creates a cluster of
     // its own and calls straight after it, because the gate is what a mutation
-    // arriving INSIDE the transition span is answered with, while a report of
-    // that same cluster is answered only once the span has passed — so nothing
-    // may read the cluster between its create and the call under test.
+    // arriving INSIDE the transition span is answered with.
     let gated: [(&str, &str); 2] = [
         ("modify while creating", "ModifyCacheCluster"),
         ("delete while creating", "DeleteCacheCluster"),
@@ -1972,7 +2006,8 @@ async fn an_unknown_or_unsettled_cluster_is_refused() {
     }
 
     // A describe is a read: it reports the cluster rather than refusing it, and
-    // is answered once the work the clock owed it is done.
+    // it answers with the status the record carries at that instant — `creating`
+    // inside the span the create started.
     create_cluster(&emulator, "fresh", &[]).await;
     let described = emulator
         .call("DescribeCacheClusters", &params(&[("CacheClusterId", "fresh")]))
@@ -1984,10 +2019,14 @@ async fn an_unknown_or_unsettled_cluster_is_refused() {
     );
     assert_eq!(
         described.text("CacheCluster/CacheClusterStatus"),
-        Some("available"),
-        "case describe while creating: the read is answered settled, got {:?}",
+        Some("creating"),
+        "case describe while creating: the read reports the cluster as it stands, got {:?}",
         described.text("CacheCluster/CacheClusterStatus")
     );
+    // And the clock carries it on from there, which the client learns by looking
+    // again.
+    poll_cluster_status(&emulator, "describe while creating", "fresh", state::STATUS_AVAILABLE)
+        .await;
 }
 
 /// One row of the subnet-group table.
@@ -2781,10 +2820,11 @@ async fn a_reboot_moves_only_the_named_nodes_and_settles_back() {
         );
 
         // Persisted, not merely reported: the next read reads the cluster back
-        // node for node — answered once the reboot the clock owed is over, so
+        // node for node — polled until the reboot the clock owed is over, so
         // the cluster and every node it restarted are available again — and the
         // reboot changed nothing else about the cluster.
-        let settled = describe_cluster(&emulator, case.id).await;
+        let settled =
+            poll_cluster_status(&emulator, case.id, case.id, state::STATUS_AVAILABLE).await;
         assert_eq!(
             settled.text("CacheCluster/CacheClusterStatus"),
             Some("available"),

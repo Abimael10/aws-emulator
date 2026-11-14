@@ -14,11 +14,15 @@
 //! > carries `access-control-allow-credentials: true` when `AllowCredentials` is set, and a
 //! > request whose origin the configuration does not admit — matching exactly or through the
 //! > wildcard entry — carries NO `Access-Control-*` header at all. A PREFLIGHT — the `OPTIONS`
-//! > request carrying `Access-Control-Request-Method` — is answered by the GATEWAY itself with
-//! > `204` and the configured `AllowMethods`, `AllowHeaders` and `MaxAge` when the method it
-//! > asks about is admitted (and with no CORS header when the origin or that method is not),
-//! > reaching no route and no integration of the api. An api carrying no configuration
-//! > decorates nothing and answers an `OPTIONS` request from its routes like any other.
+//! > request carrying `Access-Control-Request-Method` — is ROUTED like any other request when
+//! > a route of the serving deployment matches it (an `OPTIONS` route, an `ANY` route, or the
+//! > `$default` route that catches what nothing else matches), so the integration behind that
+//! > route answers it and the configuration decorates that answer; only where NO route
+//! > matches it does the GATEWAY answer it itself, with `204` and the configured
+//! > `AllowMethods`, `AllowHeaders` and `MaxAge` when the method it asks about is admitted
+//! > (and with no CORS header when the origin or that method is not). An api carrying no
+//! > configuration decorates nothing and answers an `OPTIONS` request from its routes like
+//! > any other.
 //!
 //! `smithy_query(query="shape", shape="Cors")` is where each member's meaning comes from —
 //! `AllowOrigins` "a collection of allowed origins", `AllowMethods` "a collection of allowed
@@ -32,10 +36,11 @@
 //! which one the request comes from, the wildcard entry, a spelling that differs from the
 //! collection's only in case, a collection that is absent or empty, whether the request is a
 //! preflight, whether the method it asks about is admitted, which `Cors` members the
-//! configuration carries at all, and WHICH BACKEND the matched route fronts — an
+//! configuration carries at all, WHICH BACKEND the matched route fronts — an
 //! `HTTP_PROXY` upstream the caller is redirected to (`307`) and an `AWS_PROXY` integration
 //! that produces no response (`500`) — because the decoration is the api's and is
-//! independent of what answered. The recorded case is one row.
+//! independent of what answered, and WHICH ROUTE KEYS the api holds, which is what decides
+//! whether a preflight is routed or answered by the gateway. The recorded case is one row.
 //!
 //! What these cases do not reach: the `200` and the handler's body the recorded check polls
 //! for. That answer is the Lambda function's own, and this emulator has no in-process runtime
@@ -68,9 +73,12 @@ const REDIRECT: u16 = 307;
 /// The status a matched route whose integration produced no response is answered with.
 const INTEGRATION_FAULT: u16 = 500;
 
-/// The status the GATEWAY answers a preflight of a CORS-configured api with: it answers the
-/// preflight itself, so no route of the api is matched and no integration is reached.
+/// The status the GATEWAY answers a preflight NO ROUTE of the api matches with: it answers
+/// that preflight itself, so no integration is reached.
 const PREFLIGHT: u16 = 204;
+
+/// The status a request no route of the api matches is answered with.
+const NOT_FOUND: u16 = 404;
 
 /// The modelled bounds of `IntegerWithLengthBetweenMinus1And86400`, the shape `Cors$MaxAge`
 /// targets (`range` min -1 max 86400). NEITHER is a bound the service enforces, so a value
@@ -179,6 +187,20 @@ async fn deploy(
     cors: Option<Value>,
     backend: Backend,
 ) -> (String, String) {
+    // The `$default` route catches every method and path, so one deployment serves both the
+    // actual request and the preflight.
+    deploy_with_route_key(emulator, case, cors, backend, "$default").await
+}
+
+/// [`deploy`], with the ROUTE KEY the api's one route carries — the axis that decides
+/// whether a preflight is matched by a route at all.
+async fn deploy_with_route_key(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    cors: Option<Value>,
+    backend: Backend,
+    route_key: &str,
+) -> (String, String) {
     let mut request = json!({ "name": "cors-data-plane-api", "protocolType": "HTTP" });
     if let Some(cors) = cors {
         request["corsConfiguration"] = cors;
@@ -208,14 +230,12 @@ async fn deploy(
     );
     let integration_id = as_str(&integration, "integrationId");
 
-    // The `$default` route catches every method and path, so one deployment serves both the
-    // actual request and the preflight.
     let (status, route) = call(
         emulator,
         "POST",
         &format!("/v2/apis/{api_id}/routes"),
         Some(json!({
-            "routeKey": "$default",
+            "routeKey": route_key,
             "target": format!("integrations/{integration_id}")
         })),
     )
@@ -255,26 +275,12 @@ struct Row {
 }
 
 impl Row {
-    /// Whether the GATEWAY answers this request itself: a PREFLIGHT — the `OPTIONS` request
-    /// carrying `Access-Control-Request-Method` — of an api that carries a configuration at
-    /// all, whether or not that configuration admits the origin or the method it asks about.
-    fn answered_by_the_gateway(&self) -> bool {
-        self.cors.is_some()
-            && self.method == "OPTIONS"
-            && self
-                .request_headers
-                .iter()
-                .any(|(name, _)| *name == "access-control-request-method")
-    }
-
-    /// The status this row's answer must carry: [`PREFLIGHT`] for a preflight the gateway
-    /// answered itself, and the backend's own class for every request a route served.
+    /// The status this row's answer must carry: the backend's own class, because the api the
+    /// rows are deployed on holds the `$default` route, which catches a preflight as it
+    /// catches everything else — so every row here is served THROUGH that route and the
+    /// decoration is applied to what the integration answered.
     fn status(&self, backend: Backend) -> u16 {
-        if self.answered_by_the_gateway() {
-            PREFLIGHT
-        } else {
-            backend.status()
-        }
+        backend.status()
     }
 }
 
@@ -530,9 +536,9 @@ fn decorated(case: &str, backend: Backend, row: &Row, answer: &Answer) {
         "case {case:?} behind {backend:?}: expected the CORS headers {wanted:?}, got {}",
         answer.summary()
     );
-    // Either the gateway answered the preflight itself — which reaches no backend at all, so
-    // the status is its own and no `Location` of an upstream is carried — or the answer is the
-    // one the data plane already computed, whose status the decoration leaves untouched.
+    // The api holds the `$default` route, so every row — preflight included — was served
+    // through it: the status is the one the data plane already computed, whose status the
+    // decoration leaves untouched, and an `HTTP_PROXY` row still names its upstream.
     assert_eq!(
         answer.status,
         row.status(backend),
@@ -540,19 +546,11 @@ fn decorated(case: &str, backend: Backend, row: &Row, answer: &Answer) {
         row.status(backend),
         answer.summary()
     );
-    if backend == Backend::HttpProxy && !row.answered_by_the_gateway() {
+    if backend == Backend::HttpProxy {
         assert_eq!(
             answer.location.as_deref(),
             Some("https://upstream.example.test/forward"),
             "case {case:?}: the redirect must still name the upstream, got {:?}",
-            answer.location
-        );
-    }
-    if row.answered_by_the_gateway() {
-        assert_eq!(
-            answer.location, None,
-            "case {case:?} behind {backend:?}: a preflight the gateway answered reaches no \
-             integration, so it carries no upstream, got {:?}",
             answer.location
         );
     }
@@ -590,6 +588,113 @@ async fn an_apis_cors_configuration_decorates_what_its_stage_answers() {
             .await;
             decorated(case, backend, row, &answer);
         }
+    }
+}
+
+/// A PREFLIGHT is matched against the api's routes first: a route that catches it serves it,
+/// and the gateway answers the preflight itself only where NO route of the serving
+/// deployment matches the request.
+///
+/// The rows span the route keys an api holds along that axis — a key that catches the
+/// preflight by method (`OPTIONS /items`), one that catches every method of that path
+/// (`ANY /items`), the `$default` key that catches what nothing else matches, and a key that
+/// catches only the ACTUAL request (`GET /items`), which is the one row no route matches the
+/// preflight for. The decoration is the api's either way, so every row carries the same
+/// `Access-Control-*` headers; what differs is WHO answered.
+#[tokio::test]
+async fn a_preflight_is_routed_when_a_route_matches_it_and_answered_by_the_gateway_otherwise() {
+    // Each row: the route key the api holds, and the status the preflight must be answered
+    // with behind an `HTTP_PROXY` integration (the `307` that names the upstream) or by the
+    // gateway itself.
+    let rows: [(&str, u16); 4] = [
+        ("OPTIONS /items", REDIRECT),
+        ("ANY /items", REDIRECT),
+        ("$default", REDIRECT),
+        ("GET /items", PREFLIGHT),
+    ];
+
+    for (route_key, expected) in rows {
+        let case = format!("a preflight against an api whose one route is {route_key:?}");
+        let emulator = emulator();
+        let (_api_id, endpoint_host) = deploy_with_route_key(
+            &emulator,
+            &case,
+            Some(one_origin_one_method()),
+            Backend::HttpProxy,
+            route_key,
+        )
+        .await;
+
+        let answer = invoke(
+            &emulator,
+            &endpoint_host,
+            "OPTIONS",
+            "/items",
+            &[
+                ("origin", "https://example.test"),
+                ("access-control-request-method", "GET"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            answer.status, expected,
+            "case {case:?}: expected status {expected}, got {}",
+            answer.summary()
+        );
+        // The api's configuration decorates the answer whoever produced it.
+        let wanted: BTreeMap<String, String> = [
+            (
+                "access-control-allow-origin".to_string(),
+                "https://example.test".to_string(),
+            ),
+            (
+                "access-control-allow-methods".to_string(),
+                "GET".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            answer.cors,
+            wanted,
+            "case {case:?}: expected the CORS headers {wanted:?}, got {}",
+            answer.summary()
+        );
+        // A routed preflight reached the integration, so it names the upstream; the one the
+        // gateway answered reached none.
+        let upstream = if expected == PREFLIGHT {
+            None
+        } else {
+            Some("https://upstream.example.test/forward")
+        };
+        assert_eq!(
+            answer.location.as_deref(),
+            upstream,
+            "case {case:?}: expected the upstream {upstream:?}, got {:?}",
+            answer.location
+        );
+
+        // The ACTUAL request is unaffected by which key the api holds: the row whose key
+        // catches only `GET` serves it, and the row whose key is `OPTIONS /items` has
+        // nothing that matches it.
+        let actual = invoke(
+            &emulator,
+            &endpoint_host,
+            "GET",
+            "/items",
+            &[("origin", "https://example.test")],
+        )
+        .await;
+        let expected_actual = if route_key == "OPTIONS /items" {
+            NOT_FOUND
+        } else {
+            REDIRECT
+        };
+        assert_eq!(
+            actual.status, expected_actual,
+            "case {case:?}: a GET must be answered {expected_actual}, got {}",
+            actual.summary()
+        );
     }
 }
 

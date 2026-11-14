@@ -595,7 +595,9 @@ async fn max_results_pages_the_usage_set_and_next_token_walks_it() {
 }
 
 /// A `NextToken` this service did not mint is refused rather than read as a position in the
-/// set. Rows: free text, an allocation id sent raw, and the empty token.
+/// set, with the CoIP plane's own sentence — which QUOTES the token the request sent, as
+/// `DescribeCoipPools` does. Rows: free text, an allocation id sent raw, and the empty
+/// token.
 #[tokio::test]
 async fn a_bogus_next_token_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
@@ -620,6 +622,11 @@ async fn a_bogus_next_token_is_refused() {
             error_code(&body),
             ec2::state::INVALID_PAGINATION_TOKEN,
             "case {case:?}: expected InvalidPaginationToken, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("Next token '{token}' is invalid"),
+            "case {case:?}: expected the CoIP plane's quoted sentence, got {body}"
         );
     }
 }

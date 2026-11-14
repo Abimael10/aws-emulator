@@ -1239,6 +1239,40 @@ pub fn invalid_pagination_token_for<E>(_refused_token: &str) -> crate::scaffolde
     invalid_pagination_token()
 }
 
+/// EC2's message for [`INVALID_PAGINATION_TOKEN`] on a read whose pagination layer QUOTES
+/// the token it could not read: `Next token '<token>' is invalid`, carrying the value the
+/// request sent.
+///
+/// WHICH of the two sentences a read answers is a fact of the OPERATION and not of the
+/// token: the CoIP pool reads quote the value they were passed, while the describes that go
+/// through [`INVALID_PAGINATION_TOKEN_MESSAGE`] repeat no part of it back. The quoted value
+/// is a caller-chosen string the model puts no `@length` on, so the echo is held to
+/// [`MAX_ECHOED_PAGE_TOKEN_CHARS`] — this crate's one ceiling for repeating such a value
+/// back.
+pub fn quoted_pagination_token_message(refused_token: &str) -> String {
+    let echoed: String = refused_token
+        .chars()
+        .take(MAX_ECHOED_PAGE_TOKEN_CHARS)
+        .collect();
+    format!("Next token '{echoed}' is invalid")
+}
+
+/// Refuse a `NextToken` this service did not issue on a read whose pagination layer quotes
+/// it: HTTP 400 `InvalidPaginationToken` carrying
+/// [`quoted_pagination_token_message`].
+///
+/// This is the writer the CoIP pool reads answer that refusal through; every other paged
+/// read of this crate goes through [`invalid_pagination_token`].
+pub fn invalid_pagination_token_quoting<E>(
+    refused_token: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_PAGINATION_TOKEN,
+        400,
+        quoted_pagination_token_message(refused_token),
+    )
+}
+
 /// Report that the emulator itself could not serve the request: HTTP 500
 /// `InternalError`. Never for anything a request carries.
 pub fn internal_error<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {

@@ -25,9 +25,11 @@
 //! asserted by the `serverless_cache_snapshots` suite beside this one; the row
 //! below is only about a `FinalSnapshotName` that cannot name a snapshot at all.
 
+use std::time::{Duration, SystemTime};
+
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
 
 /// One row of the delete table: a cache to create, and the identity it is stored
 /// and reported under.
@@ -121,6 +123,31 @@ async fn describe_cache(emulator: &Emulator, name: &str) -> Reply {
         .await
 }
 
+/// How far out the removal a delete scheduled is held while the suite reads the cache back
+/// on its way out: far longer than any span this service schedules, so that read lands
+/// inside the span however fast or slow the host runs.
+const REMOVAL_HELD: Duration = Duration::from_secs(60 * 60);
+
+/// Move the removal the clock owes the stored cache `name` to `due_in` from now.
+///
+/// Only the DUE INSTANT moves: the status the delete recorded, and everything else on the
+/// record, is the handler's own. `Duration::ZERO` puts the removal back in reach, so the
+/// next read materialises it.
+fn hold_the_removal_out_of_reach(emulator: &Emulator, name: &str, due_in: Duration) {
+    let due = SystemTime::now() + due_in;
+    emulator.with_state(|store| {
+        let cache = store
+            .serverless_caches
+            .get_mut(name)
+            .unwrap_or_else(|| panic!("case {name:?}: the cache just deleted must still be stored"));
+        assert!(
+            cache.pending_deletion.is_some(),
+            "case {name:?}: the delete must have scheduled the removal"
+        );
+        cache.pending_deletion = Some(due);
+    });
+}
+
 /// Assert `reply` is the modelled refusal `code` with HTTP `status`.
 fn assert_refused(case: &str, reply: &Reply, status: u16, code: &str) {
     assert_eq!(
@@ -155,14 +182,23 @@ async fn a_delete_reports_the_cache_as_deleting_and_the_clock_removes_it() {
     }
     create_cache(&emulator, "survivor", "survivor-cache", &[("Engine", "redis")]).await;
 
-    // Read every cache back: the read is answered once the create has settled
-    // it, and `available` is the status a delete is accepted from.
+    // Read every cache back until the create has settled it: `available` is the
+    // status a delete is accepted from.
     for case in CASES {
-        let described = describe_cache(&emulator, case.request_name).await;
+        let described = poll_until(
+            &emulator,
+            REGION,
+            case.case,
+            "the serverless cache settling at available",
+            "DescribeServerlessCaches",
+            &params(&[("ServerlessCacheName", case.request_name)]),
+            |reply| reply.text("Status") == Some(state::SERVERLESS_STATUS_AVAILABLE),
+        )
+        .await;
         assert_eq!(
             described.text("Status"),
             Some(state::SERVERLESS_STATUS_AVAILABLE),
-            "case {}: the read after the create must report the cache available, got {}",
+            "case {}: the cache must settle available before it is deleted, got {}",
             case.case,
             described.body
         );
@@ -194,10 +230,34 @@ async fn a_delete_reports_the_cache_as_deleting_and_the_clock_removes_it() {
             );
         }
 
-        // The read that follows is answered once the removal the clock owed has
-        // been carried through, so the cache is gone from it — and a cache the
-        // store no longer holds cannot be deleted again.
-        let gone = describe_cache(&emulator, case.request_name).await;
+        // The read that follows the delete reports the cache ON ITS WAY OUT:
+        // the removal is the clock's, and until it falls due the cache is still
+        // there, reported `deleting`. The due instant is held out of reach for
+        // that read, so what it asserts does not depend on how fast the host
+        // runs, and is then put back so the clock takes the cache away — which
+        // the client learns by looking again, and a cache the store no longer
+        // holds cannot be deleted again.
+        hold_the_removal_out_of_reach(&emulator, case.stored_name, REMOVAL_HELD);
+        let leaving = describe_cache(&emulator, case.request_name).await;
+        assert_eq!(
+            leaving.text("Status"),
+            Some(state::SERVERLESS_STATUS_DELETING),
+            "case {}: a read inside the span reports the cache deleting, got {} {}",
+            case.case,
+            leaving.status,
+            leaving.body
+        );
+        hold_the_removal_out_of_reach(&emulator, case.stored_name, Duration::ZERO);
+        let gone = poll_until(
+            &emulator,
+            REGION,
+            case.case,
+            "the serverless cache being removed by the clock",
+            "DescribeServerlessCaches",
+            &params(&[("ServerlessCacheName", case.request_name)]),
+            |reply| reply.status == 404,
+        )
+        .await;
         assert_refused(case.case, &gone, 404, "ServerlessCacheNotFoundFault");
         let again = delete_cache(
             &emulator,

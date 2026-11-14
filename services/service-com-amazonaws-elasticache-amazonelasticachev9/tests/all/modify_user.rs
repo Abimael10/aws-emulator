@@ -19,7 +19,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
 
 /// A password that satisfies the published length rule (`state::PASSWORD_MIN_LENGTH` to
 /// `state::PASSWORD_MAX_LENGTH` characters).
@@ -209,6 +209,29 @@ pub(crate) async fn describe_user(emulator: &Emulator, case: &str, id: &str) -> 
     described
 }
 
+/// Read one user back until it reports `status`, and answer with that reply.
+///
+/// A report of this service answers from the record as it stands, so a status
+/// the clock owes a user is observed by looking again rather than by waiting a
+/// fixed time.
+pub(crate) async fn poll_user_status(
+    emulator: &Emulator,
+    case: &str,
+    id: &str,
+    status: &str,
+) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        case,
+        &format!("the user {id} reporting {status:?}"),
+        "DescribeUsers",
+        &params(&[("UserId", id)]),
+        |reply| reply.text("Status") == Some(status),
+    )
+    .await
+}
+
 /// Assert `reply` reports every `(element, text)` pair of `expected`.
 fn assert_reports(case: &str, what: &str, reply: &Reply, expected: &[(&str, &str)]) {
     for (element, text) in expected {
@@ -270,13 +293,13 @@ async fn a_modify_changes_the_members_it_names_and_leaves_the_rest() {
             );
         }
 
-        // The read that follows is answered once the status the clock owed has been
+        // The read that follows is polled until the status the clock owed has been
         // materialised, and the change is the one the store holds.
-        let settled = describe_user(&emulator, case, &id).await;
+        let settled = poll_user_status(&emulator, case, &id, state::USER_STATUS_ACTIVE).await;
         assert_eq!(
             settled.text("Status"),
             Some(state::USER_STATUS_ACTIVE),
-            "case {case}: the read after the modify must report {:?}, got {}",
+            "case {case}: the user must settle at {:?}, got {}",
             state::USER_STATUS_ACTIVE,
             settled.body
         );

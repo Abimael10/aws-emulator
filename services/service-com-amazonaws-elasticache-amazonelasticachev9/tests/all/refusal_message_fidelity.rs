@@ -31,7 +31,7 @@
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::describe_cache_parameters::create_group;
-use crate::harness::{params, Emulator, Reply, REGION};
+use crate::harness::{params, poll_until, Emulator, Reply, REGION};
 use crate::modify_cache_parameter_group::modify;
 
 /// The sentence ElastiCache refuses a value that is not one of its identifiers with,
@@ -626,13 +626,22 @@ async fn a_user_group_is_deleted_and_read_back_as_gone() {
             too_early.status,
             too_early.body
         );
-        // Reading the group back is answered once the create has settled it active,
-        // which is the state a delete is accepted from.
-        let active = describe(&emulator, id).await;
+        // Polling the group until the create has settled it active, which is the
+        // state a delete is accepted from.
+        let active = poll_until(
+            &emulator,
+            REGION,
+            id,
+            "the user group settling at active",
+            "DescribeUserGroups",
+            &params(&[("UserGroupId", id)]),
+            |reply| reply.text("Status") == Some("active"),
+        )
+        .await;
         assert_eq!(
             active.text("Status"),
             Some("active"),
-            "case {id:?}: the read after the create must report the group active, got {}",
+            "case {id:?}: the group must settle active, got {}",
             active.body
         );
 
@@ -662,10 +671,27 @@ async fn a_user_group_is_deleted_and_read_back_as_gone() {
             deleted.body
         );
 
-        // The read that follows the delete is answered once the removal the clock owed has
-        // been carried through: every reader answers the modelled not-found and the id is
-        // free again.
-        let after = describe(&emulator, id).await;
+        // The read that follows the delete reports the group on its way out, and once the
+        // removal the clock owed has been carried through every reader answers the
+        // modelled not-found and the id is free again.
+        let leaving = describe(&emulator, id).await;
+        assert_eq!(
+            leaving.text("Status"),
+            Some("deleting"),
+            "case {id:?}: a read inside the delete's span reports the group deleting, got {} {}",
+            leaving.status,
+            leaving.body
+        );
+        let after = poll_until(
+            &emulator,
+            REGION,
+            id,
+            "the user group being removed by the clock",
+            "DescribeUserGroups",
+            &params(&[("UserGroupId", id)]),
+            |reply| reply.status == 404,
+        )
+        .await;
         assert_eq!(
             (after.status, after.error_code()),
             (404, "UserGroupNotFound"),

@@ -22,7 +22,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, Emulator, Reply};
+use crate::harness::{params, poll_until, Emulator, Reply};
 
 /// The operations under test.
 const DESCRIBE: &str = "DescribeReservedCacheNodes";
@@ -368,13 +368,30 @@ async fn a_reservation_moves_from_payment_pending_to_active() {
         bought.body
     );
 
-    // The read that follows is answered once the clock owes the reservation its
-    // next state.
-    let settled = describe(&emulator, &[("ReservedCacheNodeId", row.reservation_id)]).await;
+    // A read inside the span reports the reservation as it stands, and the clock
+    // carries it to its next state, which a client learns by looking again.
+    let pending = describe(&emulator, &[("ReservedCacheNodeId", row.reservation_id)]).await;
+    assert_eq!(
+        pending.text("State"),
+        Some(state::RESERVATION_STATE_PAYMENT_PENDING),
+        "a read inside the span must report {}, got {}",
+        state::RESERVATION_STATE_PAYMENT_PENDING,
+        pending.body
+    );
+    let settled = poll_until(
+        &emulator,
+        REGION,
+        row.case,
+        "the reservation settling at active",
+        "DescribeReservedCacheNodes",
+        &params(&[("ReservedCacheNodeId", row.reservation_id)]),
+        |reply| reply.text("State") == Some(state::RESERVATION_STATE_ACTIVE),
+    )
+    .await;
     assert_eq!(
         settled.text("State"),
         Some(state::RESERVATION_STATE_ACTIVE),
-        "the read after the purchase must report {}, got {}",
+        "the reservation must settle at {}, got {}",
         state::RESERVATION_STATE_ACTIVE,
         settled.body
     );

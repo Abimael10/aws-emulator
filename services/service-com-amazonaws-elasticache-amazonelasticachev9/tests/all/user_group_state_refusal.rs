@@ -21,8 +21,8 @@
 //! written out here on purpose: a test that built it from the helper the handlers call
 //! would pass whatever that helper said.
 
-use crate::harness::{params, Emulator, Reply};
-use crate::user_group_membership::{create_user, describe_user_group, modify_user_group};
+use crate::harness::{params, poll_until, Emulator, Reply, REGION};
+use crate::user_group_membership::{create_user, modify_user_group, poll_user_group_status};
 
 /// Assert `reply` is the refusal `status` / `code` carrying exactly `message`.
 fn assert_refusal(case: &str, reply: &Reply, status: u16, code: &str, message: &str) {
@@ -101,9 +101,9 @@ async fn a_user_group_that_is_not_active_refuses_a_change_with_its_status() {
     // its way out.
     //
     // The status each row drives is read off the answer of the call that PUT the group in
-    // it, and the gated call follows that answer straight away: a report of the group is
-    // answered only once the span has passed, so a read between the two would wait the
-    // group out of the status the row is about.
+    // it, and the gated call follows that answer straight away: the status a report
+    // carries is the one the record holds, so the row's call arrives while the group is
+    // still in it.
     for (case, group) in [
         ("still creating", "creating-group"),
         ("already modifying", "modifying-group"),
@@ -113,10 +113,10 @@ async fn a_user_group_that_is_not_active_refuses_a_change_with_its_status() {
         let status = match case {
             "still creating" => reported_status(case, &created),
             "already modifying" => {
-                // Reading the group back is answered once the create has settled it
-                // `active`, which is what lets the first change be accepted; that
-                // accepted call is what puts the group in the status this row is about.
-                describe_user_group(&emulator, case, group).await;
+                // Polling the group until the create has settled it `active` is what lets
+                // the first change be accepted; that accepted call is what puts the group
+                // in the status this row is about.
+                poll_user_group_status(&emulator, case, group, "active").await;
                 let accepted = modify_user_group(&emulator, group, &["joiner"], &[], None).await;
                 assert_eq!(
                     accepted.status, 200,
@@ -126,7 +126,7 @@ async fn a_user_group_that_is_not_active_refuses_a_change_with_its_status() {
                 reported_status(case, &accepted)
             }
             _ => {
-                describe_user_group(&emulator, case, group).await;
+                poll_user_group_status(&emulator, case, group, "active").await;
                 let removed = delete_user_group(&emulator, case, group).await;
                 reported_status(case, &removed)
             }
@@ -173,11 +173,11 @@ async fn a_user_group_that_is_not_active_refuses_a_change_with_its_status() {
     // same change is accepted and the membership converges, which is what makes the
     // refusals above the state rule speaking rather than a blanket refusal.
     create_user_group(&emulator, "an active group", "active-group").await;
-    let active = describe_user_group(&emulator, "an active group", "active-group").await;
+    let active = poll_user_group_status(&emulator, "an active group", "active-group", "active").await;
     assert_eq!(
         active.text("Status"),
         Some("active"),
-        "the read after the create must report the group active, got {}",
+        "the group must settle active, got {}",
         active.body
     );
     let accepted = modify_user_group(&emulator, "active-group", &["joiner"], &[], None).await;
@@ -186,7 +186,8 @@ async fn a_user_group_that_is_not_active_refuses_a_change_with_its_status() {
         "an active group must take the change, got {} {}",
         accepted.status, accepted.body
     );
-    let described = describe_user_group(&emulator, "an active group", "active-group").await;
+    let described =
+        poll_user_group_status(&emulator, "an active group", "active-group", "active").await;
     assert_eq!(
         described.all("UserIds/member"),
         vec!["default", "joiner"],
@@ -220,16 +221,20 @@ async fn attaching_a_user_group_that_is_not_active_states_the_same_sentence() {
         "CreateReplicationGroup must answer 200, got {} {}",
         created.status, created.body
     );
-    let available = emulator
-        .call(
-            "DescribeReplicationGroups",
-            &params(&[("ReplicationGroupId", "rbac-rg")]),
-        )
-        .await;
+    let available = poll_until(
+        &emulator,
+        REGION,
+        "the user-group gate suite",
+        "the replication group settling at available",
+        "DescribeReplicationGroups",
+        &params(&[("ReplicationGroupId", "rbac-rg")]),
+        |reply| reply.text("ReplicationGroup/Status") == Some("available"),
+    )
+    .await;
     assert_eq!(
         available.text("ReplicationGroup/Status"),
         Some("available"),
-        "the read after the create must report the replication group available, got {}",
+        "the replication group must settle available, got {}",
         available.body
     );
 
@@ -241,7 +246,7 @@ async fn attaching_a_user_group_that_is_not_active_states_the_same_sentence() {
     ] {
         let created = create_user_group(&emulator, case, group).await;
         let status = if case == "already deleting" {
-            describe_user_group(&emulator, case, group).await;
+            poll_user_group_status(&emulator, case, group, "active").await;
             let removed = delete_user_group(&emulator, case, group).await;
             reported_status(case, &removed)
         } else {

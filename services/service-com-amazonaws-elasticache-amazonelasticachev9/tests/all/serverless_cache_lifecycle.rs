@@ -458,13 +458,30 @@ async fn a_serverless_cache_reaches_available_on_the_clock_and_not_before() {
         "a created cache must answer the transient status, got {:?}",
         created.text("Status")
     );
-    // The read that follows is answered once the creation the clock owed is
-    // done, so a client's first poll after its create converges.
-    let settled = describe_cache(&emulator, "timed-cache").await;
+    // A read inside the span reports the cache as it stands — still `creating` —
+    // and the clock carries it to `available`, which a client learns by looking
+    // again.
+    let transient = describe_cache(&emulator, "timed-cache").await;
+    assert_eq!(
+        transient.text("Status"),
+        Some(state::SERVERLESS_STATUS_CREATING),
+        "a read inside the span reports the cache as it stands, got {:?}",
+        transient.text("Status")
+    );
+    let settled = poll_until(
+        &emulator,
+        REGION,
+        "timed-cache",
+        "the serverless cache settling at available",
+        "DescribeServerlessCaches",
+        &params(&[("ServerlessCacheName", "timed-cache")]),
+        |reply| reply.text("Status") == Some(state::SERVERLESS_STATUS_AVAILABLE),
+    )
+    .await;
     assert_eq!(
         settled.text("Status"),
         Some(state::SERVERLESS_STATUS_AVAILABLE),
-        "a read after the create must be answered with the settled status, got {:?}",
+        "the cache must settle at available, got {:?}",
         settled.text("Status")
     );
     assert!(
