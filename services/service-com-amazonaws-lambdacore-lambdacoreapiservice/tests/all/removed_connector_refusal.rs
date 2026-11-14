@@ -6,9 +6,10 @@
 //! account and Region is refused with the modelled `ResourceNotFoundException` — HTTP 404,
 //! "the specified network connector does not exist" — and the refusal names the RESOURCE the
 //! identifier determines: `Network connector not found: ` followed by the ARN an `Id` or an
-//! ARN determines, or the name as supplied. Which form that is follows from the identifier
-//! and not from what the operation does, so a delete and a read of the same identifier name
-//! the same resource (`crate::not_found_message` states the whole rule).
+//! ARN determines, or the name as supplied. Which form that is follows from the identifier,
+//! so a delete and a read of the same identifier name the same resource
+//! (`crate::not_found_message` states the whole rule, including the one operation that
+//! words it differently).
 //! `DeleteNetworkConnector`'s documented idempotency ("calling delete on a
 //! connector that is already deleting or has been deleted succeeds without error") covers a
 //! connector this account still HAS — the window in which the record is there in `DELETING`
@@ -34,7 +35,7 @@ use super::network_connector_lifecycle::{
     at, create, delete, emulator, get, list_versions, minimal_configuration, minimal_create, text,
     update, vpc_egress, Answer,
 };
-use super::not_found_message::expected_message;
+use super::not_found_message::{expected_message, expected_update_message};
 
 /// How long a poll loop keeps looking before it gives up. Generous: the condition is owed by
 /// the emulator's clock, and nothing here measures how long it took.
@@ -126,8 +127,20 @@ async fn delete_and_wait_until_removed(router: &MultiServiceRouter, name: &str) 
 }
 
 /// Assert `answer` is the modelled 404 naming the resource `identifier` determines — the
-/// same resource whichever operation was addressed.
+/// same resource whichever of the identifier-determining operations was addressed.
 fn assert_refused(case: &str, answer: &Answer, identifier: &str) {
+    assert_refused_naming(case, answer, &expected_message(identifier));
+}
+
+/// [`assert_refused`] for `UpdateNetworkConnector`, which words the same refusal naming the
+/// IDENTIFIER the request supplied rather than the resource it determines
+/// (`crate::not_found_message` states both).
+fn assert_refused_update(case: &str, answer: &Answer, identifier: &str) {
+    assert_refused_naming(case, answer, &expected_update_message(identifier));
+}
+
+/// Assert `answer` is the modelled 404 carrying exactly `expected`.
+fn assert_refused_naming(case: &str, answer: &Answer, expected: &str) {
     assert_eq!(
         answer.status, 404,
         "case {case:?}: an identifier that names no connector is refused with HTTP 404, \
@@ -140,7 +153,6 @@ fn assert_refused(case: &str, answer: &Answer, identifier: &str) {
         "case {case:?}: expected the error code ResourceNotFoundException, got {code:?}"
     );
     let message = text(&answer.body, "/Message");
-    let expected = expected_message(identifier);
     assert_eq!(
         message, expected,
         "case {case:?}: expected the message {expected:?}, got {message:?}"
@@ -221,7 +233,7 @@ async fn a_delete_after_the_removal_is_refused_naming_the_resource_the_identifie
                 json!({ "Configuration": minimal_configuration() }),
             )
             .await;
-            assert_refused(&format!("{case}: through Update"), &updated, &identifier);
+            assert_refused_update(&format!("{case}: through Update"), &updated, &identifier);
             let versions = list_versions(&router, &identifier, "").await;
             assert_refused(
                 &format!("{case}: through ListVersions"),

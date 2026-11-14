@@ -3853,6 +3853,12 @@ pub fn undetermined_attribute_type_message(attribute_name: &str) -> String {
 /// filled in and `signing_keys` as the key pairs its tokens are signed with. The
 /// caller stores it under [`UserPool::id`].
 ///
+/// `issuer_endpoint` is the address of THIS emulator the pool publishes its token
+/// issuer on ([`issuer_endpoint_authority`], which reads it off the request being
+/// served): the issuer is a URL a relying party fetches later, so it is settled
+/// once, here, and never re-derived from the endpoint a later read happened to
+/// reach.
+///
 /// The keys are passed IN rather than minted here: generating them is
 /// milliseconds of CPU per key ([`PoolSigningKeys::generate`]), so the caller
 /// runs that on the blocking pool and only after the store's own bound has
@@ -3867,6 +3873,7 @@ pub fn new_user_pool(
     region: &str,
     now: SystemTime,
     signing_keys: PoolSigningKeys,
+    issuer_endpoint: Option<String>,
 ) -> UserPool {
     let region = sanitize_region(region);
     let id = new_pool_id(&region);
@@ -3898,6 +3905,7 @@ pub fn new_user_pool(
         user_pool_add_ons: None,
         key_configuration: effective_key_configuration(None),
         issuer_configuration: effective_issuer_configuration(None),
+        issuer_endpoint,
         acr_configuration: None,
         sms_authentication_message: None,
         software_token_mfa_configuration: None,

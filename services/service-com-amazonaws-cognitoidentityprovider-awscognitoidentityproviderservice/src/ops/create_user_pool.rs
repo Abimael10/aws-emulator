@@ -358,8 +358,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(key) = refresh_token_key {
             let _ = state.lock().refresh_token_key.set(key);
         }
-        let mut pool =
-            crate::state::new_user_pool(input.pool_name.clone(), &region, now, signing_keys);
+        // The address this pool publishes its token issuer on is settled HERE, from
+        // the request that creates the pool: the issuer is a URL a relying party
+        // fetches later (`<iss>/.well-known/jwks.json`), so it has to name an
+        // endpoint of this emulator rather than a regional host nothing on this
+        // machine resolves (`crate::state::issuer_endpoint_authority`).
+        let issuer_endpoint =
+            crate::state::issuer_endpoint_authority(ctx.parts(), ctx.endpoint().as_str());
+        let mut pool = crate::state::new_user_pool(
+            input.pool_name.clone(),
+            &region,
+            now,
+            signing_keys,
+            issuer_endpoint,
+        );
         pool.policies = crate::state::effective_policies(input.policies);
         pool.schema = crate::state::effective_schema(input.schema);
         pool.admin_create_user_config =

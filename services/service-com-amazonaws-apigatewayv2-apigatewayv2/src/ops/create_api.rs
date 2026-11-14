@@ -448,12 +448,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let api_endpoint = match announced_socket.as_deref() {
             Some(authority) => crate::state::websocket_transport::announced_endpoint(authority),
-            None => crate::state::execute_api_endpoint(&api_id, &region, &input.protocol_type),
+            None => crate::state::emulator_served_api_endpoint(
+                &api_id,
+                &region,
+                &input.protocol_type,
+                ctx.parts(),
+                ctx.endpoint().as_str(),
+            ),
         };
         let record = crate::state::Api {
             // The endpoint's scheme follows the api's protocol type, so the value a
-            // caller hands to a client library names the protocol that api speaks, and the
-            // host is the api's own, in the form `Api$ApiEndpoint` documents.
+            // caller hands to a client library names the protocol that api speaks, and
+            // the address is one THIS emulator serves the api's data plane at
+            // ([`crate::state::emulator_served_api_endpoint`]).
             api_endpoint,
             api_id: api_id.clone(),
             region,

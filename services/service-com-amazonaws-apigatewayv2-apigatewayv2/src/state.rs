@@ -1276,6 +1276,13 @@ pub struct Api {
     pub name: String,
     /// One of `PROTOCOL_TYPE_VALUES` (`HTTP | WEBSOCKET`).
     pub protocol_type: String,
+    /// The endpoint this api ANNOUNCES for a client to invoke it at, settled by the
+    /// operation that minted the api ([`emulator_served_api_endpoint`], and the socket a
+    /// WEBSOCKET api's data plane was opened on).
+    ///
+    /// Stored rather than re-derived per read, because it is an address a caller DIALS: a
+    /// client that configured itself from this value must keep reaching the api, whichever
+    /// endpoint a later reader of the api happens to address.
     pub api_endpoint: String,
     /// The Region this api lives in: the Region the request that created it was signed for
     /// ([`request_region`]).
@@ -4495,27 +4502,24 @@ pub fn execute_api_scheme(protocol_type: &str) -> &'static str {
     }
 }
 
-/// The default execute-api endpoint of an api, and the `Api$ApiEndpoint` this service
-/// reports for every api whose data plane is served through this emulator's front door.
+/// The default execute-api endpoint of an api in the form `Api$ApiEndpoint` DOCUMENTS, for
+/// a caller that resolves AWS's own hostnames.
 ///
-/// The member's documentation FIXES the form — "The URI of the API, of the form
+/// The member's documentation fixes that form — "The URI of the API, of the form
 /// `{api-id}.execute-api.{region}.amazonaws.com`", and `Api$DisableExecuteApiEndpoint`
-/// repeats it as "the default https://{api_id}.execute-api.{region}.amazonaws.com" — so
-/// the value is that template: the scheme the api's `ProtocolType` names
+/// repeats it as "the default https://{api_id}.execute-api.{region}.amazonaws.com" — so the
+/// value is that template: the scheme the api's `ProtocolType` names
 /// ([`execute_api_scheme`]), then the host [`execute_api_host`] builds from the api's own
 /// id and the Region of the request that created it, and no path of its own. Only those two
 /// parts vary; everything else is fixed text, which is what lets a client recover the api id
-/// from the host's first label and the Region from its third.
+/// from the host's first label and the Region from its third. This emulator's front door
+/// claims that host as well (`crate::service::invoke`), so a caller that DOES resolve it
+/// reaches the api there.
 ///
-/// It is therefore derived from the api alone and not from the address the control-plane
-/// request happened to reach: this emulator's front door claims that host as well
-/// (`crate::service::invoke`), and a client that resolves nothing but the emulator's own
-/// endpoint reaches the same api at that endpoint behind the [`LOCAL_ENDPOINT_PREFIX`]
-/// marker (`/_aws/execute-api/{api-id}`).
-///
-/// A WEBSOCKET api is the one api that reports something else: its data plane is a socket of
-/// its own (`crate::state::websocket_transport::announced_endpoint`), and that socket's
-/// address is the only one an RFC 6455 client can complete a handshake against.
+/// It is NOT what an api announces to a caller that resolves nothing but this emulator's own
+/// endpoint, which is every client on the machine this emulator runs on:
+/// [`emulator_served_api_endpoint`] is the reading an announced address follows, and this is
+/// the form it falls back to for a client of AWS's own hosts.
 pub fn execute_api_endpoint(api_id: &str, region: &str, protocol_type: &str) -> String {
     format!(
         "{}://{}",
@@ -4536,9 +4540,10 @@ pub fn execute_api_host(api_id: &str, region: &str) -> String {
     format!("{api_id}.{EXECUTE_API_LABEL}.{region}.amazonaws.com")
 }
 
-/// The address THIS EMULATOR serves an api's data plane at, for a URL member whose own
-/// documentation fixes no form and which therefore has to be one a client can dial.
+/// The address THIS EMULATOR serves an api's data plane at, which is what an api ANNOUNCES
+/// for a caller to invoke it at — `Api$ApiEndpoint` included.
 ///
+/// An announced address is one the caller DIALS, so it has to lead back to this emulator.
 /// Which address that is follows the same rule [`announced_portal_default_domain_name`]
 /// applies to a portal's website:
 ///
@@ -4553,11 +4558,14 @@ pub fn execute_api_host(api_id: &str, region: &str) -> String {
 ///   caller can reach too;
 /// * a request that addressed one of AWS's own hosts on an emulator served on no port at
 ///   all comes from a client that resolves them, so the api is named on the host
-///   [`execute_api_host`] builds, which the data plane claims host-style.
+///   [`execute_api_host`] builds, which the data plane claims host-style, in the form
+///   `Api$ApiEndpoint` documents ([`execute_api_endpoint`]).
 ///
-/// `Api$ApiEndpoint` is NOT such a member: its documentation fixes the form a client parses
-/// the api id and the Region back out of, so it reports the template
-/// [`execute_api_endpoint`] builds whichever address the request reached.
+/// The value is settled by the operation that MINTS the api and stored on it
+/// ([`Api::api_endpoint`]), so one api announces one endpoint however its later callers
+/// address this emulator. A WEBSOCKET api announces something else again: its data plane is
+/// a socket of its own (`crate::state::websocket_transport::announced_endpoint`), and that
+/// socket's address is the only one an RFC 6455 client can complete a handshake against.
 pub fn emulator_served_api_endpoint(
     api_id: &str,
     region: &str,

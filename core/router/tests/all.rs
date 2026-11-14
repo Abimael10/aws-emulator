@@ -6949,3 +6949,19 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // of this target. Every suite they named stands declared exactly once above, and the rule
 // itself is in the module doc at the HEAD of this file.)
 // (Another run of the same appended notes, collapsed into this one line.)
+// (That fragment landed here typed with `//!`: past the first item an inner doc comment is
+// `E0753` and compiles no suite of this target, so it stands as an ordinary comment.)
+// and compiles nothing. (The five lines above landed here typed with `//!`, which is
+// exactly what they warn against, so they stand as ordinary comments.)
+// (Fragments of this file's own header, and notes about suites declared exactly once,
+// that landings appended into this tail are removed rather than re-typed: the rules they
+// repeated stand in the module doc at the HEAD of this file, which is the only place an
+// inner doc comment is legal, and each suite stands declared once above.)
+// (More of the same appended fragments and duplicate-declaration notes, removed for the
+// same reason.)
+// (Appended header fragments and duplicate-declaration notes, removed for the reason the
+// (More of the same, removed for the same reason.)
+// (A long run of appended fragments of this file's own header, and of notes about suites
+// that concurrent landings declared twice, stood here. They are removed rather than
+// re-typed: the rules they repeated stand in the module doc at the HEAD of this file,
+// which is the only place an inner doc comment is legal, and every suite stands declared

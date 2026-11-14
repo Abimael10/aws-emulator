@@ -5,13 +5,19 @@
 //!
 //! The RULE the rows assert, one level above any single deployment:
 //!
-//! > A user-pool token's `iss` claim is the minting pool's OWN regional issuer —
+//! > A user-pool token's `iss` claim is the minting pool's OWN issuer — the address the pool
+//! > publishes it on with the pool's id as the whole path, which for a pool created by a
+//! > client that resolves AWS's own hostnames is
 //! > `https://cognito-idp.<region>.amazonaws.com/<UserPoolId>`, and
-//! > `https://issuer-cognito-idp.<region>.amazonaws.com/<UserPoolId>` for a pool
-//! > configured with the `UPDATED` issuer type — rendered from the pool's stored Region,
-//! > issuer configuration and id, whatever address the minting request was sent to. The
-//! > pool's discovery document names that same issuer, and its key set is published under
-//! > it.
+//! > `https://issuer-cognito-idp.<region>.amazonaws.com/<UserPoolId>` for such a pool
+//! > configured with the `UPDATED` issuer type — rendered from what the pool STORED when it
+//! > was created, whatever address the minting request was sent to. The pool's discovery
+//! > document names that same issuer, and its key set is published under it.
+//!
+//! Which address a pool publishes on is `pool_issuer_address`'s rule: the issuer is a URL a
+//! relying party fetches, so a pool created through this emulator's own endpoint publishes
+//! it there. Every pool here is created through this service's published regional endpoint,
+//! which is the caller the documented regional form is for.
 //!
 //! The issuer is token content, which this service's model does not describe: `smithy_query`
 //! on `InitiateAuth` / `AdminInitiateAuth` / `GetClientToken` models only the token members

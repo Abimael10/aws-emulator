@@ -1,30 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for the FORM of an api's `ApiEndpoint`.
+//! End-to-end HTTP tests for the FORM of an api's `ApiEndpoint` reported to a client that
+//! resolves AWS's OWN hostnames.
 //!
-//! The rule, one level above the recorded case (an HTTP api created through a client
-//! configured with the emulator's own loopback endpoint, whose `apiEndpoint` carried that
-//! loopback address with the api id demoted into a path segment):
+//! The rule, one level above any single deployment:
 //!
-//! > An api's `ApiEndpoint` is the api's own default endpoint in the form that member
-//! > documents — "The URI of the API, of the form `{api-id}.execute-api.{region}
-//! > .amazonaws.com`" (`Api$ApiEndpoint`, and `Api$DisableExecuteApiEndpoint` repeats it as
-//! > "the default https://{api_id}.execute-api.{region}.amazonaws.com") — so the value is
-//! > the protocol's scheme, then a host whose FIRST label is the api id returned in the
-//! > same response and whose remaining labels are the literal `execute-api`, the Region the
-//! > request was signed for and `amazonaws.com`, and no path at all. Only the id and the
-//! > Region vary: the address the control-plane request itself was addressed at is not part
-//! > of the value, and the emulator's front door claims the host it names.
+//! > An api created or imported by a client that resolves AWS's own hostnames reports, as
+//! > its `ApiEndpoint`, the api's own default endpoint in the form that member documents —
+//! > "The URI of the API, of the form `{api-id}.execute-api.{region}.amazonaws.com`"
+//! > (`Api$ApiEndpoint`, and `Api$DisableExecuteApiEndpoint` repeats it as "the default
+//! > https://{api_id}.execute-api.{region}.amazonaws.com") — so the value is the protocol's
+//! > scheme, then a host whose FIRST label is the api id returned in the same response and
+//! > whose remaining labels are the literal `execute-api`, the Region the request was
+//! > SIGNED for and `amazonaws.com`, and no path at all. Only the id and the Region vary,
+//! > which is what lets such a client recover both from the host, and this emulator's front
+//! > door claims the host it names.
 //!
-//! The rows span what the rule generalises over: the endpoint the control-plane request was
-//! addressed at (an IPv4 loopback literal with a port, a loopback NAME, a bracketed IPv6
-//! literal, this service's own AWS host), the Region the request is signed for (including
+//! The rows span what the rule generalises over: WHICH of AWS's own endpoint hosts the
+//! control-plane request was addressed at, the Region the request is signed for (including
 //! the emulator's own default, so a row cannot pass on a hardcoded Region), the operation
 //! that minted the api (`CreateApi`, `ImportApi`) and the operation that reported the value
-//! back (`GetApi`, `GetApis`, `UpdateApi`, `ReimportApi`). The recorded case is ONE row.
+//! back (`GetApi`, `GetApis`, `UpdateApi`, `ReimportApi`).
 //!
-//! One WEBSOCKET row pins the single api this rule does NOT cover: a WebSocket api's data
-//! plane is a socket of its own — an RFC 6455 handshake is completed against that socket and
+//! A client that resolves nothing but this emulator's own endpoint is announced something
+//! else — the endpoint it reached, with the api behind the reserved data-plane path, since a
+//! URL it cannot dial publishes nothing. That is `http_api_published_invoke_address`'s rule;
+//! this suite holds the half of it that this form is for.
+//!
+//! One WEBSOCKET row pins the single api neither rule covers: a WebSocket api's data plane
+//! is a socket of its own — an RFC 6455 handshake is completed against that socket and
 //! nowhere else — so such an api reports the `wss` address the core opened for it. That
 //! endpoint's own rule is `api_endpoint_scheme`'s; this suite only holds it fixed.
 
@@ -53,12 +57,12 @@ const ROUTE_PATH: &str = "/items";
 /// The reserved stage "that serves an api's root", reached with no stage segment at all.
 const DEFAULT_STAGE: &str = "$default";
 
-/// One row: the endpoint the control-plane calls are addressed at and the Region they are
-/// signed for. The announced endpoint is the same documented form for every row.
+/// One row: the AWS endpoint host the control-plane calls are addressed at and the Region
+/// they are signed for. The announced endpoint is the same documented form for every row.
 struct Row {
     case: &'static str,
-    /// The `Host` the control-plane request carries — the endpoint the client is configured
-    /// with, which the announced value must not depend on.
+    /// The `Host` the control-plane request carries — one of AWS's own endpoint hosts, which
+    /// is the client this form is reported to.
     host: &'static str,
     region: &'static str,
 }
@@ -66,29 +70,23 @@ struct Row {
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            case: "the recorded case: a client configured with the emulator's loopback \
-                   endpoint",
-            host: "127.0.0.1:40705",
+            case: "a client that resolves AWS's own hosts: this service's endpoint host",
+            host: "apigateway.us-west-2.amazonaws.com",
             region: "us-west-2",
         },
         Row {
-            case: "the same endpoint named by its loopback NAME on another port",
-            host: "localhost:9297",
+            case: "the same client in another Region",
+            host: "apigateway.eu-west-1.amazonaws.com",
             region: "eu-west-1",
         },
         Row {
-            case: "the same endpoint named by a bracketed IPv6 literal",
-            host: "[::1]:9297",
+            case: "a Region whose own name carries three labels",
+            host: "apigateway.ap-southeast-2.amazonaws.com",
             region: "ap-southeast-2",
         },
         Row {
-            case: "a client that resolves AWS's own hosts: this service's own endpoint host",
-            host: "apigateway.eu-north-1.amazonaws.com",
-            region: "eu-north-1",
-        },
-        Row {
             case: "the emulator's own default Region, signed for explicitly",
-            host: "127.0.0.1:9297",
+            host: "apigateway.us-east-1.amazonaws.com",
             region: "us-east-1",
         },
     ]
@@ -521,17 +519,17 @@ async fn a_websocket_api_still_reports_the_socket_its_data_plane_was_opened_on()
     }
 }
 
-/// The documented form is independent of the control-plane endpoint: two apis created
-/// through DIFFERENT endpoints in the same Region differ only in their api id.
+/// The Region in the documented form is the one the request was SIGNED for, not the one the
+/// endpoint host it was addressed at names: apis created through the endpoint hosts of
+/// several Regions, all signed for one Region, differ only in their api id.
 #[tokio::test]
-async fn the_announced_endpoint_does_not_depend_on_the_endpoint_the_create_reached() {
+async fn the_announced_endpoint_carries_the_region_the_create_was_signed_for() {
     let region = "eu-central-1";
     let mut announced: Vec<(String, String)> = Vec::new();
     for host in [
-        "127.0.0.1:9297",
-        "localhost:40705",
-        "[::1]:9297",
         "apigateway.eu-central-1.amazonaws.com",
+        "apigateway.us-east-1.amazonaws.com",
+        "apigateway.ap-south-1.amazonaws.com",
     ] {
         let emulator = emulator();
         let (status, created) = call_at_host(
@@ -552,8 +550,8 @@ async fn the_announced_endpoint_does_not_depend_on_the_endpoint_the_create_reach
         assert_eq!(
             reported,
             documented_endpoint(&api_id, region),
-            "case {host:?}: the endpoint must not carry the address the create reached, got \
-             {reported:?}"
+            "case {host:?}: the endpoint must carry the Region the create was signed for, \
+             got {reported:?}"
         );
         announced.push((host.to_string(), reported));
     }
@@ -566,10 +564,10 @@ async fn the_announced_endpoint_does_not_depend_on_the_endpoint_the_create_reach
                 .unwrap_or_else(|| endpoint.clone())
         })
         .collect();
-    let first = forms.first().expect("one row per endpoint form");
+    let first = forms.first().expect("one row per endpoint host");
     assert!(
         forms.iter().all(|form| form == first),
-        "every endpoint form must be the same whatever endpoint the create reached, got \
-         {announced:?}"
+        "every endpoint form must be the same whatever endpoint host the create reached, \
+         got {announced:?}"
     );
 }

@@ -2,14 +2,14 @@
 
 //! What `DescribeStream` reports as the shard its page stopped at.
 //!
-//! The rule pinned here: `LastEvaluatedShardId` names the LAST shard the page
-//! evaluated whenever the page evaluated one — whether or not a further shard follows
-//! it — and is absent only for a page that evaluated no shard at all. The member's own
-//! documentation is what makes the second half a rule rather than a guess: "If
-//! `LastEvaluatedShardId` is not empty, it does not necessarily mean that there is
-//! more data in the result set. The only way to know when you have reached the end of
-//! the result set is when `LastEvaluatedShardId` is empty"
-//! (`StreamDescription$LastEvaluatedShardId`).
+//! The rule pinned here: `LastEvaluatedShardId` is the RESUME POINT a truncated page
+//! offers — the last shard the page carried, reported only while shards of the stream
+//! remain after it — and is absent for a page that carried the shard list to its end,
+//! including one that evaluated no shard at all. The member is this operation's pagination
+//! cursor ("the shard ID of the item where the operation stopped, inclusive of the previous
+//! result set. Use this value to start a new operation, excluding this value in the new
+//! request", `StreamDescription$LastEvaluatedShardId`), and an empty one is what says the
+//! last page of results has been processed, which is what ends a consumer's walk.
 //!
 //! The rows span what the rule generalises over: how many shards the stream serves,
 //! how wide the page asked for is (absent, narrower than the shard list, exactly as
@@ -169,10 +169,11 @@ fn stream_with_shards(engine: &engine::InMemoryEngine, table_name: &str, shards:
     stream_arn
 }
 
-/// Whatever page was asked for, the cursor is the last shard the page carries — and
-/// a page carrying no shard reports none.
+/// Whatever page was asked for, the cursor is the last shard the page carries while
+/// shards remain after it — and a page that reached the end of the shard list, or
+/// carried no shard at all, reports none.
 #[tokio::test]
-async fn the_cursor_is_the_last_shard_of_whatever_page_was_served() {
+async fn the_cursor_is_the_last_shard_of_a_truncated_page() {
     let (engine, router) = build();
     let stream_arn = stream_with_shards(&engine, "ledger", 4);
     let (all_shards, cursor) = page(
@@ -187,10 +188,9 @@ async fn the_cursor_is_the_last_shard_of_whatever_page_was_served() {
         "the fixture must serve four shards, got {all_shards:?}"
     );
     assert_eq!(
-        cursor.as_deref(),
-        all_shards.last().map(String::as_str),
-        "case the whole shard list: an untruncated page still names the shard it \
-         stopped at, got {cursor:?}"
+        cursor, None,
+        "case the whole shard list: a page that carried every shard is the last page and \
+         offers no cursor, got {cursor:?}"
     );
 
     // Each row: the page width asked for (None for an absent member), where to resume
@@ -227,13 +227,16 @@ async fn the_cursor_is_the_last_shard_of_whatever_page_was_served() {
         let (shard_ids, cursor) = page(&router, case, body).await;
         assert_eq!(
             shard_ids,
-            all_shards[expected].to_vec(),
+            all_shards[expected.clone()].to_vec(),
             "case {case:?}: unexpected page, got {shard_ids:?}"
         );
+        // The page offers a cursor only while shards of the stream remain after it.
+        let expected_cursor = (expected.end < all_shards.len())
+            .then(|| shard_ids.last().cloned())
+            .flatten();
         assert_eq!(
-            cursor.as_deref(),
-            shard_ids.last().map(String::as_str),
-            "case {case:?}: the cursor must be the last shard of the page, got {cursor:?}"
+            cursor, expected_cursor,
+            "case {case:?}: expected the cursor {expected_cursor:?}, got {cursor:?}"
         );
     }
 
@@ -278,8 +281,8 @@ async fn the_cursor_is_the_last_shard_of_whatever_page_was_served() {
         "case a filter that matches no child shard: expected no cursor, got {cursor:?}"
     );
 
-    // And a filter that DOES match reports the last shard it evaluated, like any
-    // other page.
+    // And a filter that DOES match reports no cursor either when it carried every shard
+    // it matched: one child, which is the end of that filtered list.
     let (shard_ids, cursor) = page(
         &router,
         "a filter that matches one child shard",
@@ -295,10 +298,9 @@ async fn the_cursor_is_the_last_shard_of_whatever_page_was_served() {
         "case a filter that matches one child shard: expected that one child, got {shard_ids:?}"
     );
     assert_eq!(
-        cursor.as_deref(),
-        shard_ids.last().map(String::as_str),
-        "case a filter that matches one child shard: the cursor must be the last shard of \
-         the page, got {cursor:?}"
+        cursor, None,
+        "case a filter that matches one child shard: the page carried every shard the \
+         filter matched, so it offers no cursor, got {cursor:?}"
     );
 }
 
@@ -339,8 +341,7 @@ async fn a_stream_serving_no_shard_reports_no_cursor() {
 }
 
 /// The cursor is what a consumer's walk is driven by: following it visits every shard
-/// exactly once, in order, and terminates — which is the invariant the "not
-/// necessarily more data" wording depends on.
+/// exactly once, in order, and terminates — which is what an absent cursor means.
 #[tokio::test]
 async fn following_the_cursor_visits_every_shard_once_and_terminates() {
     let (engine, router) = build();

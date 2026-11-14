@@ -38,7 +38,7 @@ use super::network_connector_lifecycle::{
     at, create, delete, emulator, expected_arn, get, list, minimal_configuration, minimal_create,
     text, update, vpc_egress, wait_for_the_clock, Answer, OPERATOR_ROLE,
 };
-use super::not_found_message::expected_message;
+use super::not_found_message::{expected_message, expected_update_message};
 
 /// The state `DeleteNetworkConnectorResponse$State` reports — "the State field is typically
 /// `DELETING` after this call" — and the state a connector whose deletion completed last
@@ -116,13 +116,26 @@ fn assert_accepted(case: &str, answer: &Answer, arn: &str, name: &str, id: &str)
     );
 }
 
-/// Assert `answer` is the modelled 404 for `identifier`.
+/// Assert `answer` is the modelled 404 for `identifier`, as the read, the delete and the
+/// version listing word it.
 ///
 /// What the refusal names follows from the IDENTIFIER: the connector's ARN for an id, the
-/// value as supplied for an ARN or a name, the same for every operation addressed by one
-/// (`crate::not_found_message` states that rule over every identifier form and every
-/// operation addressed by one).
+/// value as supplied for an ARN or a name. `UpdateNetworkConnector` words it naming the
+/// identifier the request supplied ([`assert_not_found_update`]);
+/// `crate::not_found_message` states both over every identifier form and every operation
+/// addressed by one.
 fn assert_not_found(case: &str, answer: &Answer, identifier: &str) {
+    assert_not_found_naming(case, answer, &expected_message(identifier));
+}
+
+/// [`assert_not_found`] as `UpdateNetworkConnector` words it: naming the identifier the
+/// request supplied.
+fn assert_not_found_update(case: &str, answer: &Answer, identifier: &str) {
+    assert_not_found_naming(case, answer, &expected_update_message(identifier));
+}
+
+/// Assert `answer` is the modelled 404 carrying exactly `expected`.
+fn assert_not_found_naming(case: &str, answer: &Answer, expected: &str) {
     assert_eq!(
         answer.status, 404,
         "case {case:?}: expected HTTP 404, got {} with {:?}",
@@ -134,7 +147,6 @@ fn assert_not_found(case: &str, answer: &Answer, identifier: &str) {
         "case {case:?}: expected the error code ResourceNotFoundException, got {code:?}"
     );
     let message = text(&answer.body, "/Message");
-    let expected = expected_message(identifier);
     assert_eq!(
         message, expected,
         "case {case:?}: expected the message {expected:?}, got {message:?}"
@@ -420,7 +432,7 @@ async fn a_freed_name_rebinds_while_the_old_id_names_nothing() {
         json!({ "Configuration": minimal_configuration() }),
     )
     .await;
-    assert_not_found("the dead id through Update", &dead_update, &first_id);
+    assert_not_found_update("the dead id through Update", &dead_update, &first_id);
 
     // … and the delete too: the connector that id named is gone, so the identifier names
     // no connector of this account — not the live one that took its name either.

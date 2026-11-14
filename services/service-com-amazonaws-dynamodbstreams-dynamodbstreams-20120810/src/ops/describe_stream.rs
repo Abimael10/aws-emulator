@@ -293,17 +293,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let remaining = &shards[start_at.min(shards.len())..];
         let page = &remaining[..remaining.len().min(limit)];
-        // The shard this page STOPPED at, which is the last one it evaluated — not
-        // only the last one of a page a `Limit` truncated. The member is the resume
-        // point and its own documentation is explicit that it is not a "there is more"
-        // flag: "If LastEvaluatedShardId is not empty, it does not necessarily mean
-        // that there is more data in the result set. The only way to know when you
-        // have reached the end of the result set is when LastEvaluatedShardId is
-        // empty" (`StreamDescription$LastEvaluatedShardId`). So it is empty for one
-        // reason only: a page that evaluated no shard at all — a stream whose enable
-        // is not due, a filter nothing matched, or a resume point past the last shard
-        // — which is what ends a consumer's walk.
-        let last_evaluated_shard_id = page.last().map(|shard| shard.shard_id.clone());
+        // The RESUME POINT a truncated page offers: the last shard this page carried,
+        // reported only while shards of this stream remain after it. The member is the
+        // pagination cursor of this operation — "the shard ID of the item where the
+        // operation stopped, inclusive of the previous result set. Use this value to start a
+        // new operation, excluding this value in the new request"
+        // (`StreamDescription$LastEvaluatedShardId`) — and an empty one is what says the
+        // last page of results has been processed, so a page that carried the shard list to
+        // its END offers no cursor at all, and neither does one that evaluated no shard (a
+        // stream whose enable is not due, a filter nothing matched, a resume point past the
+        // last shard). That is what terminates a consumer's walk.
+        let last_evaluated_shard_id = page
+            .last()
+            .filter(|_| remaining.len() > page.len())
+            .map(|shard| shard.shard_id.clone());
 
         let shards_out: Vec<Shard> = page
             .iter()

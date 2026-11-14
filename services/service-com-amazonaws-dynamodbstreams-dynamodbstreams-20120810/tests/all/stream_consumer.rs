@@ -834,8 +834,8 @@ async fn describe_stream_agrees_with_list_streams_and_reports_the_shard_topology
     );
     assert_eq!(
         second_page["StreamDescription"]["LastEvaluatedShardId"].as_str(),
-        Some(child_id.as_str()),
-        "a shard page names the shard it stopped at, even when nothing follows it, got \
+        None,
+        "the last shard page offers no cursor, because nothing follows it, got \
          {second_page}"
     );
 

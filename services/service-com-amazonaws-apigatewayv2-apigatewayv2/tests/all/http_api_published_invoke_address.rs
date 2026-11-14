@@ -5,14 +5,15 @@
 //! The rule, one level above the recorded case that filed the issue (an HTTP api with a
 //! JWT authorizer whose published endpoint a client could not reach):
 //!
-//! > An api's `ApiEndpoint` is the api's own default endpoint in the form that member
-//! > documents — `{api-id}.execute-api.{region}.amazonaws.com`, with no path of its own —
-//! > and this emulator's front door claims that host, so the invoke URL a client builds
-//! > from it (that value with the stage name appended: "the stage name is typically
-//! > appended to this URI to form a complete path to a deployed API stage",
-//! > `Api$ApiEndpoint`) reaches the api's route. The same api is reached at the emulator's
-//! > own endpoint with the api behind the reserved data-plane path, whichever endpoint the
-//! > control-plane request itself was addressed at.
+//! > An api's `ApiEndpoint` is an address THIS emulator serves the api's data plane at, so
+//! > the invoke URL a client builds from it (that value with the stage name appended: "the
+//! > stage name is typically appended to this URI to form a complete path to a deployed API
+//! > stage", `Api$ApiEndpoint`) reaches the api's route. For a control-plane request from a
+//! > client that resolves nothing but the emulator's own endpoint, that address is the
+//! > endpoint the request itself reached, with the api behind the reserved data-plane path;
+//! > for one from a client that resolves AWS's own hostnames it is the api's own
+//! > `{api-id}.execute-api.{region}.amazonaws.com` host, the form the member documents,
+//! > which this emulator's front door claims as well.
 //!
 //! The rows span what the rule generalises over: the endpoint the control-plane request
 //! was addressed at (an IPv4 loopback literal, a loopback NAME, a bracketed IPv6 literal,
@@ -54,8 +55,7 @@ const ROUTE_PATH: &str = "/items";
 const DEFAULT_STAGE: &str = "$default";
 
 /// One row: the endpoint the control-plane calls are addressed at, the Region they are
-/// signed for, and the stage the api is deployed to. The address the api is announced on is
-/// the same documented one for every row — that is the point of the rule.
+/// signed for, and the stage the api is deployed to.
 struct Row {
     case: &'static str,
     /// The `Host` the control-plane request carries — the endpoint the client is
@@ -63,6 +63,9 @@ struct Row {
     host: &'static str,
     region: &'static str,
     stage_name: &'static str,
+    /// Whether that client resolves nothing but the endpoint it reached, which is the
+    /// address the api is then announced on.
+    reaches_only_the_emulator: bool,
 }
 
 fn rows() -> Vec<Row> {
@@ -73,30 +76,35 @@ fn rows() -> Vec<Row> {
             host: "127.0.0.1:45923",
             region: "us-west-2",
             stage_name: DEFAULT_STAGE,
+            reaches_only_the_emulator: true,
         },
         Row {
             case: "the same endpoint named by its loopback NAME, deployed to a named stage",
             host: "localhost:9297",
             region: "eu-west-1",
             stage_name: "prod",
+            reaches_only_the_emulator: true,
         },
         Row {
             case: "the same endpoint named by a bracketed IPv6 literal",
             host: "[::1]:9297",
             region: "ap-southeast-2",
             stage_name: "live",
+            reaches_only_the_emulator: true,
         },
         Row {
             case: "a client that resolves AWS's own hosts: this service's own endpoint host",
             host: "apigateway.us-east-1.amazonaws.com",
             region: "us-east-1",
             stage_name: DEFAULT_STAGE,
+            reaches_only_the_emulator: false,
         },
         Row {
             case: "a client that resolves AWS's own hosts, a named stage in another Region",
             host: "apigateway.eu-central-1.amazonaws.com",
             region: "eu-central-1",
             stage_name: "staging",
+            reaches_only_the_emulator: false,
         },
     ]
 }
@@ -116,8 +124,13 @@ fn announced_parts(announced: &str) -> (String, String) {
     }
 }
 
-/// Assert `announced` is the api's own documented endpoint, and answer the authority and
-/// base path a client builds its invoke URL from.
+/// Assert `announced` is the address this emulator serves the api at, and answer the
+/// authority and base path a client builds its invoke URL from.
+///
+/// Which address that is follows the client the control-plane request came from: a client
+/// that resolves nothing but the emulator's own endpoint is announced that endpoint with the
+/// api behind the reserved data-plane path, and a client that resolves AWS's own hostnames
+/// is announced the api's own documented `execute-api` host.
 fn assert_announced(row: &Row, reporter: &str, api_id: &str, announced: &str) -> (String, String) {
     let scheme = "https://";
     assert!(
@@ -127,16 +140,24 @@ fn assert_announced(row: &Row, reporter: &str, api_id: &str, announced: &str) ->
         row.case
     );
     let (authority, base_path) = announced_parts(announced);
+    let (expected_authority, expected_base_path) = if row.reaches_only_the_emulator {
+        (row.host.to_string(), format!("/_aws/execute-api/{api_id}"))
+    } else {
+        (
+            format!("{api_id}.execute-api.{}.amazonaws.com", row.region),
+            String::new(),
+        )
+    };
     assert_eq!(
-        authority,
-        format!("{api_id}.execute-api.{}.amazonaws.com", row.region),
-        "case {:?}: {reporter} must announce the api's own execute-api host, got \
+        authority, expected_authority,
+        "case {:?}: {reporter} must announce the api on {expected_authority}, got \
          {announced:?}",
         row.case
     );
-    assert!(
-        base_path.is_empty(),
-        "case {:?}: the documented endpoint carries no path of its own, got {announced:?}",
+    assert_eq!(
+        base_path, expected_base_path,
+        "case {:?}: {reporter} must announce the base path {expected_base_path:?}, got \
+         {announced:?}",
         row.case
     );
     (authority, base_path)

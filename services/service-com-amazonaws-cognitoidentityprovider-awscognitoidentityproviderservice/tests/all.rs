@@ -189,6 +189,8 @@ mod not_found_sentence_per_operation;
 mod per_operation_refusal_wording;
 #[path = "all/pool_configuration_refusal_wire.rs"]
 mod pool_configuration_refusal_wire;
+#[path = "all/pool_issuer_address.rs"]
+mod pool_issuer_address;
 #[path = "all/pool_plan_and_csv_header.rs"]
 mod pool_plan_and_csv_header;
 #[path = "all/pool_well_known_documents.rs"]

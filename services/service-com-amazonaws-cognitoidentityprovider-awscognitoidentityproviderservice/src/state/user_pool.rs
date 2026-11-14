@@ -45,6 +45,17 @@ pub struct UserPool {
     pub key_configuration: KeyConfigurationType,
     /// The issuer this pool's tokens carry ([`effective_issuer_configuration`]).
     pub issuer_configuration: IssuerConfigurationType,
+    /// The ENDPOINT of this emulator this pool publishes its token issuer on
+    /// ([`UserPool::issuer`]), as the `host[:port]` a client dials — `None` for a
+    /// pool created through a client that resolves AWS's own hostnames on an
+    /// emulator that is served on no port at all, which is the one caller that can
+    /// reach the regional host the issuer's documented form names.
+    ///
+    /// Settled by the create ([`issuer_endpoint_authority`]) and never rewritten by
+    /// a read, because the `iss` claim of a token is what a verifier compares
+    /// against the issuer it was configured with: a pool announces ONE issuer for
+    /// its whole life, however each later caller addresses this emulator.
+    pub issuer_endpoint: Option<String>,
     pub acr_configuration: Option<HashMap<String, AcrLevelConfigType>>,
     pub sms_authentication_message: Option<String>,
     /// This pool's TOTP MFA configuration: "Settings for time-based one-time
@@ -308,6 +319,35 @@ fn issuer_host(region: &str, issuer_type: &str) -> String {
     }
 }
 
+/// The address a pool created by the request being served publishes its token
+/// ISSUER on: the `host[:port]` of THIS emulator, since the issuer is a URL a
+/// relying party fetches later — a verifier reads the key set from
+/// `<iss>/.well-known/jwks.json` — and an address this emulator announces has to
+/// lead back to this emulator.
+///
+/// It is the endpoint the request itself reached when that endpoint is the
+/// emulator's own ([`::service_common::data_plane_addressing::reached_emulator_endpoint`]),
+/// which is a client that resolves nothing else; otherwise the one address this
+/// process answers on
+/// ([`::service_common::data_plane_addressing::served_endpoint_authority`]), so a
+/// pool minted by an in-process call of another service publishes an address that
+/// service's caller can reach too. `None` only for an emulator served on no port
+/// at all, where there is no address to publish and the pool falls back to the
+/// regional host its documented form names ([`issuer_host`]).
+///
+/// Both readings are the workspace's shared ones
+/// ([`::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts`] and
+/// [`::service_common::data_plane_addressing::served_endpoint_authority`]), so this service
+/// writes no second rule for which host is the emulator's own.
+#[must_use]
+pub fn issuer_endpoint_authority(
+    parts: &::http::request::Parts,
+    served_base: &str,
+) -> Option<String> {
+    ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(parts)
+        .or_else(|| ::service_common::data_plane_addressing::served_endpoint_authority(served_base))
+}
+
 /// Whether `issuer` is a token issuer of the user pool `pool_id` of `region` —
 /// the reading every verifier of a user-pool token shares, here and in the
 /// services that resolve one (an API Gateway `COGNITO_USER_POOLS` authorizer, a
@@ -372,23 +412,38 @@ impl UserPool {
             .unwrap_or(DEFAULT_ISSUER_TYPE)
     }
 
-    /// This pool's TOKEN ISSUER: the regional user-pool issuer of the issuer type
-    /// this pool is configured with ([`issuer_host`]) with this pool's id as the
-    /// whole path — `https://cognito-idp.<region>.amazonaws.com/<UserPoolId>` for
-    /// a pool issuing the original way.
+    /// This pool's TOKEN ISSUER: the address this pool publishes on, with this
+    /// pool's id as the whole path.
     ///
-    /// Rendered from the pool's STORED Region, issuer configuration and id, so
-    /// one pool announces ONE issuer however its callers address this emulator:
-    /// the `iss` claim of a token is what a verifier compares against the issuer
-    /// it was configured with, and the discovery root it fetches
-    /// `<iss>/.well-known/jwks.json` from, so a URL naming the socket a request
-    /// arrived on identifies neither a user pool nor a Region to any verifier.
+    /// The issuer is a URL the holder of a token FETCHES — it is the discovery
+    /// root a verifier reads `<iss>/.well-known/jwks.json` from (Amazon Cognito
+    /// Developer Guide, "Verifying a JSON web token") — so it names the endpoint of
+    /// THIS emulator the pool was created through ([`UserPool::issuer_endpoint`]),
+    /// which is the only address a client of this emulator resolves. The pool's own
+    /// endpoint is published at `/<UserPoolId>/.well-known/<document>`
+    /// (`crate::service`), so the locator a token leads a verifier to is a route
+    /// this emulator answers.
+    ///
+    /// A pool created by a client that resolves AWS's own hostnames, on an emulator
+    /// served on no port at all, has no address of this emulator to publish and
+    /// announces the documented regional form instead — the regional user-pool
+    /// issuer of the type it is configured with ([`issuer_host`]):
+    /// `https://cognito-idp.<region>.amazonaws.com/<UserPoolId>` for a pool issuing
+    /// the original way.
+    ///
+    /// Either way it is rendered from what the pool STORES, so one pool announces
+    /// ONE issuer however its later callers address this emulator: the `iss` claim
+    /// of a token is what a verifier compares against the issuer it was configured
+    /// with.
     pub fn issuer(&self) -> String {
-        format!(
-            "https://{}/{}",
-            issuer_host(&self.region, self.issuer_type()),
-            self.id
-        )
+        match self.issuer_endpoint.as_deref() {
+            Some(authority) => format!("https://{authority}/{}", self.id),
+            None => format!(
+                "https://{}/{}",
+                issuer_host(&self.region, self.issuer_type()),
+                self.id
+            ),
+        }
     }
 
     /// Where this pool publishes the key set its tokens are verified against:
