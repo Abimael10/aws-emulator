@@ -48,7 +48,10 @@ fn resolved_defaults() -> Vec<(&'static str, Value)> {
 }
 
 /// The project `name` as `BatchGetProjects` reports it.
-async fn fetch_project(router: &MultiServiceRouter, name: &str) -> Value {
+///
+/// `pub(crate)`: the sibling suite that owns the artifacts half of the same resolution
+/// rule reads a project back the same way rather than keeping a copy of this.
+pub(crate) async fn fetch_project(router: &MultiServiceRouter, name: &str) -> Value {
     let (status, body) = call(router, "BatchGetProjects", json!({"names": [name]})).await;
     assert_eq!(
         status, 200,
@@ -58,7 +61,9 @@ async fn fetch_project(router: &MultiServiceRouter, name: &str) -> Value {
 }
 
 /// `UpdateProject` for `name` with `extra`'s members merged in, asserting it succeeded.
-async fn update_project(router: &MultiServiceRouter, name: &str, extra: Value) -> Value {
+///
+/// `pub(crate)`: shared with that same sibling suite, for the same reason.
+pub(crate) async fn update_project(router: &MultiServiceRouter, name: &str, extra: Value) -> Value {
     let mut body = json!({"name": name});
     if let (Value::Object(target), Value::Object(members)) = (&mut body, extra) {
         target.extend(members);

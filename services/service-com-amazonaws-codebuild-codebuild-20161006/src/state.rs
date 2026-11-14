@@ -4369,8 +4369,9 @@ pub const DEFAULT_QUEUED_TIMEOUT_MINUTES: i32 = 480;
 ///
 /// AWS documents each of these settings with the value a project that names none runs
 /// with ([`DEFAULT_BUILD_TIMEOUT_MINUTES`], [`DEFAULT_QUEUED_TIMEOUT_MINUTES`],
-/// [`effective_cache`], [`effective_source`], [`effective_environment`],
-/// [`default_encryption_key`]), and a project is stored with those values resolved:
+/// [`effective_artifacts`], [`effective_cache`], [`effective_source`],
+/// [`effective_environment`], [`default_encryption_key`]), and a project is stored with
+/// those values resolved:
 /// every later read reports the configuration a build of it would run with rather than
 /// only the members the request happened to carry. Called wherever a project record is
 /// persisted — `CreateProject` and `UpdateProject` — so the defaults are resolved once,
@@ -4379,6 +4380,15 @@ pub const DEFAULT_QUEUED_TIMEOUT_MINUTES: i32 = 480;
 /// `region` is the request's own (see [`request_region`]): the managed key the absent
 /// `encryptionKey` resolves to is an ARN in the caller's region and account.
 pub fn resolve_project_defaults(project: &mut Project, region: &str) {
+    // The output artifact a project that names none gets is named after the project
+    // itself ([`effective_artifacts`]), so the resolution is handed the project's own
+    // name. A SECONDARY destination is left as it was written: it is told apart by its
+    // own `artifactIdentifier`, so the project's name is not its name.
+    let project_name = project.name.clone().unwrap_or_default();
+    project.artifacts = project
+        .artifacts
+        .take()
+        .map(|artifacts| effective_artifacts(artifacts, &project_name));
     project.cache = Some(effective_cache(project.cache.take()));
     project.environment = project.environment.take().map(effective_environment);
     // A secondary source is a stored source too, so its flags resolve the same way the

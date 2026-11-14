@@ -73,6 +73,8 @@ mod list_shared_report_groups;
 mod name_character_refusals;
 #[path = "all/project_arn_addressing.rs"]
 mod project_arn_addressing;
+#[path = "all/project_artifact_defaults.rs"]
+mod project_artifact_defaults;
 #[path = "all/project_build_batch_lifecycle.rs"]
 mod project_build_batch_lifecycle;
 #[path = "all/project_build_lifecycle.rs"]

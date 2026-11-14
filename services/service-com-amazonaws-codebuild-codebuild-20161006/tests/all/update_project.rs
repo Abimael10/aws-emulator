@@ -229,11 +229,15 @@ async fn update_project_replaces_the_members_it_was_given_and_keeps_the_rest() {
                 "name": "out.zip",
                 "packaging": "ZIP",
             }}),
+            // The replacement is resolved the way the create resolves the artifacts it
+            // replaces, so the members the SERVICE supplies are stated beside the ones
+            // the request carried (`project_artifact_defaults` owns that rule).
             json!({"artifacts": {
                 "type": "S3",
                 "location": "artifact-bucket",
                 "name": "out.zip",
                 "packaging": "ZIP",
+                "encryptionDisabled": false,
             }}),
         ),
         (

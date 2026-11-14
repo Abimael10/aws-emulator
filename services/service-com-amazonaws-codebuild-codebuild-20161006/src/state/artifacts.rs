@@ -24,6 +24,11 @@
 //!   accept, and nothing recorded shows CodeBuild resolving a project's stored
 //!   destination again per build. The override is the destination the caller hands over
 //!   at start time, which is the one that has not been seen before.
+//!
+//! Beside the rules, the destination a project stores is RESOLVED
+//! ([`effective_artifacts`]): the members CodeBuild supplies rather than the client are
+//! filled in when the project record is written, so every read reports the destination a
+//! build of it would upload to.
 
 use super::ProjectArtifacts;
 
@@ -70,6 +75,60 @@ pub fn artifacts_bucket_of(artifacts: &ProjectArtifacts) -> Option<&str> {
     let location = artifacts.location.as_deref()?.trim();
     let bucket = location.split('/').next().unwrap_or_default();
     (!bucket.is_empty()).then_some(bucket)
+}
+
+/// The `ArtifactPackaging` a build's output is packaged as when its artifacts name none.
+///
+/// AWS documents the default on the member itself (`ProjectArtifacts$packaging`): "NONE:
+/// CodeBuild creates in the output bucket a folder that contains the build output. This is
+/// the default if `packaging` is not specified."
+pub const DEFAULT_ARTIFACT_PACKAGING: &str = "NONE";
+
+/// Whether an unconfigured `ProjectArtifacts$encryptionDisabled` flag is on.
+///
+/// The member is the opt-out "Set to true if you do not want your output artifacts
+/// encrypted", so a destination that does not set it has its output encrypted.
+pub const DEFAULT_ENCRYPTION_DISABLED: bool = false;
+
+/// `artifacts` as the SERVICE resolves them for the project named `project_name`: every
+/// member CodeBuild supplies rather than the client, stated with the value the
+/// destination is actually configured with.
+///
+/// `ProjectArtifacts$name` is "the pattern that CodeBuild uses to name and store the
+/// output artifact" and nothing in the shape makes it `@required`: the project's one
+/// primary output artifact is named after the project itself when the request names no
+/// name, which is the only name the service has for it. `packaging` and
+/// `encryptionDisabled` resolve to the values their own documentation states for a
+/// destination that leaves them unset ([`DEFAULT_ARTIFACT_PACKAGING`],
+/// [`DEFAULT_ENCRYPTION_DISABLED`]). The resolution is independent of the artifacts TYPE
+/// — a type that manages its own output location still reports the configuration it would
+/// upload with — so the same three members are stated for every `ArtifactsType`. The
+/// members' own documentation withholds a VALUE for the types that upload nothing of
+/// their own ("this value is ignored if specified"), which says what the setting does
+/// rather than whether a read states it, and nothing shows the service stating them for
+/// one type and omitting them for another.
+///
+/// A SECONDARY entry is left as the request wrote it: each one is a destination of its
+/// own, told apart by its `artifactIdentifier` rather than by the project's name, so the
+/// project's name is not the name of any of them and nothing states what the service
+/// resolves for one.
+pub fn effective_artifacts(
+    mut artifacts: ProjectArtifacts,
+    project_name: &str,
+) -> ProjectArtifacts {
+    artifacts.name = Some(
+        artifacts
+            .name
+            .unwrap_or_else(|| project_name.to_string()),
+    );
+    artifacts.packaging = Some(
+        artifacts
+            .packaging
+            .unwrap_or_else(|| DEFAULT_ARTIFACT_PACKAGING.to_string()),
+    );
+    artifacts.encryption_disabled =
+        Some(artifacts.encryption_disabled.unwrap_or(DEFAULT_ENCRYPTION_DISABLED));
+    artifacts
 }
 
 /// What CodeBuild states as the reason the bucket a build's artifacts name does not

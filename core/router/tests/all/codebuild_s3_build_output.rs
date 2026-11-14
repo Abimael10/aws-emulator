@@ -316,7 +316,9 @@ struct Row {
     declaration: &'static str,
     /// The build's terminal status.
     status: &'static str,
-    /// The keys the bucket must hold, in order.
+    /// The keys the bucket must hold, in order. `{project}` stands for the project's own
+    /// name, which is the artifact name CodeBuild derives for a destination that names
+    /// none — so a row that states no `name` composes its keys under it.
     keys: Vec<&'static str>,
     /// The phase context the build reports for its upload, for a row that uploads nothing.
     upload_message: &'static str,
@@ -337,7 +339,9 @@ fn rows() -> Vec<Row> {
             artifacts: json!({}),
             declaration: "artifacts:\n  files:\n    - out.txt\n",
             status: "SUCCEEDED",
-            keys: vec!["out.txt"],
+            // The destination names no artifact, so the one the service derived — the
+            // project's own name — is the name the key composes through.
+            keys: vec!["{project}/out.txt"],
             upload_message: "",
         },
         Row {
@@ -427,10 +431,15 @@ async fn a_builds_declared_artifact_lands_where_its_destination_composes() {
             row.status
         );
         let keys = object_keys(&router, &bucket).await;
+        let expected: Vec<String> = row
+            .keys
+            .iter()
+            .map(|key| key.replace("{project}", &project))
+            .collect();
         assert_eq!(
-            keys, row.keys,
-            "case {:?}: expected the keys {:?}, got {keys:?}",
-            row.case, row.keys
+            keys, expected,
+            "case {:?}: expected the keys {expected:?}, got {keys:?}",
+            row.case
         );
         for key in &keys {
             let bytes = object_bytes(&router, &bucket, key).await;
