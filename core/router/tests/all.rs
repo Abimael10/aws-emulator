@@ -5011,3 +5011,15 @@ mod cloudformation_provisions_event_buses_and_bus_policies;
 // (Five more lines of that header landed here as `//!` as well, and are gone rather than
 // re-typed: `all/all_rs_declares_each_suite_once.rs` checks the declarations and
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` the notes, for this file and
+// suite left at the top level of `tests/` fails the build. (A line comment for that very
+// reason: a landing appended this fragment of the header to the tail, where `//!` is
+// note written as an inner doc comment anywhere but this file's header is `E0753` —
+// checks the declarations, for this file and for every service crate's `tests/all.rs`,
+// so check there rather than leaving a note here. (Six more lines of that header
+// fragment, ordinary comments for the reason they themselves state.)
+// leaving a note in the appended tail below, where an inner doc comment is `E0753` —
+// which is why this line of that header fragment is an ordinary comment.
+// ONCE: this is one crate root, so a second `mod` for the same name is `E0428`, and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks the notes, for this
+// file and for every service crate's `tests/all.rs`, so check there rather than leaving
+// a note in this file's tail, where an inner doc comment is `E0753` and compiles nothing.

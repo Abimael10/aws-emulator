@@ -13,7 +13,8 @@
 //! `ResourceNotFoundException` with the fixed no-data text and `ListProfileTimes` reports
 //! no profile time for it — while the group still records that the profile was RECEIVED
 //! (`profilingStatus.latestAgentProfileReportedAt`). Once the aggregation is due, the
-//! same requests serve the aggregated profile the window's profiles were collected into.
+//! same requests serve the aggregated profile the window's profiles were collected into —
+//! each period's own aggregated profile once the window OF THAT PERIOD has closed.
 //!
 //! Rows vary what the rule generalises over: how the requested window is expressed (no
 //! parameters, each of the three modelled aggregation periods alone, both bounds, each
@@ -37,6 +38,12 @@ const NO_PROFILES_IN_TIME_RANGE: &str = "No profiles found for the requested tim
 /// ISO 8601 form the modelled `date-time` query members carry.
 const WIDE_START: &str = "2000-01-01T00:00:00Z";
 const WIDE_END: &str = "2099-01-01T00:00:00Z";
+
+/// The modelled `AggregationPeriod` values the service aggregates at, with each period's
+/// length in whole seconds, read from the service's own table (finest window first) so this
+/// suite cannot name a period the service does not aggregate at.
+const AGGREGATION_PERIODS: &[(&str, i64)] =
+    service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::AGGREGATION_PERIODS;
 
 async fn create_group(harness: &Harness, name: &str) -> Answer {
     harness
@@ -296,11 +303,24 @@ async fn a_posted_profile_is_served_only_once_its_aggregation_is_due() {
                 element_of(&served.body)
             );
         }
-        for period in ["PT5M", "PT1H", "P1D"] {
+        // The aggregation a window owes falls due only once THAT window has closed, so
+        // each period's aggregated profile is reported once the window OF THAT PERIOD
+        // holding the receipt has closed: the receipt is aged past that window before the
+        // period is asked about. The service's table lists the periods finest first, so
+        // each step only moves the receipt further into the past.
+        for (period, period_seconds) in AGGREGATION_PERIODS {
+            harness.complete_aggregation_of_period(&name, *period_seconds);
             let times = list_profile_times(&harness, &name, period).await;
+            assert_eq!(
+                times.status, 200,
+                "case {case:?} ({period}): ListProfileTimes must answer 200, got {} {}",
+                times.status,
+                String::from_utf8_lossy(&times.body)
+            );
             assert!(
                 reported_times(&times) >= 1,
-                "case {case:?} ({period}): an aggregated profile must be reported, got {}",
+                "case {case:?} ({period}): a window of this period whose aggregation has \
+                 fallen due must be reported, got {}",
                 String::from_utf8_lossy(&times.body)
             );
         }

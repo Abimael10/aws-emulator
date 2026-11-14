@@ -81,15 +81,35 @@ pub(crate) fn ion_profile(start: i64, filler: usize) -> Vec<u8> {
 /// received — the window it belongs to is still open, and the aggregation pass runs
 /// after that window closes — so a case about what an AGGREGATED profile reads back as
 /// places the receipt in a window that has closed, the way `place_receipts` does for a
-/// case about several windows. This writes the same stored field `PostAgentProfile`
-/// wrote, through the one shared engine, and nothing else. `pub(crate)` so every suite
-/// in this target ages a stored profile one way.
+/// case about several windows. This is [`complete_aggregation_of_period_in`] at the
+/// FINEST period, the window a posted profile is first collected into (and the one a
+/// request naming a free-form range is served from). `pub(crate)` so every suite in this
+/// target ages a stored profile one way.
 pub(crate) fn complete_aggregation_in(engine: &Arc<engine::InMemoryEngine>, name: &str) {
-    use service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::{
-        AGGREGATION_PASS_MILLIS, finest_aggregation_period_seconds,
-    };
+    complete_aggregation_of_period_in(
+        engine,
+        name,
+        service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::finest_aggregation_period_seconds(),
+    );
+}
 
-    let back = finest_aggregation_period_seconds() + AGGREGATION_PASS_MILLIS / 1_000 + 1;
+/// Let the aggregation a `period_seconds`-long window owes fall due for every profile a
+/// group holds, by moving each stored receipt back past that window and the aggregation
+/// pass over it.
+///
+/// The aggregated profile of a period is available only once the window OF THAT PERIOD
+/// holding the receipt has closed, so a case about a coarser period's aggregated profile
+/// ages the receipt past that period's window rather than past the finest one. This writes
+/// the same stored field `PostAgentProfile` wrote, through the one shared engine, and
+/// nothing else.
+pub(crate) fn complete_aggregation_of_period_in(
+    engine: &Arc<engine::InMemoryEngine>,
+    name: &str,
+    period_seconds: i64,
+) {
+    use service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::AGGREGATION_PASS_MILLIS;
+
+    let back = period_seconds + AGGREGATION_PASS_MILLIS / 1_000 + 1;
     let state = engine
         .state::<service_com_amazonaws_codeguruprofiler_codeguruprofiler::ComAmazonawsCodeguruprofilerCodeguruprofilerState>();
     let mut guard = state.lock();
@@ -297,6 +317,11 @@ impl Harness {
     /// [`complete_aggregation_in`] on this harness's engine.
     pub(crate) fn complete_aggregation(&self, name: &str) {
         complete_aggregation_in(&self.engine, name);
+    }
+
+    /// [`complete_aggregation_of_period_in`] on this harness's engine.
+    pub(crate) fn complete_aggregation_of_period(&self, name: &str, period_seconds: i64) {
+        complete_aggregation_of_period_in(&self.engine, name, period_seconds);
     }
 
     /// Profile bytes retained across every group — what the store-wide budget bounds.

@@ -249,11 +249,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The aggregated profiles the group holds for this period AS OF NOW, keeping
-        // those whose start falls in the requested range. A profile the group has
-        // received but whose aggregation is not due yet is in no aggregated profile, so
-        // it contributes no profile time. The range is half-open at `endTime`, so paging
-        // a time axis with back-to-back ranges reports each aggregated profile exactly
-        // once.
+        // those whose start falls in the requested range. A window of THIS period that
+        // the service is still collecting into — one that has not closed, or whose
+        // aggregation pass is not through — is covered by no aggregated profile, so it
+        // contributes no profile time however many profiles it already holds. The range
+        // is half-open at `endTime`, so paging a time axis with back-to-back ranges
+        // reports each aggregated profile exactly once.
         let mut starts: Vec<::aws_smithy_types::DateTime> = group
             .aggregated_profile_starts(period_seconds, crate::state::now())
             .into_iter()

@@ -10,7 +10,9 @@
 //! due and which holds at least one profile is reported once, filtered to the requested
 //! time range, ordered by `orderBy` (descending by default) and paged by
 //! `maxResults`/`nextToken`. A window the service is still collecting into has no
-//! aggregated profile yet and is reported by nothing.
+//! aggregated profile yet and is reported by nothing — the window of the period the
+//! REQUEST names, so an hourly or daily window that has not closed reports nothing
+//! however long the finer windows inside it have been aggregated.
 //!
 //! Rows vary what the rule generalises over: the aggregation period (all three the
 //! model declares), how many profiles share a window, where a receipt sits inside its
@@ -1076,4 +1078,224 @@ async fn a_window_is_reported_only_once_the_aggregation_it_owes_is_due() {
             );
         }
     }
+}
+
+/// How far from an aggregation-window boundary the open-window cases below read the clock,
+/// in seconds.
+///
+/// Those cases place receipts relative to the clock and then state which windows have
+/// CLOSED; the service answers a few milliseconds later and must decide the same about
+/// each of them. Reading the clock this far from every window boundary is what makes the
+/// two agree — no boundary a row depends on falls between the instant the row was computed
+/// at and the instant the service answers at — and it is a whole order of magnitude more
+/// room than the requests themselves need.
+const BOUNDARY_MARGIN_SECONDS: i64 = 10;
+
+/// The clock's current second, read at least [`BOUNDARY_MARGIN_SECONDS`] away from every
+/// aggregation window boundary.
+///
+/// The three periods the model's `AggregationPeriod` declares are nested — PT5M divides
+/// PT1H, which divides P1D — so an instant that far inside a FINEST window is that far
+/// inside the hourly and the daily window containing it too, and the one condition covers
+/// all three.
+///
+/// This POLLS the clock for that condition rather than waiting a fixed span: it answers
+/// immediately unless the call lands within the margin of a five-minute boundary, and then
+/// as soon as the clock is clear of it.
+async fn now_clear_of_window_boundaries() -> i64 {
+    let finest = service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::finest_aggregation_period_seconds();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        let now = DateTime::from(std::time::SystemTime::now()).secs();
+        let inside = now.rem_euclid(finest);
+        if inside >= BOUNDARY_MARGIN_SECONDS && inside < finest - BOUNDARY_MARGIN_SECONDS {
+            return now;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the clock never came clear of an aggregation window boundary"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Whether the aggregated profile that the `period`-long window starting at `start` owes
+/// has fallen due as of `now` (both epoch seconds): the window has CLOSED and the
+/// aggregation pass over it is through
+/// (`state::AGGREGATION_PASS_MILLIS`, stated in milliseconds).
+///
+/// This is the rule the open-window rows are stated by, written out once: the window is the
+/// one of the period being asked about, so what a finer window inside it has already been
+/// aggregated into says nothing about it.
+fn aggregation_is_due(start: i64, period: i64, now: i64) -> bool {
+    let pass = service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::AGGREGATION_PASS_MILLIS;
+    start
+        .saturating_add(period)
+        .saturating_mul(1_000)
+        .saturating_add(pass)
+        <= now.saturating_mul(1_000)
+}
+
+/// The profile times a group holding `receipts` must report for a `period`-long
+/// aggregation period as of `now`, ascending and distinct: one per window of that period
+/// whose own aggregation has fallen due.
+fn due_window_starts(receipts: &[i64], period: i64, now: i64) -> Vec<i64> {
+    let mut starts: Vec<i64> = receipts
+        .iter()
+        .map(|at| window_start(*at, period))
+        .filter(|start| aggregation_is_due(*start, period, now))
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+}
+
+/// A window of the REQUESTED aggregation period that the service is still collecting into
+/// is covered by no aggregated profile, so it contributes no profile time — however long
+/// the finer windows inside it have been closed, and whatever order or page size the
+/// request names. Only the windows of that period which have closed, plus the aggregation
+/// pass they owe, are reported.
+///
+/// The rows vary what the rule generalises over: every aggregation period the service
+/// aggregates at (read from its own table), receipts in the window being collected into,
+/// in finer windows that have closed INSIDE that window, and in hourly and daily windows
+/// that have closed, each of the two orders the model declares plus the default, and a page
+/// size at the model's lower bound.
+#[tokio::test]
+async fn an_open_window_contributes_no_profile_time_whatever_the_period() {
+    let harness = Harness::new();
+    let now = now_clear_of_window_boundaries().await;
+    let finest = service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::finest_aggregation_period_seconds();
+    // The finest window the service is collecting into as of `now`.
+    let collecting = window_start(now, finest);
+    // Receipts, oldest first: one a day back and one an hour back (so the daily and the
+    // hourly window holding them have closed), two in finest windows that have closed
+    // inside the current hour and day, and one in the window being collected into.
+    let receipts: Vec<i64> = vec![
+        collecting - DAY - 150,
+        collecting - HOUR - 150,
+        collecting - 450,
+        collecting - 150,
+        collecting + 1,
+    ];
+    let name = "times-open-window";
+    group_with_receipts(&harness, name, &receipts).await;
+
+    // A range holding every window start the receipts floor to, at every period: from the
+    // start of the day containing the earliest receipt to a day past now.
+    let range = (window_start(receipts[0], DAY), now + DAY);
+
+    for (period_name, period) in
+        service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::AGGREGATION_PERIODS
+    {
+        let ascending = due_window_starts(&receipts, *period, now);
+        // The window of this period that the service is still collecting into, and the
+        // receipts it holds whose FINEST window has already been aggregated — the state a
+        // period-independent gate reports as an available aggregated profile.
+        let open = window_start(now, *period);
+        assert!(
+            receipts.iter().any(|at| window_start(*at, *period) == open),
+            "case {period_name}: the window being collected into must hold a receipt for \
+             this row to be about it"
+        );
+        let aggregated_inside_open: Vec<i64> = receipts
+            .iter()
+            .copied()
+            .filter(|at| {
+                window_start(*at, *period) == open
+                    && aggregation_is_due(window_start(*at, finest), finest, now)
+            })
+            .collect();
+
+        for order_by in [None, Some("TimestampAscending"), Some("TimestampDescending")] {
+            // The model's doc for `orderBy`: "Defaults to TIMESTAMP_DESCENDING."
+            let mut expected = ascending.clone();
+            if order_by != Some("TimestampAscending") {
+                expected.reverse();
+            }
+            let mut query = format!(
+                "?startTime={}&endTime={}&period={period_name}",
+                iso(range.0),
+                iso(range.1)
+            );
+            if let Some(order_by) = order_by {
+                query.push_str(&format!("&orderBy={order_by}"));
+            }
+            let answer = list_profile_times(&harness, name, &query).await;
+            assert_eq!(
+                answer.status,
+                200,
+                "case {period_name}/{order_by:?} ({query}): expected HTTP 200, got {} {}",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+            let reported = profile_times(&answer);
+            assert_eq!(
+                reported, expected,
+                "case {period_name}/{order_by:?} ({query}): only a window whose own \
+                 aggregation is due is reported — the window [{open}] is still collecting \
+                 and holds {} already-aggregated receipts {aggregated_inside_open:?} — \
+                 expected {expected:?}, got {reported:?}",
+                aggregated_inside_open.len()
+            );
+            assert!(
+                !reported.contains(&open),
+                "case {period_name}/{order_by:?}: the window being collected into [{open}] \
+                 must be reported by nothing, got {reported:?}"
+            );
+            assert_eq!(
+                next_token(&answer),
+                None,
+                "case {period_name}/{order_by:?}: one page holds every reported window, so \
+                 it carries no nextToken, got {:?}",
+                next_token(&answer)
+            );
+        }
+
+        // The same rule at the page size the model's `maxResults` range starts at: the
+        // first window of the default order, and a token exactly when another follows.
+        let query = format!(
+            "?startTime={}&endTime={}&period={period_name}&maxResults=1",
+            iso(range.0),
+            iso(range.1)
+        );
+        let answer = list_profile_times(&harness, name, &query).await;
+        let first_page: Vec<i64> = ascending.iter().rev().take(1).copied().collect();
+        assert_eq!(
+            profile_times(&answer),
+            first_page,
+            "case {period_name}/maxResults=1 ({query}): expected {first_page:?}, got {:?}",
+            profile_times(&answer)
+        );
+        assert_eq!(
+            next_token(&answer).is_some(),
+            ascending.len() > 1,
+            "case {period_name}/maxResults=1: expected nextToken present = {}, got {:?}",
+            ascending.len() > 1,
+            next_token(&answer)
+        );
+    }
+
+    // The other reader of the same aggregated profiles agrees: the group's status names the
+    // aggregated profile that starts latest — the narrowest period's where two start
+    // together — over exactly the windows whose aggregation is due.
+    let expected_latest = service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::AGGREGATION_PERIODS
+        .iter()
+        .filter_map(|(period_name, period)| {
+            due_window_starts(&receipts, *period, now)
+                .last()
+                .map(|start| (*start, *period, *period_name))
+        })
+        .max_by_key(|(start, period, _)| (*start, std::cmp::Reverse(*period)))
+        .map(|(start, _, period_name)| (period_name.to_string(), start));
+    let described = harness.describe(name).await;
+    assert_eq!(
+        crate::latest_aggregated_profile::latest_aggregated_profile(
+            "the open window of every period",
+            &described.json()
+        ),
+        expected_latest,
+        "the status must name the latest aggregated profile the due windows derive, got {}",
+        String::from_utf8_lossy(&described.body)
+    );
 }

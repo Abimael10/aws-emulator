@@ -136,8 +136,12 @@ fn reported_profile_times(answer: &Answer) -> Vec<i64> {
 /// The `(period, start)` pair one description reports as its most recent aggregated
 /// profile, or `None` when it reports none. `start` is answered as epoch seconds, after
 /// the member has been asserted to be a date-time string carrying no sub-second part —
-/// an aggregation window starts on a whole second.
-fn latest_aggregated_profile(case: &str, description: &serde_json::Value) -> Option<(String, i64)> {
+/// an aggregation window starts on a whole second. `pub(crate)` so every suite in this
+/// target reads the reported pair one way.
+pub(crate) fn latest_aggregated_profile(
+    case: &str,
+    description: &serde_json::Value,
+) -> Option<(String, i64)> {
     let status = description
         .get("profilingStatus")
         .unwrap_or_else(|| panic!("case {case:?}: a read must carry profilingStatus, got {description}"));

@@ -634,9 +634,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Which steps can be reported on, and which profiles their values come from. A
-        // posted profile the service has not collected into an aggregated profile yet is
-        // in no aggregated profile, so the step holding it has no profile data to report
-        // and is an unprocessed instance instead.
+        // step is one aggregated profile's window at the reported resolution, and the
+        // service is still collecting into a window that has not closed, so a profile in
+        // a step whose own aggregation is not due yet is in no aggregated profile: the
+        // step has no profile data to report and is an unprocessed instance instead.
         let now = crate::state::now();
         let mut pending: Vec<bool> = vec![false; steps.len()];
         let mut aggregated: Vec<(usize, crate::state::AgentProfile)> = Vec::new();
@@ -644,7 +645,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(step) = step_of(&steps, profile.received_at) else {
                 continue;
             };
-            if profile.is_aggregated(now) {
+            if profile.is_aggregated(resolution_seconds, now) {
                 aggregated.push((step, profile));
             } else {
                 pending[step] = true;
