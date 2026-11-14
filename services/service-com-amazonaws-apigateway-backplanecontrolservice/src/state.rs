@@ -3933,22 +3933,6 @@ pub fn domain_name_has_access_associations(domain_name: &str) -> String {
     )
 }
 
-/// The `BadRequestException` message for a custom domain name that still holds a
-/// `BasePathMapping`, which is what `DeleteDomainName` refuses while the mapping stands.
-///
-/// A mapping sends the calls arriving on its base path of this domain name to a REST API,
-/// so removing the domain name would take a mapping a client still reaches an API through
-/// with it. AWS publishes no fixed sentence for this condition, so the message is BUILT
-/// FROM STORED STATE the way the sibling dependency sentences above are: it names the
-/// record the request addressed and the base path of the mapping standing in its way, so
-/// the caller can see which `DeleteBasePathMapping` to make first.
-pub fn domain_name_has_base_path_mappings(domain_name: &str, base_path: &str) -> String {
-    format!(
-        "The domain name {domain_name} has base path mapping {base_path}. Delete the base \
-         path mappings before deleting the domain name."
-    )
-}
-
 /// How a refusal that names SEVERAL custom domain names lists them: the member it fills is
 /// plural ("in your domains"), and a list a human reads is comma separated.
 const DOMAIN_NAME_LIST_SEPARATOR: &str = ", ";

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the records a `BasePathMapping` holds a REFERENCE to, and what
-//! that reference refuses: `DeleteDomainName` and `DeleteStage`, read back through
-//! `GetDomainName`, `GetStage` and `GetBasePathMapping`.
+//! End-to-end tests for the INDEPENDENT records a `BasePathMapping` holds a REFERENCE to,
+//! and what that reference refuses: `DeleteRestApi` and `DeleteStage`, read back through
+//! `GetRestApi` and `GetStage`.
 //!
 //! Every case drives the real wire path — a `restJson1` HTTP request through the
 //! multi-service router into the mounted service — so what is asserted is what a client
@@ -11,12 +11,14 @@
 //! helpers are this crate's existing harness.
 //!
 //! The RULE under test: a base path mapping routes the calls arriving on its base path of
-//! a custom domain name to a stage of a REST API, so while it stands none of the records
-//! it names may be deleted — the domain name that HOLDS the mapping, the REST API it names
-//! and the stage of that API it names are each refused with the modelled
-//! `BadRequestException`, naming the mapping, and every record survives. Deleting the
-//! mapping releases them all. Nothing else is held: a record no mapping points at deletes
-//! as it always did.
+//! a custom domain name to a stage of a REST API, so while it stands neither of the
+//! INDEPENDENT records it NAMES may be deleted — the REST API and the stage of that API
+//! are each refused with the modelled `BadRequestException`, naming the domain names whose
+//! mappings stand in the way, and every record survives. Deleting the mapping releases
+//! them both. Nothing else is held: a record no mapping points at deletes as it always
+//! did. The custom domain name that HOLDS the mapping is NOT one of those records — a
+//! mapping is a subordinate record of it and is deleted with it — which
+//! `domain_name_delete_cascade` is the suite for.
 //!
 //! The rows differ along what the rule generalises over: the spelling of the base path
 //! (a plain one and the `(none)` the member documents), whether the mapping names a stage
@@ -24,9 +26,7 @@
 //! the mapping points at.
 
 use serde_json::json;
-use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    domain_name_has_base_path_mappings, NONE_BASE_PATH,
-};
+use service_com_amazonaws_apigateway_backplanecontrolservice::state::NONE_BASE_PATH;
 
 use crate::base_path_mapping::{create_mapping, deployed_api};
 use crate::domain_name_collection::created_domain;
@@ -34,20 +34,6 @@ use crate::rest_api_lifecycle::{assert_failure, Answer, Gateway};
 use crate::stage_lifecycle::{create_deployed_stage, get_stage};
 
 const BAD_REQUEST: (u16, &str) = (400, "BadRequestException");
-
-/// `DeleteDomainName` for `domain_name`.
-async fn delete_domain(gateway: &Gateway, domain_name: &str) -> Answer {
-    gateway
-        .call("DELETE", &format!("/domainnames/{domain_name}"), None)
-        .await
-}
-
-/// `GetDomainName` for `domain_name`.
-async fn get_domain(gateway: &Gateway, domain_name: &str) -> Answer {
-    gateway
-        .call("GET", &format!("/domainnames/{domain_name}"), None)
-        .await
-}
 
 /// `DeleteStage` for `stage_name` of `api`.
 async fn delete_stage(gateway: &Gateway, api: &str, stage_name: &str) -> Answer {
@@ -118,129 +104,6 @@ struct MappingRow {
     case: &'static str,
     base_path: &'static str,
     with_stage: bool,
-}
-
-#[tokio::test]
-async fn a_domain_name_that_still_holds_a_base_path_mapping_cannot_be_deleted() {
-    let gateway = Gateway::new();
-    let (api, stage) = deployed_api(&gateway, "held-domain-api", "prod").await;
-
-    let rows = [
-        MappingRow {
-            case: "a plain base path",
-            base_path: "v1",
-            with_stage: true,
-        },
-        MappingRow {
-            case: "the (none) base path",
-            base_path: NONE_BASE_PATH,
-            with_stage: true,
-        },
-        MappingRow {
-            case: "a mapping that names no stage",
-            base_path: "stageless",
-            with_stage: false,
-        },
-    ];
-
-    for (index, row) in rows.iter().enumerate() {
-        let domain_name = format!("held-{index}.example.com");
-        created_domain(&gateway, &domain_name, json!({})).await;
-
-        // Before the mapping exists the domain name is deletable — the guard is the
-        // mapping, not the domain name.
-        let mut request = json!({ "basePath": row.base_path, "restApiId": api });
-        if row.with_stage {
-            request["stage"] = json!(stage);
-        }
-        let created = create_mapping(&gateway, &domain_name, request).await;
-        assert_eq!(
-            created.status, 201,
-            "case {}: expected 201 from CreateBasePathMapping, got {} with {:?}",
-            row.case, created.status, created.body
-        );
-
-        let refused = delete_domain(&gateway, &domain_name).await;
-        assert_bad_request(
-            &refused,
-            &domain_name_has_base_path_mappings(&domain_name, row.base_path),
-            row.case,
-        );
-
-        // The record survives the refusal, with the mapping it holds.
-        let read = get_domain(&gateway, &domain_name).await;
-        assert_eq!(
-            read.status, 200,
-            "case {}: the refused delete must leave the domain name, got {} with {:?}",
-            row.case, read.status, read.body
-        );
-
-        // Releasing the mapping releases the domain name: the delete that was refused now
-        // succeeds, and the record stops being reported.
-        let released = delete_mapping(&gateway, &domain_name, row.base_path).await;
-        assert_eq!(
-            released.status, 202,
-            "case {}: expected 202 from DeleteBasePathMapping, got {} with {:?}",
-            row.case, released.status, released.body
-        );
-        let deleted = delete_domain(&gateway, &domain_name).await;
-        assert_eq!(
-            deleted.status, 202,
-            "case {}: expected 202 from DeleteDomainName once the mapping is gone, got {} \
-             with {:?}",
-            row.case, deleted.status, deleted.body
-        );
-        let gone = get_domain(&gateway, &domain_name).await;
-        assert_eq!(
-            gone.status, 404,
-            "case {}: expected the deleted domain name to be gone, got {} with {:?}",
-            row.case, gone.status, gone.body
-        );
-    }
-}
-
-#[tokio::test]
-async fn every_mapping_of_a_domain_name_has_to_go_before_the_domain_name_does() {
-    let gateway = Gateway::new();
-    let (api, stage) = deployed_api(&gateway, "many-mappings-api", "prod").await;
-    let domain_name = "many-mappings.example.com";
-    created_domain(&gateway, domain_name, json!({})).await;
-
-    let base_paths = ["alpha", "beta", "gamma"];
-    for base_path in base_paths {
-        create_mapping(
-            &gateway,
-            domain_name,
-            json!({ "basePath": base_path, "restApiId": api, "stage": stage }),
-        )
-        .await;
-    }
-
-    // The refusal names the FIRST mapping created, so a caller walking the refusals is
-    // told one call at a time which mapping to remove, and the domain name goes only when
-    // the last of them has.
-    for (index, base_path) in base_paths.iter().enumerate() {
-        let case = format!("{} mapping(s) left", base_paths.len() - index);
-        let refused = delete_domain(&gateway, domain_name).await;
-        assert_bad_request(
-            &refused,
-            &domain_name_has_base_path_mappings(domain_name, base_path),
-            &case,
-        );
-        let released = delete_mapping(&gateway, domain_name, base_path).await;
-        assert_eq!(
-            released.status, 202,
-            "case {case}: expected 202 from DeleteBasePathMapping, got {} with {:?}",
-            released.status, released.body
-        );
-    }
-
-    let deleted = delete_domain(&gateway, domain_name).await;
-    assert_eq!(
-        deleted.status, 202,
-        "case no mappings left: expected 202 from DeleteDomainName, got {} with {:?}",
-        deleted.status, deleted.body
-    );
 }
 
 #[tokio::test]

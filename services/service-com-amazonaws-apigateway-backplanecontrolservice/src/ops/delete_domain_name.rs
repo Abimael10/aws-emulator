@@ -3,9 +3,11 @@
 //! @op DeleteDomainName
 //! IMPLEMENTED: removes the stored custom `DomainName` record the request's `domainName`
 //! (with `domainNameId` for a private one) addresses, so a later `GetDomainName` no longer
-//! finds it and the account's `GetDomainNames` listing stops reporting it; answers
-//! `NotFoundException` when no record answers to those identifiers, and
-//! `ConflictException` while a stored `DomainNameAccessAssociation` still names it.
+//! finds it and the account's `GetDomainNames` listing stops reporting it; the
+//! `BasePathMapping` records that record HOLDS go with it, so a later `GetBasePathMapping`
+//! no longer finds them either; answers `NotFoundException` when no record answers to
+//! those identifiers, and `ConflictException` while a stored
+//! `DomainNameAccessAssociation` still names it.
 //!
 //! ## Shape of an operation
 //!
@@ -190,10 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let domain_name = entry.domain_name.clone();
         let domain_name_arn = entry.domain_name_arn.clone();
-        // The base path mappings this record still holds, in creation order, so the
-        // refusal below names the first mapping a caller created rather than whichever
-        // one the key order happens to hold first.
-        let base_path = entry.base_paths_in_creation_order().first().cloned();
+        // How many base path mappings go WITH the record, for the audit record below: a
+        // mapping is a record OF this domain name, so it has no existence apart from it.
+        let cascaded_mappings = entry.base_path_mappings.len();
 
         // A `DomainNameAccessAssociation` is a record of the ACCOUNT that NAMES a stored
         // private custom domain name — `CreateDomainNameAccessAssociation` refuses one
@@ -219,27 +220,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A `BasePathMapping` of this record sends the calls arriving on its base path of
-        // this domain name to a REST API, so it is a mapping a client still reaches that
-        // API through: deleting the domain name would take it away with the record and
-        // leave the custom-domain URL it published answering nothing. Such a delete is
-        // therefore refused while the mapping stands, as the sibling access-association
-        // dependency above is; removing the mapping is `DeleteBasePathMapping`'s own call,
-        // not something this one does on the caller's behalf.
-        if let Some(base_path) = &base_path {
-            return Err(DeleteDomainNameErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::domain_name_has_base_path_mappings(
-                        &domain_name,
-                        base_path,
-                    )),
-                },
-            )
-            .into());
-        }
-
+        // A `BasePathMapping` is a SUBORDINATE record of this custom domain name — it is
+        // created under it, addressed through it and reported by it — so it does not hold
+        // the domain name back: the delete goes through while mappings stand and takes them
+        // with the record, which is why a later `GetBasePathMapping` for one of them
+        // resolves no domain name to reach it through and answers that record's own
+        // missing-resource refusal. A reference held by an INDEPENDENT record (the access
+        // association above, and the REST API or stage a mapping names, which
+        // `DeleteRestApi` and `DeleteStage` refuse over) is the opposite case: that record
+        // outlives the reference, so the delete is refused instead of cascading.
+        //
         // The lookup, the dependency check and the removal share ONE hold of the store
-        // lock, so two concurrent deletes of one record cannot both remove it.
+        // lock, so two concurrent deletes of one record cannot both remove it. Removing the
+        // record removes the mappings it holds with it, because a mapping is stored ON the
+        // record (`DomainNameEntry::base_path_mappings`).
         store.domain_names.remove(&key);
         // The socket this record published its `regionalDomainName` as goes with it:
         // dropping the handle closes the port and severs every connection in flight on it,
@@ -270,6 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = Self::NAME,
             caller = ?crate::state::request_caller(ctx.parts()),
             domain_name = ?key,
+            cascaded_base_path_mappings = cascaded_mappings,
             outcome = "deleted",
             "custom domain name deleted",
         );

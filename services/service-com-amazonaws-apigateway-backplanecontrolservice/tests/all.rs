@@ -740,3 +740,8 @@ mod dynamodb_integration_template_written_item;
 // refusal that states them.
 #[path = "all/rest_api_import_model_reference_warnings.rs"]
 mod rest_api_import_model_reference_warnings;
+// Appended for the reason the note above gives: what `DeleteDomainName` takes WITH the
+// custom domain name it removes — the base path mappings that record holds, which are
+// subordinate to it and never hold it back.
+#[path = "all/domain_name_delete_cascade.rs"]
+mod domain_name_delete_cascade;
