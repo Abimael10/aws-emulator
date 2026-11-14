@@ -34,7 +34,7 @@ use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::ops::types::
     ScheduledChange, Subscription, SubscriptionSummary,
 };
 use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::state::{
-    parse_date_time, FIRST_REVISION,
+    parse_date_time, FIRST_REVISION, LIST_PAGE_SIZE,
 };
 use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::EmulatedService;
 
@@ -50,15 +50,18 @@ const REGION: &str = "us-west-2";
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One HTTP exchange: status, parsed body and the `ETag` response header.
-struct Answer {
-    status: u16,
-    body: Value,
-    etag: Option<String>,
+///
+/// Visible to the sibling suites of this test crate: the same harness drives the
+/// whole-listing form checks in `list_subscriptions_summary_wire_form`.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
+    pub(crate) etag: Option<String>,
 }
 
 impl Answer {
     /// The body member `name` as a string, naming the whole body when it is absent.
-    fn string(&self, name: &str) -> String {
+    pub(crate) fn string(&self, name: &str) -> String {
         self.body
             .get(name)
             .and_then(Value::as_str)
@@ -67,7 +70,7 @@ impl Answer {
     }
 
     /// The `ETag` response header; panics when the operation did not send one.
-    fn require_etag(&self, case: &str) -> String {
+    pub(crate) fn require_etag(&self, case: &str) -> String {
         self.etag
             .clone()
             .unwrap_or_else(|| panic!("case {case}: no ETag response header on {:?}", self.body))
@@ -75,7 +78,7 @@ impl Answer {
 }
 
 /// A router with this one service mounted on a shared engine, request authentication off.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::new(engine::InMemoryEngine::new())));
@@ -83,7 +86,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// POST `/v1/<operation>` with `body`, optionally under `If-Match`.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
@@ -118,7 +121,7 @@ async fn call(
 }
 
 /// A minimal valid `CreateSubscription` request.
-fn create_body(
+pub(crate) fn create_body(
     family: &str,
     tier: &str,
     resources: usize,
@@ -143,7 +146,7 @@ fn create_body(
 }
 
 /// Create one subscription, asserting only that it succeeded.
-async fn create(router: &MultiServiceRouter, body: Value) -> Answer {
+pub(crate) async fn create(router: &MultiServiceRouter, body: Value) -> Answer {
     let answer = call(router, "CreateSubscription", body.clone(), None).await;
     assert_eq!(
         answer.status, 200,
@@ -153,9 +156,13 @@ async fn create(router: &MultiServiceRouter, body: Value) -> Answer {
     answer
 }
 
-/// The summary `ListSubscriptions` reports for `arn`, following `nextToken` to the end so
-/// a store larger than one page is still searched.
-async fn summary_for(router: &MultiServiceRouter, arn: &str) -> Value {
+/// Every page of a `ListSubscriptions` walk, in order, following `nextToken` to the end.
+///
+/// The ONE paging walk of this harness: [`summary_for`] below and the whole-listing suite
+/// in `list_subscriptions_summary_wire_form` are both expressed in terms of it, so the
+/// page bookkeeping is written once.
+pub(crate) async fn pages(router: &MultiServiceRouter) -> Vec<Vec<Value>> {
+    let mut pages: Vec<Vec<Value>> = Vec::new();
     let mut next: Option<String> = None;
     loop {
         let body = match next {
@@ -163,26 +170,46 @@ async fn summary_for(router: &MultiServiceRouter, arn: &str) -> Value {
             Some(ref token) => json!({"nextToken": token}),
         };
         let listed = call(router, "ListSubscriptions", body, None).await;
+        let index = pages.len();
         assert_eq!(
             listed.status, 200,
-            "ListSubscriptions must succeed, got {} {:?}",
+            "case \"page {index}\": ListSubscriptions must succeed, got {} {:?}",
             listed.status, listed.body
         );
-        let summaries = listed.body["subscriptionSummaries"]
+        let page = listed.body["subscriptionSummaries"]
             .as_array()
-            .unwrap_or_else(|| panic!("subscriptionSummaries missing from {:?}", listed.body))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case \"page {index}\": subscriptionSummaries missing from {:?}",
+                    listed.body
+                )
+            })
             .clone();
-        if let Some(found) = summaries
-            .iter()
-            .find(|summary| summary["arn"].as_str() == Some(arn))
-        {
-            return found.clone();
-        }
+        assert!(
+            page.len() <= LIST_PAGE_SIZE,
+            "case \"page {index}\": a page carries at most {LIST_PAGE_SIZE} summaries, got {}",
+            page.len()
+        );
+        pages.push(page);
         match listed.body["nextToken"].as_str() {
             Some(token) => next = Some(token.to_string()),
-            None => panic!("no summary for {arn} in the listing"),
+            None => return pages,
         }
     }
+}
+
+/// The summary `ListSubscriptions` reports for `arn`, searched across every page so a
+/// store larger than one page is still covered.
+async fn summary_for(router: &MultiServiceRouter, arn: &str) -> Value {
+    for page in pages(router).await {
+        if let Some(found) = page
+            .into_iter()
+            .find(|summary| summary["arn"].as_str() == Some(arn))
+        {
+            return found;
+        }
+    }
+    panic!("no summary for {arn} in the listing")
 }
 
 /// Assert `value` is the RFC 3339 date-time STRING a `@timestampFormat("date-time")`
@@ -190,7 +217,7 @@ async fn summary_for(router: &MultiServiceRouter, arn: &str) -> Value {
 ///
 /// A JSON number is exactly the protocol-default encoding this rule forbids, so it is
 /// rejected by name rather than parsed.
-fn date_time_millis(case: &str, member: &str, value: &Value) -> i64 {
+pub(crate) fn date_time_millis(case: &str, member: &str, value: &Value) -> i64 {
     let text = value.as_str().unwrap_or_else(|| {
         panic!(
             "case {case}: {member} is modelled @timestampFormat(\"date-time\"), so it must be \
@@ -381,7 +408,7 @@ async fn date_time_members_travel_as_iso_8601_strings_on_every_read_path() {
 
 /// The token form the rule requires: a decimal integer, with no sign, no padding and no
 /// other character. Returns the revision it names.
-fn revision_of(case: &str, token: &str) -> u64 {
+pub(crate) fn revision_of(case: &str, token: &str) -> u64 {
     assert!(
         !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit()),
         "case {case}: the entity tag is a decimal revision, got {token:?}"

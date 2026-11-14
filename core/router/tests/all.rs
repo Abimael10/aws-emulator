@@ -6878,3 +6878,32 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (Orphaned header fragments and duplicate-declaration notes removed — see the NOTE ON THIS
 // TAIL above.)
 // (More of the same, removed — see the NOTE ON THIS TAIL above.)
+// twice is `E0428` and compiles neither, so the second one is gone.)
+// line that landed here as `//!` is gone rather than re-typed.
+// (Six further lines of that header fragment landed here typed with `//!`, which past the
+// first item is `E0753` and compiles no suite of this target, so they are gone rather than
+// re-typed: the rule they repeated stands in the module doc at the HEAD of this file.)
+// (Seven further lines of that header fragment landed here as `//!` as well, and are gone
+// for the same reason: an inner doc comment past the first item is `E0753`.)
+// The tail below is where a landing appends a new cross-service suite. Keep it to the
+// declarations and to what each suite spans: successive landings appended hundreds of
+// lines of commentary about duplicated header fragments and duplicate `mod` lines, and in
+// doing so kept re-introducing the very `E0753` that commentary described. The rules stand
+// ONCE, in the module doc at the HEAD of this file, checked by
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`.
+// Declared here, in the appended tail: what the principal tags a tagged vend attaches
+// decide about a read — the ABAC document on the mapped role resolving one tag per session
+// — spans four service crates, so no single service crate's test target can see both ends
+// of it.
+// How an EKS nodegroup converges to its ready state after the create, and what each step
+// of that convergence reports, spans several service crates at once, so no single service
+// What a stack does when its Lambda-backed custom resource's provider answers FAILED is
+// only observable across CloudFormation, AWS Lambda and CloudWatch Logs at once — the
+// Delete request the rollback sends is read out of the provider's own log — so no single
+// service crate's test target can deploy the stack and then read it.
+// (Successive landings appended their own copies of this file's head module doc and of
+// `mod` lines already declared above; the duplicates are gone rather than re-worded, and
+// the rules stand once, in the module doc at the HEAD of this file.)
+// (The notes successive landings appended below this point were copies of this file's head
+// module doc and of `mod` lines already declared above; they are gone rather than re-worded,
+// and the rules stand once, in the module doc at the HEAD of this file.)
