@@ -8041,3 +8041,29 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // file, where an inner doc comment is legal, and
 // this file and for every service crate's `tests/all.rs`. Append a suite here as its
 // `#[path]` line, its `mod` line and an ordinary `//` note, and nothing else.)
+//! declarations and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks the
+//! notes, for this file and for every service crate's `tests/all.rs`. These header lines
+//! are the only place an inner doc comment may stand: one appended into the tail below is
+//! `E0753` and compiles no suite of this target, so a note there is an ordinary `//` one.
+// twice is `E0428` and compiles neither copy, so this one is gone.)
+// suite left at the top level of `tests/` fails the build. (The same fragment again, an
+// ordinary comment for the reason the line above it states.)
+// (Fragments of this file's own header that landings appended into this tail typed with
+// `//!` are gone rather than re-typed: past the first item an inner doc comment is `E0753`
+// and compiles no suite of this target, and the rule they repeated stands in the module doc
+// (Fragments of this file's own header, and notes about duplicate declarations two
+// concurrent landings each appended here, are gone rather than re-typed: past the first
+// item an inner doc comment is `E0753`, a module declared twice is `E0428`, and the rules
+// both repeat stand in the module doc at the HEAD of this file.)
+// (Notes about declarations two concurrent landings each appended here, and fragments of
+// this file's own header they appended with `//!`, are gone rather than re-typed: a module
+// declared twice is `E0428`, an inner doc comment past the first item is `E0753`, and the
+// rules both repeat stand in the module doc at the HEAD of this file.)
+// Declared here, in the appended tail: the IaC form of an EventBridge fan-out — one stack's
+// rule with a Lambda target and a Step Functions target under a target role — spans
+// CloudFormation, EventBridge, Lambda, Step Functions, IAM, STS and Amazon SQS at once, so
+// no single service crate's test target can drive it.
+// declarations that are no longer duplicated; they are pruned rather than re-typed. Declare
+// each suite exactly ONCE, with its `#[path]` line, and keep the rules in the module doc at
+// the HEAD of this file, where an inner doc comment is legal: past the first item a `//!`
+// line is `E0753` and a module declared twice is `E0428`, and either compiles no suite of

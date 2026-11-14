@@ -58,9 +58,9 @@ const INSTANT_SLACK: f64 = 0.01;
 /// The `LegalHoldStatus` values a hold of this suite passes through, as the
 /// model lists them (`smithy_query` shape `LegalHoldStatus`:
 /// `CREATING | ACTIVE | CANCELING | CANCELED`).
-const STATUS_CREATING: &str = "CREATING";
-const STATUS_ACTIVE: &str = "ACTIVE";
-const STATUS_CANCELED: &str = "CANCELED";
+pub(crate) const STATUS_CREATING: &str = "CREATING";
+pub(crate) const STATUS_ACTIVE: &str = "ACTIVE";
+pub(crate) const STATUS_CANCELED: &str = "CANCELED";
 
 /// The vault name every case's recovery-point selection names: a hold IS the
 /// hold it places on the recovery points its selection names, so a create states
@@ -161,7 +161,11 @@ async fn create_legal_hold(router: &MultiServiceRouter, case: &str) -> String {
 
 /// `GET /legal-holds/{LegalHoldId}` — `GetLegalHold`'s HTTP binding, which is
 /// what the recorded cancellation has to be visible through.
-async fn get_legal_hold(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
+pub(crate) async fn get_legal_hold(
+    router: &MultiServiceRouter,
+    case: &str,
+    id: &str,
+) -> Value {
     let (status, read) = call(router, "GET", &format!("/legal-holds/{id}"), None).await;
     assert_eq!(
         status, 200,
@@ -172,7 +176,7 @@ async fn get_legal_hold(router: &MultiServiceRouter, case: &str, id: &str) -> Va
 
 /// `GET /legal-holds` — `ListLegalHolds`'s HTTP binding: the holds the account
 /// still holds, which a kept record stays among.
-async fn list_legal_holds(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
+pub(crate) async fn list_legal_holds(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
     let (status, listed) = call(router, "GET", "/legal-holds", None).await;
     assert_eq!(
         status, 200,
@@ -192,7 +196,7 @@ async fn list_legal_holds(router: &MultiServiceRouter, case: &str) -> Vec<Value>
 /// `DELETE /legal-holds/{LegalHoldId}` — `CancelLegalHold`'s HTTP binding, with
 /// the query string its `cancelDescription` and `retainRecordInDays` bind to.
 /// Answers with the error shape the response NAMES beside its status and body.
-async fn cancel_legal_hold(
+pub(crate) async fn cancel_legal_hold(
     router: &MultiServiceRouter,
     id: &str,
     query: &str,
@@ -204,7 +208,7 @@ async fn cancel_legal_hold(
 /// has or until [`POLL_DEADLINE`] passes: the activation falls due on the
 /// emulator's own clock, so the case waits for the STATUS rather than for a
 /// span.
-async fn hold_in_force(router: &MultiServiceRouter, case: &str, id: &str) {
+pub(crate) async fn hold_in_force(router: &MultiServiceRouter, case: &str, id: &str) {
     let deadline = Instant::now() + POLL_DEADLINE;
     loop {
         let read = get_legal_hold(router, case, id).await;
