@@ -21,6 +21,7 @@ use crate::ops::types::{
 
 pub mod account;
 pub mod account_summary;
+pub mod action_resource_types;
 pub mod authorization;
 pub mod credential_report;
 pub mod emulator_clock;
@@ -43,6 +44,7 @@ pub use managed_policy_catalog::*;
 
 pub use account::*;
 pub use account_summary::*;
+pub use action_resource_types::*;
 pub use credential_report::*;
 pub use emulator_clock::*;
 pub use entity_path::*;

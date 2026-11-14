@@ -650,7 +650,34 @@ pub async fn evaluate_page(
 /// `Null: {key: true}` do — rather than leaving the statement undecided, and
 /// `MissingContextValues` is what the evaluation says it needed a value for and did not
 /// get.
+///
+/// A pair the action cannot be performed as at all — an action published with no resource
+/// type, asked about one concrete resource — is decided before any document is read: see
+/// [`super::action_resource_types`].
 fn decide(simulated: &Simulated<'_>, action: &str, resource: &str) -> Decided {
+    // An action published with no resource type is performed on no resource, so a pair
+    // naming one concrete resource is a request that action could not have been made as:
+    // no statement of any document in force is about it — not in the identity policies,
+    // not in a permissions boundary and not in an SCP — which is the implicit deny, with
+    // nothing reported as having determined it and no condition reached for a value to be
+    // missing ([`super::action_resource_types`]).
+    if !super::action_resource_types::applies_to_resource(action, resource) {
+        return Decided {
+            result: ResourceSpecificResult {
+                eval_resource_name: resource.to_string(),
+                eval_resource_decision: DECISION_IMPLICIT_DENY.to_string(),
+                missing_context_values: None,
+                matched_statements: Some(Vec::new()),
+                eval_decision_details: None,
+                permissions_boundary_decision_detail: (!simulated.boundary.is_empty()).then_some(
+                    PermissionsBoundaryDecisionDetail {
+                        allowed_by_permissions_boundary: false,
+                    },
+                ),
+            },
+            allowed_by_organizations: (!simulated.organization_levels.is_empty()).then_some(false),
+        };
+    }
     let granting = iam::Request::new(action, resource, simulated.granting_principals)
         .with_context(simulated.context)
         .with_complete_context();

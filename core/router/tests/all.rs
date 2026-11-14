@@ -4223,3 +4223,6 @@ mod cloudformation_appsync_custom_domains;
 // declarations, for this file and for every service crate's `tests/all.rs`. (One more
 // fragment of the header that a landing appended here: past the first item a `//!` line is
 // `E0753` and compiles no suite in this target, so it stands as an ordinary comment.)
+// (One more fragment of that header, appended here by a landing as an INNER doc comment —
+// `E0753` anywhere but the head of a file — so it stands as an ordinary comment: a suite
+// left at the top level of `tests/` fails the build.)
