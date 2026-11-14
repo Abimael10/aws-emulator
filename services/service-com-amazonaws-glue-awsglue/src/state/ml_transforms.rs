@@ -75,6 +75,23 @@ pub const DEFAULT_ML_TRANSFORM_TIMEOUT_MINUTES: i32 = 2_880;
 /// columns".
 pub const MAX_TRANSFORM_SCHEMA_COLUMNS: usize = 100;
 
+/// The `TransformType` a find-matches transform is defined under: the single modelled value
+/// of that enum (`FIND_MATCHES`), which the generated
+/// [`crate::ops::types::TRANSFORM_TYPE_VALUES`] carries and the request layer validates a
+/// create's `Parameters` against.
+pub const TRANSFORM_TYPE_FIND_MATCHES: &str = "FIND_MATCHES";
+
+/// The fewest columns a find-matches transform can be defined over: two.
+///
+/// The algorithm tells rows apart by "a column that uniquely identifies rows in the source
+/// table" (`FindMatchesParameters$PrimaryKeyColumnName`) and then decides whether two rows
+/// describe the same thing from the columns BESIDE that key, so a schema holding fewer than
+/// a key column and one column to compare describes nothing the algorithm could run. A
+/// create whose input record tables resolve to such a schema
+/// ([`ComAmazonawsGlueAwsglueState::ml_transform_schema_is_too_narrow`]) is refused with
+/// [`messages::ML_TRANSFORM_SCHEMA_TOO_NARROW`].
+pub const MIN_FIND_MATCHES_SCHEMA_COLUMNS: usize = 2;
+
 /// The separator between the parts of a sorted listing's ordering key (and so of its
 /// `NextToken`): the sorted value and then the record's own id.
 ///

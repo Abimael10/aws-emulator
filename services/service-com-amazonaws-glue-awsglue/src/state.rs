@@ -3260,11 +3260,7 @@ impl ComAmazonawsGlueAwsglueState {
     pub fn ml_transform_schema(&self, tables: &[GlueTable]) -> Vec<SchemaColumn> {
         let mut schema: Vec<SchemaColumn> = Vec::new();
         for table in tables {
-            let catalog_id = resolve_catalog_id(table.catalog_id.as_ref());
-            let Some(stored) = self
-                .database(&catalog_id, &table.database_name)
-                .and_then(|database| database.tables.get(&fold_name(&table.table_name)))
-            else {
+            let Some(stored) = self.ml_transform_input_table(table) else {
                 continue;
             };
             for column in stored
@@ -3290,6 +3286,39 @@ impl ComAmazonawsGlueAwsglueState {
             }
         }
         schema
+    }
+
+    /// The catalog table one `GlueTable` of a machine learning transform's
+    /// `InputRecordTables` addresses, or `None` when this store holds no such table.
+    ///
+    /// The one resolution the transform surface reads an input record table by — the
+    /// catalog the member names or this account's own ([`resolve_catalog_id`]), then the
+    /// database and the table folded the way the catalog stores them — so the schema a
+    /// create resolves and the width it is measured at can never disagree about which
+    /// table a request addressed.
+    fn ml_transform_input_table(&self, table: &GlueTable) -> Option<&TableEntry> {
+        self.database(
+            &resolve_catalog_id(table.catalog_id.as_ref()),
+            &table.database_name,
+        )
+        .and_then(|database| database.tables.get(&fold_name(&table.table_name)))
+    }
+
+    /// Whether the schema a find-matches transform over `tables` would run against is
+    /// narrower than the algorithm can be defined over, i.e. holds fewer than
+    /// [`MIN_FIND_MATCHES_SCHEMA_COLUMNS`] columns.
+    ///
+    /// The width is measured on the schema [`Self::ml_transform_schema`] resolves out of
+    /// the CATALOG, since a create carries none — so it is a question this store can only
+    /// answer where the catalog holds at least one of the tables the request addressed:
+    /// an input record table is an ADDRESS and not an existence claim, so a request naming
+    /// only tables this catalog does not hold describes a schema the store knows nothing
+    /// about, and nothing is measured.
+    pub fn ml_transform_schema_is_too_narrow(&self, tables: &[GlueTable]) -> bool {
+        tables
+            .iter()
+            .any(|table| self.ml_transform_input_table(table).is_some())
+            && self.ml_transform_schema(tables).len() < MIN_FIND_MATCHES_SCHEMA_COLUMNS
     }
 
     /// Whether the store can hold another form type, i.e. is below [`MAX_FORM_TYPES`].

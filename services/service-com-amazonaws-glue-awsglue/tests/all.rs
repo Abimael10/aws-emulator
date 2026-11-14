@@ -285,6 +285,8 @@ mod ml_task_run_timeout;
 mod ml_task_runs;
 #[path = "all/ml_transform_deletion.rs"]
 mod ml_transform_deletion;
+#[path = "all/ml_transform_input_schema.rs"]
+mod ml_transform_input_schema;
 #[path = "all/ml_transform_reads.rs"]
 mod ml_transform_reads;
 #[path = "all/ml_transform_updates.rs"]

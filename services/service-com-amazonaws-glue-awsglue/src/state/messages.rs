@@ -82,6 +82,18 @@ pub fn ml_transform_role_not_assumable(role_arn: &str) -> String {
     format!("Unable to assume role for arn: {role_arn}")
 }
 
+/// `CreateMLTransform` for a find-matches transform whose input record tables resolve to a
+/// schema narrower than the algorithm can be defined over
+/// ([`super::ComAmazonawsGlueAwsglueState::ml_transform_schema_is_too_narrow`]).
+///
+/// RECORDED constant, and the whole message: the service's fixed sentence for this check,
+/// which states neither the number of columns it found, the minimum it wanted nor the table
+/// it read the schema out of — so its wording is all a client has to recognise this refusal
+/// by, since it shares the operation's `InvalidInputException` with every other input
+/// refusal. No trailing period, as recorded.
+pub const ML_TRANSFORM_SCHEMA_TOO_NARROW: &str =
+    "Number of columns in schema less than the minimum allowed number";
+
 /// `CreateSession` for a `Role` this service cannot assume
 /// ([`super::glue_role_is_unassumable`]).
 ///

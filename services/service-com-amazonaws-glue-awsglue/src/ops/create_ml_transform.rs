@@ -15,10 +15,17 @@
 //! the client's choice at CREATE time only — every later operation addresses a transform
 //! by the id this create minted.
 //!
+//! A transform is defined over the COLUMNS of the catalog tables it reads, so the schema
+//! those `InputRecordTables` resolve to is settled FIRST: a find-matches transform whose
+//! resolved schema is narrower than the algorithm can be defined over
+//! ([`crate::state::MIN_FIND_MATCHES_SCHEMA_COLUMNS`]) describes no transform at all and is
+//! refused with the operation's modelled `InvalidInputException`.
+//!
 //! A transform's task runs are performed BY this service acting as its `Role`, so a role
 //! the account's own IAM answers that Glue cannot assume
 //! ([`crate::state::glue_role_is_unassumable`]) is refused with the operation's modelled
-//! `InvalidInputException` before the store is read, and no transform is registered.
+//! `InvalidInputException` after the schema and before the store is read, and no transform
+//! is registered.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -237,8 +244,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A transform is defined over the COLUMNS of the catalog tables it reads, so the
+        // service settles the schema before it settles anything about the identity the
+        // task runs would be performed as: a find-matches transform whose input record
+        // tables resolve to fewer columns than the algorithm can be defined over
+        // ([`crate::state::MIN_FIND_MATCHES_SCHEMA_COLUMNS`]) describes no transform at
+        // all, and is refused with the operation's modelled `InvalidInputException` and
+        // the service's own fixed sentence for this check — ahead of the role, the name and
+        // the store's ceiling, so a client reading the refusal is told about the data and
+        // not about the role it happened to send.
+        //
+        // The guard is scoped so the store is not held across the role question below.
+        if input.parameters.transform_type == crate::state::TRANSFORM_TYPE_FIND_MATCHES {
+            let too_narrow = state
+                .lock()
+                .ml_transform_schema_is_too_narrow(&input.input_record_tables);
+            if too_narrow {
+                return Err(CreateMLTransformErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::ML_TRANSFORM_SCHEMA_TOO_NARROW.to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
+
         // A transform's task runs are performed BY this service acting as its `Role`, so
-        // the role is resolved BEFORE the request's other members: a role this service
+        // the role is resolved before the request's remaining members: a role this service
         // cannot assume backs no task run at all, so the create is refused for the role
         // whatever else the request gets wrong, and no transform is registered.
         //

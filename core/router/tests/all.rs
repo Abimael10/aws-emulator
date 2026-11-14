@@ -4514,3 +4514,17 @@ mod iot_job_cancel_unwinds_the_device_queue;
 #[path = "all/apigateway_lambda_ddb_s3_trace_tree.rs"]
 mod apigateway_lambda_ddb_s3_trace_tree;
 // (The same line appended again with `//!`, which is `E0753` past the first item.)
+// (One more line of that same appended header fragment, an ordinary comment for the reason
+// the lines around it record: a `//!` line past the first item is `E0753`.) A suite left at
+// the top level of `tests/` fails the build.
+// (Another fragment of this file's own header appended here by a landing, typed with `//!`:
+// an inner doc comment is legal only BEFORE the first item, so one in this tail is `E0753`
+// and compiles nothing. It stands as an ordinary comment — declare each suite exactly ONCE,
+// since this is one crate root and a second `mod` for the same name is `E0428`, which
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of.)
+// (Two more lines of that header fragment, as ordinary comments for the same reason:
+// `tests/all.rs`, so check there rather than leaving a note here.)
+// (Four more lines of that appended header fragment, as ordinary comments for the reason
+// they themselves state: declare each suite exactly ONCE, since this is one crate root and
+// a second `mod` for the same name is `E0428`, and a note written with `//!` anywhere but
+// this file's head is `E0753` — either fails every suite in this target;
