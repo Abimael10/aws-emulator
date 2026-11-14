@@ -241,5 +241,7 @@ mod discovered_resource_item_identity;
 mod withdrawn_managed_rule;
 #[path = "all/recorded_relationship_graph_matches_its_counter.rs"]
 mod recorded_relationship_graph_matches_its_counter;
+#[path = "all/config_rule_evaluator_permission.rs"]
+mod config_rule_evaluator_permission;
 #[path = "all/recorded_queue_across_every_read_surface.rs"]
 mod recorded_queue_across_every_read_surface;

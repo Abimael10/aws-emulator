@@ -275,7 +275,10 @@ impl Emulator {
 
 /// A .zip deployment package holding `source` as `lambda_function.py`, written in memory
 /// the way a caller uploads one.
-fn package(source: &str) -> Vec<u8> {
+///
+/// Shared with the suite that pins which Custom Lambda rules Config will take at all, so
+/// one statement of how a deployment package is written serves both.
+pub(crate) fn package(source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -341,6 +344,11 @@ def lambda_handler(event, context):
 
 /// Create the function `name` from `source`, wait until it reports `Active`, and answer its
 /// ARN.
+///
+/// The function is created with the resource-based policy a Config rule's evaluator needs:
+/// Config invokes it as its own service principal, so `AddPermission` has to grant
+/// `config.amazonaws.com` `lambda:InvokeFunction` on it before Config will take a rule
+/// pointing at it at all.
 async fn given_function(case: &str, emulator: &Emulator, name: &str, source: &str) -> String {
     let (status, created) = emulator
         .lambda(
@@ -369,6 +377,22 @@ async fn given_function(case: &str, emulator: &Emulator, name: &str, source: &st
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no FunctionArn in {created}"))
         .to_string();
+    let (status, granted) = emulator
+        .lambda(
+            "POST",
+            &format!("{FUNCTIONS_URI}/{name}/policy"),
+            Some(&json!({
+                "StatementId": "AllowExecutionFromConfig",
+                "Action": "lambda:InvokeFunction",
+                "Principal": "config.amazonaws.com",
+                "SourceAccount": engine::emulator_account_id(),
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: AddPermission answered {status} {granted}"
+    );
     let deadline = Instant::now() + BUDGET;
     loop {
         let (status, read) = emulator
@@ -617,32 +641,45 @@ async fn a_change_triggered_rules_evaluator_is_handed_the_recorded_configuration
             );
         } else {
             // A rule whose scope covers nothing the account holds has no item to be
-            // triggered by, so its evaluator is never invoked and no verdict is recorded.
-            tokio::time::sleep(QUIET).await;
-            let results = reported(&emulator, rule).await;
-            assert!(
-                results.is_empty(),
-                "case {case:?}: expected no verdict at all, got {results:?}"
-            );
+            // triggered by, so its evaluator is never invoked and no verdict is recorded —
+            // watched for a window many passes long rather than read once.
+            let deadline = Instant::now() + QUIET;
+            while Instant::now() < deadline {
+                let results = reported(&emulator, rule).await;
+                assert!(
+                    results.is_empty(),
+                    "case {case:?}: expected no verdict at all, got {results:?}"
+                );
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
         }
     }
 }
 
+/// A handler that delivers NOTHING: it is handed the event and returns without calling
+/// `PutEvaluations` at all, which is what lets the counter-case below observe that Config
+/// records no verdict of its own.
+const SILENT_HANDLER_SOURCE: &str = r#"
+def lambda_handler(event, context):
+    return {"delivered": None}
+"#;
+
 #[tokio::test]
-async fn an_evaluator_that_cannot_be_invoked_delivers_nothing() {
-    // The counter-case: a rule pointing at a function Lambda does not hold has no
-    // evaluator to invoke, so no verdict is ever recorded for it — Config reports the
-    // rule as evaluated by nobody rather than inventing a verdict of its own.
+async fn an_evaluator_that_delivers_nothing_leaves_the_rule_unevaluated() {
+    // The counter-case: the verdict of a Custom Lambda rule is the function's own. The
+    // function is there and its policy admits Config, so the invocation is made — and
+    // because the function delivers no evaluation, Config reports none rather than
+    // inventing one of its own.
+    let case = "an evaluator that delivers nothing";
     let emulator = Emulator::new();
     emulator.given_recorder().await;
-    let rule = "rule-with-no-evaluator";
+    let function =
+        given_function(case, &emulator, "silent-evaluator", SILENT_HANDLER_SOURCE).await;
+    let rule = "rule-whose-evaluator-is-silent";
     put_rule(
         &emulator,
         rule,
-        &format!(
-            "arn:aws:lambda:{REGION}:{}:function:nothing-created-this",
-            engine::emulator_account_id()
-        ),
+        &function,
         json!([{
             "EventSource": "aws.config",
             "MessageType": "ScheduledNotification",
@@ -650,10 +687,15 @@ async fn an_evaluator_that_cannot_be_invoked_delivers_nothing() {
         }]),
     )
     .await;
-    tokio::time::sleep(QUIET).await;
-    let results = reported(&emulator, rule).await;
-    assert!(
-        results.is_empty(),
-        "case \"a function nothing created\": expected no verdict at all, got {results:?}"
-    );
+    // Watched for a window many passes long: the rule stays unevaluated for every read in
+    // it, rather than merely for the first one.
+    let deadline = Instant::now() + QUIET;
+    while Instant::now() < deadline {
+        let results = reported(&emulator, rule).await;
+        assert!(
+            results.is_empty(),
+            "case {case:?}: expected no verdict at all, got {results:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }

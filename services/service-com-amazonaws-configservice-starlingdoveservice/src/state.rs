@@ -2814,6 +2814,12 @@ pub use account_rule::*;
 pub mod custom_lambda_rule;
 pub use custom_lambda_rule::*;
 
+// Whether Config MAY invoke that evaluator — what the function's own resource-based policy
+// says about the Config service principal — lives in `state/evaluator_authorization.rs`,
+// re-exported here for the same reason.
+pub mod evaluator_authorization;
+pub use evaluator_authorization::*;
+
 // How a RECORDED resource is resolved to its own ARN — the one member of a
 // configuration item that carries it — lives in `state/resource_arn.rs`, re-exported
 // here like the modules above so a handler reaches its names as `crate::state::<name>`.

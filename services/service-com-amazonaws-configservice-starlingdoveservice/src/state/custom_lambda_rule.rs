@@ -390,7 +390,11 @@ pub async fn invoke_due_rule_evaluators<Eng: Send + Sync + 'static>(
 /// An AWS Lambda client over the in-process callback, built the way this crate's other
 /// cross-service clients are: the emulator supplies the transport, so there is nothing to
 /// retry, time out, cache an identity for or watch for a stalled stream.
-fn lambda_client(
+///
+/// The ONE place this crate reaches AWS Lambda, so the invocation Config makes and the
+/// reading of whether it MAY make it ([`super::evaluator_authorization`]) address the same
+/// Lambda the same way.
+pub(super) fn lambda_client(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_lambda::Client {

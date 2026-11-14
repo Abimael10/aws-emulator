@@ -10,6 +10,12 @@
 //! no managed rule to evaluate, so the write is refused rather than creating a rule
 //! nothing evaluates ([`crate::state::withdrawn_managed_rule_identifier`]).
 //!
+//! A rule owned by CUSTOM_LAMBDA is evaluated by the function its `SourceIdentifier` names
+//! rather than by Config, so the write is refused `InsufficientPermissionsException` where
+//! Config could not invoke that function — the ARN names none, or its own resource-based
+//! policy does not admit the Config service principal
+//! ([`crate::state::evaluator_authorization`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -290,40 +296,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
-        // A rule evaluates the configuration changes a CUSTOMER MANAGED recorder
-        // captures, so there has to be one: a service-linked recorder records for the
-        // service it is linked to.
-        if !store.has_customer_managed_recorder() {
-            return Err(
-                PutConfigRuleErrorModeled::NoAvailableConfigurationRecorderException(
-                    NoAvailableConfigurationRecorderException {
-                        message: Some(
-                            crate::state::NO_RECORDER_TO_PUT_CONFIG_RULE.to_string(),
-                        ),
-                    },
+        // The refusals this store alone decides, taken first and under one guard, so a
+        // request refused by any of them has read nothing of another service.
+        let existing_rule_arn = {
+            let store = state.lock();
+            if let Some(refusal) = store_refusal(&store, name) {
+                return Err(refusal.into());
+            }
+            // The ARN of the rule this request writes, where the account already holds it:
+            // the resource of Config's that the evaluator's invocation would be made for.
+            store.config_rules.get(name).map(|rule| rule.arn.clone())
+        };
+
+        // A Custom Lambda rule is evaluated by the function the account points it at, not
+        // by Config — so a function Config could not invoke is a rule nothing would ever
+        // evaluate, which is what `InsufficientPermissionsException` refuses ("the Lambda
+        // function cannot be invoked. Check the function ARN, and check the function's
+        // permissions"). Asked of AWS Lambda itself, with the store's guard released, and
+        // before anything is written, so a refused request leaves the rule the account
+        // holds — or does not hold — exactly as it was.
+        if requested.source.owner == crate::state::OWNER_CUSTOM_LAMBDA {
+            if let Some(function) = requested
+                .source
+                .source_identifier
+                .as_deref()
+                .map(str::trim)
+                .filter(|identifier| !identifier.is_empty())
+            {
+                let answered = crate::state::evaluator_authorization(
+                    ctx.callback(),
+                    &region,
+                    function,
+                    existing_rule_arn.as_deref(),
                 )
-                .into(),
-            );
+                .await;
+                if answered == crate::state::EvaluatorAuthorization::Denied {
+                    return Err(
+                        PutConfigRuleErrorModeled::InsufficientPermissionsException(
+                            InsufficientPermissionsException {
+                                message: Some(
+                                    crate::state::cannot_invoke_evaluator_message(function),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
         }
 
-        // A new rule has to fit under this Region's Config rules quota.
-        if !store.config_rules.contains_key(name)
-            && store.config_rules.len() >= crate::state::CONFIG_RULES_QUOTA
-        {
-            return Err(
-                PutConfigRuleErrorModeled::MaxNumberOfConfigRulesExceededException(
-                    MaxNumberOfConfigRulesExceededException {
-                        message: Some(format!(
-                            "this account already has the maximum of {} Config rules in this \
-                             Region",
-                            crate::state::CONFIG_RULES_QUOTA,
-                        )),
-                    },
-                )
-                .into(),
-            );
+        let mut store = state.lock();
+
+        // The guard was RELEASED for the read above, so what this store decides is asked
+        // again under the guard that writes: a precondition that stopped holding while it
+        // was released — the account's last customer managed recorder deleted, or another
+        // write taking the last place under the quota — is one no rule may be written under.
+        if let Some(refusal) = store_refusal(&store, name) {
+            return Err(refusal.into());
         }
 
         if let Some(existing) = store.config_rules.get_mut(name) {
@@ -395,4 +425,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(PutConfigRuleOutput)
     }
+}
+
+/// The refusal THIS STORE alone decides for a write of the rule `name`, or `None` when it
+/// decides none: the account holds no customer managed configuration recorder, or a new rule
+/// would not fit under this Region's Config rules quota.
+///
+/// Asked TWICE — before the rule's evaluator is read from AWS Lambda, and again under the
+/// guard that writes — because the guard is RELEASED for that read: a precondition that
+/// stopped holding while it was released is one no rule may be written under, and stating it
+/// once here is what keeps the two readings the same.
+fn store_refusal(
+    store: &crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState,
+    name: &str,
+) -> Option<PutConfigRuleErrorModeled> {
+    // A rule evaluates the configuration changes a CUSTOMER MANAGED recorder captures, so
+    // there has to be one: a service-linked recorder records for the service it is linked to.
+    if !store.has_customer_managed_recorder() {
+        return Some(
+            PutConfigRuleErrorModeled::NoAvailableConfigurationRecorderException(
+                NoAvailableConfigurationRecorderException {
+                    message: Some(crate::state::NO_RECORDER_TO_PUT_CONFIG_RULE.to_string()),
+                },
+            ),
+        );
+    }
+    // A new rule has to fit under this Region's Config rules quota.
+    if !store.config_rules.contains_key(name)
+        && store.config_rules.len() >= crate::state::CONFIG_RULES_QUOTA
+    {
+        return Some(
+            PutConfigRuleErrorModeled::MaxNumberOfConfigRulesExceededException(
+                MaxNumberOfConfigRulesExceededException {
+                    message: Some(format!(
+                        "this account already has the maximum of {} Config rules in this \
+                         Region",
+                        crate::state::CONFIG_RULES_QUOTA,
+                    )),
+                },
+            ),
+        );
+    }
+    None
 }

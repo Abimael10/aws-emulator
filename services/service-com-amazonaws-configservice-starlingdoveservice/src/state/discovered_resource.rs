@@ -235,14 +235,19 @@ impl DiscoveredResourceEntry {
             }),
             related_events: None,
             // The other resources the owning service links this one to, as the recorder
-            // observed them; a resource with no observed link reports none at all rather
-            // than an empty list.
-            relationships: (!self.relationships.is_empty()).then(|| {
+            // observed them. `relationships` is a LIST member of the configuration item,
+            // so a resource the recorder observed no link for reports the EMPTY list
+            // rather than no member at all: a reader of an item can read the links it
+            // carries without first asking whether the member is there. Only the reads
+            // that document dropping it (`BatchGetAggregateResourceConfig`: "The API does
+            // not return tags and relationships") leave it out, which they do by reporting
+            // a `BaseConfigurationItem`, the shape that has no such member.
+            relationships: Some(
                 self.relationships
                     .iter()
                     .map(RecordedRelationship::to_shape)
-                    .collect()
-            }),
+                    .collect(),
+            ),
             configuration: base.configuration,
             supplementary_configuration: base.supplementary_configuration,
             recording_frequency: base.recording_frequency,

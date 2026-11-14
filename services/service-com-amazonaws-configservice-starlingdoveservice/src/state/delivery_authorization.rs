@@ -117,9 +117,13 @@ const DELIVERY_OBJECT_ACL: &str = "bucket-owner-full-control";
 /// resource of Config's that the delivery is made for — the two the documented bucket
 /// policy constrains beside the ACL above. IAM compares a condition key's NAME
 /// case-insensitively, so one spelling of each serves a policy written in any of them.
-const SOURCE_ACCOUNT_KEY: &str = "AWS:SourceAccount";
+///
+/// Visible to this store's other modules because they are the two confused-deputy keys
+/// EVERY call Config makes as its own service principal carries, so the reading of a
+/// Lambda function's policy ([`super::evaluator_authorization`]) names the same keys.
+pub(super) const SOURCE_ACCOUNT_KEY: &str = "AWS:SourceAccount";
 /// See [`SOURCE_ACCOUNT_KEY`].
-const SOURCE_ARN_KEY: &str = "AWS:SourceArn";
+pub(super) const SOURCE_ARN_KEY: &str = "AWS:SourceArn";
 /// See [`DELIVERY_OBJECT_ACL`].
 const OBJECT_ACL_KEY: &str = "s3:x-amz-acl";
 

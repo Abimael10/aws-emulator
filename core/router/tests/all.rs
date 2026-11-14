@@ -8017,3 +8017,27 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // of this file, which is the only place an inner doc comment may stand. Every further
 // header copy and duplicate declaration appended after this point is removed for those same
 // two reasons.)
+//! suite in this target. An inner doc comment is legal only BEFORE the first item, so
+//! these lines are the only place one may stand: a note appended further down this file
+//! compiles no suite of this target and must be an ordinary `//` comment.
+//! a note in the appended tail below.
+// (A long run of orphaned comment fragments stood here: copies of this file's own header
+// that concurrent landings appended into the tail, several of them typed `//!`, which past
+// the first item is `E0753` and compiles no suite of this target. They are gone rather than
+// re-typed — the rules they repeated stand in the module doc at the HEAD of this file, and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of them, for
+// (A second long run of orphaned comment fragments stood here: copies of this file's own
+// header and of other suites' notes that concurrent landings appended into the tail,
+// several of them typed `//!`, which past the first item is `E0753` and compiles no suite
+// of this target. They are gone rather than re-typed — the rules they repeated stand in
+// the module doc at the HEAD of this file, and `all/all_rs_declares_each_suite_once.rs`
+// and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of them,
+// Declared here, in the appended tail, for the reason the entries above record: what a
+// (Everything that stood below this point was an orphaned comment: copies of this file's
+// own header that concurrent landings appended into the tail — many of them typed `//!`,
+// which past the first item is `E0753` and compiles no suite of this target — and
+// bookkeeping about duplicate `mod` declarations that are already gone. They are removed
+// rather than re-typed: the rules they repeated stand in the module doc at the HEAD of this
+// file, where an inner doc comment is legal, and
+// this file and for every service crate's `tests/all.rs`. Append a suite here as its
+// `#[path]` line, its `mod` line and an ordinary `//` note, and nothing else.)
