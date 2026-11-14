@@ -50,6 +50,13 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// See [`VALIDATION_EXCEPTION`].
 const BAD_REQUEST: u16 = 400;
 
+/// The opaque sentence the service answers for a `queryVector` the bound index cannot be
+/// searched with, whichever rule the vector broke: the discriminating text is the
+/// `fieldList` entry's. A LITERAL, not the handler's own constant, so this suite would
+/// not agree with any wording the handler chose.
+const QUERY_VECTOR_SENTENCE: &str =
+    "Query vector contains invalid values or is invalid for this index";
+
 /// A `CreateIndex` request body for `index` in `bucket`, inside every modelled bound.
 fn create_index_request(bucket: &str, index: &str) -> Value {
     json!({
@@ -876,8 +883,10 @@ async fn a_vector_the_index_cannot_hold_is_refused_as_the_record_it_is() {
     }
 }
 
-/// The same rule about a vector holds of the vector a QUERY is run with, where the
-/// member it travelled in is what the refusal names — there is no record to name.
+/// The same rule about a vector holds of the vector a QUERY is run with, except that the
+/// READ path keeps the defect out of the top-level sentence: `fieldList` names the member
+/// the vector travelled in and says what was wrong, while the message is the one opaque
+/// query-vector sentence.
 #[tokio::test]
 async fn a_query_vector_the_index_cannot_hold_names_the_member_it_travelled_in() {
     let router = with_index("query-vector-bucket", "query-vector-index").await;
@@ -903,11 +912,11 @@ async fn a_query_vector_the_index_cannot_hold_names_the_member_it_travelled_in()
         assert_eq!(
             (message_of(&body), field_list(&body)),
             (
-                defect.clone(),
+                QUERY_VECTOR_SENTENCE.to_string(),
                 vec![("queryVector".to_string(), defect.clone())]
             ),
-            "case a {length}-value query vector: must name the member it travelled in, \
-             got {body}"
+            "case a {length}-value query vector: must carry the opaque query-vector \
+             sentence and name the member it travelled in, got {body}"
         );
     }
 }

@@ -284,12 +284,30 @@ pub enum LookupError {
 }
 
 impl LookupError {
-    /// A refusal about `path`, an input member path.
+    /// A refusal about `path`, an input member path: the sentence is the whole body,
+    /// top level and field entry alike.
     pub fn invalid(path: &str, message: impl Into<String>) -> Self {
         let message = message.into();
+        Self::invalid_detail(path, message.clone(), message)
+    }
+
+    /// A refusal whose two halves say different things about ONE input member: the
+    /// top-level `message` the service answers for this error class, and `detail`, the
+    /// sentence the `fieldList` entry for `path` carries about what was actually wrong.
+    ///
+    /// The one place an `Invalid` about a member is built, so every refusal above is a
+    /// choice of the two sentences rather than its own construction. Used directly where
+    /// the service's top-level sentence is deliberately the same for every defect of that
+    /// member, so the discriminating sentence can only live in the field entry (see
+    /// [`QUERY_VECTOR_INVALID`]).
+    pub fn invalid_detail(
+        path: &str,
+        message: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
         Self::Invalid {
-            field: Some((path.to_string(), message.clone())),
-            message,
+            message: message.into(),
+            field: Some((path.to_string(), detail.into())),
         }
     }
 
@@ -305,17 +323,13 @@ impl LookupError {
     /// record was submitted in, and `defect`, the sentence saying what is wrong
     /// with it.
     ///
-    /// The two halves of the body say different things here, which is what this
-    /// constructor exists for: `fieldList` names the list ELEMENT and carries the
-    /// defect alone, while the top-level `message` states which record of the batch
-    /// was rejected — by the `key` the caller submitted it under, the only thing
-    /// that identifies a record to the client that sent the batch.
+    /// The two halves of the body say different things here: `fieldList` names the list
+    /// ELEMENT and carries the defect alone, while the top-level `message` states which
+    /// record of the batch was rejected — by the `key` the caller submitted it under, the
+    /// only thing that identifies a record to the client that sent the batch.
     pub fn invalid_record(path: &str, key: &str, defect: impl Into<String>) -> Self {
         let defect = defect.into();
-        Self::Invalid {
-            message: format!("Invalid record for key '{key}': {defect}"),
-            field: Some((path.to_string(), defect)),
-        }
+        Self::invalid_detail(path, format!("Invalid record for key '{key}': {defect}"), defect)
     }
 
     /// An absent resource.
@@ -440,6 +454,32 @@ pub const TAG_WRITE_CONFLICT: &str =
 /// client that branches on the text matches one constant string.
 pub const SEGMENT_INDEX_OUT_OF_RANGE: &str =
     "Segment index is zero-indexed and must be smaller than segment count";
+
+/// The `ValidationException` message for a batch write whose records do not each name a
+/// distinct vector key.
+///
+/// `PutInputVector$key` is "the name of the vector. The key uniquely identifies the
+/// vector in a vector index", so two records of ONE batch under the same key describe
+/// two different vectors for one identity: which of them the index would end up holding
+/// is decided by nothing but arrival order. The service refuses the whole request
+/// instead, so the producer that assembled the batch wrongly can fix and re-send it.
+/// ONE fixed sentence about the REQUEST, interpolating neither the repeated key nor the
+/// positions it was submitted in — a client that branches on the text matches one
+/// constant string.
+pub const DUPLICATE_VECTOR_KEYS: &str = "Request must not contain duplicate keys";
+
+/// The `ValidationException` message for a query whose `queryVector` the bound index
+/// cannot be searched with.
+///
+/// ONE fixed opaque sentence about the query vector, covering every defect it can carry
+/// — a width that disagrees with the index's `dimension`, a non-finite value, a vector
+/// the index's distance metric is undefined for — and interpolating nothing: neither the
+/// submitted width, nor the index's dimension, nor the index name. Which defect it was
+/// is the `fieldList` entry's half of the body (see [`LookupError::invalid_detail`]);
+/// the top-level sentence is what other services forward verbatim when they probe an
+/// index on a caller's behalf, so it stays the same for every defect and every index.
+pub const QUERY_VECTOR_INVALID: &str =
+    "Query vector contains invalid values or is invalid for this index";
 
 /// Wording for the one failure that is not about the request: the shared engine
 /// did not hand this service's store back. Every operation models
@@ -1121,6 +1161,17 @@ pub fn vector_distance(metric: &str, left: &[f32], right: &[f32]) -> f32 {
         }
         1.0 - dot / (left_norm * right_norm)
     }
+}
+
+/// Whether a batch names one vector key more than once.
+///
+/// A vector key identifies ONE vector in an index, so a batch is well formed only while
+/// its records' keys are distinct; see [`DUPLICATE_VECTOR_KEYS`] for the refusal this
+/// answers. The keys are compared exactly as submitted — a key is the identity the
+/// caller gave the vector, not a normalized form of it.
+pub fn duplicate_vector_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    keys.into_iter().any(|key| !seen.insert(key))
 }
 
 /// Why one vector's `float32` data cannot be written to (or queried against) the

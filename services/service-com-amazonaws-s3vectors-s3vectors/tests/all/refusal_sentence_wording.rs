@@ -21,7 +21,9 @@
 //!   values this suite writes), in the record's position in the batch, in the form of
 //!   its `key`, in which member the vector travelled in (`vectors[n].data`, `queryVector`)
 //!   and in the index's `distanceMetric` — `cosine` refuses the zero-norm vector and
-//!   `euclidean` stores it, which is the positive control;
+//!   `euclidean` stores it, which is the positive control. On the READ path the rule is
+//!   carried by the `fieldList` entry and the top-level sentence is the one opaque
+//!   query-vector sentence, which `batch_keys_and_query_vector_refusals.rs` owns;
 //! * the segment rows differ in the submitted `segmentCount` and `segmentIndex`,
 //!   spanning each published bound of the two members' modelled ranges and one pairing
 //!   past the rule, with the accepted pairings as the positive control;
@@ -53,6 +55,13 @@ const CONFLICT: u16 = 409;
 /// handler's own constant: a suite asserting the constant would agree with any wording
 /// the handler chose.
 const ZERO_NORM_SENTENCE: &str = "cosine distance does not support vectors with zero norm";
+
+/// The sentence the service answers for a `queryVector` the bound index cannot be
+/// searched with, whichever rule the vector broke: one opaque sentence at the top level,
+/// with the rule itself left to the `fieldList` entry. A LITERAL, as [`ZERO_NORM_SENTENCE`]
+/// is.
+const QUERY_VECTOR_SENTENCE: &str =
+    "Query vector contains invalid values or is invalid for this index";
 
 /// The sentence the service answers for a parallel `ListVectors` whose `segmentIndex` is
 /// not inside the partition its `segmentCount` describes. All fixed text restating the
@@ -205,9 +214,10 @@ async fn a_zero_norm_vector_reports_the_metrics_own_rule_named_by_the_records_ke
     }
 }
 
-/// The same rule holds of the vector a QUERY is run with, where the refusal names the
-/// MEMBER the vector travelled in — there is no record to name — and the sentence it
-/// carries is the same one.
+/// The same rule holds of the vector a QUERY is run with, except that the read path
+/// keeps the rule it broke in the `fieldList` entry for the MEMBER the vector travelled
+/// in — there is no record to name — while the top-level sentence is the one opaque
+/// query-vector sentence.
 #[tokio::test]
 async fn a_zero_norm_query_vector_reports_the_same_rule_named_by_its_member() {
     for dimension in [1_usize, 3, 8] {
@@ -230,9 +240,9 @@ async fn a_zero_norm_query_vector_reports_the_same_rule_named_by_its_member() {
                 error_code(&body).as_str(),
                 message_of(&body).as_str()
             ),
-            (BAD_REQUEST, VALIDATION_EXCEPTION, ZERO_NORM_SENTENCE),
-            "case {case:?}: a zero-norm query vector must carry the same rule, \
-             got {status} {body}"
+            (BAD_REQUEST, VALIDATION_EXCEPTION, QUERY_VECTOR_SENTENCE),
+            "case {case:?}: a zero-norm query vector must carry the opaque \
+             query-vector sentence, got {status} {body}"
         );
         assert_eq!(
             field_list(&body),

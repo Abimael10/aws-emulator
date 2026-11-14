@@ -249,11 +249,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
         let VectorData::Float32(query) = &input.query_vector;
-        // The vector a query is run with is held to the same rules as a stored one,
-        // and the member it travelled in is the path the refusal names.
+        // The vector a query is run with is held to the same rules as a stored one, but
+        // the READ path reports breaking them differently: one opaque sentence about the
+        // query vector, whichever rule it broke, with the defect itself in the
+        // `fieldList` entry for the member it travelled in. The write path's
+        // record-level sentence — which states the index's dimension and the submitted
+        // width — stays on the write path.
         if let Some(defect) = crate::state::vector_data_defect(index, query) {
-            return Err(refusal(crate::state::LookupError::invalid(
+            return Err(refusal(crate::state::LookupError::invalid_detail(
                 "queryVector",
+                crate::state::QUERY_VECTOR_INVALID,
                 defect,
             )));
         }

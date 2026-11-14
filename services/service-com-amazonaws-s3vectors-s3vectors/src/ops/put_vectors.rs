@@ -222,6 +222,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // index cannot hold is refused as the record it is: `fieldList` names the
         // element of `vectors` it was submitted in, and the message names it by the
         // `key` the caller gave it.
+        //
+        // The batch's key SET is checked first, because it is a defect of the request
+        // rather than of any one record: two records under one key cannot both be
+        // stored, so the whole request is refused and nothing is written.
+        if crate::state::duplicate_vector_keys(
+            input.vectors.iter().map(|vector| vector.key.as_str()),
+        ) {
+            return Err(refusal(crate::state::LookupError::invalid_request(
+                crate::state::DUPLICATE_VECTOR_KEYS,
+            )));
+        }
         let mut prepared: Vec<crate::state::StoredVector> = Vec::with_capacity(input.vectors.len());
         for (position, vector) in input.vectors.into_iter().enumerate() {
             let VectorData::Float32(data) = vector.data;

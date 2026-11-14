@@ -299,7 +299,7 @@ pub(crate) async fn with_index(
 }
 
 /// The `key` of each vector in a `vectors` list, in the order reported.
-fn keys_of(body: &Value) -> Vec<String> {
+pub(crate) fn keys_of(body: &Value) -> Vec<String> {
     body["vectors"]
         .as_array()
         .map(|vectors| {
