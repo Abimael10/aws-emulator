@@ -47,6 +47,8 @@ mod access_point_public_access_block_default;
 mod access_point_reads_and_refusals;
 #[path = "all/account_authorization.rs"]
 mod account_authorization;
+#[path = "all/account_public_access_block_authorization.rs"]
+mod account_public_access_block_authorization;
 #[path = "all/account_public_access_block_bucket_policy.rs"]
 mod account_public_access_block_bucket_policy;
 #[path = "all/batch_job_absent_refusal.rs"]

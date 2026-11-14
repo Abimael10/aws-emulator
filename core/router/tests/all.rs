@@ -5087,3 +5087,8 @@ mod eks_nodegroup_lifecycle_convergence;
 // this tail: two landings in the same window each appended a declaration of it here.)
 // up in this same tail: two branches landing in the same window each appended a declaration
 // of it here, which compiled neither.)
+// fragment of the header landed here as `//!`, which past the first item is `E0753`.)
+// leaving a note here. (Six more lines of that header fragment, ordinary comments for
+// the reason they themselves state.)
+// (An ordinary comment, for exactly the reason that line states.)
+// and compiles nothing. (Five more lines of that fragment, ordinary comments.)

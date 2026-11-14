@@ -20,6 +20,18 @@
 //! combinations of the four settings, the subsets of them a request may carry at
 //! all, and the accounts a caller may name — its own, which is served, and
 //! others, which are refused.
+//!
+//! WHICH account the call is addressed in is decided ahead of all of that. Each
+//! of these three operations carries its `AccountId` in the `{AccountId}.` host
+//! prefix of the endpoint it is sent to and in the `x-amz-account-id` header
+//! beside it (`smithy_query(query="operation",operation="GetPublicAccessBlock")`:
+//! `AccountId` is `@required`, `@hostLabel`, `httpHeader: x-amz-account-id`,
+//! `@length` max 64, `@pattern ^\d{12}$`, and the operation's
+//! `endpoint.hostPrefix` is `{AccountId}.`), and that account says WHOSE control
+//! plane the call is for — so it is authorized before the request's shape is
+//! validated and before any configuration is read, written or removed. The last
+//! two suites below pin that over what this surface can vary: what the account
+//! VALUE looks like, and what the named account HOLDS.
 
 use std::sync::Arc;
 
@@ -30,21 +42,23 @@ use smithy_server_runtime::MultiServiceRouter;
 // put and the delete, whose modelled output is `smithy.api#Unit` — answers a
 // success with: the service's own constant, read through the shared test
 // harness so every suite asserts the one value.
-use crate::access_point_lifecycle::NO_CONTENT;
+use crate::access_point_lifecycle::{
+    FOREIGN_ACCOUNT_CODE, FOREIGN_ACCOUNT_MESSAGE, FOREIGN_ACCOUNT_STATUS, NO_CONTENT,
+};
 
 /// The region every request in this suite is signed for.
 const REGION: &str = "us-west-2";
 
 /// The account whose configuration most rows below write and read: the caller's
 /// own, which is the only one S3 Control authorizes a request for.
-const ACCOUNT: &str = ::emulator_server::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = ::emulator_server::EMULATOR_ACCOUNT_ID;
 
 /// A second account — one the caller holds no credentials for — used to pin that
 /// a configuration request addressed in another account is refused.
-const OTHER_ACCOUNT: &str = "210987654321";
+pub(crate) const OTHER_ACCOUNT: &str = "210987654321";
 
 /// A third account, so the refusal rows differ in more than one foreign account.
-const THIRD_ACCOUNT: &str = "210987654322";
+pub(crate) const THIRD_ACCOUNT: &str = "210987654322";
 
 /// The XML namespace this service's model declares.
 const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
@@ -53,11 +67,19 @@ const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
 /// (`smithy_query(query="operation",operation="GetPublicAccessBlock")`).
 const URI: &str = "/v20180820/configuration/publicAccessBlock";
 
+/// The code the boundary's own shape validation answers a member that violates
+/// its constraints with, named here because no account value below may be
+/// answered by it: an account that cannot be authorized is an authorization
+/// failure rather than a violation of `AccountId`'s pattern or length.
+const SHAPE_VIOLATION_CODE: &str = "ValidationException";
+
 /// The four members of `PublicAccessBlockConfiguration`, in the order the shape
 /// declares them. SOURCE: the model's
 /// `com.amazonaws.s3control#PublicAccessBlockConfiguration` — each member
 /// targets `Setting` (boolean) and carries `@default: false`.
-const SETTINGS: [&str; 4] = [
+/// `pub(crate)` because the sibling authorization suite reads the same four
+/// element names out of a refusal rather than restating them.
+pub(crate) const SETTINGS: [&str; 4] = [
     "BlockPublicAcls",
     "IgnorePublicAcls",
     "BlockPublicPolicy",
@@ -67,12 +89,12 @@ const SETTINGS: [&str; 4] = [
 /// The wire error code `GetPublicAccessBlock` answers for an account that has no
 /// configuration, with HTTP 404 (the model's
 /// `NoSuchPublicAccessBlockConfiguration`, `@httpError(404)`).
-const NO_SUCH_CONFIGURATION: &str = "NoSuchPublicAccessBlockConfiguration";
+pub(crate) const NO_SUCH_CONFIGURATION: &str = "NoSuchPublicAccessBlockConfiguration";
 
 /// One response: the status and the body, with readers for its XML elements.
-struct Reply {
-    status: u16,
-    body: String,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Reply {
@@ -82,7 +104,7 @@ impl Reply {
     /// The emulator writes a flat document: no attributes on these elements, no
     /// CDATA, no layout whitespace between tags, and the values read here
     /// (`true`, `false`, an error code) carry no character needing escaping.
-    fn text(&self, element: &str) -> Option<String> {
+    pub(crate) fn text(&self, element: &str) -> Option<String> {
         let open = format!("<{element}>");
         let close = format!("</{element}>");
         let start = self.body.find(&open)? + open.len();
@@ -91,7 +113,7 @@ impl Reply {
     }
 
     /// The S3-style error code (`<Code>`) of a failure response.
-    fn code(&self) -> String {
+    pub(crate) fn code(&self) -> String {
         self.text("Code")
             .unwrap_or_else(|| format!("<no Code element> in {}", self.body))
     }
@@ -99,7 +121,7 @@ impl Reply {
     /// The four settings this reply reports, as the text of each element, in the
     /// order [`SETTINGS`] declares them. An element the reply omits reads
     /// `None`.
-    fn settings(&self) -> [Option<String>; 4] {
+    pub(crate) fn settings(&self) -> [Option<String>; 4] {
         [
             self.text(SETTINGS[0]),
             self.text(SETTINGS[1]),
@@ -112,13 +134,15 @@ impl Reply {
 /// One emulator: a router with this service mounted on a single shared engine,
 /// exactly as `core/router` assembles it. The engine is kept so a test can seed
 /// the store directly (see [`Emulator::hold_configurations_for`]).
-struct Emulator {
+/// `pub(crate)` because the sibling authorization suite drives exactly this
+/// surface and stands its emulator up here rather than writing a second harness.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These requests carry an unsigned `Authorization` header, which is what
@@ -186,7 +210,7 @@ impl Emulator {
     }
 
     /// `PutPublicAccessBlock` with all four settings spelled out.
-    async fn put(&self, account_id: &str, settings: [bool; 4]) -> Reply {
+    pub(crate) async fn put(&self, account_id: &str, settings: [bool; 4]) -> Reply {
         let members: String = SETTINGS
             .iter()
             .zip(settings)
@@ -206,13 +230,76 @@ impl Emulator {
         self.call("PUT", account_id, &body).await
     }
 
-    async fn get(&self, account_id: &str) -> Reply {
+    pub(crate) async fn get(&self, account_id: &str) -> Reply {
         self.call("GET", account_id, "").await
     }
 
-    async fn delete(&self, account_id: &str) -> Reply {
+    pub(crate) async fn delete(&self, account_id: &str) -> Reply {
         self.call("DELETE", account_id, "").await
     }
+
+    /// Every call of this surface, addressed in `account_id`: the reporting one
+    /// and both mutating ones, so a rule about the account is asserted over all
+    /// three rather than over the read alone.
+    pub(crate) async fn every_call(&self, account_id: &str) -> Vec<(&'static str, Reply)> {
+        vec![
+            ("GetPublicAccessBlock", self.get(account_id).await),
+            (
+                "PutPublicAccessBlock",
+                self.put(account_id, [true, false, false, true]).await,
+            ),
+            ("DeletePublicAccessBlock", self.delete(account_id).await),
+        ]
+    }
+
+    /// Put `settings` on `account_id` directly in the store the configurations
+    /// LIVE in — Amazon S3's own, which this service reads and writes them
+    /// through, and which [`Emulator::hold_configurations_for`] seeds the same
+    /// way.
+    ///
+    /// The only way to put a configuration on an account the front door refuses
+    /// every call for, which is what a row asserting that the refusal is no
+    /// existence oracle needs.
+    pub(crate) fn seed(&self, case: &str, account_id: &str, settings: [bool; 4]) {
+        let state = ::service_com_amazonaws_s3_amazons3::state::service_state(&*self.engine)
+            .expect("the shared engine must hold the object store");
+        assert!(
+            state
+                .lock()
+                .record_account_public_access_block(account_id, configuration(settings)),
+            "case {case:?}: seeding the configuration of {account_id} must be recorded"
+        );
+    }
+
+    /// The settings `account_id` holds in that store, read where they live rather
+    /// than through a front door that refuses to report them.
+    pub(crate) fn held(&self, account_id: &str) -> Option<[bool; 4]> {
+        ::service_com_amazonaws_s3_amazons3::state::account_public_access_block_in(
+            &*self.engine,
+            account_id,
+        )
+        .map(flags_of)
+    }
+}
+
+/// The store record for the four settings, in [`SETTINGS`] order.
+fn configuration(settings: [bool; 4]) -> BucketPublicAccessBlock {
+    BucketPublicAccessBlock {
+        block_public_acls: settings[0],
+        ignore_public_acls: settings[1],
+        block_public_policy: settings[2],
+        restrict_public_buckets: settings[3],
+    }
+}
+
+/// [`configuration`] the other way round.
+fn flags_of(settings: BucketPublicAccessBlock) -> [bool; 4] {
+    [
+        settings.block_public_acls,
+        settings.ignore_public_acls,
+        settings.block_public_policy,
+        settings.restrict_public_buckets,
+    ]
 }
 
 /// Every combination of the four settings: sixteen rows, differing in which
@@ -232,7 +319,7 @@ fn every_combination() -> Vec<[bool; 4]> {
 }
 
 /// The text a reply must carry for each setting of `settings`.
-fn expected(settings: [bool; 4]) -> [Option<String>; 4] {
+pub(crate) fn expected(settings: [bool; 4]) -> [Option<String>; 4] {
     [
         Some(settings[0].to_string()),
         Some(settings[1].to_string()),
@@ -624,5 +711,176 @@ async fn the_number_of_stored_configurations_is_bounded_and_a_delete_releases_th
         "expected the refused put to store nothing, got {} with body {}",
         unstored.status,
         unstored.body
+    );
+}
+
+/// An account id differing from the caller's own in its last digit alone — a
+/// foreign account by one character.
+fn one_digit_from_the_callers_own() -> String {
+    let (head, last) = ACCOUNT.split_at(ACCOUNT.len() - 1);
+    let other = match last {
+        "0" => "1",
+        _ => "0",
+    };
+    format!("{head}{other}")
+}
+
+/// The account values a caller may name that are not the caller's own.
+///
+/// The rows differ in WHAT makes the value unusable as this caller's account:
+/// another well-formed id, one a single digit away from the caller's own, the
+/// largest `^\d{12}$` admits, text that is no id at all, ids one digit short of
+/// and one past that pattern, digits with a letter among them, and a value past
+/// `AccountId`'s `@length` maximum of 64 — every one of which names a control
+/// plane this caller holds no credentials for. SOURCE of the pattern and the
+/// maximum: the model's `com.amazonaws.s3control#AccountId`.
+fn foreign_accounts() -> Vec<(&'static str, String)> {
+    vec![
+        ("another well-formed account", OTHER_ACCOUNT.to_string()),
+        ("a third account", THIRD_ACCOUNT.to_string()),
+        (
+            "an account one digit from the caller's own",
+            one_digit_from_the_callers_own(),
+        ),
+        (
+            "the largest id the AccountId pattern admits",
+            "999999999999".to_string(),
+        ),
+        ("text that is no account id", "not-an-account".to_string()),
+        (
+            "one digit short of the AccountId pattern",
+            "12345678901".to_string(),
+        ),
+        (
+            "one digit past the AccountId pattern",
+            "1234567890123".to_string(),
+        ),
+        ("digits with a letter among them", "12345678901a".to_string()),
+        (
+            // One character past the member's `@length` maximum of 64.
+            "a value past the AccountId length maximum",
+            "9".repeat(65),
+        ),
+    ]
+}
+
+/// The part of a refusal a client branches on, without the account it names: the
+/// status, the wire code and the message — so two refusals naming DIFFERENT
+/// accounts can be compared for being the same answer.
+pub(crate) type Stated = (u16, String, Option<String>);
+
+pub(crate) fn stated(reply: &Reply) -> Stated {
+    (reply.status, reply.code(), reply.text("Message"))
+}
+
+/// Assert `reply` is the refusal a call addressed in an account the caller holds
+/// no credentials for gets, naming `account` in the member a client reads it
+/// from. The three facts of it are the service's own, stated once for every suite
+/// in [`crate::access_point_lifecycle`].
+pub(crate) fn assert_denied(case: &str, account: &str, reply: &Reply) {
+    assert_eq!(
+        (reply.status, reply.code().as_str()),
+        (FOREIGN_ACCOUNT_STATUS, FOREIGN_ACCOUNT_CODE),
+        "case {case:?}: expected a call for another account to be refused \
+         {FOREIGN_ACCOUNT_STATUS} {FOREIGN_ACCOUNT_CODE}, got {} with body {}",
+        reply.status,
+        reply.body
+    );
+    assert_eq!(
+        reply.text("Message").as_deref(),
+        Some(FOREIGN_ACCOUNT_MESSAGE),
+        "case {case:?}: expected the fixed refusal message, got body {}",
+        reply.body
+    );
+    assert_eq!(
+        reply.text("AccountId").as_deref(),
+        Some(account),
+        "case {case:?}: expected the refusal to name the account the request asked for, got \
+         body {}",
+        reply.body
+    );
+}
+
+/// Assert `reply` reports nothing of any configuration: the account is
+/// authorized before the configuration is looked up, so no setting and no
+/// configuration element travels with the refusal.
+pub(crate) fn assert_nothing_reported(case: &str, reply: &Reply) {
+    for element in SETTINGS
+        .iter()
+        .copied()
+        .chain(["PublicAccessBlockConfiguration"])
+    {
+        assert!(
+            reply.text(element).is_none(),
+            "case {case:?}: expected no <{element}> beside the refusal, got body {}",
+            reply.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_call_in_a_foreign_account_is_denied_whatever_the_account_value_looks_like() {
+    let emulator = Emulator::start();
+    let mine = [true, false, false, true];
+
+    // The caller's own configuration, set through the front door, so the refused
+    // rows are compared against a surface that is being served.
+    assert_eq!(
+        emulator.put(ACCOUNT, mine).await.status,
+        NO_CONTENT,
+        "expected the caller's own put to be accepted"
+    );
+
+    for (account_case, account) in foreign_accounts() {
+        for (operation, reply) in emulator.every_call(&account).await {
+            let case = format!("{operation} for {account_case}");
+            assert_denied(&case, &account, &reply);
+            // The same answer stated as what it is NOT: a value the member's
+            // pattern or length would refuse is an authorization failure rather
+            // than a shape violation, so a client branching on the status and
+            // the code sees the denial.
+            assert_ne!(
+                reply.code(),
+                SHAPE_VIOLATION_CODE,
+                "case {case:?}: expected an authorization failure rather than a shape \
+                 violation, got body {}",
+                reply.body
+            );
+            assert_nothing_reported(&case, &reply);
+            assert_eq!(
+                emulator.held(&account),
+                None,
+                "case {case:?}: expected the refused call to store nothing for {account}"
+            );
+        }
+    }
+
+    // None of that touched the caller's own configuration, and its own calls are
+    // still served: the read reports exactly what it put.
+    let kept = emulator.get(ACCOUNT).await;
+    assert_eq!(
+        (kept.status, kept.settings()),
+        (200, expected(mine)),
+        "expected the caller's own configuration to survive the refusals, got {} with body {}",
+        kept.status,
+        kept.body
+    );
+    assert_eq!(
+        emulator.held(ACCOUNT),
+        Some(mine),
+        "expected the store to hold exactly the caller's own configuration"
+    );
+    assert_eq!(
+        emulator.delete(ACCOUNT).await.status,
+        NO_CONTENT,
+        "expected the caller's own delete to still be served"
+    );
+    let gone = emulator.get(ACCOUNT).await;
+    assert_eq!(
+        (gone.status, gone.code().as_str()),
+        (404, NO_SUCH_CONFIGURATION),
+        "expected the caller's own delete to have removed its configuration, got {} with body {}",
+        gone.status,
+        gone.body
     );
 }
