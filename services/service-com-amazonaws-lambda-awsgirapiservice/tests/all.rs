@@ -359,6 +359,8 @@ mod invocation_duration_report_agreement;
 mod invocation_duration_statistics_reads;
 #[path = "all/invocation_init_phase.rs"]
 mod invocation_init_phase;
+#[path = "all/invocation_log_after_a_role_change.rs"]
+mod invocation_log_after_a_role_change;
 #[path = "all/invocation_log_delivery.rs"]
 mod invocation_log_delivery;
 #[path = "all/invocation_log_delivery_grant_carrier.rs"]

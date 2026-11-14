@@ -5092,3 +5092,22 @@ mod eks_nodegroup_lifecycle_convergence;
 // the reason they themselves state.)
 // (An ordinary comment, for exactly the reason that line states.)
 // and compiles nothing. (Five more lines of that fragment, ordinary comments.)
+// stack does when its Lambda-backed custom resource's provider answers FAILED is only
+// observable across CloudFormation, AWS Lambda and CloudWatch Logs at once — the Delete
+// request the rollback sends is read out of the provider's own log — so no single service
+// crate's test target can deploy the stack and then read it.
+#[path = "all/cloudformation_failed_custom_resource_rollback_deletes.rs"]
+mod cloudformation_failed_custom_resource_rollback_deletes;
+// lines above record: a `//!` line past the first item of this crate root is `E0753`.)
+// (One more copy of this file's own header landed in the tail typed with `//!`, which is
+// `E0753` past the first item and compiles no suite at all, so it stands as ordinary
+// comments here: every suite is declared ONCE, and the rule itself is in the module doc at
+// the HEAD of this file, where `all/all_rs_declares_each_suite_once.rs` and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of it.)
+// line it repeated — a suite left at the top level of `tests/` fails the build — stands as
+// an ordinary comment here.
+// (One more line of that header landed here as `//!` as well: check the header, rather than
+// leaving a note in the appended tail, where an inner doc comment is `E0753`.)
+// (five more lines of that same fragment, ordinary comments for the reason they state:
+// and for every service crate's `tests/all.rs`, so check there rather than leaving a note
+// in this file's tail, where an inner doc comment is `E0753` and compiles nothing.)

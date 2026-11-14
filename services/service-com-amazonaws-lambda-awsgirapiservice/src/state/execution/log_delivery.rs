@@ -13,14 +13,24 @@
 //! events are put, so `DescribeLogGroups`, `DescribeLogStreams`, `GetLogEvents` and
 //! `FilterLogEvents` report exactly what the run produced.
 //!
-//! Lambda makes those calls ACTING AS the function's execution role, not as the caller, so
-//! each is made only while the policies in force on that role allow it
-//! ([`super::super::role_actions`], over the one reading of those documents this crate
-//! states). A role short of `logs:CreateLogGroup` creates no group,
+//! Lambda makes those calls FOR THE FUNCTION rather than for the caller, and judges them
+//! against the policies in force on the function's EXECUTION ROLE, so each is made only while
+//! that role allows it ([`super::super::role_actions`], over the one reading of those
+//! documents this crate states). A role short of `logs:CreateLogGroup` creates no group,
 //! and one short of `logs:PutLogEvents` writes no events — which is why a function whose
 //! role carries no logs grant leaves nothing behind for a client to read. A withheld call is
 //! not an invocation failure: the answer to `Invoke` is the handler's, whatever became of
 //! the log.
+//!
+//! That decision belongs to the RUN: it is read off the role once, when the invocation is
+//! accepted and before the handler runs ([`log_target`], which every invocation surface calls
+//! to build the run's [`LogTarget`]), and the lines a run wrote are its own from then on. So
+//! the delivery itself is this service's write rather than a second, later judgement of the
+//! same role: a role whose policies change — or that is deleted outright — while the run is
+//! in flight cannot erase the log of a run that already happened, which is what a client
+//! reading the group after such a run finds on AWS. The gate above is still the only thing
+//! that decides whether Lambda writes at all, so a role short of a logs grant leaves exactly
+//! as little behind as before.
 //!
 //! Nothing here is synthesised. Every event's message is a line the run wrote, and its
 //! instant is the run's own: the opening frame carries the instant the run started, and the
@@ -201,9 +211,16 @@ const MAX_MESSAGE_BYTES_PER_BATCH: usize = 512 * 1024;
 
 /// Deliver one run's log: open the group and the stream, and put the run's events.
 ///
-/// Every call is made only while the role may make it, and a call CloudWatch Logs refuses is
-/// not an invocation failure — there is simply less of the log to read, which is exactly what
-/// a client sees of a function whose role is short of a logs grant.
+/// Every call is made only while the role may make it — the decision the run was accepted
+/// with ([`LogTarget::grants`]) — and a call CloudWatch Logs refuses is not an invocation
+/// failure: there is simply less of the log to read, which is exactly what a client sees of a
+/// function whose role is short of a logs grant.
+///
+/// The three calls are THIS SERVICE's own, signed with the credential the framework hands its
+/// handlers rather than with the session of the execution role
+/// ([`super::aws_api::AwsAccess::signing_as`]): the lines belong to a run that has already
+/// happened, so what the role allows is the reading taken for that run and not a second one
+/// taken after it (see the module docs).
 pub(super) async fn deliver(
     aws: &AwsAccess,
     target: &LogTarget,
@@ -214,6 +231,8 @@ pub(super) async fn deliver(
     if events.is_empty() {
         return;
     }
+    let writer = aws.clone().signing_as(None);
+    let aws = &writer;
     if target.grants.create_log_group {
         let body = ::serde_json::json!({ "logGroupName": target.log_group }).to_string();
         made(aws, region, CREATE_LOG_GROUP, &body).await;
