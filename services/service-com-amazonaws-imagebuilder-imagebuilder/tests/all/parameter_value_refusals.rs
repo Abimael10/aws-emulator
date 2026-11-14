@@ -156,19 +156,26 @@ fn expected_message(parameter: &str, requirement: &str) -> String {
 /// Assert one refused call: the status, the error in both places it travels, the sentence,
 /// and the request the response names.
 fn assert_refused(case: &str, answered: &Answer, expected: &str) {
+    assert_refused_as(case, answered, INVALID_PARAMETER_VALUE, expected);
+}
+
+/// [`assert_refused`] for a refusal this service answers in another of its modelled error
+/// classes: the class is asserted in both places it travels, and everything else is the
+/// same.
+fn assert_refused_as(case: &str, answered: &Answer, code: &str, expected: &str) {
     assert_eq!(
         answered.status, 400,
         "case {case:?}: expected HTTP 400, got {} with {}",
         answered.status, answered.body
     );
     assert_eq!(
-        answered.code, INVALID_PARAMETER_VALUE,
-        "case {case:?}: expected $.__type {INVALID_PARAMETER_VALUE:?}, got {:?}",
+        answered.code, code,
+        "case {case:?}: expected $.__type {code:?}, got {:?}",
         answered.code
     );
     assert_eq!(
-        answered.error_type, INVALID_PARAMETER_VALUE,
-        "case {case:?}: expected x-amzn-errortype {INVALID_PARAMETER_VALUE:?}, got {:?}",
+        answered.error_type, code,
+        "case {case:?}: expected x-amzn-errortype {code:?}, got {:?}",
         answered.error_type
     );
     assert_eq!(
@@ -513,10 +520,12 @@ async fn a_requirement_over_two_parameters_together_names_both() {
 
     // "The component is based on a YAML document that you specify using exactly one of the
     // following methods" — so the requirement holds over `data` and `uri` together, and
-    // neither value is wrong on its own, which is why the sentence names both.
-    let expected = "The value supplied for parameter 'data' and 'uri' is not valid. You must \
-                    specify either data or a uri.";
-    let rows: Vec<(&str, Value)> = vec![
+    // neither value is wrong on its own. The two halves of that requirement are different
+    // failures, each in its own class: a request naming BOTH carries two mutually exclusive
+    // parameters (`InvalidParameterCombinationException`, which `CreateComponent`'s own
+    // error list declares) and the sentence names both members, while one naming NEITHER is
+    // missing a required parameter and is told which members it could have chosen from.
+    let rows: Vec<(&str, Value, &str, &str)> = vec![
         (
             "a component naming both data and uri",
             component_body(
@@ -525,6 +534,9 @@ async fn a_requirement_over_two_parameters_together_names_both() {
                 "ctok-0001",
                 json!({"uri": "s3://probe-bucket/component.yaml"}),
             ),
+            "InvalidParameterCombinationException",
+            "The value supplied for parameter 'data' and 'uri' is not valid. You must specify \
+             either data or a uri.",
         ),
         (
             "a component naming neither data nor uri",
@@ -534,12 +546,15 @@ async fn a_requirement_over_two_parameters_together_names_both() {
                 "platform": "Linux",
                 "clientToken": "ctok-0002",
             }),
+            "MissingParametersException",
+            "Required parameters are missing from the request: 'data' or 'uri'. Verify that you \
+             have entered all of the required parameters in your request and try again.",
         ),
     ];
 
-    for (case, body) in &rows {
+    for (case, body, code, expected) in &rows {
         let answered = call(&router, case, "PUT", "/CreateComponent", Some(body)).await;
-        assert_refused(case, &answered, expected);
+        assert_refused_as(case, &answered, code, expected);
     }
 }
 

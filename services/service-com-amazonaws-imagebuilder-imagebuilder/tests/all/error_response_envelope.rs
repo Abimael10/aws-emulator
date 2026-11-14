@@ -198,7 +198,8 @@ fn is_request_id(id: &str) -> bool {
     groups.next().is_none()
 }
 
-/// The not-found message this service states for `arn`, whose kind is `resource_type`.
+/// The not-found message this service states for a resource of its authoring and build
+/// resources, whose kind is `resource_type`.
 fn not_found_message(resource_type: &str, arn: &str) -> String {
     format!("The following required resource '{resource_type}' cannot be found: '{arn}'.")
 }
@@ -472,9 +473,9 @@ async fn every_failure_answers_the_modelled_error_and_names_the_request_it_answe
                 "maxResults must be smaller than or equal to 25",
             )),
         },
-        // A constraint class this service states no requirement for keeps the framework's
-        // own refusal — which still names the request it answers, because the report is the
-        // envelope's and not any one wording's.
+        // A member the shape REQUIRES and the request omits is refused about the request as
+        // a whole — there is no value to state a requirement about — naming the properties
+        // it had to carry.
         Failure {
             case: "a create omitting a member its shape requires".to_string(),
             method: "PUT",
@@ -486,8 +487,12 @@ async fn every_failure_answers_the_modelled_error_and_names_the_request_it_answe
                 "data": BUILD_DOCUMENT,
             })),
             status: 400,
-            code: "ValidationException",
-            message: None,
+            code: "InvalidRequestException",
+            message: Some(
+                "Your request is invalid. Request must contain ['semanticVersion'] \
+                 properties. Verify your request and try again."
+                    .to_string(),
+            ),
         },
     ];
 

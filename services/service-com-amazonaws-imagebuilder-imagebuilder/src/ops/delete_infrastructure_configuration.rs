@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInfrastructureConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInfrastructureConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInfrastructureConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Forgets the infrastructure configuration this service's state holds and echoes the ARN
+//! it removed, so a later read of it reports it missing. A configuration an image pipeline
+//! still REFERENCES is not removed: "You can't delete a configuration that an image
+//! pipeline still references. The request fails with ResourceDependencyException. Update or
+//! delete the referencing pipelines first." An ARN nothing is stored under, and one of
+//! another Region, delete nothing — which is reported MISSING, as the not-found error this
+//! service models for the resource a request acts on and it does not hold, so a repeat of a
+//! delete that already succeeded is reported the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +87,8 @@
 //!   processed the request. Retrying the request may succeed.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unable to process your request
 //!   at this time.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   "At least one of the resources referenced by your request does not exist."
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -102,7 +104,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `DeleteInfrastructureConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#DeleteInfrastructureConfiguration")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`:
+// `infrastructureConfigurationArn` is an `@httpQuery` member naming a configuration that
+// may not exist, this SERVICE models that shape for exactly that case
+// (`com.amazonaws.imagebuilder#ResourceNotFoundException`, HTTP 404, declared in
+// `types/shared_types.rs`), and this operation's own `errors` list omits it. So an ARN
+// nothing is stored under is reported MISSING rather than dressed up as an invalid request
+// or as a dependency, which are different claims a client branches on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#DeleteInfrastructureConfiguration",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum DeleteInfrastructureConfigurationErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
@@ -110,6 +123,7 @@ pub enum DeleteInfrastructureConfigurationErrorModeled {
     ForbiddenException(ForbiddenException),
     InvalidRequestException(InvalidRequestException),
     ResourceDependencyException(ResourceDependencyException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -165,18 +179,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInfrastructureConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInfrastructureConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInfrastructureConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteInfrastructureConfigurationErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // The dependency check and the removal happen under ONE lock, so a pipeline cannot
+        // be created against this configuration between the two.
+        let mut store = state.lock();
+
+        if store
+            .infrastructure_configuration(&input.infrastructure_configuration_arn, &region)
+            .is_none()
+        {
+            return Err(
+                DeleteInfrastructureConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_arn_not_found_message(
+                            &input.infrastructure_configuration_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You can't delete a configuration that an image pipeline still references."
+        if store
+            .pipeline_depending_on_infrastructure_configuration(
+                &input.infrastructure_configuration_arn,
+            )
+            .is_some()
+        {
+            return Err(
+                DeleteInfrastructureConfigurationErrorModeled::ResourceDependencyException(
+                    ResourceDependencyException {
+                        message: Some(crate::state::configuration_dependency_message(
+                            &input.infrastructure_configuration_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let removed = store
+            .remove_infrastructure_configuration(&input.infrastructure_configuration_arn, &region);
+        drop(store);
+
+        Ok(DeleteInfrastructureConfigurationOutput {
+            request_id: Some(crate::state::new_request_id()),
+            // The ARN of the record this call removed, read back from it rather than echoed
+            // from the request.
+            infrastructure_configuration_arn: removed.map(|record| record.arn),
+        })
     }
 }

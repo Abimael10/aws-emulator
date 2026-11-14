@@ -25,11 +25,14 @@
 //! establish a clause for: a `@pattern`, a `@range` bound, an enumerated value set, and the
 //! `@length` MINIMUM of a COLLECTION ([`must_contain_at_least`]). A class they do not — a
 //! `@length` bound on a STRING, a `@length` maximum, a repeated element of a `@uniqueItems`
-//! list, a member the shape requires and the request omits — is left to the framework's own
-//! refusal rather than being given a clause this service has never been seen to state.
-//! Two of them, the `@range` MINIMUM and a collection's, this service words its own way
-//! ([`must_be_at_least`], [`must_contain_at_least`]); every other clause is the shared
-//! statement of it.
+//! list — is left to the framework's own refusal rather than being given a clause this
+//! service has never been seen to state. Two of them, the `@range` MINIMUM and a
+//! collection's, this service words its own way ([`must_be_at_least`],
+//! [`must_contain_at_least`]); every other clause is the shared statement of it.
+//!
+//! A member the shape REQUIRES and the request OMITS is not one of those classes at all:
+//! there is no value to state a requirement about, so the refusal is about the request as a
+//! whole and names the properties it had to carry ([`missing_properties`]).
 //!
 //! ## How it quotes an ARN expression, and why that is per BINDING
 //!
@@ -71,6 +74,15 @@ use smithy_server_runtime::{Refused, Violation, ViolationKind};
 /// `ServiceException` (`smithy_query(query="service_info")`) — so the framework's synthetic
 /// one is not an error this service can answer with.
 pub const INVALID_PARAMETER_VALUE_EXCEPTION: &str = "InvalidParameterValueException";
+
+/// The error code this service answers a request that left out a member its operation
+/// requires with: the modelled `InvalidRequestException` (HTTP 400), whose own documentation
+/// is "The request is malformed or otherwise invalid. Verify the request and try again."
+///
+/// A member the shape REQUIRES and the request omits is not a value this service could refuse
+/// as that parameter's — there is no value — so the refusal is about the request as a whole,
+/// which is the class this one names ([`missing_properties`]).
+pub const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
 
 /// The ARN partition field as the model spells it: `aws` followed by anything up to the
 /// next colon, which is all a pattern needs in order to bound ONE field.
@@ -179,6 +191,31 @@ fn requirement(member: &str, violation: &Violation, form: StatedPattern) -> Opti
     }
 }
 
+/// The refusal this service states for a request that left out properties its operation
+/// requires: the properties it had to carry, each quoted inside one pair of brackets.
+///
+/// `None` unless EVERY violation is a member the shape requires and the request omitted: a
+/// request that also broke a constraint of a value it DID carry is left to the clauses
+/// below, which state that value's own requirement.
+fn missing_properties(refused: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
+    let missing: Vec<String> = refused
+        .iter()
+        .map(|(violation, _)| match violation.kind {
+            ViolationKind::MissingRequiredMember => Some(api_parameter_path(&violation.path)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let quoted: Vec<String> = missing.iter().map(|member| format!("'{member}'")).collect();
+    (!quoted.is_empty()).then(|| Refused {
+        code: INVALID_REQUEST_EXCEPTION.to_owned(),
+        message: format!(
+            "Your request is invalid. Request must contain [{}] properties. Verify your \
+             request and try again.",
+            quoted.join(", ")
+        ),
+    })
+}
+
 /// The refusal this service states for `refused`, quoting an ARN expression in `form`, or
 /// `None` to leave the request to the layers behind the front door.
 ///
@@ -188,8 +225,13 @@ fn requirement(member: &str, violation: &Violation, form: StatedPattern) -> Opti
 /// than being restated as one parameter's.
 ///
 /// ONE parameter is named, the first the walk found: the sentence states the parameter whose
-/// value was refused, and a sentence naming several would be a different sentence.
+/// value was refused, and a sentence naming several would be a different sentence. The one
+/// refusal that does name several is the request that carried none of the properties it had
+/// to ([`missing_properties`]), which is about no single value.
 fn refusal(refused: &[(Violation, SubmittedEcho)], form: StatedPattern) -> Option<Refused> {
+    if let Some(stated) = missing_properties(refused) {
+        return Some(stated);
+    }
     let stated: Vec<(String, String)> = refused
         .iter()
         .map(|(violation, _)| {
@@ -451,7 +493,10 @@ mod tests {
             (
                 "a member the shape requires and the request omits",
                 violation("clientToken", ViolationKind::MissingRequiredMember),
-                None,
+                Some(
+                    "Your request is invalid. Request must contain ['clientToken'] properties. \
+                     Verify your request and try again.",
+                ),
             ),
         ];
 

@@ -9,18 +9,23 @@
 //!
 //! The rule under test: when an ARN a request carries resolves to no resource of the
 //! calling Region — because it was deleted, or was never created, or belongs to another
-//! Region — the call is answered with the not-found error this service models for a
-//! referenced resource it does not hold (`ResourceNotFoundException`, HTTP 404, "At least
-//! one of the resources referenced by your request does not exist"), whose message names
-//! the kind of resource the ARN identifies and the ARN the request carried, verbatim.
-//! That is one answer for every lookup THIS SERVICE performs, whatever the operation does
-//! with what it finds: a read, a delete, a policy write, a tagging write, and the reference
-//! resolution of a create.
+//! Region — the call is answered with the not-found error this service models
+//! (`ResourceNotFoundException`, HTTP 404), and WHICH SENTENCE it carries follows the FAMILY
+//! of the resource the ARN names rather than what the call does with it:
+//!
+//! * the authoring and build resources — components, recipes, pipelines, images and
+//!   workflows — are reported as the required resource they are: "The following required
+//!   resource '<Kind>' cannot be found: '<arn>'.", naming the kind the ARN identifies. One
+//!   answer for every lookup of them: a read, a delete, a policy write, a tagging write, and
+//!   the reference resolution of a create.
+//! * the two CONFIGURATION resources — infrastructure and distribution — are reported by
+//!   quoting the ARN the request carried: "The resource ARN '<arn>' was not found.", which
+//!   names no kind.
 //!
 //! The TAG LISTING is the one lookup answered by another layer and so by another class: it
 //! reports an ARN that resolves to nothing as the resource-tagging layer's own
 //! `NotFoundException` (HTTP 404) with the fixed sentence "Resource was not found", which
-//! names neither the kind nor the ARN. Each row below states which of the two classes its
+//! names neither the kind nor the ARN. Each row below states which of the three classes its
 //! answer carries.
 //!
 //! The rows span what the rule generalises over: which operation performs the lookup,
@@ -144,9 +149,9 @@ fn error_message(case: &str, body: &Value) -> String {
         .to_string()
 }
 
-/// Assert `status` and the answer are the not-found report the rule requires for `arn`:
-/// HTTP 404, the error type this service models for a resource it does not hold, and the
-/// message that names `resource_type` and `arn`.
+/// Assert `status` and the answer are the not-found report the rule requires for one of this
+/// service's authoring and build resources: HTTP 404, the error type this service models for
+/// a resource it does not hold, and the message that names `resource_type` and `arn`.
 fn assert_reported_missing(
     case: &str,
     status: u16,
@@ -154,6 +159,31 @@ fn assert_reported_missing(
     resource_type: &str,
     arn: &str,
 ) {
+    assert_not_found_shape(case, status, body);
+    let expected = format!("The following required resource '{resource_type}' cannot be found: '{arn}'.");
+    let actual = error_message(case, body);
+    assert_eq!(
+        actual, expected,
+        "case {case:?}: expected the message {expected:?}, got {actual:?}"
+    );
+}
+
+/// Assert `status` and the answer are the not-found report the rule requires for one of the
+/// two CONFIGURATION resources: HTTP 404, the same modelled error type, and the message that
+/// quotes `arn` and names no kind.
+fn assert_arn_not_found(case: &str, status: u16, body: &Value, arn: &str) {
+    assert_not_found_shape(case, status, body);
+    let expected = format!("The resource ARN '{arn}' was not found.");
+    let actual = error_message(case, body);
+    assert_eq!(
+        actual, expected,
+        "case {case:?}: expected the message {expected:?}, got {actual:?}"
+    );
+}
+
+/// Assert the answer is this service's own modelled not-found error at the status it models,
+/// whichever of its two sentences it carries.
+fn assert_not_found_shape(case: &str, status: u16, body: &Value) {
     assert_eq!(
         status, 404,
         "case {case:?}: expected HTTP 404, got {status} with {body}"
@@ -162,12 +192,6 @@ fn assert_reported_missing(
     assert_eq!(
         code, "ResourceNotFoundException",
         "case {case:?}: expected ResourceNotFoundException, got {code:?} with {body}"
-    );
-    let expected = format!("The following required resource '{resource_type}' cannot be found: '{arn}'.");
-    let actual = error_message(case, body);
-    assert_eq!(
-        actual, expected,
-        "case {case:?}: expected the message {expected:?}, got {actual:?}"
     );
 }
 
@@ -312,8 +336,12 @@ fn configuration_arn(region: &str, normalized: &str) -> String {
 /// Which not-found class a lookup's answer carries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MissingReport {
-    /// This service's own modelled not-found error, naming the kind and the ARN.
-    Modelled,
+    /// This service's own modelled not-found error for one of the two CONFIGURATION
+    /// resources, quoting the ARN the request carried.
+    ConfigurationArn,
+    /// This service's own modelled not-found error for one of the authoring and build
+    /// resources, naming the kind and the ARN.
+    RequiredResource,
     /// The resource-tagging layer's own class, whose sentence is fixed text.
     TaggingPlane,
 }
@@ -342,7 +370,10 @@ struct Lookup {
 /// Assert one lookup's answer is the not-found report its class requires.
 fn assert_lookup_missing(lookup: &Lookup, status: u16, body: &Value) {
     match lookup.report {
-        MissingReport::Modelled => assert_reported_missing(
+        MissingReport::ConfigurationArn => {
+            assert_arn_not_found(&lookup.case, status, body, &lookup.arn)
+        }
+        MissingReport::RequiredResource => assert_reported_missing(
             &lookup.case,
             status,
             body,
@@ -356,7 +387,11 @@ fn assert_lookup_missing(lookup: &Lookup, status: u16, body: &Value) {
 /// Every operation that looks up the resource `arn` names by the member that names it.
 fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn: &str) -> Vec<Lookup> {
     let mut rows = Vec::new();
-    let mut push = |operation: &str, method: &'static str, uri: String, body: Option<Value>| {
+    let mut push = |operation: &str,
+                    method: &'static str,
+                    uri: String,
+                    body: Option<Value>,
+                    report: MissingReport| {
         rows.push(Lookup {
             case: format!("{operation} on {case}"),
             method,
@@ -365,7 +400,7 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
             region,
             resource_type,
             arn: arn.to_string(),
-            report: MissingReport::Modelled,
+            report,
         });
     };
     match resource_type {
@@ -375,6 +410,7 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
                 "GET",
                 format!("/GetComponent?componentBuildVersionArn={arn}"),
                 None,
+                MissingReport::RequiredResource,
             );
             // `DeleteComponent` and the policy pair model their ARN member as a BUILD
             // version ARN (`ComponentBuildVersionArn`), so a version ARN whose trailing
@@ -390,18 +426,21 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
                     "DELETE",
                     format!("/DeleteComponent?componentBuildVersionArn={arn}"),
                     None,
+                    MissingReport::RequiredResource,
                 );
                 push(
                     "GetComponentPolicy",
                     "GET",
                     format!("/GetComponentPolicy?componentArn={arn}"),
                     None,
+                    MissingReport::RequiredResource,
                 );
                 push(
                     "PutComponentPolicy",
                     "PUT",
                     "/PutComponentPolicy".to_string(),
                     Some(json!({"componentArn": arn, "policy": "{\"Version\":\"2012-10-17\"}"})),
+                    MissingReport::RequiredResource,
                 );
             }
         }
@@ -411,12 +450,14 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
                 "GET",
                 format!("/GetImageRecipe?imageRecipeArn={arn}"),
                 None,
+                MissingReport::RequiredResource,
             );
             push(
                 "DeleteImageRecipe",
                 "DELETE",
                 format!("/DeleteImageRecipe?imageRecipeArn={arn}"),
                 None,
+                MissingReport::RequiredResource,
             );
         }
         "InfrastructureConfiguration" => {
@@ -425,12 +466,24 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
                 "GET",
                 format!("/GetInfrastructureConfiguration?infrastructureConfigurationArn={arn}"),
                 None,
+                MissingReport::ConfigurationArn,
+            );
+            push(
+                "DeleteInfrastructureConfiguration",
+                "DELETE",
+                format!(
+                    "/DeleteInfrastructureConfiguration?infrastructureConfigurationArn={arn}"
+                ),
+                None,
+                MissingReport::ConfigurationArn,
             );
         }
         other => panic!("case {case:?}: no lookup is declared for the resource type {other:?}"),
     }
-    // The tagging pair takes the ARN of ANY kind, in the URI path. The LISTING is answered
-    // by the tagging layer's own class; the WRITE is this service's own lookup.
+    // The tagging pair takes the ARN of ANY kind, in the URI path, and is answered by the
+    // resource-tagging layer rather than by the resource's own API: the LISTING in that
+    // layer's own class, and the WRITE as the required resource it looks up — one answer for
+    // every kind, the configurations included.
     rows.push(Lookup {
         case: format!("ListTagsForResource on {case}"),
         method: "GET",
@@ -449,7 +502,7 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
         region,
         resource_type,
         arn: arn.to_string(),
-        report: MissingReport::Modelled,
+        report: MissingReport::RequiredResource,
     });
     rows
 }

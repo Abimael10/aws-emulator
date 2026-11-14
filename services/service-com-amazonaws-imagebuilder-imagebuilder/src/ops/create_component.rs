@@ -296,17 +296,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         // "The component is based on a YAML document that you specify using exactly one
-        // of the following methods" — inline `data`, or a `uri` pointing at one. A
-        // requirement over the two members together, so it is refused as this service
-        // refuses every parameter whose value it cannot accept: the parameter-value class,
-        // naming both members ([`crate::state::component_data_or_uri_message`]).
+        // of the following methods" — inline `data`, or a `uri` pointing at one, and `data`
+        // adds "you cannot specify both properties". The model can require a member, so it
+        // can say nothing about a GROUP, and the two halves of the requirement are different
+        // failures: a request naming NEITHER is missing a required parameter
+        // ([`crate::state::MISSING_PARAMETERS_CODE`], whose sentence names the members it
+        // could have chosen from), while one naming BOTH carries "two mutually exclusive
+        // parameters", which is the class this model names for it
+        // (`InvalidParameterCombinationException`) over the sentence naming both members
+        // ([`crate::state::component_data_or_uri_message`]).
         let document_source = match (input.data.as_deref(), input.uri.as_deref()) {
             (Some(data), None) => DocumentSource::Inline(data),
             (None, Some(uri)) => DocumentSource::Uri(uri),
-            _ => {
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::MISSING_PARAMETERS_CODE,
+                    crate::state::MISSING_PARAMETERS_STATUS,
+                    crate::state::missing_parameters_message(
+                        &crate::state::COMPONENT_DOCUMENT_MEMBERS,
+                    ),
+                ))
+            }
+            (Some(_), Some(_)) => {
                 return Err(
-                    CreateComponentErrorModeled::InvalidParameterValueException(
-                        InvalidParameterValueException {
+                    CreateComponentErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
                             message: Some(crate::state::component_data_or_uri_message()),
                         },
                     )

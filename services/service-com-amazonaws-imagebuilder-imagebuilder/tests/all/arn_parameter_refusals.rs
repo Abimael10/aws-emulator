@@ -238,35 +238,22 @@ async fn a_constraint_class_this_service_states_no_requirement_for_keeps_the_fra
 
     // The control: this service states a requirement for the constraint classes its
     // recorded refusals establish one for (a pattern, a numeric bound, an enumerated value
-    // set). A class they do not — a string past a `@length` maximum, a member the shape
-    // requires and the request omits — is left to the framework's own refusal rather than
-    // being given a clause this service has never been seen to state.
-    let rows: Vec<ControlRow> = vec![
-        (
-            "a description past its modelled length maximum",
-            "PUT",
-            "/CreateComponent".to_string(),
-            Some(json!({
-                "name": "control-component",
-                "semanticVersion": "1.0.0",
-                "platform": "Linux",
-                "clientToken": "ctrl-0001",
-                "description": "d".repeat(1025),
-                "data": "name: Control\nschemaVersion: 1.0\n",
-            })),
-        ),
-        (
-            "a member the shape requires and the request omits",
-            "PUT",
-            "/CreateComponent".to_string(),
-            Some(json!({
-                "name": "control-component",
-                "platform": "Linux",
-                "clientToken": "ctrl-0002",
-                "data": "name: Control\nschemaVersion: 1.0\n",
-            })),
-        ),
-    ];
+    // set). A class they do not — a string past a `@length` maximum — is left to the
+    // framework's own refusal rather than being given a clause this service has never been
+    // seen to state.
+    let rows: Vec<ControlRow> = vec![(
+        "a description past its modelled length maximum",
+        "PUT",
+        "/CreateComponent".to_string(),
+        Some(json!({
+            "name": "control-component",
+            "semanticVersion": "1.0.0",
+            "platform": "Linux",
+            "clientToken": "ctrl-0001",
+            "description": "d".repeat(1025),
+            "data": "name: Control\nschemaVersion: 1.0\n",
+        })),
+    )];
 
     for (case, method, uri, body) in &rows {
         let (status, code, message) = call(&router, case, method, uri, body.as_ref()).await;
@@ -279,4 +266,36 @@ async fn a_constraint_class_this_service_states_no_requirement_for_keeps_the_fra
             "case {case:?}: expected the framework's own refusal, got {code:?}: {message}"
         );
     }
+
+    // A member the shape REQUIRES and the request omits is not one of those classes: there
+    // is no value to state a requirement about, so the refusal is about the request as a
+    // whole and names the properties it had to carry.
+    let case = "a member the shape requires and the request omits";
+    let (status, code, message) = call(
+        &router,
+        case,
+        "PUT",
+        "/CreateComponent",
+        Some(&json!({
+            "name": "control-component",
+            "platform": "Linux",
+            "clientToken": "ctrl-0002",
+            "data": "name: Control\nschemaVersion: 1.0\n",
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with {code}: {message}"
+    );
+    assert_eq!(
+        code, "InvalidRequestException",
+        "case {case:?}: expected the request-level refusal, got {code:?}: {message}"
+    );
+    assert_eq!(
+        message,
+        "Your request is invalid. Request must contain ['semanticVersion'] properties. Verify \
+         your request and try again.",
+        "case {case:?}: expected the properties the request had to carry, got {message:?}"
+    );
 }

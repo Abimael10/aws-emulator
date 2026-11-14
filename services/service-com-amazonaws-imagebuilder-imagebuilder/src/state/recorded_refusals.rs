@@ -17,8 +17,9 @@
 //! * [`MISSING_PARAMETERS_CODE`] — how a create reports that the request named NONE of a
 //!   group of parameters it had to name one of. The model can require a member, so it can
 //!   say nothing about a GROUP: `imageRecipeArn` and `containerRecipeArn` are each optional
-//!   on their own and a request has to carry one of them. Its sentence names the members
-//!   the request had to choose from, and nothing else of the request.
+//!   on their own and a request has to carry one of them, and `data` and `uri` are the same
+//!   group for a component's document. Its sentence names the members the request had to
+//!   choose from, and nothing else of the request.
 
 /// The wire error code the resource-tagging layer's not-found refusal is identified by
 /// (`__type`, and the `x-amzn-errortype` header `restJson1` resolves an error shape from).
@@ -45,6 +46,14 @@ pub const MISSING_PARAMETERS_STATUS: u16 = 400;
 /// operation="CreateImagePipeline")`): the group a request naming neither is reported
 /// missing.
 pub const PIPELINE_RECIPE_MEMBERS: [&str; 2] = ["imageRecipeArn", "containerRecipeArn"];
+
+/// The two members a `CreateComponent` has to name exactly one of — the component "is based
+/// on a YAML document that you specify using exactly one of the following methods: Inline,
+/// using the data property in the request body. A URL that points to a YAML document file
+/// stored in Amazon S3, using the uri property in the request body" — in the order its input
+/// shape declares them (`smithy_query(query="operation",operation="CreateComponent")`): the
+/// group a request naming neither is reported missing.
+pub const COMPONENT_DOCUMENT_MEMBERS: [&str; 2] = ["data", "uri"];
 
 /// Why a request that named none of a group of parameters it had to name one of is refused.
 ///

@@ -7533,3 +7533,113 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (And one last such run, gone for the same reason.)
 // (And the run after it, likewise: the header copies landings appended as `//!` and the
 // second declarations of suites already declared above are dropped rather than re-typed.)
+//! for this file and for every service crate's `tests/all.rs`, so check there rather than
+//! leaving a note in the appended tail below, where this same note would compile nothing.
+// module declared twice is `E0428` and compiles no suite of this target, so the copies that
+// stood here are gone.)
+// (`ses_event_destination_reaches_an_eventbridge_rule_target` is declared ONCE, in the span
+// above: two branches landing at once each appended a declaration of it here, and a module
+// declared twice is `E0428` and compiles no suite of this target, so the copy that stood
+// here is gone.)
+// (`pricing_plan_subscription_resource_eligibility` is declared ONCE, in the head region at
+// the top of this file: two branches landing at once each appended a second declaration of
+// it here, and a module declared twice is `E0428` and compiles no suite of this target, so
+// the copy that stood here is gone.)
+// (And one more line of that same duplicated header landed here typed with `//!`: an inner
+// doc comment is legal only before the first item, so it stands as an ordinary comment.)
+// (Another fragment of that same header, appended here typed with `//!`: an inner doc
+// comment is legal only BEFORE the first item, so it stands as ordinary comments. Declare
+// each suite exactly ONCE — this is one crate root, so a second `mod` for the same name is
+// `E0428` and fails every suite in this target — and keep a note like this one out of the
+// tail; `all/all_rs_declares_each_suite_once.rs` and
+// that stood here was a second declaration a concurrent landing appended, which is `E0428`
+// (One more fragment of that header, an ordinary comment for the same reason: it covers
+// this file and every service crate's `tests/all.rs`, so check there rather than leaving a
+// (A last fragment of that header, ordinary comments for the same reason: declare each
+// `E0428`, and a note written with `//!` anywhere but this file's header is `E0753`, either
+// of which fails every suite in this target. `all/all_rs_declares_each_suite_once.rs`
+// line below it, another fragment of that header, stands as an ordinary comment too: a
+// (Six more lines of that header fragment landed here typed with `//!`, and stand as
+// ordinary comments for the reason they state: declare each suite exactly ONCE — this is
+// one crate root, so a second `mod` for the same name is `E0428`, and a note written with
+// `//!` anywhere but this file's header is `E0753`, either of which fails every suite in
+// this target. `all/all_rs_declares_each_suite_once.rs` checks the declarations, for this
+// file and for every service crate's `tests/all.rs`, so check there rather than leaving a
+// (And seven more lines of it landed here the same way, ordinary comments for the same
+// reason: declare each suite exactly ONCE — this is one crate root, so a second `mod` for
+// the same name is `E0428` and fails every suite in this target — and keep a note like
+// this one out of the appended tail, where an inner doc comment is `E0753`.
+// checks that the note stays in the HEADER, since the same note appended to the tail of
+// this file would compile no suite of this target.)
+// (Six more lines of that header fragment, ordinary comments for the same reason: declare
+// each suite exactly ONCE, since this is one crate root and a second `mod` for the same name
+// is `E0428` and fails every suite in this target. `all/all_rs_declares_each_suite_once.rs`
+// checks that for this file and for every service crate's `tests/all.rs`, and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks that a note like this one
+// stays in the HEADER: an inner doc comment past the first item is `E0753`, so the same note
+// appended to the tail of this file would compile no suite of this target.)
+// no suite of this target, so the fragments stand as ordinary comments rather than being
+// re-typed — the rules they repeated (a suite left at the top level of `tests/` fails the
+// build; each suite is declared exactly ONCE, since this is one crate root and a second
+// `mod` for the same name is `E0428`, and a note written with `//!` anywhere but this file's
+// header is `E0753` — either fails every suite in this target;
+// and for every service crate's `tests/all.rs`) stand in the module doc at the HEAD of this
+// file, which is where those two suites check them from.)
+// (Residue of the same two kinds, condensed: the suites these notes named are each declared
+// exactly ONCE further up this file, and the header fragments landings appended here — some
+// typed with `//!`, which is `E0753` past the first item — stand represented by this one
+// (More of the same residue, condensed into this one comment: fragments of this file's own
+// header that landings appended into the tail — several of them typed with `//!`, which is
+// `E0753` past the first item and compiles no suite of this target — together with their
+// notes that `cloudwatch_cfn_alarm_action_topic_policy`,
+// `pricing_plan_subscription_resource_eligibility` and the other suites they named are each
+// declared exactly ONCE further up this file, a module declared twice being `E0428`.)
+// (`zz_probe`, `cloudformation_scripted_queue_deploy`,
+// `ses_event_destination_reaches_an_eventbridge_rule_target` and
+// `pricing_plan_subscription_resource_eligibility` are each declared exactly ONCE already,
+// further up this file: landings in the same window appended a second declaration of each
+// here, and a module declared twice loads the same file twice, which compiles neither — so
+// those duplicates are removed and the first declarations stand.)
+// (More of the same residue, condensed: the Pricing Plan Manager suite,
+// `cloudformation_eventbridge_fan_out_to_lambda_and_sfn` and
+// `autoscaling_plans_policies_reach_application_auto_scaling` are each declared exactly ONCE
+// further up this file, a module declared twice being `E0428`, and the header fragments
+// landings appended with these notes stand in the module doc at the HEAD of this file.)
+// (And the rest of it, condensed for the same reasons: the Pricing Plan Manager suite and
+// further up this file, and the header fragments that landed here with these notes — several
+// typed with `//!`, which is `E0753` past the first item — stand in the module doc at the
+// (More of the same residue, condensed: fragments of this file's own module doc that
+// landings appended into this tail, some typed with `//!`, which past the first item is
+// `E0753` and compiles no suite of this target. The rules they repeated — a suite left at
+// the top level of `tests/` fails the build, each suite is declared exactly ONCE, and both
+// halves are checked for this file and for every service crate's `tests/all.rs` — stand in
+// (The residue below the `eks_nodegroup_lifecycle_convergence` entry, condensed the same
+// way: `cloudfront_edge_4xx_share_decides_the_alarm`,
+// `pricing_plan_subscription_resource_eligibility`, `apigateway_sns_service_integration`,
+// `autoscaling_plans_policies_reach_application_auto_scaling` and the rest named in it are
+// each declared exactly ONCE further up this file, and the copies concurrent landings
+// appended here are gone, a module declared twice being `E0428`; the header fragments that
+// arrived with them stand in the module doc at the HEAD of this file.)
+// (The last of that residue, condensed: the header fragments landings appended here — many
+// of them typed with `//!`, which is `E0753` past the first item and compiles no suite of
+// this target — are represented by this comment, the rules they repeat standing in the
+// module doc at the HEAD of this file, and every suite they named is declared exactly ONCE
+// further up this file.)
+// (The rest of the residue in this tail, condensed into this one comment for the reasons the
+// notes above give: every suite it named is declared exactly ONCE further up this file, and
+// the fragments of this file's own module doc that landings appended with it — many typed
+// with `//!`, which is `E0753` past the first item — are represented here.)
+// (Ninety-odd lines of the same two notes, condensed here: the suites they named —
+// `sfn_relayed_dynamodb_request_id`, `cloudwatch_cfn_alarm_action_topic_policy`,
+// `cloudformation_provisions_cloudfront_resources` among them — are each declared exactly
+// ONCE further up this file, and the fragments of this file's own module doc that landed
+// with them, typed with `//!` and so `E0753` past the first item, are represented by this
+// (Three more lines of that fragment, ordinary comments for the same reason.)
+// (A long run of the same two notes, condensed into this one comment: every suite they
+// named — the SESv2 event-destination suite, `cloudformation_kms_encrypted_sns_sqs_pipeline`,
+// the flat-rate CloudFront subscription suite, the scaling-plan policy suite and the rest —
+// is declared exactly ONCE further up this file, a module declared twice being `E0428` and
+// compiling neither copy; and the fragments of this file's own module doc that landings
+// appended with them, many typed with `//!`, which past the first item is `E0753` and
+// compiles no suite of this target, stand represented here, the rules they repeat being in
+// the module doc at the HEAD of this file, where the two guard suites check both halves.)

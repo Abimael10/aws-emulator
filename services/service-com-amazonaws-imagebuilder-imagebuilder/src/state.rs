@@ -153,6 +153,10 @@ pub use image_pipeline_listing::*;
 mod infrastructure_configuration_update;
 pub use infrastructure_configuration_update::*;
 
+/// How a resource this store holds is forgotten. The module adds methods to this service's
+/// state rather than items of its own, so there is nothing to re-export from it.
+mod removals;
+
 use crate::ops::types::{
     AdditionalInstanceConfiguration, AmiDistributionConfiguration, Component,
     ComponentConfiguration, ComponentParameterDetail,
@@ -2384,11 +2388,13 @@ pub fn image_recipe_platform(components_target: Option<&str>, parent_image: &str
 ///
 /// `parentImage` is "AMI ID", an "Image Builder image Amazon Resource Name (ARN)", an
 /// "Amazon Web Services Systems Manager (SSM) Parameter Store Parameter" or a
-/// "Marketplace product ID" (the modelled member's own list). None of those is resolved
-/// against EC2 by anything in this emulator, so what is read is the reference itself: the
-/// Windows and macOS images a recipe builds from name their operating system in the image
-/// or parameter name, and the remaining value of the modelled `Platform` enum is the one
-/// every other base image carries.
+/// "Marketplace product ID" (the modelled member's own list). Whether the image EXISTS is a
+/// separate question, asked where the create resolves it ([`parent_image_reachable`]); what
+/// a platform is read from is the reference itself, because nothing this emulator can ask
+/// reports the operating system of the image behind it: the Windows and macOS images a
+/// recipe builds from name their operating system in the image or parameter name, and the
+/// remaining value of the modelled `Platform` enum is the one every other base image
+/// carries.
 #[must_use]
 pub fn parent_image_platform(reference: &str) -> String {
     let named = reference.to_ascii_lowercase();
@@ -4230,9 +4236,26 @@ pub fn component_document_message(member: &str, why: &str) -> String {
 /// Names the ARN the request asked to delete and the fact that something else depends on
 /// it, and nothing about the resources that do: what the caller has to act on is that the
 /// delete cannot proceed while a reference stands.
+///
+/// The sentence the components, recipes, pipelines, images and workflows carry, and the
+/// distribution configuration with them; the INFRASTRUCTURE configuration carries
+/// [`configuration_dependency_message`] instead.
 #[must_use]
 pub fn resource_dependency_message(arn: &str) -> String {
     format!("Resource dependency error: The resource ARN '{arn}' has other resources depended on it.")
+}
+
+/// Why a delete of an INFRASTRUCTURE configuration an image pipeline still references is
+/// refused.
+///
+/// "You can't delete a configuration that an image pipeline still references. The request
+/// fails with `ResourceDependencyException`" — stated in the wording that resource carries:
+/// the ARN the request asked to delete, and that resources depend on it. Its sibling the
+/// distribution configuration carries [`resource_dependency_message`], as every other
+/// resource of this service does.
+#[must_use]
+pub fn configuration_dependency_message(arn: &str) -> String {
+    format!("The resource ARN '{arn}' has dependent resources")
 }
 
 /// Why a create whose components do not agree on one platform is refused.
@@ -4355,12 +4378,18 @@ pub fn incomplete_filter_message() -> String {
     "Each filter must specify a name and one or more values.".to_string()
 }
 
-/// Why a call naming a resource this Region holds nothing under reports it missing.
+/// Why a call naming a resource of this service's AUTHORING and BUILD resources that this
+/// Region holds nothing under reports it missing.
 ///
 /// Names the resource TYPE the request needed and the ARN it named, and nothing about any
 /// resource that does exist. The type token is the kind the ARN itself names
-/// ([`arn_resource_type`]), so one wording serves every lookup: the resource an operation
-/// acts on, and a resource a create has to resolve a reference to.
+/// ([`arn_resource_type`]).
+///
+/// WHICH of this service's two missing-resource sentences a call carries follows the FAMILY
+/// of the resource, not what the call does with it: the components, recipes, pipelines,
+/// images and workflows are reported this way, whether the call reads one, deletes one or
+/// resolves a reference to one, while the two CONFIGURATION resources are reported by
+/// [`resource_arn_not_found_message`].
 #[must_use]
 pub fn required_resource_not_found_message(arn: &str) -> String {
     missing_resource_message(&arn_resource_type(arn), arn)
@@ -4376,6 +4405,18 @@ pub fn required_resource_not_found_message(arn: &str) -> String {
 #[must_use]
 pub fn missing_resource_message(resource_type: &str, identifier: &str) -> String {
     format!("The following required resource '{resource_type}' cannot be found: '{identifier}'.")
+}
+
+/// Why a call naming an infrastructure or distribution CONFIGURATION this Region holds
+/// nothing under reports it missing.
+///
+/// The sentence the two configuration resources carry, for a read of one and for its delete
+/// alike: it quotes the ARN the request carried and names no kind. The resources of every
+/// other family are reported by [`required_resource_not_found_message`] instead — see the
+/// note there.
+#[must_use]
+pub fn resource_arn_not_found_message(arn: &str) -> String {
+    format!("The resource ARN '{arn}' was not found.")
 }
 
 /// The resource-type token a missing-resource report names the resource `arn` identifies

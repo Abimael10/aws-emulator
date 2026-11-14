@@ -53,6 +53,8 @@ mod parameter_value_refusals;
 mod parent_image_and_dependencies;
 #[path = "all/recipe_group_and_pipeline_listing.rs"]
 mod recipe_group_and_pipeline_listing;
+#[path = "all/resource_delete_lifecycle.rs"]
+mod resource_delete_lifecycle;
 #[path = "all/resource_not_found.rs"]
 mod resource_not_found;
 #[path = "all/resource_policy_kinds.rs"]

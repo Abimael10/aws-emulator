@@ -20,10 +20,13 @@
 //! * A delete removes the record and reports the ARN it removed, and a component a
 //!   stored recipe still includes is not removed at all.
 //!
-//! None of the EC2 values a recipe names is resolved at create time — a parent image is
-//! "AMI ID", an "Image Builder image Amazon Resource Name (ARN)", an SSM parameter or a
-//! Marketplace product id, none of which any other service in this emulator holds — so
-//! the rows below name values nothing else knows and still expect a 200.
+//! A parent image is "AMI ID", an "Image Builder image Amazon Resource Name (ARN)", an SSM
+//! parameter or a Marketplace product id. An AMI ID is RESOLVED at create time against the
+//! account's own Amazon EC2, and the other forms against nothing — no EC2 is mounted beside
+//! this service here, so no lookup is answered and nothing about the image is established, so
+//! the rows below name values in a documented form and still expect a 200. What a value in
+//! NO documented form earns, and what an AMI ID Amazon EC2 reports missing earns, is
+//! `crate::resource_delete_lifecycle`'s.
 
 use std::sync::Arc;
 
@@ -768,7 +771,7 @@ async fn a_create_this_service_cannot_serve_is_refused_the_documented_way() {
                 json!({"uri": "s3://bucket/key.yaml"}),
             ),
             400,
-            "InvalidParameterValueException",
+            "InvalidParameterCombinationException",
         ),
         (
             "a component naming neither data nor uri",
@@ -779,7 +782,7 @@ async fn a_create_this_service_cannot_serve_is_refused_the_documented_way() {
                 "clientToken": "rtok-0002",
             }),
             400,
-            "InvalidParameterValueException",
+            "MissingParametersException",
         ),
         (
             "a component version one past the documented bound",
@@ -1214,7 +1217,7 @@ async fn listing_reports_the_stored_recipes_filtered_and_paginated() {
             "1.0.0",
             "ltok-0002",
             json!({
-                "parentImage": "ami-ffffffffffffffffff",
+                "parentImage": "ami-0fedcba987654321f",
                 "components": [{"componentArn": windows_build}],
             }),
         ),
@@ -1362,7 +1365,7 @@ async fn listing_reports_the_stored_recipes_filtered_and_paginated() {
         ),
         (
             "the parentImage filter",
-            json!({"filters": [{"name": "parentImage", "values": ["ami-ffffffffffffffffff"]}]}),
+            json!({"filters": [{"name": "parentImage", "values": ["ami-0fedcba987654321f"]}]}),
             vec![recipe_arn(REGION, "beta-recipe", "1.0.0")],
         ),
         (

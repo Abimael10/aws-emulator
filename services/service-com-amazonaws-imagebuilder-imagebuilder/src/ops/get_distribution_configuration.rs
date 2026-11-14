@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetDistributionConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::required_resource_not_found_message(
+                        message: Some(crate::state::resource_arn_not_found_message(
                             &input.distribution_configuration_arn,
                         )),
                     },

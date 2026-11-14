@@ -3,11 +3,10 @@
 //! @op DeleteImageRecipe
 //!
 //! Forgets the image recipe this service's state holds and echoes the ARN it removed.
-//! Once it is gone, the components it included can themselves be deleted. An ARN nothing
-//! is stored under, and one of another Region, delete nothing — which is reported MISSING,
-//! as the not-found error this service models for a resource its request references and
-//! it does not hold, so a repeat of a delete that already succeeded is reported the same
-//! way.
+//! Once it is gone, the components it included can themselves be deleted. An ARN nothing is
+//! stored under, and one of another Region, delete nothing — which is reported MISSING, as
+//! the not-found error this service models for a resource its request references and it does
+//! not hold, so a repeat of a delete that already succeeded is reported the same way.
 //!
 //! A recipe another stored resource still REFERENCES is not removed at all:
 //! `ResourceDependencyException` is the modelled answer for "a resource with a dependency
@@ -212,7 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A recipe an image pipeline still references is not removed: the pipeline's
         // reference is what each of its runs builds, so while it stands the recipe is in
-        // use.
+        // use. The dependency a build of that pipeline resolves is what is asked about, so a
+        // WILDCARD reference that reaches this version counts
+        // ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::pipeline_depending_on_image_recipe`]).
         if store
             .pipeline_depending_on_image_recipe(&input.image_recipe_arn)
             .is_some()
