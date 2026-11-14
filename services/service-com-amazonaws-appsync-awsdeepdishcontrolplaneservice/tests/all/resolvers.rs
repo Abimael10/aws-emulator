@@ -53,10 +53,10 @@ use super::error_contract::{call, create_api, router, Answer};
 use super::functions::{create_data_source, create_function, rows as function_rows, RUNTIME};
 
 /// The name of the one data source the seeded resolvers resolve against.
-const DATA_SOURCE: &str = "ds_resolvers";
+pub(crate) const DATA_SOURCE: &str = "ds_resolvers";
 
 /// The type whose fields the seeded resolvers are attached to.
-const TYPE: &str = "Query";
+pub(crate) const TYPE: &str = "Query";
 
 /// A second type of the same API, so a listing of one type is not a listing of the API.
 const OTHER_TYPE: &str = "Mutation";
@@ -250,7 +250,7 @@ fn request_body(row: &Row, field: &str, function_id: &str) -> Value {
 }
 
 /// Send one `CreateResolver` for `body` on the type `type_name`.
-async fn create_resolver_body(
+pub(crate) async fn create_resolver_body(
     router: &MultiServiceRouter,
     api_id: &str,
     type_name: &str,
@@ -266,7 +266,7 @@ async fn create_resolver_body(
 }
 
 /// Read one resolver back by the type and field it is attached to.
-async fn get_resolver(
+pub(crate) async fn get_resolver(
     router: &MultiServiceRouter,
     api_id: &str,
     type_name: &str,
@@ -434,7 +434,10 @@ fn listed_fields(listed: &[Value]) -> Vec<String> {
 
 /// One API with the data source and the function the table's rows need, and the id of
 /// that function.
-async fn api_with_dependencies(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn api_with_dependencies(
+    router: &MultiServiceRouter,
+    name: &str,
+) -> (String, String) {
     let api_id = create_api(router, name).await;
     create_data_source(router, &api_id, DATA_SOURCE).await;
     let created = create_function(router, &api_id, DATA_SOURCE, &function_rows()[0]).await;

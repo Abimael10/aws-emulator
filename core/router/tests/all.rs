@@ -4190,3 +4190,7 @@ mod cloudformation_appsync_custom_domains;
 // as ordinary comments rather than as a repeated header.
 // leaving a note here. (A plain comment: a `//!` line past the first item of this crate
 // root is `E0753` and compiles nothing.)
+// comment past the first item is `E0753` and compiles no suite of this target.)
+// note written with an inner doc comment anywhere but this file's header is `E0753` —
+// either fails every suite in this target. `all/all_rs_declares_each_suite_once.rs`
+// checks the declarations, for this file and for every service crate's `tests/all.rs`.

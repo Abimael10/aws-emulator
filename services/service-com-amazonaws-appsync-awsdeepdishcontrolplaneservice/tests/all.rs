@@ -123,6 +123,8 @@ mod graphql_types;
 mod identity_authorization;
 #[path = "all/introspection_schema.rs"]
 mod introspection_schema;
+#[path = "all/introspection_schema_absence_classification.rs"]
+mod introspection_schema_absence_classification;
 #[path = "all/list_apis.rs"]
 mod list_apis;
 #[path = "all/list_types_sdl_layout.rs"]
@@ -135,6 +137,8 @@ mod merged_api_association_topology;
 mod merged_api_disassociation;
 #[path = "all/plane_dependency_refusals.rs"]
 mod plane_dependency_refusals;
+#[path = "all/resolver_definition_pairing.rs"]
+mod resolver_definition_pairing;
 #[path = "all/resolvers.rs"]
 mod resolvers;
 #[path = "all/resource_tags.rs"]

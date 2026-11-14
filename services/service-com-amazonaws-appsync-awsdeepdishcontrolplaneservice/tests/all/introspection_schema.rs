@@ -66,16 +66,16 @@ const OUTPUT_TYPES: &[&str] = &["SDL", "JSON"];
 /// response body, because the schema is an `@httpPayload` blob rather than a JSON
 /// document.
 #[derive(Debug, Clone)]
-struct SchemaAnswer {
-    status: u16,
+pub(crate) struct SchemaAnswer {
+    pub(crate) status: u16,
     /// The `x-amzn-errortype` header restJson1 resolves the error shape from.
-    error_type: String,
+    pub(crate) error_type: String,
     payload: Vec<u8>,
 }
 
 impl SchemaAnswer {
     /// The payload as the text the schema was rendered as.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.payload).into_owned()
     }
 
@@ -85,7 +85,7 @@ impl SchemaAnswer {
     }
 
     /// The `message` of the refusal the payload carries.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         let body = self.json();
         body["message"]
             .as_str()
@@ -96,7 +96,11 @@ impl SchemaAnswer {
 }
 
 /// Read the introspection schema of `api_id`, with `query` as the request's query string.
-async fn get_schema(router: &MultiServiceRouter, api_id: &str, query: &str) -> SchemaAnswer {
+pub(crate) async fn get_schema(
+    router: &MultiServiceRouter,
+    api_id: &str,
+    query: &str,
+) -> SchemaAnswer {
     let request = http::Request::builder()
         .method("GET")
         .uri(format!(
