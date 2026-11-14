@@ -11,9 +11,10 @@
 //! The rules under test, each over a TABLE spanning the class it generalises over
 //! rather than over one recorded request:
 //!
-//! 1. A destination a reservation returns ACCEPTS the upload: an unsigned `PUT` to it
-//!    answers HTTP 200, whatever the reservation asked to upload (one zipped
-//!    deployment, or one file per name) and whatever the content is.
+//! 1. A destination a reservation returns ACCEPTS the upload: it is a PRESIGNED URL on
+//!    the base this emulator publishes, and an unsigned `PUT` to it answers HTTP 200,
+//!    whatever the reservation asked to upload (one zipped deployment, or one file per
+//!    name) and whatever the content is.
 //! 2. What a reserved deployment deploys is what was UPLOADED to those destinations:
 //!    the job settles to `SUCCEED` and publishes the files the upload carries when
 //!    they make up a servable site, and to `FAILED` with the reason when they do not —
@@ -48,6 +49,30 @@ use crate::app_branch_lifecycle::{list_member, string_member, Emulator, Reply, R
 /// `UploadUrl`'s modelled maximum length, which every destination has to fit in
 /// (`smithy_query(query="shape",shape="UploadUrl")`: `length 0..1000`).
 const UPLOAD_URL_MAX: usize = 1000;
+
+/// The base this emulator publishes for the URLs it hands out.
+///
+/// This harness mounts the router without serving it on a port, so the base it signs for
+/// is the framework's own unserved base (`smithy_server_runtime::UNSERVED_URL_BASE`); a
+/// served emulator signs for its data port instead. Either way the rule is the one
+/// asserted here — a destination is on the base THIS emulator publishes, never on a host
+/// only AWS serves.
+const EMULATOR_BASE: &str = smithy_server_runtime::UNSERVED_URL_BASE;
+
+/// The query fields a SigV4 query-presigned URL carries, which is what makes a
+/// destination followable with no `Authorization` header of its own.
+///
+/// Source: the SigV4 query-signing fields (`X-Amz-Algorithm`, `X-Amz-Credential`,
+/// `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-SignedHeaders`, `X-Amz-Signature`), which is
+/// what AWS's own presigned upload destinations carry.
+const PRESIGNING_QUERY_FIELDS: &[&str] = &[
+    "X-Amz-Algorithm",
+    "X-Amz-Credential",
+    "X-Amz-Date",
+    "X-Amz-Expires",
+    "X-Amz-SignedHeaders",
+    "X-Amz-Signature",
+];
 
 /// The terminal status of a deployment whose files were read and published.
 const SUCCEED: &str = "SUCCEED";
@@ -433,20 +458,28 @@ async fn an_upload_destination_accepts_the_upload_and_the_deployment_deploys_it(
             .to_string();
         let per_file = file_upload_urls(&reserved);
 
-        // Every destination addresses THIS emulator — the endpoint the reserving call
-        // was made to — and is inside the modelled bound.
+        // Every destination is a PRESIGNED URL on the base THIS emulator publishes, and
+        // is inside the modelled bound.
         for url in per_file
             .iter()
             .map(|(_, url)| url)
             .chain(if zip_url.is_empty() { None } else { Some(&zip_url) })
         {
             assert!(
-                url.starts_with(&format!("https://amplify.{REGION}.amazonaws.com/"))
+                url.starts_with(&format!("{EMULATOR_BASE}/apps/"))
                     && url.len() <= UPLOAD_URL_MAX,
-                "case {:?}: a destination must address the endpoint the caller reached, \
-                 in at most {UPLOAD_URL_MAX} characters, got {url:?}",
+                "case {:?}: a destination must address this emulator's own base, in at \
+                 most {UPLOAD_URL_MAX} characters, got {url:?}",
                 row.case
             );
+            for field in PRESIGNING_QUERY_FIELDS {
+                assert!(
+                    url.contains(&format!("{field}=")),
+                    "case {:?}: a destination is followed with no credential, so it must \
+                     carry the presigning field {field}, got {url:?}",
+                    row.case
+                );
+            }
             assert!(
                 seen.insert(url.clone()),
                 "case {:?}: every upload has its OWN destination, got the repeated {url:?}",

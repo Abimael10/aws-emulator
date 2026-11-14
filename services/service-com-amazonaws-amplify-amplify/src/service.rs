@@ -46,16 +46,15 @@
 //! be FOLLOWED: the documented manual-deployment contract is that the caller uploads
 //! the site to the URL that call returned and then calls `StartDeployment` with the
 //! `jobId` it returned. The destinations it mints
-//! (`crate::state::deployment_upload_url`) therefore address the endpoint the reserving
-//! caller reached, under the reservation's own path
+//! (`crate::state::deployment_upload_url`) are therefore PRESIGNED against the base this
+//! emulator publishes, under the reservation's own path
 //! (`/apps/<appId>/deployments/<jobId>/uploads/<token>`) — a path the model binds no
 //! operation to, so it reaches this file twice:
 //!
 //! - [`Service::can_handle`] also claims a request to an upload path naming a
 //!   reservation THIS store holds, so following the URL routes back here even when
-//!   nothing else in the request names a service (an upload URL is followed WITHOUT a
-//!   signature, as a presigned URL is, and a loopback endpoint host names no service at
-//!   all).
+//!   nothing else in the request names a service (a presigned URL is followed with no
+//!   `Authorization` header, and a loopback endpoint host names no service at all).
 //! - [`Service::override_routing_error`] serves it: that seam is reached BEFORE
 //!   authentication precisely for requests that name no modelled operation, which is
 //!   what makes an unsigned `PUT` to a minted URL work.

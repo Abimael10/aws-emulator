@@ -286,27 +286,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let summary = JobSummary {
             job_arn: crate::state::job_arn(&branch_arn, &job_id),
-            // A manual deployment deploys content, not a commit of a repository: each
-            // member is @required on `JobSummary` with a length minimum of 0, so the
-            // job carries the empty value rather than none — and `commitTime` has no
-            // empty value, so it records the instant the deployment was started.
+            // A manual deployment deploys content, not a commit of a repository, so this
+            // job has no commit information to report; `commitId` and `commitMessage`
+            // are @required with a length minimum of 0 and `commitTime` is a timestamp,
+            // so the record holds each type's one value for "nothing" and the projection
+            // reports none of them (see `JobSummaryProjection::deploying`).
             commit_id: String::new(),
             commit_message: String::new(),
             commit_time: started,
+            // The instant the deployment's work is timed from, reported once that work
+            // has run rather than while the job is still queued.
             start_time: started,
             // Nothing has been deployed yet: the job is PENDING, it has no end, and the
             // clock settles it (see `crate::state::BranchJob::settle`).
             status: crate::state::JOB_STATUS_PENDING.to_string(),
             end_time: None,
-            // "If the value is MANUAL, the job is for a manually deployed app"
-            // (`smithy_query(query="shape",shape="JobSummary",member="jobType")`), which
-            // is the only kind of app this operation deploys.
-            job_type: MANUAL_JOB_TYPE.to_string(),
+            // `jobType` names which kind of job a repository build ran — `MANUAL`,
+            // `RELEASE`, `RETRY` or `WEB_HOOK`
+            // (`smithy_query(query="shape",shape="JobSummary",member="jobType")`) — and a
+            // deployment of content is none of them, so this job reports no type, the
+            // same way it reports no commit.
+            job_type: String::new(),
             // The source the files came from, as the request named it — echoed rather
-            // than rewritten, so a prefix the caller wrote without its separator is
-            // reported the way it was sent. A deployment started from a reservation
-            // names no URL: its content was uploaded to the destinations that
-            // reservation handed out.
+            // than rewritten, so a location the caller wrote is reported the way it was
+            // sent. A deployment started from a reservation names no URL: its content was
+            // uploaded to the destinations that reservation handed out.
             source_url,
             source_url_type,
             job_id,
@@ -314,16 +318,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let deployed_assets = deployment.assets();
         let publishes = deployment.publishes();
-        branch.jobs.insert(
-            summary.job_id.clone(),
-            crate::state::BranchJob::settling(summary.clone(), deployment.conclusion, deployed_assets),
-        );
+        let record =
+            crate::state::BranchJob::deploying(summary, deployment.conclusion, deployed_assets);
+        let job_id = record.job.summary.job_id.clone();
+        let answer = record.job.summary.clone();
+        branch.jobs.insert(job_id.clone(), record);
         // The files go LIVE when the deployment's job reaches its terminal status, not
         // when this call answers, so they are staged on the branch and published by the
         // settling the clock owes that job (see `crate::state::AmplifyBranch::settle`).
         // A deployment that ends FAILED publishes nothing and leaves the site as it was.
         if publishes {
-            branch.stage_site(&summary.job_id, deployment.files);
+            branch.stage_site(&job_id, deployment.files);
         }
 
         // The branch's own view of its jobs: the deployment just started is the active
@@ -331,12 +336,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `activeJobId` IDENTIFIES that job rather than reporting its number, so it
         // carries the fixed-width form the job's ARN segment carries
         // (`crate::state::padded_job_number`).
-        branch.branch.active_job_id = crate::state::padded_job_number(&summary.job_id);
+        branch.branch.active_job_id = crate::state::padded_job_number(&job_id);
         branch.branch.total_number_of_jobs = branch.jobs_started().to_string();
 
-        Ok(StartDeploymentOutput {
-            job_summary: JobSummaryProjection::executed(summary),
-        })
+        // The summary of the job just recorded, so this call and every later read of that
+        // job report it the same way.
+        Ok(StartDeploymentOutput { job_summary: answer })
     }
 }
 
@@ -395,6 +400,10 @@ impl Source {
 /// handed out: a `jobId` whose reservation holds no upload is refused with the same
 /// modelled 400, carrying [`DEPLOYMENT_FILE_NOT_UPLOADED`], so the upload step cannot
 /// be skipped silently.
+///
+/// A `BUCKET_PREFIX` source names a FOLDER of a bucket, so a source URL that does not end
+/// in the path separator names something else and takes the same modelled 400, carrying
+/// [`PREFIX_WITHOUT_TRAILING_SEPARATOR`].
 fn source_of(
     input: &StartDeploymentInput,
     branch: &crate::state::AmplifyBranch,
@@ -451,15 +460,19 @@ fn source_of(
     };
 
     if url_type == SOURCE_URL_TYPE_BUCKET_PREFIX {
-        // A prefix addresses the FOLDER the deployment's files sit in, so an asset's
-        // path is its key under that folder: a prefix the request wrote without the
-        // separator addresses the same folder as one that wrote it.
-        let prefix = if path.is_empty() || path.ends_with('/') {
-            path
-        } else {
-            format!("{path}/")
-        };
-        return Ok(Source::Prefix { bucket, prefix });
+        // A prefix addresses the FOLDER the deployment's files sit in, and Amplify takes
+        // such a location only as a folder: a `BUCKET_PREFIX` source URL that does not
+        // end in the path separator names an object instead, and is refused with the
+        // modelled 400 ("A request contains unexpected data") BEFORE a job exists —
+        // nothing here guesses the separator onto it, because the prefix a caller meant
+        // is not recoverable from a location that names something else.
+        if !source_url.ends_with('/') {
+            return Err(bad_request(PREFIX_WITHOUT_TRAILING_SEPARATOR));
+        }
+        return Ok(Source::Prefix {
+            bucket,
+            prefix: path,
+        });
     }
     Ok(Source::Archive { bucket, key: path })
 }
@@ -1206,6 +1219,15 @@ pub const DEPLOYMENT_FILE_NOT_UPLOADED: &str =
 pub const PREFIX_WITHOUT_ROOT_DOCUMENT: &str =
     "The bucket must have an index.html file at the path provided in the sourceUrl";
 
+/// What a `BUCKET_PREFIX` deployment is refused with when its source URL does not end in
+/// the path separator, so the Amazon S3 location it names is an object rather than the
+/// folder a prefix source has to name.
+///
+/// The ONE sentence recorded behaviour words this modelled 400 with: entirely fixed
+/// text, including the quotes around the separator, carrying nothing from the request or
+/// from the store.
+pub const PREFIX_WITHOUT_TRAILING_SEPARATOR: &str = "The s3 sourceUrl must end with '/'";
+
 /// What a `ZIP` deployment is refused with when the source URL names an object the bucket
 /// does not hold, as recorded behaviour words this modelled 400.
 pub const SOURCE_URL_WITHOUT_OBJECT: &str =
@@ -1260,13 +1282,6 @@ const S3_SCHEME: &str = "s3://";
 /// The status Amazon S3 answers a `HeadObject` for an object it does not hold: a HEAD
 /// carries no body, so the status is the whole answer (`NoSuchKey` / `NoSuchBucket`).
 const OBJECT_NOT_FOUND_STATUS: u16 = 404;
-
-/// The `jobType` of a job this operation starts: "If the value is MANUAL, the job is for
-/// a manually deployed app" (`smithy_query(query="shape",shape="JobType")`).
-///
-/// Shared with `CreateDeployment`, which creates the job of the deployment this operation
-/// later runs, so the two report one `jobType` for one job.
-pub const MANUAL_JOB_TYPE: &str = "MANUAL";
 
 /// The document a hosted Amplify branch serves at the root of its site, and so the one
 /// file a deployment has to carry at its own root to be servable.

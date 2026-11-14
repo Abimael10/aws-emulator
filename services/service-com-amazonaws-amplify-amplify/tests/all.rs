@@ -41,6 +41,8 @@ mod branch_job_stopping;
 mod branch_jobs;
 #[path = "all/branch_revision_echo.rs"]
 mod branch_revision_echo;
+#[path = "all/deployment_job_projection.rs"]
+mod deployment_job_projection;
 #[path = "all/deployment_upload_plane.rs"]
 mod deployment_upload_plane;
 #[path = "all/domain_association_certificate_lifecycle.rs"]

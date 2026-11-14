@@ -672,19 +672,48 @@ pub fn parse_deployment_upload_path(path: &str) -> Option<DeploymentUploadTarget
     })
 }
 
-/// The URL one upload of a reserved deployment is written to: the endpoint the caller
-/// reached, plus that upload's own path.
+/// The URL one upload of a reserved deployment is written to: that upload's own path,
+/// SigV4 query-presigned against the base URL this emulator is reached on.
 ///
-/// NO SigV4 signature is attached — this emulator does not sign URLs, and a fabricated
-/// signature would claim a computation nothing performed. The token in the path is the
-/// receipt that authorises the write: it is minted per upload, unguessable, and stops
-/// being usable when the reservation's window closes.
-pub fn deployment_upload_url(host: &str, app_id: &str, job_id: &str, token: &str) -> String {
-    format!(
-        "https://{host}{}",
-        deployment_upload_path(app_id, job_id, token)
-    )
+/// An upload destination is a PRESIGNED PUT target — a URL carrying its own
+/// authorisation in the query, which is why it is followed with no `Authorization`
+/// header — so the destination announced here is signed through the framework's URL
+/// signer. That is what makes it both presigned and an address of THIS emulator: the
+/// signer signs for the emulator's own base URL, never for a host only AWS serves.
+///
+/// The token in the path says WHICH upload of the reservation the URL names: it is
+/// minted per upload, so no two uploads of a deployment — and no two deployments —
+/// share a destination, and it stops being usable when the reservation's window closes.
+///
+/// A request that could not be signed is served at that same address, so the address is
+/// what is announced — on `fallback_host`, the endpoint the reserving caller reached —
+/// rather than no destination at all.
+pub fn deployment_upload_url(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    fallback_host: &str,
+    app_id: &str,
+    job_id: &str,
+    token: &str,
+) -> String {
+    let path = deployment_upload_path(app_id, job_id, token);
+    let request = ::smithy_server_runtime::SignedUrlRequest::new(
+        ::smithy_server_runtime::http::Method::PUT,
+        ctx.identity().signing_name(),
+        &path,
+    );
+    match ctx.url_signer().sign(request, DEPLOYMENT_UPLOAD_URL_EXPIRY) {
+        Ok(signed) => signed.as_str().to_string(),
+        Err(_) => format!("https://{fallback_host}{path}"),
+    }
 }
+
+/// How long an upload destination this service announces stays valid.
+///
+/// The documented window, not a chosen one: a reservation's uploads can be written for
+/// exactly as long as the deployment that reads them can be started, which is
+/// [`DEPLOYMENT_WINDOW_MILLIS`].
+pub const DEPLOYMENT_UPLOAD_URL_EXPIRY: ::std::time::Duration =
+    ::std::time::Duration::from_millis(DEPLOYMENT_WINDOW_MILLIS.unsigned_abs());
 
 /// How long a reserved deployment may wait to be started.
 ///
@@ -763,11 +792,38 @@ impl BranchJob {
         conclusion: JobConclusion,
         deployed_assets: BTreeSet<String>,
     ) -> Self {
+        Self::queued(
+            JobSummaryProjection::executed(summary),
+            conclusion,
+            deployed_assets,
+        )
+    }
+
+    /// A manual DEPLOYMENT's job that a `StartDeployment` call has just queued: the same
+    /// settling as [`Self::settling`], reporting only what a deployment's job has a value
+    /// for (see [`JobSummaryProjection::deploying`]).
+    pub fn deploying(
+        summary: JobSummary,
+        conclusion: JobConclusion,
+        deployed_assets: BTreeSet<String>,
+    ) -> Self {
+        Self::queued(
+            JobSummaryProjection::deploying(summary),
+            conclusion,
+            deployed_assets,
+        )
+    }
+
+    /// One job whose work a start call has queued, however that call projects its
+    /// summary.
+    fn queued(
+        summary: JobSummaryProjection,
+        conclusion: JobConclusion,
+        deployed_assets: BTreeSet<String>,
+    ) -> Self {
         Self {
             job: Job {
-                // The job is RUNNING, so the service determined every member of its
-                // summary when it started it.
-                summary: JobSummaryProjection::executed(summary),
+                summary,
                 // The steps of a job are what its execution produced, and it has
                 // produced none yet; the settling the clock owes records the one step
                 // (see [`Self::settle`]).
@@ -836,6 +892,11 @@ impl BranchJob {
         }
         self.settles_at = None;
         let ended = ::aws_smithy_types::DateTime::from_millis(due);
+        // The settling is the instant this job's work RAN, so a job that had work to run
+        // now reports the instant it started as well as the status it reached.
+        if self.work_has_begun {
+            self.job.summary.work_began();
+        }
         self.job.summary.status = self.conclusion.status.clone();
         self.job.summary.end_time = Some(ended);
         self.job.steps = vec![Step {

@@ -172,9 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         // The endpoint the caller reached, which is where the upload destinations this
-        // call hands back have to resolve: they are served by this emulator (see
-        // `crate::state::deployment_upload_path`), so they name the endpoint the caller
-        // is already talking to rather than a host nothing here serves.
+        // call hands back have to resolve when one of them cannot be presigned: they are
+        // served by this emulator (see `crate::state::deployment_upload_url`), so they
+        // name the endpoint the caller is already talking to rather than a host nothing
+        // here serves.
         let endpoint_host = crate::state::request_endpoint_host(ctx.parts(), &region);
         let created_at = crate::state::now_millis();
 
@@ -186,6 +187,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // single upload of the zipped deployment.
         let declared: ::std::collections::BTreeMap<String, String> =
             input.file_map.unwrap_or_default().into_iter().collect();
+
+        // How many upload destinations this call mints — and then holds on the
+        // reservation, each a presigned URL — is the CALLER'S choice, one per name the
+        // `fileMap` carries, so it is bounded BEFORE any of them is minted: a request
+        // naming more files than a deployment may carry
+        // (`crate::ops::start_deployment::MAX_DEPLOYMENT_ASSETS`, the same ceiling the
+        // start of a deployment holds its content to) is answered with the modelled quota
+        // error rather than minting a destination per name.
+        if declared.len() > crate::ops::start_deployment::MAX_DEPLOYMENT_ASSETS {
+            return Err(CreateDeploymentErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(file_limit_message(declared.len())),
+                },
+            )
+            .into());
+        }
 
         let mut store = state.lock();
 
@@ -256,14 +273,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     file_name,
                     crate::state::DeploymentFile {
                         content_md5,
-                        upload: upload(&endpoint_host, &input.app_id, &job_id, token),
+                        upload: upload(ctx, &endpoint_host, &input.app_id, &job_id, token),
                     },
                 )
             })
             .collect();
         let zip = if files.is_empty() {
             let token = store.mint_upload_token();
-            Some(upload(&endpoint_host, &input.app_id, &job_id, token))
+            Some(upload(ctx, &endpoint_host, &input.app_id, &job_id, token))
         } else {
             // `zipUploadUrl` is returned "when the fileMap argument is not provided in
             // the request", and this request provided one, so there is no single
@@ -318,6 +335,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             CreateDeploymentResponse::per_file(answer)
         })
     }
+}
+
+/// Why a `fileMap` naming more files than a deployment may carry is refused.
+///
+/// The ceiling is this emulator's own, not a published Amplify quota — it is the one
+/// `crate::ops::start_deployment::MAX_DEPLOYMENT_ASSETS` holds a deployment's content to
+/// — so the sentence states it, with the number the request named taken from the request
+/// and the ceiling from that constant. `LimitExceededException` is the modelled error for
+/// it ("A resource could not be created because service quotas were exceeded").
+fn file_limit_message(named: usize) -> String {
+    format!(
+        "The deployment names {named} files, more than the {} files this emulator deploys.",
+        crate::ops::start_deployment::MAX_DEPLOYMENT_ASSETS
+    )
 }
 
 /// The branch `branch_name` of the app `app_id`, as the one entity a reservation is
@@ -383,12 +414,14 @@ fn reserved_job_summary(branch_arn: &str, job_id: &str, created_at: i64) -> JobS
 
 /// Where ONE upload of a reserved deployment goes.
 ///
-/// A deployment's content is uploaded to a destination THIS EMULATOR SERVES — the
-/// endpoint the reserving caller reached, under the reservation's own path
-/// (`crate::state::deployment_upload_path`) — because a URL this operation hands back
-/// is a promise that it can be written to: "the caller uploads the zipped site to that
-/// URL and then calls StartDeployment", and what that later call deploys is what is
-/// actually at these destinations. The `crate::service` upload plane serves them.
+/// A deployment's content is uploaded to a PRESIGNED destination THIS EMULATOR SERVES —
+/// the reservation's own path (`crate::state::deployment_upload_path`), query-signed
+/// against the base URL this emulator answers on — because a URL this operation hands
+/// back is a promise that it can be written to: "the caller uploads the zipped site to
+/// that URL and then calls StartDeployment", and what that later call deploys is what is
+/// actually at these destinations. The `crate::service` upload plane serves them, and
+/// `endpoint_host` — the endpoint the reserving caller reached — is the address announced
+/// for an upload whose URL could not be signed.
 ///
 /// Each destination carries the `token` minted for that one upload, so an app id and a
 /// job id — which the caller already knows — are not by themselves enough to write to
@@ -400,13 +433,14 @@ fn reserved_job_summary(branch_arn: &str, job_id: &str, created_at: i64) -> JobS
 /// (`smithy_query(query="shape",shape="UploadUrl")`) whatever a request named its
 /// files — a `FileName` is itself modelled up to 255 characters.
 fn upload(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
     endpoint_host: &str,
     app_id: &str,
     job_id: &str,
     token: String,
 ) -> crate::state::DeploymentUpload {
     crate::state::DeploymentUpload {
-        url: crate::state::deployment_upload_url(endpoint_host, app_id, job_id, &token),
+        url: crate::state::deployment_upload_url(ctx, endpoint_host, app_id, job_id, &token),
         token,
         // Nothing has been uploaded yet: a reservation whose uploads never happen
         // deploys nothing, and the job its start call runs says so.

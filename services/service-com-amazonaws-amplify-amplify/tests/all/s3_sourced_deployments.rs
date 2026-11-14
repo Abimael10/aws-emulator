@@ -18,8 +18,9 @@
 //!    deny, a condition about another account — is refused with the modelled HTTP 401
 //!    `UnauthorizedException`, and no job is started.
 //! 2. A source Amplify MAY read starts a job: HTTP 200 with a `jobSummary` whose status
-//!    is the non-terminal `PENDING`, whose `jobType` is `MANUAL`, and which is readable
-//!    through `GetJob` and `ListJobs` under the branch it deploys to.
+//!    is the non-terminal `PENDING`, which reports no member a deployment's job has no
+//!    value for, and which is readable through `GetJob` and `ListJobs` under the branch it
+//!    deploys to.
 //! 3. That job's terminal status is computed from what the read FOUND: it settles to
 //!    `SUCCEED` when the source's files were read and carry the root document, and to
 //!    `FAILED` — with the reason on its one execution step — when they could not be
@@ -32,8 +33,9 @@
 //!    deploy and is refused with the modelled 400; an app, branch or reservation that
 //!    names nothing is refused with the modelled 404.
 //! 6. A source URL is RESOLVED while the caller waits, so a URL that addresses nothing
-//!    deployable — a prefix the bucket holds no root document under, an archive object the
-//!    bucket does not hold — takes the modelled 400 and starts no job.
+//!    deployable — a prefix the bucket holds no root document under, a prefix written
+//!    without the separator that makes it one, an archive object the bucket does not hold
+//!    — takes the modelled 400 and starts no job.
 //! 7. The decision about the source bucket's policy carries a value for every global
 //!    condition key the read itself fixes, so a clause over one of them is decided rather
 //!    than left undecided: the usual statement refusing everything not sent over a secure
@@ -49,7 +51,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_amplify_amplify::ops::start_deployment::{
     BUCKET_POLICY_WITHOUT_AMPLIFY_ACCESS, NO_SOURCE_MESSAGE, PREFIX_WITHOUT_ROOT_DOCUMENT,
-    ROOT_DOCUMENT, SOURCE_URL_WITHOUT_OBJECT,
+    PREFIX_WITHOUT_TRAILING_SEPARATOR, ROOT_DOCUMENT, SOURCE_URL_WITHOUT_OBJECT,
 };
 use service_com_amazonaws_amplify_amplify::state::{
     ComAmazonawsAmplifyAmplifyState, JOB_SETTLE_MILLIS,
@@ -77,15 +79,59 @@ const SUCCEED: &str = "SUCCEED";
 /// The terminal status of a deployment whose files could not be published.
 const FAILED: &str = "FAILED";
 
-/// `JobSummary$jobType` for "a manually deployed app"
-/// (`smithy_query(query="shape",shape="JobType")`), which is the only kind of app this
-/// operation deploys.
-const MANUAL: &str = "MANUAL";
+/// The members a DEPLOYMENT's job summary reports no value for, whatever it deploys.
+///
+/// Source: `JobSummary`'s member list
+/// (`smithy_query(query="shape",shape="JobSummary")`). `commitId`, `commitMessage` and
+/// `commitTime` describe a commit "from a third-party repository provider", which a
+/// deployment of content has none of, and `jobType` names which kind of job a repository
+/// build ran — so a deployment reports none of the four.
+const UNREPORTED_ON_A_DEPLOYMENT: &[&str] =
+    &["commitId", "commitMessage", "commitTime", "jobType"];
 
 /// How long a case waits before expecting the clock-owed status change: the span the
 /// service itself publishes, plus a margin for a slow machine.
 fn past_the_settle_span() -> Duration {
     Duration::from_millis(u64::try_from(JOB_SETTLE_MILLIS).unwrap_or(500) + 500)
+}
+
+/// How long a case waiting for a clock-owed status change gives up after: generous
+/// enough that a loaded machine still reaches the condition, since what the case is
+/// about is the status the job SETTLES to and never how fast it got there.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a poll waits before looking again. A blocking pause, because this
+/// workspace's `tokio` carries no `time` feature and a `#[tokio::test]` body owns its
+/// runtime thread for the duration of the case.
+const BETWEEN_POLLS: Duration = Duration::from_millis(25);
+
+/// `GetJob` for `job_id`, read again until the clock has settled that job out of its
+/// non-terminal status or a generous deadline passes: a case waits for the CONDITION
+/// rather than for a fixed time, so it does not turn on how fast the host runs.
+async fn settled_job(
+    deployments: &Deployments,
+    app_id: &str,
+    branch: &str,
+    job_id: &str,
+    case: &str,
+) -> Reply {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let reply = deployments.get_job(app_id, branch, job_id).await;
+        let summary = reply
+            .member("job")
+            .get("summary")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if [SUCCEED, FAILED, "CANCELLED"].contains(&string_member(&summary, "status").as_str()) {
+            return reply;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: job {job_id:?} never settled: last read {summary:?}"
+        );
+        sleep(BETWEEN_POLLS);
+    }
 }
 
 /// The Amplify emulator with object storage beside it, and the engine both share.
@@ -498,26 +544,16 @@ async fn an_authorized_source_starts_a_job_whose_outcome_is_what_was_read() {
         .await;
 
     // The rows differ along what the rule generalises over: the source type, where under
-    // the bucket the source sits, whether the prefix was written with its separator,
-    // whether the archive's files carry a root document, whether the listing is
-    // permitted, and whether the source is in this emulator. (A source URL that addresses
-    // nothing deployable at all is refused before a job exists, which
+    // the bucket the source sits, whether the archive's files carry a root document,
+    // whether the listing is permitted, and whether the source is in this emulator. (A
+    // source URL that addresses nothing deployable at all, and a prefix written without
+    // its separator, are refused before a job exists, which
     // `a_source_url_addressing_nothing_deployable_is_refused` covers.)
     let rows = vec![
         AcceptedRow {
             case: "a prefix holding the built site",
             request: json!({
                 "sourceUrl": format!("s3://{granted}/src/"),
-                "sourceUrlType": "BUCKET_PREFIX",
-            }),
-            status: SUCCEED,
-            assets: vec!["assets/app.js", "assets/styles/main.css", "index.html"],
-            reason_names: None,
-        },
-        AcceptedRow {
-            case: "the same prefix written without its separator",
-            request: json!({
-                "sourceUrl": format!("s3://{granted}/src"),
                 "sourceUrlType": "BUCKET_PREFIX",
             }),
             status: SUCCEED,
@@ -592,12 +628,14 @@ async fn an_authorized_source_starts_a_job_whose_outcome_is_what_was_read() {
             "case {:?}: a started deployment has deployed nothing yet, got {summary:?}",
             row.case
         );
-        assert_eq!(
-            string_member(&summary, "jobType"),
-            MANUAL,
-            "case {:?}: a manual deployment's job is MANUAL, got {summary:?}",
-            row.case
-        );
+        for member in UNREPORTED_ON_A_DEPLOYMENT {
+            assert!(
+                summary.get(member).is_none(),
+                "case {:?}: a deployment's job has no value for {member}, so its summary \
+                 must leave it out, got {summary:?}",
+                row.case
+            );
+        }
         assert_eq!(
             summary.get("sourceUrl").and_then(Value::as_str),
             row.request.get("sourceUrl").and_then(Value::as_str),
@@ -622,10 +660,8 @@ async fn an_authorized_source_starts_a_job_whose_outcome_is_what_was_read() {
         started.push((row, job_id));
     }
 
-    sleep(past_the_settle_span());
-
     for (row, job_id) in &started {
-        let reply = deployments.get_job(&app_id, "main", job_id).await;
+        let reply = settled_job(&deployments, &app_id, "main", job_id, row.case).await;
         assert_eq!(
             reply.status, 200,
             "case {:?}: a started deployment's job is readable, got {reply:?}",
@@ -1169,7 +1205,20 @@ async fn a_source_url_addressing_nothing_deployable_is_refused() {
         (
             "that same prefix written without its separator",
             json!({ "sourceUrl": format!("s3://{bucket}/src"), "sourceUrlType": "BUCKET_PREFIX" }),
-            None,
+            Some(PREFIX_WITHOUT_TRAILING_SEPARATOR),
+        ),
+        (
+            "a deeper prefix written without its separator",
+            json!({
+                "sourceUrl": format!("s3://{bucket}/src/assets"),
+                "sourceUrlType": "BUCKET_PREFIX",
+            }),
+            Some(PREFIX_WITHOUT_TRAILING_SEPARATOR),
+        ),
+        (
+            "a prefix source naming the bucket and no path at all",
+            json!({ "sourceUrl": format!("s3://{bucket}"), "sourceUrlType": "BUCKET_PREFIX" }),
+            Some(PREFIX_WITHOUT_TRAILING_SEPARATOR),
         ),
         (
             "an archive object the bucket does not hold",

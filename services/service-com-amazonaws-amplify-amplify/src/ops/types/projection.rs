@@ -343,6 +343,34 @@ impl JobSummaryProjection {
             unvalued: UNVALUED_ON_A_JOB_NOTHING_RAN,
         }
     }
+
+    /// The summary of a MANUAL DEPLOYMENT's job, which `StartDeployment` has queued and
+    /// whose work has not begun: it deploys content rather than a commit of a repository,
+    /// so it has no commit information and no type to report at all, and until its work
+    /// runs it has no start instant either — the same members a reserved job leaves out
+    /// ([`UNVALUED_ON_A_JOB_NOTHING_RAN`]).
+    ///
+    /// [`Self::work_began`] is what adds the start instant, once the job's work has run.
+    pub fn deploying(summary: JobSummary) -> Self {
+        Self {
+            summary,
+            unvalued: UNVALUED_ON_A_JOB_NOTHING_RAN,
+        }
+    }
+
+    /// Record that the work of a QUEUED deployment job has BEGUN: the job now has a start
+    /// instant to report, while the commit members and the job type it never had a value
+    /// for stay out of every answer ([`UNVALUED_ON_A_DEPLOYMENT`]).
+    ///
+    /// A summary whose job is not a queued deployment — one whose every member the service
+    /// determined when it started it, and one of a deployment nobody started — is left
+    /// exactly as it is: there is no start instant to begin reporting for work that never
+    /// ran.
+    pub fn work_began(&mut self) {
+        if self.unvalued == UNVALUED_ON_A_JOB_NOTHING_RAN {
+            self.unvalued = UNVALUED_ON_A_DEPLOYMENT;
+        }
+    }
 }
 
 /// The stored record, so the service reads and writes the job's own members — the
@@ -405,6 +433,16 @@ pub const UNVALUED_ON_A_JOB_NOTHING_RAN: &[&str] = &[
     "startTime",
     "jobType",
 ];
+
+/// The members a MANUAL DEPLOYMENT's job has no value for once its work HAS run, and so
+/// leaves out of every answer carrying it.
+///
+/// A deployment deploys content a caller uploaded or named by URL, so there is no commit
+/// of a third-party repository provider behind it: `commitId`, `commitMessage` and
+/// `commitTime` describe one, and `jobType` names the kind of job a repository build
+/// ran. A job whose work has begun DOES have a start instant, which is the one member
+/// [`UNVALUED_ON_A_JOB_NOTHING_RAN`] drops and this list keeps.
+pub const UNVALUED_ON_A_DEPLOYMENT: &[&str] = &["commitId", "commitMessage", "commitTime", "jobType"];
 
 /// The member a domain-association record never carries without a value, whichever
 /// operation answers it.
