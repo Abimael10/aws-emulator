@@ -493,7 +493,8 @@ use super::template::{
     ECR_PUBLIC_REPOSITORY, ECR_REPOSITORY, ECS_CLUSTER, ECS_SERVICE, EKS_ACCESS_ENTRY,
     EKS_CLUSTER,
     EKS_POD_IDENTITY_ASSOCIATION,
-    EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
+    EMR_CLUSTER, EVENTS_EVENT_BUS, EVENTS_EVENT_BUS_POLICY, EVENTS_RULE,
+    FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
     ELASTIC_BEANSTALK_ENVIRONMENT, GLUE_CRAWLER, GLUE_DATABASE, GLUE_TABLE, GRAFANA_WORKSPACE,
     GUARDDUTY_DETECTOR, GUARDDUTY_IP_SET,
@@ -1039,6 +1040,16 @@ pub(super) enum Provisioner {
     /// and the rule id the type publishes, so both are read off that service's own read of
     /// the rule.
     ConfigConfigRule,
+    /// `AWS::Events::EventBus`: an Amazon EventBridge event bus, which `CreateEventBus`
+    /// creates under the name the template states and `DeleteEventBus` deletes. The name is
+    /// the identifier every EventBridge call on a bus takes, so it is the physical id the
+    /// naming rules compute for the type — and what a rule, a policy or a rule target of the
+    /// same stack resolves the bus by.
+    EventsEventBus,
+    /// `AWS::Events::EventBusPolicy`: one statement on an event bus's resource policy, which
+    /// `PutPermission` installs under the declaration's `StatementId` and `RemovePermission`
+    /// revokes by that same id.
+    EventsEventBusPolicy,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -1121,6 +1132,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         REDSHIFT_CLUSTER_PARAMETER_GROUP => Some(Provisioner::RedshiftClusterParameterGroup),
         REDSHIFT_SNAPSHOT_COPY_GRANT => Some(Provisioner::RedshiftSnapshotCopyGrant),
         EVENTS_RULE => Some(Provisioner::EventsRule),
+        EVENTS_EVENT_BUS => Some(Provisioner::EventsEventBus),
+        EVENTS_EVENT_BUS_POLICY => Some(Provisioner::EventsEventBusPolicy),
         PIPES_PIPE => Some(Provisioner::PipesPipe),
         RESOURCE_GROUPS_GROUP => Some(Provisioner::ResourceGroupsGroup),
         SSM_PARAMETER => Some(Provisioner::SsmParameter),
@@ -1502,6 +1515,19 @@ impl Provisioner {
             // `Name`, `RoleArn`, `ScheduleExpression`, `State` and `Targets` and no
             // `Tags`: the type is not taggable, so no tags are propagated to it.
             Self::EventsRule => put_rule(ctx, region, resource).await,
+            // `AWS::Events::EventBus` publishes `Tags` as the `[{Key, Value}]` list most
+            // types do, which is the shape `CreateEventBus`'s own `Tags` member takes, so a
+            // bus a stack creates carries the tags CloudFormation gives it beside the ones
+            // the declaration asks for.
+            Self::EventsEventBus => {
+                event_buses::create_event_bus(ctx, region, resource, propagated).await
+            }
+            // `AWS::Events::EventBusPolicy` publishes no `Tags` property — a grant on a bus's
+            // resource policy is not a resource EventBridge tags — so the type is not taggable
+            // and no tags are propagated to one.
+            Self::EventsEventBusPolicy => {
+                event_buses::put_event_bus_policy(ctx, region, resource).await
+            }
             // `AWS::Pipes::Pipe` publishes `Tags` as a MAP, which is the shape
             // `CreatePipe`'s own `Tags` member takes, so a pipe a stack creates carries the
             // tags CloudFormation gives it beside the ones the declaration asks for.
@@ -1936,6 +1962,11 @@ impl Provisioner {
                 // check its own crate's tag validation makes — so a group carries the stack's
                 // own tags without the three.
                 | Self::ResourceGroupsGroup
+                // Amazon EventBridge refuses a tag key in the reserved namespace on every
+                // call that takes tags — `CreateEventBus`'s `Tags` list and `TagResource`
+                // alike, in the one check its own crate's tag merge makes — so a bus carries
+                // the stack's own tags without the three.
+                | Self::EventsEventBus
                 // Amazon Redshift refuses a tag key in the reserved namespace on
                 // `CreateSnapshotCopyGrant`'s own `Tags` member and on `CreateTags` alike, in
                 // the one check its own crate's tag validation makes — so a grant carries the
@@ -2387,6 +2418,16 @@ impl Provisioner {
             // that created the rule is the call that applies a changed declaration to it,
             // with the declared target list reconciled against the one it carries.
             Self::EventsRule => update_rule(ctx, region, resource, declared).await,
+            // `UpdateEventBus` is the call that applies a changed declaration to the bus the
+            // stack already has, under the name it was created under.
+            Self::EventsEventBus => {
+                event_buses::update_event_bus(ctx, region, resource, declared).await
+            }
+            // `PutPermission` is the call that installs a grant, and a grant installed again
+            // under a statement id already on the bus replaces that one statement.
+            Self::EventsEventBusPolicy => {
+                event_buses::update_event_bus_policy(ctx, region, declared).await
+            }
             // `PutParameter` is documented "Create or update a parameter in Parameter
             // Store", and `Overwrite` is what makes the second of the two: the changed
             // declaration reaches Systems Manager as a new version of the same parameter.
@@ -3091,6 +3132,16 @@ impl Provisioner {
             // A rule still carrying targets cannot be deleted, and only the rule's own
             // record says which bus it is on, so the delete takes the record.
             Self::EventsRule => delete_rule(ctx, region, resource).await,
+            // A bus is addressed by the name it was created under, which is this resource's
+            // physical id.
+            Self::EventsEventBus => {
+                event_buses::delete_event_bus(ctx, region, physical_resource_id).await
+            }
+            // A grant is addressed by the bus AND the statement id that identify it, and only
+            // the resource's own declaration carries either, so the delete takes the record.
+            Self::EventsEventBusPolicy => {
+                event_buses::remove_event_bus_policy(ctx, region, resource).await
+            }
             Self::SsmParameter => delete_parameter(ctx, region, physical_resource_id).await,
             Self::SsmAssociation => {
                 delete_ssm_association(ctx, region, physical_resource_id).await
@@ -3581,6 +3632,16 @@ impl Provisioner {
             // The read is addressed by the rule's name AND the bus it is bound to, which
             // only the resource's own record carries.
             Self::EventsRule => describe_rule(ctx, region, resource).await,
+            // EventBridge's own read of the bus the stack created, by the name it was created
+            // under.
+            Self::EventsEventBus => {
+                event_buses::describe_event_bus(ctx, region, physical_resource_id).await
+            }
+            // A grant is read out of the POLICY the bus it was installed on carries now, by
+            // the statement id that identifies it.
+            Self::EventsEventBusPolicy => {
+                event_buses::describe_event_bus_policy(ctx, region, resource).await
+            }
             Self::SsmParameter => describe_parameter(ctx, region, physical_resource_id).await,
             // Systems Manager's own read of the association the stack created, by the id it
             // minted for it.
@@ -3910,6 +3971,10 @@ pub(in crate::state) mod cloudwatch_alarms;
 /// the same owning service.
 mod ecs_services;
 mod event_pipes;
+/// The Amazon EventBridge EVENT BUS arms: the bus an `AWS::Events::EventBus` declares, which
+/// the rules, policies and rule targets of the same stack resolve by name, and the grant an
+/// `AWS::Events::EventBusPolicy` installs on one.
+mod event_buses;
 mod bedrock_guardrails;
 mod bedrock_knowledge_bases;
 /// The Amazon SageMaker AI types a stack declares beside the model registry's: the model,

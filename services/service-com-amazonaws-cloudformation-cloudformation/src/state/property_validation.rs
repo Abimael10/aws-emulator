@@ -198,6 +198,15 @@ pub const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
         resource_type: "AWS::Pipes::Pipe",
         required: &["RoleArn", "Source", "Target"],
     },
+    // `AWS::Events::EventBusPolicy`: the resource IS one grant on a bus's resource policy,
+    // addressed by the `StatementId` that identifies it — "each StatementId must be unique",
+    // and `RemovePermission` revokes the statement that id names — so a declaration stating
+    // none describes no grant that could be installed or ever removed. The bus itself is not
+    // required: a declaration naming none is about the account's default bus.
+    RequiredProperties {
+        resource_type: crate::state::template::EVENTS_EVENT_BUS_POLICY,
+        required: &["StatementId"],
+    },
     // `AWS::SSM::Parameter`: `PutParameter` declares `Name`, `Value` and (for a new
     // parameter) `Type` required; the name is CloudFormation's to generate, the other two
     // are the template's.

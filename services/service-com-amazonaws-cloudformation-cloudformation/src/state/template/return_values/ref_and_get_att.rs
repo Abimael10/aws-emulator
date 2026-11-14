@@ -682,6 +682,9 @@ pub(crate) fn return_values(
             );
             (name.to_string(), attributes)
         }
+        // "Ref returns the event bus name"; Fn::GetAtt: Arn, Name
+        // ([`EVENTS_EVENT_BUS_ATTRIBUTES`]).
+        EVENTS_EVENT_BUS => (name.to_string(), event_bus_attributes(region, name)),
         // "Ref returns the name of the parameter"; Fn::GetAtt: Type, Value — the two
         // required properties of the declaration, which is what the parameter Systems
         // Manager holds carries.

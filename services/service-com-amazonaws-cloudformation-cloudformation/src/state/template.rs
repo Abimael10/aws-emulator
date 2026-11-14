@@ -2767,6 +2767,16 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // node an association was created for cannot be changed on it, so a declaration
         // naming another node asks for a different association.
         SSM_ASSOCIATION => &["InstanceId"],
+        // An event bus is created FOR a partner source or for nothing, and EventBridge
+        // publishes no call that re-points one: `EventSourceName` is a member of
+        // `CreateEventBus` and of no member of `UpdateEventBus`, so a declaration restating it
+        // asks for a different bus.
+        EVENTS_EVENT_BUS => &["EventSourceName"],
+        // An event bus's resource policy statement is installed ON one bus under one
+        // statement id: `PutPermission` takes both and EventBridge publishes no call that
+        // moves a statement to another bus or renames one, so a declaration restating either
+        // asks for a different grant — which CloudFormation replaces rather than updates.
+        EVENTS_EVENT_BUS_POLICY => &["EventBusName", "StatementId"],
         // A document's TYPE is fixed when Systems Manager makes it: `DocumentType` is a member
         // of `CreateDocument` and of no member of `UpdateDocument` — no call of that service
         // turns a command document into a runbook — and so is `Requires`, so a declaration
@@ -3086,6 +3096,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     ELB_LISTENER_RULE,
     ELB_LOAD_BALANCER,
     ELB_TARGET_GROUP,
+    EVENTS_EVENT_BUS,
     EVENTS_RULE,
     FIS_EXPERIMENT_TEMPLATE,
     GUARDDUTY_DETECTOR,

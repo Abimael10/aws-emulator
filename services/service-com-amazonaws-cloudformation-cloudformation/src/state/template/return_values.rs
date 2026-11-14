@@ -6,6 +6,10 @@ use super::*;
 // this file holds the per-type return values alone. Re-exported, so the one path every caller
 // of `Scope` and of an evaluation uses is unchanged.
 mod outputs;
+// The Amazon EventBridge entries of this catalogue — the resource types and the values their
+// `Ref` and `Fn::GetAtt` resolve to — beside the types that reach them.
+mod event_bridge;
+pub use event_bridge::*;
 mod type_names;
 // The AWS AppSync types' return values, in a module of their own for the reason it records.
 // Re-exported, so the one path every caller of a type name uses is unchanged.
@@ -280,6 +284,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => &["Arn"],
         MQ_BROKER => &["Arn"],
         EVENTS_RULE => &["Arn"],
+        EVENTS_EVENT_BUS => EVENTS_EVENT_BUS_ATTRIBUTES,
         SSM_PARAMETER => &["Type", "Value"],
         STEP_FUNCTIONS_ACTIVITY => &["Arn", "Name"],
         STEP_FUNCTIONS_STATE_MACHINE => &["Arn", "Name"],
@@ -1210,37 +1215,6 @@ pub const ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION: &str =
 /// `Permission` under them — so that pair is this type's primary identifier and its physical
 /// resource id ([`composite_identity_properties`]), which is what `Ref` returns.
 pub const ACMPCA_PERMISSION: &str = "AWS::ACMPCA::Permission";
-
-/// An Amazon EventBridge rule's resource type (the EventBridge model:
-/// `cloudFormationName: Events`). This is a type `super::provisioning` creates in
-/// EventBridge itself, and "Ref returns the rule name", so the rule a stack's output names
-/// is the one `events DescribeRule` answers with.
-pub const EVENTS_RULE: &str = "AWS::Events::Rule";
-
-/// An Amazon EventBridge Pipes pipe's resource type (the Pipes model:
-/// `cloudFormationName: Pipes`, `arnNamespace: pipes`). This is a type
-/// `super::provisioning` creates in EventBridge Pipes itself, and "Ref returns the pipe
-/// name" — which is the physical id the naming rules already compute for the type — so the
-/// pipe a stack's output names is the one `pipes DescribePipe` answers with, and the `Arn`
-/// and `CurrentState` the type publishes are the ones that service reports for it.
-pub const PIPES_PIPE: &str = "AWS::Pipes::Pipe";
-
-/// The event bus a rule declaring none is bound to — "if you omit this, the default event
-/// bus is used" (`PutRule$EventBusName`) — and the one bus whose name a rule ARN does not
-/// carry a segment for.
-pub(super) const DEFAULT_EVENT_BUS: &str = "default";
-
-/// The bus NAME an `EventBusName` property names.
-///
-/// EventBridge's `EventBusNameOrArn` admits either a bare name or an event-bus ARN, so an
-/// ARN is reduced to everything after its `event-bus/` resource-type segment — the whole
-/// remainder, not the text after the last `/`, because a bus name may itself carry `/`.
-pub(super) fn event_bus_name(declared: &str) -> String {
-    match declared.split_once(":event-bus/") {
-        Some((_, name)) => name.to_string(),
-        None => declared.to_string(),
-    }
-}
 
 /// The ARN namespace AWS Step Functions mints its resources under: that model's
 /// `awsService.arnNamespace`, which is `states` rather than the `StepFunctions` its
