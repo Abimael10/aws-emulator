@@ -468,7 +468,9 @@ async fn a_started_run_is_read_back_through_get_job_run() {
                 // A fraction of a DPU is no whole DPU.
                 "AllocatedCapacity": 0,
                 "Attempt": FIRST_JOB_RUN_ATTEMPT,
-                "Arguments": {},
+                // The start carried no arguments, so the run records none of its own:
+                // the job's own `DefaultArguments` stay on the definition.
+                "Arguments": Value::Null,
                 // Nothing triggered this run and it retries nothing, so no predicate run
                 // precedes it — reported as the empty list.
                 "TriggerName": Value::Null,
@@ -803,6 +805,14 @@ async fn a_start_past_the_jobs_concurrency_limit_is_refused() {
             error_code(&answer).contains("ConcurrentRunsExceededException"),
             "case {case:?}: expected ConcurrentRunsExceededException, got {answer}"
         );
+        // The refusal is the service's own fixed sentence, spelled out here rather than
+        // imported so a wrong constant in the implementation cannot make this pass: it
+        // names neither the job, the runs in flight nor the ceiling they reached.
+        assert_eq!(
+            error_message(&answer),
+            "Concurrent runs exceeded.",
+            "case {case:?}: expected the fixed concurrency refusal, got {answer}"
+        );
         assert_eq!(
             stored_runs(&engine, &name).len(),
             allowed,
@@ -820,66 +830,80 @@ async fn a_start_past_the_jobs_concurrency_limit_is_refused() {
     }
 }
 
-/// A start whose `Arguments` the run must carry: the job's `DefaultArguments` with the
-/// run's own applied over them, and the job's `NonOverridableArguments` applied last —
-/// "arguments for this job that are not overridden when providing job arguments in a job
-/// run".
+/// `JobRun$Arguments` reports the arguments the START of that run carried — "the job
+/// arguments associated with this run" — and nothing at all for a run started with none,
+/// however many arguments the job definition it runs carries: a definition's
+/// `DefaultArguments` and `NonOverridableArguments` stay on the definition, where every
+/// read of the job reports them, and are what the run's SCRIPT is given on its command
+/// line (`tests/all/job_script_execution.rs`).
 ///
 /// The rows differ along which of the three argument sets are present and whether they
 /// collide, and the count of arguments sent.
 #[tokio::test]
-async fn run_arguments_overlay_the_job_defaults() {
+async fn a_run_reports_the_arguments_its_start_carried() {
     let (router, engine) = emulator_with_engine();
 
-    // (case, DefaultArguments, NonOverridableArguments, the run's Arguments, expected)
+    // (case, DefaultArguments, NonOverridableArguments, the start's Arguments, expected)
     let cases: Vec<(&str, Value, Value, Value, Value)> = vec![
         (
             "no arguments anywhere",
             Value::Null,
             Value::Null,
             Value::Null,
-            json!({}),
+            Value::Null,
         ),
         (
+            // The recorded case: the job carries defaults and the start overrides
+            // nothing, so the run itself records no argument.
             "the job's defaults alone",
             json!({ "--job-bookmark-option": "job-bookmark-enable" }),
             Value::Null,
             Value::Null,
-            json!({ "--job-bookmark-option": "job-bookmark-enable" }),
+            Value::Null,
         ),
         (
-            "the run's arguments alone",
+            "a job whose arguments are all locked",
+            Value::Null,
+            json!({ "--locked": "yes" }),
+            Value::Null,
+            Value::Null,
+        ),
+        (
+            "the start's arguments alone",
             Value::Null,
             Value::Null,
             json!({ "--input": "s3://lake/in/" }),
             json!({ "--input": "s3://lake/in/" }),
         ),
         (
-            "the run's arguments replacing a default",
+            "the start's arguments beside a default they replace",
             json!({ "--input": "s3://lake/in/", "--enable-metrics": "true" }),
             Value::Null,
             json!({ "--input": "s3://lake/other/" }),
-            json!({ "--input": "s3://lake/other/", "--enable-metrics": "true" }),
+            json!({ "--input": "s3://lake/other/" }),
         ),
         (
-            "a non-overridable argument the run tried to replace",
+            "an argument the job does not let the start replace",
             json!({ "--input": "s3://lake/in/" }),
             json!({ "--locked": "yes" }),
             json!({ "--locked": "no", "--input": "s3://lake/other/" }),
-            json!({ "--locked": "yes", "--input": "s3://lake/other/" }),
+            json!({ "--locked": "no", "--input": "s3://lake/other/" }),
         ),
         (
             "many arguments at once",
             json!({ "--a": "1", "--b": "2", "--c": "3" }),
             json!({ "--c": "locked" }),
             json!({ "--b": "overridden", "--d": "4", "--e": "5" }),
-            json!({
-                "--a": "1",
-                "--b": "overridden",
-                "--c": "locked",
-                "--d": "4",
-                "--e": "5",
-            }),
+            json!({ "--b": "overridden", "--d": "4", "--e": "5" }),
+        ),
+        (
+            // A start that sent the member carrying nothing sent no argument, and the
+            // run records exactly that.
+            "an empty argument map sent by the start",
+            json!({ "--a": "1" }),
+            Value::Null,
+            json!({}),
+            json!({}),
         ),
     ];
 
@@ -902,8 +926,15 @@ async fn run_arguments_overlay_the_job_defaults() {
         set_due_instant(&engine, &name, far_future());
 
         let run = get_run(&router, &name, &run_id).await;
-        let reported: BTreeMap<String, String> = run
-            .get("Arguments")
+        let reported = run.get("Arguments");
+        if expected.is_null() {
+            assert!(
+                reported.is_none(),
+                "case {case:?}: a run whose start carried no arguments records none, got {run}"
+            );
+            continue;
+        }
+        let reported: BTreeMap<String, String> = reported
             .and_then(Value::as_object)
             .unwrap_or_else(|| panic!("case {case:?}: a run reports its arguments, got {run}"))
             .iter()

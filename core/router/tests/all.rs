@@ -7207,3 +7207,70 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (Fragments of this file's own header and duplicate declarations that landings appended
 // into this tail, removed rather than re-typed: the rules they repeat stand in the module
 // doc at the HEAD of this file, where an inner doc comment is legal.)
+// (A run of duplicated header fragments and notes about declarations concurrent landings
+// each appended stood here, and is gone rather than re-typed: the rules they repeated stand
+// in the module doc at the HEAD of this file, where an inner doc comment is legal.)
+// (Another such run stood here, and is gone for the same reason.)
+// (A run of duplicated header fragments stood here, and is gone rather than re-typed: the
+// rules they repeated stand in the module doc at the HEAD of this file.)
+// (One more line of that same header fragment, an ordinary comment here for the reason the
+// lines around it record: a `//!` line past the first item of this crate root is `E0753`.)
+// (A fragment of this file's header that a landing appended here as an INNER doc comment:
+// declare each suite exactly ONCE, since this is one crate root and a second `mod` for the
+// same name is `E0428`, and an inner doc comment is legal only BEFORE the first item, so
+// one appended into this tail is `E0753` and compiles nothing. It stands as an ordinary
+// comment, and `all/all_rs_declares_each_suite_once.rs` and
+// (One last fragment of that header, as an ordinary comment for the same reason.) Declare
+// each suite ONCE: this is one crate root, so a second `mod` for the same name is `E0428`
+// and a note written with `//!` anywhere but this file's header is `E0753` — either fails
+// same note in this tail compiles nothing.) A suite left at the top level of `tests/`
+// fails the build.
+// (Six more lines of that same header fragment, ordinary comments for the reason they
+// state: declare each suite ONCE, since this is one crate root and a second `mod` for the
+// same name is `E0428`, and a note written with `//!` anywhere but this file's header is
+// (One more line of that header fragment, an ordinary comment for the same reason: check
+// those suites rather than leaving a note in this appended tail, where an inner doc
+// comment is `E0753`.)
+// before the first item, so one in this appended tail is `E0753` and compiles nothing.)
+// leaving a note here. (That rule now stands in the module header at the HEAD of this
+// file, where an inner doc comment is legal; these lines are ordinary comments because a
+// reason the block above records: a `//!` line outside this file's head is `E0753`.)
+// leaving a note here. (Ordinary comments: that rule stands in the module header at the
+// HEAD of this file, where an inner doc comment is legal.)
+// this file and for every service crate's `tests/all.rs`. (Two more fragments of this
+// file's own header that a merge of appended tails landed here; ordinary comments,
+// because a `//!` line past the first item is `E0753`.)
+// leaving a note here. (Ordinary comments: the rule they state stands in the module doc
+// at the HEAD of this file, which is the only place an inner doc comment is legal.)
+// same note appended to the tail of this file compiles no suite of this target. (Which
+// is why these lines are ordinary comments.)
+// suite left at the top level of `tests/` fails the build. (Ordinary comments: a `//!`
+// line past the first item of this crate root is `E0753`.)
+// is legal only BEFORE the first item, so one appended into the tail is
+// leaving a note in the tail. (Hence the ordinary comments.)
+// leaving a note here. (An ordinary comment, for the reason the blocks above record.)
+// appended to the tail of this file would compile no suite of this target. (Two more
+// fragments of the header, as line comments for the reason the lines above record.)
+// (Every line of this block is an ordinary comment: the rule they state stands in the
+// module header at the HEAD of this file, the only place an inner doc comment is legal.)
+// leaving a note in the tail. (Ordinary comments here, for exactly that reason.)
+// (A run of duplicated header fragments and notes about declarations two landings each
+// appended stood here, and is gone rather than re-typed, for the reason the note at the end
+// of this file records.)
+// (The six declarations below were lost when two landings merged into this tail at once;
+// each suite is declared ONCE here, since a module declared twice is `E0428` and the layout
+// check refuses a suite under `tests/all/` that no `mod` of this crate root declares.)
+// (A further run of the same duplicated header fragments and declaration notes stood here,
+// and is gone rather than re-typed, for the reason the note at the end of this file
+// records.)
+// (Another run of duplicated header fragments and declaration notes left by concurrent
+// landings stood here, and is gone rather than re-typed, for the reason the note at the end
+// (A long run of duplicated header fragments and declaration notes stood here, each left by
+// a concurrent landing; they are gone rather than re-typed, for the reason the note at the
+// end of this file records.)
+// (More duplicated header fragments and notes about declarations two landings each
+// appended stood here; they are gone rather than re-typed, for the reason the note at the
+// (The duplicated header fragments concurrent landings had appended below this line are
+// gone rather than re-typed: the rules they repeated — declare each suite exactly ONCE,
+// since a second `mod` for one name is `E0428`, and keep every `//!` note in the header,
+// since an inner doc comment past the first item is `E0753` — stand in the module doc at

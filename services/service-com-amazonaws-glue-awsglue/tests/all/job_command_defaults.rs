@@ -26,7 +26,7 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{emulator, ok};
+use crate::wire::{call, emulator, error_code, error_message, ok};
 
 /// The IAM role every job of these suites runs as.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/service-role/GlueJobRole";
@@ -230,6 +230,79 @@ async fn an_update_stores_its_command_with_the_same_python_version_rule() {
             stored.get("PythonVersion").and_then(Value::as_str),
             Some(expected),
             "case {case:?}: the overwritten definition must report {expected:?}, got {stored}"
+        );
+    }
+}
+
+/// The version the service fills in is part of the definition a REPEAT create is compared
+/// against: a second create submitting the same definition is still the retry of the create
+/// that stored it ("It must be unique in your account" — the name is the create's
+/// idempotency identifier), and one submitting a different `PythonVersion` has associated
+/// that identifier with two different records, which is the idempotency mismatch.
+///
+/// The rows differ along how the second create states the version: not at all, as the value
+/// the service filled in, and as another value the member admits.
+#[tokio::test]
+async fn the_filled_version_is_part_of_the_definition_a_repeat_create_is_compared_against() {
+    let router = emulator();
+
+    // (case, the second create's PythonVersion, the error code it must be refused with)
+    let rows: Vec<(&str, Option<&str>, &str)> = vec![
+        (
+            "the repeat names no version either",
+            None,
+            "AlreadyExistsException",
+        ),
+        (
+            "the repeat states the version the service filled in",
+            Some(DEFAULT_PYTHON_VERSION),
+            "AlreadyExistsException",
+        ),
+        (
+            "the repeat names another version",
+            Some("2"),
+            "IdempotentParameterMismatchException",
+        ),
+    ];
+
+    for (index, (case, named, expected)) in rows.iter().enumerate() {
+        let job = format!("repeat-create-{index}");
+        let command = json!({ "Name": "glueetl", "ScriptLocation": SCRIPT_LOCATION });
+        ok(
+            &router,
+            "CreateJob",
+            &json!({ "Name": job, "Role": ROLE_ARN, "Command": command.clone() }),
+        )
+        .await;
+
+        let mut repeat = command;
+        if let Some(named) = named {
+            repeat["PythonVersion"] = json!(named);
+        }
+        let (status, answer) = call(
+            &router,
+            "CreateJob",
+            &json!({ "Name": job, "Role": ROLE_ARN, "Command": repeat }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a second create under a stored name is refused, got {status} with \
+             {answer}"
+        );
+        assert!(
+            error_code(&answer).contains(expected),
+            "case {case:?}: expected {expected}, got {answer} ({})",
+            error_message(&answer)
+        );
+
+        // Whichever refusal it earned, the stored definition is the one the first create
+        // stored.
+        let stored = command_of(&router, &job).await;
+        assert_eq!(
+            stored.get("PythonVersion").and_then(Value::as_str),
+            Some(DEFAULT_PYTHON_VERSION),
+            "case {case:?}: the refused create changes nothing, got {stored}"
         );
     }
 }

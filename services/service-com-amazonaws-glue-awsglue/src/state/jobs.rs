@@ -495,12 +495,15 @@ impl JobEntry {
             .clone()
             .unwrap_or_else(|| DEFAULT_GLUE_VERSION.to_string());
         let max_concurrent_runs = max_concurrent_runs_of(input.execution_property.as_ref());
+        // The `Command` is stored with the members the service fills in added inside the
+        // structure the caller supplied ([`stored_command`]).
+        let command = stored_command(&input.command);
         let (worker_type, number_of_workers, max_capacity) = capacity_members(
             input.max_capacity,
             input.allocated_capacity,
             input.worker_type.as_deref(),
             input.number_of_workers,
-            &input.command,
+            &command,
             &glue_version,
         );
         Self {
@@ -518,7 +521,7 @@ impl JobEntry {
             execution_property: ExecutionProperty {
                 max_concurrent_runs,
             },
-            command: stored_command(&input.command),
+            command,
             default_arguments: input.default_arguments.clone(),
             non_overridable_arguments: input.non_overridable_arguments.clone(),
             connections: input.connections.clone(),
@@ -1169,12 +1172,24 @@ pub struct JobRunEntry {
     /// to rest. It is bookkeeping about the publication and no part of what any read of the
     /// run reports.
     pub state_change_published: bool,
-    /// The job's `DefaultArguments` with this run's `Arguments` applied over them, then
-    /// the job's `NonOverridableArguments`: "For this job run, they replace the default
-    /// arguments set in the job definition itself" (`StartJobRun$Arguments`), except for
-    /// the "arguments for this job that are not overridden when providing job arguments
-    /// in a job run" (`CreateJob$NonOverridableArguments`).
-    pub arguments: HashMap<String, String>,
+    /// `JobRun$Arguments`: "the job arguments associated with this run" — the arguments the
+    /// START of this run carried, and `None` for a run started with none at all.
+    ///
+    /// They are the run's OWN arguments: "for this job run, they replace the default
+    /// arguments set in the job definition itself" (`StartJobRun$Arguments`) says what they
+    /// do to the definition's `DefaultArguments` when the run is executed, not that the run
+    /// is recorded carrying them — those stay on the definition, where every read of the job
+    /// reports them. So a run a start sent no arguments with records none, however many the
+    /// job definition it runs carries.
+    pub arguments: Option<HashMap<String, String>>,
+    /// The arguments the run's SCRIPT is given: the job's `DefaultArguments` with this run's
+    /// own applied over them, then the job's `NonOverridableArguments` — the "arguments for
+    /// this job that are not overridden when providing job arguments in a job run"
+    /// (`CreateJob$NonOverridableArguments`).
+    ///
+    /// This is what one execution of the script resolves its arguments off
+    /// ([`super::JobScriptPlan`]) and no part of what a read of the run reports.
+    pub effective_arguments: HashMap<String, String>,
     pub error_message: Option<String>,
     pub max_capacity: Option<f64>,
     pub timeout: i32,
@@ -1233,16 +1248,16 @@ impl JobRunEntry {
         )
         .or(job.max_capacity);
 
-        let mut arguments = job.default_arguments.clone().unwrap_or_default();
+        let mut effective_arguments = job.default_arguments.clone().unwrap_or_default();
         if let Some(requested) = input.arguments.as_ref() {
-            arguments.extend(
+            effective_arguments.extend(
                 requested
                     .iter()
                     .map(|(name, value)| (name.clone(), value.clone())),
             );
         }
         if let Some(locked) = job.non_overridable_arguments.as_ref() {
-            arguments.extend(
+            effective_arguments.extend(
                 locked
                     .iter()
                     .map(|(name, value)| (name.clone(), value.clone())),
@@ -1279,7 +1294,8 @@ impl JobRunEntry {
             awaiting_script: true,
             // Nothing has come to rest, so nothing has been published about this run.
             state_change_published: false,
-            arguments,
+            arguments: input.arguments.clone(),
+            effective_arguments,
             // Nothing has failed yet: a run carries an error message only once it has.
             error_message: None,
             max_capacity,
@@ -1535,7 +1551,7 @@ impl JobRunEntry {
             last_modified_on: Some(to_date_time(self.last_modified_on)),
             completed_on: self.completed_on.map(to_date_time),
             job_run_state: Some(self.state.clone()),
-            arguments: Some(self.arguments.clone()),
+            arguments: self.arguments.clone(),
             error_message: self.error_message.clone(),
             // "A job run that was used in the predicate of a conditional trigger that
             // triggered this job run" (`Predecessor`): the runs that preceded this one, which

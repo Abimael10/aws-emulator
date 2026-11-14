@@ -218,6 +218,9 @@ pub(crate) async fn given_rule(
 }
 
 /// Every message the queue at `url` holds, drained.
+///
+/// Each message received is DELETED, so a message this answered with cannot come back when
+/// its visibility timeout lapses and be read as a second delivery of the same event.
 pub(crate) async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
     let received = sqs(
         router,
@@ -225,17 +228,23 @@ pub(crate) async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<Value> 
         json!({ "QueueUrl": url, "MaxNumberOfMessages": 10 }),
     )
     .await;
-    received["Messages"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|message| {
-            let body = message["Body"].as_str().unwrap_or_default();
-            serde_json::from_str(body)
-                .unwrap_or_else(|error| panic!("a delivered event must be JSON, got {body:?} ({error})"))
-        })
-        .collect()
+    let messages = received["Messages"].as_array().cloned().unwrap_or_default();
+    let mut events = Vec::with_capacity(messages.len());
+    for message in &messages {
+        let body = message["Body"].as_str().unwrap_or_default();
+        events.push(serde_json::from_str(body).unwrap_or_else(|error| {
+            panic!("a delivered event must be JSON, got {body:?} ({error})")
+        }));
+        if let Some(handle) = message["ReceiptHandle"].as_str() {
+            sqs(
+                router,
+                "DeleteMessage",
+                json!({ "QueueUrl": url, "ReceiptHandle": handle }),
+            )
+            .await;
+        }
+    }
+    events
 }
 
 /// How long a delivery is waited for, and how often the queue is looked at.

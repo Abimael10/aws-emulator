@@ -1302,6 +1302,17 @@ pub fn no_starting_trigger(name: &str) -> String {
     format!("Workflow {name} doesn't have any starting trigger.")
 }
 
+/// `StartJobRun` for a job that already has as many runs in flight as its
+/// `ExecutionProperty$MaxConcurrentRuns` admits.
+///
+/// RECORDED constant, and the whole message: the job-run concurrency refusal is FIXED text
+/// with no variable part — it names neither the job, nor how many runs are in flight, nor
+/// the ceiling — so a client recognises the refusal by its wording whatever it started. The
+/// WORKFLOW surface words its own concurrency refusal differently
+/// ([`concurrent_workflow_runs_exceeded`]), which is why this is a second constant and not
+/// that one.
+pub const CONCURRENT_JOB_RUNS_EXCEEDED: &str = "Concurrent runs exceeded.";
+
 /// `StartWorkflowRun` for a workflow already running as many runs as it allows.
 /// DOCUMENTED template: `WorkflowRun$ErrorMessage` states this is the wording — "This
 /// error message describes any error that may have occurred in starting the workflow

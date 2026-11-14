@@ -1002,13 +1002,17 @@ boto3.client("s3").put_object(
             Some(expected),
             "case {case:?}: the script must read --scale {expected:?}, got {read}"
         );
-        // And the run reports the same resolved set the script read.
+        // The run itself reports the WHOLE set of arguments ITS START carried, and not the
+        // resolved set its script read: a job's `DefaultArguments` stay on the definition,
+        // so a row whose start carried no arguments at all records none.
+        let carried = arguments
+            .as_object()
+            .is_some_and(|members| !members.is_empty());
         assert_eq!(
-            run.get("Arguments").and_then(Value::as_object).and_then(|arguments| {
-                arguments.get("--scale").and_then(Value::as_str)
-            }),
-            Some(expected),
-            "case {case:?}: the run must report the arguments it resolved, got {run}"
+            run.get("Arguments"),
+            carried.then_some(&arguments),
+            "case {case:?}: the run must report exactly the arguments its start carried \
+             ({arguments}), got {run}"
         );
     }
 }

@@ -254,7 +254,9 @@ async fn an_actions_overrides_are_applied_over_the_job_definition() {
                 // and earlier, or 480 minutes for Glue version 5.0 and later"
                 // (`Action$Timeout`), which is the version these jobs are created at.
                 "Timeout": 480,
-                "Arguments": { "--job-language": "python" },
+                // The action named no arguments, so the run it began records none: the
+                // job's own defaults stay on the definition.
+                "Arguments": Value::Null,
                 "SecurityConfiguration": Value::Null,
                 "NotificationProperty": Value::Null,
             }),
@@ -264,10 +266,9 @@ async fn an_actions_overrides_are_applied_over_the_job_definition() {
             json!({ "Arguments": { "--day": "2026-10-26", "--mode": "backfill" } }),
             json!({
                 "Timeout": 480,
-                // The action's arguments replace the job's default of the same name and
-                // are added beside the ones it does not name.
+                // The run records the arguments the action carried, which is what
+                // replaces the job's defaults when its script runs.
                 "Arguments": {
-                    "--job-language": "python",
                     "--day": "2026-10-26",
                     "--mode": "backfill",
                 },
@@ -281,7 +282,7 @@ async fn an_actions_overrides_are_applied_over_the_job_definition() {
         (
             "the timeout only",
             json!({ "Timeout": 45 }),
-            json!({ "Timeout": 45, "Arguments": { "--job-language": "python" } }),
+            json!({ "Timeout": 45, "Arguments": Value::Null }),
         ),
         (
             "the security configuration only",
@@ -303,7 +304,7 @@ async fn an_actions_overrides_are_applied_over_the_job_definition() {
             }),
             json!({
                 "Timeout": 10_080,
-                "Arguments": { "--job-language": "python", "--day": "2026-01-01" },
+                "Arguments": { "--day": "2026-01-01" },
                 "SecurityConfiguration": "action-security-config",
                 "NotificationProperty": { "NotifyDelayAfter": 1 },
             }),

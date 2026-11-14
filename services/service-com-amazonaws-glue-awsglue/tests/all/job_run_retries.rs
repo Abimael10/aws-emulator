@@ -338,7 +338,9 @@ async fn every_retry_carries_the_configuration_of_the_attempt_it_retries() {
         "AllocatedCapacity": 6,
         "SecurityConfiguration": "run-security",
         "GlueVersion": "4.0",
-        "Arguments": { "--job-language": "python", "--scale": "7" },
+        // The run records the arguments its start carried; the job's own defaults stay
+        // on the definition.
+        "Arguments": { "--scale": "7" },
     });
     for (attempt, run) in &chain {
         for (member, value) in expected.as_object().expect("the expectation is an object") {

@@ -354,18 +354,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `ExecutionProperty$MaxConcurrentRuns` is "the maximum number of concurrent
             // runs allowed for this job", so a start that would exceed it is refused with
             // this operation's own modelled error ("Too many jobs are being run
-            // concurrently") rather than admitted.
+            // concurrently") rather than admitted. The refusal states the ceiling was
+            // reached in the service's own fixed words and discloses neither the job nor
+            // the figures ([`crate::state::messages::CONCURRENT_JOB_RUNS_EXCEEDED`]).
             let in_flight = job.runs_in_flight();
             let allowed = job.max_concurrent_runs();
             if in_flight >= usize::try_from(allowed).unwrap_or(usize::MAX) {
                 return Err(
                     StartJobRunErrorModeled::ConcurrentRunsExceededException(
                         ConcurrentRunsExceededException {
-                            message: Some(format!(
-                                "Job {} already has {in_flight} of {allowed} concurrent runs \
-                                 in flight",
-                                input.job_name
-                            )),
+                            message: Some(
+                                crate::state::messages::CONCURRENT_JOB_RUNS_EXCEEDED.to_string(),
+                            ),
                         },
                     )
                     .into(),

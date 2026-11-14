@@ -484,8 +484,9 @@ pub struct JobScriptPlan {
     pub run_id: String,
     /// `JobCommand$ScriptLocation`: the Amazon S3 path of the script to run.
     pub script_location: Option<String>,
-    /// The run's own arguments — the job's `DefaultArguments` with the start's `Arguments`
-    /// over them — which the script reads off its command line.
+    /// The arguments one execution of the run's script is given — the job's
+    /// `DefaultArguments` with the start's own `Arguments` over them, then the job's
+    /// `NonOverridableArguments` — which the script reads off its command line.
     pub arguments: BTreeMap<String, String>,
     /// `JobRun$Timeout`, in minutes, as the run carries it.
     pub timeout_minutes: i32,
@@ -518,7 +519,7 @@ impl JobScriptPlan {
             run_id: run.id.clone(),
             script_location: job.command.script_location.clone(),
             arguments: run
-                .arguments
+                .effective_arguments
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
