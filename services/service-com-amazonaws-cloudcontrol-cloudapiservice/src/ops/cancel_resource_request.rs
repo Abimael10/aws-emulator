@@ -164,8 +164,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match store.cancel_request(&input.request_token, now) {
             crate::state::CancelVerdict::NotFound => Err(not_found()),
             // "Only resource operations requests with a status of PENDING or IN_PROGRESS
-            // can be canceled": a request in any other status — one already over, and one
-            // already being canceled — is not cancelable, which is a fault in the request
+            // can be canceled": a request that is already over, and that no cancellation
+            // of its own put there, is not cancelable, which is a fault in the request
             // this operation models no error for, so it is refused as an invalid request
             // naming the token and the status it is already in.
             crate::state::CancelVerdict::NotCancelable(operation_status) => {

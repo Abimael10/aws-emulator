@@ -93,15 +93,36 @@ pub const STATUS_PENDING: &str = "PENDING";
 ///
 /// "Only resource operations requests with a status of PENDING or IN_PROGRESS can be
 /// canceled" (`CancelResourceRequest`): the cancelable set is those two and no other, which
-/// is narrower than "not over" — a request already being canceled is still running and is
-/// not cancelable again, which is what keeps this `@idempotent` operation from moving the
-/// instant that cancellation completes.
+/// is narrower than "not over".
 pub const CANCELABLE_STATUSES: [&str; 2] = [STATUS_PENDING, STATUS_IN_PROGRESS];
 
 /// Whether a request in `status` can be canceled — see [`CANCELABLE_STATUSES`].
 pub fn is_cancelable_status(status: &str) -> bool {
     CANCELABLE_STATUSES.contains(&status)
 }
+
+/// The statuses a request is in BECAUSE it was canceled: the cancellation still running,
+/// and the cancellation over.
+///
+/// A request reaches neither except through `CancelResourceRequest`, so a request in one of
+/// them is one that operation already acted on — which is what makes a repeat of an
+/// `@idempotent` cancel answer that same cancellation instead of starting a second one.
+pub const CANCELLATION_STATUSES: [&str; 2] = [STATUS_CANCEL_IN_PROGRESS, STATUS_CANCEL_COMPLETE];
+
+/// Whether a request in `status` is one a cancel already acted on — see
+/// [`CANCELLATION_STATUSES`].
+pub fn is_cancellation_status(status: &str) -> bool {
+    CANCELLATION_STATUSES.contains(&status)
+}
+
+/// The `StatusMessage` a canceled request carries — "any message explaining the current
+/// status" (`ProgressEvent$StatusMessage`).
+///
+/// A request moves into the cancellation statuses only because the CALLER asked it to, so
+/// what explains those two statuses is that the cancellation was user-initiated. It is
+/// fixed text: nothing about which request was canceled varies it, and the request itself
+/// is already named by the event's own `RequestToken`.
+pub const CANCELLATION_STATUS_MESSAGE: &str = "User Initialized the Cancellation";
 
 /// How long after the call that starts it a resource operation completes.
 ///
@@ -377,12 +398,13 @@ pub enum CancelVerdict {
     /// This store holds no request under that token.
     NotFound,
     /// The request is in a status no cancel acts on — one outside
-    /// [`CANCELABLE_STATUSES`]: carries that status, so the refusal can state it.
+    /// [`CANCELABLE_STATUSES`] that no cancellation produced either: carries that status,
+    /// so the refusal can state it.
     NotCancelable(String),
-    /// The request was canceled: the work it owed is abandoned and it is now
-    /// [`STATUS_CANCEL_IN_PROGRESS`]. Carries the record as it stands, which is the
-    /// `ProgressEvent` the cancel answers with — boxed, so the verdict stays the size of
-    /// its smallest variant.
+    /// This request's cancellation is what the answer reports — either because this call
+    /// started it, or because an earlier one did and this `@idempotent` repeat answers the
+    /// same cancellation. Carries the record as it stands, which is the `ProgressEvent` the
+    /// cancel answers with — boxed, so the verdict stays the size of its smallest variant.
     Canceling(Box<RequestRecord>),
 }
 
@@ -784,17 +806,22 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
     /// Cancel the request `request_token` names, as of `now`.
     ///
     /// "Only resource operations requests with a status of PENDING or IN_PROGRESS can be
-    /// canceled" (`CancelResourceRequest`), so a request in any other status — one already
-    /// over, and one already being canceled — is reported back in that status rather than
-    /// moved, and a token this store holds no request under is reported as holding none.
-    /// That is what makes a repeated cancel leave the request exactly where the first one
-    /// put it, as an `@idempotent` operation must.
+    /// canceled" (`CancelResourceRequest`), so a request whose status is outside
+    /// [`CANCELABLE_STATUSES`] is reported back in that status rather than moved, and a
+    /// token this store holds no request under is reported as holding none.
+    ///
+    /// The exception is a request a cancel ALREADY acted on — one in a
+    /// [`CANCELLATION_STATUSES`] status, which nothing but this operation puts a request
+    /// in. `CancelResourceRequest` is `@idempotent`, so repeating it answers that same
+    /// cancellation, exactly as the first call did, and moves nothing: not the work it
+    /// abandoned, and not the instant the cancellation completes.
     ///
     /// A canceled request ABANDONS the work it owed — the resource it was to provision,
     /// patch or remove is left exactly as it is — and is answered while the cancellation
     /// is still running, so it reaches [`STATUS_CANCEL_COMPLETE`] one
     /// [`RESOURCE_OPERATION_SPAN`] later, the way every other resource operation reaches
-    /// its own terminal status.
+    /// its own terminal status. From here on it carries
+    /// [`CANCELLATION_STATUS_MESSAGE`] as the message explaining that status.
     ///
     /// Call [`Self::materialise_due`] first: a request whose work has fallen due is over,
     /// and a cancel must see the status it has actually reached.
@@ -802,11 +829,17 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
         let Some(record) = self.requests.get_mut(request_token) else {
             return CancelVerdict::NotFound;
         };
+        if is_cancellation_status(&record.operation_status) {
+            return CancelVerdict::Canceling(Box::new(record.clone()));
+        }
         if !is_cancelable_status(&record.operation_status) {
             return CancelVerdict::NotCancelable(record.operation_status.clone());
         }
         let due = now + RESOURCE_OPERATION_SPAN;
         record.operation_status = STATUS_CANCEL_IN_PROGRESS.to_string();
+        // What explains the status the request is now in, which it keeps as the
+        // cancellation runs on to its own terminal status: the caller initiated it.
+        record.status_message = Some(CANCELLATION_STATUS_MESSAGE.to_string());
         // The work is dropped rather than applied: nothing the request was accepted for
         // happens, which is what cancelling it means. What is still owed is the
         // cancellation reaching its own terminal status.
@@ -2182,9 +2215,9 @@ mod tests {
                 "status {status:?}: not a value the model's OperationStatus enum declares"
             );
         }
-        for status in CANCELABLE_STATUSES {
+        for status in CANCELABLE_STATUSES.iter().chain(&CANCELLATION_STATUSES) {
             assert!(
-                crate::ops::types::OPERATION_STATUS_VALUES.contains(&status),
+                crate::ops::types::OPERATION_STATUS_VALUES.contains(status),
                 "status {status:?}: not a value the model's OperationStatus enum declares"
             );
         }
@@ -2294,8 +2327,9 @@ mod tests {
         record
     }
 
-    /// A cancel acts exactly on a request in one of the two cancelable statuses, and the
-    /// work it abandons is never applied.
+    /// A cancel acts exactly on a request in one of the two cancelable statuses, answers a
+    /// request its own earlier call already canceled, and refuses every other status — and
+    /// the work it abandons is never applied.
     ///
     /// The rows are the model's OWN `OperationStatus` enum
     /// (`smithy_query(query="shape",shape="OperationStatus")`), so every status a request
@@ -2342,6 +2376,30 @@ mod tests {
                         .resolve(&native, DEFAULT_REGION, "AWS::Kinesis::Stream", "stream")
                         .is_none(),
                     "case {status:?}: a canceled create must leave no resource to resolve"
+                );
+            } else if is_cancellation_status(status) {
+                // A request already in one of the cancellation statuses is one a cancel put
+                // there, so the repeat answers that cancellation and moves nothing.
+                match &verdict {
+                    CancelVerdict::Canceling(record) => assert_eq!(
+                        record.operation_status, *status,
+                        "case {status:?}: the repeat must answer the request as it stands, \
+                         got {:?}",
+                        record.operation_status
+                    ),
+                    other => panic!(
+                        "case {status:?}: expected the cancellation to be answered, got \
+                         {other:?}"
+                    ),
+                }
+                assert_eq!(
+                    store
+                        .request("a-request-token")
+                        .map(|record| record.operation_status.as_str()),
+                    Some(*status),
+                    "case {status:?}: an idempotent repeat must leave the request as it was, \
+                     got {:?}",
+                    store.request("a-request-token")
                 );
             } else {
                 match &verdict {
