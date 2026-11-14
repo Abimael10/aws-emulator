@@ -858,10 +858,11 @@ struct IdentifierCase {
 /// must begin with a letter and must contain only ASCII letters, digits, and hyphens. It
 /// can't end with a hyphen or contain two consecutive hyphens"), and the rows span its
 /// clauses — a trailing hyphen, two consecutive hyphens, a character outside the alphabet
-/// and a leading digit — across the parameter-group names, a snapshot identifier and the
-/// two members RDS words by their subject, the DB instance's twice: once for a value that is
-/// no identifier token at all, which its subject answers, and once for a token breaking a
-/// hyphen rule, which the sentence pair answers.
+/// and a leading digit — across the DB parameter group's name, which states the rule, the DB
+/// CLUSTER parameter group's, which RDS words by its subject, a snapshot identifier and the
+/// two database identifiers RDS words by their subject, the DB instance's twice: once for a
+/// value that is no identifier token at all, which its subject answers, and once for a token
+/// breaking a hyphen rule, which the sentence pair answers.
 const IDENTIFIER_CASES: &[IdentifierCase] = &[
     IdentifierCase {
         case: "a DB parameter group name ending in a hyphen",
@@ -894,7 +895,7 @@ const IDENTIFIER_CASES: &[IdentifierCase] = &[
             ("DBParameterGroupFamily", "aurora-mysql8.0"),
             ("Description", "a-group-under-test"),
         ],
-        subject: None,
+        subject: Some("cluster parameter group name"),
     },
     IdentifierCase {
         case: "a DB snapshot identifier starting with a digit",

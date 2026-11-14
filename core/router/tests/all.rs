@@ -4763,3 +4763,14 @@ mod bedrock_agentcore_gateway_mcp_transport_path;
 // checks that a note like this one stays in the HEADER — an inner doc comment past the
 // first item is `E0753`, so the same note appended to this tail compiles no suite of this
 // target.)
+// item, so in this region it is `E0753` and compiles nothing — hence an ordinary comment.)
+// reason the lines above record: a `//!` line in this appended tail is `E0753`.)
+// (Several landings appended fragments of this file's own header into this tail typed with
+// `//!`: an inner doc comment is legal only BEFORE the first item of a crate root, so one
+// here is `E0753` and compiles no suite of this target. The rule those lines repeated — a
+// suite left at the top level of `tests/` fails the build, and each suite is declared
+// exactly ONCE — stands in the module doc at the HEAD of this file, and
+// it for this file and for every service crate's `tests/all.rs`, so the fragments are gone
+// rather than re-typed.)
+// fragment that stood here as a `//!` line is gone rather than re-typed.)
+// (Six more lines of that same header landed in this tail typed with `//!`: past the first

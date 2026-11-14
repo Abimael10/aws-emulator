@@ -15,5 +15,7 @@
 mod db_cluster_associated_roles;
 #[path = "all/db_cluster_lifecycle.rs"]
 mod db_cluster_lifecycle;
+#[path = "all/duplicate_cluster_refusal_sentence.rs"]
+mod duplicate_cluster_refusal_sentence;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -226,13 +226,23 @@ pub fn check_event_categories(source_type: &str, categories: &[String]) -> Resul
     };
     for category in categories {
         if !published.contains(&category.as_str()) {
-            return Err(format!(
-                "{category} is not a published event category of {source_type} \
-                 (its categories are {})",
-                published.join(", ")
+            return Err(category_not_found_for_source_type_message(
+                category,
+                source_type,
             ));
         }
     }
     Ok(())
+}
+
+/// How this front door words the refusal of a category a source type does not publish: it
+/// reports that the CATEGORY could not be found FOR that source type and names both, and
+/// says nothing about the categories the type does publish.
+///
+/// Everything but the two names is fixed text — including the space before the colon — and
+/// each is carried as the request spelled it. The caller answers it with the modelled
+/// `SubscriptionCategoryNotFoundFault` (HTTP 404).
+pub fn category_not_found_for_source_type_message(category: &str, source_type: &str) -> String {
+    format!("Category : {category} not found for source type {source_type}.")
 }
 

@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // states are enforced here: the target name follows the name rule the API
         // publishes for a cluster parameter group, and "this value is stored as a lowercase
         // string".
-        crate::state::validate_parameter_group_name(
+        crate::state::check_parameter_group_name(
             "TargetDBClusterParameterGroupIdentifier",
             &input.target_db_cluster_parameter_group_identifier,
         )

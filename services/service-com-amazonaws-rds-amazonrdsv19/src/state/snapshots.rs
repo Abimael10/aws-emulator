@@ -496,14 +496,18 @@ pub fn db_snapshot_already_exists_message(named: &str) -> String {
 }
 
 /// The sentence the `DBClusterSnapshotAlreadyExistsFault` carries for `named`: "the user
-/// already has a DB cluster snapshot with the given identifier", worded as the resource
-/// type and the identifier the snapshot would be stored under.
+/// already has a DB cluster snapshot with the given identifier", worded as the service words
+/// it — a statement about the snapshot that cannot be created, whose only variable part is
+/// the identifier the snapshot would be stored under.
 ///
 /// One wording for every operation that MINTS a cluster snapshot — `CreateDBClusterSnapshot`,
 /// `CopyDBClusterSnapshot` and the final snapshot `DeleteDBCluster` takes — so no two of them
 /// word the same collision differently.
 pub fn db_cluster_snapshot_already_exists_message(named: &str) -> String {
-    format!("DB cluster snapshot already exists: {named}")
+    format!(
+        "Cannot create the cluster snapshot because one with the identifier {named} already \
+         exists."
+    )
 }
 
 /// The sentence the `SnapshotQuotaExceededFault` carries when another manual DB cluster

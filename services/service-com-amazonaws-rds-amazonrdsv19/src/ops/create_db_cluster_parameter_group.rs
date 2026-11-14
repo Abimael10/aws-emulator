@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // — a group "can be applied only to a DB cluster running a database engine and
         // engine version compatible with that … family", so a family no engine version
         // belongs to is refused (see `crate::state::validate_parameter_group_family`).
-        crate::state::validate_parameter_group_name(
+        crate::state::check_parameter_group_name(
             "DBClusterParameterGroupName",
             &input.db_cluster_parameter_group_name,
         )

@@ -10,10 +10,11 @@
 //! `InvalidDBSubnetGroupStateFault`, HTTP 400 with the `awsQueryError` code
 //! `InvalidDBSubnetGroupStateFault` — carries ONE sentence built from the request and from
 //! the blocking resource: the fixed text "Cannot delete the subnet group '" … "' because at
-//! least one database instance: " … " is still using it.", whose variable parts are the
-//! group name the request named (quoted, in the folded spelling it is stored under, since
-//! "This value is stored as a lowercase string") and the identifier of the database still
-//! using it. Nothing of either part comes from one particular group, instance or run.
+//! least one " … ": " … " is still using it.", whose variable parts are the group name the
+//! request named (quoted, in the folded spelling it is stored under, since "This value is
+//! stored as a lowercase string"), the KIND of database still using it — a database instance
+//! or a database cluster, whichever the store holds the association on — and that database's
+//! identifier. Nothing of any part comes from one particular group, instance or run.
 //!
 //! The table spans the classes the rule generalises over: the shape of the group name (plain,
 //! mixed case folded on the way in, the periods, underscores and spaces the member admits, a
@@ -28,7 +29,8 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::db_instances::{call, emulator, expect_error, expect_ok, text, wait_for_settle};
+use crate::db_instances::{call, emulator, expect_error, expect_ok, text};
+use crate::lifecycle_poll_loops::poll_until;
 
 /// Two subnets in the 17-character id form: the smallest list a DB subnet group can be made
 /// of, which every group below is created over.
@@ -44,14 +46,40 @@ enum Holder {
     DbCluster,
 }
 
+impl Holder {
+    /// How the in-use sentence names this kind of database: the refusal tells the caller
+    /// what has to be deleted before the group can be, so the noun is the holder's own.
+    fn noun(self) -> &'static str {
+        match self {
+            Self::DbInstance => "database instance",
+            Self::DbCluster => "database cluster",
+        }
+    }
+}
+
 /// The message `DeleteDBSubnetGroup` answers for a group a database still uses: the fixed
-/// sentence, with the group name as the request named it (folded) and the identifier of the
-/// blocking database.
-fn in_use_wording(folded_name: &str, holder_identifier: &str) -> String {
+/// sentence, with the group name as the request named it (folded), the noun naming the kind
+/// of database that holds it and the identifier of that database.
+fn in_use_wording(folded_name: &str, holder: Holder, holder_identifier: &str) -> String {
     format!(
-        "Cannot delete the subnet group '{folded_name}' because at least one database \
-         instance: {holder_identifier} is still using it."
+        "Cannot delete the subnet group '{folded_name}' because at least one {}: \
+         {holder_identifier} is still using it.",
+        holder.noun()
     )
+}
+
+/// Read `identifier` until the DB instance has left the store, through the one poll loop
+/// this test target shares (`lifecycle_poll_loops::poll_until`): the CONDITION is waited
+/// for, never a fixed span.
+async fn poll_until_removed(router: &MultiServiceRouter, case: &str, identifier: &str) {
+    let params = [("DBInstanceIdentifier", identifier)];
+    poll_until(
+        case,
+        &format!("the DB instance {identifier}"),
+        || call(router, "DescribeDBInstances", &params),
+        |status, _| status == 404,
+    )
+    .await;
 }
 
 /// `CreateDBSubnetGroup` over [`TWO_SUBNETS`].
@@ -172,7 +200,8 @@ async fn a_group_a_database_still_uses_is_refused_with_the_documented_sentence()
             "InvalidDBSubnetGroupStateFault",
         );
         let message = text(&refused, "Message");
-        let expected = in_use_wording(&row.group.to_ascii_lowercase(), row.identifier);
+        let expected =
+            in_use_wording(&row.group.to_ascii_lowercase(), row.holder, row.identifier);
         assert_eq!(
             message, expected,
             "case {:?}: expected the in-use sentence, got {message:?}",
@@ -231,7 +260,7 @@ async fn the_sentence_names_a_database_the_store_really_holds_when_several_hold_
     let message = text(&refused, "Message");
     let admissible: Vec<String> = identifiers
         .iter()
-        .map(|identifier| in_use_wording(group, identifier))
+        .map(|identifier| in_use_wording(group, Holder::DbInstance, identifier))
         .collect();
     assert!(
         admissible.contains(&message),
@@ -265,13 +294,13 @@ async fn the_refusal_is_answered_only_while_a_database_holds_the_group() {
     );
     assert_eq!(
         text(&refused, "Message"),
-        in_use_wording(group, identifier),
+        in_use_wording(group, Holder::DbInstance, identifier),
         "expected the in-use sentence, got {refused}"
     );
 
     // Released: the instance leaves the store when the removal the clock owes falls due, and
     // only then is the same delete accepted — the state fault is about the store, not about
-    // the name the request carries.
+    // the name the request carries. The removal is POLLED for, never waited out.
     expect_ok(
         "the instance delete",
         call(
@@ -284,7 +313,7 @@ async fn the_refusal_is_answered_only_while_a_database_holds_the_group() {
         )
         .await,
     );
-    wait_for_settle();
+    poll_until_removed(&router, "the released instance", identifier).await;
     expect_ok(
         "the delete once nothing holds the group",
         call(

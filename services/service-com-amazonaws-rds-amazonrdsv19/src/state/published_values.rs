@@ -979,6 +979,12 @@ pub const DB_CLUSTER_ENGINES: [&str; 6] = [
 
 /// Refuse an `Engine` outside the value list `CreateDBClusterMessage$Engine` publishes
 /// ([`DB_CLUSTER_ENGINES`]).
+///
+/// The refusal is the ONE fixed sentence this front door answers an `Engine` that names no
+/// engine it serves with ([`INVALID_DB_ENGINE_MESSAGE`]): the value list the member
+/// publishes decides WHICH values are refused, not how the refusal is worded, so a cluster
+/// create and an instance create word the same verdict the same way and neither states the
+/// list nor echoes the rejected value.
 pub fn check_db_cluster_engine(engine: &str) -> Result<(), String> {
     if DB_CLUSTER_ENGINES
         .iter()
@@ -986,10 +992,7 @@ pub fn check_db_cluster_engine(engine: &str) -> Result<(), String> {
     {
         return Ok(());
     }
-    Err(format!(
-        "Invalid DB engine: {engine} is not one of {}",
-        DB_CLUSTER_ENGINES.join(", ")
-    ))
+    Err(INVALID_DB_ENGINE_MESSAGE.to_string())
 }
 
 /// Whether a cluster of `engine` is a MULTI-AZ DB CLUSTER rather than an Aurora-style one.

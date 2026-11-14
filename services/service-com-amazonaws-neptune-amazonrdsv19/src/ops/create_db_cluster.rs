@@ -293,7 +293,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.clusters.contains_key(&identifier) {
             return Err(CreateDBClusterErrorModeled::DBClusterAlreadyExistsFault(
                 DBClusterAlreadyExistsFault {
-                    message: Some(format!("DB Cluster already exists: {identifier}")),
+                    // The fault's sentence is FIXED text: the service states only that the
+                    // cluster exists and interpolates neither the identifier the request
+                    // carried nor the one the store holds.
+                    message: Some(st::DB_CLUSTER_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());

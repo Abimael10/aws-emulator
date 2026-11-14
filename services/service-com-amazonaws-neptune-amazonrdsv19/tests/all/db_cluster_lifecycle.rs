@@ -149,15 +149,18 @@ fn decode_entities(text: &str) -> String {
 
 /// One response: the HTTP status, the raw XML body (for assertion messages) and its
 /// parsed root element.
-struct Reply {
-    status: u16,
-    body: String,
+///
+/// `pub(crate)` so the sibling suites of this one test target read a response through this
+/// reader rather than growing another copy of it.
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: String,
     root: Element,
 }
 
 impl Reply {
     /// The text of the element at `path`, descending from the response root.
-    fn field(&self, path: &[&str]) -> String {
+    pub(crate) fn field(&self, path: &[&str]) -> String {
         self.root
             .at(path)
             .map(|found| found.text.clone())
@@ -193,23 +196,26 @@ impl Reply {
     }
 
     /// The awsQuery `<Error><Code>` of a failure response.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.field(&["Error", "Code"])
     }
 
     /// The awsQuery `<Error><Message>` of a failure response.
-    fn error_message(&self) -> String {
+    pub(crate) fn error_message(&self) -> String {
         self.field(&["Error", "Message"])
     }
 }
 
 /// One emulator with this service mounted, driven over HTTP in-process.
-struct Neptune {
+///
+/// `pub(crate)` for the same reason [`Reply`] is: one harness for every suite of this test
+/// target, so a change to the routing key or to the body encoding is made once.
+pub(crate) struct Neptune {
     router: MultiServiceRouter,
 }
 
 impl Neptune {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The test asserts service behaviour, not SigV4 verification.
@@ -218,7 +224,7 @@ impl Neptune {
         Self { router }
     }
 
-    async fn call(&self, action: &str, params: &[(&str, &str)]) -> Reply {
+    pub(crate) async fn call(&self, action: &str, params: &[(&str, &str)]) -> Reply {
         let mut body = format!("Action={action}&Version={API_VERSION}");
         for (key, value) in params {
             assert!(

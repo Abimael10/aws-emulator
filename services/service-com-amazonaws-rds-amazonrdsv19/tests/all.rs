@@ -217,6 +217,8 @@ mod export_source_state;
 mod export_tasks;
 #[path = "all/family_release_parameters.rs"]
 mod family_release_parameters;
+#[path = "all/front_door_refusal_sentences.rs"]
+mod front_door_refusal_sentences;
 #[path = "all/global_cluster_member_resource_id.rs"]
 mod global_cluster_member_resource_id;
 #[path = "all/global_cluster_membership.rs"]

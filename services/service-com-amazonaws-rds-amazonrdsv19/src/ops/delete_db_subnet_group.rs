@@ -214,13 +214,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot be deleted because it's in use"). A DB cluster placed in the group holds
         // it the same way, and both are read off the records that NAME the group, which is
         // the only place that association is recorded. What the refusal needs of either is
-        // the IDENTIFIER of the database still using the group, which is the one variable
-        // part of the wording RDS answers here.
+        // its KIND and its IDENTIFIER — the two variable parts of the wording RDS answers
+        // here, which names the database that has to be deleted first.
         let holder = store
             .instances_in(&region)
             .into_iter()
             .find(|instance| instance.db_subnet_group_name.as_deref() == Some(name.as_str()))
-            .map(|instance| instance.identifier.clone())
+            .map(|instance| {
+                (
+                    crate::state::DbSubnetGroupHolder::DbInstance,
+                    instance.identifier.clone(),
+                )
+            })
             .or_else(|| {
                 store
                     .clusters_in(&region)
@@ -228,14 +233,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .find(|cluster| {
                         cluster.db_subnet_group_name.as_deref() == Some(name.as_str())
                     })
-                    .map(|cluster| cluster.identifier.clone())
+                    .map(|cluster| {
+                        (
+                            crate::state::DbSubnetGroupHolder::DbCluster,
+                            cluster.identifier.clone(),
+                        )
+                    })
             });
-        if let Some(holder) = holder {
+        if let Some((kind, holder)) = holder {
             return Err(
                 DeleteDBSubnetGroupErrorModeled::InvalidDBSubnetGroupStateFault(
                     InvalidDBSubnetGroupStateFault {
                         message: Some(crate::state::db_subnet_group_in_use_message(
-                            &name, &holder,
+                            &name, kind, &holder,
                         )),
                     },
                 )

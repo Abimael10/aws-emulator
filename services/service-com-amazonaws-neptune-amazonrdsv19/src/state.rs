@@ -107,6 +107,15 @@ pub const MAX_STORED_INSTANCES: usize = 5_000;
 /// same and the message names the cluster and the limit.
 pub const MAX_MEMBERS_PER_CLUSTER: usize = 16;
 
+/// The sentence the `DBClusterAlreadyExistsFault` carries: the answer to a create that names
+/// an identifier the region already holds.
+///
+/// The whole message is FIXED text — the service states only that the cluster exists, and
+/// interpolates neither the identifier the request carried nor the one the store holds — so
+/// it is a constant rather than a `format!` over the request. The capitalisation is the
+/// service's own.
+pub const DB_CLUSTER_ALREADY_EXISTS_MESSAGE: &str = "DB Cluster already exists";
+
 /// Status of an IAM role association the service is still putting in place.
 /// Source: `DBClusterRole$Status` — "PENDING - the IAM role ARN is being associated with the
 /// DB cluster."

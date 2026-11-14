@@ -162,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for a DB parameter group ("Must contain from 1 to 255 letters, numbers, or
         // hyphens. First character must be a letter. Can't end with a hyphen or contain two
         // consecutive hyphens"), and "this value is stored as a lowercase string".
-        crate::state::validate_parameter_group_name(
+        crate::state::check_parameter_group_name(
             "TargetDBParameterGroupIdentifier",
             &input.target_db_parameter_group_identifier,
         )

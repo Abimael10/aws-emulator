@@ -2052,14 +2052,48 @@ pub fn db_subnet_group_already_exists_message(name: &str) -> String {
 /// group must not be associated with any DB instances").
 ///
 /// Amazon RDS words this one sentence from the request and from the blocking resource: the
-/// group name the request asked to delete, quoted, and the identifier of the database that
-/// still holds it. It lives here, beside the not-found wordings, so the one operation that
-/// answers it and any later one word it the same way.
-pub fn db_subnet_group_in_use_message(name: &str, holder_identifier: &str) -> String {
+/// group name the request asked to delete, quoted, the KIND of database that still holds it
+/// ([`DbSubnetGroupHolder::noun`]) and that database's identifier. It lives here, beside the
+/// not-found wordings, so the one operation that answers it and any later one word it the
+/// same way.
+///
+/// The noun comes from the record the association was found on rather than being fixed:
+/// the sentence tells the caller what has to be deleted before the group can be, so naming
+/// a DB instance where a DB cluster is the holder would name the wrong resource.
+pub fn db_subnet_group_in_use_message(
+    name: &str,
+    holder: DbSubnetGroupHolder,
+    holder_identifier: &str,
+) -> String {
     format!(
-        "Cannot delete the subnet group '{name}' because at least one database instance: \
-         {holder_identifier} is still using it."
+        "Cannot delete the subnet group '{name}' because at least one {}: \
+         {holder_identifier} is still using it.",
+        holder.noun()
     )
+}
+
+/// The KIND of database that can hold a DB subnet group, as the in-use refusal names it.
+///
+/// Both records of this front door that carry a `DBSubnetGroupName` place a database in the
+/// group — a DB instance and a DB cluster — and the refusal
+/// ([`db_subnet_group_in_use_message`]) names the one it found, so the two kinds are a type
+/// rather than a string a handler spells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbSubnetGroupHolder {
+    /// A DB instance created with `DBSubnetGroupName` set to the group.
+    DbInstance,
+    /// A DB cluster created with `DBSubnetGroupName` set to the group.
+    DbCluster,
+}
+
+impl DbSubnetGroupHolder {
+    /// How the in-use sentence names this kind of database.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::DbInstance => "database instance",
+            Self::DbCluster => "database cluster",
+        }
+    }
 }
 
 /// A stored DB subnet group: the name, the description and the EC2 subnets the request
@@ -3710,13 +3744,20 @@ fn identifier_wording(member: &str) -> IdentifierWording {
         "OptionGroupName" | "TargetOptionGroupIdentifier" => {
             IdentifierWording::Subject("option group name")
         }
+        // The name of a DB CLUSTER parameter group, which RDS words by its own subject
+        // rather than by the sentence pair the DB parameter group's name answers — the two
+        // members differ in that — for every clause of the name rule, and at the create and
+        // at the name a COPY of a group is created under alike.
+        "DBClusterParameterGroupName" | "TargetDBClusterParameterGroupIdentifier" => {
+            IdentifierWording::Subject("cluster parameter group name")
+        }
         // The identifier of a DB SNAPSHOT a copy names: the source it is taken of and the
         // name the copy is created under are both a snapshot's identifier, so the one
         // subject answers either.
         "SourceDBSnapshotIdentifier" | "TargetDBSnapshotIdentifier" => {
             IdentifierWording::Subject("snapshot identifier")
         }
-        // Every other identifier member — a parameter group's name, a subscription's, a
+        // Every other identifier member — a DB parameter group's name, a subscription's, a
         // shard group's, a tenant database's — states the rule and names itself.
         _ => IdentifierWording::TheRule,
     }
@@ -3756,7 +3797,19 @@ pub fn check_identifier(member: &str, value: &str, max_len: usize) -> Result<(),
     if identifier_is_well_formed(value, max_len) {
         return Ok(());
     }
-    Err(match identifier_wording(member) {
+    Err(identifier_refusal_message(member, value, max_len))
+}
+
+/// The message a value outside its identifier member's rule is refused with: the wording
+/// that member carries ([`identifier_wording`]), filled in from the member and the value.
+///
+/// Stated once here because the rule a value broke and the WORDING of the refusal are two
+/// different things: every member whose value has to be an identifier of this front door —
+/// whether its rule is the identifier walk ([`check_identifier`]) or the name rule a
+/// parameter group's name follows ([`check_parameter_group_name`]) — words its refusal from
+/// this one place, so no two of them can disagree about what a member is called.
+fn identifier_refusal_message(member: &str, value: &str, max_len: usize) -> String {
+    match identifier_wording(member) {
         IdentifierWording::Subject(subject) => format!("Invalid {subject}:  {value}"),
         IdentifierWording::SubjectForAValueThatIsNoToken(subject)
             if !is_an_identifier_token(value, max_len) =>
@@ -3764,7 +3817,29 @@ pub fn check_identifier(member: &str, value: &str, max_len: usize) -> Result<(),
             format!("Invalid {subject}:  {value}")
         }
         _ => not_a_valid_identifier_message(member),
-    })
+    }
+}
+
+/// Refuse a parameter group NAME outside the rule the API publishes for it, worded the way
+/// this front door words that member.
+///
+/// The rule is the shared one every view of this front door holds a parameter group name to
+/// ([`validate_parameter_group_name`]: "from 1 to 255 letters or numbers. The first
+/// character must be a letter. Cannot end with a hyphen or contain two consecutive
+/// hyphens"). What is this crate's own is the WORDING — a cluster parameter group's name is
+/// refused by its SUBJECT, the other parameter-group members by the sentence pair that
+/// states the rule — so the verdict comes from the shared rule and the sentence from
+/// [`identifier_refusal_message`], the one place every identifier member of this service is
+/// worded from.
+pub fn check_parameter_group_name(member: &str, value: &str) -> Result<(), String> {
+    if validate_parameter_group_name(member, value).is_ok() {
+        return Ok(());
+    }
+    Err(identifier_refusal_message(
+        member,
+        value,
+        MAX_PARAMETER_GROUP_NAME_LEN,
+    ))
 }
 
 /// Whether `value` is written as an identifier TOKEN at all: it begins with an ASCII letter,

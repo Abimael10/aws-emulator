@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // states are enforced here: the published name rule, and a family that is one of the
         // engine-version families this front door publishes (see
         // `crate::state::validate_parameter_group_family`).
-        crate::state::validate_parameter_group_name(
+        crate::state::check_parameter_group_name(
             "DBParameterGroupName",
             &input.db_parameter_group_name,
         )
