@@ -855,6 +855,24 @@ impl ComAmazonawsEc2Amazonec2State {
                 // The transition is applied once; nothing is owed on this target any more.
                 false
             });
+        // A resource discovery `CreateIpamResourceDiscovery` answered as `create-in-progress`
+        // reaches `create-complete` once its due instant has passed, whether or not anybody
+        // called — the same contract as the scope above. The DEFAULT discovery of an IPAM is
+        // not listed here: `complete_ipam_creation` moves it with the IPAM it came up with.
+        let ipam_discoveries = &mut self.ipam_resource_discoveries;
+        self.ipam_resource_discovery_create_complete_at
+            .retain(|discovery_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(discovery) = ipam_discoveries.get_mut(discovery_id) {
+                    if discovery.state.as_deref() == Some(IPAM_STATE_CREATE_IN_PROGRESS) {
+                        discovery.state = Some(IPAM_STATE_CREATE_COMPLETE.to_string());
+                    }
+                }
+                // The transition is applied once; nothing is owed on this discovery any more.
+                false
+            });
         // A resource discovery association `AssociateIpamResourceDiscovery` answered as
         // `associate-in-progress` reaches `associate-complete` once its due instant has
         // passed, whether or not anybody called — the same contract as the scope above. The

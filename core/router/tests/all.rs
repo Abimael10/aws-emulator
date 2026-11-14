@@ -7815,3 +7815,36 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // (Three more such lines stood here.)
 // (Seven more such lines stood here.)
 // (And two last ones here.)
+// (`ses_event_destination_reaches_an_eventbridge_rule_target` is declared ONCE, a few lines
+// above in this same tail: two landings in the same window each appended a declaration of it
+// here, and a module declared twice is `E0428`, which compiles no suite of this target, so
+// the duplicate that stood here is gone.)
+// is `E0428`, so the duplicate that stood here is gone.)
+// leaving a note in the appended tail below, where an inner doc comment is `E0753`. (The
+// same fragment, landed here typed with `//!`: past the first item that is `E0753` and
+// compiles no suite of this target, so it stands as an ordinary comment.)
+// and compiles nothing. (Five more lines of that header fragment, appended here by a
+// landing typed with `//!` and re-typed as ordinary comments for the reason they
+// themselves state.)
+// (This tail accumulated many fragments of this file's own header, appended by landings
+// typed with `//!`. Past the first item of a crate root an inner doc comment is `E0753`
+// and compiles no suite of this target, so those fragments are gone rather than re-typed:
+// the rule they repeated stands in the module doc at the HEAD of this file, checked by
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`.)
+// (Merge residue stood here: fragments of this file's own header that landings appended,
+// several typed with `//!`, which past the first item of a crate root is `E0753` and compiles
+// no suite of this target. They are gone rather than re-typed — the rule they repeated stands
+// in the module doc at the HEAD of this file. No suite declaration stood among them.)
+// (More residue of the same kind stood here and is gone rather than re-typed: appended
+// fragments of this file's own header, several typed with `//!`, which past the first item is
+// `E0753`. No suite declaration stood among them.)
+// Declared here, in this tail: whether an EventBridge rule fans one event out to both a Lambda
+// target and a Step Functions state machine spans EventBridge, AWS Lambda, Step Functions and
+// CloudFormation at once, so no single service crate's test target can wire it and then read
+// both deliveries. (A merge of two landings had left this suite declared nowhere.)
+// (Everything that stood from here to the end of the file was merge residue: fragments of
+// this file's own header that landings appended to the tail, many of them typed with `//!`.
+// Past the first item of a crate root an inner doc comment is `E0753` and compiles no suite of
+// this target, so they are gone rather than re-typed — the rule they repeated stands in the
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of it. No suite
+// declaration stood among them.)

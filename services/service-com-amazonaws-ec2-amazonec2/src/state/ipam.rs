@@ -1267,6 +1267,127 @@ impl ComAmazonawsEc2Amazonec2State {
             ipam.resource_discovery_association_count = i32::try_from(associations).ok();
         }
     }
+
+    /// Whether another IPAM resource discovery fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]) — the same contract as
+    /// [`Self::has_ipam_resource_discovery_association_capacity`]: a create asks first and
+    /// refuses when it answers `false`.
+    pub fn has_ipam_resource_discovery_capacity(&self) -> bool {
+        self.ipam_resource_discoveries.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store the resource discovery a `CreateIpamResourceDiscovery` asked for and answer the
+    /// `IpamResourceDiscoveryId` it was given — or `None` when the store is at its ceiling and
+    /// nothing was stored.
+    ///
+    /// The ONE way a CALLER-CREATED discovery is stored, the counterpart of
+    /// [`Self::insert_created_ipam_scope`] for the component that does the discovering: every
+    /// member the SERVICE owns is derived here rather than taken from the request — the id, the
+    /// ARN it reports ([`ipam_resource_arn`] under this resource's modelled type), "the ID of
+    /// the owner" (`IpamResourceDiscovery$OwnerId`), the `create-in-progress` state it starts
+    /// in, the fact that a discovery a caller asked for is not the default one ("The default
+    /// resource discovery is the resource discovery automatically created when you create an
+    /// IPAM", `$IsDefault`) and the empty organizational-unit exclusion set, which only
+    /// `ModifyIpamResourceDiscovery` adds to. The discovery is answered in the non-terminal
+    /// state, so the clock owes it [`IPAM_STATE_CREATE_COMPLETE`] one [`TRANSITION_DELAY`]
+    /// later ([`Self::ipam_resource_discovery_create_complete_at`], applied by
+    /// [`Self::materialize_due_transitions`]); `client_token` names the discovery from here on
+    /// so a replay of the same request answers it instead of creating a second one; and every
+    /// caller-chosen byte the record retains is charged to the store's byte budget
+    /// ([`ipam_resource_discovery_payload_bytes`]).
+    pub fn insert_ipam_resource_discovery(
+        &mut self,
+        spec: IpamResourceDiscoverySpec,
+    ) -> Option<String> {
+        if !self.has_ipam_resource_discovery_capacity() {
+            return None;
+        }
+        let payload_bytes = ipam_resource_discovery_payload_bytes(&spec);
+        let discovery_id = self.next_id(IPAM_RESOURCE_DISCOVERY_ID_PREFIX);
+        self.ipam_resource_discoveries.insert(
+            discovery_id.clone(),
+            IpamResourceDiscovery {
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                ipam_resource_discovery_id: Some(discovery_id.clone()),
+                ipam_resource_discovery_arn: Some(ipam_resource_arn(
+                    RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY,
+                    &discovery_id,
+                )),
+                ipam_resource_discovery_region: Some(spec.region),
+                description: spec.description,
+                operating_regions: Some(
+                    spec.operating_regions
+                        .into_iter()
+                        .map(|region_name| IpamOperatingRegion {
+                            region_name: Some(region_name),
+                        })
+                        .collect(),
+                ),
+                is_default: Some(false),
+                state: Some(IPAM_STATE_CREATE_IN_PROGRESS.to_string()),
+                tags: Some(spec.tags),
+                // "If your IPAM is integrated with Amazon Web Services Organizations and you
+                // add an organizational unit (OU) exclusion, IPAM will not manage the IP
+                // addresses in accounts in that OU exclusion"
+                // (`IpamResourceDiscovery$OrganizationalUnitExclusions`): a create adds none,
+                // so the discovery starts excluding nothing.
+                organizational_unit_exclusions: Some(Vec::new()),
+            },
+        );
+        self.add_stored_bytes(payload_bytes);
+        self.ipam_resource_discovery_create_complete_at
+            .insert(discovery_id.clone(), Instant::now() + TRANSITION_DELAY);
+        if let Some(token) = spec.client_token {
+            self.ipam_resource_discovery_client_tokens
+                .insert(token, discovery_id.clone());
+        }
+        Some(discovery_id)
+    }
+}
+
+/// What one stored IPAM resource discovery is created with, beside everything the store
+/// derives itself (its id, its ARN, its owner, its state, its default flag and its
+/// organizational-unit exclusions).
+///
+/// The spec of the resource, in the same shape [`IpamSpec`] has for an IPAM:
+/// `CreateIpamResourceDiscovery` fills this in and
+/// [`ComAmazonawsEc2Amazonec2State::insert_ipam_resource_discovery`] turns it into the modelled
+/// [`IpamResourceDiscovery`] the describe reports, so no two paths can create one two ways.
+#[derive(Debug, Clone)]
+pub struct IpamResourceDiscoverySpec {
+    /// "The resource discovery Region" (`IpamResourceDiscovery$IpamResourceDiscoveryRegion`):
+    /// the Region the creating request was signed for.
+    pub region: String,
+    /// "A description for the IPAM resource discovery"
+    /// (`CreateIpamResourceDiscoveryRequest$Description`), or `None`.
+    pub description: Option<String>,
+    /// The Region names of `IpamResourceDiscovery$OperatingRegions`, already validated and
+    /// deduplicated by the caller, including the discovery's own Region.
+    pub operating_regions: Vec<String>,
+    /// The tags of an `ipam-resource-discovery` tag specification.
+    pub tags: Vec<Tag>,
+    /// The request's `ClientToken`, which
+    /// [`ComAmazonawsEc2Amazonec2State::insert_ipam_resource_discovery`] records against the
+    /// discovery it mints so a replay of the same request answers with that discovery, or
+    /// `None` when the request carried none.
+    pub client_token: Option<String>,
+}
+
+/// The bytes one `CreateIpamResourceDiscovery` adds to the store: the caller-chosen ones — its
+/// description, the Region names it operates in, its tags and the client token the token map
+/// keeps — plus the fixed [`STORED_RECORD_OVERHEAD_BYTES`] of the one record it writes. Every
+/// other member is an id, an ARN, a state or a flag this module derives, so it is fixed-size.
+///
+/// The ONE definition of that charge, the way [`ipam_payload_bytes`] is for an IPAM: the writer
+/// charges exactly it, so a removal path can give back the same number.
+pub fn ipam_resource_discovery_payload_bytes(spec: &IpamResourceDiscoverySpec) -> usize {
+    let regions: usize = spec.operating_regions.iter().map(String::len).sum();
+    let description = spec.description.as_deref().unwrap_or_default().len();
+    tag_list_bytes(&spec.tags)
+        .saturating_add(regions)
+        .saturating_add(description)
+        .saturating_add(spec.client_token.as_deref().unwrap_or_default().len())
+        .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
 }
 
 /// What one resource discovery association LINKS, read off the two stored resources it names:

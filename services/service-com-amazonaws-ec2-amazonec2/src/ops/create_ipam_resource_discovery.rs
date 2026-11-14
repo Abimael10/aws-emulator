@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIpamResourceDiscovery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIpamResourceDiscovery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIpamResourceDiscovery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the resource discovery the request asks for as the modelled
+//! [`IpamResourceDiscovery`] shape (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::insert_ipam_resource_discovery`]) — a
+//! NON-default discovery in the Region the request was signed for, operating in that Region
+//! and in every one the request names — and answers it in `create-in-progress` with the
+//! instant the clock owes it `create-complete` recorded beside it. A replayed `ClientToken`
+//! answers with the discovery that token made, or refuses with `IdempotentParameterMismatch`
+//! when the rest of the request differs. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +141,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIpamResourceDiscovery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIpamResourceDiscoveryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIpamResourceDiscovery"))
+        use crate::state;
+
+        // "A client token for the IPAM resource discovery"
+        // (`CreateIpamResourceDiscoveryRequest$ClientToken`). The model declares no `@length`
+        // on it, so the bound every client token in this crate is held to is applied here — a
+        // stored token is kept for the process's lifetime.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "Operating Regions for the IPAM resource discovery. Operating Regions are Amazon Web
+        // Services Regions where the IPAM is allowed to manage IP address CIDRs. IPAM only
+        // discovers and monitors resources in the Amazon Web Services Regions you select as
+        // operating Regions" (`CreateIpamResourceDiscoveryRequest$OperatingRegions`). The
+        // Region names a REQUEST carries are read by the ONE reader every operation resolving
+        // an operating-Region list in this crate goes through
+        // ([`crate::state::ipam_operating_region_names`]), so a create and a modify cannot
+        // disagree about which Region names may be given: each is held to the catalog itself —
+        // the Regions of the `aws` partition this emulator's ARNs name — and the list is a
+        // SET, so a name given twice is kept once. The discovery's OWN Region belongs to that
+        // set whether or not the request names it: it is where the discovery lives
+        // (`IpamResourceDiscovery$IpamResourceDiscoveryRegion`), and a discovery that did not
+        // operate in its own Region could monitor nothing there — the same invariant
+        // `crate::ops::create_ipam` establishes for an IPAM and its default discovery. The
+        // model's `len 0..50` has already bounded how many may be named.
+        let region = state::request_region(ctx.parts());
+        let mut operating_regions: Vec<String> = vec![region.clone()];
+        for region_name in state::ipam_operating_region_names(
+            input
+                .operating_regions
+                .iter()
+                .flatten()
+                .map(|requested| requested.region_name.as_deref()),
+            "operatingRegion",
+        )? {
+            if !operating_regions.contains(&region_name) {
+                operating_regions.push(region_name);
+            }
+        }
+
+        // "Tag specifications for the IPAM resource discovery"
+        // (`CreateIpamResourceDiscoveryRequest$TagSpecifications`): the discovery is the only
+        // resource this call creates, so a specification naming any other resource type is
+        // refused rather than accepted and discarded — by the one helper every create in this
+        // crate bounds its tag payload with.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY,
+            Self::NAME,
+        )?;
+
+        let spec = state::IpamResourceDiscoverySpec {
+            region,
+            // "A description for the IPAM resource discovery"
+            // (`CreateIpamResourceDiscoveryRequest$Description`).
+            description: input.description.clone(),
+            operating_regions,
+            tags,
+            client_token: input.client_token.clone(),
+        };
+        // The caller-chosen bytes this create would retain for the process's lifetime, asked
+        // of the store below: a COUNT ceiling admits megabytes on its own, because each record
+        // holds strings the caller chose the length of.
+        let payload_bytes = state::ipam_resource_discovery_payload_bytes(&spec);
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first, the way every other state-touching handler in this crate starts: a
+        // discovery whose `create-complete` move has fallen due is already in that state, so a
+        // `ClientToken` replay below answers the discovery as it ACTUALLY stands rather than as
+        // the create left it.
+        store.materialize_due_transitions();
+
+        // Idempotency: one client token names the one discovery it minted, so a replay reports
+        // that discovery and creates nothing. Resolved BEFORE the ceilings and the dry run
+        // below, because a replay stores nothing — so it is charged nothing — and because a
+        // replay the token cannot serve is a request that would NOT have succeeded.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.ipam_resource_discovery_client_tokens.get(token).cloned());
+        let replayed = match replayed {
+            None => None,
+            Some(discovery_id) => {
+                let discovery = store
+                    .ipam_resource_discoveries
+                    .get(&discovery_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        state::internal_error(format!(
+                            "a client token names IPAM resource discovery '{discovery_id}', \
+                             which is not stored"
+                        ))
+                    })?;
+                // A token is only idempotent for the REQUEST it was first given with: replayed
+                // with a different parameter it names a discovery the caller did not ask for,
+                // which EC2 refuses rather than answers.
+                if !same_request(&discovery, &spec) {
+                    return Err(state::idempotent_parameter_mismatch());
+                }
+                Some(discovery)
+            }
+        };
+
+        // The store's ceilings, asked before the first write: nothing in this emulator reclaims
+        // a discovery, so both the COUNT of records and the caller-chosen BYTES they retain are
+        // bounded. The ONE wording of the count refusal, so the pre-check and the writer's own
+        // `None` cannot answer it two ways.
+        let at_the_ceiling = || {
+            state::resource_limit_exceeded(format!(
+                "This emulator holds {max} IPAM resource discoveries, which is as many as it \
+                 stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            ))
+        };
+        if replayed.is_none() && !store.has_ipam_resource_discovery_capacity() {
+            return Err(at_the_ceiling());
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, so \
+                 it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you have
+        // the required permissions, the error response is DryRunOperation"
+        // (`CreateIpamResourceDiscoveryRequest$DryRun`). Nothing has been written yet, and
+        // nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The discovery that token already minted, exactly as it is stored now.
+        if let Some(discovery) = replayed {
+            return Ok(CreateIpamResourceDiscoveryOutput {
+                ipam_resource_discovery: Some(discovery),
+            });
+        }
+
+        // `insert_ipam_resource_discovery` records the request's client token against the
+        // discovery it mints, so the replay above and this create cannot disagree about which
+        // discovery a token names. It asks the same ceiling again before it writes anything, so
+        // its `None` is unreachable while the pre-check above holds; answering it with the same
+        // refusal is what keeps the two honest if they ever stop agreeing.
+        let discovery_id = store
+            .insert_ipam_resource_discovery(spec)
+            .ok_or_else(at_the_ceiling)?;
+
+        // Read the answer back OUT of the store, so the caller sees the discovery a later
+        // reader will see rather than the request object.
+        store
+            .ipam_resource_discoveries
+            .get(&discovery_id)
+            .cloned()
+            .map(|discovery| CreateIpamResourceDiscoveryOutput {
+                ipam_resource_discovery: Some(discovery),
+            })
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the newly created IPAM resource discovery '{discovery_id}' could not be \
+                     read back"
+                ))
+            })
     }
+}
+
+/// Does `discovery` — the one a replayed `ClientToken` names — hold what THIS request asks
+/// for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with a
+/// discovery the caller did not ask for; the same contract `create_ipam`'s `same_request` has
+/// for an IPAM. The members this service derives (the id, the ARN, the owner, the state, the
+/// default flag and the organizational-unit exclusions) are not compared: they follow from the
+/// ones that are — except the discovery's own Region, which is the Region the REQUEST was
+/// signed for, so the same token sent to another Region asks for a discovery homed there
+/// rather than for this one. The operating Regions are a SET, so the order a request names
+/// them in is not a difference.
+fn same_request(
+    discovery: &IpamResourceDiscovery,
+    spec: &crate::state::IpamResourceDiscoverySpec,
+) -> bool {
+    let sorted = |mut values: Vec<String>| {
+        values.sort();
+        values
+    };
+    discovery.ipam_resource_discovery_region.as_deref() == Some(spec.region.as_str())
+        && discovery.description == spec.description
+        && sorted(
+            discovery
+                .operating_regions
+                .iter()
+                .flatten()
+                .filter_map(|region| region.region_name.clone())
+                .collect(),
+        ) == sorted(spec.operating_regions.clone())
+        && crate::state::same_tags(discovery.tags.as_deref().unwrap_or_default(), &spec.tags)
 }

@@ -328,6 +328,12 @@ mod describe_ipam_pools;
 // through.
 #[path = "all/describe_ipam_resource_discoveries.rs"]
 mod describe_ipam_resource_discoveries;
+// What `CreateIpamResourceDiscovery` stores: one non-default resource discovery in the Region
+// the call was signed for, operating in that Region and in every one the request names, with
+// its description and tags carried through and every member the service owns derived — plus the
+// `create-complete` move the clock owes it, what it refuses, and what one `ClientToken` names.
+#[path = "all/create_ipam_resource_discovery.rs"]
+mod create_ipam_resource_discovery;
 // What `DescribeIpamResourceDiscoveryAssociations` reports: the associations the store holds,
 // narrowed to the ids and filters the request carries, paged in association-id order, and the
 // `associate-complete` move the clock owes one it is read through.

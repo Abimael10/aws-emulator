@@ -2597,6 +2597,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// repeat of the same request answers with that association instead of making a second
     /// one.
     pub ipam_resource_discovery_association_client_tokens: HashMap<String, String>,
+    /// When each CALLER-CREATED resource discovery's `create-in-progress` ->
+    /// `create-complete` transition falls due, for the discoveries that have one.
+    ///
+    /// The discovery counterpart of [`Self::ipam_scope_create_complete_at`], on the same clock
+    /// and for the same reason: `CreateIpamResourceDiscovery` answers a discovery in the
+    /// non-terminal `create-in-progress` state, so the clock owes it `create-complete`
+    /// [`TRANSITION_DELAY`] later whether or not anybody calls again. The DEFAULT discovery of
+    /// an IPAM is not listed here: it is completed by the one entry
+    /// [`Self::ipam_create_complete_at`] holds for the IPAM it came up with.
+    pub ipam_resource_discovery_create_complete_at: BTreeMap<String, Instant>,
+    /// A `CreateIpamResourceDiscovery` `ClientToken` and the resource discovery it minted, so
+    /// a repeat of the same request answers with that discovery instead of creating a second
+    /// one.
+    pub ipam_resource_discovery_client_tokens: HashMap<String, String>,
     /// A `CreateIpam` `ClientToken` and the IPAM it minted, so a repeat of the same request
     /// answers with that IPAM instead of creating a second one.
     pub ipam_client_tokens: HashMap<String, String>,
@@ -3687,6 +3701,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             ipam_resource_discovery_associations: BTreeMap::new(),
             ipam_resource_discovery_association_complete_at: BTreeMap::new(),
             ipam_resource_discovery_association_client_tokens: HashMap::new(),
+            ipam_resource_discovery_create_complete_at: BTreeMap::new(),
+            ipam_resource_discovery_client_tokens: HashMap::new(),
             ipam_client_tokens: HashMap::new(),
             instance_event_tag_registrations: BTreeMap::new(),
             route_server_endpoints: BTreeMap::new(),
