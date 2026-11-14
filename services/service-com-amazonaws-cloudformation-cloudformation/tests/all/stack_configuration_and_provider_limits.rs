@@ -42,21 +42,24 @@ use super::stack_lifecycle::resource_event_reason;
 
 /// The topics one row gives the stack, as the `NotificationARNs.member.<n>` members a
 /// request spells them in.
-fn notification_members(topics: &[&str]) -> Vec<(String, String)> {
+///
+/// Shared with the suites that give a stack its topics through another operation
+/// (`change_set_output_values`), so one definition fixes how a topic is spelled on the wire.
+pub(crate) fn notification_members(topics: &[&str]) -> Vec<(String, String)> {
     topics
         .iter()
         .enumerate()
         .map(|(index, topic)| {
             member(
                 &format!("NotificationARNs.member.{}", index + 1),
-                &format!("arn:aws:sns:{REGION}:000000000000:{topic}"),
+                &topic_arn(topic),
             )
         })
         .collect()
 }
 
 /// The ARN form the rows above expect a topic name to resolve to.
-fn topic_arn(topic: &str) -> String {
+pub(crate) fn topic_arn(topic: &str) -> String {
     format!("arn:aws:sns:{REGION}:000000000000:{topic}")
 }
 

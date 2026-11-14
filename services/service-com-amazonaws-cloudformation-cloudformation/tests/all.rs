@@ -79,6 +79,8 @@ mod change_set_hooks;
 mod change_set_import_and_drift;
 #[path = "all/change_set_lifecycle.rs"]
 mod change_set_lifecycle;
+#[path = "all/change_set_output_values.rs"]
+mod change_set_output_values;
 #[path = "all/change_set_preview.rs"]
 mod change_set_preview;
 #[path = "all/change_set_recreation.rs"]
