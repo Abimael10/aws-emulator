@@ -257,6 +257,18 @@ pub enum WorkflowRunStatus {
 }
 
 impl WorkflowRunStatus {
+    /// Every status the model declares, in the ORDER it declares them
+    /// (`smithy_query(query="shape",shape="WorkflowRunStatus")`). It is the one list
+    /// [`Self::from_wire`] reads, so no second spelling of any value exists to drift from
+    /// the wire form.
+    pub const ALL: [Self; 5] = [
+        Self::Running,
+        Self::Succeeded,
+        Self::Failed,
+        Self::TimedOut,
+        Self::Deleting,
+    ];
+
     /// The value as the model spells it on the wire.
     pub fn as_wire(self) -> &'static str {
         match self {
@@ -268,9 +280,30 @@ impl WorkflowRunStatus {
         }
     }
 
+    /// The status a request named, or `None` for a value the model's enum does not
+    /// declare. Read off [`Self::ALL`] through [`Self::as_wire`], exactly as
+    /// [`ActStatus::from_wire`] is.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|status| status.as_wire() == value)
+    }
+
     /// Whether the run has finished: only a finished run has an `endedAt`.
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::TimedOut)
+    }
+
+    /// Whether the run is still under way, which is the only state from which its status
+    /// can still be written: a run that has finished, or that is on its way out, has no
+    /// execution left for a further status to describe.
+    ///
+    /// This is where a run differs from an act: an act's status may be re-sent as often as
+    /// a caller likes ([`Act::move_to`]), while a run's completion is claimed ONCE — of
+    /// several callers finishing one run, the first commits its status and every later one,
+    /// the one naming the same status included, is refused the state conflict.
+    pub fn is_running(self) -> bool {
+        matches!(self, Self::Running)
     }
 }
 
@@ -390,6 +423,21 @@ pub struct WorkflowRun {
 }
 
 impl WorkflowRun {
+    /// Move the run to `status` as of `now`, keeping the instant the status implies in
+    /// step: a run that has just reached a terminal status ended at `now`, and one in a
+    /// status that leaves it under way has not ended.
+    ///
+    /// The ONE place a run's status is written, so `endedAt` cannot drift from the status
+    /// it belongs to. A move to the status the run already holds is no move at all, which
+    /// leaves the instant the run finished where it was.
+    pub fn move_to(&mut self, status: WorkflowRunStatus, now: SystemTime) {
+        if self.status == status {
+            return;
+        }
+        self.status = status;
+        self.ended_at = if status.is_terminal() { Some(now) } else { None };
+    }
+
     /// The session `session_id` names.
     pub fn session(&self, session_id: &str) -> Result<&Session, MissingResource> {
         self.sessions.get(session_id).ok_or_else(|| {

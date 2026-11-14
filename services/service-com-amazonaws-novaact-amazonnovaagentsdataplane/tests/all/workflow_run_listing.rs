@@ -413,9 +413,9 @@ async fn each_summary_is_read_off_the_stored_run() {
 /// The listing reflects the status each run is in, with `endedAt` exactly on the runs that
 /// have finished and `traceLocation` exactly on the runs a trace was recorded for.
 ///
-/// `UpdateWorkflowRun` is still a scaffolded 501, so the only way to observe a run in a
-/// status other than the one its create stores is to put the store into that state the way
-/// that operation would.
+/// The store is put into each status directly: a chosen end instant and a recorded trace
+/// location are not something `UpdateWorkflowRun` (which ends a run at the instant it is
+/// called) produces.
 #[tokio::test]
 async fn the_listing_reflects_each_run_status_transition() {
     let emulator = Emulator::new("us-west-2");

@@ -276,9 +276,9 @@ async fn an_enum_refusal_lists_the_values_in_the_order_the_front_door_states_the
             json!({ "status": "SUCCEEDED" }),
             200,
         ),
-        // `UpdateWorkflowRun` is still scaffolded, so a status INSIDE its set is answered
-        // 501 rather than 200 — which is itself the positive control for its rows above: a
-        // declared value reaches the (unimplemented) handler, and only a value outside the
+        // `UpdateWorkflowRun` writes the status of a run still under way, so a status
+        // INSIDE its set is answered 200 — which is itself the positive control for its
+        // rows above: a declared value reaches the handler, and only a value outside the
         // set is refused at the boundary.
         (
             "UpdateWorkflowRun with a declared status",
@@ -288,7 +288,7 @@ async fn an_enum_refusal_lists_the_values_in_the_order_the_front_door_states_the
                 placed.run_id
             ),
             json!({ "status": "SUCCEEDED" }),
-            501,
+            200,
         ),
     ] {
         let (status, answer) = emulator.call(method, &path, Some(body)).await;

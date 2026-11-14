@@ -39,3 +39,5 @@ mod workflow_definition_listing;
 mod workflow_lifecycle;
 #[path = "all/workflow_run_listing.rs"]
 mod workflow_run_listing;
+#[path = "all/workflow_run_status_update.rs"]
+mod workflow_run_status_update;

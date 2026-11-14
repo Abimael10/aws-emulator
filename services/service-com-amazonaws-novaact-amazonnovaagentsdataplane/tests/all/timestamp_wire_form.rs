@@ -330,8 +330,10 @@ async fn get_workflow_run_renders_both_instants_as_date_time_strings() {
             .unwrap_or_else(|| panic!("case {label:?}: the create must answer a run id: {run}"))
             .to_string();
 
-        // `UpdateWorkflowRun` is still a scaffolded 501, so the only way to observe a
-        // finished run is to put the store into that state the way that operation would.
+        // The instants a finished run reports are what this suite is about, so the store is
+        // put into that state directly: an end instant a chosen number of seconds after the
+        // start is not something `UpdateWorkflowRun` (which ends a run at the instant it is
+        // called) can produce.
         let (started_at, ended_at) = {
             let store = emulator.store();
             let mut store = store.lock();

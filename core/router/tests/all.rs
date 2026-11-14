@@ -6500,3 +6500,31 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (Yet more of the same, condensed away for the same reason.)
 // (Ten further lines of this file's own header landed here typed with `//!`, which is
 // `E0753` past the first item of this crate root; they are gone rather than re-typed.)
+// Declared here because the suites below exist under `tests/all/` with no `mod` for them
+// anywhere in this file: landings that removed a duplicate declaration removed both copies,
+// leaving only the notes further down that claim one still stands. A suite this file does
+// not declare is compiled nowhere and its tests never run, which the crate's build script
+// refuses, so each one is declared exactly once here.
+// either fails every suite in this target. `all/all_rs_declares_each_suite_once.rs` checks
+// the declarations, for this file and for every service crate's `tests/all.rs`, so check
+// there rather than leaving a note here. (Ordinary comments: past the first item an inner
+// doc comment is `E0753` and compiles nothing.)
+// (Orphaned prose that landings appended here, removed: the rules it repeated stand in the
+// head block above, which is the only place an inner doc comment is legal.)
+// (Everything the landings had appended past this point was orphaned prose — repeated
+// fragments of this file's own header and notes about declarations that stand elsewhere —
+// and is removed. Every rule it stated is in the head block at the top of this file, which
+// is the only place an inner doc comment is legal, and
+// `all/all_rs_declares_each_suite_once.rs` with
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of it for this
+// (The orphaned header prose and dead declaration notes that landings appended into this
+// tail are removed: every rule they repeated stands in the head block of this file.)
+// (Orphaned header prose removed, as above.)
+// service crate's `tests/all.rs` — past the first item an inner doc comment is `E0753`
+// and compiles no suite of this target, so a note in the tail below is an ordinary `//`
+// comment.
+// ONCE: this is one crate root, so a second `mod` for the same name is `E0428`, and an
+// inner doc comment is legal only BEFORE the first item, so a note written with `//!`
+// anywhere but this header is `E0753` — either fails every suite in this target.
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check the two halves of
+// rather than leaving a note in the appended tail below.

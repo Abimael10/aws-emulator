@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // that had not finished is going away with it.
             for run in definition.runs.values_mut() {
                 if !run.status.is_terminal() {
-                    run.status = crate::state::WorkflowRunStatus::Deleting;
+                    run.move_to(crate::state::WorkflowRunStatus::Deleting, now);
                 }
             }
         }

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkflowRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkflowRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Writes the status of one STORED workflow run and answers 200 with the modelled empty
+//! body. The run is reached by resolving its definition first, so an unknown definition
+//! name or run id answers `ResourceNotFoundException` (404) naming whichever link was
+//! missing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkflowRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A run's status is writable only while the run is still under way: a `RUNNING` run takes
+//! `RUNNING` (no change) or one of the statuses that FINISH it (`SUCCEEDED`, `FAILED`,
+//! `TIMED_OUT`), and the transition is decided and committed under one hold of the store,
+//! so of several callers racing to finish one run exactly ONE commits its status. Every
+//! later status write on that run — the same terminal status included — conflicts with the
+//! state the run is now in and is refused `ConflictException` (409) carrying the run as
+//! `resourceId` and its kind as `resourceType`. `DELETING` is the status the delete of a
+//! run produces rather than one this update can set, so naming it for a run still under
+//! way is a `ValidationException` (400) with reason `InvalidStatus`.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +82,18 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How this service states a status the workflow run's current status does not admit: the
+/// run is in a state this update did not expect. Fixed text with nothing interpolated, so
+/// the refusal reads the same whichever run and whichever status a caller named — the same
+/// shape `UpdateAct` states for an act. Private: the sentence belongs to this operation,
+/// and the wire cases spell it out themselves.
+const RUN_IN_UNEXPECTED_STATE: &str = "Workflow run in unexpected state";
+
+/// What a `ConflictException` from this operation reports as the type of the resource whose
+/// current state the request conflicts with — the kind name every refusal of this service
+/// uses for a workflow run.
+const RUN_RESOURCE_TYPE: &str = "workflow-run";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,18 +168,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkflowRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkflowRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkflowRun"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateWorkflowRunErrorModeled::InternalServerException(InternalServerException {
+                message: "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+                reason: None,
+            })
+        })?;
+        // The region is read for the identifier a refusal reports: the missing resource's
+        // ARN in the requesting credential scope's region.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let not_found = |missing: crate::state::MissingResource| -> Self::Error {
+            UpdateWorkflowRunErrorModeled::ResourceNotFoundException(missing.not_found(&region))
+                .into()
+        };
+
+        // The status to move the run to. The model constrains the member to its enum, so
+        // the boundary walk refuses a value outside it before this handler runs; reading it
+        // here means a status a run can hold, and anything else is refused rather than
+        // stored as a status no read could report. The requirement is stated through the
+        // workspace's shared sentence for a value outside an enumerated type's set, over
+        // the values in the order the table of them is walked — a table keyed on each
+        // value's own text, not the order the model declares them — and without echoing
+        // what the caller sent, exactly as `UpdateAct` states the same clause.
+        let requested = crate::state::WorkflowRunStatus::from_wire(&input.status).ok_or_else(|| {
+            let admitted: Vec<&str> = crate::state::WorkflowRunStatus::ALL
+                .iter()
+                .map(|status| status.as_wire())
+                .collect();
+            let declared: Vec<String> =
+                ::service_common::validation_message::hashed_enum_order(&admitted)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+            UpdateWorkflowRunErrorModeled::ValidationException(
+                crate::state::paging::field_validation_failed(
+                    "status",
+                    ::service_common::validation_message::must_be_one_of("status", &declared),
+                ),
+            )
+        })?;
+
+        let mut state = state.lock();
+        // A deletion the clock has already made due is completed first, as every handler of
+        // this service does: a run under a definition whose removal was owed at this instant
+        // is gone, so this update cannot resurrect one.
+        state.complete_due_deletions(now);
+
+        let run = state
+            .definition_mut(&input.workflow_definition_name)
+            .and_then(|definition| definition.run_mut(&input.workflow_run_id))
+            .map_err(not_found)?;
+        let current = run.status;
+
+        // `DELETING` is what the delete of a run reports while the removal it started is
+        // outstanding, so it describes work a status write starts nothing of: a request
+        // naming it for a run still under way names a status that run's current status does
+        // not admit, which is what `ValidationExceptionReason`'s `InvalidStatus` is for.
+        if requested == crate::state::WorkflowRunStatus::Deleting && current.is_running() {
+            return Err(UpdateWorkflowRunErrorModeled::ValidationException(ValidationException {
+                message: RUN_IN_UNEXPECTED_STATE.to_string(),
+                reason: "InvalidStatus".to_string(),
+                field_list: None,
+            })
+            .into());
+        }
+
+        // A run that has left `RUNNING` has settled: its execution is over (it finished) or
+        // it is on its way out (it is being deleted), so there is no transition left for
+        // this update to make and the request conflicts with the state the run is in.
+        // Deciding this under the one hold of the store the write happens under is what
+        // makes a single caller the winner when several race to finish the same run: the
+        // first to take the store moves the run, and every later one reads a settled run.
+        if !current.is_running() {
+            return Err(UpdateWorkflowRunErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "workflow run {} is {} and cannot be moved to {}",
+                    input.workflow_run_id,
+                    current.as_wire(),
+                    requested.as_wire()
+                ),
+                resource_id: input.workflow_run_id.clone(),
+                resource_type: RUN_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        run.move_to(requested, now);
+
+        Ok(UpdateWorkflowRunOutput {})
     }
 }
