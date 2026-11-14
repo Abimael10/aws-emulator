@@ -23,6 +23,8 @@ mod ca_certificate_chain_import;
 mod ca_certificate_import;
 #[path = "all/ca_csr_extensions.rs"]
 mod ca_csr_extensions;
+#[path = "all/ca_key_material_identity.rs"]
+mod ca_key_material_identity;
 #[path = "all/certificate_authority_audit_reports.rs"]
 mod certificate_authority_audit_reports;
 #[path = "all/certificate_authority_key_material.rs"]

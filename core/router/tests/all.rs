@@ -4429,3 +4429,4 @@ mod cloudformation_appsync_custom_domains;
 // declarations, for this file and for every service crate's `tests/all.rs`. (These lines
 // landed here as `//!`, which is exactly the `E0753` they describe, so they are ordinary
 // comments.)
+// leaving a note in the tail. (Ordinary comments here, for the reason they record.)
