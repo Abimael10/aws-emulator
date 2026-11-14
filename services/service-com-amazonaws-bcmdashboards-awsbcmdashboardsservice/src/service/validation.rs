@@ -10,14 +10,13 @@
 //!
 //! * a `@pattern` requirement is quoted as the expression this service publishes, without
 //!   the pair of whole-value anchors the model wraps it in. The CHECK is unchanged — it
-//!   still runs the model's pattern as written — so only the rendering drops the pair;
-//! * a numeric value outside its member's declared RANGE is stated with no value half at
-//!   all: the clause names the member and the bound every value of that member has to
-//!   respect, and nothing of the number this request carried. A bound is a property of the
-//!   member, so the sentence reads the same whatever value tripped it, at whichever end and
-//!   on whichever member. Every other class keeps the framework's value half — a string
-//!   outside a `@length` or a `@pattern` is stated with the string it submitted, and a
-//!   member absent from the request with the `null` it was.
+//!   still runs the model's pattern as written — so only the rendering drops the pair.
+//!
+//! Every constraint class keeps the value half of the standard clause — the value the
+//! request submitted at the member that failed, quoted between `Value` and `at`, which is
+//! where a caller reads WHICH input was refused: a number outside its member's `@range`
+//! states that number, a string outside a `@length` or a `@pattern` the string it
+//! submitted, and a member absent from the request the `null` it was.
 //!
 //! The envelope, its error count, the clause, the member paths and every constraint class's
 //! requirement sentence belong to [`service_common::validation_message`] — the shared home
@@ -25,8 +24,8 @@
 //! service cannot word a constraint differently from the services that state the same
 //! sentence. `tests/all/range_refusal_wording.rs` pins the range clause over the wire.
 
-use service_common::validation_message::aws_validation_refusal_withholding_violations;
-use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
+use service_common::validation_message::aws_validation_refusal;
+use smithy_server_runtime::{Refusal, Refused};
 
 /// How this service states `refusal`, or `None` to keep the framework's own wording.
 ///
@@ -35,20 +34,13 @@ use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 /// to word. The code travels with the message and stays the modelled `ValidationException`
 /// (HTTP 400) a client branches on.
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
-    aws_validation_refusal_withholding_violations(refusal, states_no_value)
-}
-
-/// Whether the clause for `violation` states no value: a numeric value outside its member's
-/// declared range, at either end of it.
-fn states_no_value(violation: &Violation) -> bool {
-    matches!(
-        violation.kind,
-        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
-    )
+    aws_validation_refusal(refusal)
 }
 
 #[cfg(test)]
 mod tests {
+    use smithy_server_runtime::{Violation, ViolationKind};
+
     use super::*;
 
     /// One violation of `kind` at `path`, for the value a request sent.
@@ -61,11 +53,11 @@ mod tests {
         }
     }
 
-    /// Either end of a declared range is stated with the member and the bound and no value.
-    /// The wire-level counterpart, over real operations and real members, is
+    /// Either end of a declared range is stated with the value submitted, the member and
+    /// the bound. The wire-level counterpart, over real operations and real members, is
     /// `tests/all/range_refusal_wording.rs`.
     #[test]
-    fn a_range_clause_names_the_member_and_the_bound_only() {
+    fn a_range_clause_states_the_value_the_member_and_the_bound() {
         for (path, kind, expected) in [
             (
                 "maxResults",
@@ -91,8 +83,8 @@ mod tests {
             let stated = refused(&Refusal::Invalid(vec![violation(path, kind.clone())]))
                 .expect("an input-constraint refusal is this service's to state");
             let expected = format!(
-                "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
-                 {expected}"
+                "1 validation error detected: Value '101' at '{path}' failed to satisfy \
+                 constraint: {expected}"
             );
             assert_eq!(
                 stated.message, expected,
@@ -102,10 +94,10 @@ mod tests {
         }
     }
 
-    /// Every other class keeps the value half the framework writes: a string states what it
-    /// submitted, an absent member the `null` it was.
+    /// Every other class keeps the same value half: a string states what it submitted, an
+    /// absent member the `null` it was.
     #[test]
-    fn another_class_still_states_its_value() {
+    fn another_class_states_its_value_too() {
         for (kind, expected) in [
             (
                 ViolationKind::MinLength(20),

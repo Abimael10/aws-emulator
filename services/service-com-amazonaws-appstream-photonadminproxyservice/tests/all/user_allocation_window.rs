@@ -1,32 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for WHAT decides whether a create of a user pool identity the pool
-//! already holds is answered like the create that allocated it.
+//! End-to-end tests for WHAT decides the outcome of a create of a user pool identity the
+//! pool already holds.
 //!
-//! RULE: the outcome of a create is decided by this service's own state and by the span the
-//! emulator OWES the allocation it made — never by how many calls a caller made in between
-//! or by how fast the host ran them. So a repeat issued while the allocation is still open
-//! is answered the same empty success however much work precedes it, a repeat that asks for
-//! a DIFFERENT user than the stored one is refused `ResourceAlreadyExistsException` even
-//! while it is open, and the window closes on an instant the allocating create fixed,
-//! whatever arrives in the meantime.
+//! RULE: a create of a `(UserName, AuthenticationType)` the pool already holds claims a
+//! username that is taken, so it is refused `ResourceAlreadyExistsException` (400) with
+//! AWS's sentence and leaves the stored user exactly as it was — decided by this service's
+//! own state alone, never by how many calls a caller made in between, by what they were, or
+//! by how fast the host ran them.
 //!
 //! The rows differ along what the rule generalises over: the number and the kind of calls
 //! between the create and the repeat (none, one read, several reads, a write then a read, a
-//! create of another identity), the attributes the identity carries, and which attribute a
-//! conflicting repeat names.
+//! create of another identity), the attributes the identity carries, and what the repeat
+//! names beside the identity — the same attributes, none, or a different one.
 //!
 //! Every case drives the awsJson1_1 front door through the shared
-//! [`Emulator`](crate::stack_fleet_lifecycle::Emulator) harness. Nothing here waits out a
-//! span of its own choosing: the one case about the window CLOSING looks again until it
-//! has, inside a generous deadline.
-
-use std::time::{Duration, Instant};
+//! [`Emulator`](crate::stack_fleet_lifecycle::Emulator) harness.
 
 use serde_json::{json, Value};
 
-use crate::refusal_messages::{error_message, refusal};
-use crate::stack_fleet_lifecycle::{error_code, Emulator};
+use crate::refusal_messages::refusal;
+use crate::stack_fleet_lifecycle::Emulator;
 
 /// The only authentication type the user pool operations manage, which
 /// `CreateUser.AuthenticationType` documents as "You must specify USERPOOL".
@@ -36,13 +30,6 @@ const USER_POOL: &str = "USERPOOL";
 /// what the service states rather than a copy of it.
 const ALREADY_EXISTS: &str =
     service_com_amazonaws_appstream_photonadminproxyservice::state::USER_ALREADY_EXISTS_MESSAGE;
-
-/// How long the window-closing case looks again before it gives up. Generous: it bounds a
-/// span the service owes, so it says nothing about how fast this host has to be.
-const DEADLINE: Duration = Duration::from_secs(60);
-
-/// How often that case looks again while it waits.
-const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// The `CreateUser` request for `user_name` carrying `extra` beside the identity.
 fn create_request(user_name: &str, extra: &Value) -> Value {
@@ -76,6 +63,29 @@ async fn reported(emulator: &Emulator, case: &str, user_name: &str) -> Vec<Value
         .into_iter()
         .filter(|user| user.get("UserName").and_then(Value::as_str) == Some(user_name))
         .collect()
+}
+
+/// Assert a create of `request` is refused as a username that is taken, and hand back the
+/// sentence that refusal carried.
+pub(crate) async fn refused_as_a_username_that_is_taken(
+    emulator: &Emulator,
+    case: &str,
+    request: &Value,
+) -> String {
+    let message = refusal(
+        emulator,
+        case,
+        "CreateUser",
+        request.clone(),
+        400,
+        "ResourceAlreadyExistsException",
+    )
+    .await;
+    assert_eq!(
+        message, ALREADY_EXISTS,
+        "case {case:?}: expected AWS's sentence {ALREADY_EXISTS:?}, got {message:?}"
+    );
+    message
 }
 
 /// What a row does between the create that allocates the identity and the repeat of it.
@@ -127,10 +137,10 @@ impl Between {
 }
 
 #[tokio::test]
-async fn a_repeat_issued_while_the_allocation_is_open_is_answered_like_the_first() {
+async fn a_repeat_of_a_held_identity_is_refused_however_much_work_precedes_it() {
     // Rows: what the created identity carries, and what the caller does between the create
-    // and the repeat of it. Whatever that work is, the repeat is answered the same empty
-    // success and the identity is still allocated exactly once, exactly as it was.
+    // and the repeat of it. Whatever that work is, the repeat is refused as a username that
+    // is taken and the identity is still allocated exactly once, exactly as it was.
     for (case, user_name, created, between) in [
         (
             "nothing in between",
@@ -178,14 +188,13 @@ async fn a_repeat_issued_while_the_allocation_is_open_is_answered_like_the_first
         between.apply(&emulator, case, user_name).await;
         let before = reported(&emulator, case, user_name).await;
 
-        let answer = emulator
-            .ok(case, "CreateUser", create_request(user_name, &created))
-            .await;
-        assert_eq!(
-            answer,
-            json!({}),
-            "case {case:?}: a repeat of an open allocation answers the same empty result, got \
-             {answer}"
+        let message =
+            refused_as_a_username_that_is_taken(&emulator, case, &create_request(user_name, &created))
+                .await;
+        assert!(
+            !message.contains(user_name),
+            "case {case:?}: the sentence states that the username is taken without echoing \
+             it, got {message:?}"
         );
 
         let after = reported(&emulator, case, user_name).await;
@@ -196,18 +205,18 @@ async fn a_repeat_issued_while_the_allocation_is_open_is_answered_like_the_first
         );
         assert_eq!(
             after, before,
-            "case {case:?}: the repeat must leave the stored user exactly as it was, got \
-             {after:?}"
+            "case {case:?}: the refused create must leave the stored user exactly as it was, \
+             got {after:?}"
         );
     }
 }
 
 #[tokio::test]
-async fn a_repeat_that_asks_for_a_different_user_is_refused_while_the_allocation_is_open() {
+async fn a_repeat_that_asks_for_a_different_user_is_refused_too() {
     // Rows: what the identity was created with, and the attribute the repeat names
     // differently — including one the stored record does not carry at all. A create that
-    // asks for a user other than the one that is there claims a username that is taken,
-    // whether or not the allocation is still open, so no row waits for anything.
+    // asks for a user other than the one that is there claims a username that is taken just
+    // as an identical one does.
     for (case, created, repeated) in [
         (
             "a different first name",
@@ -229,6 +238,11 @@ async fn a_repeat_that_asks_for_a_different_user_is_refused_while_the_allocation
             json!({}),
             json!({ "FirstName": "Augusta" }),
         ),
+        (
+            "nothing beside the identity",
+            json!({ "FirstName": "Ada" }),
+            json!({}),
+        ),
     ] {
         let emulator = Emulator::new();
         let user_name = "conflicting@example.com";
@@ -237,19 +251,12 @@ async fn a_repeat_that_asks_for_a_different_user_is_refused_while_the_allocation
             .await;
         let before = reported(&emulator, case, user_name).await;
 
-        let message = refusal(
+        let message = refused_as_a_username_that_is_taken(
             &emulator,
             case,
-            "CreateUser",
-            create_request(user_name, &repeated),
-            400,
-            "ResourceAlreadyExistsException",
+            &create_request(user_name, &repeated),
         )
         .await;
-        assert_eq!(
-            message, ALREADY_EXISTS,
-            "case {case:?}: expected AWS's sentence {ALREADY_EXISTS:?}, got {message:?}"
-        );
         assert!(
             !message.contains(user_name),
             "case {case:?}: the sentence states that the username is taken without echoing \
@@ -265,90 +272,24 @@ async fn a_repeat_that_asks_for_a_different_user_is_refused_while_the_allocation
     }
 }
 
-/// Look again until a create of the identity `request` names is refused as a username that
-/// is taken, answering the message that refusal carried.
-///
-/// The allocation a create makes settles on an instant that create fixed, which is a span no
-/// caller controls, so a suite that needs the identity ESTABLISHED waits for the refusal
-/// rather than for a span of its own choosing. A repeat cannot move that instant, which is
-/// what makes looking again with the create itself sound — and asserting it, since a run of
-/// identical creates may not hold the allocation open.
-///
-/// THE ONE waiter for that span in these suites, so no row decides the outcome at an instant
-/// of its own choosing.
-pub(crate) async fn refused_once_the_allocation_settles(
-    emulator: &Emulator,
-    case: &str,
-    request: &Value,
-) -> String {
-    let deadline = Instant::now() + DEADLINE;
-    let mut issued = 0_usize;
-    loop {
-        let (status, payload) = emulator.call("CreateUser", request.clone()).await;
-        issued += 1;
-        if status != 200 {
-            assert_eq!(
-                status, 400,
-                "case {case:?}: create {issued} must be answered 200 or refused 400, got \
-                 {status} {payload}"
-            );
-            assert_eq!(
-                error_code(&payload),
-                "ResourceAlreadyExistsException",
-                "case {case:?}: create {issued} must be refused as a username that is taken, \
-                 got {payload}"
-            );
-            return error_message(&payload);
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: the allocation never closed: {issued} identical creates were all \
-             answered 200"
-        );
-        tokio::time::sleep(LOOK_AGAIN).await;
-    }
-}
-
 #[tokio::test]
-async fn the_allocation_window_closes_on_an_instant_a_later_create_cannot_move() {
-    // A run of identical creates cannot hold the allocation open: the window is measured
-    // from the create that allocated the identity, so looking again eventually finds it
-    // closed — and once it is, every further create is refused.
-    let case = "a run of identical creates";
+async fn a_refused_create_does_not_free_the_username() {
+    // The refusal is a property of the pool's contents, so it repeats: a run of creates of
+    // a held identity is refused every time, and the stored user is untouched by all of
+    // them.
+    let case = "a run of repeated creates";
     let emulator = Emulator::new();
     let user_name = "settles@example.com";
     let request = create_request(user_name, &json!({ "MessageAction": "SUPPRESS" }));
     emulator.ok(case, "CreateUser", request.clone()).await;
-
-    let message = refused_once_the_allocation_settles(&emulator, case, &request).await;
-    assert_eq!(
-        message, ALREADY_EXISTS,
-        "case {case:?}: expected AWS's sentence {ALREADY_EXISTS:?}, got {message:?}"
-    );
-
-    // However many creates were answered, the identity was allocated once.
     let allocated = reported(&emulator, case, user_name).await;
-    assert_eq!(
-        allocated.len(),
-        1,
-        "case {case:?}: the identity must be allocated exactly once, got {allocated:?}"
-    );
 
-    // And the window stays closed: a refused create does not reopen it.
     for round in 0..3 {
-        let message = refusal(
-            &emulator,
-            case,
-            "CreateUser",
-            request.clone(),
-            400,
-            "ResourceAlreadyExistsException",
-        )
-        .await;
+        let message = refused_as_a_username_that_is_taken(&emulator, case, &request).await;
         assert_eq!(
             message, ALREADY_EXISTS,
-            "case {case:?}: create {round} after the window closed must carry AWS's sentence \
-             {ALREADY_EXISTS:?}, got {message:?}"
+            "case {case:?}: create {round} must carry AWS's sentence {ALREADY_EXISTS:?}, got \
+             {message:?}"
         );
     }
     let settled = reported(&emulator, case, user_name).await;

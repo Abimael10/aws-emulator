@@ -170,16 +170,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // addresses only their own account's resources, so an ARN carrying another
         // account's id names nothing they could read — a fact about the REQUEST, decided
         // before the store is consulted at all, so the answer cannot depend on whether a
-        // record with that id happens to exist. Reported in the one sentence this service
-        // words that verdict with — fixed text carrying nothing from the request — as
-        // every sibling ACME operation reports it.
+        // record with that id happens to exist. This operation words that verdict as a
+        // verdict on the ARN the request carried — fixed text carrying nothing from the
+        // request, not even the resource type
+        // ([`crate::service::cross_account_arn_in_request_refusal`]).
         if !crate::state::arn_is_in_caller_account(&input.acme_external_account_binding_arn) {
             return Err(
                 GetAcmeExternalAccountBindingCredentialsErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(crate::service::cross_account_arn_refusal(
-                            &input.acme_external_account_binding_arn,
-                        )),
+                        message: Some(
+                            crate::service::cross_account_arn_in_request_refusal(),
+                        ),
                     },
                 )
                 .into(),

@@ -484,34 +484,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                 && registered_to.as_deref() != Some(named)
         });
         if proves_another_account || would_join_a_proven_identity {
-            // Either way this is a login already linked to another account, which is
-            // precisely what the modelled `ResourceConflictException` states ("Thrown when a
-            // user tries to use a login which is already linked to another account"): a
-            // condition of what the pool HOLDS, not of what the caller may do, so no login
-            // the caller could add would clear it and it is never answered as an
-            // authorization failure.
+            // Which refusal this is follows WHOSE ownership the request got wrong.
             //
-            // Which sentence it carries follows how many of the link's two sides are
-            // identities the pool already holds. A request that NAMES an identity and
-            // presents a developer user identifier the pool has already registered names
-            // both sides: the link it asks for would have to fuse two stored identities into
-            // one, which is the MERGE this service refuses in the same words wherever it is
-            // asked for and cannot be done ([`crate::state::CANNOT_MERGE_IDENTITIES_MESSAGE`],
-            // as `MergeDeveloperIdentities` answers a pair that cannot become one user).
-            // Where one side does not exist yet — a developer user identifier the pool has
-            // registered against nothing, or no identity named at all — there is no pair to
-            // merge and what cannot be done is the LINK of the logins presented
-            // ([`crate::state::CANNOT_LINK_LOGINS_MESSAGE`]). Both sentences are fixed text,
-            // so neither tells a caller which other identity holds the login it presented.
-            let message = if input.identity_id.is_some() && registered_to.is_some() {
-                crate::state::CANNOT_MERGE_IDENTITIES_MESSAGE
-            } else {
-                crate::state::CANNOT_LINK_LOGINS_MESSAGE
-            };
+            // A request that NAMES an identity and presents a developer user identifier the
+            // pool has already registered against another identity presents logins that are
+            // not all logins OF the identity it named: the call is not one the caller has
+            // shown it may make on that identity, which is the authorization failure every
+            // login-authorized call of this service answers in one sentence
+            // ([`crate::state::UNMATCHED_LOGINS_MESSAGE`]) — "include at least one valid
+            // login for this identity". Fixed text, so it tells a caller nothing about which
+            // other identity holds the login it presented.
+            //
+            // Where the request names NO identity, or names one the pool has registered
+            // nothing against, there is no identity whose logins could have been presented
+            // and the fact is about the POOL's state instead: a login already linked to
+            // another account, which is precisely what the modelled
+            // `ResourceConflictException` states ("Thrown when a user tries to use a login
+            // which is already linked to another account") — a condition of what the pool
+            // HOLDS rather than of what the caller may do, so no login the caller could add
+            // would clear it ([`crate::state::CANNOT_LINK_LOGINS_MESSAGE`], also fixed
+            // text). The merge conflict stays where a merge is what was asked for, which is
+            // `MergeDeveloperIdentities`.
+            if input.identity_id.is_some() && registered_to.is_some() {
+                return Err(
+                    GetOpenIdTokenForDeveloperIdentityErrorModeled::NotAuthorizedException(
+                        NotAuthorizedException {
+                            message: Some(crate::state::UNMATCHED_LOGINS_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
             return Err(
                 GetOpenIdTokenForDeveloperIdentityErrorModeled::ResourceConflictException(
                     ResourceConflictException {
-                        message: Some(message.to_string()),
+                        message: Some(crate::state::CANNOT_LINK_LOGINS_MESSAGE.to_string()),
                     },
                 )
                 .into(),

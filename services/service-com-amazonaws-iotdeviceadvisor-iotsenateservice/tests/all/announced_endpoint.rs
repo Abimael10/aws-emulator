@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH endpoint this service ANNOUNCES, over every way a caller can address the
-//! emulator.
+//! WHICH endpoint this service REPORTS, over every way a caller can address the emulator.
 //!
-//! The rule under test is one sentence: an operation that reports an address the caller
-//! then DIALS announces the endpoint THIS request reached the emulator on, and only a
-//! caller that addressed one of AWS's own hostnames — with no own address to be sent to in
-//! its place — is told the host AWS itself vends, whose single DNS label is an opaque
-//! service-minted one (the account's for a request that names no device, that device's own
-//! for a request that names one) and never an AWS identifier such as the account id.
+//! The rule under test is one sentence: `endpoint` is a modelled Device Advisor hostname,
+//! so an operation reporting one reports the host of the account and region asked about —
+//! or of the device the request names — whose single DNS label is an opaque service-minted
+//! one and never an AWS identifier such as the account id, whichever address the asking
+//! request reached this emulator on.
 //!
 //! Both operations that report an endpoint are driven here — `GetEndpoint`, which vends it,
 //! and `StartSuiteRun`, which reports and persists the host its primary device connects to
@@ -46,8 +44,7 @@ fn thing_arn(name: &str) -> String {
     )
 }
 
-/// How one case addresses this emulator, and what every endpoint it is answered with has
-/// to be.
+/// How one case addresses this emulator.
 struct Addressing {
     /// What this row is called in an assertion message.
     case: &'static str,
@@ -57,68 +54,56 @@ struct Addressing {
     /// The authority the request URI carries in absolute form, or `None` for an
     /// origin-form request URI, which carries none.
     authority: Option<&'static str>,
-    /// `Some(authority)` when the request reached an address of THIS emulator, which is the
-    /// address that has to be announced; `None` for a caller that resolves AWS's own
-    /// hostnames, which is told the host AWS vends.
-    own: Option<&'static str>,
 }
 
-/// The ways a caller reaches this emulator, each with the endpoint it has to be announced.
+/// The ways a caller reaches this emulator — none of which is a value of the endpoint it is
+/// reported.
 fn addressings() -> Vec<Addressing> {
     vec![
         Addressing {
             case: "the emulator's own socket",
             host: Some(b"127.0.0.1:9297"),
             authority: None,
-            own: Some("127.0.0.1:9297"),
         },
         Addressing {
             case: "a loopback address with no port",
             host: Some(b"127.0.0.1"),
             authority: None,
-            own: Some("127.0.0.1"),
         },
         Addressing {
             case: "a loopback name with a port",
             host: Some(b"localhost:9297"),
             authority: None,
-            own: Some("localhost:9297"),
         },
         Addressing {
             case: "an IPv6 literal with a port",
             host: Some(b"[::1]:9297"),
             authority: None,
-            own: Some("[::1]:9297"),
         },
         Addressing {
             case: "a private address with a port",
             host: Some(b"192.168.1.10:4566"),
             authority: None,
-            own: Some("192.168.1.10:4566"),
         },
         Addressing {
             case: "an address carried only on the request URI",
             host: None,
             authority: Some("127.0.0.1:9297"),
-            own: Some("127.0.0.1:9297"),
         },
         Addressing {
             case: "this service's own endpoint host",
             host: Some(b"iotdeviceadvisor.us-west-2.amazonaws.com"),
             authority: None,
-            own: None,
         },
         Addressing {
             case: "an API endpoint host",
             host: Some(b"api.iotdeviceadvisor.us-west-2.amazonaws.com"),
             authority: None,
-            own: None,
         },
         Addressing {
             case: "no host at all",
             host: None,
             authority: None,
-            own: None,
         },
     ]
 }
@@ -187,7 +172,7 @@ fn persisted_run_endpoint(emulator: &Emulator, run_id: &str) -> Option<String> {
     store.runs.get(run_id).map(|run| run.endpoint.clone())
 }
 
-/// Assert `endpoint` is a host AWS ITSELF vends: ONE opaque lowercase-alphanumeric DNS
+/// Assert `endpoint` is a Device Advisor host: ONE opaque lowercase-alphanumeric DNS
 /// label under this service's endpoint domain, inside the modelled `Endpoint` length
 /// bounds, naming no AWS identifier a caller could read off it. Returns the label.
 fn assert_aws_vended_host(case: &str, endpoint: &str) -> String {
@@ -225,11 +210,11 @@ fn assert_aws_vended_host(case: &str, endpoint: &str) -> String {
     label.to_string()
 }
 
-/// Every endpoint this service reports names the address the request reached it on, so the
-/// device the caller points at it reaches this emulator — whether the request names a
+/// Every endpoint this service reports is the Device Advisor host of what the request asks
+/// about, whichever address the request reached this emulator on — whether it names a
 /// device or none, and whichever operation reports it.
 #[tokio::test]
-async fn an_announced_endpoint_names_the_address_the_request_reached() {
+async fn a_reported_endpoint_is_the_device_advisor_host_whatever_address_the_request_reached() {
     let emulator = Emulator::new();
 
     for addressing in addressings() {
@@ -278,7 +263,7 @@ async fn an_announced_endpoint_names_the_address_the_request_reached() {
 
         assert_eq!(
             reported, device_level,
-            "case {case:?}: StartSuiteRun must report the endpoint GetEndpoint announces \
+            "case {case:?}: StartSuiteRun must report the endpoint GetEndpoint vends \
              for the run's primary device, got {reported:?} and {device_level:?}"
         );
         assert_eq!(
@@ -288,41 +273,21 @@ async fn an_announced_endpoint_names_the_address_the_request_reached() {
             persisted_run_endpoint(&emulator, &run_id)
         );
 
-        match addressing.own {
-            // A client configured with one local endpoint resolves nothing else, so the
-            // address announced is the one it is already talking to.
-            Some(own) => {
-                for (question, announced) in
-                    [("no device", &account_level), ("a device", &device_level)]
-                {
-                    assert_eq!(
-                        announced, own,
-                        "case {case:?} ({question}): the endpoint announced must be the \
-                         address the request reached, got {announced:?}"
-                    );
-                }
-            }
-            // A client that resolves AWS's own hostnames is told the host AWS vends, whose
-            // label is the account's for a request naming no device and the device's own
-            // for one naming a device.
-            None => {
-                let account_label = assert_aws_vended_host(case, &account_level);
-                let device_label = assert_aws_vended_host(case, &device_level);
-                assert_ne!(
-                    account_label, device_label,
-                    "case {case:?}: a request that names a device is vended that device's \
-                     own host, not the account-level one, got {device_level:?}"
-                );
-            }
-        }
+        let account_label = assert_aws_vended_host(case, &account_level);
+        let device_label = assert_aws_vended_host(case, &device_level);
+        assert_ne!(
+            account_label, device_label,
+            "case {case:?}: a request that names a device is vended that device's \
+             own host, not the account-level one, got {device_level:?}"
+        );
     }
 }
 
-/// The announced endpoint is resolved per REQUEST and never remembered: one device asked
-/// about through two addresses is announced each of them, and asking again through one
-/// address answers what it answered before.
+/// The endpoint reported is a function of the account, the region and the device alone: one
+/// device asked about through any of the addresses above is answered the SAME host every
+/// time.
 #[tokio::test]
-async fn the_announced_endpoint_follows_the_request() {
+async fn the_reported_endpoint_does_not_follow_the_address_the_request_reached() {
     let emulator = Emulator::new();
     let thing = thing_arn("two-endpoints-device");
     let query = [("thingArn", thing.as_str())];
@@ -341,36 +306,28 @@ async fn the_announced_endpoint_follows_the_request() {
             "case {case:?}: asking twice through one address must answer one endpoint, got \
              {announced:?} and {again:?}"
         );
+        assert_aws_vended_host(case, &announced);
 
         for (other_case, other) in &seen {
-            // Two addresses of this emulator are announced as themselves, and the AWS-
-            // vended rows all answer the one host AWS vends for this device, so only rows
-            // that addressed the SAME thing may agree.
-            let same_address = addressing.own.is_some_and(|own| own == other.as_str())
-                || (addressing.own.is_none() && other.ends_with(&aws_host_suffix()));
             assert_eq!(
-                &announced == other,
-                same_address,
-                "case {case:?}: must {} the endpoint announced for case {other_case:?}, got \
-                 {announced:?} and {other:?}",
-                if same_address { "agree with" } else { "differ from" }
+                &announced, other,
+                "case {case:?}: must answer the endpoint reported for case {other_case:?}, \
+                 got {announced:?} and {other:?}"
             );
         }
         seen.push((case, announced));
     }
 }
 
-/// A request that reaches this emulator is announced that address whichever region it is
-/// signed for: the address is the one the client is talking to, so it carries no region,
-/// while the host AWS vends names the region the request was signed for.
+/// The host reported names the region the request was signed for, whichever address the
+/// request reached: the region is part of the Device Advisor domain the member carries.
 #[tokio::test]
-async fn an_own_address_is_announced_whatever_region_the_request_signs_for() {
+async fn a_reported_endpoint_names_the_region_the_request_signs_for() {
     let emulator = Emulator::new();
     let own = Addressing {
         case: "the emulator's own socket",
         host: Some(b"127.0.0.1:9297"),
         authority: None,
-        own: Some("127.0.0.1:9297"),
     };
 
     // Regions of several shapes, including a GovCloud one and the longest AWS publishes.
@@ -383,12 +340,20 @@ async fn an_own_address_is_announced_whatever_region_the_request_signs_for() {
             "case {region:?}: expected HTTP 200 from GetEndpoint, got {} {}",
             answer.status, answer.body
         );
-        assert_eq!(
-            answer.string("endpoint"),
-            own.own.expect("this row addresses the emulator's own endpoint"),
-            "case {region:?}: the address the request reached is announced whatever region \
-             it signs for, got {}",
-            answer.body
+        let endpoint = answer.string("endpoint");
+        let suffix = format!(".deviceadvisor.iot.{region}.amazonaws.com");
+        assert!(
+            endpoint.ends_with(&suffix),
+            "case {region:?}: the endpoint must name the region the request signs for, \
+             expected a host ending in {suffix:?}, got {endpoint:?}"
+        );
+        let bounds = iotdeviceadvisor::state::MIN_ENDPOINT_LENGTH
+            ..=iotdeviceadvisor::state::MAX_ENDPOINT_LENGTH;
+        assert!(
+            bounds.contains(&endpoint.len()),
+            "case {region:?}: the endpoint must satisfy the modelled len 45..75, got \
+             {endpoint:?} ({} chars)",
+            endpoint.len()
         );
     }
 }

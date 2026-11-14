@@ -2,20 +2,20 @@
 
 //! How `GetOpenIdTokenForDeveloperIdentity` refuses an implicit link it cannot make.
 //!
-//! RULE: a call whose presented logins cannot all name ONE account is refused as the CONFLICT
-//! between stored identities that is — the modelled `ResourceConflictException`, "Thrown when
-//! a user tries to use a login which is already linked to another account"
+//! RULE: a call whose presented logins cannot all name ONE account is refused, and WHICH
+//! refusal it is follows whose ownership the request got wrong. A request that names an
+//! `IdentityId` AND presents a developer user identifier the pool has already registered
+//! elsewhere has shown no login of the identity it named, so it is the failure of the
+//! caller's authority over THAT identity: the modelled `NotAuthorizedException` carrying the
+//! fixed logins-mismatch sentence ("Logins don't match. Please include at least one valid
+//! login for this identity or identity pool."). Where one of the link's two sides is not
+//! identified — a developer user identifier the pool has registered against nothing, or no
+//! `IdentityId` at all — there is no identity whose logins could have been presented and the
+//! fact is about the POOL's state: the modelled `ResourceConflictException`, "Thrown when a
+//! user tries to use a login which is already linked to another account"
 //! (`smithy_query(query="doc",shape="ResourceConflictException")`), named in the body's
-//! `__type` and in the `x-amzn-errortype` header — and never as a failure of the caller's
-//! authority, which no login the caller could add would clear. Which fixed sentence it
-//! carries follows how many of the link's two sides the REQUEST itself identifies: a request
-//! that names an `IdentityId` AND presents a developer user identifier the pool has already
-//! registered identifies both, so the link it asks for would have to fuse two stored
-//! identities into one and is refused as the merge of them that is ("Cannot merge these
-//! identities."); where one of the two sides is not identified — a developer user identifier
-//! the pool has registered against nothing, or no `IdentityId` at all — there is no pair to
-//! merge and what cannot be done is the LINK of the logins presented ("Cannot link these
-//! logins."). Neither sentence has a request- or state-derived part, so neither names an
+//! `__type` and in the `x-amzn-errortype` header, carrying "Cannot link these logins.".
+//! Neither sentence has a request- or state-derived part, so neither names an
 //! identity, a provider or a login, and a refused call writes nothing.
 //!
 //! The rows differ along what the rule generalises over: whether the request names an
@@ -43,8 +43,9 @@ const OPERATION: &str = "GetOpenIdTokenForDeveloperIdentity";
 /// answers is annotated with (`crate::service` owns that rule).
 const REFUSED_STATUS: u16 = 400;
 
-/// The exception shape every refusal below names.
+/// The exception shapes the refusals below name.
 const CONFLICT: &str = "ResourceConflictException";
+const NOT_AUTHORIZED: &str = "NotAuthorizedException";
 
 /// The header a failure names its exception shape in.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
@@ -67,7 +68,8 @@ const PUBLIC_PROVIDER: &str = "graph.facebook.com";
 
 /// The two fixed sentences AWS words these refusals with, spelled out here so the
 /// wire-visible text is pinned by the test rather than read back out of the crate.
-const CANNOT_MERGE_IDENTITIES: &str = "Cannot merge these identities.";
+const UNMATCHED_LOGINS: &str = "Logins don't match. Please include at least one valid login \
+                                for this identity or identity pool.";
 const CANNOT_LINK_LOGINS: &str = "Cannot link these logins.";
 
 /// A pool carrying a `DeveloperProviderName` AND the identity providers whose logins the rows
@@ -267,17 +269,25 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
         )
         .await;
 
-    // (case, the IdentityId sent, the logins presented, the sentence owed)
-    type Row<'a> = (&'a str, Option<&'a str>, Vec<(&'a str, &'a str)>, &'a str);
+    // (case, the IdentityId sent, the logins presented, the shape owed, the sentence owed)
+    type Row<'a> = (
+        &'a str,
+        Option<&'a str>,
+        Vec<(&'a str, &'a str)>,
+        &'a str,
+        &'a str,
+    );
     let rows: Vec<Row<'_>> = vec![
         // Both sides identified: the request names an identity and presents an identifier
-        // the pool has already registered, so the link would fuse two stored identities.
+        // the pool has already registered elsewhere, so it has shown no login of the
+        // identity it named.
         (
             "an identity a user-pool id token proves, with an identifier registered \
              elsewhere",
             Some(idp_proven.as_str()),
             vec![(DEVELOPER_PROVIDER, registered_user)],
-            CANNOT_MERGE_IDENTITIES,
+            NOT_AUTHORIZED,
+            UNMATCHED_LOGINS,
         ),
         (
             "that identity, with its own id token presented beside the registered identifier",
@@ -286,7 +296,8 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
                 (USER_POOL_PROVIDER, user_pool_login.as_str()),
                 (DEVELOPER_PROVIDER, registered_user),
             ],
-            CANNOT_MERGE_IDENTITIES,
+            NOT_AUTHORIZED,
+            UNMATCHED_LOGINS,
         ),
         (
             "the identifier's OWN identity, beside a login bound to another identity",
@@ -295,7 +306,8 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
                 (USER_POOL_PROVIDER, user_pool_login.as_str()),
                 (DEVELOPER_PROVIDER, registered_user),
             ],
-            CANNOT_MERGE_IDENTITIES,
+            NOT_AUTHORIZED,
+            UNMATCHED_LOGINS,
         ),
         (
             "an identity a public provider's access token proves, with its own token beside \
@@ -305,22 +317,25 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
                 (PUBLIC_PROVIDER, facebook_login),
                 (DEVELOPER_PROVIDER, registered_user),
             ],
-            CANNOT_MERGE_IDENTITIES,
+            NOT_AUTHORIZED,
+            UNMATCHED_LOGINS,
         ),
         (
             "another developer identity of the same backend",
             Some(other_registered.as_str()),
             vec![(DEVELOPER_PROVIDER, registered_user)],
-            CANNOT_MERGE_IDENTITIES,
+            NOT_AUTHORIZED,
+            UNMATCHED_LOGINS,
         ),
         (
             "an identity an unlink left linked to nothing",
             Some(unlinked.as_str()),
             vec![(DEVELOPER_PROVIDER, registered_user)],
-            CANNOT_MERGE_IDENTITIES,
+            NOT_AUTHORIZED,
+            UNMATCHED_LOGINS,
         ),
         // One side unidentified: a brand-new developer user identifier, or no IdentityId at
-        // all, so there is no pair of identities to merge.
+        // all, so there is no identity whose logins could have been presented.
         (
             "no identity named, a user-pool login proving one identity beside a new \
              identifier",
@@ -329,6 +344,7 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
                 (USER_POOL_PROVIDER, user_pool_login.as_str()),
                 (DEVELOPER_PROVIDER, "a-brand-new-backend-user"),
             ],
+            CONFLICT,
             CANNOT_LINK_LOGINS,
         ),
         (
@@ -339,6 +355,7 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
                 (USER_POOL_PROVIDER, user_pool_login.as_str()),
                 (DEVELOPER_PROVIDER, registered_user),
             ],
+            CONFLICT,
             CANNOT_LINK_LOGINS,
         ),
         (
@@ -348,6 +365,7 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
                 (PUBLIC_PROVIDER, facebook_login),
                 (DEVELOPER_PROVIDER, "a-second-brand-new-backend-user"),
             ],
+            CONFLICT,
             CANNOT_LINK_LOGINS,
         ),
         (
@@ -355,6 +373,7 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
              logins",
             Some(idp_proven.as_str()),
             vec![(DEVELOPER_PROVIDER, "a-third-brand-new-backend-user")],
+            CONFLICT,
             CANNOT_LINK_LOGINS,
         ),
     ];
@@ -374,7 +393,7 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
     }
     let identities_before = identity_count(&emulator, &pool_id).await;
 
-    for (case, identity_id, presented, sentence) in &rows {
+    for (case, identity_id, presented, shape, sentence) in &rows {
         let (status, body, error_type) = answer(
             &emulator,
             &token_request(&pool_id, presented, *identity_id, None),
@@ -382,13 +401,13 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
         .await;
         assert_eq!(
             (status, body_shape(case, &body).as_str()),
-            (REFUSED_STATUS, CONFLICT),
-            "case {case:?}: expected ({REFUSED_STATUS}, {CONFLICT}), got ({status}, {body})"
+            (REFUSED_STATUS, *shape),
+            "case {case:?}: expected ({REFUSED_STATUS}, {shape}), got ({status}, {body})"
         );
         assert_eq!(
             error_type.as_deref(),
-            Some(format!("{CONFLICT}:").as_str()),
-            "case {case:?}: expected the header to name {CONFLICT}, got {error_type:?}"
+            Some(format!("{shape}:").as_str()),
+            "case {case:?}: expected the header to name {shape}, got {error_type:?}"
         );
         assert_eq!(
             error_message(case, &body),

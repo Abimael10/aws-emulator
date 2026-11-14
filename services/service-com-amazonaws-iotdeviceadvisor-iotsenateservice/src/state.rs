@@ -18,8 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{DeviceUnderTest, SuiteDefinitionConfiguration, SuiteRunConfiguration};
 
-// WHERE an endpoint is ANNOUNCED — which of the addresses below a caller is actually
-// handed, so the device it points at reaches something — lives in
+// WHICH host an operation that reports an endpoint reports lives in
 // `state/endpoint_addressing.rs`.
 pub mod endpoint_addressing;
 
@@ -1706,9 +1705,10 @@ pub fn endpoint_for_device(region: &str, device: &DeviceIdentity<'_>) -> String 
 /// nothing per call, so the host a suite run reports for its primary device and the host
 /// `GetEndpoint` vends for that same device are the same string.
 ///
-/// This is the host a client that resolves AWS's own names is told; what an operation
-/// ANNOUNCES to a client that reached THIS emulator is the address it can dial
-/// ([`announced_endpoint`]), because a host nothing here answers on is no endpoint at all.
+/// This is the host every operation that reports an endpoint reports — `GetEndpoint` and
+/// the suite-run start alike — whichever address the asking request reached this emulator
+/// on: `endpoint` is a modelled Device Advisor hostname (`Endpoint`, `len 45..75`), so the
+/// address a client happens to be configured with is not a value of it.
 pub fn endpoint_for(region: &str, device: &DeviceIdentity<'_>) -> String {
     if device.names_no_device() {
         endpoint_for_region(region)

@@ -436,13 +436,12 @@ pub const EFFECTIVE_DELIVERY_POLICY_ATTRIBUTE: &str = "EffectiveDeliveryPolicy";
 /// until the confirmed and pending counts had settled still read `0` deleted on every one
 /// of those reads.
 ///
-/// The span is this emulator's own — AWS documents no period for it — and is chosen
-/// longer than such a convergence loop runs for, which is what the recording requires: a
-/// span of a few seconds was measured against this same recorded sequence and the count
-/// had already moved to 1 by the read the recording shows as 0, because the client's own
-/// polling spans more than that. A count that moves inside a convergence loop reports a
-/// number no real client reading those three counters together ever sees.
-pub const SUBSCRIPTION_DELETION_SETTLES_AFTER: Duration = Duration::from_secs(15 * 60);
+/// The span is this emulator's own — AWS documents no period for it — and it is the
+/// standard span this emulator owes a transition the clock makes due: non-zero, so a read
+/// taken straight after the `Unsubscribe` still reports the count from before it, and short
+/// enough that a client's ordinary convergence loop over the three counters observes the
+/// deletion being taken up rather than timing out on a number that never moves.
+pub const SUBSCRIPTION_DELETION_SETTLES_AFTER: Duration = Duration::from_secs(3);
 
 /// How many not-yet-counted deletions ONE topic holds the instants of.
 ///

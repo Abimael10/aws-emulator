@@ -62,9 +62,9 @@
 //! renders the sessions of one stack's fleet back, a page at a time.
 //!
 //! The user pool lives here as well: `CreateUser` writes a [`UserRecord`] under the
-//! `(AuthenticationType, UserName)` identity it allocates, a create racing that allocation
-//! collapses into it while one issued after the identity is established is refused
-//! ([`UserRecord::is_established`]), `DisableUser` and `EnableUser`
+//! `(AuthenticationType, UserName)` identity it allocates, a further create of an identity
+//! the pool already holds is refused as a username that is taken, `DisableUser` and
+//! `EnableUser`
 //! move that record's sign-in flag
 //! ([`ComAmazonawsAppstreamPhotonadminproxyserviceState::set_user_enabled`]), `DeleteUser`
 //! removes the identity with what it entitled
@@ -1333,28 +1333,6 @@ impl UsageReportSubscriptionRecord {
     }
 }
 
-/// How long the allocation of a user pool identity stays open to a create arriving
-/// together with it.
-///
-/// AppStream's user pool is written through an index a create checks the username
-/// against, and that index is eventually consistent: creates issued together all find the
-/// identity free, all succeed, and the pool ends up holding it exactly once. A create
-/// issued once the identity is ESTABLISHED — the case AWS refuses as an already-taken
-/// username — is one a caller sends after that view has caught up.
-///
-/// AWS publishes no propagation window, so this span is the emulator's own, and it is the
-/// same span every other transition this crate owes the clock takes ([`FLEET_START_SPAN`]):
-/// a caller acting straight after the create still observes the allocation that is open —
-/// however many calls it makes in between and however slowly the host runs them — while a
-/// caller that waits for the span sees the identity established and its next create refused
-/// as AWS refuses it. A span short enough to elapse between two calls would make the
-/// OUTCOME of a create depend on how fast the host executed the calls before it, which is
-/// not something this service decides on. The window is ABSOLUTE — measured from the create
-/// that allocated the identity, and never extended by a later one — so the identity becomes
-/// established at an instant that create fixed, whatever arrives in the meantime. Nothing
-/// sleeps for it: the instant the identity is established is stored on the record.
-pub const USER_ALLOCATION_GRACE: ::std::time::Duration = FLEET_START_SPAN;
-
 /// A persisted user pool user.
 ///
 /// The identity is the `(AuthenticationType, UserName)` pair this record is stored
@@ -1376,19 +1354,9 @@ pub struct UserRecord {
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub created_time: ::aws_smithy_types::DateTime,
-    /// The instant from which this identity counts as established, so that a further
-    /// create of it is refused as a username that is taken: the create that allocated it
-    /// plus [`USER_ALLOCATION_GRACE`].
-    pub established_at: ::std::time::Instant,
 }
 
 impl UserRecord {
-    /// Whether this identity is established at `now`: the allocation that minted it is no
-    /// longer open to a create racing it, so a further create of the same username is
-    /// refused rather than answered like the first.
-    pub fn is_established(&self, now: ::std::time::Instant) -> bool {
-        now >= self.established_at
-    }
 
     /// Render the stored record as the modelled `User` every reader returns.
     pub fn to_user(&self) -> User {

@@ -10,23 +10,21 @@
 //! The rules under test, each asserted over a TABLE of inputs rather than over one
 //! recorded request:
 //!
-//! * a `(UserName, AuthenticationType)` identity is allocated AT MOST ONCE, and once it is
-//!   ESTABLISHED a further create of it is refused `ResourceAlreadyExistsException` (400)
+//! * a `(UserName, AuthenticationType)` identity is allocated AT MOST ONCE, and a further
+//!   create of a username the pool holds is refused `ResourceAlreadyExistsException` (400)
 //!   with AWS's sentence — which states that the username is taken and echoes nothing —
 //!   whatever that create carries, and leaves the stored user exactly as it was;
-//! * creates ISSUED TOGETHER on one identity race its allocation: every one of them
-//!   succeeds and the pool holds one enabled user for the name afterwards, however many
-//!   there are;
+//! * creates ISSUED TOGETHER on one identity are serialised on the pool: exactly one of
+//!   them allocates the username, every other is refused as a name that is taken, and the
+//!   pool holds one enabled user for the name afterwards, however many there are;
 //! * deleting the identity frees the username: a create afterwards allocates it again,
 //!   while a delete of an identity the pool does not hold is refused
 //!   `ResourceNotFoundException` (400) — gone means unusable, not merely unlisted.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use crate::refusal_messages::refusal;
-use crate::stack_fleet_lifecycle::Emulator;
+use crate::stack_fleet_lifecycle::{error_code, Emulator};
 
 /// The only authentication type the user pool operations accept, which both
 /// `CreateUser.AuthenticationType` and `DescribeUsers.AuthenticationType` document as
@@ -39,18 +37,6 @@ const ALREADY_EXISTS: &str =
     service_com_amazonaws_appstream_photonadminproxyservice::state::USER_ALREADY_EXISTS_MESSAGE;
 const NOT_FOUND: &str =
     service_com_amazonaws_appstream_photonadminproxyservice::state::USER_NOT_FOUND_MESSAGE;
-
-/// How long the allocation of an identity stays open to a create racing it, read from the
-/// crate so the test tracks the constant rather than a copy of its value.
-const ALLOCATION_GRACE: Duration =
-    service_com_amazonaws_appstream_photonadminproxyservice::state::USER_ALLOCATION_GRACE;
-
-/// Wait until the identity a create allocated is established, which is what makes a
-/// further create of it a claim on a username that is taken. Nothing in the service sleeps
-/// for the span; only this test waits for it.
-async fn settle() {
-    tokio::time::sleep(ALLOCATION_GRACE + Duration::from_millis(50)).await;
-}
 
 /// The users a read of the pool reports.
 async fn user_pool(emulator: &Emulator, case: &str) -> Vec<Value> {
@@ -82,8 +68,8 @@ struct Row {
 /// The duplicate table. The rows differ along what the rule generalises over: the form of
 /// the user name (ASCII email, tagged address, non-ASCII letters, a bare name), what the
 /// first create stored, and what the second create asks for — identical, bare, a welcome
-/// email resent, or a different attribute. Once the identity is established every one of
-/// them is a claim on a username that is taken.
+/// email resent, or a different attribute. Each of them is a claim on a username that is
+/// taken.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -129,7 +115,7 @@ fn create_request(user_name: &str, extra: &Value) -> Value {
 }
 
 #[tokio::test]
-async fn a_create_of_an_established_identity_is_refused_as_a_username_that_is_taken() {
+async fn a_create_of_a_held_identity_is_refused_as_a_username_that_is_taken() {
     for row in rows() {
         let case = row.case;
         let emulator = Emulator::new();
@@ -141,7 +127,7 @@ async fn a_create_of_an_established_identity_is_refused_as_a_username_that_is_ta
             )
             .await;
 
-        // The identity is observable, and the clock has settled its allocation.
+        // The identity is observable.
         let stored = user_pool(&emulator, case).await;
         assert_eq!(
             stored.len(),
@@ -149,7 +135,6 @@ async fn a_create_of_an_established_identity_is_refused_as_a_username_that_is_ta
             "case {case:?}: the create must have allocated exactly the one identity, got \
              {stored:?}"
         );
-        settle().await;
 
         let message = refusal(
             &emulator,
@@ -184,12 +169,11 @@ async fn a_create_of_an_established_identity_is_refused_as_a_username_that_is_ta
 async fn an_identity_differing_only_in_capitalisation_is_still_free() {
     // Email addresses are case-sensitive, so the refusal above is about the name the
     // request spells and not about any other spelling of it.
-    let case = "another capitalisation of a settled identity";
+    let case = "another capitalisation of a held identity";
     let emulator = Emulator::new();
     emulator
         .ok(case, "CreateUser", create_request("settled@example.com", &json!({})))
         .await;
-    settle().await;
 
     emulator
         .ok(case, "CreateUser", create_request("Settled@example.com", &json!({})))
@@ -203,10 +187,11 @@ async fn an_identity_differing_only_in_capitalisation_is_still_free() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn creates_issued_together_on_one_identity_all_succeed_and_allocate_it_once() {
+async fn creates_issued_together_on_one_identity_allocate_it_once() {
     // Rows: how many callers issue the create together, and what each of them carries.
-    // However many of them arrive at once, each is answered 200 and the pool holds one
-    // enabled user for the name afterwards.
+    // However many of them arrive at once, exactly one allocates the username, the others
+    // are refused as a name that is taken, and the pool holds one enabled user for the
+    // name afterwards.
     for (racers, extra) in [
         (2_usize, json!({})),
         (6, json!({ "MessageAction": "SUPPRESS" })),
@@ -224,19 +209,35 @@ async fn creates_issued_together_on_one_identity_all_succeed_and_allocate_it_onc
                 emulator.call("CreateUser", request).await
             }));
         }
+        let mut allocated = 0_usize;
         for call in issued {
             let (status, payload) = call.await.expect("the racing call completes");
+            if status == 200 {
+                allocated += 1;
+                assert_eq!(
+                    payload,
+                    json!({}),
+                    "case {case:?}: the create that allocated the identity gets the empty \
+                     result, got {payload}"
+                );
+                continue;
+            }
             assert_eq!(
-                status, 200,
-                "case {case:?}: every create racing one allocation must succeed, got \
+                status, 400,
+                "case {case:?}: a create is either answered 200 or refused 400, got \
                  {status} {payload}"
             );
             assert_eq!(
-                payload,
-                json!({}),
-                "case {case:?}: every one of them gets the same empty result, got {payload}"
+                error_code(&payload),
+                "ResourceAlreadyExistsException",
+                "case {case:?}: a create that lost the allocation must be refused as a \
+                 username that is taken, got {payload}"
             );
         }
+        assert_eq!(
+            allocated, 1,
+            "case {case:?}: exactly one of them must allocate the identity, got {allocated}"
+        );
 
         let stored = user_pool(&emulator, &case).await;
         assert_eq!(
@@ -251,9 +252,7 @@ async fn creates_issued_together_on_one_identity_all_succeed_and_allocate_it_onc
             stored[0]
         );
 
-        // Once that allocation has settled, a further create is a claim on a username
-        // that is taken.
-        settle().await;
+        // And a further create is a claim on a username that is taken.
         refusal(
             &emulator,
             &case,
@@ -279,7 +278,6 @@ async fn deleting_an_identity_frees_the_username_and_a_repeat_delete_is_not_foun
                 create_request(row.user_name, &row.created),
             )
             .await;
-        settle().await;
 
         let deleted = emulator.ok(case, "DeleteUser", identity.clone()).await;
         assert_eq!(

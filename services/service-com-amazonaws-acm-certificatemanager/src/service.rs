@@ -224,14 +224,30 @@ pub(crate) fn enum_value_refusal(path: &str, allowed: &[&str]) -> String {
 /// request or the store appears, so a refusal cannot echo a caller's own ARN or account
 /// back, or say whether a record with that id exists.
 ///
-/// Rendered here once, so every operation that holds an ARN member to the caller's
-/// account answers the same sentence about its own member.
+/// Rendered here once, so every operation that states this verdict in the
+/// identifier-scoped envelope answers the same sentence about its own member. The ONE
+/// operation whose recorded refusal words the same verdict differently
+/// ([`cross_account_arn_in_request_refusal`]) states it there instead: the envelope is a
+/// property of the operation that refuses rather than of the service.
 pub(crate) fn cross_account_arn_refusal(arn: &str) -> String {
     format!(
         "Resource identifier for {} has a validation error: Same account ARN expected but got \
          cross-account ARN",
         crate::state::acm_arn_resource_noun(arn)
     )
+}
+
+/// The `ValidationException` message `GetAcmeExternalAccountBindingCredentials` states that
+/// same verdict with: ACM words that operation's cross-account refusal as a verdict on the
+/// ARN the request carried — "Invalid ARN in request: " followed by the verdict — rather than
+/// in the identifier-scoped envelope its sibling operations word it in
+/// ([`cross_account_arn_refusal`]).
+///
+/// The sentence is WHOLLY fixed text: no account id, no ARN, no resource type and no id, so
+/// this refusal discloses nothing of the identifier it rejected and nothing about whether a
+/// record with that id exists — the account is judged before the store is read.
+pub(crate) fn cross_account_arn_in_request_refusal() -> String {
+    "Invalid ARN in request: Same account ARN expected but got cross-account ARN".to_string()
 }
 
 /// The subject a clause about `path` opens with: the position that failed

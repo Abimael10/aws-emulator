@@ -247,6 +247,9 @@ mod subscription_attributes;
 #[path = "all/subscription_dead_letter_queue.rs"]
 mod subscription_dead_letter_queue;
 
+#[path = "all/subscription_deletion_counter.rs"]
+mod subscription_deletion_counter;
+
 #[path = "all/subscription_endpoint_rebinding.rs"]
 mod subscription_endpoint_rebinding;
 

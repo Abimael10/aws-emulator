@@ -57,6 +57,26 @@ pub(crate) fn cross_account_arn_message(resource_type: &str) -> String {
     )
 }
 
+/// The sentence the ACME external-account-binding CREDENTIAL read refuses a cross-account
+/// ARN with: the same verdict stated as a verdict on the ARN the request carried, which is
+/// WHOLLY fixed text — it names no resource type and nothing else of the request.
+pub(crate) const IN_REQUEST_CROSS_ACCOUNT_ARN_MESSAGE: &str =
+    "Invalid ARN in request: Same account ARN expected but got cross-account ARN";
+
+/// The operation whose recorded cross-account refusal uses the in-request sentence rather
+/// than the identifier-scoped envelope. The envelope is a property of the refusing
+/// operation, so a suite asks per operation ([`cross_account_arn_message_for`]).
+const IN_REQUEST_ENVELOPE_OPERATION: &str = "GetAcmeExternalAccountBindingCredentials";
+
+/// The sentence `operation` states a cross-account `resource_type` ARN with.
+pub(crate) fn cross_account_arn_message_for(operation: &str, resource_type: &str) -> String {
+    if operation == IN_REQUEST_ENVELOPE_OPERATION {
+        IN_REQUEST_CROSS_ACCOUNT_ARN_MESSAGE.to_string()
+    } else {
+        cross_account_arn_message(resource_type)
+    }
+}
+
 /// The access key id of the account's own published credential, as every other suite in
 /// this crate signs with it: a key neither STS nor IAM holds a record for, which is the
 /// position AWS account root credentials are in.
@@ -948,9 +968,9 @@ async fn an_arn_of_another_account_is_refused_as_invalid_input() {
             );
             assert_eq!(
                 message,
-                cross_account_arn_message(resource_type),
-                "case {case:?}: expected the cross-account verdict scoped to {resource_type}, got \
-                 {refusal}"
+                cross_account_arn_message_for(operation, resource_type),
+                "case {case:?}: expected the cross-account verdict this operation states for \
+                 {resource_type}, got {refusal}"
             );
         }
     }

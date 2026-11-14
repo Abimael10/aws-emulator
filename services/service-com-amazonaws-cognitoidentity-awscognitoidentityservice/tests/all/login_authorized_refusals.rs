@@ -63,7 +63,6 @@ const UNMATCHED_LOGINS: &str = "Logins don't match. Please include at least one 
 const CANNOT_UNLINK_UNAUTHENTICATED: &str = "Cannot unlink unauthenticated user.";
 const UNAUTHENTICATED_ACCESS: &str = "Unauthenticated access is not supported for this identity pool.";
 const CANNOT_LINK_LOGINS: &str = "Cannot link these logins.";
-const CANNOT_MERGE_IDENTITIES: &str = "Cannot merge these identities.";
 const CUSTOM_ROLE_ARN_UNSUPPORTED: &str =
     "Only SAML providers and providers with RoleMappings support custom role ARN.";
 const NO_DEVELOPER_ACCESS: &str = "You do not have access to this identity";
@@ -561,7 +560,7 @@ async fn a_developer_login_links_only_logins_that_name_one_account() {
             "an identifier registered against another identity",
             provider_proven.as_str(),
             "the-backends-user",
-            Some(("ResourceConflictException", CANNOT_MERGE_IDENTITIES)),
+            Some(("NotAuthorizedException", UNMATCHED_LOGINS)),
         ),
         (
             "a new identifier, for an identity a provider's login proves",

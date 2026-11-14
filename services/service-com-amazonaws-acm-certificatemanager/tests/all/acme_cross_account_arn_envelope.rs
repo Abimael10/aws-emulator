@@ -4,13 +4,17 @@
 //! with, across every ARN input member of its ACME surface.
 //!
 //! RULE: an ARN input member whose account segment is not the caller's is refused as
-//! invalid input (`ValidationException`, HTTP 400) with ACM's identifier-validation
-//! envelope — `Resource identifier for <resource type> has a validation error: ` followed
-//! by the verdict on the ARN — where the one request-derived token is the resource TYPE
-//! the offending ARN carries, and nothing else of the request (its account id, its ARN,
-//! its domain name) appears in the message. That token is what tells a client WHICH
-//! identifier member of a multi-ARN request was rejected, since every such refusal of
-//! this service carries the one modelled error code.
+//! invalid input (`ValidationException`, HTTP 400) with the sentence the REFUSING
+//! OPERATION states that verdict in: every operation of the ACME surface but one words it
+//! in ACM's identifier-validation envelope — `Resource identifier for <resource type> has a
+//! validation error: ` followed by the verdict on the ARN, where the one request-derived
+//! token is the resource TYPE the offending ARN carries — while the external-account-binding
+//! credential read words the same verdict on the request's ARN alone, `Invalid ARN in
+//! request: ` followed by it, which carries no token of the request at all. Nothing else of
+//! the request (its account id, its ARN, its domain name) appears in either sentence. The
+//! resource-type token is what tells a client WHICH identifier member of a multi-ARN request
+//! was rejected, since every such refusal of this service carries the one modelled error
+//! code.
 //!
 //! The rows differ along what the rule generalises over: the ARN member and so the
 //! resource type it names (the three the ACME surface addresses — `acme-endpoint`,
@@ -30,7 +34,7 @@
 
 use serde_json::{json, Value};
 
-use crate::acme_authorization::cross_account_arn_message;
+use crate::acme_authorization::{cross_account_arn_message, cross_account_arn_message_for};
 use crate::acme_domain_validation_lifecycle::{
     create_validation, describe_validation, endpoint_body,
 };
@@ -220,10 +224,10 @@ fn requests_for(foreign: &ForeignAccount<'_>) -> Vec<(&'static str, Value, &'sta
 }
 
 /// RULE: every operation that holds an ARN member to the caller's account refuses a
-/// cross-account ARN with the identifier-validation envelope scoped to the resource type
-/// that ARN carries, and carries nothing else of the request.
+/// cross-account ARN with the sentence that operation states the verdict in, and carries
+/// nothing else of the request.
 #[tokio::test]
-async fn a_cross_account_arn_is_refused_in_the_member_scoped_envelope() {
+async fn a_cross_account_arn_is_refused_in_the_envelope_the_operation_states_it_in() {
     let (router, _engine) = router_with_engine();
 
     for foreign in FOREIGN_ACCOUNTS {
@@ -243,10 +247,11 @@ async fn a_cross_account_arn_is_refused_in_the_member_scoped_envelope() {
             let message = error_message(&refusal);
             assert_eq!(
                 message,
-                cross_account_arn_message(resource_type),
-                "case {case:?}: expected the envelope scoped to {resource_type}, got {message:?}"
+                cross_account_arn_message_for(operation, resource_type),
+                "case {case:?}: expected the envelope {operation} states for {resource_type}, \
+                 got {message:?}"
             );
-            // The resource type is the ONLY thing the sentence takes from the request.
+            // The resource type is the ONLY thing either sentence takes from the request.
             assert!(
                 !message.contains(arn.as_str()) && !message.contains(account),
                 "case {case:?}: the refusal must withhold the submitted ARN and account, got \
@@ -283,8 +288,9 @@ async fn an_own_account_arn_is_not_answered_with_the_cross_account_envelope() {
             let (_status, refusal) = call(&router, operation, &body).await;
             assert_eq!(
                 error_message(&refusal),
-                cross_account_arn_message(resource_type),
-                "case {case:?}: expected the envelope scoped to {resource_type}, got {refusal}"
+                cross_account_arn_message_for(operation, resource_type),
+                "case {case:?}: expected the envelope {operation} states for {resource_type}, \
+                 got {refusal}"
             );
         }
     }

@@ -12,12 +12,10 @@
 //! * creating a user allocates the `(AuthenticationType, UserName)` identity and
 //!   persists it, so a later read reports that user with the ARN, the names and the
 //!   creation instant the create stored, enabled and not yet confirmed;
-//! * the identity is allocated at most once: a create that arrives while the allocation
-//!   is still open asks for the user that is already there, so it answers the same empty
-//!   success and changes nothing — however many callers race on it — while one that names
-//!   an attribute differing from the stored one is refused with
-//!   `ResourceAlreadyExistsException` (400), as is any create of an identity that is
-//!   already established (`tests/all/user_identity_allocation.rs`); and names differing
+//! * the identity is allocated at most once: a create of a username the pool already
+//!   holds under that authentication type is refused with
+//!   `ResourceAlreadyExistsException` (400), whatever it carries beside the identity
+//!   (`tests/all/user_allocation_window.rs`); and names differing
 //!   only in capitalisation are different identities, because email addresses are
 //!   case-sensitive;
 //! * the user pool operations manage USERPOOL identities only, so any other
@@ -34,8 +32,8 @@
 use serde_json::{json, Value};
 
 use crate::refusal_messages::refusal;
-use crate::stack_fleet_lifecycle::{assert_error, Emulator};
-use crate::user_allocation_window::refused_once_the_allocation_settles;
+use crate::stack_fleet_lifecycle::{assert_error, error_code, Emulator};
+use crate::user_allocation_window::refused_as_a_username_that_is_taken;
 
 /// The account every emulated resource belongs to.
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
@@ -269,23 +267,24 @@ async fn create_user_persists_the_identity_a_later_read_reports() {
 }
 
 #[tokio::test]
-async fn a_repeat_create_of_an_identity_that_exists_is_idempotent() {
-    // Rows: what the repeat request carries beside the identity, and whether it asks for
-    // the user that is already there. A repeat that asks for nothing different is
-    // answered with the same empty success; one that names an attribute differing from
-    // the stored value asks for a different user under a name that is taken, and is
-    // refused. Either way the stored user is left exactly as it was.
-    for (case, repeat_extra, succeeds) in [
-        ("identical request", json!({ "FirstName": "Ada", "LastName": "Lovelace" }), true),
-        ("only the identity", json!({}), true),
-        ("welcome email resent", json!({ "MessageAction": "RESEND" }), true),
-        ("one name repeated", json!({ "LastName": "Lovelace" }), true),
-        ("a different first name", json!({ "FirstName": "Augusta" }), false),
-        ("a different last name", json!({ "LastName": "Byron" }), false),
+async fn a_repeat_create_of_an_identity_that_exists_is_refused() {
+    // Rows: what the repeat request carries beside the identity. The username is taken
+    // whichever of them it is — the identical request, the identity alone, a welcome email
+    // resent, or an attribute differing from the stored value — so every repeat is refused
+    // and the stored user is left exactly as it was.
+    for (case, repeat_extra) in [
+        (
+            "identical request",
+            json!({ "FirstName": "Ada", "LastName": "Lovelace" }),
+        ),
+        ("only the identity", json!({})),
+        ("welcome email resent", json!({ "MessageAction": "RESEND" })),
+        ("one name repeated", json!({ "LastName": "Lovelace" })),
+        ("a different first name", json!({ "FirstName": "Augusta" })),
+        ("a different last name", json!({ "LastName": "Byron" })),
         (
             "both names different",
             json!({ "FirstName": "Augusta", "LastName": "Byron" }),
-            false,
         ),
     ] {
         let row = Row {
@@ -307,33 +306,24 @@ async fn a_repeat_create_of_an_identity_that_exists_is_idempotent() {
             repeat[member] = value.clone();
         }
 
-        if succeeds {
-            let answer = emulator.ok(case, "CreateUser", repeat).await;
-            assert_eq!(
-                answer,
-                json!({}),
-                "case {case:?}: a repeat create answers the same empty result, got {answer}"
-            );
-        } else {
-            let message = refusal(
-                &emulator,
-                case,
-                "CreateUser",
-                repeat,
-                400,
-                "ResourceAlreadyExistsException",
-            )
-            .await;
-            assert_eq!(
-                message, USER_ALREADY_EXISTS_MESSAGE,
-                "case {case:?}: expected message {USER_ALREADY_EXISTS_MESSAGE:?}, got {message:?}"
-            );
-            assert!(
-                !message.contains(row.user_name.as_str()),
-                "case {case:?}: the sentence states that the username is taken without \
-                 echoing it, got {message:?}"
-            );
-        }
+        let message = refusal(
+            &emulator,
+            case,
+            "CreateUser",
+            repeat,
+            400,
+            "ResourceAlreadyExistsException",
+        )
+        .await;
+        assert_eq!(
+            message, USER_ALREADY_EXISTS_MESSAGE,
+            "case {case:?}: expected message {USER_ALREADY_EXISTS_MESSAGE:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(row.user_name.as_str()),
+            "case {case:?}: the sentence states that the username is taken without \
+             echoing it, got {message:?}"
+        );
 
         let after = user_pool(&emulator, case).await;
         assert_eq!(
@@ -345,11 +335,16 @@ async fn a_repeat_create_of_an_identity_that_exists_is_idempotent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_creates_of_one_identity_all_succeed_and_allocate_it_once() {
-    // Rows: how many callers race on the same identity, and what each of them carries.
-    // However many of them arrive at once, each is answered 200 and the pool holds one
-    // user for that name afterwards.
-    for (racers, extra) in [(2_usize, json!({})), (6, json!({ "MessageAction": "SUPPRESS" })), (16, json!({}))] {
+async fn creates_racing_on_one_identity_allocate_it_exactly_once() {
+    // Rows: how many callers race on the same identity, and what each of them carries. The
+    // lookup and the insert happen under one lock, so however many arrive at once exactly
+    // ONE of them allocates the username and every other is refused as a name that is
+    // taken — the pool holds one user for that name afterwards.
+    for (racers, extra) in [
+        (2_usize, json!({})),
+        (6, json!({ "MessageAction": "SUPPRESS" })),
+        (16, json!({})),
+    ] {
         let case = format!("{racers} racers");
         let emulator = std::sync::Arc::new(Emulator::new());
         let mut request = json!({
@@ -368,18 +363,38 @@ async fn concurrent_creates_of_one_identity_all_succeed_and_allocate_it_once() {
                 emulator.call("CreateUser", request).await
             }));
         }
+        let mut allocated = 0_usize;
         for racer in racing {
             let (status, payload) = racer.await.expect("the racing call completes");
-            assert_eq!(
-                status, 200,
-                "case {case:?}: every racer on one identity must succeed, got {status} {payload}"
-            );
-            assert_eq!(
-                payload,
-                json!({}),
-                "case {case:?}: every racer gets the same empty result, got {payload}"
-            );
+            match status {
+                200 => {
+                    allocated += 1;
+                    assert_eq!(
+                        payload,
+                        json!({}),
+                        "case {case:?}: the racer that allocated the identity gets the empty \
+                         result, got {payload}"
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        status, 400,
+                        "case {case:?}: a racer is either answered 200 or refused 400, got \
+                         {status} {payload}"
+                    );
+                    assert_eq!(
+                        error_code(&payload),
+                        "ResourceAlreadyExistsException",
+                        "case {case:?}: a losing racer must be refused as a username that is \
+                         taken, got {payload}"
+                    );
+                }
+            }
         }
+        assert_eq!(
+            allocated, 1,
+            "case {case:?}: exactly one racer must allocate the identity, got {allocated}"
+        );
 
         let users = user_pool(&emulator, &case).await;
         assert_eq!(
@@ -727,10 +742,8 @@ async fn the_user_store_refuses_a_user_past_its_ceiling() {
 
     // An identity already held allocates nothing, so a create of one is answered by the
     // identity gate rather than by the ceiling: the username is taken, at the ceiling as
-    // below it. The identity the first create allocated settles on an instant that create
-    // fixed, so this looks again until it has rather than assuming the loop above took
-    // longer than the span.
-    let message = refused_once_the_allocation_settles(
+    // below it.
+    let message = refused_as_a_username_that_is_taken(
         &emulator,
         case,
         &json!({

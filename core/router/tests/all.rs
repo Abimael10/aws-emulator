@@ -5293,3 +5293,11 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // where an inner doc comment is legal.)
 // (Pruned, for the reason recorded above: everything that stood here was a fragment of this
 // file's own header or a note about a duplicate declaration that is already gone.)
+// (The copies of this file's own header that concurrent landings appended into this tail,
+// and the duplicate `mod` declarations beside them, are removed rather than re-typed: an
+// inner doc comment is legal only before the first item, a module may be declared only
+// once, and the rule itself stands in the module doc at the HEAD of this file.)
+// (The duplicate `mod` declarations and header copies concurrent landings appended below
+// this point are removed for the same reason.)
+// (Every further header copy and duplicate declaration concurrent landings appended after
+// this point is removed for the same two reasons.)

@@ -321,6 +321,8 @@ mod minted_identity_across_updates;
 mod nested_resource_outputs;
 #[path = "all/nested_stack_output_attributes.rs"]
 mod nested_stack_output_attributes;
+#[path = "all/nested_stack_output_feeds_a_parent_resource.rs"]
+mod nested_stack_output_feeds_a_parent_resource;
 #[path = "all/nested_stack_output_values.rs"]
 mod nested_stack_output_values;
 #[path = "all/nested_stacks.rs"]
