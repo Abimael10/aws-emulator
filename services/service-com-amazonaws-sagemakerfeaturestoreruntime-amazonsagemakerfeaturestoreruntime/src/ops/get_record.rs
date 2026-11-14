@@ -164,22 +164,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(GetRecordErrorModeled::InternalFailure(InternalFailure {
-                message: Some("GetRecord: this service holds no state on the mounted engine".into()),
-            })
-            .into());
+            return Err(internal_failure(
+                "GetRecord: this service holds no state on the mounted engine",
+            ));
         };
 
         // The boundary validator refuses an undeclared enum value first; this is the
         // handler's own guard, shared with BatchGetRecord so the two cannot drift.
-        let expiration_enabled = crate::state::expiration_time_enabled(
-            input.expiration_time_response.as_deref(),
-        )
-        .map_err(|message| {
-            GetRecordError::from(GetRecordErrorModeled::ValidationError(ValidationError {
-                message: Some(message),
-            }))
-        })?;
+        let expiration_enabled =
+            crate::state::expiration_time_enabled(input.expiration_time_response.as_deref())
+                .map_err(validation)?;
 
         // The data plane's one feature-group resolution: a `FeatureGroupName` naming no
         // feature group is a request defect (400 `ValidationError`), never a missing
@@ -194,30 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(definition) => definition,
             Err(unresolved) => {
                 return Err(match unresolved {
-                    crate::state::Unresolved::Refused(message) => {
-                        GetRecordErrorModeled::ValidationError(ValidationError {
-                            message: Some(message),
-                        })
-                        .into()
-                    }
-                    crate::state::Unresolved::NoDirectory => {
-                        GetRecordErrorModeled::InternalFailure(InternalFailure {
-                            message: Some(
-                                "GetRecord: this service holds no feature-group directory on \
-                                 the mounted engine"
-                                    .into(),
-                            ),
-                        })
-                        .into()
-                    }
+                    crate::state::Unresolved::Refused(message) => validation(message),
+                    crate::state::Unresolved::NoDirectory => internal_failure(
+                        "GetRecord: this service holds no feature-group directory on the \
+                         mounted engine",
+                    ),
                 })
             }
         };
         if !definition.online_store_enabled {
-            return Err(GetRecordErrorModeled::ValidationError(ValidationError {
-                message: Some(crate::state::no_online_store(&definition.name)),
-            })
-            .into());
+            return Err(validation(crate::state::no_online_store(&definition.name)));
         }
 
         let identifier = input.record_identifier_value_as_string.clone();
@@ -250,4 +230,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             expires_at,
         })
     }
+}
+
+/// The modelled `ValidationError` (HTTP 400) for a request this operation refuses.
+///
+/// The message is worded through [`crate::state::bounded_message`], so the text this
+/// operation answers is inside the maximum length its own `ValidationError$Message`
+/// declares even when the refusal quotes something the request supplied.
+fn validation(message: impl Into<String>) -> GetRecordError {
+    GetRecordErrorModeled::ValidationError(ValidationError {
+        message: Some(crate::state::bounded_message(message)),
+    })
+    .into()
+}
+
+/// The modelled `InternalFailure` (HTTP 500) for a fault of the emulator itself, with its
+/// message bounded the same way: `InternalFailure$Message` targets the same `Message`.
+fn internal_failure(message: impl Into<String>) -> GetRecordError {
+    GetRecordErrorModeled::InternalFailure(InternalFailure {
+        message: Some(crate::state::bounded_message(message)),
+    })
+    .into()
 }

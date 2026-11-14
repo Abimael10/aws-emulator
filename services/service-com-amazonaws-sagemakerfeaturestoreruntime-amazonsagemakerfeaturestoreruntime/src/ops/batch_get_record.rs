@@ -152,26 +152,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(BatchGetRecordErrorModeled::InternalFailure(InternalFailure {
-                message: Some(
-                    "BatchGetRecord: this service holds no state on the mounted engine".into(),
-                ),
-            })
-            .into());
+            return Err(internal_failure(
+                "BatchGetRecord: this service holds no state on the mounted engine",
+            ));
         };
 
         // The boundary validator refuses an undeclared enum value first; this is the
         // handler's own guard, shared with GetRecord so the two cannot drift.
-        let expiration_enabled = crate::state::expiration_time_enabled(
-            input.expiration_time_response.as_deref(),
-        )
-        .map_err(|message| {
-            BatchGetRecordError::from(BatchGetRecordErrorModeled::ValidationError(
-                ValidationError {
-                    message: Some(message),
-                },
-            ))
-        })?;
+        let expiration_enabled =
+            crate::state::expiration_time_enabled(input.expiration_time_response.as_deref())
+                .map_err(validation)?;
 
         let mut records: Vec<BatchGetRecordResultDetail> = Vec::new();
         let mut errors: Vec<BatchGetRecordError2> = Vec::new();
@@ -206,17 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .then(|| crate::state::no_online_store(&definition.name)),
                 Err(crate::state::Unresolved::Refused(message)) => Some(message),
                 Err(crate::state::Unresolved::NoDirectory) => {
-                    return Err(BatchGetRecordErrorModeled::InternalFailure(InternalFailure {
-                        message: Some(
-                            "BatchGetRecord: this service holds no feature-group directory on \
-                             the mounted engine"
-                                .into(),
-                        ),
-                    })
-                    .into())
+                    return Err(internal_failure(
+                        "BatchGetRecord: this service holds no feature-group directory on the \
+                         mounted engine",
+                    ))
                 }
             };
             if let Some(message) = refusal {
+                // The per-element `ErrorMessage` targets the same `Message` as every
+                // modelled error's own, so it is worded under the same bound.
+                let message = crate::state::bounded_message(message);
                 errors.extend(wanted.record_identifiers_value_as_string.iter().map(
                     |identifier| BatchGetRecordError2 {
                         feature_group_name: group_name.clone(),
@@ -270,4 +259,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             unprocessed_identifiers: Vec::new(),
         })
     }
+}
+
+/// The modelled `ValidationError` (HTTP 400) for a REQUEST this operation refuses whole,
+/// as opposed to one identifier of a batch whose others are served.
+///
+/// The message is worded through [`crate::state::bounded_message`], so the text this
+/// operation answers is inside the maximum length its own `ValidationError$Message`
+/// declares even when the refusal quotes something the request supplied.
+fn validation(message: impl Into<String>) -> BatchGetRecordError {
+    BatchGetRecordErrorModeled::ValidationError(ValidationError {
+        message: Some(crate::state::bounded_message(message)),
+    })
+    .into()
+}
+
+/// The modelled `InternalFailure` (HTTP 500) for a fault of the emulator itself, with its
+/// message bounded the same way: `InternalFailure$Message` targets the same `Message`.
+fn internal_failure(message: impl Into<String>) -> BatchGetRecordError {
+    BatchGetRecordErrorModeled::InternalFailure(InternalFailure {
+        message: Some(crate::state::bounded_message(message)),
+    })
+    .into()
 }

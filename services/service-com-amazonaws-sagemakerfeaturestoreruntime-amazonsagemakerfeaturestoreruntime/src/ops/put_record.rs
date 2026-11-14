@@ -194,10 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(PutRecordErrorModeled::InternalFailure(InternalFailure {
-                message: Some("PutRecord: this service holds no state on the mounted engine".into()),
-            })
-            .into());
+            return Err(internal_failure(
+                "PutRecord: this service holds no state on the mounted engine",
+            ));
         };
 
         // A value outside the `TargetStore` enum would be read below as "not the
@@ -222,14 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(definition) => definition,
             Err(crate::state::Unresolved::Refused(message)) => return Err(validation(message)),
             Err(crate::state::Unresolved::NoDirectory) => {
-                return Err(PutRecordErrorModeled::InternalFailure(InternalFailure {
-                    message: Some(
-                        "PutRecord: this service holds no feature-group directory on the \
-                         mounted engine"
-                            .into(),
-                    ),
-                })
-                .into())
+                return Err(internal_failure(
+                    "PutRecord: this service holds no feature-group directory on the \
+                     mounted engine",
+                ))
             }
         };
 
@@ -308,9 +303,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The modelled `ValidationError` (HTTP 400) for a request this operation refuses.
+///
+/// The message is worded through [`crate::state::bounded_message`], so the text this
+/// operation answers is inside the maximum length its own `ValidationError$Message`
+/// declares even when the refusal quotes something the request supplied.
 fn validation(message: impl Into<String>) -> PutRecordError {
     PutRecordErrorModeled::ValidationError(ValidationError {
-        message: Some(message.into()),
+        message: Some(crate::state::bounded_message(message)),
+    })
+    .into()
+}
+
+/// The modelled `InternalFailure` (HTTP 500) for a fault of the emulator itself, with its
+/// message bounded the same way: `InternalFailure$Message` targets the same `Message`.
+fn internal_failure(message: impl Into<String>) -> PutRecordError {
+    PutRecordErrorModeled::InternalFailure(InternalFailure {
+        message: Some(crate::state::bounded_message(message)),
     })
     .into()
 }
@@ -322,7 +330,7 @@ fn validation(message: impl Into<String>) -> PutRecordError {
 /// of room, so it must not be reported to the caller as its own mistake.
 fn at_capacity(message: impl Into<String>) -> PutRecordError {
     PutRecordErrorModeled::ServiceUnavailable(ServiceUnavailable {
-        message: Some(message.into()),
+        message: Some(crate::state::bounded_message(message)),
     })
     .into()
 }

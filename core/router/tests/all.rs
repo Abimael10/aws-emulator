@@ -7877,3 +7877,8 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // note about a duplicate declaration that is already gone. Declare each suite exactly
 // ONCE, with its `#[path]` line, and keep the rules in the module doc at the HEAD of this
 // file, where an inner doc comment is legal — past the first item it is `E0753`.)
+// The IaC form of an EventBridge fan-out — one stack's rule with a Lambda target and a Step
+// Functions, IAM, STS and Amazon SQS at once, so no single service crate's test target can
+// deploy it and then read what each leg received.
+// declarations and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` the notes,
+// than leaving a note in the appended tail below.

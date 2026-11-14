@@ -686,6 +686,41 @@ pub fn undeclared_target_store(target_stores: Option<&Vec<String>>) -> Option<St
 /// feature group that exists.
 pub const VALIDATION_ERROR_CODE: &str = "ValidationError";
 
+/// The modelled maximum length of a message this service answers an error with.
+///
+/// Every member this service fills a failure's text into targets the `Message` shape,
+/// modelled `len 0..2048`: the `Message` of each modelled error structure
+/// (`ValidationError`, `InternalFailure`, `ResourceNotFound`, `ServiceUnavailable`,
+/// `AccessForbidden`, `ConflictException`) and the per-element `ErrorMessage` of
+/// `BatchGetRecordError` and `BatchWriteRecordError`
+/// (`smithy_query(query="shape", shape="Message")`).
+pub const MAX_MESSAGE_LENGTH: usize = 2048;
+
+/// `message`, cut to [`MAX_MESSAGE_LENGTH`].
+///
+/// A refusal quotes what the request supplied — a `ValueAsString` is modelled
+/// `len 0..358400`, and the Region a resolved ARN takes from the caller's own credential
+/// scope ([`request_region`]) is bounded by nothing — so a message BUILT from a request
+/// can be longer than the member that carries it admits. Every failure of this service is
+/// worded through this, so the text a client reads is inside the modelled bound whichever
+/// operation refused, whichever of its messages it chose and whether the operation carries
+/// the message in a modelled error or per element of a batch.
+///
+/// The cut is at the last character boundary within the bound, counted in bytes, so the
+/// message stays valid UTF-8 and is inside the bound whether a string's length is counted
+/// in bytes or in characters.
+pub fn bounded_message(message: impl Into<String>) -> String {
+    let mut message = message.into();
+    if message.len() > MAX_MESSAGE_LENGTH {
+        let cut = (0..=MAX_MESSAGE_LENGTH)
+            .rev()
+            .find(|at| message.is_char_boundary(*at))
+            .unwrap_or_default();
+        message.truncate(cut);
+    }
+    message
+}
+
 /// Whether a caller asked for `ExpiresAt` in the response.
 ///
 /// "Parameter to request ExpiresAt in response. If Enabled, GetRecord will return the

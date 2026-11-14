@@ -224,12 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(UpdateRecordErrorModeled::InternalFailure(InternalFailure {
-                message: Some(
-                    "UpdateRecord: this service holds no state on the mounted engine".into(),
-                ),
-            })
-            .into());
+            return Err(internal_failure(
+                "UpdateRecord: this service holds no state on the mounted engine",
+            ));
         };
 
         // A value outside the `TargetStore` enum would be read below as "not the
@@ -252,14 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(definition) => definition,
             Err(crate::state::Unresolved::Refused(message)) => return Err(validation(message)),
             Err(crate::state::Unresolved::NoDirectory) => {
-                return Err(UpdateRecordErrorModeled::InternalFailure(InternalFailure {
-                    message: Some(
-                        "UpdateRecord: this service holds no feature-group directory on the \
-                         mounted engine"
-                            .into(),
-                    ),
-                })
-                .into())
+                return Err(internal_failure(
+                    "UpdateRecord: this service holds no feature-group directory on the \
+                     mounted engine",
+                ))
             }
         };
 
@@ -414,7 +407,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let (Some(posted), Some(current)) = (posted_secs, updated.event_time_secs()) {
             if posted < current {
                 return Err(UpdateRecordErrorModeled::ConflictException(ConflictException {
-                    message: Some(CONFLICTING_EVENT_TIME.to_owned()),
+                    message: Some(crate::state::bounded_message(CONFLICTING_EVENT_TIME)),
                 })
                 .into());
             }
@@ -519,9 +512,22 @@ const EVENT_TIME_REQUIRED_FOR_TTL: &str =
      group has a default TTL configured. Include the EventTime feature in the Features list.";
 
 /// The modelled `ValidationError` (HTTP 400) for a request this operation refuses.
+///
+/// The message is worded through [`crate::state::bounded_message`], so the text this
+/// operation answers is inside the maximum length its own `ValidationError$Message`
+/// declares even when the refusal quotes something the request supplied.
 fn validation(message: impl Into<String>) -> UpdateRecordError {
     UpdateRecordErrorModeled::ValidationError(ValidationError {
-        message: Some(message.into()),
+        message: Some(crate::state::bounded_message(message)),
+    })
+    .into()
+}
+
+/// The modelled `InternalFailure` (HTTP 500) for a fault of the emulator itself, with its
+/// message bounded the same way: `InternalFailure$Message` targets the same `Message`.
+fn internal_failure(message: impl Into<String>) -> UpdateRecordError {
+    UpdateRecordErrorModeled::InternalFailure(InternalFailure {
+        message: Some(crate::state::bounded_message(message)),
     })
     .into()
 }
@@ -537,9 +543,9 @@ fn validation(message: impl Into<String>) -> UpdateRecordError {
 /// the two absences are routed differently by a caller, so they are stated differently.
 fn no_such_record(identifier: &str) -> UpdateRecordError {
     UpdateRecordErrorModeled::ResourceNotFound(ResourceNotFound {
-        message: Some(format!(
+        message: Some(crate::state::bounded_message(format!(
             "Record Not Found: Record not found with record identifier [{identifier}]."
-        )),
+        ))),
     })
     .into()
 }
@@ -551,7 +557,7 @@ fn no_such_record(identifier: &str) -> UpdateRecordError {
 /// room, so it must not be reported to the caller as its own mistake.
 fn at_capacity(message: impl Into<String>) -> UpdateRecordError {
     UpdateRecordErrorModeled::ServiceUnavailable(ServiceUnavailable {
-        message: Some(message.into()),
+        message: Some(crate::state::bounded_message(message)),
     })
     .into()
 }

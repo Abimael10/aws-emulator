@@ -162,12 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(ListRecordsErrorModeled::InternalFailure(InternalFailure {
-                message: Some(
-                    "ListRecords: this service holds no state on the mounted engine".into(),
-                ),
-            })
-            .into());
+            return Err(internal_failure(
+                "ListRecords: this service holds no state on the mounted engine",
+            ));
         };
 
         // The page cursor: an opaque token whose only content is the identifier the
@@ -176,11 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume_at = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(decode_next_token(token).ok_or_else(|| {
-                ListRecordsErrorModeled::ValidationError(ValidationError {
-                    message: Some(
-                        "NextToken is not a ListRecords pagination token".to_owned(),
-                    ),
-                })
+                validation("NextToken is not a ListRecords pagination token")
             })?),
         };
 
@@ -197,30 +190,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(definition) => definition,
             Err(unresolved) => {
                 return Err(match unresolved {
-                    crate::state::Unresolved::Refused(message) => {
-                        ListRecordsErrorModeled::ValidationError(ValidationError {
-                            message: Some(message),
-                        })
-                        .into()
-                    }
-                    crate::state::Unresolved::NoDirectory => {
-                        ListRecordsErrorModeled::InternalFailure(InternalFailure {
-                            message: Some(
-                                "ListRecords: this service holds no feature-group directory on \
-                                 the mounted engine"
-                                    .into(),
-                            ),
-                        })
-                        .into()
-                    }
+                    crate::state::Unresolved::Refused(message) => validation(message),
+                    crate::state::Unresolved::NoDirectory => internal_failure(
+                        "ListRecords: this service holds no feature-group directory on the \
+                         mounted engine",
+                    ),
                 })
             }
         };
         if !definition.online_store_enabled {
-            return Err(ListRecordsErrorModeled::ValidationError(ValidationError {
-                message: Some(crate::state::no_online_store(&definition.name)),
-            })
-            .into());
+            return Err(validation(crate::state::no_online_store(&definition.name)));
         }
 
         let include_soft_deleted = input.include_soft_deleted_records.unwrap_or(false);
@@ -304,4 +283,25 @@ fn decode_next_token(token: &str) -> Option<String> {
     decoded
         .strip_prefix(&format!("{:016x}:", page_token_key()))
         .map(str::to_owned)
+}
+
+/// The modelled `ValidationError` (HTTP 400) for a request this operation refuses.
+///
+/// The message is worded through [`crate::state::bounded_message`], so the text this
+/// operation answers is inside the maximum length its own `ValidationError$Message`
+/// declares even when the refusal quotes something the request supplied.
+fn validation(message: impl Into<String>) -> ListRecordsError {
+    ListRecordsErrorModeled::ValidationError(ValidationError {
+        message: Some(crate::state::bounded_message(message)),
+    })
+    .into()
+}
+
+/// The modelled `InternalFailure` (HTTP 500) for a fault of the emulator itself, with its
+/// message bounded the same way: `InternalFailure$Message` targets the same `Message`.
+fn internal_failure(message: impl Into<String>) -> ListRecordsError {
+    ListRecordsErrorModeled::InternalFailure(InternalFailure {
+        message: Some(crate::state::bounded_message(message)),
+    })
+    .into()
 }

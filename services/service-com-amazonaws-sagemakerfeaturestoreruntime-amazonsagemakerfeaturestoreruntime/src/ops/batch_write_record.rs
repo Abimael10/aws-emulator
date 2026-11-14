@@ -172,12 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(BatchWriteRecordErrorModeled::InternalFailure(InternalFailure {
-                message: Some(
-                    "BatchWriteRecord: this service holds no state on the mounted engine".into(),
-                ),
-            })
-            .into());
+            return Err(internal_failure(
+                "BatchWriteRecord: this service holds no state on the mounted engine",
+            ));
         };
 
         // `Entries` is modelled `len 1..25` and refused at the boundary; read it
@@ -266,16 +263,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         continue;
                     }
                     Err(crate::state::Unresolved::NoDirectory) => {
-                        return Err(BatchWriteRecordErrorModeled::InternalFailure(
-                            InternalFailure {
-                                message: Some(
-                                    "BatchWriteRecord: this service holds no feature-group \
-                                     directory on the mounted engine"
-                                        .into(),
-                                ),
-                            },
-                        )
-                        .into())
+                        return Err(internal_failure(
+                            "BatchWriteRecord: this service holds no feature-group directory \
+                             on the mounted engine",
+                        ))
                     }
                 };
 
@@ -361,15 +352,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The modelled `ValidationError` (HTTP 400) for a REQUEST this operation refuses whole,
 /// as opposed to one entry of a batch whose other entries are written.
+///
+/// The message is worded through [`crate::state::bounded_message`], so the text this
+/// operation answers is inside the maximum length its own `ValidationError$Message`
+/// declares even when the refusal quotes something the request supplied.
 fn validation(message: impl Into<String>) -> BatchWriteRecordError {
     BatchWriteRecordErrorModeled::ValidationError(ValidationError {
-        message: Some(message.into()),
+        message: Some(crate::state::bounded_message(message)),
+    })
+    .into()
+}
+
+/// The modelled `InternalFailure` (HTTP 500) for a fault of the emulator itself, with its
+/// message bounded the same way: `InternalFailure$Message` targets the same `Message`.
+fn internal_failure(message: impl Into<String>) -> BatchWriteRecordError {
+    BatchWriteRecordErrorModeled::InternalFailure(InternalFailure {
+        message: Some(crate::state::bounded_message(message)),
     })
     .into()
 }
 
 /// One entry's failure, as `Errors` reports it: "The entry that failed to be written",
 /// the error code for the failed record write, and its message.
+///
+/// The per-entry `ErrorMessage` targets the same `Message` as every modelled error's own,
+/// so it is worded under the same bound ([`crate::state::bounded_message`]).
 fn entry_error(
     entry: &BatchWriteRecordEntry,
     error_code: &str,
@@ -378,27 +385,6 @@ fn entry_error(
     BatchWriteRecordError2 {
         entry: entry.clone(),
         error_code: error_code.to_owned(),
-        error_message: bounded_message(message),
+        error_message: crate::state::bounded_message(message),
     }
 }
-
-/// `message`, cut to the modelled maximum length of an `ErrorMessage`.
-///
-/// A refusal may quote a value the request supplied, and a `ValueAsString` is modelled
-/// `len 0..358400`, so the message is cut at the last character boundary within the bound
-/// rather than answered outside it.
-fn bounded_message(mut message: String) -> String {
-    if message.len() > MAX_ERROR_MESSAGE {
-        let cut = (0..=MAX_ERROR_MESSAGE)
-            .rev()
-            .find(|at| message.is_char_boundary(*at))
-            .unwrap_or_default();
-        message.truncate(cut);
-    }
-    message
-}
-
-/// The modelled maximum length of a `BatchWriteRecordError`'s `ErrorMessage`: its target
-/// `Message` is `len 0..2048`
-/// (`smithy_query(query="shape", shape="BatchWriteRecordError")`).
-const MAX_ERROR_MESSAGE: usize = 2048;
