@@ -5023,3 +5023,8 @@ mod cloudformation_provisions_event_buses_and_bus_policies;
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks the notes, for this
 // file and for every service crate's `tests/all.rs`, so check there rather than leaving
 // a note in this file's tail, where an inner doc comment is `E0753` and compiles nothing.
+// suite left at the top level of `tests/` fails the build. (An ordinary comment: this
+// fragment of the file's own header landed here, and a `//!` line past the first item is
+// doc comment is only legal before the first item, so a `//!` line in this appended tail is
+// fragment of the file's own header landed in the appended tail, where a `//!` line past the
+// first item is `E0753` and compiles nothing.)

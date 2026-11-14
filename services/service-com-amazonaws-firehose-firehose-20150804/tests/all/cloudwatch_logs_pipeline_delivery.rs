@@ -66,7 +66,7 @@ const PAST_THE_DELIVERY_WINDOW: Duration = Duration::from_millis(2_000);
 
 /// `body` in one gzip frame — the framing a CloudWatch Logs subscription payload arrives in
 /// ("they are Base64 encoded and compressed with the GZIP format").
-fn gzip(body: &str) -> Vec<u8> {
+pub(crate) fn gzip(body: &str) -> Vec<u8> {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder
         .write_all(body.as_bytes())
@@ -76,7 +76,7 @@ fn gzip(body: &str) -> Vec<u8> {
 
 /// One CloudWatch Logs envelope document of `message_type`, carrying one log event per
 /// message.
-fn envelope(message_type: &str, messages: &[&str]) -> String {
+pub(crate) fn envelope(message_type: &str, messages: &[&str]) -> String {
     json!({
         "messageType": message_type,
         "owner": engine::emulator_account_id(),
@@ -98,7 +98,7 @@ fn envelope(message_type: &str, messages: &[&str]) -> String {
 
 /// The `Decompression` processor, naming the format CloudWatch Logs frames its payload in.
 /// Source: `smithy_query(query="shape", shape="ProcessorType,ProcessorParameterName")`.
-fn decompression() -> Value {
+pub(crate) fn decompression() -> Value {
     json!({
         "Type": "Decompression",
         "Parameters": [{ "ParameterName": "CompressionFormat", "ParameterValue": "GZIP" }],
@@ -106,7 +106,7 @@ fn decompression() -> Value {
 }
 
 /// The `CloudWatchLogProcessing` processor, with its extraction switch on.
-fn message_extraction() -> Value {
+pub(crate) fn message_extraction() -> Value {
     json!({
         "Type": "CloudWatchLogProcessing",
         "Parameters": [{ "ParameterName": "DataMessageExtraction", "ParameterValue": "true" }],
@@ -114,7 +114,7 @@ fn message_extraction() -> Value {
 }
 
 /// A `ProcessingConfiguration` over `processors`, enabled or not.
-fn processing(enabled: bool, processors: Vec<Value>) -> Value {
+pub(crate) fn processing(enabled: bool, processors: Vec<Value>) -> Value {
     json!({ "Enabled": enabled, "Processors": processors })
 }
 
@@ -255,7 +255,7 @@ fn in_flight_calls(
 
 /// Record that the calls signed with [`ACCESS_KEY_ID`] are CloudWatch Logs forwarding a
 /// subscription filter's log events, for as long as the returned guard lives.
-fn as_cloudwatch_logs(emulator: &Emulator) -> CloudWatchLogsCaller<'_> {
+pub(crate) fn as_cloudwatch_logs(emulator: &Emulator) -> CloudWatchLogsCaller<'_> {
     let now = std::time::SystemTime::now();
     in_flight_calls(emulator).lock().remember(
         ACCESS_KEY_ID,
@@ -275,7 +275,7 @@ fn as_cloudwatch_logs(emulator: &Emulator) -> CloudWatchLogsCaller<'_> {
 
 /// Holds the record above for one put, and forgets it again — so the SAME harness makes an
 /// ordinary API put once it is dropped.
-struct CloudWatchLogsCaller<'e> {
+pub(crate) struct CloudWatchLogsCaller<'e> {
     emulator: &'e Emulator,
 }
 

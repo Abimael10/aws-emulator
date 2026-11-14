@@ -386,7 +386,10 @@ async fn put_record(emulator: &Emulator, stream: &str, payload: &[u8]) -> (u16, 
 /// and the caller's stream name) and spelled in the documented sentence form AWS answers,
 /// so the assertion is a statement about the message and not a read of the code under
 /// test.
-fn expected_refusal(stream: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite asserting the same refusal states the sentence once
+/// rather than copying the template.
+pub(crate) fn expected_refusal(stream: &str) -> String {
     format!(
         "Put to Firehose failed for AccountId: {}, FirehoseName: {stream} \
          because the request is not originating from CloudWatch.",
