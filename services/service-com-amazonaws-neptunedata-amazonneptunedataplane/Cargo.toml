@@ -26,6 +26,25 @@ tracing = { workspace = true }
 logos = "0.16"
 # The UUID the fast-reset token is: `ExecuteFastReset`'s initiate step hands back a v4 UUID.
 uuid = { version = "1", features = ["v4"] }
+# `opencypher`: the openCypher query text the openCypher endpoints take is LEXED and
+# PARSED with it into the crate's own typed AST, so a malformed query is refused by a
+# real openCypher parser and a well-formed one is evaluated from that AST rather than
+# from its source text. A LIBRARY that computes over data in process: it parses and
+# executes nothing ("it does not execute queries" — its own documentation), opens no
+# socket, reads no file, declares no FFI and ships no native code; its one build-time
+# step is the `logos` derive macro its lexer is generated with. The evaluation of the
+# AST, and every bound on what one query may spend, are this crate's own
+# (`src/state/open_cypher.rs`), through the `Executor` trait the crate documents as the
+# contract for running a parsed query against a consumer's own store. Chosen over
+# `cypher-parser`, whose own executor covers reading clauses only (its documentation
+# states write clauses are "intentionally not supported"), because this endpoint has to
+# serve CREATE, MERGE, SET, REMOVE and DELETE as well as MATCH.
+opencypher = "0.1.4"
+# `regex`: openCypher's `=~` operator takes a regular expression FROM THE QUERY, so it
+# is matched with a real engine rather than a hand-rolled matcher. Linear-time by
+# construction (no backtracking), and the program one pattern may compile to is capped
+# before it is built (`MAX_REGEX_PROGRAM_BYTES`).
+regex = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

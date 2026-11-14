@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-neptunedata-amazonneptunedataplane service.
 //!
-//! Four kinds of record live here, and every implemented operation computes its answer
+//! Five kinds of record live here, and every implemented operation computes its answer
 //! from them:
 //!
 //! * [`FastResetRecord`] — the fast-reset token the engine is willing to accept, and what
@@ -17,6 +17,9 @@
 //!   `CancelGremlinQuery` mutates them.
 //! * [`LoaderJobRecord`] — one per bulk-load job the engine has admitted, keyed by load
 //!   id. `ListLoaderJobs` reports the load ids of the active ones.
+//! * [`PropertyGraph`] — the graph's own data: the nodes and relationships the
+//!   openCypher endpoints read and write (see [`open_cypher`]). `ExecuteFastReset`
+//!   empties it, because that is what a database reset leaves behind.
 //!
 //! `ExecuteGremlinExplainQuery` is what admits a query record: it reads the submitted
 //! traversal and plans it (see [`gremlin_plan`]), which is work the engine really did, so
@@ -27,10 +30,14 @@
 //! evaluation time, for a traversal nothing ran would be a fabrication.
 //!
 //! The loader registry is in the same position: `StartLoaderJob` still answers HTTP 501,
-//! because a bulk load reads data files and writes them into a graph, and this emulator
-//! has no graph store to write them into — so a load id for a load nothing performed
-//! would be a fabrication too. `ListLoaderJobs` therefore reports exactly the jobs the
-//! registry holds, which is nothing until a loader that really loads is wired in.
+//! because a bulk load reads the data files its source names, and this emulator has no
+//! reader for those formats yet — so a load id for a load nothing performed would be a
+//! fabrication too. `ListLoaderJobs` therefore reports exactly the jobs the registry
+//! holds, which is nothing until a loader that really loads is wired in.
+//!
+//! `ExecuteOpenCypherQuery` is the one operation that both reads and writes the graph: it
+//! parses the submitted query with a real openCypher parser and evaluates it against
+//! [`PropertyGraph`], so what a query answers is what this store holds.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,8 +51,12 @@ use crate::ops::types::{
 };
 
 mod gremlin_plan;
+mod open_cypher;
+mod property_graph;
 
 pub use gremlin_plan::*;
+pub use open_cypher::*;
+pub use property_graph::*;
 
 /// `GetEngineStatusOutput$status` for an instance that is not experiencing problems:
 /// the member's own documentation says "Set to `healthy` if the instance is not
@@ -414,6 +425,10 @@ pub struct FastResetRecord {
     /// reset is outstanding, which is what makes every perform refusable.
     pub pending_token: Option<String>,
     /// When that token was minted; `None` whenever [`Self::pending_token`] is.
+    ///
+    /// The token does not expire: a test initiates a reset and performs it when it is
+    /// ready, and a validity window would make that a race against a clock. The instant
+    /// is kept because it is what the engine knows about the outstanding token.
     pub token_issued_at: Option<SystemTime>,
     /// How many resets this engine has performed.
     pub resets_performed: u64,
@@ -463,6 +478,9 @@ pub struct ComAmazonawsNeptunedataAmazonneptunedataplaneState {
     /// Every bulk-load job the engine has admitted, keyed by load id. `ListLoaderJobs`
     /// reports the load ids of the active ones.
     pub loader_jobs: BTreeMap<String, LoaderJobRecord>,
+    /// The nodes and relationships the openCypher endpoints read and write — this
+    /// engine's one copy of the graph's data.
+    pub graph: PropertyGraph,
 }
 
 impl ComAmazonawsNeptunedataAmazonneptunedataplaneState {
@@ -575,17 +593,23 @@ impl ComAmazonawsNeptunedataAmazonneptunedataplaneState {
     /// Perform the fast reset `token` authorises, and report whether it did.
     ///
     /// `false` means `token` is not the outstanding one — nothing was reset, so a wrong
-    /// token cannot empty the database. On a match the database is emptied: every query
-    /// the engine has accepted but not completed was asked about data the reset removes,
-    /// so it is marked cancelled exactly as a cancel marks one (the record is KEPT, so
-    /// the status family goes on reporting those ids), and the token is consumed.
+    /// token cannot empty the database. On a match the database is emptied: the graph's
+    /// own data is dropped, every query the engine has accepted but not completed was
+    /// asked about data the reset removes, so it is marked cancelled exactly as a cancel
+    /// marks one (the record is KEPT, so the status family goes on reporting those ids),
+    /// and the token is consumed.
     pub fn perform_fast_reset(&mut self, token: &str, now: SystemTime) -> bool {
         if !self.fast_reset.authorises(token) {
             return false;
         }
+        self.graph.clear();
         for query in self.gremlin_queries.values_mut() {
             query.cancel(now);
         }
+        // The cancellation above moved every accepted query into a terminal state, so the
+        // registry's bound on finished queries is applied to them now rather than at
+        // whatever later write happens to apply it.
+        self.forget_oldest_finished_queries();
         self.fast_reset.consume(now);
         true
     }
@@ -657,7 +681,7 @@ const ECHOED_VALUE_LIMIT: usize = 128;
 
 /// A request-supplied value as an error message may carry it: control characters escaped
 /// (so a message cannot forge a line in anything that renders it) and bounded in length.
-fn echoed(value: &str) -> String {
+pub fn echoed(value: &str) -> String {
     value.escape_debug().take(ECHOED_VALUE_LIMIT).collect()
 }
 

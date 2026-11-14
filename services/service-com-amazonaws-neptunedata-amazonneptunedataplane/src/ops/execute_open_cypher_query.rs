@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteOpenCypherQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteOpenCypherQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! This operation EVALUATES the submitted openCypher query against this engine's stored
+//! graph: the text is parsed by a real openCypher parser and the query it reads as is run
+//! by [`crate::state::open_cypher`], which reads and writes the one
+//! [`crate::state::PropertyGraph`] every other reading of this engine's data answers
+//! from. Nothing in a result is synthesised — a row carrying an element reports what the
+//! store holds for it — and a query that writes is applied whole or not at all.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteOpenCypherQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What the modelled contract below says about IAM (the `neptune-db:ReadDataViaQuery`,
+//! `WriteDataViaQuery` and `DeleteDataViaQuery` actions a cluster with IAM authentication
+//! enabled requires, and the `neptune-db:QueryLanguage:OpenCypher` condition key) is NOT
+//! enforced here, and no handler in this emulator evaluates a policy: it verifies a
+//! request's signature and serves it. A query that would be refused by a real cluster's
+//! policy is answered here, so a test must not read a success as evidence that the
+//! calling principal is allowed to run it.
 //!
 //! ## Shape of an operation
 //!
@@ -187,6 +192,14 @@ impl<Eng> ExecuteOpenCypherQuery<Eng> {
     }
 }
 
+/// The input member the query arrives in, by its wire name (`openCypherQuery`'s
+/// `jsonName`), which is the name a refusal has to name for the caller to fix the
+/// request from it.
+const OPEN_CYPHER_QUERY_MEMBER: &str = "query";
+
+/// The input member the query's parameters arrive in.
+const PARAMETERS_MEMBER: &str = "parameters";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ExecuteOpenCypherQuery<Eng>
 {
@@ -204,18 +217,329 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteOpenCypherQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteOpenCypherQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteOpenCypherQuery"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            record_access(ctx, &input, "store-unavailable");
+            return Err(ExecuteOpenCypherQueryErrorModeled::FailureByQueryException(
+                crate::state::store_unavailable_failure(),
+            )
+            .into());
+        };
+
+        // The member is required, so it is here — but a blank one carries no query, and
+        // an endpoint with nothing to run is the parameter being missing.
+        if input.open_cypher_query.trim().is_empty() {
+            record_access(ctx, &input, "missing-query");
+            return Err(ExecuteOpenCypherQueryErrorModeled::MissingParameterException(
+                crate::state::missing_parameter(OPEN_CYPHER_QUERY_MEMBER),
+            )
+            .into());
+        }
+
+        let parameters = match request_parameters(input.parameters.as_deref()) {
+            Ok(parameters) => parameters,
+            Err(reason) => {
+                record_access(ctx, &input, "invalid-parameters");
+                return Err(
+                    ExecuteOpenCypherQueryErrorModeled::InvalidParameterException(
+                        crate::state::invalid_open_cypher_parameters(&reason),
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The evaluation is CPU-bound and takes the store's lock, so it runs on the
+        // blocking pool rather than on the worker serving this request: the `.await`
+        // below is a real yield point, so health checks, request timeouts and a graceful
+        // shutdown go on working while a query runs, and a second request does not park a
+        // second worker waiting for the lock. The run holds the lock for the whole query,
+        // which is what makes two concurrent writers apply one whole query at a time.
+        let store = state.clone();
+        let text = input.open_cypher_query.clone();
+        let answered = ::tokio::task::spawn_blocking(move || {
+            let mut held = store.lock();
+            // The span starts when the run does: neither the wait for a free thread nor
+            // the wait for the store's lock comes out of the budget the query is given,
+            // so a query that queued behind another is not refused for the time it spent
+            // waiting.
+            let deadline = ::std::time::Instant::now() + crate::state::QUERY_RUN_TIMEOUT;
+            crate::state::run_query(&mut held.graph, &text, parameters, deadline)
+        })
+        .await
+        .unwrap_or_else(|joined| {
+            Err(crate::state::QueryFailure::Interrupted(format!(
+                "the openCypher engine did not finish this query: {joined}"
+            )))
+        });
+
+        match answered {
+            Ok(rows) => {
+                record_access(ctx, &input, "answered");
+                Ok(ExecuteOpenCypherQueryOutput {
+                    // `results` is the modelled document the rows are carried in: one
+                    // object per row, keyed by the query's own column names.
+                    results: crate::state::results_document(&rows),
+                })
+            }
+            Err(failure) => {
+                record_access(ctx, &input, outcome(&failure));
+                Err(refusal(failure))
+            }
+        }
     }
+}
+
+/// The parameters the request carried, by name.
+///
+/// `parameters` is modelled as a String, and the member's own documentation names it "the
+/// openCypher query parameters for query execution", which Neptune takes as a JSON object
+/// of parameter name to value. A member carrying anything else cannot bind a parameter, so
+/// it is refused with what was wrong rather than read as no parameters at all.
+///
+/// The text is bounded before it is read ([`crate::state::MAX_PARAMETERS_CHARS`]): every
+/// value a parameter binds comes out of it, so bounding the text bounds what one request
+/// can hand the evaluation.
+fn request_parameters(
+    supplied: Option<&str>,
+) -> Result<::std::collections::BTreeMap<String, ::serde_json::Value>, String> {
+    let Some(text) = supplied else {
+        return Ok(::std::collections::BTreeMap::new());
+    };
+    if text.trim().is_empty() {
+        return Ok(::std::collections::BTreeMap::new());
+    }
+    let characters = text.chars().count();
+    if characters > crate::state::MAX_PARAMETERS_CHARS {
+        return Err(format!(
+            "Supplied {PARAMETERS_MEMBER} is {characters} characters, and this engine reads \
+             at most {}",
+            crate::state::MAX_PARAMETERS_CHARS
+        ));
+    }
+    let parsed: ::serde_json::Value = ::serde_json::from_str(text).map_err(|refused| {
+        format!("Supplied {PARAMETERS_MEMBER} is not valid JSON: {refused}")
+    })?;
+    match parsed {
+        ::serde_json::Value::Object(members) => Ok(members.into_iter().collect()),
+        _ => Err(format!(
+            "Supplied {PARAMETERS_MEMBER} must be a JSON object of parameter names to values"
+        )),
+    }
+}
+
+/// How one failure is recorded in the access log: the KIND of refusal, never the query or
+/// the values it carried.
+fn outcome(failure: &crate::state::QueryFailure) -> &'static str {
+    use crate::state::QueryFailure;
+    match failure {
+        QueryFailure::Malformed { .. } => "malformed-query",
+        QueryFailure::Unsupported { .. } => "unsupported-clause",
+        QueryFailure::Refused(_) => "refused-query",
+        QueryFailure::Constraint(_) => "constraint-violation",
+        QueryFailure::MissingParameter(_) => "missing-parameter",
+        QueryFailure::TooLong { .. } => "query-too-large",
+        QueryFailure::TooDeep { .. }
+        | QueryFailure::TooLarge { .. }
+        | QueryFailure::ValueTooLarge { .. }
+        | QueryFailure::TooNested { .. }
+        | QueryFailure::TooManyHops { .. }
+        | QueryFailure::Exhausted { .. } => "query-limit",
+        QueryFailure::TimedOut { .. } => "time-limit",
+        QueryFailure::Write(_) => "write-refused",
+        QueryFailure::Interrupted(_) => "engine-failure",
+    }
+}
+
+/// The modelled error one failure is reported through.
+///
+/// Each variant is a different fact about the request, so each is reported through the
+/// error whose own documentation states that fact — the query could not be read, names a
+/// clause this engine does not run, asked for more than a system limit allows, ran out of
+/// time, or could not be served at all.
+fn refusal(failure: crate::state::QueryFailure) -> ExecuteOpenCypherQueryError {
+    use crate::state::QueryFailure;
+    match failure {
+        QueryFailure::Malformed { reason } => {
+            ExecuteOpenCypherQueryErrorModeled::MalformedQueryException(
+                crate::state::malformed_open_cypher_query(&reason),
+            )
+        }
+        // A well-formed query this engine does not run is a different answer to the
+        // caller than a text that is not a query.
+        QueryFailure::Unsupported { clause } => {
+            ExecuteOpenCypherQueryErrorModeled::UnsupportedOperationException(
+                crate::state::open_cypher_unsupported(clause),
+            )
+        }
+        QueryFailure::Refused(reason) => {
+            ExecuteOpenCypherQueryErrorModeled::MalformedQueryException(
+                crate::state::malformed_open_cypher_query(&reason),
+            )
+        }
+        QueryFailure::Constraint(reason) => {
+            ExecuteOpenCypherQueryErrorModeled::ConstraintViolationException(
+                crate::state::open_cypher_constraint(&reason),
+            )
+        }
+        QueryFailure::MissingParameter(name) => {
+            ExecuteOpenCypherQueryErrorModeled::InvalidParameterException(
+                crate::state::invalid_open_cypher_parameters(&format!(
+                    "Supplied {PARAMETERS_MEMBER} does not carry the parameter '{name}' \
+                     the query references"
+                )),
+            )
+        }
+        QueryFailure::TooLong {
+            characters,
+            ceiling,
+        } => ExecuteOpenCypherQueryErrorModeled::QueryTooLargeException(
+            crate::state::open_cypher_query_too_large(&format!(
+                "the query is {characters} characters, and this engine reads at most {ceiling}"
+            )),
+        ),
+        QueryFailure::TooDeep { depth, ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::QueryLimitException(
+                crate::state::open_cypher_query_limit(&format!(
+                    "the query nests {depth} deep, and this engine reads at most {ceiling}"
+                )),
+            )
+        }
+        QueryFailure::TooLarge { rows, ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::QueryLimitException(
+                crate::state::open_cypher_query_limit(&format!(
+                    "the query answers {rows} rows, and this engine answers at most {ceiling}"
+                )),
+            )
+        }
+        QueryFailure::ValueTooLarge { size, ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::QueryLimitException(
+                crate::state::open_cypher_query_limit(&format!(
+                    "the query builds a value of {size}, and this engine builds at most {ceiling}"
+                )),
+            )
+        }
+        QueryFailure::TooNested { ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::QueryLimitException(
+                crate::state::open_cypher_query_limit(&format!(
+                    "the query evaluates deeper than the {ceiling} levels one query may descend"
+                )),
+            )
+        }
+        QueryFailure::TooManyHops { asked, ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::QueryLimitException(
+                crate::state::open_cypher_query_limit(&format!(
+                    "the query walks up to {asked} hops, and this engine walks at most {ceiling}"
+                )),
+            )
+        }
+        QueryFailure::Exhausted { ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::QueryLimitException(
+                crate::state::open_cypher_query_limit(&format!(
+                    "the query asked for more than the {ceiling} units of work one query may spend"
+                )),
+            )
+        }
+        QueryFailure::TimedOut { ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::TimeLimitExceededException(
+                crate::state::open_cypher_time_limit(&format!(
+                    "one query runs for at most {} seconds",
+                    ceiling.as_secs()
+                )),
+            )
+        }
+        QueryFailure::Write(refused) => write_refusal(refused),
+        QueryFailure::Interrupted(reason) => {
+            ExecuteOpenCypherQueryErrorModeled::FailureByQueryException(
+                crate::state::engine_failure(&reason),
+            )
+        }
+    }
+    .into()
+}
+
+/// The modelled error a write the store could not take is reported through: a store with
+/// no room left for the element is a resource limit, and a write the graph's own rules
+/// refuse is a constraint the request did not satisfy.
+fn write_refusal(refused: crate::state::GraphWriteError) -> ExecuteOpenCypherQueryErrorModeled {
+    use crate::state::GraphWriteError;
+    match refused {
+        GraphWriteError::NodeLimit { ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::MemoryLimitExceededException(
+                crate::state::open_cypher_memory_limit(&format!(
+                    "this engine holds at most {ceiling} nodes"
+                )),
+            )
+        }
+        GraphWriteError::RelationshipLimit { ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::MemoryLimitExceededException(
+                crate::state::open_cypher_memory_limit(&format!(
+                    "this engine holds at most {ceiling} relationships"
+                )),
+            )
+        }
+        GraphWriteError::ByteLimit { ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::MemoryLimitExceededException(
+                crate::state::open_cypher_memory_limit(&format!(
+                    "this engine holds at most {ceiling} bytes of element data"
+                )),
+            )
+        }
+        GraphWriteError::LabelLimit { ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::ConstraintViolationException(
+                crate::state::open_cypher_constraint(&format!(
+                    "A node carries at most {ceiling} labels"
+                )),
+            )
+        }
+        GraphWriteError::NameTooLong { size, ceiling } => {
+            ExecuteOpenCypherQueryErrorModeled::ConstraintViolationException(
+                crate::state::open_cypher_constraint(&format!(
+                    "An id, a label and a relationship type are at most {ceiling} bytes, \
+                     and this one is {size}"
+                )),
+            )
+        }
+        GraphWriteError::DuplicateId { id } => {
+            ExecuteOpenCypherQueryErrorModeled::ConstraintViolationException(
+                crate::state::open_cypher_constraint(&format!(
+                    "An element with the id {} already exists",
+                    crate::state::echoed(&id)
+                )),
+            )
+        }
+        GraphWriteError::MissingEndpoint { id } => {
+            ExecuteOpenCypherQueryErrorModeled::ConstraintViolationException(
+                crate::state::open_cypher_constraint(&format!(
+                    "A relationship joins two nodes this graph holds, and {} is not one",
+                    crate::state::echoed(&id)
+                )),
+            )
+        }
+    }
+}
+
+/// Record one query request: what was asked (the method, the URI, how long the query was
+/// and whether it carried parameters), who asked (the access key the request presented),
+/// and how it ended — refusals included.
+///
+/// The query itself and its parameters are deliberately absent: both carry the caller's
+/// own data, and a log is a file. Their LENGTH is recorded instead, which is what tells an
+/// oversized request from an empty one, and no secret is recorded (the access key id is an
+/// identifier, never the signing key).
+fn record_access(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    input: &ExecuteOpenCypherQueryInput,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        operation = "ExecuteOpenCypherQuery",
+        method = %parts.method,
+        uri = %parts.uri,
+        query_length = input.open_cypher_query.len(),
+        parameters_length = input.parameters.as_ref().map_or(0, String::len),
+        akid = ?::emulator_server::extract_akid(&parts.headers),
+        outcome,
+        "neptunedata execute openCypher query"
+    );
 }
