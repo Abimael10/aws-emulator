@@ -288,7 +288,15 @@ async fn an_update_replaces_only_the_members_the_request_names() {
         // previously set that role will be removed").
         let mut expected = before.clone();
         for (member, value) in &changes {
-            apply(&mut expected, member, value);
+            // A configuration member is stored COMPLETED — a collection the
+            // request supplied nothing for is stored as the empty collection —
+            // so the expectation goes through the one helper that says what the
+            // service completes.
+            apply(
+                &mut expected,
+                member,
+                &crate::support::stored_channel_member(member, value),
+            );
         }
         if patch.get("roleArn").is_none() {
             apply(&mut expected, "roleArn", &Value::Null);
@@ -686,7 +694,8 @@ async fn an_update_this_emulator_cannot_store_is_refused() {
                 "case {case:?}: expected {count} entries to be accepted, got {status}: {body}"
             );
             assert_eq!(
-                body["channel"][member], entries,
+                body["channel"][member],
+                crate::support::stored_channel_member(member, &entries),
                 "case {case:?}: expected the accepted list to be stored, got {:?}",
                 body["channel"][member]
             );

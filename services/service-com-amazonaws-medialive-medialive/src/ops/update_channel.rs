@@ -426,6 +426,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // previously set that role will be removed".
         channel.role_arn = input.role_arn;
 
+        // The rewritten configuration is completed the same way a created one
+        // is — the same helper, so an update cannot leave a channel reporting
+        // less than a create would.
+        crate::state::apply_channel_configuration_defaults(channel);
+
         // The configuration has been applied, which is what `UPDATING` reports;
         // the channel is still stopped, so the clock owes it the `IDLE` the
         // update started from.

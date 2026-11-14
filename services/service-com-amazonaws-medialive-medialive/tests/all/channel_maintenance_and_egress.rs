@@ -284,11 +284,16 @@ async fn an_update_moves_the_selected_window_member_by_member() {
 }
 
 /// Rule: a channel egresses from one public address per pipeline of its class,
-/// so every channel-shaped response reports one `ChannelEgressEndpoint` per
-/// pipeline (`SourceIp`: "Public IP of where a channel's output comes from"),
-/// whatever state the channel is in — the address is provisioned with the
-/// channel, so it is the same through its whole lifetime, from `CREATING` to the
+/// so every READ of the channel reports one `ChannelEgressEndpoint` per pipeline
+/// (`SourceIp`: "Public IP of where a channel's output comes from"), whatever
+/// state the channel is in and for the channel's whole lifetime, up to the
 /// terminal `DELETED`.
+///
+/// The addresses are spent by the provisioning the accepted create starts, so
+/// the create's own acknowledgement — the channel as it was created — reports
+/// none of them yet: `EgressEndpoints` is "The endpoints where outgoing
+/// connections initiate from", and a channel that has just been accepted
+/// initiates connections from nowhere so far.
 ///
 /// The rows span the `ChannelClass` enum (`smithy_query(query="shape",
 /// shape="ChannelClass")`: STANDARD | SINGLE_PIPELINE) plus the absent-class
@@ -312,12 +317,23 @@ async fn a_channel_reports_one_egress_endpoint_per_pipeline_in_every_state() {
 
         let created = create(&router, body).await;
         let id = created["id"].as_str().unwrap_or_default().to_string();
-        let ips = source_ips(&created);
+        assert!(
+            source_ips(&created).is_empty(),
+            "case {case:?}: CreateChannel: expected the acknowledgement to report no egress endpoint yet, got {:?}",
+            created["egressEndpoints"]
+        );
+
+        // The addresses the provisioning spent, as the first read of the
+        // channel reports them.
+        wait_for_the_clock();
+        let (status, idle) = describe(&router, &id).await;
+        assert_eq!(status, 200, "case {case:?}: DescribeChannel: got {status}: {idle}");
+        let ips = source_ips(&idle);
         assert_eq!(
             ips.len(),
             endpoints,
-            "case {case:?}: CreateChannel: expected {endpoints} egress endpoint(s), got {:?}",
-            created["egressEndpoints"]
+            "case {case:?}: DescribeChannel: expected {endpoints} egress endpoint(s), got {:?}",
+            idle["egressEndpoints"]
         );
         for ip in &ips {
             assert!(
@@ -334,11 +350,8 @@ async fn a_channel_reports_one_egress_endpoint_per_pipeline_in_every_state() {
         // The same endpoints through every state the channel passes through,
         // and through every channel-shaped response: the describe, the list
         // summary, the start, the stop and the delete.
-        wait_for_the_clock();
-        let (status, idle) = describe(&router, &id).await;
-        assert_eq!(status, 200, "case {case:?}: DescribeChannel: got {status}: {idle}");
         let reads: [(&str, Vec<String>); 2] = [
-            ("DescribeChannel while IDLE", source_ips(&idle)),
+            ("DescribeChannel while IDLE", ips.clone()),
             ("the ListChannels summary", source_ips(&summary(&router, &id).await)),
         ];
         for (read, reported) in reads {
@@ -385,7 +398,9 @@ async fn a_channel_reports_one_egress_endpoint_per_pipeline_in_every_state() {
 /// `SourceIp`.
 ///
 /// The rows differ along the classes the account's channels are created with, so
-/// the pipeline count per channel varies while the uniqueness rule does not.
+/// the pipeline count per channel varies while the uniqueness rule does not. The
+/// addresses are read through the describe, which is where a channel reports
+/// the addresses its provisioning spent.
 #[tokio::test]
 async fn no_two_pipelines_in_an_account_share_an_egress_address() {
     let table: [(&str, &[&str]); 3] = [
@@ -409,7 +424,13 @@ async fn no_two_pipelines_in_an_account_share_an_egress_address() {
                 json!({ "name": format!("channel-{index}"), "channelClass": class }),
             )
             .await;
-            all.extend(source_ips(&created));
+            let id = created["id"].as_str().unwrap_or_default().to_string();
+            let (status, described) = describe(&router, &id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: DescribeChannel: got {status}: {described}"
+            );
+            all.extend(source_ips(&described));
         }
         assert_eq!(
             all.iter().collect::<BTreeSet<_>>().len(),

@@ -301,15 +301,17 @@ async fn a_create_accepts_a_configuration_it_can_run() {
             status, 200,
             "case {case:?}: DescribeChannel: got {status}: {read}"
         );
+        // The stored configuration is the declared one COMPLETED, through the
+        // one helper that says what the service completes.
         assert_eq!(
             read["encoderSettings"],
-            channel_encoder_settings(),
+            crate::support::stored_channel_member("encoderSettings", &channel_encoder_settings()),
             "case {case:?}: expected the declared encoder settings, got {:?}",
             read["encoderSettings"]
         );
         assert_eq!(
             read["inputAttachments"],
-            json!(attachments),
+            crate::support::stored_channel_member("inputAttachments", &json!(attachments)),
             "case {case:?}: expected the declared attachments, got {:?}",
             read["inputAttachments"]
         );
@@ -441,7 +443,10 @@ async fn an_update_refuses_a_configuration_it_could_not_run() {
         );
         assert_eq!(
             read["inputAttachments"],
-            json!([attachment("held", Some(&held))]),
+            crate::support::stored_channel_member(
+                "inputAttachments",
+                &json!([attachment("held", Some(&held))])
+            ),
             "case {case:?}: expected the refused update to leave the attachments alone, got {:?}",
             read["inputAttachments"]
         );
@@ -522,6 +527,7 @@ async fn an_update_accepts_a_configuration_it_can_run() {
             status, 200,
             "case {case:?}: DescribeChannel: got {status}: {read}"
         );
+        let expected = crate::support::stored_channel_member("inputAttachments", &expected);
         assert_eq!(
             read["inputAttachments"], expected,
             "case {case:?}: expected the attachments {expected:?}, got {:?}",

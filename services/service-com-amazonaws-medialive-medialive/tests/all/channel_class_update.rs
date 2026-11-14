@@ -364,6 +364,10 @@ async fn a_class_update_replaces_the_destinations_only_when_the_request_names_th
             status, 200,
             "case {case:?}: UpdateChannelClass: expected 200, got {status}: {response}"
         );
+        // The stored destinations are the named ones COMPLETED, through the one
+        // helper that says what the service completes.
+        let expected_destinations =
+            crate::support::stored_channel_member("destinations", &expected_destinations);
         assert_eq!(
             response["channel"]["destinations"], expected_destinations,
             "case {case:?}: expected the answered destinations to be {expected_destinations:?}, got {:?}",

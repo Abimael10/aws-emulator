@@ -675,3 +675,76 @@ async fn resolved_channel_attachments(router: &MultiServiceRouter, body: Value) 
     body["inputAttachments"] = Value::Array(resolved);
     body
 }
+
+/// The channel-configuration member as the service STORES it: the submitted
+/// value with the collections the service completes filled in.
+///
+/// A channel's configuration is stored as the service COMPLETES it, not as one
+/// request spelled it: a collection member of the configuration that the
+/// request supplied nothing for is stored as the EMPTY collection, so every
+/// client reading it walks a collection instead of a null one
+/// (`crate::channel_projection_completeness` is the suite about that rule, and
+/// names the members). A suite that submits a configuration and compares the
+/// stored one against it states that expectation through here, so its
+/// comparison stays EXACT instead of each suite restating the completion.
+///
+/// A member that carries no such collection (a name, a log level, a
+/// specification) comes back exactly as it was submitted.
+pub fn stored_channel_member(member: &str, submitted: &Value) -> Value {
+    let mut value = submitted.clone();
+    match member {
+        "destinations" => {
+            for destination in collection(&mut value) {
+                completed(
+                    destination,
+                    &[
+                        "mediaPackageSettings",
+                        "settings",
+                        "srtSettings",
+                        "logicalInterfaceNames",
+                    ],
+                );
+            }
+        }
+        "inputAttachments" => {
+            for attachment in collection(&mut value) {
+                completed(attachment, &["logicalInterfaceNames"]);
+            }
+        }
+        "encoderSettings" => {
+            completed(&mut value, &["captionDescriptions"]);
+            for group in collection(&mut value["outputGroups"]) {
+                if let Some(hls) = group
+                    .get_mut("outputGroupSettings")
+                    .and_then(|settings| settings.get_mut("hlsGroupSettings"))
+                {
+                    completed(hls, &["adMarkers", "captionLanguageMappings"]);
+                }
+                for output in collection(&mut group["outputs"]) {
+                    completed(
+                        output,
+                        &["audioDescriptionNames", "captionDescriptionNames"],
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
+/// The entries of a JSON collection, to walk and complete one by one; none at
+/// all for a value that carries no collection.
+fn collection(value: &mut Value) -> impl Iterator<Item = &mut Value> {
+    value.as_array_mut().into_iter().flatten()
+}
+
+/// Fill in every `member` of one JSON object the request left out, as the empty
+/// collection.
+fn completed(object: &mut Value, members: &[&str]) {
+    for member in members {
+        if object.get(member).is_none() {
+            object[*member] = json!([]);
+        }
+    }
+}

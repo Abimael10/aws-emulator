@@ -551,8 +551,11 @@ async fn an_update_every_stored_action_survives_is_applied() {
             "case {case:?}: expected 200, got {status}: {applied}"
         );
         for (member, value) in patch.as_object().expect("the patch is a JSON object") {
+            // The patched configuration is stored COMPLETED, through the one
+            // helper that says what the service completes.
+            let expected = crate::support::stored_channel_member(member, value);
             assert_eq!(
-                applied["channel"][member], *value,
+                applied["channel"][member], expected,
                 "case {case:?}: expected the stored {member} to be the patched one, got {:?}",
                 applied["channel"][member]
             );
@@ -565,8 +568,9 @@ async fn an_update_every_stored_action_survives_is_applied() {
             "case {case:?}: DescribeChannel expected 200, got {status}: {after}"
         );
         for (member, value) in patch.as_object().expect("the patch is a JSON object") {
+            let expected = crate::support::stored_channel_member(member, value);
             assert_eq!(
-                after[member], *value,
+                after[member], expected,
                 "case {case:?}: expected the channel to read back the patched {member}, got {:?}",
                 after[member]
             );

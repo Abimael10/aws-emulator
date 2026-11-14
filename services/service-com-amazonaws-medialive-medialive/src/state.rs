@@ -249,6 +249,15 @@ pub mod channel_configurations;
 
 pub use channel_configurations::ChannelConfiguration;
 
+/// The channel DEFAULTS slice: the values the service applies to a channel's
+/// configuration as it stores it — the log level a request that chose none is
+/// stored with, and the collection members a request supplied nothing for, which
+/// are stored empty rather than unset — so every projection of the stored
+/// channel reports a complete configuration.
+pub mod channel_defaults;
+
+pub use channel_defaults::{apply_channel_configuration_defaults, DEFAULT_LOG_LEVEL};
+
 /// The IN-USE slice: the one rule a write that would hand a resource to a second
 /// holder, or take one out from under its holder, is refused by — an input is
 /// attached to at most one channel at a time, and an input security group is not

@@ -279,6 +279,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             channel.destinations = destinations;
         }
 
+        // The destinations this request wrote are completed the same way a
+        // create's and an update's are, through the one helper, so a channel is
+        // stored complete whichever operation last wrote its configuration.
+        crate::state::apply_channel_configuration_defaults(channel);
+
         // The new class has been applied, which is what `UPDATING` reports; the
         // channel is still stopped, so the clock owes it the `IDLE` the change
         // started from.

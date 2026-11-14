@@ -80,6 +80,9 @@ mod channel_placement_group_update;
 #[path = "all/channel_placement_groups.rs"]
 mod channel_placement_groups;
 
+#[path = "all/channel_projection_completeness.rs"]
+mod channel_projection_completeness;
+
 #[path = "all/channel_schedule.rs"]
 mod channel_schedule;
 

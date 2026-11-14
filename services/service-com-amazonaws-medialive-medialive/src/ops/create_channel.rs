@@ -354,11 +354,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .channel_engine_version
             .and_then(|version| version.version)
             .and_then(crate::state::requested_engine_version_pin);
+        // The configuration the service STORES is the one the request supplied
+        // completed with the values the service applies to every channel — the
+        // log level a request that chose none writes at, and the collection
+        // members it supplied nothing for, which are stored as empty
+        // collections. One helper, shared with `UpdateChannel`, so a channel is
+        // stored complete however it was written.
+        crate::state::apply_channel_configuration_defaults(&mut channel);
 
         state.channels.insert(id.clone(), channel);
-        // The channel's pipelines now exist, so each gets the public address its
-        // outputs originate from — a write, done here rather than by any later
-        // read of the channel.
+        // The channel as it was CREATED, which is what this acknowledgement
+        // reports: its pipelines have not been provisioned yet, so it egresses
+        // from no address so far and `EgressEndpoints` — "The endpoints where
+        // outgoing connections initiate from" — is still empty.
+        let created = state.channel_description(&id).ok_or_else(unavailable)?;
+        // Provisioning the accepted create starts is what gives each pipeline
+        // the public address its outputs originate from, so the addresses are
+        // spent here, after the acknowledgement above and before any later read
+        // of the channel — a write, done here rather than by any such read.
         state.allocate_channel_egress_addresses(&id);
         if let Some(token) = input.request_id {
             // Bounded, evicting write: a caller-chosen token can neither
@@ -366,9 +379,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.record_idempotency_token(token, &id);
         }
 
-        let channel = state.channel_description(&id).ok_or_else(unavailable)?;
         Ok(CreateChannelOutput {
-            channel: Some(channel),
+            channel: Some(created),
         })
     }
 }

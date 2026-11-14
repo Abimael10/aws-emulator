@@ -356,9 +356,13 @@ async fn every_member_a_create_supplies_is_read_back_by_describe() {
                 }),
                 other => described[other].clone(),
             };
+            // The stored configuration is the submitted one COMPLETED, so the
+            // expectation is stated through the one helper that says what the
+            // service completes (`crate::support::stored_channel_member`).
+            let expected = crate::support::stored_channel_member(member, value);
             assert_eq!(
-                &stored, value,
-                "case {case:?}: member {member:?} was not persisted: expected {value}, got {stored}"
+                stored, expected,
+                "case {case:?}: member {member:?} was not persisted: expected {expected}, got {stored}"
             );
         }
 
@@ -936,7 +940,8 @@ async fn the_attachment_list_of_one_channel_is_bounded() {
 
         if expected_status == 201 {
             assert_eq!(
-                body["channel"]["inputAttachments"], attachments,
+                body["channel"]["inputAttachments"],
+                crate::support::stored_channel_member("inputAttachments", &attachments),
                 "case {case:?}: expected the stored attachments, got {:?}",
                 body["channel"]["inputAttachments"]
             );
@@ -1002,7 +1007,7 @@ async fn the_destination_list_of_one_channel_is_bounded() {
         if expected_status == 201 {
             assert_eq!(
                 body["channel"]["destinations"],
-                json!(destinations),
+                crate::support::stored_channel_member("destinations", &json!(destinations)),
                 "case {case:?}: expected the stored destinations, got {:?}",
                 body["channel"]["destinations"]
             );
