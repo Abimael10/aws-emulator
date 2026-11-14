@@ -4443,3 +4443,7 @@ mod cloudformation_appsync_custom_domains;
 // stands as ordinary comments: declare each suite exactly ONCE, since this is one crate
 // root and a second `mod` for the same name is `E0428`, and keep a note like this one at
 // the HEAD of the file. `all/all_rs_declares_each_suite_once.rs` and
+// doc comment is only legal before the first item of a crate root, so a `//!` line in this
+// appended tail is `E0753` and compiles no suite of this target.)
+// line in this appended tail is `E0753` and compiles no suite of this target.)
+// leaving a note in the tail. (Ordinary comments, for the reason they state.)

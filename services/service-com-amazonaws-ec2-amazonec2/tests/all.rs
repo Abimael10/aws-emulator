@@ -2300,6 +2300,14 @@ mod delete_transit_gateway_connect_peer;
 // `UpdateSecurityGroupRuleDescriptionsIngress`: the description it writes onto each inbound
 #[path = "all/update_security_group_rule_descriptions_ingress.rs"]
 mod update_security_group_rule_descriptions_ingress;
+// What `ModifyTransitGatewayMeteringPolicy` applies: the additions and the removals a request
+// names laid over the set of middlebox attachments the policy already meters, persisted and
+// reported with the policy left in the transient state of a change under way and the clock
+// owing it the state a policy in force is in — beside the ids, the removal of something it does
+// not meter, the policy on its way out and the dry run it refuses without changing anything.
+// Declared at the tail of this file, which is where every new ec2 suite lands.
+#[path = "all/modify_transit_gateway_metering_policy.rs"]
+mod modify_transit_gateway_metering_policy;
 // What `DeleteTransitGatewayVpcAttachment` records: the stored VPC attachment the request names
 // written into the transient delete state of its own catalog with the clock owing it the terminal
 // one, answered and described with every other member unchanged — and the ids, the kinds, the

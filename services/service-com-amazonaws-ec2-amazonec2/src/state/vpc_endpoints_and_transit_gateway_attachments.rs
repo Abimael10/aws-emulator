@@ -1620,6 +1620,12 @@ pub const TRANSIT_GATEWAY_METERING_POLICY_STATE_PENDING: &str = "pending";
 /// clock owes a freshly created policy.
 pub const TRANSIT_GATEWAY_METERING_POLICY_STATE_AVAILABLE: &str = "available";
 
+/// A metering policy whose change has been asked for and has not taken effect yet: that
+/// enum's `modifying` member, which is what `ModifyTransitGatewayMeteringPolicy` answers with
+/// until [`TRANSITION_DELAY`] has passed and the clock owes it
+/// [`TRANSIT_GATEWAY_METERING_POLICY_STATE_AVAILABLE`] again.
+pub const TRANSIT_GATEWAY_METERING_POLICY_STATE_MODIFYING: &str = "modifying";
+
 /// A metering policy whose deletion has been asked for and has not settled yet: that enum's
 /// `deleting` member, which is what `DeleteTransitGatewayMeteringPolicy` answers with.
 pub const TRANSIT_GATEWAY_METERING_POLICY_STATE_DELETING: &str = "deleting";
@@ -1848,6 +1854,72 @@ impl ComAmazonawsEc2Amazonec2State {
             PendingStateMove::starting_now(TRANSIT_GATEWAY_METERING_POLICY_STATE_DELETED),
         );
         Some(view)
+    }
+
+    /// Record `middlebox_attachment_ids` as the attachments the metering policy
+    /// `transit_gateway_metering_policy_id` meters from now on, and answer it as the store
+    /// then holds it — `None`, with NOTHING written, when the account holds no such policy or
+    /// when what the change would store does not fit the store's byte budget.
+    ///
+    /// The ids are the set the policy carries AFTER the change: which of them the request
+    /// added and which it removed is settled by the caller, which reads the policy as it
+    /// stands and lays the request's additions and removals over it, so this writer stores
+    /// what it is given rather than deciding membership a second way. A change that leaves
+    /// the policy metering nothing stores the EMPTY set rather than dropping the member, so
+    /// the answer reports the set the change left behind — a policy a change emptied reads
+    /// back as metering nothing, which is not the same as one a create never named an
+    /// attachment for ([`Self::insert_pending_transit_gateway_metering_policy`], which stores
+    /// that one absent).
+    ///
+    /// A change is work AWS reports as under way: the `TransitGatewayMeteringPolicyState`
+    /// catalog carries [`TRANSIT_GATEWAY_METERING_POLICY_STATE_MODIFYING`], so the policy is
+    /// left in that TRANSIENT state with the clock owing it
+    /// [`TRANSIT_GATEWAY_METERING_POLICY_STATE_AVAILABLE`] one [`TRANSITION_DELAY`] later
+    /// ([`PendingStateMove`], applied by [`Self::materialize_due_transitions`]) — the same
+    /// arrangement, on the same clock, as the `pending` a create leaves it in and the
+    /// `deleting` a delete does. The span is never zero and nothing is slept for, so a caller
+    /// reading straight back still sees the change under way. Any move the clock still owed
+    /// the policy is superseded: this call decides when the policy is next in force.
+    ///
+    /// "The date and time when the metering policy update becomes effective"
+    /// (`TransitGatewayMeteringPolicy$UpdateEffectiveAt`) is that same instant, read off the
+    /// wall clock exactly as the create and the delete read it, so the member and the owed
+    /// move cannot disagree about when this change takes effect.
+    ///
+    /// The budget is asked about the NET change BEFORE anything is mutated: this call stores
+    /// no further policy, so the record ceiling cannot bound it, while the ids it carries are
+    /// caller-chosen text — so a change that does not fit is declined here as well as by its
+    /// caller, and no path can write past [`MAX_STORED_BYTES`].
+    pub fn modify_transit_gateway_metering_policy(
+        &mut self,
+        transit_gateway_metering_policy_id: &str,
+        middlebox_attachment_ids: Vec<String>,
+    ) -> Option<TransitGatewayMeteringPolicy> {
+        let current = self
+            .transit_gateway_metering_policies
+            .get(transit_gateway_metering_policy_id)?;
+        let refund = transit_gateway_metering_policy_payload_bytes(current);
+        let mut updated = current.clone();
+        updated.middlebox_attachment_ids = Some(middlebox_attachment_ids);
+        updated.state = Some(TRANSIT_GATEWAY_METERING_POLICY_STATE_MODIFYING.to_string());
+        updated.update_effective_at = Some(system_time_to_date_time(
+            SystemTime::now() + TRANSITION_DELAY,
+        ));
+        let charge = transit_gateway_metering_policy_payload_bytes(&updated);
+        if self.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return None;
+        }
+        self.release_stored_bytes(refund);
+        self.add_stored_bytes(charge);
+        self.transit_gateway_metering_policies
+            .insert(transit_gateway_metering_policy_id.to_string(), updated);
+        self.transit_gateway_metering_policy_moves.insert(
+            transit_gateway_metering_policy_id.to_string(),
+            PendingStateMove::starting_now(TRANSIT_GATEWAY_METERING_POLICY_STATE_AVAILABLE),
+        );
+        self.transit_gateway_metering_policies
+            .get(transit_gateway_metering_policy_id)
+            .cloned()
     }
 }
 

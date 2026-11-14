@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyTransitGatewayMeteringPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyTransitGatewayMeteringPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyTransitGatewayMeteringPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +130,206 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyTransitGatewayMeteringPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyTransitGatewayMeteringPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyTransitGatewayMeteringPolicy"))
+        // `ctx` carries request metadata only; this operation reads none of it — the policy is
+        // named by id and is a resource of the gateway that holds it. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The request's own FORM first, before anything is resolved: "not an id of this kind"
+        // is a malformed request rather than a missing resource, and it is not answered by the
+        // DryRun arm below. Through the ONE place this resource's malformed refusal is worded,
+        // which every other reader of a `TransitGatewayMeteringPolicyId` answers.
+        let metering_policy_id = input.transit_gateway_metering_policy_id.as_str();
+        state::require_well_formed_transit_gateway_metering_policy_id(metering_policy_id)?;
+
+        // "The IDs of middlebox attachments to add to the metering policy"
+        // (`AddMiddleboxAttachmentIds`) and "to remove from the metering policy"
+        // (`RemoveMiddleboxAttachmentIds`): naming one id twice asks for it once, so each list
+        // is deduplicated, and each is bounded before any per-id work is done — the model
+        // publishes no bound on `TransitGatewayAttachmentIdStringList`, so the number of ids
+        // one request may name is the ceiling every list of resource ids in this crate is held
+        // to, the same one the create holds `MiddleboxAttachmentIds` to.
+        let added = state::deduplicate_ids(input.add_middlebox_attachment_ids.as_deref().unwrap_or_default());
+        let removed = state::deduplicate_ids(
+            input
+                .remove_middlebox_attachment_ids
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        for (member, supplied) in [
+            ("AddMiddleboxAttachmentIds", added.len()),
+            ("RemoveMiddleboxAttachmentIds", removed.len()),
+        ] {
+            if supplied > state::MAX_RESOURCE_IDS {
+                return Err(state::invalid_parameter_value(format!(
+                    "{member} carries {supplied} ids, above the maximum of {maximum}",
+                    maximum = state::MAX_RESOURCE_IDS,
+                )));
+            }
+        }
+        // A value that is not a transit gateway attachment id at all is refused as malformed
+        // BEFORE anything is looked up, so "not an id of this kind" never reads as "no such
+        // attachment", and never as a policy that quietly dropped it — the check the create
+        // puts every middlebox attachment id through.
+        for attachment_id in added.iter().chain(removed.iter()) {
+            state::require_well_formed_transit_gateway_attachment_id(attachment_id)?;
+        }
+        // One id both added and removed asks for two incompatible things of the same
+        // attachment, so the request is refused rather than one of the two silently winning.
+        if let Some(conflicting) = added.iter().find(|asked| removed.contains(asked)) {
+            return Err(state::invalid_parameter_combination(format!(
+                "The middlebox attachment {conflicting} cannot be added and removed by the \
+                 same request"
+            )));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // resources the request names, so it is answered once the request's own form has been
+        // checked and before anything is resolved or written; every caller of this emulator is
+        // permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether this policy can be modified is asked of the state it and
+        // the attachments the request names are ACTUALLY in rather than the one they were left
+        // in. That move was owed at this instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "Modifies a transit gateway metering policy": an id this account holds no policy for
+        // has nothing to modify — the one refusal every operation that resolves a
+        // `TransitGatewayMeteringPolicyId` answers, so one resource family reads one way.
+        let Some(policy) = store
+            .transit_gateway_metering_policies
+            .get(metering_policy_id)
+        else {
+            return Err(state::invalid_transit_gateway_metering_policy_id_not_found(
+                metering_policy_id,
+            ));
+        };
+        // A policy on its way out has nothing left to meter, so a change to it is refused
+        // rather than written over a record the account has already let go of.
+        if state::transit_gateway_metering_policy_is_deleting(policy) {
+            let current = policy.state.clone().unwrap_or_default();
+            return Err(state::incorrect_state_of(
+                "Transit Gateway Metering Policy",
+                metering_policy_id,
+                &current,
+            ));
+        }
+
+        // What the change would leave behind, resolved before anything is written: the
+        // attachments the policy meters now, less the ones this request removes, plus the ones
+        // it adds.
+        let metered: Vec<String> = policy.middlebox_attachment_ids.clone().unwrap_or_default();
+        // "The IDs of middlebox attachments to remove from the metering policy"
+        // (`RemoveMiddleboxAttachmentIds`): an attachment the policy does not meter has
+        // nothing to remove, so naming one is refused rather than reported back as a removal
+        // that happened — the refusal `ModifyVpcEndpoint` answers for a subnet its endpoint
+        // does not serve.
+        if let Some(absent) = removed
+            .iter()
+            .find(|attachment_id| !metered.contains(attachment_id))
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({absent}) for parameter removeMiddleboxAttachmentId is invalid. The \
+                 transit gateway metering policy {metering_policy_id} does not meter that \
+                 attachment"
+            )));
+        }
+        // Every middlebox attachment the policy is to meter has to exist: an id that names no
+        // attachment of the account is a dangling reference, and storing it would leave a
+        // policy metering nothing — the refusal this crate answers wherever an attachment id
+        // is a PARAMETER of some other action, and the one the create answers for the same
+        // member.
+        if let Some(unknown) = added
+            .iter()
+            .find(|attachment_id| !store.transit_gateway_attachments.contains_key(attachment_id.as_str()))
+        {
+            return Err(state::invalid_transit_gateway_attachment_id_not_found(
+                unknown,
+            ));
+        }
+
+        // The policy records the SET of attachments it meters, in the order it first came to
+        // meter each: an attachment already metered is metered once, so a request that adds
+        // one it already carries leaves the set as it stands rather than growing it.
+        let mut middlebox_attachment_ids: Vec<String> = metered
+            .iter()
+            .filter(|attachment_id| !removed.contains(attachment_id))
+            .cloned()
+            .collect();
+        for attachment_id in &added {
+            if !middlebox_attachment_ids.contains(attachment_id) {
+                middlebox_attachment_ids.push(attachment_id.clone());
+            }
+        }
+        // The set a stored policy carries is bounded by the same ceiling the create bounds the
+        // request's list by, so a policy cannot be grown past it one change at a time.
+        if middlebox_attachment_ids.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::resource_limit_exceeded(format!(
+                "A transit gateway metering policy meters at most {maximum} middlebox \
+                 attachments, and this change would leave it metering {asked}",
+                maximum = state::MAX_RESOURCE_IDS,
+                asked = middlebox_attachment_ids.len(),
+            )));
+        }
+
+        // What this call would store, charged by the ONE definition of a stored policy's
+        // caller-chosen bytes, so the figure checked here is exactly the one the write
+        // charges. The budget is asked about the NET change: this call stores no further
+        // policy, so the record ceiling cannot bound it, while the ids it carries are
+        // caller-chosen text — a change that replaced a small set with a large one, over and
+        // over, would otherwise grow this process's memory past the only bound it has.
+        let mut updated = policy.clone();
+        updated.middlebox_attachment_ids = Some(middlebox_attachment_ids.clone());
+        let refund = state::transit_gateway_metering_policy_payload_bytes(policy);
+        let charge = state::transit_gateway_metering_policy_payload_bytes(&updated);
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(change_does_not_fit(&store, charge));
+        }
+
+        let Some(metering_policy) = store
+            .modify_transit_gateway_metering_policy(metering_policy_id, middlebox_attachment_ids)
+        else {
+            // Unreachable: the policy was resolved above, the budget was asked about this very
+            // charge, and the store is locked throughout. Kept as the backstop that keeps a
+            // change the writer declined from reading as a 200 over a policy the store still
+            // holds as it was, worded by the ONE definition of that refusal so the pre-check
+            // and the backstop cannot drift apart.
+            return Err(change_does_not_fit(&store, charge));
+        };
+
+        // "Information about the modified transit gateway metering policy"
+        // (`$TransitGatewayMeteringPolicy`) as the STORE now holds it — `modifying`, with the
+        // clock owing it `available` — so what this answer carries is what a read straight
+        // after this call corroborates rather than a value built here.
+        Ok(ModifyTransitGatewayMeteringPolicyOutput {
+            transit_gateway_metering_policy: Some(metering_policy),
+        })
     }
+}
+
+/// The refusal a change that does not fit the store's byte budget answers: HTTP 400
+/// `ResourceLimitExceeded`, naming what the store holds, what it holds at most and what this
+/// change would have charged.
+///
+/// The ONE definition of that wording, worded as every other replacement path of this crate
+/// words it, so the pre-check and the writer's backstop below it cannot drift apart.
+fn change_does_not_fit(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    charge: usize,
+) -> ModifyTransitGatewayMeteringPolicyError {
+    crate::state::resource_limit_exceeded(format!(
+        "This emulator holds {held} of at most {max} bytes of caller-supplied data, so it \
+         cannot store this modification's {charge} bytes",
+        held = store.stored_bytes(),
+        max = crate::state::MAX_STORED_BYTES,
+    ))
 }
