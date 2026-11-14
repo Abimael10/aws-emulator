@@ -5,10 +5,13 @@
 //! Removes one revision of an Automated Reasoning policy, addressed by the same
 //! `AutomatedReasoningPolicyArn` a read of it is addressed by: the unversioned ARN removes
 //! the POLICY, and an ARN carrying a `:<version>` suffix removes just that numbered
-//! version. An ARN this store resolves to no revision is refused with the modelled 404 —
-//! RECORDED behaviour, which the modelled contract below does not describe: a repeated
-//! delete reports the policy as missing rather than succeeding, in the sentence a write of
-//! the policy reports an absent one with
+//! version. The operation is modelled `@idempotent` and documented "This operation is
+//! idempotent. If you delete a policy more than once, each call succeeds", so an ARN that
+//! resolves to no revision BECAUSE a delete already took it away is answered with the same
+//! empty success rather than with a refusal — see
+//! [`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::removed_automated_reasoning_policy_revision`].
+//! An ARN that never named a revision of this account is refused with the modelled 404, in
+//! the sentence a write of the policy reports an absent one with
 //! ([`crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND_ON_WRITE`]).
 //!
 //! A policy removal takes every artifact that hangs off the policy with it, which `force`
@@ -181,15 +184,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::automated_reasoning_policy_arn_parts(&input.policy_arn);
         let base_arn = base_arn.to_string();
 
-        // An ARN that resolves to NO revision is refused with the 404 the model declares —
-        // the documented idempotency is about repeating a delete of a policy this account
-        // holds, not about an ARN naming nothing, which Amazon Bedrock reports as missing in
-        // the sentence a write of the policy reports it with. WHICH half of the ARN resolved
+        // An ARN that resolves to NO revision is answered as the delete that already
+        // happened when this account HELD that revision and a delete took it away: the
+        // operation is modelled `@idempotent` and documented "This operation is idempotent.
+        // If you delete a policy more than once, each call succeeds", so repeating a delete
+        // succeeds rather than reporting the revision it removed as missing. An ARN that
+        // never named a revision of this account is still refused with the modelled 404,
+        // which is what a caller addressing nothing is told; WHICH half of the ARN resolved
         // to nothing decides that sentence, which is the store's own rule.
         if store
             .automated_reasoning_policy_revision(&input.policy_arn)
             .is_none()
         {
+            if store.removed_automated_reasoning_policy_revision(&input.policy_arn) {
+                return Ok(DeleteAutomatedReasoningPolicyOutput {});
+            }
             return Err(not_found(
                 store.automated_reasoning_policy_write_not_found_message(&input.policy_arn),
             ));
@@ -218,6 +227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if policy.remove_version(number).is_none() {
                     return Err(server_error());
                 }
+                // The revision this call took away, so repeating the call is answered as the
+                // delete that already happened rather than as a missing version.
+                store.remember_removed_automated_reasoning_policy_revision(
+                    crate::state::automated_reasoning_policy_version_arn(&base_arn, number),
+                );
             }
             None => {
                 // `force` false: "Amazon Bedrock validates if all artifacts have been
@@ -270,6 +284,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store
                     .automated_reasoning_policy_test_workflow_tokens
                     .retain(|(policy_arn, _), _| *policy_arn != base_arn);
+                // The revisions this call took away — the policy and every version of it,
+                // which went with the policy — so a repeated delete of any of them is
+                // answered as the delete that already happened.
+                store.remember_removed_automated_reasoning_policy_revision(base_arn.clone());
+                for number in removed.versions.keys() {
+                    store.remember_removed_automated_reasoning_policy_revision(
+                        crate::state::automated_reasoning_policy_version_arn(&base_arn, *number),
+                    );
+                }
             }
         }
 
@@ -360,8 +383,8 @@ fn referencing_guardrail(
         .map(|guardrail| guardrail.id.clone())
 }
 
-/// The modelled 404 this operation answers for an `AutomatedReasoningPolicyArn` this store
-/// resolves to no revision — the policy, or the version a versioned ARN names.
+/// The modelled 404 this operation answers for an `AutomatedReasoningPolicyArn` that never
+/// named a revision of this account — neither a policy it holds nor one a delete took away.
 fn not_found(message: String) -> DeleteAutomatedReasoningPolicyError {
     DeleteAutomatedReasoningPolicyErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {

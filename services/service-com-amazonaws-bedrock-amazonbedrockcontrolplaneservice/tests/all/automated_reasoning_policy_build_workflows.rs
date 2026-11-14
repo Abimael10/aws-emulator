@@ -273,6 +273,43 @@ fn definition_source() -> Value {
     })
 }
 
+/// The document metadata a read of a started workflow reports: the name, the content type and
+/// the description `GetAutomatedReasoningPolicyBuildWorkflow` answers with, or `None` for a
+/// source that names no document at all.
+type DocumentMetadata = Option<(&'static str, &'static str, Option<&'static str>)>;
+
+/// The `sourceContent` a start of `workflow_type` carries, with the document metadata a read
+/// of the workflow it starts then reports.
+///
+/// Each kind of build workflow is started from the form of
+/// `AutomatedReasoningPolicyWorkflowTypeContent` the model documents as that kind's content
+/// — `documents` for a document ingestion workflow, `policyRepairAssets` for a policy repair
+/// workflow, `generateFidelityReportContent` for a fidelity report workflow and
+/// `iterativeRefinementContent` for an iterative policy refinement workflow
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyWorkflowTypeContent")`) — and
+/// a type the model names no form for is started from the source documents here.
+fn source_for(
+    workflow_type: &str,
+    name: &'static str,
+    content_type: &'static str,
+) -> (Value, DocumentMetadata) {
+    match workflow_type {
+        "REFINE_POLICY" => (repair_source(), None),
+        "GENERATE_FIDELITY_REPORT" => (
+            fidelity_report_source(&[(name, content_type)]),
+            Some((name, content_type, None)),
+        ),
+        "ITERATIVELY_REFINE_POLICY" => (
+            iterative_refinement_source(&[(name, content_type)], "tighten the rules"),
+            Some((name, content_type, None)),
+        ),
+        _ => (
+            documents_source(name, content_type, None),
+            Some((name, content_type, None)),
+        ),
+    }
+}
+
 /// Assert `id` is one `AutomatedReasoningPolicyBuildWorkflowId` admits: the hyphenated
 /// 36-character form, lowercase hex, with RFC 4122's version nibble `4` and a variant
 /// digit in `[89ab]` — the `4` and the `[89ab]` the member's own pattern fixes.
@@ -330,7 +367,7 @@ async fn a_started_build_workflow_round_trips_through_get() {
         },
         Row {
             case: "one pdf document, undescribed",
-            workflow_type: WORKFLOW_TYPES[1],
+            workflow_type: WORKFLOW_TYPES[0],
             source: documents_source("returns.pdf", "pdf", None),
             document: Some(("returns.pdf", "pdf", None)),
         },
@@ -359,21 +396,19 @@ async fn a_started_build_workflow_round_trips_through_get() {
             document: None,
         },
     ];
-    // Every remaining workflow type, so the rule is not keyed to the ones above.
+    // Every remaining workflow type, so the rule is not keyed to the ones above — each
+    // started from the content its own kind of workflow is built from.
     for (index, workflow_type) in WORKFLOW_TYPES.iter().enumerate() {
+        let (source, document) = source_for(
+            workflow_type,
+            "catalog.txt",
+            DOCUMENT_CONTENT_TYPES[index % DOCUMENT_CONTENT_TYPES.len()],
+        );
         rows.push(Row {
             case: workflow_type,
             workflow_type,
-            source: documents_source(
-                "catalog.txt",
-                DOCUMENT_CONTENT_TYPES[index % DOCUMENT_CONTENT_TYPES.len()],
-                None,
-            ),
-            document: Some((
-                "catalog.txt",
-                DOCUMENT_CONTENT_TYPES[index % DOCUMENT_CONTENT_TYPES.len()],
-                None,
-            )),
+            source,
+            document,
         });
     }
 
@@ -585,7 +620,7 @@ async fn a_policy_a_workflow_is_still_building_is_in_use() {
             &emu,
             &policy_arn,
             first_type,
-            documents_source("first.txt", "txt", None),
+            source_for(first_type, "first.txt", "txt").0,
         )
         .await;
         assert_eq!(
@@ -598,7 +633,7 @@ async fn a_policy_a_workflow_is_still_building_is_in_use() {
             &emu,
             &policy_arn,
             second_type,
-            documents_source("second.txt", "txt", None),
+            source_for(second_type, "second.txt", "txt").0,
         )
         .await;
         if second.status == 200 {
@@ -640,7 +675,7 @@ async fn a_policy_a_workflow_is_still_building_is_in_use() {
             &emu,
             &policy_arn,
             second_type,
-            documents_source("third.txt", "txt", None),
+            source_for(second_type, "third.txt", "txt").0,
         )
         .await;
         assert_eq!(
@@ -925,7 +960,7 @@ async fn a_cancel_stops_a_workflow_that_is_still_building() {
             &emu,
             &policy_arn,
             workflow_type,
-            documents_source("after-the-cancel.txt", "txt", None),
+            source_for(workflow_type, "after-the-cancel.txt", "txt").0,
         )
         .await;
         assert_eq!(

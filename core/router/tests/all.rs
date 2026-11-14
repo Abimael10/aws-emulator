@@ -4879,11 +4879,6 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (Two more lines of that header fragment, appended typed with `//!` and standing as
 // ordinary comments for the same reason: the suite-declaration check covers this file and
 // every service crate's `tests/all.rs`, so check there rather than leaving a note here.)
-// and here: what the PRINCIPAL TAGS a tagged vend attaches decide about that read — the ABAC
-// document on the mapped role resolving `${aws:PrincipalTag/<key>}` per session — spans the
-// same four services, so no single service crate's test target can see both ends of it.
-#[path = "all/cognito_vended_session_principal_tag_scoped_read.rs"]
-mod cognito_vended_session_principal_tag_scoped_read;
 // (`sfn_relayed_dynamodb_request_id` and `cloudformation_provisions_cloudfront_resources` are
 // each declared ONCE above — the first further up this tail, the second in the sorted
 // CloudFormation span — so the second declaration two concurrent landings appended here is
@@ -5103,18 +5098,6 @@ mod cognito_vended_session_principal_tag_scoped_read;
 // fragment that stood here as a `//!` line is gone rather than re-typed.)
 // (Six more lines of that same header landed in this tail typed with `//!`: past the first
 // (Ten further lines of this file's own header landed here typed with `//!`, which is
-// Declared here, in this same head region, for the reason the entry above records: which role a
-// CloudWatch Logs subscription delivery is authorized against, and what that role must allow,
-// is decided by CloudWatch Logs, IAM and the destination's own service at once, so no single
-// service crate's test target can set the permissions and then read the destination.
-#[path = "all/logs_subscription_delivery_role_scope.rs"]
-mod logs_subscription_delivery_role_scope;
-#[path = "all/cloudformation_provisions_event_buses_and_bus_policies.rs"]
-mod cloudformation_provisions_event_buses_and_bus_policies;
-// Declared here, in this same head region, for the reason the entry above records: how a
-#[path = "all/eks_nodegroup_lifecycle_convergence.rs"]
-mod eks_nodegroup_lifecycle_convergence;
-// `pricing_plan_subscription_resource_eligibility` are each declared ONCE, further up this
 // item that is `E0753`, so they are gone rather than re-typed.)
 // (Written with `//` on purpose: an inner doc comment past the first item is `E0753`, and
 // the second declarations and header fragments concurrent landings appended into this tail
@@ -5464,44 +5447,9 @@ mod eks_nodegroup_lifecycle_convergence;
 // the reason they themselves state.)
 // (An ordinary comment, for exactly the reason that line states.)
 // and compiles nothing. (Five more lines of that fragment, ordinary comments.)
-// stack does when its Lambda-backed custom resource's provider answers FAILED is only
-// observable across CloudFormation, AWS Lambda and CloudWatch Logs at once — the Delete
-// request the rollback sends is read out of the provider's own log — so no single service
-// crate's test target can deploy the stack and then read it.
-#[path = "all/cloudformation_failed_custom_resource_rollback_deletes.rs"]
-mod cloudformation_failed_custom_resource_rollback_deletes;
 // item of a crate root that is `E0753` and compiles no suite of this target, so they are gone
-// rather than re-typed \u2014 the header at the top of this file carries the rule, and the two
-// guard suites check both halves of it.)
-// suite left at the top level of `tests/` fails the build. (An ordinary comment for the
-// reason it states: this line landed here as `//!`, which compiles no suite of this target.)
-// reason they state: as `//!` in this tail they compiled nothing.)
-// appended to the tail of this file would compile no suite of this target. (Seven more
 // declarations and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` the notes,
 // than leaving a note in the appended tail below.
-// head of this file: two branches landing at once declared each of them here as well, and a
-// module declared twice compiles neither copy, so the copies that stood here are gone.)
-// above: two branches landing at once appended a second declaration of it here, and a
-// (Fragments of this file's own header, and notes about declarations that are no longer
-// duplicated, were pruned from this tail: the rule they repeated stands in the module doc
-// at the HEAD of this file, and an inner doc comment past the first item is `E0753`.)
-// item an inner doc comment is `E0753`, so they are gone rather than re-typed.)
-// leaving a note at the end of this file — an inner doc comment is legal only before the
-// first item, so one appended to the tail is `E0753` and compiles nothing.
-// (The notes that stood here were fragments of this file's own header and bookkeeping about
-// declarations that are no longer duplicated; they were pruned. Declare each suite ONCE,
-// with its `#[path]` line, and keep the rules in the module doc at the HEAD of this file,
-// where an inner doc comment is legal.)
-// (Pruned, for the reason recorded above: everything that stood here was a fragment of this
-// file's own header or a note about a duplicate declaration that is already gone.)
-// (The copies of this file's own header that concurrent landings appended into this tail,
-// and the duplicate `mod` declarations beside them, are removed rather than re-typed: an
-// inner doc comment is legal only before the first item, a module may be declared only
-// once, and the rule itself stands in the module doc at the HEAD of this file.)
-// (The duplicate `mod` declarations and header copies concurrent landings appended below
-// this point are removed for the same reason.)
-// (Every further header copy and duplicate declaration concurrent landings appended after
-// this point is removed for the same two reasons.)
 // lines above record: a `//!` line past the first item of this crate root is `E0753`.)
 // (One more copy of this file's own header landed in the tail typed with `//!`, which is
 // `E0753` past the first item and compiles no suite at all, so it stands as ordinary
@@ -5627,9 +5575,6 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (And one more such line, gone for the same reason.)
 // item, so they are gone rather than re-typed; the header at the top of this file and the
 // two guard suites carry the rule they repeated.)
-// item of a crate root that is `E0753` and compiles no suite of this target, so they are gone
-// declarations and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` the notes,
-// than leaving a note in the appended tail below.
 // lines of that fragment landed here as `//!` too, and are gone for the same reason.)
 //! Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]`/`mod`
 //! pair, keeping the list sorted. A suite no `mod` names compiles nowhere and its tests
@@ -6830,7 +6775,6 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (And more of the same: appended header copies, and notes about duplicate `mod` lines
 // earlier landings removed.)
 // (Yet more of the same, condensed away for the same reason.)
-// (Ten further lines of this file's own header landed here typed with `//!`, which is
 // `E0753` past the first item of this crate root; they are gone rather than re-typed.)
 // Declared here because the suites below exist under `tests/all/` with no `mod` for them
 // anywhere in this file: landings that removed a duplicate declaration removed both copies,
@@ -7378,10 +7322,6 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // where `all/all_rs_declares_each_suite_once.rs` and
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of them, so
 // the fragments are gone rather than re-typed. Append a DECLARATION here, not a note.)
-// (`sfn_relayed_dynamodb_request_id` and `cloudformation_provisions_cloudfront_resources` are
-// each declared ONCE above — the first further up this tail, the second in the sorted
-// CloudFormation span — so the second declaration two concurrent landings appended here is
-// gone rather than re-typed: a module declared twice is `E0428` and compiles neither copy.)
 // The notes that stood here repeated, over and over, the two rules the module doc at the
 // HEAD of this file states — each suite is declared exactly ONCE, and an inner doc comment
 // belongs only to that header — one copy per landing that merged two appended tails. They
@@ -8203,3 +8143,8 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // `#[path]`/`mod` declarations: a module may be declared only once, and an inner doc
 // comment (`//!`) is legal only before the first item, so a note belongs in the module doc
 // at the HEAD of this file and never here.)
+// (Fragments of this file's own header, and bookkeeping notes about declarations that are
+// no longer duplicated, were pruned from this tail: the rule they repeated stands in the
+// module doc at the HEAD of this file, where an inner doc comment is legal, and past the
+// first item a `//!` line is `E0753` and compiles no suite of this target. Declare each
+// suite ONCE, with its `#[path]` line, in the sorted span above.)

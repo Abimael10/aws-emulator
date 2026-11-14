@@ -42,6 +42,16 @@ pub const POLICY_DEFINITION_FORMAT_VERSION: &str = "1";
 /// caller could also grow this part of the store with nothing but fresh starts.
 pub const MAX_BUILD_WORKFLOWS_PER_POLICY: usize = 1000;
 
+/// How many removed Automated Reasoning policy revisions this store remembers, so a
+/// repeated delete of one of them is answered as the documented idempotent success.
+///
+/// The emulator's own bound rather than a published quota: an entry is added by every
+/// delete and nothing releases one, so a create-and-delete loop would grow this part of the
+/// store without end. Past the bound the LONGEST-removed revision is released first, and an
+/// ARN whose entry has been released is reported missing again — the same refusal an ARN
+/// that never named a revision is reported with.
+pub const MAX_REMOVED_AUTOMATED_REASONING_POLICY_REVISIONS: usize = 1024;
+
 /// How long a build workflow dwells in each status of its progression before the clock
 /// owes it the next one: the span from the start to [`BUILD_WORKFLOW_STATUS_PREPROCESSING`],
 /// and then the span each processing status dwells for
@@ -210,6 +220,15 @@ pub fn build_workflow_not_found_message() -> &'static str {
 /// ([`build_workflow_not_found_message`]) — the same split the guardrail has — so a caller
 /// learns which half of its request named the missing workflow.
 pub const REQUEST_BUILD_WORKFLOW_NOT_FOUND: &str = "Build workflow not found";
+
+/// What `StartAutomatedReasoningPolicyBuildWorkflow` answers as its `ValidationException`
+/// message when the `sourceContent` a start carried is not content the requested
+/// `buildWorkflowType` is built from.
+///
+/// RECORDED behaviour, and wholly FIXED text: Amazon Bedrock names neither the type the
+/// request addressed nor the form of content it carried, so the wording is the whole
+/// requirement.
+pub const BUILD_WORKFLOW_INVALID_CONTENT: &str = "Invalid content for workflow type.";
 
 /// What an unforced `DeleteAutomatedReasoningPolicy` of a policy that still holds an
 /// artifact answers as its `ValidationException` message, for the artifact `kind` that is in

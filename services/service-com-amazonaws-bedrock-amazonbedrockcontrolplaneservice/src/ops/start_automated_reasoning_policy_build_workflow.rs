@@ -17,6 +17,8 @@
 //! workflow while it builds reads each processing status in turn.
 //!
 //! An ARN naming no policy of this account is refused with `ResourceNotFoundException`, a
+//! `sourceContent` that is not content the requested `buildWorkflowType` is built from is
+//! refused with `ValidationException` ([`content_matches_workflow_type`]), a
 //! policy one build workflow is still working on is refused with `ResourceInUseException`
 //! (one build at a time per policy), a replay of the same `clientRequestToken` answers
 //! with the workflow that token already started (`@idempotencyToken`), and a policy
@@ -196,6 +198,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already completed is terminal for the checks below.
         store.settle_automated_reasoning_policy_build_workflows(&input.policy_arn, now);
 
+        // The source content a build is started from must be the content the requested
+        // workflow TYPE is built from: each form of `sourceContent$workflowContent` is
+        // documented as the content of ONE kind of workflow, so a start carrying another
+        // kind's content — or none of its own — has nothing this build could run on
+        // ([`workflow_content_form`]).
+        if !content_matches_workflow_type(&input.build_workflow_type, &input.source_content) {
+            return Err(invalid_content());
+        }
+
         // `@idempotencyToken`: a replay answers with what the first request started.
         if let Some(started) = input
             .client_request_token
@@ -316,6 +327,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// Whether the `sourceContent` a start carried is content the requested
+/// `buildWorkflowType` is built from.
+///
+/// Four forms of `AutomatedReasoningPolicyWorkflowTypeContent` are each documented as the
+/// content of ONE kind of build workflow — `documents` is "the list of documents to be
+/// processed in a document ingestion workflow", `policyRepairAssets` "the assets and
+/// instructions needed for a policy repair workflow", `generateFidelityReportContent` "the
+/// content configuration for generating a fidelity report workflow" and
+/// `iterativeRefinementContent` "content configuration to start an iterative policy
+/// refinement workflow"
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyWorkflowTypeContent")`) — so
+/// a build of one of those kinds must carry exactly its own form: another kind's content, or
+/// none at all, is content this build could not run on. A type the model names no form for
+/// is built from the policy itself, so no form of content is wrong for it and this decides
+/// nothing.
+///
+/// The `policyDefinition` beside it is NOT one of those forms: it is "an existing policy
+/// definition that serves as the starting point for the build workflow"
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyBuildWorkflowSource")`),
+/// which any kind of build may start from, so it is weighed by neither side of this rule.
+fn content_matches_workflow_type(
+    workflow_type: &str,
+    source: &AutomatedReasoningPolicyBuildWorkflowSource,
+) -> bool {
+    match workflow_content_form(workflow_type) {
+        None => true,
+        Some(required) => {
+            source.workflow_content.as_ref().map(content_form) == Some(required)
+        }
+    }
+}
+
+/// The form of `workflowContent` a build workflow of type `workflow_type` is built from, as
+/// the member documentation [`content_matches_workflow_type`] cites names the workflow kind
+/// of each one; `None` for a type the model names no form for, which is built from the
+/// policy itself rather than from content the request carries.
+fn workflow_content_form(workflow_type: &str) -> Option<&'static str> {
+    match workflow_type {
+        "INGEST_CONTENT" => Some("documents"),
+        "REFINE_POLICY" => Some("policyRepairAssets"),
+        "GENERATE_FIDELITY_REPORT" => Some("generateFidelityReportContent"),
+        "ITERATIVELY_REFINE_POLICY" => Some("iterativeRefinementContent"),
+        _ => None,
+    }
+}
+
+/// Which form of `workflowContent` a request carried, named as the model names that member.
+fn content_form(content: &AutomatedReasoningPolicyWorkflowTypeContent) -> &'static str {
+    match content {
+        AutomatedReasoningPolicyWorkflowTypeContent::Documents(_) => "documents",
+        AutomatedReasoningPolicyWorkflowTypeContent::policyRepairAssets(_) => "policyRepairAssets",
+        AutomatedReasoningPolicyWorkflowTypeContent::generateFidelityReportContent(_) => {
+            "generateFidelityReportContent"
+        }
+        AutomatedReasoningPolicyWorkflowTypeContent::iterativeRefinementContent(_) => {
+            "iterativeRefinementContent"
+        }
+    }
+}
+
 /// The source document a start's `sourceContent` carries, if any: the first entry of
 /// whichever document list its `workflowContent` names.
 ///
@@ -377,6 +448,19 @@ fn started_workflow(
         policy_arn: record.policy_arn.clone(),
         build_workflow_id: record.id.clone(),
     }
+}
+
+/// The modelled 400 `ValidationException` this operation answers for a `sourceContent` that
+/// is not content the requested `buildWorkflowType` is built from
+/// ([`content_matches_workflow_type`]), worded as Amazon Bedrock words that validation
+/// ([`crate::state::BUILD_WORKFLOW_INVALID_CONTENT`]).
+fn invalid_content() -> StartAutomatedReasoningPolicyBuildWorkflowError {
+    StartAutomatedReasoningPolicyBuildWorkflowErrorModeled::ValidationException(
+        ValidationException {
+            message: Some(crate::state::BUILD_WORKFLOW_INVALID_CONTENT.to_string()),
+        },
+    )
+    .into()
 }
 
 /// The modelled 500 this operation answers when the engine carries no store for this

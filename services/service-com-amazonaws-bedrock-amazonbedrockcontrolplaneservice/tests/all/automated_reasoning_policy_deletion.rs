@@ -13,7 +13,9 @@
 //!    name and the `clientRequestToken` the deleted policy held are free again — over
 //!    policies carrying each form of the create's optional members, and over the three
 //!    spellings of `force` (omitted, so the modelled `@default(false)` applies, `false` and
-//!    `true`), which decides nothing for a policy holding no artifact.
+//!    `true`), which decides nothing for a policy holding no artifact. Repeating the delete
+//!    of the policy that is now gone succeeds, which
+//!    `automated_reasoning_policy_delete_idempotency.rs` pins over every form of revision.
 //! 2. **A versioned ARN removes only that version**: the `:<version>` suffix
 //!    `AutomatedReasoningPolicyArn` admits selects ONE snapshot, so the draft and every
 //!    other version read back exactly as they did — for the only version of a policy and
@@ -27,9 +29,10 @@
 //!    the policy can hold — in the one sentence Amazon Bedrock words that validation with,
 //!    naming the kind in the way — leaves everything readable, and the forced delete takes
 //!    the policy and that artifact with it.
-//! 4. **An ARN naming no revision is refused**: `404 ResourceNotFoundException` over
-//!    well-formed ARNs whose policy id, whose region or whose version number names nothing,
-//!    with `force` set either way — forcing a delete does not conjure the policy.
+//! 4. **An ARN naming no revision this account ever held is refused**: `404
+//!    ResourceNotFoundException` over well-formed ARNs whose policy id, whose region or whose
+//!    version number names nothing, with `force` set either way — forcing a delete does not
+//!    conjure the policy.
 //! 5. **A policy a guardrail checks against is in use by it**: the case
 //!    `ResourceInUseException` itself documents, over the policy's unversioned and versioned
 //!    ARNs and over a reference held by the guardrail's draft and by a published version of
@@ -322,14 +325,12 @@ async fn a_deleted_policy_is_gone_from_every_read() {
             "case {case:?}: the listing must report exactly the policies that are left"
         );
 
-        // A second delete has no policy to remove, and Amazon Bedrock reports that rather
-        // than accepting it.
-        assert_refused(
+        // A second delete has no policy left to remove and succeeds anyway: the operation
+        // is `@idempotent` and documented "This operation is idempotent. If you delete a
+        // policy more than once, each call succeeds".
+        assert_accepted(
             &format!("{case}, deleted twice"),
             &delete_policy(&emu, &policy_arn, row.force).await,
-            404,
-            "ResourceNotFoundException",
-            POLICY_NOT_FOUND,
         );
 
         // The name is free again, and the `clientRequestToken` that minted the policy no
@@ -468,13 +469,11 @@ async fn a_versioned_arn_removes_only_that_version() {
             cut.body
         );
 
-        // Deleting the same version again has nothing to remove.
-        assert_refused(
+        // Deleting the same version again has nothing left to remove and succeeds anyway,
+        // by the same documented idempotency.
+        assert_accepted(
             &format!("{case}, deleted twice"),
             &delete_policy(&emu, &victim_arn, Force::True).await,
-            404,
-            "ResourceNotFoundException",
-            POLICY_VERSION_NOT_FOUND,
         );
     }
 }
@@ -664,7 +663,7 @@ async fn an_unforced_delete_takes_a_policy_whose_artifacts_are_gone() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 4. An ARN naming no revision is refused.
+// 4. An ARN naming no revision this account ever held is refused.
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]

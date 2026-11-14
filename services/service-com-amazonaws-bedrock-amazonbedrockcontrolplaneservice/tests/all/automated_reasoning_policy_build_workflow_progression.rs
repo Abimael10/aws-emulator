@@ -40,7 +40,7 @@
 
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{json, Value};
 use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::automated_reasoning_policy_test_cases::{create_policy, create_test_case, CHECK_RESULTS};
@@ -88,6 +88,40 @@ const SETTLE_SLACK: Duration = Duration::from_millis(150);
 /// form is an RFC 3339 `date-time`, so a comparison of parsed seconds carries its rounding.
 const INSTANT_TOLERANCE: f64 = 0.01;
 
+/// The `sourceContent` a start of `workflow_type` carries: the form of
+/// `AutomatedReasoningPolicyWorkflowTypeContent` the model documents as that kind of
+/// workflow's content, and the source documents a type the model names no form for is
+/// started from here
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyWorkflowTypeContent")`).
+fn source_for(workflow_type: &str) -> Value {
+    let documents = json!([{
+        "document": DOCUMENT_BLOB,
+        "documentContentType": "txt",
+        "documentName": "safety-policy.txt",
+    }]);
+    match workflow_type {
+        "REFINE_POLICY" => json!({
+            "workflowContent": {
+                "policyRepairAssets": {
+                    "annotations": [{ "addRule": { "expression": "returnWindow == Open" } }],
+                },
+            },
+        }),
+        "GENERATE_FIDELITY_REPORT" => json!({
+            "workflowContent": { "generateFidelityReportContent": { "documents": documents } },
+        }),
+        "ITERATIVELY_REFINE_POLICY" => json!({
+            "workflowContent": {
+                "iterativeRefinementContent": {
+                    "documents": documents,
+                    "feedback": "tighten the rules",
+                },
+            },
+        }),
+        _ => json!({ "workflowContent": { "documents": documents } }),
+    }
+}
+
 /// `StartAutomatedReasoningPolicyBuildWorkflow`: the `sourceContent` is the request's
 /// `@httpPayload` and the policy ARN and the workflow type are path labels.
 async fn start_build_workflow(emu: &Emulator, policy_arn: &str, workflow_type: &str) -> String {
@@ -98,15 +132,7 @@ async fn start_build_workflow(emu: &Emulator, policy_arn: &str, workflow_type: &
                 "/automated-reasoning-policies/{}/build-workflows/{workflow_type}/start",
                 label(policy_arn)
             ),
-            Some(json!({
-                "workflowContent": {
-                    "documents": [{
-                        "document": DOCUMENT_BLOB,
-                        "documentContentType": "txt",
-                        "documentName": "safety-policy.txt",
-                    }],
-                },
-            })),
+            Some(source_for(workflow_type)),
         )
         .await;
     assert_eq!(
