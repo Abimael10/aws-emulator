@@ -38,6 +38,7 @@ pub mod listener_registry;
 pub mod model_template;
 mod network;
 pub mod paging;
+pub mod parameter_mapping;
 pub mod route_request_parameters;
 pub mod route_throttle;
 pub mod selection_expression;

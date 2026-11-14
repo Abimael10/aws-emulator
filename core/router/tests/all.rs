@@ -4447,3 +4447,12 @@ mod cloudformation_appsync_custom_domains;
 // appended tail is `E0753` and compiles no suite of this target.)
 // line in this appended tail is `E0753` and compiles no suite of this target.)
 // leaving a note in the tail. (Ordinary comments, for the reason they state.)
+// leaving a note here. (Plain line comments: an inner doc comment `//!` is legal only at
+// the very start of a file, and this note sits mid-file.)
+// (A fragment of the same rule, appended here as an inner doc comment while two branches
+// were landing at once: it stands as an ordinary line comment, because `//!` before no item
+// is `E0753` and compiles no suite of this target.) This file, and every service crate's
+// `tests/all.rs`.
+// This file, and every service crate's `tests/all.rs`. (A line comment, for the reason the
+// A suite left at the top level of `tests/` fails the build. (An ordinary comment: `//!`
+// past the first item is `E0753`.)

@@ -1381,6 +1381,28 @@ fn read_integration(extension: &Node) -> Result<ImportedIntegration, String> {
         }
     }
 
+    let request_parameters = extension.string_map_member("requestParameters");
+    let response_parameters: ::std::collections::BTreeMap<
+        String,
+        ::std::collections::BTreeMap<String, String>,
+    > = extension
+        .member("responseParameters")
+        .and_then(Node::entries)
+        .unwrap_or_default()
+        .iter()
+        .map(|(selection, parameters)| (selection.clone(), parameters.scalar_entries()))
+        .collect();
+    // The same rule the create and the update hold a PARAMETER MAPPING to: a definition
+    // cannot write a mapping that operates on a header API Gateway reserves
+    // (`crate::state::parameter_mapping`). An imported api speaks HTTP, so its integrations
+    // carry the mapping language that rule is about.
+    crate::state::parameter_mapping::validate_integration_parameter_mappings(
+        crate::state::HTTP_PROTOCOL_TYPE,
+        integration_subtype.as_deref(),
+        &request_parameters,
+        &response_parameters,
+    )?;
+
     Ok(ImportedIntegration {
         integration_type,
         integration_uri,
@@ -1394,14 +1416,8 @@ fn read_integration(extension: &Node) -> Result<ImportedIntegration, String> {
         timeout_in_millis: timeout_in_millis.map(|timeout| {
             i32::try_from(timeout).unwrap_or(crate::state::DEFAULT_HTTP_TIMEOUT_MILLIS)
         }),
-        request_parameters: extension.string_map_member("requestParameters"),
-        response_parameters: extension
-            .member("responseParameters")
-            .and_then(Node::entries)
-            .unwrap_or_default()
-            .iter()
-            .map(|(selection, parameters)| (selection.clone(), parameters.scalar_entries()))
-            .collect(),
+        request_parameters,
+        response_parameters,
         server_name_to_verify: extension
             .member("tlsConfig")
             .and_then(|config| config.string_member("serverNameToVerify")),

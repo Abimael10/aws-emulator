@@ -454,6 +454,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The two maps that carry this integration's PARAMETER MAPPING, collected here so
+        // the mappings are weighed before anything is minted or written: a mapping that
+        // operates on a header API Gateway reserves is refused rather than stored
+        // (`crate::state::parameter_mapping`).
+        let request_parameters: ::std::collections::BTreeMap<String, String> =
+            input.request_parameters.unwrap_or_default().into_iter().collect();
+        let response_parameters: ::std::collections::BTreeMap<
+            String,
+            ::std::collections::BTreeMap<String, String>,
+        > = input
+            .response_parameters
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(selection, parameters)| (selection, parameters.into_iter().collect()))
+            .collect();
+        if let Err(message) =
+            crate::state::parameter_mapping::validate_integration_parameter_mappings(
+                &protocol_type,
+                input.integration_subtype.as_deref(),
+                &request_parameters,
+                &response_parameters,
+            )
+        {
+            return Err(bad_request(&message));
+        }
+
         // Bound the growth a caller drives: AWS's published quota is 300 integrations per
         // API, and `TooManyRequestsException` is the modelled error for "a limit has been
         // exceeded" (it carries the limit's name in `LimitType`).
@@ -514,14 +540,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             payload_format_version: Some(input.payload_format_version.unwrap_or_else(|| {
                 crate::state::ONLY_PAYLOAD_FORMAT_VERSION.to_string()
             })),
-            request_parameters: input.request_parameters.unwrap_or_default().into_iter().collect(),
+            request_parameters,
             request_templates: input.request_templates.unwrap_or_default().into_iter().collect(),
-            response_parameters: input
-                .response_parameters
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(selection, parameters)| (selection, parameters.into_iter().collect()))
-                .collect(),
+            response_parameters,
             template_selection_expression: input.template_selection_expression,
             // "The default timeout is 29 seconds for WebSocket APIs and 30 seconds for
             // HTTP APIs" (`CreateIntegration$TimeoutInMillis`), so the default is the

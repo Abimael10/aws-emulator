@@ -505,6 +505,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(&message));
         }
 
+        // And to the same rule for the PARAMETER MAPPING the merged record would carry: a
+        // mapping that operates on a header API Gateway reserves is refused here exactly as
+        // the create refuses it, through the gate they share
+        // (`crate::state::parameter_mapping`).
+        if let Err(message) =
+            crate::state::parameter_mapping::validate_integration_parameter_mappings(
+                &api.protocol_type,
+                updated.integration_subtype.as_deref(),
+                &updated.request_parameters,
+                &updated.response_parameters,
+            )
+        {
+            return Err(bad_request(&message));
+        }
+
         // Read the response back out of the STORE, so what the caller gets is what a
         // later GetIntegration will report. The integration exists (checked above), so
         // this replaces its record rather than minting a second one, and its

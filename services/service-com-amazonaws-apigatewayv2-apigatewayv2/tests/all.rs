@@ -147,6 +147,8 @@ mod integration_deletion;
 mod integration_lifecycle;
 #[path = "all/integration_pagination.rs"]
 mod integration_pagination;
+#[path = "all/integration_parameter_mapping.rs"]
+mod integration_parameter_mapping;
 #[path = "all/integration_response_key_grammar.rs"]
 mod integration_response_key_grammar;
 #[path = "all/integration_response_lifecycle.rs"]
