@@ -80,6 +80,16 @@ const OTHER_RULE: &str = "unrelated-events";
 /// only requests scoped to its own signing name, so no Backup request is routed any
 /// differently for their presence.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same three services on one engine, with the engine handle KEPT.
+///
+/// `pub(crate)` for the sibling suite covering what a REFUSED start publishes
+/// (`refused_job_start_publishes_no_event.rs`), which has to see what that call stored;
+/// [`emulator`] delegates here, so the services mounted are one list rather than two that
+/// can drift apart.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -92,9 +102,9 @@ pub(crate) fn emulator() -> MultiServiceRouter {
         service_com_amazonaws_eventbridge_awsevents::EmulatedService::new(Arc::clone(&engine)),
     );
     router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
-    router
+    (router, engine)
 }
 
 /// One `awsJson` RPC call against the service whose signing name is `signing_name`, the way
@@ -356,7 +366,10 @@ async fn delivered_at_least_in(
 }
 
 /// [`delivered_at_least_in`] in [`REGION`].
-async fn delivered_at_least(
+///
+/// `pub(crate)` for the sibling suite covering what a REFUSED start publishes
+/// (`refused_job_start_publishes_no_event.rs`), which waits for an envelope the same way.
+pub(crate) async fn delivered_at_least(
     router: &MultiServiceRouter,
     case: &str,
     url: &str,
