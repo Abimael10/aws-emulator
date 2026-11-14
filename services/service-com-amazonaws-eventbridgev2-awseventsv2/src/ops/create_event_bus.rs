@@ -210,40 +210,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A retry carrying the same ClientToken replays the bus that token
         // minted — identical parameters only; different ones are the mismatch
-        // the model names. The record is per region, because a bus belongs to
-        // the region its create named.
+        // the model names. The token is read off the stored bus, so a bus that
+        // is gone replays nothing and its name is free again. The lookup is per
+        // region, because a bus belongs to the region its create named.
         if let Some(token) = input.client_token.as_deref() {
-            let replay_key = crate::state::idempotency_key(&region, token);
-            if let Some(arn) = state.idempotency.get(&replay_key).cloned() {
-                if let Some(bus) = state.bus(&arn) {
-                    if !matches_stored(bus, &input) {
-                        return Err(CreateEventBusErrorModeled::IdempotentParameterMismatchException(
-                            IdempotentParameterMismatchException {
-                                message: Some(format!(
-                                    "ClientToken {token} was already used to create event bus \
-                                     {arn} with different parameters"
-                                )),
-                            },
-                        )
-                        .into());
-                    }
-                    return Ok(created_response(bus, now));
+            if let Some(bus) = state.bus_by_client_token(&region, token) {
+                if !matches_stored(bus, &input) {
+                    let arn = bus.arn.clone();
+                    return Err(CreateEventBusErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(format!(
+                                "ClientToken {token} was already used to create event bus \
+                                 {arn} with different parameters"
+                            )),
+                        },
+                    )
+                    .into());
                 }
-                // The bus that token minted is gone, so the token no longer
-                // replays anything and the name is free again.
-                state.idempotency.remove(&replay_key);
+                return Ok(created_response(bus, now));
             }
         }
 
         // A bus name is unique per account AND region, so only a bus in the
         // region this request names can collide with it.
-        if let Some(existing) = state.bus_by_name(&region, &input.name) {
+        if state.bus_by_name(&region, &input.name).is_some() {
             return Err(CreateEventBusErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!(
-                        "event bus {} already exists as {}",
-                        input.name, existing.arn
-                    )),
+                    // The wording of this error class, which names nothing of
+                    // the request or of the store.
+                    message: Some(crate::state::RESOURCE_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -317,12 +312,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_sequence_number: 1,
         };
 
-        if let Some(token) = input.client_token.as_deref() {
-            // Keyed with the bus's own region, so a token used against another
-            // region records a create of its own.
-            let replay_key = crate::state::idempotency_key(&bus.region, token);
-            state.idempotency.insert(replay_key, arn.clone());
-        }
+        // The bus carries its own `ClientToken` (above), which is the replay
+        // record a later retry is matched against, so there is nothing else to
+        // write here.
         state.event_buses.insert(arn.clone(), bus);
         let stored = state
             .bus(&arn)

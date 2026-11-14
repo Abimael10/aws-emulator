@@ -4368,3 +4368,9 @@ mod cloudformation_appsync_custom_domains;
 // (Twelve more lines of this file's own header were appended here as INNER doc comments,
 // which is `E0753` past the first item and compiles no suite of this target; they are gone
 // rather than re-typed, because the rule they repeat stands in the module doc at the HEAD
+// Declared in this same head region, for the reason the entry above records: the mail
+// it here. (`sfn_relayed_dynamodb_request_id` is declared ONCE as well, a few lines above in
+// this same tail, for the same reason.)
+// tails landed down here; ordinary comments, because an inner doc comment may only appear
+// before any item.)
+// comment is only legal before the first item, so this fragment landed in the tail as `//!`

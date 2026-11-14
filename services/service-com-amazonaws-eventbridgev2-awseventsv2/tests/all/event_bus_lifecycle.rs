@@ -831,6 +831,76 @@ async fn a_client_token_replays_only_an_identical_request() {
     }
 }
 
+/// RULE: the replay record of a `ClientToken` is the resource that token
+/// minted, so it never outlives it — once the bus is gone the same token mints a
+/// NEW bus instead of replaying one, and the store keeps nothing behind for it,
+/// so repeating a create/delete cycle under the same or a fresh token leaves the
+/// registry exactly where it started rather than growing a record per cycle.
+#[tokio::test]
+async fn a_client_token_record_never_outlives_the_bus_it_minted() {
+    let harness = Harness::new();
+    let mut minted: Vec<String> = Vec::new();
+
+    // Rows: the recycled token, and a fresh token each round — the two ways a
+    // caller repeats a create/delete cycle.
+    for round in 0..4 {
+        for (label, token) in [
+            ("recycled token", "a-recycled-token".to_string()),
+            ("fresh token", format!("a-fresh-token-{round}")),
+        ] {
+            let case = format!("{label}, round {round}");
+            let arn = harness
+                .create(CreateEventBusInput {
+                    name: format!("recycled-bus-{label}").replace(' ', "-"),
+                    client_token: Some(token.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_else(|e| panic!("case {case:?}: CreateEventBus must succeed, got {e:?}"))
+                .event_bus_arn
+                .unwrap_or_else(|| panic!("case {case:?}: the create must report an EventBusArn"));
+            assert!(
+                !minted.contains(&arn),
+                "case {case:?}: the bus the token minted is gone, so the create must mint a \
+                 NEW bus, got one already seen: {arn:?}"
+            );
+            minted.push(arn.clone());
+
+            harness.await_bus_state(&case, &arn, "ACTIVE").await;
+            harness
+                .delete(&arn)
+                .await
+                .unwrap_or_else(|e| panic!("case {case:?}: DeleteEventBus must succeed, got {e:?}"));
+
+            // Wait for the CONDITION, not for a duration: the deletion having
+            // completed, which a later call is what materialises. Polling
+            // through `DescribeEventBus` is what settles what the clock owes.
+            let deadline = std::time::Instant::now() + POLL_DEADLINE;
+            while harness.describe(&arn).await.is_ok() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "case {case:?}: the deleted bus never disappeared"
+                );
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            assert!(
+                harness.store().lock().event_buses.is_empty(),
+                "case {case:?}: the deleted bus must leave nothing in the registry, got {} \
+                 stored",
+                harness.store().lock().event_buses.len()
+            );
+            assert!(
+                harness
+                    .store()
+                    .lock()
+                    .bus_by_client_token(REGION, &token)
+                    .is_none(),
+                "case {case:?}: the token's replay record must go with the bus it minted"
+            );
+        }
+    }
+}
+
 /// RULE: `ListEventBuses` enumerates every stored bus that passes its filters,
 /// in name order, in pages of at most `MaxResults`, and the `NextToken` of a
 /// page resumes exactly where that page stopped — so following the tokens yields

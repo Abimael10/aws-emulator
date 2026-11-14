@@ -228,43 +228,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A retry carrying the same ClientToken replays the EventSource that
         // token minted — identical parameters only; different ones are the
-        // mismatch the model names. The record is per region, because an
-        // EventSource belongs to the region of its bus.
+        // mismatch the model names. The token is read off the stored source, so
+        // a source that is gone replays nothing and its name is free again. The
+        // lookup is per region, because an EventSource belongs to the region of
+        // its bus.
         if let Some(token) = input.client_token.as_deref() {
-            let replay_key = crate::state::idempotency_key(&region, token);
-            if let Some(arn) = state.event_source_idempotency.get(&replay_key).cloned() {
-                if let Some(source) = state.event_source(&arn) {
-                    if !matches_stored(source, &input) {
-                        return Err(
-                            CreateEventSourceErrorModeled::IdempotentParameterMismatchException(
-                                IdempotentParameterMismatchException {
-                                    message: Some(format!(
-                                        "ClientToken {token} was already used to create event \
-                                         source {arn} with different parameters"
-                                    )),
-                                },
-                            )
-                            .into(),
-                        );
-                    }
-                    return Ok(created_response(source));
+            if let Some(source) = state.event_source_by_client_token(&region, token) {
+                if !matches_stored(source, &input) {
+                    let arn = source.arn.clone();
+                    return Err(
+                        CreateEventSourceErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: Some(format!(
+                                    "ClientToken {token} was already used to create event \
+                                     source {arn} with different parameters"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
                 }
-                // The source that token minted is gone, so the token no longer
-                // replays anything and the name is free again.
-                state.event_source_idempotency.remove(&replay_key);
+                return Ok(created_response(source));
             }
         }
 
         // An EventSource name is unique per account AND region, the way a bus
         // name is, so only a source in the region of this request's bus can
         // collide with it.
-        if let Some(existing) = state.event_source_by_name(&region, &input.name) {
+        if state.event_source_by_name(&region, &input.name).is_some() {
             return Err(CreateEventSourceErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!(
-                        "event source {} already exists as {}",
-                        input.name, existing.arn
-                    )),
+                    // The wording of this error class, which names nothing of
+                    // the request or of the store.
+                    message: Some(crate::state::RESOURCE_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -318,12 +314,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_token: input.client_token.clone(),
         };
 
-        if let Some(token) = input.client_token.as_deref() {
-            let replay_key = crate::state::idempotency_key(&region, token);
-            state
-                .event_source_idempotency
-                .insert(replay_key, arn.clone());
-        }
+        // The source carries its own `ClientToken` (above), which is the replay
+        // record a later retry is matched against, so there is nothing else to
+        // write here.
         state.event_sources.insert(arn.clone(), source);
         let stored = state
             .event_source(&arn)

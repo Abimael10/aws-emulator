@@ -78,9 +78,9 @@ pub const MAX_EMULATED_REGIONS: usize = 10;
 
 /// The most event buses one emulator process holds across every region, which is
 /// what actually bounds [`ComAmazonawsEventbridgev2Awseventsv2State::event_buses`]
-/// (and with it `idempotency`, which holds at most one client token per stored
-/// bus). A create past it answers the same modelled `LimitExceededException` as
-/// the per-region quota.
+/// (and with it every replay record, because a client token is held by the bus it
+/// minted rather than in a table of its own). A create past it answers the same
+/// modelled `LimitExceededException` as the per-region quota.
 pub const MAX_EVENT_BUSES_PER_EMULATOR: usize = MAX_EVENT_BUSES * MAX_EMULATED_REGIONS;
 
 /// The retention period an event bus holds when the create that minted it named
@@ -100,6 +100,18 @@ pub const DEFAULT_RETENTION_PERIOD_IN_DAYS: i32 = 1;
 /// any caller could grow one process's heap without limit. Reaching it does not
 /// fail a publish; the oldest events simply stop being readable.
 pub const MAX_STORED_EVENTS_PER_BUS: usize = 10_000;
+
+/// The whole `Message` of a `ResourceAlreadyExistsException`, wherever this
+/// service raises it: a name collision on an event bus, an event source or a
+/// subscriber.
+///
+/// The message of this error class is FIXED text — the service names neither the
+/// colliding name nor the resource that already holds it, so nothing of the
+/// request or of the store is interpolated into it, and the identity of the
+/// existing resource is read with a describe or a list rather than parsed out of
+/// an error. It is named once here because every handler that refuses a
+/// collision must word it the same way.
+pub const RESOURCE_ALREADY_EXISTS_MESSAGE: &str = "Resource already exists";
 
 /// Lifecycle state of a stored event bus, as the `BusState` enum words it on the
 /// wire. Only the states this slice can produce are modelled here; the failure
@@ -303,26 +315,12 @@ pub struct ComAmazonawsEventbridgev2Awseventsv2State {
     /// Buses keyed by `EventBusArn`, so an ARN-addressed read is O(log n) and
     /// enumeration is in a stable order.
     pub event_buses: BTreeMap<String, EventBus>,
-    /// [`idempotency_key`] -> the `EventBusArn` the create carrying that client
-    /// token minted, which is what makes a retry replay the original bus
-    /// instead of minting a second one.
-    pub idempotency: BTreeMap<String, String>,
     /// EventSources keyed by `EventSourceArn`, so an ARN-addressed read is
     /// O(log n) and enumeration is in a stable order.
     pub event_sources: BTreeMap<String, EventSource>,
-    /// [`idempotency_key`] -> the `EventSourceArn` the create carrying that
-    /// client token minted. Kept apart from [`Self::idempotency`] because a
-    /// client token is scoped to the request that carried it: the same token
-    /// used for a bus and for an EventSource names two different resources.
-    pub event_source_idempotency: BTreeMap<String, String>,
     /// Subscribers keyed by `SubscriberArn`, so an ARN-addressed read is
     /// O(log n) and enumeration is in a stable order.
     pub subscribers: BTreeMap<String, Subscriber>,
-    /// [`idempotency_key`] -> the `SubscriberArn` the create carrying that
-    /// client token minted. Kept apart from the other two records for the
-    /// reason [`Self::event_source_idempotency`] gives: a client token is
-    /// scoped to the request that carried it.
-    pub subscriber_idempotency: BTreeMap<String, String>,
     /// How many service-assigned identifiers this store has handed out.
     ///
     /// This is what makes every minted id UNIQUE: [`Self::next_id_seed`] hands
@@ -368,7 +366,6 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
         }
         for arn in completed_deletions {
             self.event_buses.remove(&arn);
-            self.idempotency.retain(|_, minted| *minted != arn);
             // An EventSource forwards onto one bus, so it goes with the bus.
             self.forget_event_sources_of_bus(&arn);
             // A subscriber is created on one bus, so it goes with the bus too.
@@ -390,6 +387,20 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
         self.event_buses
             .values()
             .find(|bus| bus.region == region && bus.name == name)
+    }
+
+    /// The bus a create carrying this client token in this region minted, or
+    /// `None` when no such bus is stored — which is what makes a retry replay
+    /// the original bus instead of minting a second one.
+    ///
+    /// The record is the BUS: a client token is read off the bus that carried
+    /// it, so the replay index is the registry itself. There is no table beside
+    /// it that a caller could grow by creating and deleting under a fresh token
+    /// each time, and no record can outlive the resource it replays.
+    pub fn bus_by_client_token(&self, region: &str, client_token: &str) -> Option<&EventBus> {
+        self.event_buses.values().find(|bus| {
+            bus.region == region && bus.client_token.as_deref() == Some(client_token)
+        })
     }
 
     /// The next identifier seed, handed out exactly once.
@@ -444,18 +455,6 @@ fn is_region_shaped(region: &str) -> bool {
         && region.split('-').all(|part| {
             !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         })
-}
-
-/// The key a `ClientToken` replay is remembered under: the token AND the region
-/// the request named.
-///
-/// A bus belongs to one region, so the same token used against two regions is
-/// two different creates — replaying the first region's bus for the second would
-/// answer with a bus the caller cannot address. The unit separator cannot occur
-/// in either part: `ClientToken` is `[\u0021-\u007E]+` and a region segment is
-/// `[a-z][a-z0-9]*(-[a-z0-9]+)*`.
-pub fn idempotency_key(region: &str, client_token: &str) -> String {
-    format!("{region}\u{1f}{client_token}")
 }
 
 /// Mint the ARN of a bus: `arn:aws:events:<region>:<account>:event-busv2/<name>/<id>`,

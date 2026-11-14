@@ -224,6 +224,22 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
             .find(|source| source.region == region && source.name == name)
     }
 
+    /// The EventSource a create carrying this client token in this region
+    /// minted, or `None` when no such source is stored.
+    ///
+    /// The record is the SOURCE: a client token is read off the source that
+    /// carried it, so the replay index is the registry itself — nothing beside
+    /// it can grow, and no record can outlive the resource it replays.
+    pub fn event_source_by_client_token(
+        &self,
+        region: &str,
+        client_token: &str,
+    ) -> Option<&EventSource> {
+        self.event_sources.values().find(|source| {
+            source.region == region && source.client_token.as_deref() == Some(client_token)
+        })
+    }
+
     /// How many EventSources forward onto this bus.
     pub fn event_sources_of_bus(&self, event_bus_arn: &str) -> usize {
         self.event_sources
@@ -232,11 +248,11 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
             .count()
     }
 
-    /// Forget the EventSources of a bus that has finished disappearing, and the
-    /// client tokens that replayed them.
+    /// Forget the EventSources of a bus that has finished disappearing.
     ///
     /// An EventSource forwards onto one bus, so it cannot outlive that bus: a
-    /// source left behind would name a bus no read can resolve.
+    /// source left behind would name a bus no read can resolve. Its client
+    /// token goes with it, because the token is held by the source itself.
     pub fn forget_event_sources_of_bus(&mut self, event_bus_arn: &str) {
         let orphaned: Vec<String> = self
             .event_sources
@@ -246,8 +262,6 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
             .collect();
         for arn in orphaned {
             self.event_sources.remove(&arn);
-            self.event_source_idempotency
-                .retain(|_, minted| *minted != arn);
         }
     }
 }

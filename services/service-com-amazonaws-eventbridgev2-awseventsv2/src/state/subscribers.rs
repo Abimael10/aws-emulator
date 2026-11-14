@@ -574,6 +574,23 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
             .find(|subscriber| subscriber.region == region && subscriber.name == name)
     }
 
+    /// The subscriber a create carrying this client token in this region
+    /// minted, or `None` when no such subscriber is stored.
+    ///
+    /// The record is the SUBSCRIBER: a client token is read off the subscriber
+    /// that carried it, so the replay index is the registry itself — nothing
+    /// beside it can grow, and no record can outlive the resource it replays.
+    pub fn subscriber_by_client_token(
+        &self,
+        region: &str,
+        client_token: &str,
+    ) -> Option<&Subscriber> {
+        self.subscribers.values().find(|subscriber| {
+            subscriber.region == region
+                && subscriber.client_token.as_deref() == Some(client_token)
+        })
+    }
+
     /// Take what the subscriber `arn` is owed right now, advancing its position
     /// past the events handed back.
     ///
@@ -629,11 +646,11 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
             .collect()
     }
 
-    /// Forget the subscribers of a bus that has finished disappearing, and the
-    /// client tokens that replayed them.
+    /// Forget the subscribers of a bus that has finished disappearing.
     ///
     /// A subscriber is created ON one bus, so it cannot outlive that bus: one
-    /// left behind would name a bus no read can resolve.
+    /// left behind would name a bus no read can resolve. Its client token goes
+    /// with it, because the token is held by the subscriber itself.
     pub fn forget_subscribers_of_bus(&mut self, event_bus_arn: &str) {
         let orphaned: Vec<String> = self
             .subscribers
@@ -643,7 +660,6 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
             .collect();
         for arn in orphaned {
             self.subscribers.remove(&arn);
-            self.subscriber_idempotency.retain(|_, minted| *minted != arn);
         }
     }
 }

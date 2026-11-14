@@ -318,49 +318,44 @@ fn create(
 
     // A retry carrying the same ClientToken replays the subscriber that
     // token minted — identical parameters only; different ones are the
-    // mismatch the model names. The record is per region, because a
-    // subscriber belongs to the region of its bus.
+    // mismatch the model names. The token is read off the stored subscriber, so
+    // one that is gone replays nothing and its name is free again. The lookup
+    // is per region, because a subscriber belongs to the region of its bus.
     if let Some(token) = input.client_token.as_deref() {
-        let replay_key = crate::state::idempotency_key(&region, token);
-        if let Some(arn) = state.subscriber_idempotency.get(&replay_key).cloned() {
-            if let Some(subscriber) = state.subscriber(&arn) {
-                if !matches_stored(subscriber, input) {
-                    return Err(
-                        CreateSubscriberErrorModeled::IdempotentParameterMismatchException(
-                            IdempotentParameterMismatchException {
-                                message: Some(format!(
-                                    "ClientToken {token} was already used to create \
-                                     subscriber {arn} with different parameters"
-                                )),
-                            },
-                        )
-                        .into(),
-                    );
-                }
-                // A replay mints nothing and so makes nothing newly due: the
-                // subscriber the token already minted was handed its backlog
-                // when it was created.
-                return Ok(Created {
-                    response: created_response(subscriber),
-                    due: Vec::new(),
-                });
+        if let Some(subscriber) = state.subscriber_by_client_token(&region, token) {
+            if !matches_stored(subscriber, input) {
+                let arn = subscriber.arn.clone();
+                return Err(
+                    CreateSubscriberErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(format!(
+                                "ClientToken {token} was already used to create \
+                                 subscriber {arn} with different parameters"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
             }
-            // The subscriber that token minted is gone, so the token no
-            // longer replays anything and the name is free again.
-            state.subscriber_idempotency.remove(&replay_key);
+            // A replay mints nothing and so makes nothing newly due: the
+            // subscriber the token already minted was handed its backlog
+            // when it was created.
+            return Ok(Created {
+                response: created_response(subscriber),
+                due: Vec::new(),
+            });
         }
     }
 
     // A `SubscriberArn` names a subscriber by its name and a minted id
     // alone, so a subscriber name is unique per account AND region: only a
     // subscriber in the region of this request's bus can collide with it.
-    if let Some(existing) = state.subscriber_by_name(&region, &input.name) {
+    if state.subscriber_by_name(&region, &input.name).is_some() {
         return Err(CreateSubscriberErrorModeled::ResourceAlreadyExistsException(
             ResourceAlreadyExistsException {
-                message: Some(format!(
-                    "subscriber {} already exists as {}",
-                    input.name, existing.arn
-                )),
+                // The wording of this error class, which names nothing of the
+                // request or of the store.
+                message: Some(crate::state::RESOURCE_ALREADY_EXISTS_MESSAGE.to_string()),
             },
         )
         .into());
@@ -437,10 +432,9 @@ fn create(
         next_sequence_number,
     };
 
-    if let Some(token) = input.client_token.as_deref() {
-        let replay_key = crate::state::idempotency_key(&region, token);
-        state.subscriber_idempotency.insert(replay_key, arn.clone());
-    }
+    // The subscriber carries its own `ClientToken` (above), which is the replay
+    // record a later retry is matched against, so there is nothing else to write
+    // here.
     state.subscribers.insert(arn.clone(), subscriber);
     let stored = state
         .subscriber(&arn)

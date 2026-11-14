@@ -857,7 +857,16 @@ async fn describe_refuses_an_event_source_that_is_not_stored() {
         .expect("CreateEventSource must report an EventSourceArn");
 
     harness.delete_bus(&bus).await;
-    tokio::time::sleep(past_the_lifecycle_span()).await;
+    // Wait for the CONDITION the rows below need — the bus's deletion having
+    // completed, so the source it held is gone — rather than for a duration.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while harness.describe_source(&source).await.is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case \"bus deleted under it\": the source must disappear with the bus that held it"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let never = format!(
         "arn:aws:events:{REGION}:{ACCOUNT}:event-sourcev2/aws.service/absent/\
@@ -886,13 +895,14 @@ async fn describe_refuses_an_event_source_that_is_not_stored() {
         );
     }
 
-    // The token that minted the forgotten source replays nothing either.
+    // The token that minted the forgotten source replays nothing either: the
+    // replay record is the source itself, and the source is gone.
     assert!(
         harness
             .store()
             .lock()
-            .event_source_idempotency
-            .is_empty(),
+            .event_source_by_client_token(REGION, "transient-token")
+            .is_none(),
         "case \"bus deleted under it\": the replay record must go with the source"
     );
 }
