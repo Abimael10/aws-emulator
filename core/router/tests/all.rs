@@ -4849,3 +4849,36 @@ mod bedrock_agentcore_gateway_mcp_transport_path;
 // header.)
 // (Written with `//` on purpose: an inner doc comment past the first item is `E0753`.)
 // line below is an ordinary comment.)
+// Declared here, in this same head region, for the reason the entry above records: which role a
+// CloudWatch Logs subscription delivery is authorized against, and what that role must allow,
+// is decided by CloudWatch Logs, IAM and the destination's own service at once, so no single
+// service crate's test target can set the permissions and then read the destination.
+#[path = "all/logs_subscription_delivery_role_scope.rs"]
+mod logs_subscription_delivery_role_scope;
+// (The Pricing Plan Manager subscription-eligibility suite is declared ONCE, in the appended
+// tail beside the SESv2 event-destination suite, which is where the landing that owns it put
+// its declaration: a module declared twice is `E0428` and compiles no suite of this target,
+// so the head-region copy that stood here is gone rather than kept beside it.)
+// this file: two landings in the same window each declared it here as well, and a module
+// declared twice is `E0428`, which compiles neither copy.)
+// (That Pricing Plan Manager suite stands declared ONCE, in the head region of this file: the
+// copy that was appended here again is gone, a module declared twice being `E0428`.)
+// (`autoscaling_plans_policies_reach_application_auto_scaling` is declared ONCE, in the head
+// region of this file: two landings in the same window each declared it here as well, and a
+// module declared twice is `E0428`, which compiles neither copy.)
+// comment is legal only before the first item of a crate root, so this fragment of the header
+// cannot carry `//!` down here.)
+// suite left at the top level of `tests/` fails the build. (An ordinary comment: a `//!` line
+// anywhere but this file's head is `E0753` and compiles no suite of this target.)
+// leaving a note in the tail. (Which is why these six lines are ordinary comments.)
+// leaving a note in the tail. (Which is why these seven lines are ordinary comments.)
+// declarations, for this file and for every service crate's `tests/all.rs`. (Which is why
+// these four lines are ordinary comments rather than the inner doc comment they landed as.)
+// reason the line above records.)
+// leaving a note here. (Six ordinary comments: the `//!` form these lines landed in is
+// `E0753` past the first item.)
+// appended to the tail of this file would compile no suite of this target. (Seven
+// ordinary comments, for the reason they themselves state.)
+// leaving a note in the appended tail below, where an inner doc comment is `E0753`. (An
+// ordinary comment, for the reason it itself states.)
+// and compiles nothing. (Five ordinary comments, for the reason they state.)
