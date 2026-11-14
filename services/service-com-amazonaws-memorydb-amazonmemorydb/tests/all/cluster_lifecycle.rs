@@ -134,6 +134,18 @@ pub(crate) fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The `Message` of a failure body, under either spelling the wire uses for it.
+///
+/// `pub(crate)` beside [`error_code`], so a suite asserting on a refusal's wording reads
+/// the message the same way every other suite does.
+pub(crate) fn error_message(body: &Value, case: &str) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a message in {body}"))
+        .to_string()
+}
+
 /// Create an ACL, the step a client takes before it creates clusters. No wait: an
 /// ACL's status gates nothing, and only the suite that asserts the settle pays for it.
 async fn acl(router: &MultiServiceRouter, name: &str) {

@@ -226,11 +226,10 @@ pub fn delete_workflow_version_not_found_message(
 /// of the modelled `ResourceNotFoundException` for that retry says: to a delete, a spent
 /// share is simply not there, even though `GetShare` still reports its terminal status.
 ///
-/// The variable part is the share id the REQUEST carried; stated once because every share
-/// operation answering that condition words it the same way.
-pub fn share_not_found_message(share_id: &str) -> String {
-    format!("Share {share_id} not found")
-}
+/// The service words this refusal as FIXED text that echoes no id back: the sentence names
+/// the kind of resource that was requested and nothing of the request. Stated once because
+/// every share operation answering that condition words it the same way.
+pub const SHARE_NOT_FOUND_MESSAGE: &str = "Requested share not found";
 
 /// What `CreateShare` answers when the resource the request offers is not one this
 /// emulator holds.

@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(DeleteShareErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: crate::state::share_not_found_message(&input.share_id),
+                    message: crate::state::SHARE_NOT_FOUND_MESSAGE.to_string(),
                 },
             )
             .into());

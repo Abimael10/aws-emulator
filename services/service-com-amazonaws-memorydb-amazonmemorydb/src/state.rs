@@ -553,16 +553,20 @@ impl EngineVersion {
 /// about a parameter and what an update enforces for it cannot disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterDomain {
-    /// A whole number, at least `min` and — when the engine publishes an upper bound —
-    /// at most `max`.
-    Integer { min: i64, max: Option<i64> },
+    /// A whole number, at least `min` and at most `max`, where a `None` end is a
+    /// direction the service publishes NO bound in.
+    ///
+    /// Both ends are open-ended in their own right: a setting the engine reads a
+    /// negative value of as an instruction of its own publishes no lower bound, exactly
+    /// as a setting with no ceiling publishes no upper one.
+    Integer { min: Option<i64>, max: Option<i64> },
     /// A whole number from one of several DISJOINT ranges, in the order the engine
-    /// publishes them, each `(min, max)` with `None` for an open-ended top.
+    /// publishes them, each `(min, max)` with the same open-ended ends.
     ///
     /// Not every numeric setting takes one contiguous range: `timeout` takes 0 (never
     /// close an idle connection) or 20 seconds and up, which the service publishes as
     /// `0,20-`. A single-value range is published as that value alone.
-    IntegerRanges(&'static [(i64, Option<i64>)]),
+    IntegerRanges(&'static [(Option<i64>, Option<i64>)]),
     /// One of a fixed set of tokens, in the order the engine documents them.
     Tokens(&'static [&'static str]),
     /// Free text: a parameter the engine itself parses (a flag string, or a size that
@@ -584,7 +588,7 @@ impl ParameterDomain {
     /// One source for both the published `AllowedValues` and the accept/refuse
     /// decision, so what the service says a parameter takes and what it actually takes
     /// cannot drift apart.
-    fn number_ranges(&self) -> Vec<(i64, Option<i64>)> {
+    fn number_ranges(&self) -> Vec<(Option<i64>, Option<i64>)> {
         match self {
             Self::Integer { min, max } => vec![(*min, *max)],
             Self::IntegerRanges(ranges) => ranges.to_vec(),
@@ -593,9 +597,11 @@ impl ParameterDomain {
     }
 
     /// `Parameter$AllowedValues`, rendered the way MemoryDB publishes it: `<min>-<max>`
-    /// for a number (an open-ended range keeps the trailing hyphen, a single-value one
-    /// is just that value, and several ranges are comma-separated) and a
-    /// comma-separated list for a token set.
+    /// for a number, where an end the service publishes no bound for is simply ABSENT
+    /// from its side of the hyphen (so a range open at the top keeps the trailing
+    /// hyphen, one open at the bottom keeps the leading one, and a range open at both
+    /// ends is the bare hyphen), a single-value range is just that value, several
+    /// ranges are comma-separated, and a token set is a comma-separated list.
     ///
     /// `None` for free text: the service publishes no value set for a parameter the
     /// engine parses itself, so the member is ABSENT rather than an empty string a
@@ -605,10 +611,13 @@ impl ParameterDomain {
             Self::Integer { .. } | Self::IntegerRanges(_) => Some(
                 self.number_ranges()
                     .iter()
-                    .map(|(min, max)| match max {
-                        Some(max) if max == min => format!("{min}"),
-                        Some(max) => format!("{min}-{max}"),
-                        None => format!("{min}-"),
+                    .map(|(min, max)| match (min, max) {
+                        (Some(min), Some(max)) if min == max => format!("{min}"),
+                        (min, max) => format!(
+                            "{}-{}",
+                            min.map(|min| min.to_string()).unwrap_or_default(),
+                            max.map(|max| max.to_string()).unwrap_or_default(),
+                        ),
                     })
                     .collect::<Vec<String>>()
                     .join(","),
@@ -632,10 +641,9 @@ impl ParameterDomain {
                     return Err(format!("invalid integer value: {value}"));
                 };
                 let ranges = self.number_ranges();
-                if ranges
-                    .iter()
-                    .any(|(min, max)| number >= *min && max.is_none_or(|max| number <= max))
-                {
+                if ranges.iter().any(|(min, max)| {
+                    min.is_none_or(|min| number >= min) && max.is_none_or(|max| number <= max)
+                }) {
                     return Ok(());
                 }
                 Err(format!(
@@ -1059,10 +1067,12 @@ pub mod parameter_source {
 /// (`default.memorydb-redis6`, `default.memorydb-redis7`, `default.memorydb-valkey7` —
 /// one per family [`ENGINE_VERSIONS`] publishes), whose settings and defaults are the
 /// Redis OSS / Valkey engine defaults of the corresponding engine line, plus the settings
-/// MemoryDB adds itself. Each `description` and each published value range is SERVICE
-/// data — the same for every account — so it is the catalog's own text and bounds rather
-/// than a paraphrase of them. `since`/`until` record which engine line a setting belongs
-/// to, which is what makes one family's listing differ from another's.
+/// MemoryDB adds itself. Each `description` and each published value domain is SERVICE
+/// data — one fixed string and one fixed value domain per setting name, the same for
+/// every account — so each entry carries the text and the bounds the service publishes
+/// for that name WORD FOR WORD rather than a paraphrase or a tightened range of them.
+/// `since`/`until` record which engine line a setting belongs to, which is what makes one
+/// family's listing differ from another's.
 ///
 /// Every entry is modifiable: MemoryDB's `Parameter` shape models no `IsModifiable`
 /// member, and the settings MemoryDB manages itself (`maxmemory`, `cluster-enabled`,
@@ -1073,7 +1083,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "acllog-max-len",
         default_value: "128",
         description: "The maximum length of the ACL Log",
-        domain: ParameterDomain::Integer { min: 1, max: Some(10_000) },
+        domain: ParameterDomain::Integer { min: Some(1), max: Some(10_000) },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1081,7 +1091,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "active-defrag-cycle-max",
         default_value: "75",
         description: "Maximal effort for defrag in CPU percentage",
-        domain: ParameterDomain::Integer { min: 1, max: Some(75) },
+        domain: ParameterDomain::Integer { min: Some(1), max: Some(75) },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1089,7 +1099,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "active-defrag-cycle-min",
         default_value: "5",
         description: "Minimal effort for defrag in CPU percentage",
-        domain: ParameterDomain::Integer { min: 1, max: Some(75) },
+        domain: ParameterDomain::Integer { min: Some(1), max: Some(75) },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1097,7 +1107,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "active-defrag-ignore-bytes",
         default_value: "104857600",
         description: "Minimum amount of fragmentation waste to start active defrag",
-        domain: ParameterDomain::Integer { min: 1_048_576, max: None },
+        domain: ParameterDomain::Integer { min: Some(1_048_576), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1106,7 +1116,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "1000",
         description: "Maximum number of set/hash/zset/list fields that will be \
                       processed from the main dictionary scan",
-        domain: ParameterDomain::Integer { min: 1, max: Some(1_000_000) },
+        domain: ParameterDomain::Integer { min: Some(1), max: Some(1_000_000) },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1114,7 +1124,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "active-defrag-threshold-lower",
         default_value: "10",
         description: "Minimum percentage of fragmentation to start active defrag",
-        domain: ParameterDomain::Integer { min: 1, max: Some(100) },
+        domain: ParameterDomain::Integer { min: Some(1), max: Some(100) },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1122,7 +1132,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "active-defrag-threshold-upper",
         default_value: "100",
         description: "Maximum percentage of fragmentation at which we use maximum effort",
-        domain: ParameterDomain::Integer { min: 1, max: Some(100) },
+        domain: ParameterDomain::Integer { min: Some(1), max: Some(100) },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1147,7 +1157,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "1",
         description: "The amount of effort that redis uses to expire items in the \
                       active expiration job",
-        domain: ParameterDomain::Integer { min: 1, max: Some(10) },
+        domain: ParameterDomain::Integer { min: Some(1), max: Some(10) },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1160,7 +1170,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "client-output-buffer-limit-normal-hard-limit",
         default_value: "0",
         description: "Normal client output buffer hard limit in bytes",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1168,7 +1178,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "client-output-buffer-limit-normal-soft-limit",
         default_value: "0",
         description: "Normal client output buffer soft limit in bytes",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1176,7 +1186,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "client-output-buffer-limit-normal-soft-seconds",
         default_value: "0",
         description: "Normal client output buffer soft limit in seconds",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1184,7 +1194,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "client-output-buffer-limit-pubsub-hard-limit",
         default_value: "33554432",
         description: "Pubsub client output buffer hard limit in bytes",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1192,7 +1202,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "client-output-buffer-limit-pubsub-soft-limit",
         default_value: "8388608",
         description: "Pubsub client output buffer soft limit in bytes",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1200,7 +1210,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "client-output-buffer-limit-pubsub-soft-seconds",
         default_value: "60",
         description: "Pubsub client output buffer soft limit in seconds",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1208,7 +1218,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "hll-sparse-max-bytes",
         default_value: "3000",
         description: "HyperLogLog sparse representation bytes limit",
-        domain: ParameterDomain::Integer { min: 1, max: Some(16_000) },
+        domain: ParameterDomain::Integer { min: Some(1), max: Some(16_000) },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1250,7 +1260,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "1",
         description: "The amount of time in minutes to decrement the key counter for \
                       LFU eviction policyd",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1259,7 +1269,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "10",
         description: "The log factor for incrementing key counter for LFU eviction \
                       policy",
-        domain: ParameterDomain::Integer { min: 1, max: None },
+        domain: ParameterDomain::Integer { min: Some(1), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1269,7 +1279,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         description: "Number of quicklist ziplist nodes from each side of the list to \
                       exclude from compression. The head and tail of the list are \
                       always uncompressed for fast push/pop operations",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1285,7 +1295,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "maxmemory-samples",
         default_value: "3",
         description: "Max memory samples",
-        domain: ParameterDomain::Integer { min: 1, max: None },
+        domain: ParameterDomain::Integer { min: Some(1), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1302,7 +1312,10 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "proto-max-bulk-len",
         default_value: "536870912",
         description: "The largest single request or bulk reply, in bytes",
-        domain: ParameterDomain::Integer { min: 1_048_576, max: Some(536_870_912) },
+        domain: ParameterDomain::Integer {
+            min: Some(1_048_576),
+            max: Some(536_870_912),
+        },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1311,26 +1324,31 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "512",
         description: "The limit in the size of the set in order for the dataset to be \
                       compressed",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "slowlog-log-slower-than",
         default_value: "10000",
-        description: "The execution time threshold (in microseconds) above which a \
-                      command is logged in the slow log",
-        // A command slower than this is logged, and the service caps what a caller may
-        // ask for at one second: a threshold above that would log nothing at all.
-        domain: ParameterDomain::Integer { min: 0, max: Some(1_000_000) },
+        description: "The execution time, in microseconds, to exceed in order for the \
+                      command to get logged. Note that a negative number disables the \
+                      slow log, while a value of zero forces the logging of every \
+                      command",
+        // A command slower than this is logged, zero logs every command and a negative
+        // value disables the log altogether, so the service publishes no bound in either
+        // direction for it.
+        domain: ParameterDomain::Integer { min: None, max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "slowlog-max-len",
         default_value: "128",
-        description: "The maximum length of the slow log",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        description: "The length of the slow log. There is no limit to this length. Just \
+                      be aware that it will consume memory. You can reclaim memory used \
+                      by the slow log with SLOWLOG RESET.",
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1338,7 +1356,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "stream-node-max-bytes",
         default_value: "4096",
         description: "The maximum size of a single node in a stream in bytes",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1346,7 +1364,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "stream-node-max-entries",
         default_value: "100",
         description: "The maximum number of items a single node in a stream can contain",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1354,7 +1372,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "tcp-keepalive",
         default_value: "300",
         description: "If non-zero, send ACKs every given number of seconds",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1366,15 +1384,16 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         // Published as `0,20-`: the engine either never closes an idle connection (0)
         // or waits at least 20 seconds, so the seconds between are not a value the
         // parameter takes.
-        domain: ParameterDomain::IntegerRanges(&[(0, Some(0)), (20, None)]),
+        domain: ParameterDomain::IntegerRanges(&[(Some(0), Some(0)), (Some(20), None)]),
         since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "tracking-table-max-keys",
         default_value: "1000000",
-        description: "The maximum number of keys in the invalidation table",
-        domain: ParameterDomain::Integer { min: 1, max: Some(100_000_000) },
+        description: "The maximum number of keys allowed for the tracking table for \
+                      client side caching",
+        domain: ParameterDomain::Integer { min: Some(1), max: Some(100_000_000) },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1384,7 +1403,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "512",
         description: "The maximum number of hash entries in order for the dataset to be \
                       compressed",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: Some(GENERATION_REDIS7),
     },
@@ -1393,7 +1412,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "64",
         description: "The threshold of biggest hash entries in order for the dataset to \
                       be compressed",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: Some(GENERATION_REDIS7),
     },
@@ -1402,7 +1421,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "128",
         description: "The maximum number of list entries in order for the dataset to be \
                       compressed",
-        domain: ParameterDomain::Integer { min: 1, max: None },
+        domain: ParameterDomain::Integer { min: Some(1), max: None },
         since: GENERATION_REDIS6,
         until: Some(GENERATION_REDIS7),
     },
@@ -1410,7 +1429,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "lua-time-limit",
         default_value: "5000",
         description: "Max execution time of a Lua script in milliseconds",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: Some(GENERATION_REDIS7),
     },
@@ -1419,7 +1438,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "128",
         description: "The maximum number of sorted set entries in order for the dataset \
                       to be compressed",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: Some(GENERATION_REDIS7),
     },
@@ -1428,7 +1447,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "64",
         description: "The threshold of biggest sorted set entries in order for the \
                       dataset to be compressed",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS6,
         until: Some(GENERATION_REDIS7),
     },
@@ -1438,7 +1457,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "5000",
         description: "The milliseconds a script may run before the engine starts \
                       answering BUSY to other clients",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS7,
         until: None,
     },
@@ -1447,7 +1466,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "512",
         description: "The maximum number of hash entries in order for the dataset to be \
                       compressed",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS7,
         until: None,
     },
@@ -1456,7 +1475,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "64",
         description: "The threshold of biggest hash entries in order for the dataset to \
                       be compressed",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS7,
         until: None,
     },
@@ -1476,7 +1495,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "128",
         description: "The maximum number of list entries in order for the dataset to be \
                       compressed",
-        domain: ParameterDomain::Integer { min: 1, max: None },
+        domain: ParameterDomain::Integer { min: Some(1), max: None },
         since: GENERATION_REDIS7,
         until: None,
     },
@@ -1494,7 +1513,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "128",
         description: "The maximum number of set entries in order for the dataset to be \
                       compressed",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS7,
         until: None,
     },
@@ -1503,7 +1522,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "64",
         description: "The threshold of biggest set entries in order for the dataset to \
                       be compressed",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS7,
         until: None,
     },
@@ -1512,7 +1531,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "128",
         description: "The maximum number of sorted set entries in order for the dataset \
                       to be compressed",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS7,
         until: None,
     },
@@ -1521,7 +1540,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "64",
         description: "The threshold of biggest sorted set entries in order for the \
                       dataset to be compressed",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: Some(0), max: None },
         since: GENERATION_REDIS7,
         until: None,
     },
@@ -1532,7 +1551,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: SEARCH_ENABLED_PARAMETER,
         default_value: NO,
-        description: "Enables or disables search",
+        description: "When set to yes, it enables search capabilities.",
         // A boolean engine setting, spelled the way the engine's own configuration
         // spells its booleans: the service publishes `yes,no` for it and takes those two
         // tokens, which is also what the search baseline's own group description reports
@@ -1544,10 +1563,11 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "search-query-timeout-ms",
         default_value: "10000",
-        description: "The timeout in milliseconds for search queries",
-        // A timeout bounds a query, so it is at least one millisecond; the service
-        // publishes no upper bound for it.
-        domain: ParameterDomain::Integer { min: 1, max: None },
+        description: "The maximum amount of time in milliseconds that a search query is \
+                      allowed to run.",
+        // A timeout bounds a query, so it is at least one millisecond, and the service
+        // caps how long a single search query may be allowed to run.
+        domain: ParameterDomain::Integer { min: Some(1), max: Some(60_000) },
         since: GENERATION_VALKEY,
         until: None,
     },

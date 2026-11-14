@@ -23,6 +23,7 @@ use service_com_amazonaws_memorydb_amazonmemorydb::state::PARAMETER_PAGE_SIZE_WI
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{call, error_code, ok, router};
+use crate::parameters::default_group_name;
 
 /// The region the suite's requests are signed for (the shared harness signs for it), so
 /// the ARN a default group reports must carry it rather than a baked-in region.
@@ -88,12 +89,6 @@ async fn catalog_families(router: &MultiServiceRouter) -> BTreeSet<String> {
         "the catalog must report at least one parameter group family"
     );
     families
-}
-
-/// The name of the default parameter group of `family`, derived the way a client derives
-/// it: `default.` + the family with underscores written as hyphens.
-fn default_group_name(family: &str) -> String {
-    format!("default.{}", family.replace('_', "-"))
 }
 
 /// `DescribeParameters` over every page of `group`, as `(Name, Value)` pairs in answer

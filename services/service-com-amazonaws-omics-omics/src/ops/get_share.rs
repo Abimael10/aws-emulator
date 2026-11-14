@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(&input.share_id),
             );
             GetShareErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::share_not_found_message(&input.share_id),
+                message: crate::state::SHARE_NOT_FOUND_MESSAGE.to_string(),
             })
         })?;
         crate::state::audit(

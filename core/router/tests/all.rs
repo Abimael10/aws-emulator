@@ -4808,3 +4808,11 @@ mod bedrock_agentcore_gateway_mcp_transport_path;
 // a note in the tail.
 // leaving a note here. (Six more lines of that header fragment, ordinary comments for the
 // leaving a note in the appended tail below, where an inner doc comment is `E0753`.
+// (Declared ONCE, further up this file: a module may be declared only once, and two
+// landings in the same window each kept a copy of this line.)
+// each target. (Declared ONCE, in the sorted span at the head of this file: two landings in
+// the same window each appended a declaration of it here, and a module declared twice
+// compiles neither copy.)
+// it scales. (Declared ONCE, in the sorted span at the head of this file: two landings in
+// (`cloudwatch_cfn_alarm_action_topic_policy` is declared ONCE, further up this file: a
+// module may be declared only once, and two landings each kept a copy of this line.)

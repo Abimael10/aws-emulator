@@ -31,7 +31,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{call, error_code, ok, router};
-use crate::parameters::{create_group, field, parameters, update};
+use crate::parameters::{
+    carries, create_group, default_group_name, field, is_valkey, parameters, update, Lines,
+};
 
 /// One engine release this service publishes.
 ///
@@ -79,24 +81,6 @@ const RELEASES: &[Release] = &[
     },
 ];
 
-/// Which engine lines carry one setting.
-///
-/// Source: the engine default parameters this service publishes
-/// (`crate::state::ENGINE_PARAMETERS`), whose `since`/`until` say which line a setting
-/// belongs to: the Redis OSS 6 line renamed its collection-encoding settings in Redis OSS
-/// 7.0, and the vector-search settings are MemoryDB's own on its Valkey-backed families.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lines {
-    /// Every family the catalog publishes.
-    Every,
-    /// Only the Redis OSS 6 line (the setting was renamed or replaced after it).
-    Redis6Only,
-    /// The Redis OSS 7 line and the Valkey line after it.
-    Redis7Onwards,
-    /// Only the Valkey-backed families.
-    ValkeyOnly,
-}
-
 /// One row of the published setting catalog: a setting, and the lines carrying it.
 ///
 /// Rows the issue cited and rows it did not (`maxmemory-samples`, `lfu-log-factor`,
@@ -133,30 +117,9 @@ const SOURCE_SYSTEM: &str = "system";
 /// `Parameter$Source`: the value is one a caller persisted on this group.
 const SOURCE_USER: &str = "user";
 
-/// Whether `family` is one of the service's Valkey-backed families.
-fn is_valkey(family: &str) -> bool {
-    family.starts_with("memorydb_valkey")
-}
-
-/// Whether a family of `family` carries the setting of `lines`.
-fn carries(family: &str, lines: Lines) -> bool {
-    match lines {
-        Lines::Every => true,
-        Lines::Redis6Only => family == "memorydb_redis6",
-        Lines::Redis7Onwards => family != "memorydb_redis6",
-        Lines::ValkeyOnly => is_valkey(family),
-    }
-}
-
 /// The families the published releases name, each once.
 fn families() -> BTreeSet<&'static str> {
     RELEASES.iter().map(|release| release.family).collect()
-}
-
-/// The name of the parameter group MemoryDB itself provides for `family`, derived the way
-/// a client derives it: `default.` + the family with underscores written as hyphens.
-fn default_group_name(family: &str) -> String {
-    format!("default.{}", family.replace('_', "-"))
 }
 
 /// The patch version of the earliest release the catalog publishes for `family` — what

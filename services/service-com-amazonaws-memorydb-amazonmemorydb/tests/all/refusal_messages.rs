@@ -41,7 +41,7 @@ use service_com_amazonaws_memorydb_amazonmemorydb::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::cluster_lifecycle::{call, error_code, ok, router};
+use crate::cluster_lifecycle::{call, error_code, error_message, ok, router};
 
 /// Longer than the service's `SETTLE_AFTER`, so a resource reported in a transient
 /// status is certainly due its terminal one by the time the test looks again. The
@@ -74,15 +74,6 @@ enum Subject {
     LabelAndVerdict,
     /// The request member the name arrived in, followed by that verdict.
     Member(&'static str),
-}
-
-/// The `Message` of a failure body, under either spelling of the member.
-fn error_message(body: &Value, case: &str) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("case {case:?}: expected a message in {body}"))
-        .to_string()
 }
 
 /// Call an operation that must be refused, and return `(status, code, message)`.
@@ -715,13 +706,21 @@ async fn published_parameters(
 /// The first number an integer parameter's published `AllowedValues` names — the start
 /// of its lowest range — so one BELOW it is a value that domain cannot hold, whatever
 /// shape the rest of it has.
-fn lowest_published_bound(allowed: &str, case: &str) -> i64 {
-    allowed
+///
+/// `None` when the lowest range is open at the bottom (the service publishes no lower
+/// bound at all for the parameter), where no value lies below what it accepts.
+fn lowest_published_bound(allowed: &str, case: &str) -> Option<i64> {
+    let lowest = allowed
         .split(',')
         .next()
         .and_then(|range| range.split('-').next())
-        .and_then(|min| min.parse::<i64>().ok())
-        .unwrap_or_else(|| panic!("case {case:?}: expected a numeric bound in {allowed:?}"))
+        .unwrap_or_else(|| panic!("case {case:?}: expected a range in {allowed:?}"));
+    if lowest.is_empty() {
+        return None;
+    }
+    Some(lowest.parse::<i64>().unwrap_or_else(|_| {
+        panic!("case {case:?}: expected a numeric bound in {allowed:?}")
+    }))
 }
 
 /// A parameter-value refusal is built from the `AllowedValues` the service itself
@@ -764,8 +763,20 @@ async fn a_parameter_value_refusal_is_built_from_the_published_allowed_values() 
                     "case {case:?}: expected the service's integer-parse sentence"
                 );
                 // Outside every published range: the refusal names the value and the
-                // range the service publishes for it.
-                let outside = (lowest_published_bound(allowed, &case) - 1).to_string();
+                // range the service publishes for it. A domain the service publishes no
+                // lower bound for has no value below it to refuse, so what it holds
+                // instead is checked: the negative value is accepted.
+                let Some(lowest) = lowest_published_bound(allowed, &case) else {
+                    let (status, answered) =
+                        update_parameters(&router, GROUP, &[(name, "-1")]).await;
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: a domain open at the bottom must accept -1, got \
+                         {status} with {answered}"
+                    );
+                    continue;
+                };
+                let outside = (lowest - 1).to_string();
                 let (status, answered) =
                     update_parameters(&router, GROUP, &[(name, outside.as_str())]).await;
                 assert_eq!(

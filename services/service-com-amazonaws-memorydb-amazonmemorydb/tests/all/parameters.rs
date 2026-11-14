@@ -148,6 +148,48 @@ async fn published_versions(router: &MultiServiceRouter) -> Vec<(String, String,
         .collect()
 }
 
+/// Which engine lines carry one setting.
+///
+/// Source: the engine default parameters this service publishes
+/// (`crate::state::ENGINE_PARAMETERS`), whose `since`/`until` say which line a setting
+/// belongs to: the Redis OSS 6 line renamed its collection-encoding settings in Redis OSS
+/// 7.0, and the vector-search settings are MemoryDB's own on its Valkey-backed families.
+///
+/// `pub(crate)` with the two helpers below, so every parameter suite reads ONE mapping of
+/// family to engine line rather than keeping a copy that can drift from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lines {
+    /// Every family the catalog publishes.
+    Every,
+    /// Only the Redis OSS 6 line (the setting was renamed or replaced after it).
+    Redis6Only,
+    /// The Redis OSS 7 line and the Valkey line after it.
+    Redis7Onwards,
+    /// Only the Valkey-backed families.
+    ValkeyOnly,
+}
+
+/// Whether `family` is one of the service's Valkey-backed families.
+pub(crate) fn is_valkey(family: &str) -> bool {
+    family.starts_with("memorydb_valkey")
+}
+
+/// Whether a family of `family` carries the setting of `lines`.
+pub(crate) fn carries(family: &str, lines: Lines) -> bool {
+    match lines {
+        Lines::Every => true,
+        Lines::Redis6Only => family == "memorydb_redis6",
+        Lines::Redis7Onwards => family != "memorydb_redis6",
+        Lines::ValkeyOnly => is_valkey(family),
+    }
+}
+
+/// The name of the parameter group MemoryDB itself provides for `family`, derived the way
+/// a client derives it: `default.` + the family with underscores written as hyphens.
+pub(crate) fn default_group_name(family: &str) -> String {
+    format!("default.{}", family.replace('_', "-"))
+}
+
 /// Create one parameter group of `family`, named after the case.
 ///
 /// `pub(crate)` so the catalog suite drives the same helpers rather than standing up a
@@ -240,13 +282,18 @@ pub(crate) fn field(parameter: &Value, member: &str, case: &str) -> String {
 /// The domain a reported parameter publishes, parsed from its `DataType` and
 /// `AllowedValues`.
 ///
-/// The catalog publishes no negative bound, so a numeric domain is a comma-separated
-/// list of ranges, each `"<min>-<max>"`, the open-ended `"<min>-"` or a single value
-/// (`timeout` publishes `0,20-`); a token set is comma-separated; free text publishes no
-/// `AllowedValues` member at all.
+/// A numeric domain is a comma-separated list of ranges, each `"<min>-<max>"` with an
+/// end the service publishes no bound for left EMPTY on its side of the hyphen (so
+/// `"<min>-"` is open at the top, `"-<max>"` open at the bottom and a bare `"-"` open at
+/// both), or a single value (`timeout` publishes `0,20-`); a token set is
+/// comma-separated; free text publishes no `AllowedValues` member at all.
+///
+/// The catalog publishes no range whose lower bound is itself a negative NUMBER, and such
+/// a range would fail the numeric parse below loudly rather than be read as something
+/// else, because the remainder would not parse as one whole number.
 #[derive(Debug, PartialEq, Eq)]
 enum Domain {
-    Ranges(Vec<(i64, Option<i64>)>),
+    Ranges(Vec<(Option<i64>, Option<i64>)>),
     Tokens(Vec<String>),
     Text,
 }
@@ -273,19 +320,23 @@ fn domain_of(parameter: &Value, case: &str) -> Domain {
             .split(',')
             .map(|part| {
                 let (min, max) = match part.split_once('-') {
-                    // `"<min>-<max>"`, or the open-ended `"<min>-"`.
-                    Some((min, max)) => (min, if max.is_empty() { None } else { Some(max) }),
+                    // `"<min>-<max>"`, with either end empty when the service publishes
+                    // no bound in that direction.
+                    Some((min, max)) => (
+                        if min.is_empty() { None } else { Some(min) },
+                        if max.is_empty() { None } else { Some(max) },
+                    ),
                     // A single published value is its own one-value range.
-                    None => (part, Some(part)),
+                    None => (Some(part), Some(part)),
                 };
                 let number = |text: &str| {
                     text.parse::<i64>().unwrap_or_else(|_| {
                         panic!("case {case:?}: expected a numeric bound in {allowed:?}")
                     })
                 };
-                (number(min), max.map(number))
+                (min.map(number), max.map(number))
             })
-            .collect::<Vec<(i64, Option<i64>)>>();
+            .collect::<Vec<(Option<i64>, Option<i64>)>>();
         assert!(
             !ranges.is_empty(),
             "case {case:?}: an integer parameter must publish a range, got {allowed:?}"
@@ -387,10 +438,9 @@ async fn a_groups_parameters_are_the_engine_defaults_of_its_family() {
                         panic!("case {case:?}: expected an integer value, got {value:?}")
                     });
                     assert!(
-                        ranges
-                            .iter()
-                            .any(|(min, max)| number >= *min
-                                && max.is_none_or(|max| number <= max)),
+                        ranges.iter().any(|(min, max)| min
+                            .is_none_or(|min| number >= min)
+                            && max.is_none_or(|max| number <= max)),
                         "case {case:?}: the default {value:?} must lie in {ranges:?}"
                     );
                 }
@@ -641,7 +691,7 @@ async fn every_published_bound_is_accepted_and_one_past_it_is_refused() {
                 // reports.
                 let bounds: Vec<i64> = ranges
                     .iter()
-                    .flat_map(|(min, max)| [Some(*min), *max].into_iter().flatten())
+                    .flat_map(|(min, max)| [*min, *max].into_iter().flatten())
                     .collect();
                 for bound in bounds {
                     let value = bound.to_string();
@@ -660,12 +710,32 @@ async fn every_published_bound_is_accepted_and_one_past_it_is_refused() {
                         reported[&name]
                     );
                 }
+                // A range the service publishes no lower bound for holds every value
+                // below the ones it names, so a negative value belongs to the domain
+                // rather than past it.
+                if ranges[0].0.is_none() {
+                    let value = "-1";
+                    let (status, answered) = update(&router, GROUP, &[(&name, value)]).await;
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: a domain open at the bottom must accept {value}, \
+                         got {status} with {answered}"
+                    );
+                    assert_eq!(
+                        parameters(&router, GROUP).await[&name]["Value"],
+                        json!(value),
+                        "case {case:?}: expected {value} to persist"
+                    );
+                }
                 // Outside what the parameter publishes: below the first minimum, inside
                 // any gap between two published ranges, and above a closed top bound.
                 let accepted = parameters(&router, GROUP).await[&name]["Value"].clone();
-                let mut past: Vec<i64> = vec![ranges[0].0 - 1];
+                // A range open at the bottom has no value below it to probe.
+                let mut past: Vec<i64> = ranges[0].0.map(|min| min - 1).into_iter().collect();
                 for window in ranges.windows(2) {
-                    let gap_top = window[1].0 - 1;
+                    let Some(gap_top) = window[1].0.map(|min| min - 1) else {
+                        continue;
+                    };
                     if window[0].1.is_some_and(|max| gap_top > max) {
                         past.push(gap_top);
                     }

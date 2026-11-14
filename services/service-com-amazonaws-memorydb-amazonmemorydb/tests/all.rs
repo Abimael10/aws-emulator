@@ -47,6 +47,8 @@ mod parameter_group_reset;
 mod parameter_groups;
 #[path = "all/parameters.rs"]
 mod parameters;
+#[path = "all/published_parameter_metadata.rs"]
+mod published_parameter_metadata;
 #[path = "all/refusal_fault_codes.rs"]
 mod refusal_fault_codes;
 #[path = "all/refusal_messages.rs"]

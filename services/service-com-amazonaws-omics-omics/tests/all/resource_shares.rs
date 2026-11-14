@@ -50,6 +50,15 @@ const SHARE_STATUSES: &[&str] = &[
 /// Source: the `shareName` member of `CreateShareRequest`.
 const SHARE_NAME_MAX: usize = 256;
 
+/// The sentence the service answers a share operation with when the share the request
+/// names is not one it can act on.
+///
+/// Source: the recorded `ResourceNotFoundException` of `DeleteShare` for an id no share
+/// carries — fixed text that names the kind of resource requested and echoes nothing of
+/// the request, so it is written out here rather than read from the emulator's own
+/// constant.
+const SHARE_NOT_FOUND_SENTENCE: &str = "Requested share not found";
+
 /// Accounts a share can be offered to: twelve-digit ids (the account-id form
 /// `service_common::arn::is_account_id` reads), none of them the account this emulator
 /// serves (which is the resource owner and so cannot be a subscriber).
@@ -365,6 +374,12 @@ async fn a_share_settles_to_deleted_on_the_clock() {
             "ResourceNotFoundException",
             "case {case:?}: expected ResourceNotFoundException, got {response:?}"
         );
+        assert_eq!(
+            response.get("message").and_then(Value::as_str),
+            Some(SHARE_NOT_FOUND_SENTENCE),
+            "case {case:?}: a spent share is refused in the same words as one no share \
+             carries, got {response:?}"
+        );
         let after = share_details(&router, case, &share_id).await;
         assert_eq!(
             after.get("status").and_then(Value::as_str),
@@ -425,6 +440,23 @@ async fn an_unknown_share_is_not_found() {
                 "ResourceNotFoundException",
                 "case {id:?}: expected ResourceNotFoundException from {operation}, \
                  got {body:?}"
+            );
+            // The service words this refusal as FIXED text: it names the kind of
+            // resource requested and echoes nothing of the request, so the same
+            // sentence answers every id above and both operations.
+            assert_eq!(
+                body.get("message").and_then(Value::as_str),
+                Some(SHARE_NOT_FOUND_SENTENCE),
+                "case {id:?}: expected the service's share not-found sentence from \
+                 {operation}, got {body:?}"
+            );
+            assert!(
+                !body
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .contains(id.as_str()),
+                "case {id:?}: the refusal must not echo the requested id, got {body:?}"
             );
         }
     }
