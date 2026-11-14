@@ -5,9 +5,10 @@
 //! endpoint AppSync serves the domain through, minted from this service's own state,
 //! plus the certificate and description the request named. The certificate side of the
 //! rule lives in [`crate::state::certificate_region_refusal`] (the one Region a custom
-//! domain's distribution reads a certificate from) and
-//! [`crate::state::certificate_coverage_refusal`] (whether that certificate covers the
-//! name the domain is created under).
+//! domain's distribution reads a certificate from),
+//! [`crate::state::certificate_provenance_refusal`] (whether Certificate Manager issued
+//! that certificate at all) and [`crate::state::certificate_coverage_refusal`] (whether
+//! that certificate covers the name the domain is created under).
 //!
 //! ## Shape of an operation
 //!
@@ -176,6 +177,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved: a certificate the distribution serving this domain could never
         // read cannot be attached to it, whatever name the create asks for.
         if let Some(message) = crate::state::certificate_region_refusal(&input.certificate_arn) {
+            return Err(CreateDomainNameErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // Nor can a certificate this account did not get from Certificate Manager: the
+        // distribution serving the domain presents only certificates that service ISSUED,
+        // so one a client imported — whoever signed it — could never terminate the
+        // handshake on this name. Read in the service that holds the certificate
+        // ([`crate::state::certificate_provenance_refusal`]), before the coverage of the
+        // name is asked about: a certificate that cannot be attached at all is refused
+        // whatever names it carries.
+        if let Some(message) =
+            crate::state::certificate_provenance_refusal(&*self.engine, &input.certificate_arn)
+        {
             return Err(CreateDomainNameErrorModeled::BadRequestException(BadRequestException {
                 message: Some(message),
                 ..Default::default()

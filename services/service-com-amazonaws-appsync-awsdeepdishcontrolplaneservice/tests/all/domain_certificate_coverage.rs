@@ -16,12 +16,14 @@
 //! wildcard, the wildcard itself, another letter case) rather than only along the one pair
 //! that exposed the defect.
 //!
-//! Every certificate is a certificate Certificate Manager really holds: it is minted here
-//! and imported through that service's own `ImportCertificate` on the same engine, and the
-//! name set each one covers is read back with its own `DescribeCertificate`, so no row
-//! rests on a record this file wrote. An ARN that service resolves nothing for is the
-//! row that pins the other half of the rule: a name is never refused on evidence that is
-//! not there.
+//! Every certificate is a certificate Certificate Manager really holds: it is requested
+//! through that service's own `RequestCertificate` on the same engine, and the name set each
+//! one covers is read back with its own `DescribeCertificate`, so no row rests on a record
+//! this file wrote. They are REQUESTED rather than imported because a custom domain is only
+//! served with a certificate that service issued — which is a rule of its own, asserted in
+//! `domain_certificate_provenance` — so an imported one would be refused before its names
+//! were ever looked at. An ARN that service resolves nothing for is the row that pins the
+//! other half of the rule: a name is never refused on evidence that is not there.
 
 use std::sync::Arc;
 
@@ -31,7 +33,7 @@ use service_com_amazonaws_appsync_awsdeepdishcontrolplaneservice::EmulatedServic
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region a custom domain's certificate is read from, which is the Region every
-/// certificate here is imported at. Source: the service's own
+/// certificate here is requested at. Source: the service's own
 /// `state::CERTIFICATE_REGION`.
 const REGION: &str = "us-east-1";
 
@@ -142,60 +144,32 @@ async fn acm_call(router: &MultiServiceRouter, operation: &str, body: Value) -> 
     dispatch(router, request).await
 }
 
-/// A real self-signed certificate covering `names`, as the PEM pair `ImportCertificate`
-/// takes: the leaf and the private key that matches it. The first name is also the subject
-/// common name, which is the name Certificate Manager reports as the certificate's own.
-fn minted(names: &[&str]) -> (String, String) {
-    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key pair");
-    let mut params = rcgen::CertificateParams::new(
-        names
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect::<Vec<String>>(),
-    )
-    .expect("certificate parameters");
-    let mut subject = rcgen::DistinguishedName::new();
-    subject.push(
-        rcgen::DnType::CommonName,
-        *names.first().expect("a certificate covers at least one name"),
-    );
-    params.distinguished_name = subject;
-    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
-    params.not_after = rcgen::date_time_ymd(2100, 1, 1);
-    let certificate = params
-        .self_signed(&key)
-        .expect("a self-signed certificate")
-        .pem();
-    (certificate, key.serialize_pem())
-}
-
-/// Import a certificate covering `names` into Certificate Manager through that service's
-/// own `ImportCertificate`, and answer the ARN it was stored under.
+/// Request a certificate covering `names` from Certificate Manager through that service's
+/// own `RequestCertificate`, and answer the ARN it was stored under: the first name is the
+/// certificate's own `DomainName` and the rest its subject alternative names.
 ///
 /// The stored certificate is read back with that service's own `DescribeCertificate` and
 /// its `SubjectAlternativeNames` asserted to be the names handed in, so a row's
 /// expectation rests on the name set Certificate Manager holds.
-async fn imported(router: &MultiServiceRouter, names: &[&str]) -> String {
-    let (certificate, private_key) = minted(names);
-    let answer = acm_call(
-        router,
-        "ImportCertificate",
-        json!({
-            "Certificate": ::aws_smithy_types::base64::encode(certificate.as_bytes()),
-            "PrivateKey": ::aws_smithy_types::base64::encode(private_key.as_bytes()),
-        }),
-    )
-    .await;
+async fn issued(router: &MultiServiceRouter, names: &[&str]) -> String {
+    let (domain_name, alternatives) = names
+        .split_first()
+        .expect("a certificate covers at least one name");
+    let mut request = json!({"DomainName": domain_name, "ValidationMethod": "DNS"});
+    if !alternatives.is_empty() {
+        request["SubjectAlternativeNames"] = json!(alternatives);
+    }
+    let answer = acm_call(router, "RequestCertificate", request).await;
     assert_eq!(
         answer.status, 200,
-        "case ImportCertificate({names:?}): expected 200, got {} with {:?}",
+        "case RequestCertificate({names:?}): expected 200, got {} with {:?}",
         answer.status, answer.body
     );
     let arn = answer.body["CertificateArn"]
         .as_str()
         .unwrap_or_else(|| {
             panic!(
-                "case ImportCertificate({names:?}): expected a CertificateArn, got {:?}",
+                "case RequestCertificate({names:?}): expected a CertificateArn, got {:?}",
                 answer.body
             )
         })
@@ -221,7 +195,7 @@ async fn imported(router: &MultiServiceRouter, names: &[&str]) -> String {
     let expected: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
     assert_eq!(
         held, expected,
-        "case DescribeCertificate({arn}): expected the imported name set {expected:?}, got \
+        "case DescribeCertificate({arn}): expected the requested name set {expected:?}, got \
          {held:?}"
     );
     arn
@@ -256,7 +230,7 @@ const TWO_NAMES_ALTERNATIVE: &str = "alternative.appsync-domain-test.com";
 /// The apex [`CertificateChoice::Wildcard`]'s single wildcard name sits over.
 const WILDCARD_APEX: &str = "wild.appsync-domain-test.com";
 
-/// A certificate id no import mints (Certificate Manager mints a random one), so the ARN
+/// A certificate id no request mints (Certificate Manager mints a random one), so the ARN
 /// built from it resolves to nothing in the account.
 const NIL_CERTIFICATE_ID: &str = "00000000-0000-0000-0000-000000000000";
 
@@ -270,12 +244,12 @@ struct Certificates {
 }
 
 impl Certificates {
-    /// Import the three real certificates and build the two ARNs that resolve to nothing.
-    async fn imported(router: &MultiServiceRouter) -> Self {
+    /// Request the three real certificates and build the two ARNs that resolve to nothing.
+    async fn issued(router: &MultiServiceRouter) -> Self {
         Self {
-            one_name: imported(router, &[ONE_NAME]).await,
-            two_names: imported(router, &[TWO_NAMES_SUBJECT, TWO_NAMES_ALTERNATIVE]).await,
-            wildcard: imported(router, &[&format!("*.{WILDCARD_APEX}")]).await,
+            one_name: issued(router, &[ONE_NAME]).await,
+            two_names: issued(router, &[TWO_NAMES_SUBJECT, TWO_NAMES_ALTERNATIVE]).await,
+            wildcard: issued(router, &[&format!("*.{WILDCARD_APEX}")]).await,
             unresolvable: format!(
                 "arn:aws:acm:{REGION}:{ACCOUNT}:certificate/{NIL_CERTIFICATE_ID}"
             ),
@@ -431,7 +405,7 @@ fn message(answer: &Answer) -> &str {
 #[tokio::test]
 async fn create_domain_name_requires_a_certificate_that_covers_the_domain() {
     let router = router();
-    let certificates = Certificates::imported(&router).await;
+    let certificates = Certificates::issued(&router).await;
 
     for row in rows() {
         let arn = certificates.arn(row.certificate);
@@ -510,7 +484,7 @@ async fn create_domain_name_requires_a_certificate_that_covers_the_domain() {
 #[tokio::test]
 async fn get_api_association_reports_an_unassociated_domain() {
     let router = router();
-    let certificates = Certificates::imported(&router).await;
+    let certificates = Certificates::issued(&router).await;
 
     let created = create_domain(&router, ONE_NAME, &certificates.one_name).await;
     assert_eq!(

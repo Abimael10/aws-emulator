@@ -233,16 +233,40 @@ enum Addressed {
     Account,
 }
 
-/// The child space of an API that carries its environment variables, and the one child
-/// space of this service that no ARN spelling of its own covers — neither this service's
-/// own ARN builders nor the resource types IAM publishes for it name an environment
-/// variable set — so a call addressing it is judged by its URI path ([`Addressed::Path`]).
+/// The child space of an API that carries its environment variables.
 ///
 /// Source: `smithy_query(query="operation",
 /// operation="GetGraphqlApiEnvironmentVariables,PutGraphqlApiEnvironmentVariables")` — both
 /// are bound to `/v1/apis/{apiId}/environmentVariables`, and no other operation of this
 /// service is bound under this segment.
 const ENVIRONMENT_VARIABLES_SEGMENT: &str = "environmentVariables";
+
+/// The child space of an API that carries its CACHE: the instance `CreateApiCache` enables
+/// and `GetApiCache`, `UpdateApiCache` and `DeleteApiCache` address, under
+/// `/v{n}/apis/{apiId}/ApiCaches` (`UpdateApiCache` one segment deeper).
+///
+/// Source: `smithy_query(query="operation",
+/// operation="CreateApiCache,GetApiCache,UpdateApiCache,DeleteApiCache")`.
+const API_CACHES_SEGMENT: &str = "ApiCaches";
+
+/// The child space of an API that carries the FLUSH of its cache — `DELETE
+/// /v{n}/apis/{apiId}/FlushCache` (`smithy_query(query="operation",
+/// operation="FlushApiCache")`), the one call that empties the instance.
+const FLUSH_CACHE_SEGMENT: &str = "FlushCache";
+
+/// Every child space of an API that no ARN spelling of this service covers — neither this
+/// service's own ARN builders nor the resource types IAM publishes for it name one — so a
+/// call addressing one is judged by its URI path ([`Addressed::Path`]) rather than by the
+/// ARN of the API above it.
+///
+/// Two of them: an API's environment-variable SET, and its CACHE — which is configuration
+/// of the API rather than a resource of this service anything addresses by an ARN, so the
+/// only spelling that identifies what such a call acts on is the call's own URI.
+const UNSPELLED_CHILD_SEGMENTS: &[&str] = &[
+    ENVIRONMENT_VARIABLES_SEGMENT,
+    API_CACHES_SEGMENT,
+    FLUSH_CACHE_SEGMENT,
+];
 
 /// The member a create names the custom domain it is about to create by, which is where
 /// that request carries the resource its URI does not.
@@ -323,7 +347,7 @@ fn named(
 /// COLLECTION rather than one member of it is judged against the parent it collects under,
 /// which is the resource such a call names.
 ///
-/// A child that no ARN spelling covers ([`ENVIRONMENT_VARIABLES_SEGMENT`]) is named by the
+/// A child that no ARN spelling covers ([`UNSPELLED_CHILD_SEGMENTS`]) is named by the
 /// request's own URI path instead: there is no ARN of it to judge the call by, and the path
 /// is the only spelling that identifies it — so a policy written about the parent API does
 /// not reach it, and one written about the path does.
@@ -352,14 +376,18 @@ fn addressed(
             let Some(api_id) = segment(2) else {
                 return Addressed::Account;
             };
-            // The one child space with no ARN spelling of its own, which the request's URI
-            // path identifies instead. Rebuilt from the decoded segments, so the resource
-            // the decision is taken about does not depend on how the caller escaped them.
-            if segment(3).as_deref() == Some(ENVIRONMENT_VARIABLES_SEGMENT) {
+            // A child space with no ARN spelling of its own, which the request's URI path
+            // identifies instead — the path of the SPACE, rebuilt from the decoded segments
+            // so the resource the decision is taken about does not depend on how the caller
+            // escaped them. A segment deeper than the space itself is left out: it names
+            // the CALL rather than another resource (`…/ApiCaches/update` is the update of
+            // the one cache `…/ApiCaches` addresses), so one policy statement about the
+            // space covers every call on it.
+            if let Some(child) = segment(3)
+                .filter(|child| UNSPELLED_CHILD_SEGMENTS.contains(&child.as_str()))
+            {
                 let version = segment(0).unwrap_or_default();
-                return Addressed::Path(format!(
-                    "/{version}/apis/{api_id}/{ENVIRONMENT_VARIABLES_SEGMENT}"
-                ));
+                return Addressed::Path(format!("/{version}/apis/{api_id}/{child}"));
             }
             Addressed::Resource(match (segment(3).as_deref(), segment(4)) {
                 (Some("channelNamespaces"), Some(name)) => {
@@ -377,9 +405,9 @@ fn addressed(
                     }
                     _ => crate::state::type_resource(&api_id, &type_name),
                 },
-                // Every other child space — the API keys, the cache, the schema, the
-                // source-API associations — is addressed under the API itself, which is the
-                // resource those calls name.
+                // Every other child space — the API keys, the schema, the source-API
+                // associations — is addressed under the API itself, which is the resource
+                // those calls name.
                 _ => crate::state::api_resource(&api_id),
             })
         }
@@ -944,6 +972,24 @@ mod tests {
                 Addressed::Path(
                     "/v1/apis/abcdefghijklmnopqrstuvwxyz/environmentVariables".to_string(),
                 ),
+            ),
+            (
+                "a GraphQL API's cache, which no ARN spelling covers either",
+                "/v1/apis/abcdefghijklmnopqrstuvwxyz/ApiCaches",
+                None,
+                Addressed::Path("/v1/apis/abcdefghijklmnopqrstuvwxyz/ApiCaches".to_string()),
+            ),
+            (
+                "the update of that cache, one segment deeper, which names the same cache",
+                "/v1/apis/abcdefghijklmnopqrstuvwxyz/ApiCaches/update",
+                None,
+                Addressed::Path("/v1/apis/abcdefghijklmnopqrstuvwxyz/ApiCaches".to_string()),
+            ),
+            (
+                "the flush of that cache",
+                "/v1/apis/abcdefghijklmnopqrstuvwxyz/FlushCache",
+                None,
+                Addressed::Path("/v1/apis/abcdefghijklmnopqrstuvwxyz/FlushCache".to_string()),
             ),
             (
                 "an Event API",
