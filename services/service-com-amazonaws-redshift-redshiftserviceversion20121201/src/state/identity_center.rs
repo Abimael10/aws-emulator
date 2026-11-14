@@ -15,6 +15,12 @@
 //! `DependentServiceAccessDeniedFault` channel both operations model ("A dependent
 //! service denied access for the integration", HTTP 403), registering nothing.
 //!
+//! The denial was answered by that OTHER service, so it is reported as a relayed refusal:
+//! the downstream sentence verbatim, then the envelope the SDK layer that relayed the call
+//! states around a failed call (which service answered, with what status, under which
+//! request id, after how many attempts) — the one form the whole workspace renders
+//! ([`::service_common::relayed_refusal`]).
+//!
 //! WHICH instances the account holds is the owning service's own rule, asked here
 //! through its read-only reading of it
 //! ([`::service_com_amazonaws_ssoadmin_swbexternalservice::state::ComAmazonawsSsoadminSwbexternalserviceState::holds_instance`]),
@@ -29,6 +35,32 @@
 /// The IAM Identity Center action an application registration performs on the caller's
 /// behalf, as IAM names it.
 pub const SSO_CREATE_APPLICATION: &str = "sso:CreateApplication";
+
+/// The dependent service the nested create is made TO, named the way the SDK layer that
+/// relayed the call reports it — which is neither that endpoint's signing name (`sso`)
+/// nor the casing of its `sdkId`.
+pub const IDENTITY_CENTER_SERVICE: &str = "SsoAdmin";
+
+/// The `@httpError` the dependent service's own `CreateApplication` binds to the channel
+/// it reports an `InstanceArn` that resolves to no instance of the account on
+/// (`smithy_query(query="operation",operation="CreateApplication",model_path="services/service-com-amazonaws-ssoadmin-swbexternalservice/smithy-model/com-amazonaws-ssoadmin-swbexternalservice.json")`
+/// — `ResourceNotFoundException`, `@httpError` 404), which is the refusal the nested call
+/// behind this denial came back with.
+const INSTANCE_UNRESOLVED_MODELED_STATUS: u16 = 404;
+
+/// The HTTP status the dependent call was answered with, as the envelope reports it.
+///
+/// The status is a fact about the ANSWER the called endpoint gave, so it is read from
+/// that service's own statement of what it sends for a modelled refusal
+/// ([`::service_com_amazonaws_ssoadmin_swbexternalservice::scaffolded::modeled_error_status`])
+/// rather than restated here: that endpoint is awsJson1_1 and does not send every shape's
+/// own `@httpError`, so a status guessed from the model would name a status it never
+/// answers with.
+fn identity_center_refusal_status() -> u16 {
+    ::service_com_amazonaws_ssoadmin_swbexternalservice::scaffolded::modeled_error_status(
+        INSTANCE_UNRESOLVED_MODELED_STATUS,
+    )
+}
 
 /// The partition an IAM Identity Center resource is named under when the value the
 /// request named is no ARN to read one off. Every ARN this emulator emits carries it.
@@ -101,6 +133,16 @@ pub fn identity_center_instance_is_absent<Eng: Send + Sync + 'static>(
 /// than a copy, so two services that reach the same decision word it the same way: the
 /// principal that called, the action performed on its behalf, and the application
 /// namespace of the instance the request named.
+///
+/// The refusal was answered by the DEPENDENT service, not by this one, so the sentence is
+/// carried through inside the envelope the SDK layer that relayed the call states around a
+/// failed call — the service that answered, the status it answered with, that call's own
+/// request id and how many attempts it took — rendered by the workspace's one writer of
+/// that envelope ([`::service_common::relayed_refusal`]). Without it a client cannot tell
+/// which service refused, read the downstream status or quote a request id, and tooling
+/// that parses the dependent-exception tail reads the refusal as this service's own.
+/// The request id belongs to the relayed CALL, so it is minted per call and nothing in the
+/// request decides it.
 pub fn sso_create_application_denial<Eng: Send + Sync + 'static>(
     engine: &Eng,
     instance_arn: &str,
@@ -108,11 +150,16 @@ pub fn sso_create_application_denial<Eng: Send + Sync + 'static>(
     if !identity_center_instance_is_absent(engine, instance_arn) {
         return None;
     }
-    Some(
-        ::service_common::iam_authorization::not_authorized_by_resource_policy(
-            &caller_principal(),
-            SSO_CREATE_APPLICATION,
-            &identity_center_application_resource(instance_arn),
+    let reason = ::service_common::iam_authorization::not_authorized_by_resource_policy(
+        &caller_principal(),
+        SSO_CREATE_APPLICATION,
+        &identity_center_application_resource(instance_arn),
+    );
+    Some(::service_common::relayed_refusal::relayed_refusal_message(
+        &reason,
+        ::service_common::relayed_refusal::RelayedCall::once(
+            IDENTITY_CENTER_SERVICE,
+            identity_center_refusal_status(),
         ),
-    )
+    ))
 }

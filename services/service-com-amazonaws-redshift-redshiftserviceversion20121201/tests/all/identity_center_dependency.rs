@@ -13,6 +13,12 @@
 //! resource-based policy allows that action. Nothing is registered, and a create naming
 //! an instance the account DOES hold is served.
 //!
+//! RULE under test (the refusal's FORM): that sentence was answered by the DEPENDENT
+//! service, not by Redshift, so it is reported relayed — the downstream sentence, then
+//! the envelope the SDK layer states around a failed relayed call, naming the service
+//! that answered, the status it answered with, that call's own request id and how many
+//! attempts it took. A refusal Redshift answers ITSELF carries no such envelope.
+//!
 //! The rows differ along what the rule generalises over: which operation registers the
 //! application (both creates that take an `IdcInstanceArn`), the form of the instance id
 //! and the partition the instance ARN carries, whether the instance is one the account
@@ -39,6 +45,24 @@ const DENIED_STATUS: u16 = 403;
 
 /// The IAM role an application assumes to invoke the IAM Identity Center API.
 const IAM_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/RedshiftIdcRole";
+
+/// The dependent service the denied nested create was made to, named the way the SDK
+/// layer that relayed the call reports it — neither that endpoint's signing name (`sso`)
+/// nor the casing of its `sdkId`.
+const DEPENDENT_SERVICE: &str = "SsoAdmin";
+
+/// The HTTP status the dependent service answered the nested create with.
+///
+/// The instance the request named resolves to no instance of the account, which that
+/// service reports on the not-found channel its own `CreateApplication` declares; it is
+/// an awsJson1_1 endpoint whose wire answers carry HTTP 400 for a refusal of the request
+/// whatever 4xx the shape models (the reading that service's own crate takes of its
+/// answers, `services/service-com-amazonaws-ssoadmin-swbexternalservice/src/scaffolded.rs`).
+const DEPENDENT_STATUS: &str = "400";
+
+/// How many attempts the relayed call took: a refusal of the caller's own input is not
+/// retried, so the call that came back refused was the first and only one.
+const DEPENDENT_ATTEMPTS: &str = "1";
 
 /// Instance ARNs that name no instance this account holds, in the forms the owning
 /// service's `InstanceArn` pattern admits (`^arn:[\w-]+:sso:::instance/(sso)?ins-[a-zA-Z0-9-.]{16}$`):
@@ -82,6 +106,70 @@ fn expected_message(principal: &str, instance_arn: &str) -> String {
         partition(instance_arn),
         instance_id(instance_arn)
     )
+}
+
+/// A relayed refusal, as a client parses it back out of the message: the reason the
+/// dependent service itself gave, then the four facts about the call it came from.
+#[derive(Debug)]
+struct Relayed {
+    reason: String,
+    service: String,
+    status: String,
+    request_id: String,
+    attempts: String,
+}
+
+/// `message` split on the envelope literals the rule states — written here from the rule
+/// rather than from the implementation — or `None` when it carries no envelope at all.
+fn parse_relayed(message: &str) -> Option<Relayed> {
+    let (reason, rest) = message.split_once(" (Service: ")?;
+    let (service, rest) = rest.split_once(", Status Code: ")?;
+    let (status, rest) = rest.split_once(", Request ID: ")?;
+    let (request_id, rest) = rest.split_once(") (SDK Attempt Count: ")?;
+    let attempts = rest.strip_suffix(')')?;
+    Some(Relayed {
+        reason: reason.to_string(),
+        service: service.to_string(),
+        status: status.to_string(),
+        request_id: request_id.to_string(),
+        attempts: attempts.to_string(),
+    })
+}
+
+/// Assert that `answer` relays `expected_reason` from the dependent service, and answer
+/// the request id the envelope named that call by.
+fn assert_relayed_denial(case: &str, answer: &Answer, expected_reason: &str) -> String {
+    let message = answer
+        .text("Message")
+        .unwrap_or_else(|| panic!("case {case:?}: expected a refusal message, got {}", answer.body));
+    let relayed = parse_relayed(&message).unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: expected the reason followed by \"(Service: <service>, Status Code: \
+             <status>, Request ID: <id>) (SDK Attempt Count: <n>)\", got {message:?}"
+        )
+    });
+    assert_eq!(
+        relayed.reason, expected_reason,
+        "case {case:?}: expected the relayed reason {expected_reason:?}, got {:?}",
+        relayed.reason
+    );
+    assert_eq!(
+        (
+            relayed.service.as_str(),
+            relayed.status.as_str(),
+            relayed.attempts.as_str()
+        ),
+        (DEPENDENT_SERVICE, DEPENDENT_STATUS, DEPENDENT_ATTEMPTS),
+        "case {case:?}: expected the call to {DEPENDENT_SERVICE} answered \
+         {DEPENDENT_STATUS} after {DEPENDENT_ATTEMPTS} attempt(s), got {relayed:?}"
+    );
+    assert!(
+        ::service_common::query_error_envelope::is_request_id(&relayed.request_id),
+        "case {case:?}: expected the envelope to name the relayed call by a request id, got \
+         {:?}",
+        relayed.request_id
+    );
+    relayed.request_id
 }
 
 /// The principal every request of this suite is refused as: the harness signs with the
@@ -147,6 +235,19 @@ impl Registration {
         match self {
             Self::Redshift => "RedshiftIdcApplicationName",
             Self::Qev2 => "Qev2IdcApplicationName",
+        }
+    }
+
+    /// The awsQueryError code THIS service answers a name it already holds an
+    /// application under with
+    /// (`smithy_query(query="shape", shape="RedshiftIdcApplicationAlreadyExistsFault,Qev2IdcApplicationAlreadyExistsFault")`
+    /// — httpError 400, codes `RedshiftIdcApplicationAlreadyExists` and
+    /// `Qev2IdcApplicationAlreadyExists`): a refusal of this service's own, reached
+    /// without calling anybody.
+    fn already_exists_code(self) -> &'static str {
+        match self {
+            Self::Redshift => "RedshiftIdcApplicationAlreadyExists",
+            Self::Qev2 => "Qev2IdcApplicationAlreadyExists",
         }
     }
 
@@ -288,12 +389,7 @@ async fn a_registration_naming_an_instance_the_account_does_not_hold_is_denied()
                 answer.body
             );
             let expected = expected_message(&principal, instance_arn);
-            assert_eq!(
-                answer.text("Message"),
-                Some(expected.clone()),
-                "case {case:?}: expected {expected:?}, got {:?}",
-                answer.text("Message")
-            );
+            assert_relayed_denial(&case, &answer, &expected);
             // The refusal registered nothing: no application was minted, so this
             // registration's own read lists exactly what it listed before.
             let after = registered_names(&emulator, registration, &case).await;
@@ -395,6 +491,133 @@ async fn an_instance_the_account_comes_to_hold_is_served_afterwards() {
         assert!(
             listed.contains(&name.to_string()),
             "case {case:?}: expected the read to list {name:?}, got {listed:?}"
+        );
+    }
+}
+
+/// One row of the relayed-refusal table: which registration made the nested call, the
+/// instance ARN it named, and what else the create asked for.
+struct RelayRow {
+    registration: Registration,
+    instance_arn: &'static str,
+    extra: Vec<(&'static str, &'static str)>,
+}
+
+/// RULE (the refusal's FORM): the denial was answered by the DEPENDENT service, so every
+/// relayed refusal states that service's own sentence and then the envelope naming the
+/// call it came from — the service that answered, the status it answered with, that
+/// call's request id and how many attempts it took. The id belongs to the CALL, so two
+/// refusals never report one id while everything else about them is identical.
+///
+/// The rows differ along what the rule generalises over: which operation made the nested
+/// call, the form and partition of the instance ARN it named, and whether the create
+/// asked for anything beside its required members.
+#[tokio::test]
+async fn every_relayed_denial_states_the_dependent_call_it_came_from() {
+    let emulator = Emulator::new();
+    let principal = caller_principal();
+
+    let rows: Vec<RelayRow> = vec![
+        RelayRow {
+            registration: Registration::Redshift,
+            instance_arn: NOT_HELD[0],
+            extra: vec![],
+        },
+        RelayRow {
+            registration: Registration::Redshift,
+            instance_arn: NOT_HELD[1],
+            extra: vec![("IdentityNamespace", "corp.directory_1")],
+        },
+        RelayRow {
+            registration: Registration::Redshift,
+            instance_arn: NOT_HELD[3],
+            extra: vec![],
+        },
+        RelayRow {
+            registration: Registration::Qev2,
+            instance_arn: NOT_HELD[2],
+            extra: vec![],
+        },
+        RelayRow {
+            registration: Registration::Qev2,
+            instance_arn: NOT_HELD[3],
+            extra: vec![("Tags.Tag.1.Key", "env"), ("Tags.Tag.1.Value", "prod")],
+        },
+    ];
+
+    let mut request_ids: Vec<String> = Vec::new();
+    for (position, row) in rows.iter().enumerate() {
+        let RelayRow {
+            registration,
+            instance_arn,
+            extra,
+        } = row;
+        let case = format!("{registration:?} naming {instance_arn}");
+        let name = format!("relayed-app-{position}");
+        let answer = registration
+            .create(&emulator, &name, instance_arn, extra)
+            .await;
+        assert_eq!(
+            (answer.status, answer.error_code().as_deref()),
+            (DENIED_STATUS, Some(DENIED_CODE)),
+            "case {case:?}: expected {DENIED_STATUS} {DENIED_CODE}, got {} with body {}",
+            answer.status,
+            answer.body
+        );
+        let expected = expected_message(&principal, instance_arn);
+        request_ids.push(assert_relayed_denial(&case, &answer, &expected));
+
+        // The same request again: one call, one request id, so the repeat is relayed
+        // under an id of its own.
+        let again = registration
+            .create(&emulator, &name, instance_arn, extra)
+            .await;
+        request_ids.push(assert_relayed_denial(&case, &again, &expected));
+    }
+
+    let mut unique = request_ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        request_ids.len(),
+        "case \"every relayed denial\": expected each relayed call its own request id, got \
+         {request_ids:?}"
+    );
+}
+
+/// RULE (its boundary): the envelope names a call made to ANOTHER service, so a refusal
+/// this service reaches on its own terms — a name it already holds an application under —
+/// carries no envelope at all.
+#[tokio::test]
+async fn a_refusal_this_service_answers_itself_carries_no_relayed_envelope() {
+    let emulator = Emulator::new();
+    let instance_arn = IDENTITY_CENTER_INSTANCES[0];
+
+    for registration in [Registration::Redshift, Registration::Qev2] {
+        let case = format!("{registration:?} re-registering a held name");
+        let name = "own-refusal-app";
+        let first = registration.create(&emulator, name, instance_arn, &[]).await;
+        assert_eq!(
+            first.status, 200,
+            "case {case:?}: expected the first create served, got {} with body {}",
+            first.status, first.body
+        );
+
+        let again = registration.create(&emulator, name, instance_arn, &[]).await;
+        assert_eq!(
+            (again.status, again.error_code().as_deref()),
+            (400, Some(registration.already_exists_code())),
+            "case {case:?}: expected 400 {}, got {} with body {}",
+            registration.already_exists_code(),
+            again.status,
+            again.body
+        );
+        let message = again.text("Message").unwrap_or_default();
+        assert!(
+            parse_relayed(&message).is_none() && !message.contains("(Service: "),
+            "case {case:?}: expected a refusal of this service's own to name no relayed \
+             call, got {message:?}"
         );
     }
 }

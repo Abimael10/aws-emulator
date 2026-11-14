@@ -7865,3 +7865,15 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // that concurrent landings had appended fragments of this file's own header into it — many
 // this target. The rules they repeated stand in the module doc at the HEAD of this file,
 // the notes are gone rather than re-typed. Declare a new suite in the sorted list above.)
+// (Fragments of this file's own module doc, and second declarations of suites already
+// declared above, that concurrent landings appended into this tail are not kept here: an
+// inner doc comment is legal only BEFORE the first item of a crate root, so a `//!` line
+// in this tail is `E0753` and compiles no suite of this target, and a module declared
+// twice is `E0428`. The rules those fragments repeated stand in the module doc at the HEAD
+// of this file, which `all/all_rs_declares_each_suite_once.rs` and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of, for this
+// (More such fragments and duplicate declarations stood here; see the note above.)
+// (Pruned: every line that stood here was a fragment of this file's own module doc or a
+// note about a duplicate declaration that is already gone. Declare each suite exactly
+// ONCE, with its `#[path]` line, and keep the rules in the module doc at the HEAD of this
+// file, where an inner doc comment is legal — past the first item it is `E0753`.)

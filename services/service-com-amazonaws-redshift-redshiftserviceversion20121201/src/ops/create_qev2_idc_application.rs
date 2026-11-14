@@ -268,7 +268,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The dependent service denied the registration, so there is no managed
         // application to back this one and nothing is stored: the denial is relayed
-        // on the modelled `DependentServiceAccessDeniedFault` channel (HTTP 403).
+        // on the modelled `DependentServiceAccessDeniedFault` channel (HTTP 403),
+        // carrying that service's own sentence inside the envelope naming the call it
+        // came from (`st::identity_center`).
         if let Some(message) = dependent_denial {
             return Err(
                 CreateQev2IdcApplicationErrorModeled::DependentServiceAccessDeniedFault(
