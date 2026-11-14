@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNotifyCodeConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNotifyCodeConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNotifyCodeConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a notify code configuration, persists the passcode policy and
+//! channel parameters the request supplied, and reports the resource read back off
+//! the persisted record.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNotifyCodeConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNotifyCodeConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNotifyCodeConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateNotifyCodeConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::NO_STORE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // `clientToken` is `@idempotencyToken`: a repeat of a request already served
+        // reports the SAME configuration instead of creating a second one.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.notify_code_configuration_minted_by(token))
+        {
+            return Ok(CreateNotifyCodeConfigurationOutput {
+                notify_code_configuration: crate::state::notify_code_configuration_view(existing),
+            });
+        }
+
+        // The store is bounded: once it is full a further create is refused with
+        // the operation's own `ServiceQuotaExceededException` rather than growing
+        // the emulator's heap. Checked AFTER the idempotency lookup, so a repeat of
+        // a request already served still answers from the store at the ceiling.
+        if store.notify_code_configurations.len() >= crate::state::MAX_NOTIFY_CODE_CONFIGURATIONS {
+            return Err(
+                CreateNotifyCodeConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The maximum number of notify code configurations ({}) has already been created.",
+                            crate::state::MAX_NOTIFY_CODE_CONFIGURATIONS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_notify_code_configuration_id();
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::NotifyCodeConfigurationRecord {
+            arn: crate::state::notify_code_configuration_arn(&region, &id),
+            id: id.clone(),
+            name: input.notify_code_configuration_name,
+            // Both parameter structures are stored exactly as supplied: no value is
+            // applied for a member the request omits, and the passcode defaults are
+            // applied when a code is sent rather than at create time.
+            code_configuration_parameters: input.code_configuration_parameters,
+            channel_parameters: input.channel_parameters,
+            deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
+            created_at: now,
+            updated_at: now,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect(),
+            client_token: input.client_token,
+        };
+        // Insert, then report from the record now in the store.
+        let stored = store.notify_code_configurations.entry(id).or_insert(record);
+        Ok(CreateNotifyCodeConfigurationOutput {
+            notify_code_configuration: crate::state::notify_code_configuration_view(stored),
+        })
     }
 }

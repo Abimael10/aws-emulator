@@ -18,6 +18,10 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The `brand-profile` resource segment of a brand-profile ARN.
 const BRAND_PROFILE_RESOURCE: &str = "brand-profile";
 
+/// The `notify-code-configuration` resource segment of a notify-code-configuration
+/// ARN, as `NotifyCodeConfigurationIdOrArn` documents it.
+const NOTIFY_CODE_CONFIGURATION_RESOURCE: &str = "notify-code-configuration";
+
 /// One brand-profile attribute, keyed in [`BrandProfile::attributes`] by its
 /// name (`BrandProfileAttributeName` is unique within a profile).
 ///
@@ -55,6 +59,44 @@ pub struct BrandProfile {
     pub attributes: BTreeMap<String, BrandProfileAttribute>,
 }
 
+/// A persisted notify code configuration: the reusable passcode policy the
+/// notify-code-configuration operations report.
+///
+/// `code_configuration_parameters` and `channel_parameters` hold the modelled
+/// structures exactly as the request supplied them, member for member. The API
+/// documents every one of their members as optional and applies no value at create
+/// time for an omitted one — the passcode defaults are applied when a code is sent —
+/// so a member absent from the request stays absent in the store and in every
+/// projection of this record.
+#[derive(Debug, Clone)]
+pub struct NotifyCodeConfigurationRecord {
+    /// The minted `notifyCodeConfigurationId`.
+    pub id: String,
+    /// `notifyCodeConfigurationArn`, built once at create time from the request's
+    /// region.
+    pub arn: String,
+    pub name: String,
+    pub code_configuration_parameters: Option<crate::ops::types::CodeConfigurationParameters>,
+    pub channel_parameters: Option<crate::ops::types::ChannelParameters>,
+    pub deletion_protection_enabled: bool,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// `tags` as supplied at create time; the tagging operations are scaffolded.
+    pub tags: Vec<(String, String)>,
+    /// The `clientToken` of the request that minted this record, when it carried
+    /// one. Kept on the record rather than in a map beside it, so the token lives
+    /// and dies with the resource it names and is bounded by the same ceiling.
+    pub client_token: Option<String>,
+}
+
+/// The most notify code configurations this emulator stores for one account.
+///
+/// A ceiling, not a guess at AWS's published quota: it exists so a create loop
+/// cannot grow the emulator's heap without bound. `CreateNotifyCodeConfiguration`
+/// models `ServiceQuotaExceededException`, which is the refusal once the store is
+/// full.
+pub const MAX_NOTIFY_CODE_CONFIGURATIONS: usize = 100;
+
 /// The most brand profiles this emulator stores for one account.
 ///
 /// A ceiling, not a guess at AWS's published quota: it exists so a create loop
@@ -77,6 +119,10 @@ pub struct ComAmazonawsEndusermessagingEndusermessagingState {
     /// `ListBrandProfiles` pages in a stable, resumable order. Bounded by
     /// [`MAX_BRAND_PROFILES`].
     pub brand_profiles: BTreeMap<String, BrandProfile>,
+    /// Every notify code configuration, keyed by `notifyCodeConfigurationId`. A
+    /// `BTreeMap` so `ListNotifyCodeConfigurations` pages in a stable, resumable
+    /// order. Bounded by [`MAX_NOTIFY_CODE_CONFIGURATIONS`].
+    pub notify_code_configurations: BTreeMap<String, NotifyCodeConfigurationRecord>,
     /// `CreateBrandProfile` idempotency: `clientToken` -> `brandProfileId`.
     /// Bounded by [`MAX_CREATE_TOKENS`]; write it through
     /// [`Self::record_create_token`], never directly.
@@ -99,17 +145,47 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
     /// different runs apart; the counter keeps ids within one run unique, and
     /// the loop re-draws rather than ever handing back an id already in use.
     pub fn mint_brand_profile_id(&mut self) -> String {
-        if self.id_seed == 0 {
-            // 36 bits of the current nanosecond clock -> 9 hex digits.
-            self.id_seed = (nanos_since_epoch() as u64) & 0x0000_000F_FFFF_FFFF;
-        }
         loop {
-            self.next_id = self.next_id.wrapping_add(1);
-            let id = format!("bp-{:09x}{:08x}", self.id_seed, self.next_id & 0xFFFF_FFFF);
+            let id = self.next_candidate_id("bp");
             if !self.brand_profiles.contains_key(&id) {
                 return id;
             }
         }
+    }
+
+    /// Mint a fresh, unused `notifyCodeConfigurationId`.
+    ///
+    /// `NotifyCodeConfigurationIdOrArn` documents the identifier as an opaque token
+    /// of no particular length or format, so it takes the same minted shape as every
+    /// other id this state hands out — a resource prefix plus clock-seeded and
+    /// counted hex digits — which satisfies `NotifyCodeConfigurationId`'s
+    /// `@length(1..64)` and `^[A-Za-z0-9_-]+$` pattern. The loop re-draws rather than
+    /// ever handing back an id already in use.
+    pub fn mint_notify_code_configuration_id(&mut self) -> String {
+        loop {
+            let id = self.next_candidate_id("ncc");
+            if !self.notify_code_configurations.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The next candidate id for a resource addressed with `prefix`.
+    ///
+    /// The clock-derived seed keeps ids from different runs apart; the counter keeps
+    /// ids within one run unique. Whether the candidate is free is the caller's
+    /// question, since it is the caller that knows which map the id goes in.
+    fn next_candidate_id(&mut self, prefix: &str) -> String {
+        if self.id_seed == 0 {
+            // 36 bits of the current nanosecond clock -> 9 hex digits.
+            self.id_seed = (nanos_since_epoch() as u64) & 0x0000_000F_FFFF_FFFF;
+        }
+        self.next_id = self.next_id.wrapping_add(1);
+        format!(
+            "{prefix}-{:09x}{:08x}",
+            self.id_seed,
+            self.next_id & 0xFFFF_FFFF
+        )
     }
 
     /// Record `token` as having minted `brand_profile_id`, evicting the oldest
@@ -155,17 +231,48 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
         if let Some((id, _)) = self.brand_profiles.get_key_value(id_or_arn) {
             return Some(id.as_str());
         }
-        let id = brand_profile_id_from_arn(id_or_arn)?;
+        let id = resource_id_from_arn(id_or_arn, BRAND_PROFILE_RESOURCE)?;
         self.brand_profiles.get_key_value(id).map(|(id, _)| id.as_str())
+    }
+
+    /// Resolve a `NotifyCodeConfigurationIdOrArn` to the id of a stored
+    /// configuration.
+    ///
+    /// The shape accepts either a bare id or the resource's full ARN, so every
+    /// operation taking one resolves both; an unknown value answers `None`, which
+    /// the caller renders as `ResourceNotFoundException`.
+    pub fn resolve_notify_code_configuration_id(&self, id_or_arn: &str) -> Option<&str> {
+        if let Some((id, _)) = self.notify_code_configurations.get_key_value(id_or_arn) {
+            return Some(id.as_str());
+        }
+        let id = resource_id_from_arn(id_or_arn, NOTIFY_CODE_CONFIGURATION_RESOURCE)?;
+        self.notify_code_configurations
+            .get_key_value(id)
+            .map(|(id, _)| id.as_str())
+    }
+
+    /// The stored notify code configuration a previous create minted for `token`,
+    /// or `None` when no live record carries it.
+    ///
+    /// `clientToken` is `@idempotencyToken`, so a repeat of a request already
+    /// served reports the record it minted instead of creating a second one. The
+    /// scan is over a map bounded by [`MAX_NOTIFY_CODE_CONFIGURATIONS`].
+    pub fn notify_code_configuration_minted_by(
+        &self,
+        token: &str,
+    ) -> Option<&NotifyCodeConfigurationRecord> {
+        self.notify_code_configurations
+            .values()
+            .find(|record| record.client_token.as_deref() == Some(token))
     }
 }
 
-/// The id named by a brand-profile ARN
-/// (`arn:<partition>:end-user-messaging:<region>:<account>:brand-profile/<id>`),
-/// or `None` for anything that is not one.
-fn brand_profile_id_from_arn(candidate: &str) -> Option<&str> {
+/// The id named by an ARN of this service's `resource` type
+/// (`arn:<partition>:end-user-messaging:<region>:<account>:<resource>/<id>`), or
+/// `None` for anything that is not one.
+fn resource_id_from_arn<'a>(candidate: &'a str, resource: &str) -> Option<&'a str> {
     let mut fields = candidate.splitn(6, ':');
-    let (Some("arn"), Some(_partition), Some(ARN_NAMESPACE), Some(_region), Some(_account), Some(resource)) = (
+    let (Some("arn"), Some(_partition), Some(ARN_NAMESPACE), Some(_region), Some(_account), Some(segment)) = (
         fields.next(),
         fields.next(),
         fields.next(),
@@ -175,7 +282,7 @@ fn brand_profile_id_from_arn(candidate: &str) -> Option<&str> {
     ) else {
         return None;
     };
-    let id = resource.strip_prefix(BRAND_PROFILE_RESOURCE)?.strip_prefix('/')?;
+    let id = segment.strip_prefix(resource)?.strip_prefix('/')?;
     (!id.is_empty()).then_some(id)
 }
 
@@ -185,6 +292,15 @@ pub fn brand_profile_arn(region: &str, brand_profile_id: &str) -> String {
         ARN_NAMESPACE,
         region,
         &format!("{BRAND_PROFILE_RESOURCE}/{brand_profile_id}"),
+    )
+}
+
+/// The ARN of a notify code configuration in `region`.
+pub fn notify_code_configuration_arn(region: &str, notify_code_configuration_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{NOTIFY_CODE_CONFIGURATION_RESOURCE}/{notify_code_configuration_id}"),
     )
 }
 
@@ -226,6 +342,10 @@ pub const ACTIVE_STATUS: &str = "ACTIVE";
 /// resource segment — not that enum's `BRAND_PROFILE` — is the token reported
 /// here and quoted in the refusal messages below.
 pub const BRAND_PROFILE_RESOURCE_TYPE: &str = BRAND_PROFILE_RESOURCE;
+
+/// The `resourceType` a notify-code-configuration error reports, in that same
+/// hyphenated resource vocabulary: the spelling the resource takes in its own ARN.
+pub const NOTIFY_CODE_CONFIGURATION_RESOURCE_TYPE: &str = NOTIFY_CODE_CONFIGURATION_RESOURCE;
 
 /// The conflict `Reason` token for a request refused because the resource it
 /// names has deletion protection switched on.
@@ -283,6 +403,34 @@ pub fn brand_profile_deletion_protection_conflict(
         BRAND_PROFILE_RESOURCE_TYPE,
         brand_profile_id,
     )
+}
+
+/// `ResourceNotFoundException` for a `NotifyCodeConfigurationIdOrArn` that names no
+/// stored configuration. The message is built from the request, so it names the
+/// value given.
+pub fn notify_code_configuration_not_found(
+    id_or_arn: &str,
+) -> crate::ops::types::ResourceNotFoundException {
+    resource_not_found(NOTIFY_CODE_CONFIGURATION_RESOURCE_TYPE, id_or_arn)
+}
+
+/// The modelled `NotifyCodeConfiguration` resource, read back off a stored record.
+///
+/// Every operation that projects a notify code configuration reports it through
+/// here, so one record has one rendering whichever operation returns it.
+pub fn notify_code_configuration_view(
+    record: &NotifyCodeConfigurationRecord,
+) -> crate::ops::types::NotifyCodeConfiguration {
+    crate::ops::types::NotifyCodeConfiguration {
+        notify_code_configuration_id: record.id.clone(),
+        notify_code_configuration_arn: record.arn.clone(),
+        notify_code_configuration_name: record.name.clone(),
+        code_configuration_parameters: record.code_configuration_parameters.clone(),
+        channel_parameters: record.channel_parameters.clone(),
+        deletion_protection_enabled: record.deletion_protection_enabled,
+        created_at: timestamp(record.created_at),
+        updated_at: timestamp(record.updated_at),
+    }
 }
 
 fn nanos_since_epoch() -> u128 {
