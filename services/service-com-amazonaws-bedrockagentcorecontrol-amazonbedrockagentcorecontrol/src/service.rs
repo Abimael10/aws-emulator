@@ -510,10 +510,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         ) {
             return true;
         }
-        // And a request addressed to a GATEWAY endpoint host — the host this service
-        // PUBLISHES in every gateway's `gatewayUrl`, whose first label is the gateway's
-        // own id and which no route key can therefore name. See [`mcp`]: without this the
-        // router answers `404 UnknownService` for a URL this service handed out.
+        // And a request addressed to a GATEWAY endpoint of this emulator — the gateway's
+        // own endpoint host, whose first label is the gateway's own id, or a path of this
+        // emulator's own endpoint naming the gateway plane: both are addresses this
+        // service PUBLISHES in a gateway's `gatewayUrl`, and no route key can name
+        // either. See [`mcp`]: without this the router answers `404 UnknownService` for a
+        // URL this service handed out.
         mcp::addresses_gateway_endpoint_parts(parts)
     }
 

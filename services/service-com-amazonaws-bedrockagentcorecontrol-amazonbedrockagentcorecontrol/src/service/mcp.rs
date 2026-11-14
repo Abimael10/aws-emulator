@@ -8,15 +8,29 @@
 //! Every operation in this service's model is control plane: it creates, reads, updates
 //! and deletes gateways and the targets configured on them. What an MCP client then does
 //! with the URL `CreateGateway` / `GetGateway` hand back is the Model Context Protocol
-//! itself — a JSON-RPC 2.0 `POST` to that URL, whose path is the fixed `/mcp` transport
-//! path of the gateway's host ([`crate::state::GATEWAY_MCP_PATH`], which
-//! [`crate::state::gateway_url`] publishes as part of the endpoint), carrying
+//! itself — a JSON-RPC 2.0 `POST` to that URL, whose path ends in the fixed `/mcp`
+//! transport path of the gateway's protocol ([`crate::state::GATEWAY_MCP_PATH`], which
+//! [`crate::state::published_gateway_url`] publishes as part of the endpoint), carrying
 //! `initialize`, `tools/list` and
 //! `tools/call`. None of those is a modelled operation and none carries an `X-Amz-Target`:
 //! they are addressed by host, path and method, so nothing in the generated routing table
 //! can name them and they are reached through the seams
 //! [`crate::service::EmulatedService`] has for a request the model's routing key cannot
 //! name.
+//!
+//! # The two addresses, and the one endpoint
+//!
+//! A gateway publishes the address this emulator answers on for the client that asked
+//! ([`crate::state::published_gateway_url`]): the gateway's own endpoint host for a client
+//! that resolves AWS's own hostnames, and this emulator's own endpoint with the gateway
+//! named in the path ([`crate::state::GATEWAY_PLANE_SEGMENT`]) for a client on the machine
+//! it runs on, which resolves nothing else. [`AddressedGateway`] reads both, so either
+//! address reaches the gateway behind it.
+//!
+//! What follows the address is the transport path, read IDEMPOTENTLY
+//! ([`crate::state::addresses_transport_path`]): the published URL already carries it, so a
+//! client that joins the transport path onto the URL it holds reaches the same endpoint
+//! rather than a resource the address does not publish.
 //!
 //! # What is served
 //!
@@ -173,18 +187,18 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for GatewayMcpSurface<Eng> {
 impl<Eng: Send + Sync + 'static> GatewayMcpSurface<Eng> {
     /// Serve one request to a published gateway endpoint.
     ///
-    /// The host names the gateway and its Region, the path names the MCP surface, and the
-    /// JSON-RPC body names the interaction — which is how an MCP server is addressed;
-    /// there is no operation name on this wire.
+    /// The address names the gateway, the path names the MCP surface, and the JSON-RPC
+    /// body names the interaction — which is how an MCP server is addressed; there is no
+    /// operation name on this wire.
     pub async fn serve(&self, req: &RtRequest, ctx: &OperationContext<'_>) -> RtResponse {
-        let Some((gateway_id, region)) = host_of(req).and_then(state::gateway_endpoint_identity)
-        else {
+        let path = ::service_common::request_path(req.uri());
+        let Some(addressed) = AddressedGateway::of(req, path) else {
             // Unreachable: the service claims a request for this surface only when its
-            // host IS a gateway endpoint host. Answering the envelope rather than
-            // panicking keeps the handler total.
+            // address IS a gateway endpoint of this emulator. Answering the envelope
+            // rather than panicking keeps the handler total.
             return aws_error(404, RESOURCE_NOT_FOUND, NO_GATEWAY_HERE);
         };
-        if !addresses_mcp_path(req) {
+        if !addressed.addresses_mcp_path() {
             return aws_error(404, RESOURCE_NOT_FOUND, NO_SUCH_PATH);
         }
         if req.method() != ALLOWED_METHOD {
@@ -210,9 +224,11 @@ impl<Eng: Send + Sync + 'static> GatewayMcpSurface<Eng> {
         let serving = {
             let mut store = store.lock();
             store.expire_deleted_gateways_and_targets(now);
-            store
-                .gateway_on_endpoint_host(region, gateway_id)
-                .map(|gateway| ServingGateway::of(gateway, now))
+            match addressed.region {
+                Some(region) => store.gateway_on_endpoint_host(region, addressed.gateway_id),
+                None => store.gateway_by_id(addressed.gateway_id),
+            }
+            .map(|gateway| ServingGateway::of(gateway, now))
         };
         let Some(gateway) = serving.filter(ServingGateway::serves) else {
             return aws_error(404, RESOURCE_NOT_FOUND, NO_GATEWAY_HERE);
@@ -277,14 +293,54 @@ impl<Eng: Send + Sync + 'static> GatewayMcpSurface<Eng> {
     }
 }
 
-/// Whether a request's path names the gateway's MCP endpoint — the one resource a
-/// gateway endpoint host publishes.
-///
-/// A trailing slash is the same resource: the `gatewayUrl` a client holds already ends in
-/// this sub-path, and a client that appended its own separator sends `/mcp/`.
-fn addresses_mcp_path(req: &RtRequest) -> bool {
-    let path = ::service_common::request_path(req.uri());
-    path.strip_suffix('/').unwrap_or(path) == state::GATEWAY_MCP_PATH
+/// Which gateway a request to a published gateway endpoint addresses, read off the two
+/// forms a gateway's `gatewayUrl` can carry ([`state::published_gateway_url`]).
+#[derive(Debug)]
+struct AddressedGateway<'r> {
+    /// The gateway the address names.
+    gateway_id: &'r str,
+    /// The Region the ADDRESS carries, for the form that carries one — the gateway's own
+    /// endpoint host, where the Region is part of the host. `None` for an address of this
+    /// emulator's own, which names the gateway in its path and no Region at all.
+    region: Option<&'r str>,
+    /// What is left of the request path once the address has been read: the transport
+    /// path the gateway's protocol is served on.
+    transport_path: &'r str,
+}
+
+impl<'r> AddressedGateway<'r> {
+    /// The gateway `req` addresses, or `None` for a request that addresses no gateway
+    /// endpoint of this emulator.
+    fn of(req: &'r RtRequest, path: &'r str) -> Option<Self> {
+        // The gateway's own endpoint host: the whole path is the transport path.
+        if let Some((gateway_id, region)) = host_of(req).and_then(state::gateway_endpoint_identity)
+        {
+            return Some(Self {
+                gateway_id,
+                region: Some(region),
+                transport_path: path,
+            });
+        }
+        // An address of this emulator's own: the gateway is named in the path, and the
+        // transport path is what follows it.
+        let (gateway_id, transport_path) = state::gateway_plane_identity(path)?;
+        Some(Self {
+            gateway_id,
+            region: None,
+            transport_path,
+        })
+    }
+
+    /// Whether what follows the address names the gateway's MCP endpoint — the one
+    /// resource a gateway endpoint publishes.
+    ///
+    /// Addressed idempotently, by [`state::addresses_transport_path`]: the `gatewayUrl` a
+    /// client holds already ends in this transport path, so a client that appended its own
+    /// separator sends `/mcp/` and one that appended the transport path again sends
+    /// `/mcp/mcp` — each of them the one endpoint this address serves.
+    fn addresses_mcp_path(&self) -> bool {
+        state::addresses_transport_path(self.transport_path, state::GATEWAY_MCP_PATH)
+    }
 }
 
 /// One gateway as this surface reads it: everything an answer is computed from, owned, so
@@ -666,20 +722,26 @@ fn bounded(value: &str) -> String {
         .collect()
 }
 
-/// Whether `req` addresses a gateway endpoint host — one of the hosts this service
-/// PUBLISHES in `gatewayUrl`.
+/// Whether `req` addresses a gateway endpoint of this emulator — one of the addresses
+/// this service PUBLISHES in `gatewayUrl` ([`state::published_gateway_url`]): a gateway's
+/// own endpoint host, or a path of this emulator's own endpoint naming this plane.
 pub fn addresses_gateway_endpoint(req: &RtRequest) -> bool {
     host_of(req)
         .and_then(state::gateway_endpoint_identity)
         .is_some()
+        || state::gateway_plane_path(::service_common::request_path(req.uri())).is_some()
 }
 
-/// Whether a buffered request addresses a gateway endpoint host.
+/// Whether a buffered request addresses a gateway endpoint of this emulator.
 ///
 /// Reads the `Host` header an HTTP/1 request carries, else the authority an HTTP/2
 /// request carries on its URI (`http` parses `:authority` onto the URI rather than
-/// exposing it as a header).
+/// exposing it as a header) — and, for the path form, the request path, which carries no
+/// host at all.
 pub fn addresses_gateway_endpoint_parts(parts: &http::request::Parts) -> bool {
+    if state::gateway_plane_path(::service_common::request_path(&parts.uri.to_string())).is_some() {
+        return true;
+    }
     let host = match parts.headers.get("host").and_then(|host| host.to_str().ok()) {
         Some(host) => host,
         None => match parts.uri.authority() {

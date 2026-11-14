@@ -330,21 +330,28 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
     }
 
     /// The gateway whose PUBLISHED endpoint host is the one a data-plane request
-    /// addressed: the gateway `gateway_id` names, and only while the URL it
-    /// published is the one on `region`'s gateway host.
+    /// addressed: the gateway `gateway_id` names, and only while that gateway
+    /// belongs to `region`.
     ///
-    /// The Region is part of the address, so a gateway created in one Region is
+    /// The Region is part of that address, so a gateway created in one Region is
     /// not reachable through another Region's host — the gateway store is keyed
-    /// by id alone, and the published URL is what ties a record to a host
-    /// ([`gateway_url`]).
+    /// by id alone, and the record's own ARN is what carries its Region
+    /// ([`GatewayRecord::region`]).
     pub fn gateway_on_endpoint_host(
         &self,
         region: &str,
         gateway_id: &str,
     ) -> Option<&GatewayRecord> {
         let record = self.gateways.get(gateway_id)?;
-        let published = gateway_url(region, gateway_id, record.protocol_type.as_deref());
-        (record.gateway_url == published).then_some(record)
+        (record.region() == Some(region)).then_some(record)
+    }
+
+    /// The gateway a data-plane request named in its PATH, on an address of this
+    /// emulator's own (`published_gateway_url`): the gateway `gateway_id` names,
+    /// whatever Region it belongs to, because such an address carries no Region
+    /// to tie it to.
+    pub fn gateway_by_id(&self, gateway_id: &str) -> Option<&GatewayRecord> {
+        self.gateways.get(gateway_id)
     }
 
     /// Remove every gateway whose deletion the clock has already made due, with

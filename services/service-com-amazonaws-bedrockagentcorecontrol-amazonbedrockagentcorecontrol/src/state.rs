@@ -912,14 +912,25 @@ impl GatewayRecord {
         self.targets.values().any(|target| !target.is_deleting())
     }
 
-    /// The status this gateway reports at `now`: the transient one until the
-    /// transition the clock owes comes due, the settled one afterwards.
+    /// The status this gateway reports at `now`: the transition the clock owes
+    /// materialised, or the transient status until it comes due.
     pub fn status_at(&self, now: SystemTime) -> &str {
         if now < self.settles_at {
             &self.transient_status
         } else {
             &self.settled_status
         }
+    }
+
+    /// The Region this gateway was created in, read off its own ARN — the one
+    /// field of the record that carries it
+    /// (`arn:aws:bedrock-agentcore:{region}:{account}:gateway/{gatewayId}`).
+    ///
+    /// What ties a gateway to the endpoint HOST it answers on: that host carries
+    /// the Region, so a gateway created in one Region is not reachable through
+    /// another Region's host.
+    pub fn region(&self) -> Option<&str> {
+        ::service_common::arn::region_of(&self.gateway_arn, ARN_SERVICE)
     }
 
     /// This gateway as `CreateGateway`'s response envelope.
@@ -3870,9 +3881,9 @@ pub fn configuration_bundle_arn(region: &str, bundle_id: &str) -> String {
     )
 }
 
-/// The gateway's endpoint, in the form AWS returns for a Bedrock AgentCore
-/// gateway: its host, plus the transport path the gateway's own protocol is
-/// served on —
+/// The gateway's endpoint on AWS's OWN host, in the form AWS returns for a
+/// Bedrock AgentCore gateway: its host, plus the transport path the gateway's own
+/// protocol is served on —
 /// `https://{gatewayId}.gateway.bedrock-agentcore.{region}.amazonaws.com/mcp`
 /// for an MCP gateway.
 ///
@@ -3880,6 +3891,10 @@ pub fn configuration_bundle_arn(region: &str, bundle_id: &str) -> String {
 /// opens a session against, not an origin a suffix is still owed on, so the URL
 /// a gateway publishes is exactly the URL this emulator serves that gateway's
 /// protocol on ([`gateway_transport_path`]).
+///
+/// This host resolves only for a caller that resolves AWS's own hostnames, so it
+/// is published only where there is no address of this emulator's own to publish
+/// instead ([`published_gateway_url`]); the data plane claims it either way.
 ///
 /// Derived from the gateway id, the request's Region and the gateway's
 /// `protocolType`, so a caller that reads one gateway twice sees one URL.
@@ -3953,6 +3968,132 @@ pub fn gateway_endpoint_identity(host: &str) -> Option<(&str, &str)> {
 /// Recorded behaviour only: the MCP wire surface is not in this service's model,
 /// and the blessed recording's `gatewayUrl` ends in `/mcp`.
 pub const GATEWAY_MCP_PATH: &str = "/mcp";
+
+/// Whether `path` addresses the endpoint a gateway serves `transport_path` on.
+///
+/// Joining the transport path onto a published endpoint is IDEMPOTENT: the
+/// `gatewayUrl` this service publishes already carries the transport path
+/// ([`gateway_url`]), and an MCP client that appends the transport path to the URL
+/// it holds — the usual `url.rstrip('/') + '/mcp'` join — must reach the same
+/// endpoint rather than a resource the host does not publish. So the transport
+/// path, repeated any number of times and with any number of trailing
+/// separators, addresses that one endpoint; every other path addresses nothing on
+/// a gateway endpoint.
+pub fn addresses_transport_path(path: &str, transport_path: &str) -> bool {
+    // A protocol with no transport path of its own publishes no endpoint to
+    // address, and consuming nothing per step would not terminate.
+    if transport_path.is_empty() {
+        return false;
+    }
+    let mut rest = path.trim_end_matches('/');
+    loop {
+        match rest.strip_prefix(transport_path) {
+            // The whole path is made of transport-path segments: the endpoint.
+            Some("") => return true,
+            // A further segment follows, which can only be another repetition of
+            // the transport path.
+            Some(tail) if tail.starts_with('/') => rest = tail,
+            // The segment merely STARTS with the transport path's text
+            // (`/mcp-tools`), or names something else entirely: not this endpoint.
+            _ => return false,
+        }
+    }
+}
+
+/// The segment that names this service's GATEWAY data plane, behind the reserved
+/// namespace segment every data plane this emulator serves at its own front door
+/// is addressed under
+/// (`service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`):
+/// `/_aws/bedrock-agentcore-gateway/{gatewayId}{transport path}`.
+///
+/// The gateway's own endpoint host cannot be resolved by a client on the machine
+/// this emulator runs on, so what a gateway publishes for such a client is the
+/// emulator's own endpoint with the gateway named in the PATH
+/// ([`published_gateway_url`]); this segment is what tells that path apart from
+/// every other plane's.
+pub const GATEWAY_PLANE_SEGMENT: &str = "bedrock-agentcore-gateway";
+
+/// The endpoint a gateway PUBLISHES in `gatewayUrl`, which is the address this
+/// emulator SERVES that gateway's protocol on for the client that asked:
+///
+/// * the emulator's own endpoint — the one this request reached, else the port
+///   this process is served on — with the gateway behind
+///   [`GATEWAY_PLANE_SEGMENT`] and the protocol's transport path last
+///   (`https://127.0.0.1:9297/_aws/bedrock-agentcore-gateway/{gatewayId}/mcp`). A
+///   client on this machine resolves no host but the one it is already talking
+///   to, so this is the only address it can dial;
+/// * the gateway's own endpoint host ([`gateway_url`]) for a request that
+///   addressed one of AWS's own hosts on an emulator served on no port at all:
+///   there is no own address to publish in its place, and the data plane claims
+///   that host as well.
+///
+/// The choice is the tree's one reading of the question
+/// (`service_common::data_plane_addressing::reached_emulator_endpoint` /
+/// `served_endpoint_authority`), so this service cannot drift from the others on
+/// which address a published URL carries.
+pub fn published_gateway_url(
+    parts: &::http::request::Parts,
+    served_base: &str,
+    region: &str,
+    gateway_id: &str,
+    protocol_type: Option<&str>,
+) -> String {
+    match emulator_endpoint_authority(parts, served_base) {
+        Some(authority) => format!(
+            "https://{authority}/{namespace}/{GATEWAY_PLANE_SEGMENT}/{gateway_id}{transport}",
+            namespace = ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE,
+            transport = gateway_transport_path(protocol_type).unwrap_or_default(),
+        ),
+        None => gateway_url(region, gateway_id, protocol_type),
+    }
+}
+
+/// The address this emulator answers on for the client that made this request:
+/// the emulator's own endpoint the request reached, else the port this process is
+/// served on, and `None` for a request that addressed one of AWS's own hosts on an
+/// emulator served on no port at all.
+fn emulator_endpoint_authority(
+    parts: &::http::request::Parts,
+    served_base: &str,
+) -> Option<String> {
+    ::service_common::data_plane_addressing::reached_emulator_endpoint(
+        &parts.uri.to_string(),
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+    )
+    .or_else(|| ::service_common::data_plane_addressing::served_endpoint_authority(served_base))
+}
+
+/// The `gatewayId` a request to the emulator's own endpoint names in its path, and
+/// the path that follows it — the inverse of the path form
+/// [`published_gateway_url`] publishes, so a published URL resolves back to the
+/// record behind it.
+///
+/// `None` for a path that is not under this plane's reserved prefix at all.
+pub fn gateway_plane_identity(path: &str) -> Option<(&str, &str)> {
+    let rest = gateway_plane_path(path)?;
+    let (gateway_id, rest) = ::service_common::data_plane_addressing::first_segment(rest)?;
+    (!gateway_id.is_empty()).then_some((gateway_id, rest))
+}
+
+/// The path under this plane's reserved prefix
+/// (`/_aws/bedrock-agentcore-gateway`), or `None` for a path addressing another
+/// plane or no plane at all.
+///
+/// This is what the service CLAIMS on, so a request under the prefix is answered
+/// by this plane — with its own not-found envelope for a path naming no gateway of
+/// it — rather than by the front door's unknown-service refusal.
+pub fn gateway_plane_path(path: &str) -> Option<&str> {
+    use ::service_common::data_plane_addressing::{first_segment, EMULATOR_PATH_NAMESPACE};
+    let (namespace, rest) = first_segment(path)?;
+    if namespace != EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (plane, rest) = first_segment(rest)?;
+    (plane == GATEWAY_PLANE_SEGMENT).then_some(rest)
+}
 
 /// The separator a gateway qualifies an aggregated tool name with:
 /// `<targetName>___<toolName>`, as the recorded `tools/list` reports them.

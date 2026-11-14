@@ -4703,3 +4703,26 @@ mod cognito_vended_session_principal_tag_scoped_read;
 // (Every line of this block is a fragment of this file's own header that a landing
 // appended here as an INNER doc comment: past the first item a `//!` line is `E0753` and
 // compiles no suite of this target, so each stands as an ordinary comment.)
+#[path = "all/bedrock_agentcore_gateway_mcp_transport_path.rs"]
+mod bedrock_agentcore_gateway_mcp_transport_path;
+// and SQS mounted together just as the firing leg does. (That suite is declared ONCE, in the
+// head region above: two branches landing at once each appended a declaration of it here, and
+// a module declared twice is `E0428` and compiles neither, so the earlier one stands.)
+// (That suite is declared ONCE, further up this file: two branches landing at once each
+// appended a declaration of it here, and a module declared twice is `E0428` and compiles
+// neither, so the earlier declaration stands and this one is removed.)
+// (Declared ONCE, further up this file: a module declared twice is `E0428` and compiles
+// neither, so the earlier declaration stands and the copy that stood here is removed.)
+// (That suite is declared ONCE, in the head region above: a module declared twice is `E0428`
+// and compiles neither, so the earlier declaration stands and this one is removed.)
+// above: a module declared twice is `E0428` and compiles neither, so the earlier declaration
+// stands and the copy appended here is removed.)
+// (That suite is declared ONCE, further up this file: two landings each appended a
+// declaration of it here, and a module declared twice is `E0428` and compiles neither, so
+// the earlier declaration stands and this one is removed.)
+// leaving a note here. (Line comments: an inner doc comment is only legal before the
+// first item of a crate root, so this fragment of the header note is `E0753` here.)
+// comment landed mid-file is `E0753` and compiles no suite of this target.)
+// suite left at the top level of `tests/` fails the build. (A line comment: a fragment of
+// this file's own header, which is `E0753` anywhere but the head of the file.)
+// the fragments above record: an inner doc comment mid-file is `E0753`.)

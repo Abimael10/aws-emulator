@@ -63,6 +63,8 @@ mod gateway_listings;
 mod gateway_mcp_endpoint;
 #[path = "all/gateway_mutation.rs"]
 mod gateway_mutation;
+#[path = "all/gateway_published_address.rs"]
+mod gateway_published_address;
 #[path = "all/gateway_rate_limit_batch.rs"]
 mod gateway_rate_limit_batch;
 #[path = "all/gateway_rate_limit_creation.rs"]
