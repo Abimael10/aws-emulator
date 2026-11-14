@@ -147,6 +147,11 @@ mod record_set_refusal_rules;
 mod record_set_validation;
 #[path = "all/private_zone_creation.rs"]
 mod private_zone_creation;
+// Declared beside the zone suites: this one is the query logging configuration a zone
+// publishes its DNS queries under — the pair of the zone and the CloudWatch Logs log
+// group it publishes them to, across the create, the read, the listing and the delete.
+#[path = "all/query_logging_configs.rs"]
+mod query_logging_configs;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/resource_tags_batch.rs"]

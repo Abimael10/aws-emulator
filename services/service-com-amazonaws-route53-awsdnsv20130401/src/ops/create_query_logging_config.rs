@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQueryLoggingConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQueryLoggingConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQueryLoggingConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: ties one public hosted zone to one CloudWatch Logs log group and
+//! persists that pair as the account's query logging configuration, which
+//! `GetQueryLoggingConfig` reads back and `DeleteQueryLoggingConfig` removes.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +125,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::query_logging::{
+    holds_log_group, no_such_cloud_watch_logs_log_group, query_logging_config_already_exists,
+    PUBLIC_HOSTED_ZONE_ONLY_MESSAGE,
+};
+use crate::state::{no_such_hosted_zone, normalize_zone_id, resource_location};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -204,18 +204,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQueryLoggingConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQueryLoggingConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQueryLoggingConfig"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            CreateQueryLoggingConfigErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The caller may pass the bare id or the `/hostedzone/`-prefixed `Id` a
+        // hosted-zone response handed it back; both name the same zone, and the
+        // bare form is what a stored configuration carries.
+        let zone_id = normalize_zone_id(&input.hosted_zone_id).to_string();
+        {
+            let store = state.lock();
+            let zone = store.zones.get(&zone_id).ok_or_else(|| {
+                CreateQueryLoggingConfigErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                    &input.hosted_zone_id,
+                ))
+            })?;
+            // "You can log queries only for public hosted zones"
+            // (`CreateQueryLoggingConfigRequest$HostedZoneId`): a private zone's
+            // queries are resolved inside a VPC, so there is nothing to log.
+            if zone.private_zone {
+                return Err(CreateQueryLoggingConfigErrorModeled::InvalidInput(
+                    InvalidInput {
+                        message: Some(PUBLIC_HOSTED_ZONE_ONLY_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The log group the queries are published to is CloudWatch Logs' record,
+        // so it is resolved against that service's own store — with this
+        // service's lock released above, because no handler holds two stores'
+        // locks at once. An ARN nothing answers for is the one
+        // `NoSuchCloudWatchLogsLogGroup` is about.
+        if !holds_log_group(&*self.engine, &input.cloud_watch_logs_log_group_arn) {
+            return Err(
+                CreateQueryLoggingConfigErrorModeled::NoSuchCloudWatchLogsLogGroup(
+                    no_such_cloud_watch_logs_log_group(),
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // Re-read the zone: the lock was released for the log-group read above,
+        // so the zone and the configuration it holds are judged as they are NOW
+        // rather than as they were before that read.
+        if !store.zones.contains_key(&zone_id) {
+            return Err(CreateQueryLoggingConfigErrorModeled::NoSuchHostedZone(
+                no_such_hosted_zone(&input.hosted_zone_id),
+            )
+            .into());
+        }
+        // "You can create only one query logging configuration for a hosted
+        // zone" (`QueryLoggingConfigAlreadyExists`), so a second create for a
+        // zone that already has one is refused and nothing is persisted.
+        if store.query_logging_config_for_zone(&zone_id).is_some() {
+            return Err(
+                CreateQueryLoggingConfigErrorModeled::QueryLoggingConfigAlreadyExists(
+                    query_logging_config_already_exists(),
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_query_logging_config_id();
+        let query_logging_config = QueryLoggingConfig {
+            id: id.clone(),
+            hosted_zone_id: zone_id,
+            // The log group is reported as the caller named it: the ARN is what
+            // identifies the group this configuration publishes to.
+            cloud_watch_logs_log_group_arn: input.cloud_watch_logs_log_group_arn.clone(),
+        };
+        store
+            .query_logging_configs
+            .insert(id.clone(), query_logging_config.clone());
+
+        Ok(CreateQueryLoggingConfigOutput {
+            query_logging_config,
+            // The path `GetQueryLoggingConfig` reads this configuration back at
+            // (`/2013-04-01/queryloggingconfig/{Id}`), so the URL is one the
+            // caller can follow.
+            location: resource_location(ctx, &format!("queryloggingconfig/{id}")),
+        })
     }
 }

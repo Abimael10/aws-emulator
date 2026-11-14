@@ -64,6 +64,11 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # lives in the KMS emulator's own key store: it is reached through the shared engine and
 # needs the owning service's state TYPE.
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# A query logging configuration publishes a hosted zone's DNS queries to a CloudWatch Logs
+# log group, which lives in that emulator's own log-group store: the ARN a request names is
+# resolved there through the shared engine, which needs the owning service's state TYPE
+# (`state::query_logging`).
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -66,7 +66,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{cidr_collection_arn, DEFAULT_PAGE_SIZE};
+use crate::state::{cidr_collection_arn, minted_uuid_is_well_formed, DEFAULT_PAGE_SIZE};
 
 /// The largest page this listing serves: the default page size every Route 53 listing is
 /// served in ([`DEFAULT_PAGE_SIZE`]), which is also past the account's own collection
@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order the store holds them in. A token of any other shape identifies no page.
         let resume_at = match input.next_token.as_deref().map(str::trim) {
             None | Some("") => None,
-            Some(token) if collection_id_is_well_formed(token) => Some(token.to_string()),
+            Some(token) if minted_uuid_is_well_formed(token) => Some(token.to_string()),
             Some(_) => {
                 return Err(ListCidrCollectionsErrorModeled::InvalidInput(InvalidInput {
                     message: Some(INVALID_TOKEN_MESSAGE.to_string()),
@@ -207,21 +207,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
-}
-
-/// Whether `token` has the shape of a collection id, which is the only thing this
-/// operation ever mints a token out of: the `UUID` form the model fixes for one
-/// (`^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$`).
-fn collection_id_is_well_formed(token: &str) -> bool {
-    let groups: Vec<&str> = token.split('-').collect();
-    groups.len() == 5
-        && [8, 4, 4, 4, 12]
-            .iter()
-            .zip(&groups)
-            .all(|(length, group)| {
-                group.len() == *length
-                    && group
-                        .chars()
-                        .all(|character| character.is_ascii_digit() || matches!(character, 'a'..='f'))
-            })
 }

@@ -63,6 +63,10 @@ pub mod vpc_association_authority;
 /// half of the customer managed key the KSK was created from.
 pub mod signing_key;
 
+/// The DNS query logging configuration a hosted zone publishes its queries under,
+/// and the CloudWatch Logs log group it publishes them to.
+pub mod query_logging;
+
 use crate::ops::types::change_cidr_collection_types::CidrCollectionVersionMismatchException;
 use crate::ops::types::create_cidr_collection_types::CidrCollection;
 use crate::ops::types::list_cidr_blocks_types::CidrBlockSummary;
@@ -76,7 +80,7 @@ use crate::ops::types::shared_types::{
     InvalidPaginationToken, InvalidTrafficPolicyDocument, KeySigningKey, NoSuchCidrCollectionException,
     NoSuchDelegationSet,
     NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, NoSuchTrafficPolicyInstance,
-    GeoLocationDetails,
+    GeoLocationDetails, QueryLoggingConfig,
     ResourceRecordSet, ResourceTagSet, StatusReport, Tag, TrafficPolicy, TrafficPolicyInstance, VPC,
     HEALTH_CHECK_REGION_VALUES, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
 };
@@ -2039,6 +2043,14 @@ pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     /// a listing pages over a stable total order of collection ids. Bounded by
     /// [`MAX_CIDR_COLLECTIONS`].
     pub cidr_collections: BTreeMap<String, StoredCidrCollection>,
+    /// Every DNS query logging configuration of the account's, keyed by its id. A
+    /// `BTreeMap` so a listing pages over a stable total order of configuration
+    /// ids. Stored as the modelled projection itself: every member
+    /// `QueryLoggingConfig` carries is persisted verbatim and nothing else about a
+    /// configuration is derived (see [`query_logging`]). Bounded by the zones that
+    /// can hold one — at most one per hosted zone, so [`MAX_HOSTED_ZONES`] bounds
+    /// these too.
+    pub query_logging_configs: BTreeMap<String, QueryLoggingConfig>,
     /// The id generator, kept here so ids stay unique across calls.
     ids: IdMinter,
     /// The health-checker CIDR blocks `GetCheckerIpRanges` reports, in the order
@@ -2083,6 +2095,7 @@ impl Default for ComAmazonawsRoute53Awsdnsv20130401State {
             delegation_sets: BTreeMap::new(),
             delegation_set_by_caller_reference: HashMap::new(),
             cidr_collections: BTreeMap::new(),
+            query_logging_configs: BTreeMap::new(),
             ids: IdMinter::default(),
             checker_ip_ranges: checker_ip_ranges(),
             geo_locations: geo_location::catalog(),
@@ -2151,6 +2164,34 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
                 return id;
             }
         }
+    }
+
+    /// Mint a query logging configuration id: 8-4-4-4-12 lowercase hex, the form
+    /// Route 53 returns for one (`QueryLoggingConfigId` is `len 1..36`, which is
+    /// that form's length). Retried until it is unused.
+    pub fn mint_query_logging_config_id(&mut self) -> String {
+        loop {
+            let id = self.ids.mint_uuid();
+            if !self.query_logging_configs.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The query logging configuration the hosted zone `zone_id` already has, if
+    /// it has one.
+    ///
+    /// `QueryLoggingConfigAlreadyExists` makes the hosted ZONE the identity a
+    /// create collides on — "You can create only one query logging configuration
+    /// for a hosted zone" — so the lookup is by zone id, and it is searched off
+    /// the store rather than tracked beside it: a configuration that is deleted
+    /// frees its zone by itself. `zone_id` is the BARE id, as
+    /// [`normalize_zone_id`] resolves it, which is the form a stored
+    /// configuration carries.
+    pub fn query_logging_config_for_zone(&self, zone_id: &str) -> Option<&QueryLoggingConfig> {
+        self.query_logging_configs
+            .values()
+            .find(|config| config.hosted_zone_id == zone_id)
     }
 
     /// The CIDR collection carrying `name`, if the account holds one.
@@ -3630,6 +3671,30 @@ pub fn vpc_id_is_well_formed(vpc_id: &str) -> bool {
         && body
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether `value` has the 8-4-4-4-12 lowercase-hexadecimal form of the ids this
+/// service mints for the resources it gives no letter-prefixed id — a traffic
+/// policy, a traffic policy instance, a health check, a CIDR collection, a query
+/// logging configuration ([`ComAmazonawsRoute53Awsdnsv20130401State::mint_cidr_collection_id`]
+/// and its neighbours) — which is also the form the model's `UUID` shape fixes
+/// (`pattern ^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$`).
+///
+/// The ONE reading of that form, beside [`vpc_id_is_well_formed`] for the other id
+/// shape this service reads, so the listings that resume at an id they minted cannot
+/// disagree about which strings are one.
+pub fn minted_uuid_is_well_formed(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && [8, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(length, group)| {
+                group.len() == *length
+                    && group
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            })
 }
 
 /// Whether `region` is one of the regions the model's `VPCRegion` enum names.
