@@ -17,6 +17,8 @@ mod celebrity_recognition;
 mod collection_face_lifecycle;
 #[path = "all/collection_users.rs"]
 mod collection_users;
+#[path = "all/constraint_value_rendering.rs"]
+mod constraint_value_rendering;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
 #[path = "all/face_collections.rs"]

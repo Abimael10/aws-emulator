@@ -32,6 +32,9 @@ image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
 ] }
+# The shared statement of a boundary refusal: the envelope AWS words one in, and how a
+# floating-point member's submitted value is quoted back inside it.
+service-common = { path = "../common" }
 # The Amazon S3 client an `Image.S3Object` is read through, over the in-process callback
 # into this same emulator (no network client feature: the transport is the emulator's own).
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
