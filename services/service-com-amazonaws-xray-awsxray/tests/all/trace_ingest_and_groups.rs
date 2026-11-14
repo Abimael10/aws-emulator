@@ -65,7 +65,14 @@ struct TraceCase {
     is_partial: bool,
     http_status: Option<i64>,
     http_url: Option<&'static str>,
-    service_names: Vec<&'static str>,
+    /// The `(Name, Type)` of every entry of the summary's `ServiceIds`, in the
+    /// order it reports them, with `""` for a `Type` the entry omits.
+    ///
+    /// A trace's services are the nodes of its own service graph, so a service
+    /// that reported a ROOT segment is listed twice: once as the node that
+    /// reported it, typed by that document's `origin`, and once as the `client`
+    /// node for the callers of that root, which reported no segment of its own.
+    service_ids: Vec<(&'static str, &'static str)>,
     annotation_keys: Vec<&'static str>,
 }
 
@@ -101,7 +108,7 @@ fn trace_cases() -> Vec<TraceCase> {
             is_partial: false,
             http_status: Some(200),
             http_url: Some("http://localhost/"),
-            service_names: vec!["svc"],
+            service_ids: vec![("svc", ""), ("svc", "client")],
             annotation_keys: vec![],
         },
         TraceCase {
@@ -130,7 +137,7 @@ fn trace_cases() -> Vec<TraceCase> {
             is_partial: false,
             http_status: None,
             http_url: None,
-            service_names: vec!["frontend", "backend"],
+            service_ids: vec![("backend", ""), ("frontend", ""), ("frontend", "client")],
             annotation_keys: vec![],
         },
         TraceCase {
@@ -154,7 +161,7 @@ fn trace_cases() -> Vec<TraceCase> {
             is_partial: false,
             http_status: Some(404),
             http_url: Some("http://localhost/missing"),
-            service_names: vec!["svc"],
+            service_ids: vec![("svc", ""), ("svc", "client")],
             annotation_keys: vec![],
         },
         TraceCase {
@@ -181,7 +188,7 @@ fn trace_cases() -> Vec<TraceCase> {
             is_partial: false,
             http_status: Some(503),
             http_url: Some("http://localhost/down"),
-            service_names: vec!["svc"],
+            service_ids: vec![("svc", ""), ("svc", "client")],
             annotation_keys: vec![],
         },
         TraceCase {
@@ -209,7 +216,7 @@ fn trace_cases() -> Vec<TraceCase> {
             is_partial: false,
             http_status: Some(429),
             http_url: Some("http://localhost/busy"),
-            service_names: vec!["svc"],
+            service_ids: vec![("svc", ""), ("svc", "client")],
             annotation_keys: vec![],
         },
         TraceCase {
@@ -226,7 +233,7 @@ fn trace_cases() -> Vec<TraceCase> {
             is_partial: true,
             http_status: None,
             http_url: None,
-            service_names: vec!["slow"],
+            service_ids: vec![("slow", ""), ("slow", "client")],
             annotation_keys: vec![],
         },
         TraceCase {
@@ -249,7 +256,7 @@ fn trace_cases() -> Vec<TraceCase> {
             is_partial: false,
             http_status: None,
             http_url: None,
-            service_names: vec!["worker"],
+            service_ids: vec![("worker", ""), ("worker", "client")],
             annotation_keys: vec![],
         },
         TraceCase {
@@ -273,7 +280,10 @@ fn trace_cases() -> Vec<TraceCase> {
             is_partial: false,
             http_status: None,
             http_url: None,
-            service_names: vec!["annotated"],
+            service_ids: vec![
+                ("annotated", "AWS::EC2::Instance"),
+                ("annotated", "client"),
+            ],
             annotation_keys: vec!["stage", "attempt", "cached"],
         },
     ]
@@ -376,14 +386,19 @@ async fn trace_summaries_and_traces_are_recomputed_from_the_stored_segment_docum
             case.http_url,
             summary.get("Http")
         );
-        let service_names: Vec<&str> = array(summary, "ServiceIds")
+        let service_ids: Vec<(&str, &str)> = array(summary, "ServiceIds")
             .iter()
-            .filter_map(|id| id.get("Name").and_then(Value::as_str))
+            .map(|id| {
+                (
+                    id.get("Name").and_then(Value::as_str).unwrap_or_default(),
+                    id.get("Type").and_then(Value::as_str).unwrap_or_default(),
+                )
+            })
             .collect();
         assert_eq!(
-            service_names, case.service_names,
-            "case {label:?}: expected ServiceIds names {:?}, got {service_names:?}",
-            case.service_names
+            service_ids, case.service_ids,
+            "case {label:?}: expected ServiceIds {:?}, got {service_ids:?}",
+            case.service_ids
         );
         let annotation_keys: BTreeSet<&str> = summary
             .get("Annotations")

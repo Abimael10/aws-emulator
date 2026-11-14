@@ -5209,3 +5209,21 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both, for this file
 // and for every service crate's `tests/all.rs`.
 // suite in this target. `all/all_rs_declares_each_suite_once.rs` and
+// span in the head region above: two branches landing at once each appended a copy here, and
+// declared only once, and two branches landing at once each appended a copy here.)
+// region of this file: two landings each appended a copy here, and a module declared twice
+// head region of this file: two landings each appended a copy here, and a module declared
+// (A fragment of this file's own header landed here as an INNER doc comment; past the first
+// item that is `E0753`, so it stands as an ordinary comment. The rule it repeats is in the
+// module doc at the head of this file.)
+// (Another fragment of that same header, an ordinary comment here for the same reason: an
+// inner doc comment is legal only before the first item of this crate root.)
+// (Two more fragments of this file's own header landed here as inner doc comments; `//!` is
+// legal only before the first item of this crate root, so they stand as ordinary comments —
+// the rule they repeat is in the module doc at the head of this file.)
+// (The same fragment once more, as an ordinary comment: `//!` is legal only before the
+// (A block of this file's own header appended here by a landing, typed with `//!`: an inner
+// doc comment is legal only BEFORE the first item, so in this tail it is `E0753` and
+// compiles nothing. The rule it repeats — declare each suite exactly ONCE, since this is one
+// crate root and a second `mod` for the same name is `E0428` — stands in the module doc at
+// the head of this file, and `all/all_rs_declares_each_suite_once.rs` plus

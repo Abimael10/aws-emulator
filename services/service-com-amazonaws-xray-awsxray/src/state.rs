@@ -724,6 +724,10 @@ pub struct ComAmazonawsXrayAwsxrayState {
     /// [`MAX_SAMPLING_RULES`] of them. A rule's ARN is derived from its name, so
     /// no second index is needed to resolve one by ARN.
     pub sampling_rules: BTreeMap<String, StoredSamplingRule>,
+    /// Feeds the internal id minted for a stored sampling rule
+    /// ([`sampling_rule_internal_id`]); never reset, so a rule created again
+    /// under a name a deleted rule had is a different resource from it.
+    pub sampling_rule_seq: u64,
     /// Started trace retrievals, keyed by the `RetrievalToken` that was minted
     /// for them, at most [`MAX_TRACE_RETRIEVALS`] of them.
     pub retrievals: BTreeMap<String, TraceRetrievalRecord>,
@@ -1312,11 +1316,6 @@ impl SamplingRuleLookupError {
 /// `DeleteSamplingRule` / `UpdateSamplingRule` refusals state it: the refusal
 /// reports that there is no such rule, not what the request asked for.
 pub const SAMPLING_RULE_NOT_FOUND_MESSAGE: &str = "Sampling rule does not exist";
-
-/// What X-Ray answers when a created rule's `RuleName` is already in use — the
-/// same fixed shape of wording, from its recorded `CreateSamplingRule`
-/// refusals.
-pub const SAMPLING_RULE_EXISTS_MESSAGE: &str = "Sampling rule already exists";
 
 /// The `UnprocessedStatistics$Message` for a statistics document reported
 /// against a sampling rule the account does not hold.

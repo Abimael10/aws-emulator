@@ -11,6 +11,11 @@
 //! no `origin` of its own. That is what lets a reader tell an external
 //! dependency from a service that reports for itself.
 //!
+//! A summary's `ServiceIds` are the NODES of the trace's own service graph, so
+//! beside each of those identities it carries the `client` node for the callers
+//! of every root segment — the one node no stored document names, typed
+//! `client` and named for the root service it called.
+//!
 //! The first test is a table over that class: the rows differ in whether the
 //! calling segment names an `origin`, whether its subsegments left the process
 //! at all, how many downstream calls there are and how deeply the call sits in
@@ -36,6 +41,10 @@ const CALLER_ORIGIN: &str = "AWS::EC2::Instance";
 
 /// The type of a node inferred from a `namespace: "remote"` call.
 const REMOTE: &str = "remote";
+
+/// The type of the node that stands for the callers of a root segment, which
+/// carries the root service's own name.
+const CLIENT: &str = "client";
 
 /// One subsegment of the calling segment: `namespace` absent is work inside the
 /// caller, `Some("remote")` is a call out to a downstream service.
@@ -103,13 +112,13 @@ async fn trace_summary_service_ids_type_each_service_by_what_reported_it() {
             "in-process work only, caller reporting an origin",
             Some(CALLER_ORIGIN),
             json!([subsegment("2222222222222222", "InternalPipeline", None, json!([]))]),
-            vec![(CALLER, CALLER_ORIGIN)],
+            vec![(CALLER, CALLER_ORIGIN), (CALLER, CLIENT)],
         ),
         (
             "in-process work only, caller reporting no origin",
             None,
             json!([subsegment("2222222222222222", "InternalPipeline", None, json!([]))]),
-            vec![(CALLER, "")],
+            vec![(CALLER, ""), (CALLER, CLIENT)],
         ),
         (
             "one downstream call beside in-process work, caller reporting an origin",
@@ -118,13 +127,17 @@ async fn trace_summary_service_ids_type_each_service_by_what_reported_it() {
                 subsegment("2222222222222222", "InternalPipeline", None, json!([])),
                 subsegment("3333333333333333", "QuartzAPI", Some(REMOTE), json!([])),
             ]),
-            vec![(CALLER, CALLER_ORIGIN), ("QuartzAPI", REMOTE)],
+            vec![
+                (CALLER, CALLER_ORIGIN),
+                (CALLER, CLIENT),
+                ("QuartzAPI", REMOTE),
+            ],
         ),
         (
             "one downstream call, caller reporting no origin",
             None,
             json!([subsegment("3333333333333333", "QuartzAPI", Some(REMOTE), json!([]))]),
-            vec![(CALLER, ""), ("QuartzAPI", REMOTE)],
+            vec![(CALLER, ""), (CALLER, CLIENT), ("QuartzAPI", REMOTE)],
         ),
         (
             "two downstream calls, each its own service",
@@ -135,6 +148,7 @@ async fn trace_summary_service_ids_type_each_service_by_what_reported_it() {
             ]),
             vec![
                 (CALLER, CALLER_ORIGIN),
+                (CALLER, CLIENT),
                 ("QuartzAPI", REMOTE),
                 ("basalt.example.com", REMOTE),
             ],
@@ -153,7 +167,11 @@ async fn trace_summary_service_ids_type_each_service_by_what_reported_it() {
                     json!([subsegment("3333333333333333", "QuartzAPI", Some(REMOTE), json!([]))]),
                 )]),
             )]),
-            vec![(CALLER, CALLER_ORIGIN), ("QuartzAPI", REMOTE)],
+            vec![
+                (CALLER, CALLER_ORIGIN),
+                (CALLER, CLIENT),
+                ("QuartzAPI", REMOTE),
+            ],
         ),
     ];
 
@@ -215,6 +233,7 @@ async fn every_surface_reports_an_inferred_service_with_the_same_type() {
     let listed = reported_services(summary);
     let expected: BTreeSet<(String, String)> = [
         (CALLER.to_string(), CALLER_ORIGIN.to_string()),
+        (CALLER.to_string(), CLIENT.to_string()),
         ("QuartzAPI".to_string(), REMOTE.to_string()),
     ]
     .into_iter()

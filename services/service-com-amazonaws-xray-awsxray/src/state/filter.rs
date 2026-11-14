@@ -865,13 +865,30 @@ fn root_cause_member(block: RootCauseBlock, keyword: &str) -> Result<Field, Filt
 
 /// Refuse a comparison whose operands cannot be compared at all.
 ///
-/// X-Ray words this refusal "You can't compare property [<property>] against
-/// the <Type> data type.", naming the keyword as the expression wrote it and
-/// the data type of the value it was compared to, so that is the sentence
-/// [`FilterError::operands`] carries — the one wording for every comparison this
-/// language cannot make, whether the types differ outright, the operator orders
-/// a value that has no order, or a string operator was given something that is
-/// not a string.
+/// WHICH SIDE of the comparison is at fault is what the refusal states, because
+/// that is what tells a caller what to change, and X-Ray words the two sides
+/// differently. A comparison is NUMERIC when either side makes it so — the
+/// keyword's values are numbers, or the operator orders its operands, which only
+/// numbers have — and in a numeric comparison:
+///
+/// * a keyword whose values are not numbers is refused with "You can't compare a
+///   non-numeric property [<keyword>] for the <operator> operator.", because no
+///   value of that keyword can be ordered; and
+/// * an operand that is not a number, compared against a keyword whose values
+///   are, is refused with "You can't compare a non-numeric value of type [<data
+///   type>] against property [<keyword>] for the <operator> operator.", naming
+///   the data type of the value that cannot take part.
+///
+/// Both name the keyword as the expression wrote it and the operator as it was
+/// written, so a caller sees which operand of its own expression is mistyped and
+/// under which operator. A mismatch that is not a numeric comparison at all — a
+/// literal of the wrong type against a boolean or string keyword, a string
+/// operator given something that is not a string — is refused naming the data
+/// type that cannot be compared.
+///
+/// Every surface that takes an expression reaches this one judgement — the
+/// storing surfaces through [`operand_check`] and the reading ones through
+/// [`parse`] — so one expression is refused in one sentence wherever it arrives.
 fn check(keyword: &str, field: &Field, op: Operator, value: &Literal) -> Result<(), FilterError> {
     let expected = field.value_type();
     let compatible = matches!(
@@ -886,13 +903,48 @@ fn check(keyword: &str, field: &Field, op: Operator, value: &Literal) -> Result<
     // given beyond the field's own type.
     let ordered_well = !orders(op) || matches!(value, Literal::Num(_));
     let textual_well = !textual(op) || matches!(value, Literal::Str(_));
-    if !(compatible && ordered_well && textual_well) {
-        return Err(FilterError::operands(format!(
+    if compatible && ordered_well && textual_well {
+        return Ok(());
+    }
+    let numeric_comparison = expected == ValueType::Num || orders(op);
+    // An annotation's type is the submitted value's, so it is never the
+    // non-numeric side of a comparison: whichever literal it is compared to is.
+    let numeric_keyword = matches!(expected, ValueType::Num | ValueType::Any);
+    let operator = operator_symbol(op);
+    let message = if numeric_comparison && !numeric_keyword {
+        format!("You can't compare a non-numeric property [{keyword}] for the {operator} operator.")
+    } else if numeric_comparison && !matches!(value, Literal::Num(_)) {
+        format!(
+            "You can't compare a non-numeric value of type [{}] against property [{keyword}] for \
+             the {operator} operator.",
+            value.kind()
+        )
+    } else {
+        format!(
             "You can't compare property [{keyword}] against the {} data type.",
             value.kind()
-        )));
+        )
+    };
+    Err(FilterError::operands(message))
+}
+
+/// `op` as an expression writes it, which is how a refusal names it.
+///
+/// The word operators are named as AWS's filter-expression reference writes
+/// them; `BEGINSWITH` and `STARTSWITH` are one operator under two spellings
+/// ([`filter_expression::Operator::BeginsWith`]), named by the first.
+fn operator_symbol(op: Operator) -> &'static str {
+    match op {
+        Operator::Equal => "=",
+        Operator::NotEqual => "!=",
+        Operator::Less => "<",
+        Operator::LessOrEqual => "<=",
+        Operator::Greater => ">",
+        Operator::GreaterOrEqual => ">=",
+        Operator::Contains => "CONTAINS",
+        Operator::BeginsWith => "BEGINSWITH",
+        Operator::EndsWith => "ENDSWITH",
     }
-    Ok(())
 }
 
 /// Whether `op` orders its operands, which only numbers do.

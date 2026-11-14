@@ -29,6 +29,9 @@ mod enum_value_set_order;
 #[path = "all/filter_expression_entity_ids.rs"]
 mod filter_expression_entity_ids;
 
+#[path = "all/filter_expression_operand_types.rs"]
+mod filter_expression_operand_types;
+
 #[path = "all/filter_expression_unary_forms.rs"]
 mod filter_expression_unary_forms;
 
@@ -98,6 +101,9 @@ mod sampling_rule_deletion;
 #[path = "all/sampling_rule_fixed_refusals.rs"]
 mod sampling_rule_fixed_refusals;
 
+#[path = "all/sampling_rule_name_collision.rs"]
+mod sampling_rule_name_collision;
+
 #[path = "all/sampling_rules.rs"]
 mod sampling_rules;
 
@@ -146,6 +152,8 @@ mod trace_retrieval_lifecycle;
 #[path = "all/trace_segment_destination.rs"]
 mod trace_segment_destination;
 
+#[path = "all/trace_summary_client_service_id.rs"]
+mod trace_summary_client_service_id;
 #[path = "all/trace_tree_assembly.rs"]
 mod trace_tree_assembly;
 

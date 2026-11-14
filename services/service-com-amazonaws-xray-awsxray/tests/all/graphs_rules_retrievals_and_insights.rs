@@ -40,8 +40,8 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_xray_awsxray::ops::types::Insight;
 use service_com_amazonaws_xray_awsxray::state::{
-    ComAmazonawsXrayAwsxrayState, MAX_WINDOW_FUTURE_SKEW_SECONDS, TRACE_RETRIEVAL_BURST,
-    TRACE_RETRIEVAL_RATE_PER_SECOND,
+    ComAmazonawsXrayAwsxrayState, MAX_WINDOW_FUTURE_SKEW_SECONDS, SAMPLING_RULE_EXISTS_PREFIX,
+    TRACE_RETRIEVAL_BURST, TRACE_RETRIEVAL_RATE_PER_SECOND,
 };
 
 use crate::trace_ingest_and_groups::{array, close, root_document, trace_id, Answer, Xray};
@@ -1144,6 +1144,28 @@ async fn concurrent_creates_of_one_rule_name_have_exactly_one_winner() {
             "a losing concurrent create must be refused as invalid, got {answer:?}"
         );
     }
+    // Each loser lost to the ONE winner, so each refusal reports that resource:
+    // the service's fixed text for a held name, then the internal id the winning
+    // rule is stored under — one id across every loser.
+    let named: Vec<&str> = answers
+        .iter()
+        .filter(|answer| answer.status != 200)
+        .map(|answer| {
+            let said = answer.message().unwrap_or_default();
+            said.strip_prefix(SAMPLING_RULE_EXISTS_PREFIX).unwrap_or_else(|| {
+                panic!(
+                    "a losing concurrent create must be refused for the resource holding the \
+                     name, got {said:?}"
+                )
+            })
+        })
+        .collect();
+    let one_id = named.first().copied().unwrap_or_default();
+    assert!(
+        !one_id.is_empty() && named.iter().all(|id| *id == one_id),
+        "every loser lost to the one winner, so every refusal names that one internal id, got \
+         {named:?}"
+    );
 
     // And the winner's rule is the only one stored, beside the account's
     // service-managed `Default` rule.

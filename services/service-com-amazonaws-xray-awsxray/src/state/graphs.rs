@@ -9,7 +9,7 @@
 //! recomputed from the stored segment documents, so the two readers can never
 //! describe the same stored segments differently.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     classify, inferred_service_type, timestamp_of, Classification, JsonObject, SegmentRecord,
@@ -244,26 +244,45 @@ impl EdgeAccumulator {
 
 /// What distinguishes one node of a service graph from another.
 ///
-/// A node the stored segments REPORTED is the service of that `name`. Beside it
-/// a graph carries the node `Service$Type` documents as `client` — "represents
-/// the clients that sent requests to a root service" — which carries the root
-/// service's own name, so the name alone does not identify a node.
+/// A node is a service's name TOGETHER with the type it is reported with, never
+/// the name alone:
+///
+/// * a node the stored segments REPORTED is typed by the `origin` those
+///   documents carried, so one name reported from two host types is two nodes —
+///   which is what `origin` exists to express, and what an `id(name:, type:)`
+///   selector picks one of. A document that carried NO `origin` says nothing
+///   about the host its service ran on, so it joins the node its service's other
+///   documents reported ([`ReportedOrigins`]) rather than standing as a second,
+///   untyped node of one name;
+/// * beside it a graph carries the node `Service$Type` documents as `client` —
+///   "represents the clients that sent requests to a root service" — which
+///   carries the root service's own name; and
+/// * a node a downstream call named carries the type that call inferred.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct NodeKey {
     /// The canonical service name, which is what `Service$Name` reports.
     name: String,
     /// `Service$Type` for a node no segment reported — `client`, `remote`, or
-    /// `AWS::<Service>` — and `None` for one a segment did report, whose type is
-    /// that segment's `origin`.
+    /// `AWS::<Service>` — and `None` for one a segment did report.
     inferred_type: Option<String>,
+    /// The `origin` the segments that REPORTED this node carried, which is the
+    /// type such a node is reported with; `None` for a node no segment reported,
+    /// and for one whose documents carried no `origin`.
+    reported_type: Option<String>,
 }
 
 impl NodeKey {
-    /// The node of the service whose segments report `name`.
-    fn reported(name: &str) -> Self {
+    /// The node of the service that reported `segment`, typed by that document's
+    /// `origin` — or, where it carried none, by the one `origin` the service's
+    /// other documents in this derivation reported ([`ReportedOrigins`]).
+    fn reported(segment: &SegmentRecord, origins: &ReportedOrigins<'_>) -> Self {
         Self {
-            name: name.to_string(),
+            name: segment.name.clone(),
             inferred_type: None,
+            reported_type: segment
+                .origin
+                .clone()
+                .or_else(|| origins.sole_origin(&segment.name).map(str::to_string)),
         }
     }
 
@@ -272,7 +291,53 @@ impl NodeKey {
         Self {
             name: name.to_string(),
             inferred_type: Some(SERVICE_TYPE_CLIENT.to_string()),
+            reported_type: None,
         }
+    }
+
+    /// `Service$Type` for this node: what makes an inferred node that node, and
+    /// the reported `origin` for a node a segment reported.
+    fn service_type(&self) -> Option<String> {
+        self.inferred_type
+            .clone()
+            .or_else(|| self.reported_type.clone())
+    }
+}
+
+/// The `origin`s each reporting service name was reported with, over the
+/// segments one derivation covers.
+///
+/// A service's `origin` describes the host its instrumentation ran on, and a
+/// document that carried none reports nothing about it rather than reporting a
+/// different host: so where every document of a name that named an origin named
+/// the SAME one, that origin types every node of the name, and a document
+/// carrying none joins it. Where two documents of one name named DIFFERENT
+/// origins, each is its own node and a document carrying none joins neither —
+/// nothing in it says which of the hosts it ran on.
+#[derive(Debug, Default)]
+struct ReportedOrigins<'a> {
+    /// Service name -> the distinct `origin`s its documents reported.
+    by_name: BTreeMap<&'a str, BTreeSet<&'a str>>,
+}
+
+impl<'a> ReportedOrigins<'a> {
+    /// Record the `origin` `segment` reported, if it reported one.
+    fn record(&mut self, segment: &'a SegmentRecord) {
+        if let Some(origin) = segment.origin.as_deref() {
+            self.by_name
+                .entry(segment.name.as_str())
+                .or_default()
+                .insert(origin);
+        }
+    }
+
+    /// The ONE `origin` the service called `name` was reported with, when its
+    /// documents reported exactly one.
+    fn sole_origin(&self, name: &str) -> Option<&'a str> {
+        let reported = self.by_name.get(name)?;
+        let mut origins = reported.iter();
+        let first = *origins.next()?;
+        origins.next().is_none().then_some(first)
     }
 }
 
@@ -295,6 +360,7 @@ fn downstream_node(
     Some(NodeKey {
         name: name.to_string(),
         inferred_type: Some(inferred_type),
+        reported_type: None,
     })
 }
 
@@ -302,7 +368,6 @@ fn downstream_node(
 #[derive(Debug, Default)]
 struct NodeAccumulator {
     account_id: Option<String>,
-    service_type: Option<String>,
     root: bool,
     complete: bool,
     span: Span,
@@ -345,9 +410,6 @@ impl NodeAccumulator {
                 self.response_times.push(duration);
             }
         }
-        if self.service_type.is_none() {
-            self.service_type = segment.origin.clone();
-        }
         if self.account_id.is_none() {
             self.account_id = segment.account_id.clone();
         }
@@ -361,12 +423,10 @@ impl NodeAccumulator {
             names: Some(vec![key.name.clone()]),
             root: Some(self.root),
             account_id: self.account_id.clone(),
-            // An inferred node's type is what makes it that node; a reported
-            // one's is the `origin` its segments carried.
-            r#type: key
-                .inferred_type
-                .clone()
-                .or_else(|| self.service_type.clone()),
+            // A node's type is what identifies it beside its name: the type an
+            // inferred node was inferred with, the `origin` a reported one's
+            // segments carried ([`NodeKey::service_type`]).
+            r#type: key.service_type(),
             state: Some(
                 // A node the graph DISCOVERED downstream reported no segment of
                 // its own: it is known passively, by having been called, which
@@ -431,15 +491,17 @@ fn histogram(values: &[f64]) -> Option<Vec<HistogramEntry>> {
 /// a time window and `GetTraceGraph` over named traces — so the two can never
 /// describe the same stored segments differently.
 ///
-/// A node is one distinct segment `name` (the canonical name of the service that
-/// handled the request), plus the `client` node `Service$Type` documents for
-/// every root service — "represents the clients that sent requests to a root
-/// service" — which carries that service's own name and one edge into it, plus
-/// one node per SUBSEGMENT whose `namespace` says the call left the process
-/// (`remote`, "a downstream service of indeterminate type", or `aws` for an AWS
-/// service). A subsegment reports no service of its own otherwise: one with no
-/// such namespace records in-process work, so it adds neither a node nor an
-/// edge, and the work it did is already counted on the service that recorded it.
+/// A node is one distinct REPORTED identity — a segment `name` (the canonical
+/// name of the service that handled the request) together with the `origin` that
+/// service reported itself with, so one name reported from two host types is two
+/// nodes — plus the `client` node `Service$Type` documents for every root
+/// service — "represents the clients that sent requests to a root service" —
+/// which carries that service's own name and one edge into it, plus one node per
+/// SUBSEGMENT whose `namespace` says the call left the process (`remote`, "a
+/// downstream service of indeterminate type", or `aws` for an AWS service). A
+/// subsegment reports no service of its own otherwise: one with no such
+/// namespace records in-process work, so it adds neither a node nor an edge, and
+/// the work it did is already counted on the service that recorded it.
 ///
 /// An edge is a stored `parent_id` link between two segments of DIFFERENT
 /// services, counted on the upstream node and naming the downstream one by
@@ -460,13 +522,27 @@ pub fn service_graph<'a>(
         None => true,
     };
 
+    // The traces this derivation covers, taken once: which `origin` types a
+    // reported node is decided over all of them ([`ReportedOrigins`]), before
+    // any node is built. Bounded by the stored trace cap
+    // ([`super::MAX_TRACES`]), as the single walk already was.
+    let traces: Vec<&TraceRecord> = traces.into_iter().collect();
+    let reports =
+        |segment: &SegmentRecord| selects(segment) && !segment.is_subsegment() && !segment.inferred;
+    let mut origins = ReportedOrigins::default();
+    for trace in &traces {
+        for segment in trace.segments.iter().filter(|segment| reports(segment)) {
+            origins.record(segment);
+        }
+    }
+
     let mut nodes: BTreeMap<NodeKey, NodeAccumulator> = BTreeMap::new();
     // Inline subsegments are walked under one budget across the whole
     // derivation, so a graph over many traces of many segments, each carrying
     // many subsegments, cannot multiply into unbounded work: past the budget a
     // graph reports the services its SEGMENTS named.
     let mut subsegment_budget = MAX_GRAPH_SUBSEGMENT_VISITS;
-    for trace in traces {
+    for trace in &traces {
         for segment in &trace.segments {
             // An inferred segment is not one a service REPORTED: it is this
             // service's own projection of a remote subsegment
@@ -478,8 +554,11 @@ pub fn service_graph<'a>(
                 continue;
             }
             let call = Call::of_segment(segment);
+            // This segment's own node key, built once for the node, the client
+            // edge into it and the edges its subsegments add.
+            let reported = NodeKey::reported(segment, &origins);
             nodes
-                .entry(NodeKey::reported(&segment.name))
+                .entry(reported.clone())
                 .or_default()
                 .record(segment);
             if segment.parent_id.is_none() {
@@ -492,7 +571,7 @@ pub fn service_graph<'a>(
                 client.record_call(call);
                 client
                     .edges
-                    .entry(NodeKey::reported(&segment.name))
+                    .entry(reported.clone())
                     .or_default()
                     .record(call);
             }
@@ -514,12 +593,12 @@ pub fn service_graph<'a>(
                 else {
                     continue;
                 };
-                if downstream == NodeKey::reported(&segment.name) {
+                if downstream == reported {
                     continue;
                 }
                 let subsegment_call = Call::of_subsegment(subsegment, segment);
                 nodes
-                    .entry(NodeKey::reported(&segment.name))
+                    .entry(reported.clone())
                     .or_default()
                     .edges
                     .entry(downstream.clone())
@@ -554,7 +633,10 @@ pub fn service_graph<'a>(
             if !selects(parent) {
                 continue;
             }
-            let Some(upstream) = nodes.get_mut(&NodeKey::reported(&parent.name)) else {
+            // The upstream node's key, built once: it both selects the node and
+            // decides whether this segment is a call to its own service.
+            let upstream_key = NodeKey::reported(parent, &origins);
+            let Some(upstream) = nodes.get_mut(&upstream_key) else {
                 continue;
             };
             // A subsegment names a downstream service only through its
@@ -569,9 +651,9 @@ pub fn service_graph<'a>(
                     None => continue,
                 }
             } else {
-                NodeKey::reported(&segment.name)
+                NodeKey::reported(segment, &origins)
             };
-            if downstream == NodeKey::reported(&parent.name) {
+            if downstream == upstream_key {
                 continue;
             }
             let call = Call::of_segment(segment);
@@ -589,9 +671,10 @@ pub fn service_graph<'a>(
     }
 
     // "Identifier for the service. Unique within the service map": assigned over
-    // the nodes in key order — name, then the inferred type that distinguishes a
-    // `client` node from the service it calls — so one stored graph always
-    // answers with the same ids, across pages of one walk and across calls.
+    // the nodes in key order — name, then the type that distinguishes one node of
+    // that name from another (a `client` node from the service it calls, one
+    // reported `origin` from another) — so one stored graph always answers with
+    // the same ids, across pages of one walk and across calls.
     let reference_ids: BTreeMap<NodeKey, i32> = nodes
         .keys()
         .enumerate()

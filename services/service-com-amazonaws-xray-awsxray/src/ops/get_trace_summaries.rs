@@ -17,6 +17,12 @@
 //! available traces", which takes a deterministic sample of what the window, the
 //! group and the expression selected, at the rate the request states.
 //!
+//! A summary's `ServiceIds` are the NODES of that trace's own service graph
+//! ([`crate::state::service_graph`]) — the root service typed by the `origin` it
+//! reported, the services it called typed by those calls, and the `client` node
+//! for the callers of each root segment — so the services a summary reports and
+//! the nodes a service map draws for the same stored segments cannot disagree.
+//!
 //! A request outside what this read serves is REFUSED with
 //! `InvalidRequestException` rather than answered over part of it: an inverted
 //! time range, a window wider than the longest one this read serves
@@ -825,19 +831,32 @@ fn service_id_of(segment: &crate::state::SegmentRecord) -> ServiceId {
     }
 }
 
-/// "Service IDs from the trace's segment documents" — one per distinct segment
-/// name, in first-submission order.
+/// "Service IDs from the trace's segment documents" — one per NODE of the
+/// trace's own service graph.
+///
+/// The services a trace touched are exactly the nodes a graph of that trace
+/// draws, so this reports the node set the graph derivation produces
+/// ([`crate::state::service_graph`], the one derivation both graph readers
+/// answer from) rather than walking the stored segments a second time here. That
+/// is what carries into a summary the two things a segment walk cannot see: the
+/// `client` node `Service$Type` documents for the caller of every root segment —
+/// which reported no segment of its own, and so appears nowhere in the stored
+/// documents — and the node identity being the service's name TOGETHER with the
+/// type it was reported with, so two frames of one name reported from different
+/// hosts are two identities rather than one.
+///
+/// The whole trace takes part, as it does in a per-trace graph: a summary
+/// describes the trace rather than the slice of it the query's window cuts.
 fn service_ids_of(trace: &crate::state::TraceRecord) -> Vec<ServiceId> {
-    let mut seen: Vec<&str> = Vec::new();
-    let mut ids = Vec::new();
-    for segment in &trace.segments {
-        if seen.contains(&segment.name.as_str()) {
-            continue;
-        }
-        seen.push(segment.name.as_str());
-        ids.push(service_id_of(segment));
-    }
-    ids
+    crate::state::service_graph([trace], None)
+        .into_iter()
+        .map(|node| ServiceId {
+            name: node.name,
+            names: node.names,
+            account_id: node.account_id,
+            r#type: node.r#type,
+        })
+        .collect()
 }
 
 /// "Annotations from the trace's segment documents", each value carrying the

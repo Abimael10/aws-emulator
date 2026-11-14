@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 
 use super::{
     ComAmazonawsXrayAwsxrayState, SamplingRuleLookupError, ARN_NAMESPACE, MAX_SAMPLING_RULES,
-    SAMPLING_RULE_EXISTS_MESSAGE,
 };
 use crate::ops::types::{SamplingRateBoost, SamplingRule, SamplingRuleRecord};
 
@@ -24,6 +23,18 @@ use crate::ops::types::{SamplingRateBoost, SamplingRule, SamplingRuleRecord};
 pub struct StoredSamplingRule {
     /// The accepted rule, with `RuleName` and `RuleARN` as stored.
     pub rule: SamplingRule,
+    /// The id the service holds this resource under internally, beside the
+    /// `RuleName` a caller addresses it by
+    /// ([`sampling_rule_internal_id`]).
+    ///
+    /// No member of any modelled shape carries it — `SamplingRuleRecord`
+    /// reports the rule, its `CreatedAt` and its `ModifiedAt` and nothing else
+    /// — so the one place it reaches a caller is the refusal of a create whose
+    /// `RuleName` is already held, which reports the id of the resource that is
+    /// in the way ([`sampling_rule_exists_message`]). It is minted once, when
+    /// the record is stored, so every read of one rule names one id and a name
+    /// re-used after a delete names a different resource.
+    pub internal_id: String,
     /// When the rule was created, in seconds of epoch time.
     pub created_at: f64,
     /// When the rule was last modified, in seconds of epoch time.
@@ -240,6 +251,46 @@ pub const DEFAULT_SAMPLING_RULE_NAME: &str = "Default";
 /// nor the reserved name itself — whichever of the two selectors named it.
 pub const DEFAULT_SAMPLING_RULE_UNDELETABLE_MESSAGE: &str = "Cannot delete default sampling rule";
 
+/// The fixed text of the refusal a create whose `RuleName` the account already
+/// holds is answered with, which the id of the resource in the way is appended
+/// to ([`sampling_rule_exists_message`]).
+///
+/// X-Ray refuses such a create for the RESOURCE that is in the way rather than
+/// for the request: a resource of that name exists already and is a different
+/// resource than the one being created, which is what the sentence states, and
+/// the only variable part is that resource's internal id. That is what lets a
+/// caller tell this `InvalidRequestException` from the operation's other ones —
+/// a rejected priority, resource ARN or attribute map — which carry the same
+/// status and the same code.
+pub const SAMPLING_RULE_EXISTS_PREFIX: &str =
+    "A resource with the same resourceName but a different internalId already exists: ";
+
+/// The refusal for a create whose `RuleName` the account already holds:
+/// [`SAMPLING_RULE_EXISTS_PREFIX`], then the internal id of the rule that is in
+/// the way, read from this store rather than from the request.
+#[must_use]
+pub fn sampling_rule_exists_message(internal_id: &str) -> String {
+    format!("{SAMPLING_RULE_EXISTS_PREFIX}{internal_id}")
+}
+
+/// The internal id of the sampling-rule resource stored as the `sequence`-th
+/// rule under `rule_name`.
+///
+/// Derived through the one deterministic mixing every derived id of this crate
+/// goes through ([`service_common::stable_hex_id`]), over the never-reset
+/// [`sampling_rule_seq`](ComAmazonawsXrayAwsxrayState::sampling_rule_seq) and
+/// the name: so the same resource has one id for as long as it is stored, no
+/// clock enters the value, and a name created again after a delete identifies a
+/// DIFFERENT resource — which is the distinction the uniqueness refusal reports.
+#[must_use]
+pub fn sampling_rule_internal_id(rule_name: &str, sequence: u64) -> String {
+    ::service_common::stable_hex_id(&["sampling-rule", rule_name, &sequence.to_string()])
+}
+
+/// The sequence number the account's service-managed rule's internal id is
+/// derived from: nothing created it, so it precedes every created rule.
+pub const DEFAULT_SAMPLING_RULE_SEQUENCE: u64 = 0;
+
 /// The service-managed rule's `Priority`, deliberately PAST the `@range(min: 1,
 /// max: 9999)` a caller may set on a rule of its own
 /// (`smithy_query(query="shape",shape="Priority")`), so no created rule can ever
@@ -285,6 +336,10 @@ pub fn default_sampling_rule(region: &str) -> StoredSamplingRule {
             attributes: None,
             sampling_rate_boost: None,
         },
+        internal_id: sampling_rule_internal_id(
+            DEFAULT_SAMPLING_RULE_NAME,
+            DEFAULT_SAMPLING_RULE_SEQUENCE,
+        ),
         created_at: 0.0,
         modified_at: 0.0,
         tags: BTreeMap::new(),
@@ -331,7 +386,9 @@ impl ComAmazonawsXrayAwsxrayState {
     ///
     /// The collision check and the insert are ONE step on the locked store, so N
     /// concurrent calls for one name have exactly one winner: every loser sees
-    /// the winner's record already present.
+    /// the winner's record already present and is refused for THAT resource,
+    /// naming the internal id it is stored under
+    /// ([`sampling_rule_exists_message`]).
     pub fn insert_sampling_rule(
         &mut self,
         region: &str,
@@ -340,10 +397,10 @@ impl ComAmazonawsXrayAwsxrayState {
         now: f64,
     ) -> Result<&StoredSamplingRule, SamplingRuleRejection> {
         let name = sampling_rule_name(&rule)?.to_string();
-        if self.sampling_rule_name_is_taken(&name) {
-            return Err(SamplingRuleRejection::Invalid(
-                SAMPLING_RULE_EXISTS_MESSAGE.to_string(),
-            ));
+        if let Some(internal_id) = self.sampling_rule_internal_id_in_use(&name) {
+            return Err(SamplingRuleRejection::Invalid(sampling_rule_exists_message(
+                &internal_id,
+            )));
         }
         if self.created_sampling_rule_count() >= MAX_SAMPLING_RULES {
             return Err(SamplingRuleRejection::LimitExceeded(format!(
@@ -352,10 +409,15 @@ impl ComAmazonawsXrayAwsxrayState {
         }
         rule.rule_arn = Some(sampling_rule_arn(region, &name));
         rule.rule_name = Some(name.clone());
+        // Advanced before use, so the resource this create stores is a
+        // different resource from any rule of the same name stored before it.
+        self.sampling_rule_seq += 1;
+        let internal_id = sampling_rule_internal_id(&name, self.sampling_rule_seq);
         self.sampling_rules.insert(
             name.clone(),
             StoredSamplingRule {
                 rule,
+                internal_id,
                 created_at: now,
                 modified_at: now,
                 tags,
@@ -414,11 +476,23 @@ impl ComAmazonawsXrayAwsxrayState {
         Err(SamplingRuleLookupError::NotFound)
     }
 
-    /// Whether `rule_name` already names a rule in the account, the
+    /// The internal id of the rule `rule_name` already names in the account, the
     /// service-managed [`DEFAULT_SAMPLING_RULE_NAME`] one included —
-    /// `CreateSamplingRule`'s uniqueness check.
-    pub fn sampling_rule_name_is_taken(&self, rule_name: &str) -> bool {
-        rule_name == DEFAULT_SAMPLING_RULE_NAME || self.sampling_rules.contains_key(rule_name)
+    /// `CreateSamplingRule`'s uniqueness check, which answers WHICH resource
+    /// holds the name rather than only that something does.
+    ///
+    /// `None` means the name is free. The service-managed rule is derived rather
+    /// than stored until a write materialises it ([`default_sampling_rule`]), so
+    /// its id is derived here the same way, and the reserved name is held
+    /// whether or not a record exists under it.
+    #[must_use]
+    pub fn sampling_rule_internal_id_in_use(&self, rule_name: &str) -> Option<String> {
+        if let Some(stored) = self.sampling_rules.get(rule_name) {
+            return Some(stored.internal_id.clone());
+        }
+        (rule_name == DEFAULT_SAMPLING_RULE_NAME).then(|| {
+            sampling_rule_internal_id(DEFAULT_SAMPLING_RULE_NAME, DEFAULT_SAMPLING_RULE_SEQUENCE)
+        })
     }
 
     /// How many of the account's [`MAX_SAMPLING_RULES`] are spent: the rules it

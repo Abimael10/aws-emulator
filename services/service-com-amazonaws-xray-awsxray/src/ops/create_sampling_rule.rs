@@ -9,7 +9,9 @@
 //! The collision check and the insert are ONE step on the locked store, so N
 //! concurrent calls for one `RuleName` have exactly one winner: every loser sees
 //! the winner's record already there and is refused with
-//! `InvalidRequestException` (400). A store already holding
+//! `InvalidRequestException` (400) for THAT resource, naming the internal id it
+//! is held under ([`crate::state::sampling_rule_exists_message`]) rather than
+//! only reporting that the name is in use. A store already holding
 //! [`crate::state::MAX_SAMPLING_RULES`] rules answers the modelled
 //! `RuleLimitExceededException` instead, which is the one refusal that reports a
 //! limit rather than the request.
