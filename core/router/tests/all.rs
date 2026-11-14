@@ -7301,3 +7301,14 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // there rather than leaving a note in the appended tail below, where an inner doc comment
 // is `E0753`.)
 // What a stack does when its Lambda-backed custom resource's provider answers FAILED is only
+//! sorted: one `#[path]` / `mod` pair per suite and nothing else, so a landing has one
+//! place to insert and nothing to keep consistent.
+//! A suite that is not declared here compiles nowhere and its tests never run. A suite
+//! left at the top level of `tests/` fails the build. Declare each suite exactly ONCE:
+//! this is one crate root, so a second `mod` for the same name is `E0428` and fails every
+//! suite in this target. An inner doc comment (`//!`) is legal only before the first item,
+//! so this header is the only place one may stand; past it, `//!` is `E0753` and compiles
+//! nothing. `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that —
+//! one declaration per suite file, no note past the header — for this file and for every
+//! service crate's `tests/all.rs`, so leave no note here.
