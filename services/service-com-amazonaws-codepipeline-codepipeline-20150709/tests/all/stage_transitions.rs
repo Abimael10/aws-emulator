@@ -567,10 +567,39 @@ async fn get_pipeline_state_reports_the_stored_pipeline_without_changing_it() {
         } else {
             format!("{stage}Build")
         };
+        let states = stage_state(&state, stage)
+            .and_then(|reported| reported["actionStates"].as_array().cloned())
+            .unwrap_or_else(|| panic!("stage {stage} reports its action states, got {state}"));
         assert_eq!(
-            stage_state(&state, stage).map(|reported| reported["actionStates"].clone()),
-            Some(json!([{"actionName": expected}])),
+            states
+                .iter()
+                .map(|action| action["actionName"].clone())
+                .collect::<Vec<Value>>(),
+            vec![json!(expected)],
             "stage {stage} reports its stored action names, got {state}"
+        );
+        // Beside the name, the action's state carries the deep link its action TYPE
+        // publishes, resolved for this action's configuration — the S3 source action's
+        // bucket for the first stage, the CodeBuild project for each later one — and
+        // nothing else, because nothing has run this action.
+        let configured = if index == 0 {
+            "my-bucket".to_string()
+        } else {
+            format!("project-{index}")
+        };
+        let action = states[0].clone();
+        assert!(
+            action["entityUrl"]
+                .as_str()
+                .is_some_and(|url| url.contains(&configured) && !url.contains("{Config:")),
+            "stage {stage} links the resource its action's configuration names \
+             ({configured}), got {action}"
+        );
+        assert_eq!(
+            action.as_object().map(|members| members.len()),
+            Some(2),
+            "stage {stage} reports only the name and the deep link for an action nothing \
+             ran, got {action}"
         );
     }
 

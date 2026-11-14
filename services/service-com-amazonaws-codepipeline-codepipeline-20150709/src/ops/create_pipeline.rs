@@ -270,6 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reported from the stored set, so the create answers with the same tags a
         // later `ListTagsForResource` call does.
         let stored_tags = pipeline.tag_list();
+        // WHOSE call created the pipeline — and so started the run creating it owes —
+        // resolved BEFORE this service's store is locked, so the STS and IAM stores the
+        // resolution reads are never reached while this service's own guard is held.
+        let caller = crate::state::caller_identity_arn(&*self.engine, ctx);
 
         {
             let mut state = state.lock();
@@ -306,6 +310,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &mut state,
                 &name,
                 crate::state::TRIGGER_TYPE_CREATE_PIPELINE,
+                // `ExecutionTrigger$triggerDetail` is the detail of the event that
+                // started the execution, and the event here is THIS call: the detail is
+                // the ARN of the principal that made it.
+                Some(caller),
                 &region,
                 ::std::time::SystemTime::now(),
             );

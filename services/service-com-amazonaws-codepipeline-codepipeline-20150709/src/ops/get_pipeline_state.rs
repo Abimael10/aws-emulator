@@ -194,6 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pipeline_name: Some(pipeline.declaration.name.clone()),
             pipeline_version: Some(pipeline.version),
             stage_states: Some(crate::state::stage_states(
+                &state,
                 pipeline,
                 &executions,
                 &state.action_revisions,

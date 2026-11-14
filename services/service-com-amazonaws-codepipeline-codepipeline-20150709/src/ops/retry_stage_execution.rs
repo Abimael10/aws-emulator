@@ -259,24 +259,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // `StageRetryMode`: `FAILED_ACTIONS` re-runs only the actions that failed,
             // `ALL_ACTIONS` re-runs every action of the stage. A re-run action starts
-            // from scratch: no status, no due instant, a fresh execution id.
+            // from scratch — no status, no due instant, a fresh execution id — and the
+            // attempt it replaces stays in the stage's attempt history, because every
+            // attempt is an action execution of its own that `ListActionExecutions` goes
+            // on reporting (`state::StageRun::retry`).
             let all_actions = input.retry_mode == "ALL_ACTIONS";
-            for action in &mut stage.actions {
-                let failed = action.status.as_deref() == Some(crate::state::STATUS_FAILED);
-                if all_actions || failed {
-                    action.status = None;
-                    action.due = None;
-                    action.claimed = None;
-                    action.error = None;
-                    action.summary = None;
-                    action.token = None;
-                    // Nothing this run of the action published is carried into the next
-                    // one: the variables it reports are the ones the RE-RUN publishes.
-                    action.output_variables.clear();
-                    action.action_execution_id = crate::state::random_uuid_v4();
-                    action.last_status_change = now;
-                }
-            }
+            stage.retry(all_actions, now);
             stage.status = Some("InProgress".to_string());
             record.status = crate::state::STATUS_IN_PROGRESS.to_string();
             record.status_summary = None;

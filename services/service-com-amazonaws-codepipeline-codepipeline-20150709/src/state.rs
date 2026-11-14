@@ -70,6 +70,12 @@ mod built_in_catalog;
 /// Resolving the action type a declared action names, and the artifact arity that
 /// resolution decides for it.
 mod action_type_resolution;
+/// The deep links a reported action carries, resolved from the URL templates its action
+/// type publishes.
+pub mod action_urls;
+/// The one scanner over a text that refers to values by name — an action configuration's
+/// variable references and an action type's URL templates.
+pub mod references;
 /// Whether the calling principal's own identity-based IAM policies allow the action a
 /// request asks for.
 pub mod identity_authorization;
@@ -1099,6 +1105,11 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     /// worker) therefore moves what this listing reports, and the listing cannot drift
     /// from what `GetPipelineState` reports about the same action.
     ///
+    /// One record per ATTEMPT: an action a retry ran again has one record for the run in
+    /// flight and one for each attempt that retry displaced
+    /// ([`execution::StageRun::earlier_attempts`]), so a reader counting attempts or
+    /// reading the newest one sees every run of the action rather than only the last.
+    ///
     /// The declaration each record's input is read from is the one its execution RUNS
     /// ([`Pipeline::declaration_at`]), not whatever version the pipeline carries now,
     /// so a later `UpdatePipeline` cannot change what an execution already started.
@@ -1143,17 +1154,29 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
                     };
                     let reached = action_run.status.is_some()
                         || (begins_with && Some(run_order(action)) == first_run_order);
-                    if !reached {
-                        continue;
+                    // Each attempt of this action that a retry displaced, beside the run
+                    // in flight: an attempt that RAN is an action execution of its own,
+                    // whatever the retry did next. An action a retry reset without the
+                    // execution ever having started it left no attempt behind
+                    // ([`execution::StageRun::retry`]), so the same "has it run" fact
+                    // decides both.
+                    let attempts = run
+                        .earlier_attempts
+                        .iter()
+                        .filter(|attempt| {
+                            attempt.name == action.name && attempt.status.is_some()
+                        })
+                        .chain(reached.then_some(action_run));
+                    for attempt in attempts {
+                        records.push(ActionExecutionRecord::of(
+                            execution,
+                            attempt,
+                            &stage.name,
+                            action,
+                            declaration,
+                            pipeline_region.clone(),
+                        ));
                     }
-                    records.push(ActionExecutionRecord::of(
-                        execution,
-                        action_run,
-                        &stage.name,
-                        action,
-                        declaration,
-                        pipeline_region.clone(),
-                    ));
                 }
             }
         }
@@ -3052,6 +3075,13 @@ impl PipelineExecutionRecord {
             // have produced, each at the revision it was produced from, plus the ones the
             // START resolved and no action has produced yet — an execution reports the
             // revision it is running from the instant it was started for it.
+            //
+            // `PipelineExecution$artifactRevisions` is "a list of `ArtifactRevision`
+            // objects included in a pipeline execution": the list is part of the
+            // execution's shape, so an execution that knows no revision — one whose
+            // source action has not resolved one, or could not — reports it EMPTY rather
+            // than absent, and a caller may iterate it without first telling that
+            // execution from a missing member.
             artifact_revisions: {
                 let mut revisions: Vec<crate::ops::types::ArtifactRevision> = self
                     .artifacts
@@ -3078,7 +3108,7 @@ impl PipelineExecutionRecord {
                             revision_url: None,
                         }),
                 );
-                (!revisions.is_empty()).then_some(revisions)
+                Some(revisions)
             },
             variables: optional_list(self.variables.clone()),
             trigger: Some(self.trigger.clone()),
@@ -3218,15 +3248,23 @@ impl ActionExecutionRecord {
                         .unwrap_or_else(|| declaration.role_arn.clone()),
                 ),
                 region: action.region.clone().or(pipeline_region),
-                input_artifacts: action.input_artifacts.as_ref().map(|artifacts| {
-                    artifacts
+                // `ActionExecutionInput$inputArtifacts` is "details of input artifacts of
+                // the action that correspond to the action execution": the list belongs
+                // to the action's input, so an action that declares none reports it EMPTY
+                // rather than absent — a caller may iterate it without first telling an
+                // action with no input artifacts from a missing member.
+                input_artifacts: Some(
+                    action
+                        .input_artifacts
+                        .as_deref()
+                        .unwrap_or_default()
                         .iter()
                         .map(|artifact| ArtifactDetail {
                             name: Some(artifact.name.clone()),
                             s3location: None,
                         })
-                        .collect()
-                }),
+                        .collect(),
+                ),
                 namespace: action.namespace.clone(),
             },
             output: action_execution_output(execution, action_run, action),
@@ -3268,6 +3306,8 @@ impl ActionExecutionRecord {
 /// is reported for every action that published any — the `namespace` an action declares
 /// is the prefix its execution's LATER actions resolve those variables through
 /// ([`PipelineExecutionRecord::variables_map`]) and not a condition on reporting them.
+/// The map itself belongs to the output, so a run that published none reports it EMPTY
+/// rather than absent, exactly as the artifact list beside it does.
 fn action_execution_output(
     execution: &PipelineExecutionRecord,
     action_run: &ActionRun,
@@ -3311,7 +3351,7 @@ fn action_execution_output(
             }),
             log_stream_arn: None,
         }),
-        output_variables: (!output_variables.is_empty()).then_some(output_variables),
+        output_variables: Some(output_variables),
     })
 }
 
@@ -3373,14 +3413,10 @@ fn resolved_configuration(
     // with, so a value this reader reports and the value the action ran with cannot
     // name different variables.
     let variables = execution.resolution_variables();
-    let by_reference: HashMap<&str, &str> = variables
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
-        .collect();
 
     let mut resolved = HashMap::with_capacity(configuration.len());
     for (key, value) in configuration {
-        resolved.insert(key.clone(), substitute_variables(value, &by_reference)?);
+        resolved.insert(key.clone(), substitute_variables(value, &variables)?);
     }
     Some(resolved)
 }
@@ -3388,37 +3424,27 @@ fn resolved_configuration(
 /// The namespace a pipeline-level variable's references carry.
 const VARIABLES_NAMESPACE: &str = "variables";
 
-/// `value` with every `#{<namespace>.<name>}` reference replaced by `by_reference`'s
-/// entry for that full name, in ONE pass over `value`.
+/// `value` with every `#{<namespace>.<name>}` reference replaced by `variables`'s entry
+/// for that full name, in ONE pass over `value`.
 ///
 /// `None` — the configuration has no resolved form — when a reference is not one this
 /// emulator can resolve (an unterminated `#{`, or a name this execution resolved no
 /// value for, in whatever namespace) or when the resolved text would pass
-/// [`MAX_RESOLVED_CONFIGURATION_VALUE_BYTES`].
-///
-/// A replacement is never re-scanned: a variable whose value is itself `#{...}` text
-/// is substituted literally, the way a single-pass substitution does, so no chain of
-/// references can amplify one request into unbounded allocation.
-fn substitute_variables(value: &str, by_reference: &HashMap<&str, &str>) -> Option<String> {
-    let mut resolved = String::new();
-    let mut rest = value;
-    while let Some(start) = rest.find("#{") {
-        let (before, reference) = (&rest[..start], &rest[start + 2..]);
-        let end = reference.find('}')?;
-        let substitution = *by_reference.get(&reference[..end])?;
-        if resolved.len() + before.len() + substitution.len()
-            > MAX_RESOLVED_CONFIGURATION_VALUE_BYTES
-        {
-            return None;
-        }
-        resolved.push_str(before);
-        resolved.push_str(substitution);
-        rest = &reference[end + 1..];
-    }
-    (resolved.len() + rest.len() <= MAX_RESOLVED_CONFIGURATION_VALUE_BYTES).then(|| {
-        resolved.push_str(rest);
-        resolved
-    })
+/// [`MAX_RESOLVED_CONFIGURATION_VALUE_BYTES`]: a reported `resolvedConfiguration` is
+/// absent rather than half-resolved, which is the
+/// [`Unresolved::NoResolution`](references::Unresolved::NoResolution) policy of the one
+/// scanner both reference forms of this service are walked by
+/// ([`references::substitute_references`]) — and where the single pass and the byte
+/// budget live, so no chain of references can amplify one request into unbounded
+/// allocation.
+fn substitute_variables(value: &str, variables: &BTreeMap<String, String>) -> Option<String> {
+    references::substitute_references(
+        value,
+        references::VARIABLE_REFERENCE_PREFIX,
+        MAX_RESOLVED_CONFIGURATION_VALUE_BYTES,
+        references::Unresolved::NoResolution,
+        &references::value_in(variables),
+    )
 }
 
 /// `Some(list)` unless the list is empty, in which case the member is absent —
@@ -3611,6 +3637,11 @@ pub const TRIGGER_TYPE_CREATE_PIPELINE: &str = "CreatePipeline";
 /// Start one execution of the stored pipeline `pipeline_name`, triggered by
 /// `trigger_type`, and answer the id it was recorded under.
 ///
+/// `trigger_detail` is what `ExecutionTrigger$triggerDetail` carries for the event that
+/// started it — the ARN of the webhook a trigger was delivered to, the ARN of the
+/// principal whose call ran the pipeline — and `None` only for an event that identifies
+/// nothing.
+///
 /// This is the start that carries NO caller input: the execution runs the pipeline's
 /// current version, with the variables the declaration itself resolves, no
 /// source-revision override and no idempotency token. It is what makes a pipeline run
@@ -3628,6 +3659,7 @@ pub fn start_execution(
     store: &mut ComAmazonawsCodepipelineCodepipeline20150709State,
     pipeline_name: &str,
     trigger_type: &str,
+    trigger_detail: Option<String>,
     region: &str,
     now: SystemTime,
 ) -> Option<String> {
@@ -3655,10 +3687,10 @@ pub fn start_execution(
         last_update_time: now,
         trigger: ExecutionTrigger {
             trigger_type: Some(trigger_type.to_string()),
-            // `ExecutionTrigger$triggerDetail` carries the ARN of the user who ran the
-            // command; this emulator does not resolve a caller identity, so the member
-            // is absent rather than invented.
-            trigger_detail: None,
+            // The detail of the event that started this execution, recorded as the
+            // execution is created because that event is over by the time anybody reads
+            // the execution back.
+            trigger_detail,
         },
         execution_mode,
         execution_type: EXECUTION_TYPE_STANDARD.to_string(),

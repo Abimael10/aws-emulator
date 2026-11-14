@@ -396,10 +396,15 @@ impl<Eng: Send + Sync + 'static> WebhookTriggerPlane<Eng> {
                         .pipelines
                         .get(&definition.target_pipeline)
                         .map(|pipeline| pipeline.declaration.clone());
-                    (definition, webhook.region.clone(), declaration)
+                    (
+                        definition,
+                        webhook.region.clone(),
+                        webhook.arn.clone(),
+                        declaration,
+                    )
                 })
         };
-        let Some((definition, region, declaration)) = held else {
+        let Some((definition, region, webhook_arn, declaration)) = held else {
             return answered(NOT_FOUND_STATUS, "This URL names no webhook.");
         };
 
@@ -470,6 +475,11 @@ impl<Eng: Send + Sync + 'static> WebhookTriggerPlane<Eng> {
                 &mut store,
                 &definition.target_pipeline,
                 crate::state::TRIGGER_TYPE_WEBHOOK,
+                // `ExecutionTrigger$triggerDetail` is "detail related to the event that
+                // started a pipeline execution, such as the webhook ARN of the webhook
+                // that triggered the pipeline execution": this execution was started by a
+                // trigger delivered to THIS webhook, so the detail is its ARN.
+                Some(webhook_arn),
                 &region,
                 now,
             );

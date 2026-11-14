@@ -164,6 +164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::require_state(&*self.engine)?;
         let region = crate::state::request_region(&ctx.parts().headers);
+        // WHOSE call started the execution, resolved BEFORE this service's store is
+        // locked, so the STS and IAM stores the resolution reads are never reached while
+        // this service's own guard is held.
+        let caller = crate::state::caller_identity_arn(&*self.engine, ctx);
         // An execution is started FOR a particular revision of each of its sources, so
         // the revisions its sources hold are resolved BEFORE the record is written — with
         // no lock held, because resolving one reads the service that owns the source. A
@@ -293,10 +297,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     trigger_type: Some(
                         crate::state::TRIGGER_TYPE_START_PIPELINE_EXECUTION.to_string(),
                     ),
-                    // `ExecutionTrigger$triggerDetail` carries the ARN of the user who
-                    // ran the command; this emulator does not resolve a caller identity,
-                    // so the member is absent rather than invented.
-                    trigger_detail: None,
+                    // `ExecutionTrigger$triggerDetail` is "detail related to the event
+                    // that started a pipeline execution … the user ARN for a
+                    // user-initiated start-pipeline-execution CLI command": this
+                    // execution was started by THIS call, so the detail is the ARN of the
+                    // principal that made it.
+                    trigger_detail: Some(caller),
                 },
                 execution_mode,
                 execution_type: crate::state::EXECUTION_TYPE_STANDARD.to_string(),

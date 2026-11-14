@@ -282,7 +282,7 @@ async fn the_state_reports_every_stored_stage_and_action_in_order() {
             // stage at all. A revision only `PutActionRevision` records is not reported
             // anywhere either.
             let waited_at_by_the_creation_run = position == 0;
-            for absent in ["latestExecution", "inboundExecution", "inboundExecutions"] {
+            for absent in ["latestExecution", "inboundExecution"] {
                 if waited_at_by_the_creation_run && absent == "inboundExecution" {
                     continue;
                 }
@@ -292,13 +292,72 @@ async fn the_state_reports_every_stored_stage_and_action_in_order() {
                      must be absent, got {reported}"
                 );
             }
-            for action in reported["actionStates"].as_array().expect("action states") {
-                for absent in ["currentRevision", "entityUrl", "revisionUrl", "latestExecution"] {
+            // `inboundExecutions` is the LIST of the executions held at this stage's
+            // inbound transition: part of the stage's state, so it is reported either
+            // way — carrying the creation run where that run is waiting, and empty
+            // nowhere else.
+            let expected_inbound = if waited_at_by_the_creation_run { 1 } else { 0 };
+            let inbound = reported["inboundExecutions"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "case {label:?} stage {stage:?}: expected an inboundExecutions list, \
+                     got {reported}"
+                )
+            });
+            assert_eq!(
+                inbound.len(),
+                expected_inbound,
+                "case {label:?} stage {stage:?}: expected {expected_inbound} inbound \
+                 execution(s), got {reported}"
+            );
+            for (declared_action, action) in declared["actions"]
+                .as_array()
+                .expect("declared actions")
+                .iter()
+                .zip(reported["actionStates"].as_array().expect("action states"))
+            {
+                for absent in ["currentRevision", "revisionUrl", "latestExecution"] {
                     assert!(
                         action.get(absent).is_none(),
                         "case {label:?} stage {stage:?}: nothing ran this action, so \
                          {absent} must be absent, got {action}"
                     );
+                }
+                // `entityUrl` is the deep link the action's TYPE publishes, resolved for
+                // this action's configuration — a fact about the declaration, so it is
+                // reported for an action nothing has run yet, and only for an action type
+                // that publishes a template. The `Custom` source action's type is one
+                // nobody registered, so it publishes none; the AWS-owned ones do, and the
+                // URL each resolves to names the resource that action's configuration
+                // points at, with no reference left unresolved.
+                let configured = declared_action["actionTypeId"]["owner"] == json!("Custom");
+                match action.get("entityUrl") {
+                    None => assert!(
+                        configured,
+                        "case {label:?} stage {stage:?}: this action's type publishes a \
+                         deep link, so its state carries one, got {action}"
+                    ),
+                    Some(url) => {
+                        let url = url.as_str().unwrap_or_else(|| {
+                            panic!(
+                                "case {label:?} stage {stage:?}: entityUrl is a string, \
+                                 got {action}"
+                            )
+                        });
+                        let values: Vec<&str> = declared_action["configuration"]
+                            .as_object()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|(_, value)| value.as_str())
+                            .collect();
+                        assert!(
+                            !configured
+                                && !url.contains("{Config:")
+                                && values.iter().any(|value| url.contains(value)),
+                            "case {label:?} stage {stage:?}: the deep link resolves the \
+                             action type's template against this action's configuration \
+                             {values:?}, got {url}"
+                        );
+                    }
                 }
             }
 

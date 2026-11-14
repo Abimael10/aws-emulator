@@ -1968,6 +1968,40 @@ async fn run_job(
     }
 }
 
+/// What a CodeCommit source action reports when the branch its configuration names is
+/// not one the repository holds — the summary its run publishes and the message its
+/// `ConfigurationError` carries.
+///
+/// This is the action PROVIDER's own sentence about the misconfiguration
+/// (`ActionExecutionResult$externalExecutionSummary` is "the action provider's summary
+/// for the action execution"), which is user-facing text a console, a notification and a
+/// CI gate read: it names the branch and the repository the action's `configuration`
+/// asked for, tells the operator what to correct, and closes with the message the
+/// repository service published about the failure. A provider that published none states
+/// that as `null`, the JSON spelling of a member that is not there — which is what a
+/// relayed message with nothing in it reads as.
+///
+/// Nothing of the emulator's own call reaches it: the client object the answer arrived in
+/// renders Rust type names and a whole response dump, none of which is a fact about the
+/// action (see [`service_error_detail`], which states the same for a failure of a kind no
+/// provider sentence covers).
+fn code_commit_branch_not_found_summary(
+    branch: &str,
+    repository: &str,
+    published_message: Option<&str>,
+) -> String {
+    format!(
+        "The action failed because no branch named {branch} was found in the selected \
+         AWS CodeCommit repository {repository}. Make sure you are using the correct \
+         branch name, and then try again. Error: {}",
+        published_message.unwrap_or(ABSENT_PUBLISHED_MESSAGE)
+    )
+}
+
+/// How a relayed failure states that the answering service published no message of its
+/// own: the JSON spelling of an absent value.
+const ABSENT_PUBLISHED_MESSAGE: &str = "null";
+
 /// Resolve the branch's tip commit and write the repository's files at it into the
 /// artifact store.
 ///
@@ -1997,14 +2031,25 @@ async fn run_code_commit_source(
             .unwrap_or_default(),
         Err(err) => {
             let service = err.as_service_error();
-            let unreachable = service.is_some_and(|err| {
-                err.is_repository_does_not_exist_exception()
-                    || err.is_branch_does_not_exist_exception()
-            });
             // A repository or a branch the declaration names and the service does not
             // hold is a declaration this pipeline cannot source from at all, not a
             // revision that is missing from a source it can.
-            let code = if unreachable {
+            if service.is_some_and(
+                ::aws_sdk_codecommit::operation::get_branch::GetBranchError::is_branch_does_not_exist_exception,
+            ) {
+                return JobOutcome::Failed {
+                    code: FAILURE_CONFIGURATION_ERROR.to_string(),
+                    message: code_commit_branch_not_found_summary(
+                        branch,
+                        repository,
+                        ::aws_smithy_types::error::metadata::ProvideErrorMetadata::message(&err),
+                    ),
+                    external_id: None,
+                };
+            }
+            let code = if service.is_some_and(|err| {
+                err.is_repository_does_not_exist_exception()
+            }) {
                 FAILURE_CONFIGURATION_ERROR
             } else {
                 FAILURE_JOB_FAILED

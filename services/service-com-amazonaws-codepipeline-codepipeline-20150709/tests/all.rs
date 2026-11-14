@@ -65,6 +65,8 @@ mod diagnose;
 mod error_message_rules;
 #[path = "all/execution_engine.rs"]
 mod execution_engine;
+#[path = "all/execution_read_path.rs"]
+mod execution_read_path;
 #[path = "all/execution_stage_locking.rs"]
 mod execution_stage_locking;
 #[path = "all/job_claim_nonce_window.rs"]

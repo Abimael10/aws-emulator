@@ -119,6 +119,18 @@ pub const STATUS_STOPPING: &str = "Stopping";
 /// See [`STATUS_SUCCEEDED`].
 pub const STATUS_SUPERSEDED: &str = "Superseded";
 
+/// The most displaced ATTEMPTS one stage of one execution retains
+/// ([`StageRun::earlier_attempts`]).
+///
+/// `RetryStageExecution` is a call a caller may make again every time the stage fails
+/// again, and each one appends the attempt it displaced — so without a window the plan an
+/// execution record carries would grow once per call, past the figure that bounds the
+/// execution store ([`super::MAX_EXECUTIONS_TOTAL`], whose own note counts each record's
+/// action entries). With it, one record carries at most its declared actions plus this
+/// many per stage. The figure is this emulator's own, chosen like the other retention
+/// windows here: AWS publishes no limit on how often a stage may be retried.
+pub const MAX_ATTEMPTS_RETAINED_PER_STAGE: usize = 10;
+
 /// The most entries one artifact archive may carry when a deploy action extracts it.
 ///
 /// An archive is caller content: its entry COUNT, each entry's decompressed size and
@@ -353,6 +365,10 @@ impl ActionRun {
                 }),
                 log_stream_arn: None,
             }),
+            // The deep link and the revision link are facts about the DECLARATION — the
+            // URL templates the action's type publishes, resolved for that action's
+            // configuration — rather than about this run, so they are filled in by the
+            // projection that has the declaration in hand ([`stage_states`]).
             entity_url: None,
             revision_url: None,
         }
@@ -399,6 +415,14 @@ pub struct StageRun {
     pub entry_due: Option<SystemTime>,
     /// This stage's actions, in declaration order.
     pub actions: Vec<ActionRun>,
+    /// The finished runs of this stage's actions that a RETRY replaced, oldest first.
+    ///
+    /// Retrying a stage runs its failed actions AGAIN, and every run of an action is an
+    /// action execution of its own: the history `ListActionExecutions` reports therefore
+    /// holds one record per ATTEMPT, each under the `actionExecutionId` it was reported
+    /// with. So the attempt a retry displaces is KEPT here, exactly as it stood when it
+    /// finished ([`Self::retry`]), rather than being overwritten by the next one.
+    pub earlier_attempts: Vec<ActionRun>,
     /// The condition site whose MET condition decided this execution's run of the stage,
     /// as a `ConditionType` value, or `None` while no condition has been met here.
     ///
@@ -429,6 +453,62 @@ impl StageRun {
     /// True while this stage has been entered and has not reached an outcome.
     pub fn is_in_progress(&self) -> bool {
         self.status.is_some() && !self.is_terminal()
+    }
+
+    /// Re-run this stage's actions after a failure: every action when `all_actions`, else
+    /// only the ones that failed.
+    ///
+    /// A re-run action starts from scratch — no status, no due instant, no outcome, none
+    /// of the variables the previous run published and a fresh `actionExecutionId`.
+    ///
+    /// An attempt is kept ([`Self::earlier_attempts`]) only for an action the execution had
+    /// actually STARTED — the same fact the history reports a record for at all
+    /// (`super::ComAmazonawsCodepipelineCodepipeline20150709State::action_executions_for_pipeline`)
+    /// — because that run happened and is an action execution of its own, which the history
+    /// goes on reporting beside the new one. An `ALL_ACTIONS` retry also resets the actions
+    /// of the failed stage the execution never reached (the ones after the one that failed),
+    /// and those have no attempt to keep: recording one would report an action execution for
+    /// work nothing performed. The kept attempts are a bounded window
+    /// ([`MAX_ATTEMPTS_RETAINED_PER_STAGE`]): past it the oldest is dropped, so a caller
+    /// retrying a stage over and over cannot grow the store without limit.
+    pub fn retry(&mut self, all_actions: bool, now: SystemTime) {
+        let Self {
+            actions,
+            earlier_attempts,
+            ..
+        } = self;
+        for action in actions.iter_mut() {
+            let failed = action.status.as_deref() == Some(STATUS_FAILED);
+            if !all_actions && !failed {
+                continue;
+            }
+            if action.status.is_some() {
+                earlier_attempts.push(action.clone());
+            }
+            action.status = None;
+            action.due = None;
+            action.claimed = None;
+            action.error = None;
+            action.summary = None;
+            action.token = None;
+            action.external_execution_id = None;
+            action.external_run = None;
+            // The new attempt has not started yet: it is the engine that starts it, and
+            // the instant it starts is this attempt's own start time.
+            action.start_time = None;
+            // Nothing this run of the action published is carried into the next one: the
+            // variables it reports are the ones the RE-RUN publishes.
+            action.output_variables.clear();
+            action.action_execution_id = super::random_uuid_v4();
+            action.last_status_change = now;
+        }
+        // The window: the OLDEST attempts fall out of it, so what the history reports is
+        // the most recent ones, the way the execution history keeps the most recent
+        // executions (`super::MAX_EXECUTION_HISTORY_PER_PIPELINE`).
+        let past = earlier_attempts
+            .len()
+            .saturating_sub(MAX_ATTEMPTS_RETAINED_PER_STAGE);
+        earlier_attempts.drain(..past);
     }
 }
 
@@ -521,6 +601,8 @@ fn plan_stage_at(
             .iter()
             .map(|action| plan_action(action, now))
             .collect(),
+        // Nothing has been retried in a plan that has not run.
+        earlier_attempts: Vec::new(),
     })
 }
 
@@ -577,50 +659,22 @@ pub fn artifact_store(
 /// variables under the `variables` namespace and an action's output variables under the
 /// namespace that action declares. A placeholder naming a variable the execution does
 /// not carry is left exactly as written, so the action sees (and can fail on) the
-/// unresolved reference rather than an empty string.
-///
-/// The resolved text is accumulated against the SAME byte budget the stored-record
-/// reader applies ([`super::MAX_RESOLVED_CONFIGURATION_VALUE_BYTES`]), checked as the
-/// text is built: a value whose resolution would pass it is answered UNRESOLVED (the
-/// stored text, verbatim) rather than allocated, so the allocation one request can drive
-/// is bounded by a stated figure however many placeholders a configuration value carries
-/// and however long a reported variable is. A replacement is never re-scanned either, so
-/// no chain of references can amplify one request.
+/// unresolved reference rather than an empty string — the
+/// [`Unresolved::Literal`](super::references::Unresolved::Literal) policy of the one
+/// scanner both reference forms of this service are walked by
+/// ([`super::references::substitute_references`]), which is also where the single pass
+/// and the byte budget live: a value whose resolution would pass
+/// [`super::MAX_RESOLVED_CONFIGURATION_VALUE_BYTES`] is answered UNRESOLVED (the stored
+/// text, verbatim) rather than allocated.
 pub fn resolve_placeholders(value: &str, variables: &BTreeMap<String, String>) -> String {
-    let budget = super::MAX_RESOLVED_CONFIGURATION_VALUE_BYTES;
-    let mut resolved = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(start) = rest.find("#{") {
-        let before = &rest[..start];
-        let after = &rest[start + 2..];
-        let Some(end) = after.find('}') else {
-            // An unterminated `#{`: the rest of the value is literal text.
-            break;
-        };
-        let name = &after[..end];
-        let substitution = variables.get(name).map(String::as_str);
-        // A placeholder the execution has no value for keeps its own text, which is what
-        // the budget then has to account for.
-        let substituted = substitution.map_or(name.len() + 3, str::len);
-        if resolved.len() + before.len() + substituted > budget {
-            return value.to_string();
-        }
-        resolved.push_str(before);
-        match substitution {
-            Some(replacement) => resolved.push_str(replacement),
-            None => {
-                resolved.push_str("#{");
-                resolved.push_str(name);
-                resolved.push('}');
-            }
-        }
-        rest = &after[end + 1..];
-    }
-    if resolved.len() + rest.len() > budget {
-        return value.to_string();
-    }
-    resolved.push_str(rest);
-    resolved
+    super::references::substitute_references(
+        value,
+        super::references::VARIABLE_REFERENCE_PREFIX,
+        super::MAX_RESOLVED_CONFIGURATION_VALUE_BYTES,
+        super::references::Unresolved::Literal,
+        &super::references::value_in(variables),
+    )
+    .unwrap_or_else(|| value.to_string())
 }
 
 /// One declared action's configuration as an execution RESOLVED it: every
@@ -654,19 +708,23 @@ pub fn resolved_configuration(
 /// `rules` are the rule executions the condition plane recorded for this pipeline, which
 /// is where the run of each declared condition site comes from
 /// ([`super::condition_state`]).
+///
+/// `store` is read for the action types the declared actions name, which is what each
+/// action's `entityUrl` is resolved from ([`super::action_urls`]).
 pub fn stage_states(
+    store: &super::ComAmazonawsCodepipelineCodepipeline20150709State,
     pipeline: &super::Pipeline,
     executions: &[&super::PipelineExecutionRecord],
     revisions: &BTreeMap<(String, String, String), crate::ops::types::ActionRevision>,
     rules: &[super::RuleExecutionRecord],
 ) -> Vec<StageState> {
     // One pass over the executions, newest first, builds both indexes: the newest
-    // execution that ENTERED each stage, and the newest non-terminal one still waiting
-    // to enter it. Without it this walk would rescan every execution for every declared
-    // stage. An execution WAITS at exactly one stage — the first it has not entered —
-    // so a stage further down the pipeline reports no inbound execution for it.
+    // execution that ENTERED each stage, and the non-terminal ones still waiting to enter
+    // it. Without it this walk would rescan every execution for every declared stage. An
+    // execution WAITS at exactly one stage — the first it has not entered — so a stage
+    // further down the pipeline reports no inbound execution for it.
     let mut entered: HashMap<&str, (&super::PipelineExecutionRecord, &StageRun)> = HashMap::new();
-    let mut waiting: HashMap<&str, &super::PipelineExecutionRecord> = HashMap::new();
+    let mut waiting: HashMap<&str, Vec<&super::PipelineExecutionRecord>> = HashMap::new();
     for record in executions {
         let mut waits_at: Option<&str> = None;
         for run in &record.stages {
@@ -677,7 +735,7 @@ pub fn stage_states(
             }
         }
         if let (false, Some(stage)) = (is_terminal_status(&record.status), waits_at) {
-            waiting.entry(stage).or_insert(record);
+            waiting.entry(stage).or_default().push(record);
         }
     }
 
@@ -687,7 +745,17 @@ pub fn stage_states(
         .iter()
         .map(|stage| {
             let run = entered.get(stage.name.as_str()).copied();
-            let inbound = waiting.get(stage.name.as_str()).copied();
+            let inbound: &[&super::PipelineExecutionRecord] = waiting
+                .get(stage.name.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let stage_execution = |record: &super::PipelineExecutionRecord| {
+                crate::ops::types::StageExecution {
+                    pipeline_execution_id: record.pipeline_execution_id.clone(),
+                    status: record.status.clone(),
+                    r#type: Some(record.execution_type.clone()),
+                }
+            };
             // Only the INBOUND transition is what this member reports
             // (`StageState$inboundTransitionState`); the outbound one governs leaving
             // the stage and the model binds no member to it here. The rule for what a
@@ -696,12 +764,17 @@ pub fn stage_states(
             let inbound_transition = pipeline.inbound_transition_state(&stage.name);
             StageState {
                 stage_name: Some(stage.name.clone()),
-                inbound_execution: inbound.map(|record| crate::ops::types::StageExecution {
-                    pipeline_execution_id: record.pipeline_execution_id.clone(),
-                    status: record.status.clone(),
-                    r#type: Some(record.execution_type.clone()),
-                }),
-                inbound_executions: None,
+                // `StageState$inboundExecution` is the ONE execution held at the
+                // boundary, which is the newest of them, and absent while none is.
+                inbound_execution: inbound.first().copied().map(stage_execution),
+                // `StageState$inboundExecutions` is "the inbound executions for a
+                // stage": the list is part of the stage's state, so a stage nothing is
+                // waiting at reports it EMPTY rather than absent — a caller may iterate
+                // it without first telling a stage with no inbound execution from a
+                // missing member.
+                inbound_executions: Some(
+                    inbound.iter().copied().map(stage_execution).collect(),
+                ),
                 inbound_transition_state: Some(inbound_transition),
                 // Every declared action is reported, whether or not an execution has
                 // reached it: the one that has run carries its action execution, and the
@@ -720,6 +793,16 @@ pub fn stage_states(
                                     action.name.clone(),
                                 ))
                                 .cloned();
+                            // The deep link to the resource this action acts on, which
+                            // is a fact about the DECLARATION — the action type's own
+                            // `entityUrlTemplate`, resolved for this action's
+                            // configuration — so it is reported whether or not an
+                            // execution has run the action yet.
+                            let entity_url = super::action_urls::action_entity_url(
+                                store,
+                                action,
+                                run.map(|(record, _)| record),
+                            );
                             run.and_then(|(_, run)| {
                                 run.actions
                                     .iter()
@@ -728,13 +811,14 @@ pub fn stage_states(
                             })
                             .map(|state| ActionState {
                                 current_revision: current_revision.clone(),
+                                entity_url: entity_url.clone(),
                                 ..state
                             })
                             .unwrap_or_else(|| ActionState {
                                 action_name: Some(action.name.clone()),
                                 current_revision,
                                 latest_execution: None,
-                                entity_url: None,
+                                entity_url,
                                 revision_url: None,
                             })
                         })

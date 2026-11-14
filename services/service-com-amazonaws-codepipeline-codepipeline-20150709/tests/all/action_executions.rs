@@ -848,12 +848,19 @@ async fn a_record_reports_the_input_its_declaration_configures() {
         );
     }
 
-    // An action that declares no namespace and no input artifact reports neither.
+    // An action that declares no namespace reports none — a namespace is a declared
+    // name, absent when the declaration states none. Its input artifacts are a different
+    // kind of member: the LIST of what the action consumes, part of the input's shape, so
+    // an action that consumes nothing reports it empty rather than absent.
     let overrides = by_action("Overrides");
     assert!(
-        overrides["input"]["namespace"].is_null()
-            && overrides["input"]["inputArtifacts"].is_null(),
-        "an action declaring neither namespace nor input artifact reports neither, got {overrides}"
+        overrides["input"]["namespace"].is_null(),
+        "an action declaring no namespace reports none, got {overrides}"
+    );
+    assert_eq!(
+        overrides["input"]["inputArtifacts"],
+        json!([]),
+        "an action declaring no input artifact reports an empty list, got {overrides}"
     );
 }
 

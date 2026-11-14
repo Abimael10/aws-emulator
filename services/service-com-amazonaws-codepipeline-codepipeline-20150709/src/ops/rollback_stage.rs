@@ -160,6 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialised before the request is judged.
         crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
         let now = ::std::time::SystemTime::now();
+        // WHOSE call rolled the stage back, resolved BEFORE this service's store is
+        // locked, so the STS and IAM stores the resolution reads are never reached while
+        // this service's own guard is held.
+        let caller = crate::state::caller_identity_arn(&*self.engine, ctx);
 
         let execution_id = {
             let mut state = state.lock();
@@ -330,10 +334,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 last_update_time: now,
                 trigger: ExecutionTrigger {
                     trigger_type: Some(crate::state::TRIGGER_TYPE_MANUAL_ROLLBACK.to_string()),
-                    // `ExecutionTrigger$triggerDetail` carries the ARN of the user who
-                    // ran the command; this emulator does not resolve a caller identity,
-                    // so the member is absent rather than invented.
-                    trigger_detail: None,
+                    // `ExecutionTrigger$triggerDetail` is "detail related to the event
+                    // that started a pipeline execution … the user ARN for a
+                    // user-initiated start-pipeline-execution CLI command": this
+                    // execution was started by THIS call, so the detail is the ARN of the
+                    // principal that made it.
+                    trigger_detail: Some(caller),
                 },
                 execution_mode,
                 execution_type: crate::state::EXECUTION_TYPE_ROLLBACK.to_string(),
