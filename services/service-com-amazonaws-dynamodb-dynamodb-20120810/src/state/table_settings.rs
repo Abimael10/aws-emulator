@@ -347,11 +347,32 @@ impl PointInTimeRecovery {
 /// `FAILED` is not among them: that status stands for a failure of the CloudWatch rules
 /// behind the feature ("the most common exceptions for a FAILED status are:
 /// LimitExceededException ... AccessDeniedException ..." — the `FailureException` doc),
-/// and this store runs none, so no setting is ever reported in it.
+/// and this store runs none, so no setting is ever reported in it. `DISABLING` is not
+/// among them either: DynamoDB answers a `DISABLE` with the SETTLED status, so a disable
+/// leaves no move owed and nothing is ever read between the two
+/// ([`ContributorInsights::apply`]).
 pub const CONTRIBUTOR_INSIGHTS_ENABLING: &str = "ENABLING";
 pub const CONTRIBUTOR_INSIGHTS_ENABLED: &str = "ENABLED";
-pub const CONTRIBUTOR_INSIGHTS_DISABLING: &str = "DISABLING";
 pub const CONTRIBUTOR_INSIGHTS_DISABLED: &str = "DISABLED";
+
+/// How DynamoDB opens its refusal of an `UpdateContributorInsights` whose action the
+/// addressed resource cannot be in the state it is in; the reason follows the colon.
+const CONTRIBUTOR_INSIGHTS_INVALID_STATE: &str =
+    "Table or Index is not in a valid state to update Key Access Insights";
+
+/// How a `DISABLE` is refused when the resource it addresses has no key access insights
+/// configuration to turn off ([`ContributorInsights::disableable`]).
+///
+/// The refusal is stated over the statuses the action REQUIRES — the same way the Kinesis
+/// streaming commands state theirs ([`kinesis_destination_not_active_to_disable`]) — and
+/// names neither the table nor the index: there is no configuration of this resource's for
+/// the action to be performed against.
+pub fn contributor_insights_not_disableable() -> RequestError {
+    RequestError::Validation(format!(
+        "{CONTRIBUTOR_INSIGHTS_INVALID_STATE}: ContributorInsights Status must be ENABLED or \
+         FAILED to perform DISABLE operation."
+    ))
+}
 
 /// The two values `ContributorInsightsAction` declares
 /// ([`crate::ops::types::CONTRIBUTOR_INSIGHTS_ACTION_VALUES`]), named one per meaning.
@@ -394,11 +415,11 @@ pub fn contributor_insights_key(table: &str, index: Option<&str>) -> String {
 /// `UpdateContributorInsights` asked for, and when.
 ///
 /// Only the REQUEST is stored; the status is derived at every read, because turning
-/// insights on or off is asynchronous — the call leaves the setting `ENABLING` /
-/// `DISABLING` and the clock owes it the move to `ENABLED` / `DISABLED` one
-/// [`STATUS_TRANSITION`] later. A resource no request has ever named is `DISABLED` with
-/// no timestamp at all: this API is the only way to turn insights on, and `CreateTable`
-/// carries no contributor insights member.
+/// insights ON is asynchronous — the call leaves the setting `ENABLING` and the clock owes
+/// it the move to `ENABLED` one [`STATUS_TRANSITION`] later. Turning them off is not: the
+/// call that asks for it answers `DISABLED`. A resource no request has ever named is
+/// `DISABLED` with no timestamp at all: this API is the only way to turn insights on, and
+/// `CreateTable` carries no contributor insights member.
 #[derive(Debug, Clone, Default)]
 pub struct ContributorInsights {
     /// Whether the last accepted action was `ENABLE`.
@@ -406,40 +427,69 @@ pub struct ContributorInsights {
     /// When that action was accepted, or `None` while no request has named this
     /// resource.
     pub(super) requested_at: Option<SystemTime>,
-    /// When the clock owes the move out of the transient status.
+    /// When the clock owes an accepted enable the move out of `ENABLING`, and `None` for a
+    /// setting with no move owed: one whose enable has settled, and every disabled one.
     pub(super) settles_at: Option<SystemTime>,
-    /// The mode in force while insights are on, as the request named it (or
-    /// [`DEFAULT_CONTRIBUTOR_INSIGHTS_MODE`] where it named none). A `DISABLE` clears
-    /// it: a setting that tracks nothing is tracking neither kind of event.
+    /// Whether an enable has ever CONFIGURED this resource's key access insights.
+    ///
+    /// Set by the first accepted `ENABLE` and never cleared: what a disable turns off is
+    /// the configuration, not the record of there having been one, so this is what decides
+    /// whether a `DISABLE` has anything to act on ([`Self::disableable`]).
+    pub(super) configured: bool,
+    /// The mode last configured, as an enable named it (or
+    /// [`DEFAULT_CONTRIBUTOR_INSIGHTS_MODE`] where it named none). A `DISABLE` does NOT
+    /// clear it: the mode is the configuration of the resource's key access insights, which
+    /// DynamoDB keeps reporting once they are turned off, so the disable itself and every
+    /// later read answer the mode that was in force. Only a resource no enable has ever
+    /// named carries none.
     pub(super) mode: Option<String>,
 }
 
 impl ContributorInsights {
     /// Apply one `ContributorInsightsAction`, with the mode an enable names.
     ///
-    /// The action is accepted whether or not it changes anything — re-stating `ENABLE`
-    /// re-states the mode and starts the span again — so what a later read reports is
-    /// always the last request's.
+    /// An `ENABLE` is accepted whether or not it changes anything — re-stating it re-states
+    /// the mode and starts the span again — so what a later read reports is always the last
+    /// accepted request's.
+    ///
+    /// An enable has the resource's CloudWatch rules to create, so it leaves the setting in
+    /// the transient `ENABLING` and the clock owes the move to `ENABLED`; a disable deletes
+    /// those rules there and then, so it leaves no move owed and the status it answers is
+    /// already the settled one.
     pub fn apply(&mut self, enable: bool, mode: Option<&str>, now: SystemTime) {
         self.enabled = enable;
         self.requested_at = Some(now);
-        self.settles_at = Some(now + STATUS_TRANSITION);
-        self.mode = enable.then(|| {
-            mode.unwrap_or(DEFAULT_CONTRIBUTOR_INSIGHTS_MODE)
-                .to_string()
-        });
+        self.settles_at = enable.then(|| now + STATUS_TRANSITION);
+        if enable {
+            self.configured = true;
+            self.mode = Some(
+                mode.unwrap_or(DEFAULT_CONTRIBUTOR_INSIGHTS_MODE)
+                    .to_string(),
+            );
+        }
     }
 
-    /// The status at `now`: the transient one until the clock has made the move due,
-    /// then the settled one.
+    /// The status at `now`: `ENABLING` until the clock has made an accepted enable's move
+    /// due, then the settled status of the last accepted action.
     pub fn status(&self, now: SystemTime) -> &'static str {
-        let settled = self.settles_at.is_none_or(|due| now >= due);
-        match (self.enabled, settled) {
-            (true, true) => CONTRIBUTOR_INSIGHTS_ENABLED,
-            (true, false) => CONTRIBUTOR_INSIGHTS_ENABLING,
-            (false, true) => CONTRIBUTOR_INSIGHTS_DISABLED,
-            (false, false) => CONTRIBUTOR_INSIGHTS_DISABLING,
+        match (self.enabled, self.settles_at) {
+            (true, Some(due)) if now < due => CONTRIBUTOR_INSIGHTS_ENABLING,
+            (true, _) => CONTRIBUTOR_INSIGHTS_ENABLED,
+            (false, _) => CONTRIBUTOR_INSIGHTS_DISABLED,
         }
+    }
+
+    /// Whether a `DISABLE` may be performed on this setting.
+    ///
+    /// What a disable turns off is a CONFIGURATION of key access insights
+    /// ([`Self::configured`]): an enable creates one and nothing removes it, so a resource
+    /// has one from its first enable onwards — while its insights are being turned on, while
+    /// they are on, and after they have been turned off again. A resource that has one is
+    /// served, a redundant disable included, which leaves its insights off; a resource no
+    /// enable has ever configured has nothing for the action to be performed against and is
+    /// refused ([`contributor_insights_not_disableable`]).
+    pub fn disableable(&self) -> bool {
+        self.configured
     }
 
     /// "Timestamp of the last time the status was changed"
@@ -454,7 +504,8 @@ impl ContributorInsights {
         }
     }
 
-    /// The mode in force, which a setting that is off carries none of.
+    /// The mode last configured, which only a resource no enable has ever named carries
+    /// none of.
     pub fn mode(&self) -> Option<String> {
         self.mode.clone()
     }
@@ -471,11 +522,11 @@ impl ContributorInsights {
     /// Whether this setting is one `ListContributorInsights` reports a summary for.
     ///
     /// The listing enumerates the contributor insights CONFIGURATIONS that exist — the
-    /// resources insights are being turned on for, are on for, or are still being turned
-    /// off for. A resource whose status has settled `DISABLED` has no configuration, so
-    /// it carries no summary: it drops out of the listing once a `DISABLE` settles, and a
-    /// resource no update has ever named was never in it. `DescribeContributorInsights`
-    /// is what answers for a named resource either way, and reports `DISABLED` for it.
+    /// resources insights are being turned on for, or are on for. A resource whose insights
+    /// are off has none, so it carries no summary: it drops out of the listing when a
+    /// `DISABLE` turns them off, and a resource no update has ever named was never in it.
+    /// `DescribeContributorInsights` is what answers for a named resource either way, and
+    /// reports `DISABLED` for it.
     pub fn listed(&self, now: SystemTime) -> bool {
         self.status(now) != CONTRIBUTOR_INSIGHTS_DISABLED
     }

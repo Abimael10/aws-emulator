@@ -113,15 +113,16 @@ async fn the_rules_the_resource_has_are_named_and_no_failure_is_reported_in_any_
     create_table(&router, "InsightsReported", &["Reported.Index"]).await;
     settle().await;
 
-    // Rows span the statuses a setting can be read in: never set, then each half of both
-    // transitions. The action column is what this row asks for first, and whether it waits
-    // out the transient span before reading.
+    // Rows span the statuses a setting can be read in: never set, both halves of the enable,
+    // and off — the disable that turns it off and a redundant one after it. The action column
+    // is what this row asks for first, and whether it waits out the transient span before
+    // reading.
     let cases: [StatusRow; 5] = [
         ("never set", None, "DISABLED"),
         ("the enable in flight", Some(("ENABLE", false)), "ENABLING"),
         ("the enable settled", Some(("ENABLE", true)), "ENABLED"),
-        ("the disable in flight", Some(("DISABLE", false)), "DISABLING"),
-        ("the disable settled", Some(("DISABLE", true)), "DISABLED"),
+        ("the disable", Some(("DISABLE", false)), "DISABLED"),
+        ("the disable again", Some(("DISABLE", true)), "DISABLED"),
     ];
 
     for (case, action, expected) in cases {

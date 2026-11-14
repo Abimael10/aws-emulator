@@ -6857,3 +6857,5 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // `E0753` and compiles no suite of this target, so they are gone rather than re-typed. The
 // rules they repeated stand once in the module doc at the HEAD of this file, and the two
 // `all_rs_*` guard suites check them for this file and for every service crate's
+// copy that stood here was a second declaration two concurrent landings each appended,
+// which is `E0428` and compiles no suite of this target.)

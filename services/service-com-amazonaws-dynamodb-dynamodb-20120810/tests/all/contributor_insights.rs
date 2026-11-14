@@ -13,14 +13,15 @@
 //!    does not carry, which names the table and the index instead;
 //! 2. a table or index no update has named reports `DISABLED`, with no mode and no
 //!    timestamp: the feature is off until `UpdateContributorInsights` turns it on;
-//! 3. turning it on or off is asynchronous, so the call and an immediate read report the
-//!    transient status (`ENABLING`/`DISABLING`) and a read after the span reports the
-//!    settled one (`ENABLED`/`DISABLED`), with the mode the enable asked for;
+//! 3. turning it ON is asynchronous, so the call and an immediate read report the transient
+//!    `ENABLING` and a read after the span reports `ENABLED`, with the mode the enable asked
+//!    for; turning it OFF is not, so the disable itself answers `DISABLED`, and the mode it
+//!    was configured with stays reported;
 //! 4. each resource carries its OWN setting — a table and each of its global secondary
 //!    indexes — and `ListContributorInsights` reports one summary per resource whose
 //!    insights are ON or still settling, paged by `MaxResults`/`NextToken`: a resource
-//!    enters the listing when an enable is accepted and drops out of it once a disable
-//!    settles.
+//!    enters the listing when an enable is accepted and drops out of it when a disable turns
+//!    its insights off.
 //!
 //! Every test drives the operations over the wire (`POST /` with
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same
@@ -371,13 +372,18 @@ async fn an_enable_is_reported_enabling_then_settles_enabled_with_the_mode_it_as
             "case {case}: the enable settled, got {settled} against now {now}"
         );
 
-        // The disable is asynchronous the same way, and leaves the resource tracking
-        // nothing once it settles.
+        // The disable is not asynchronous: it answers the settled status at once, with the
+        // mode the resource was configured with, and a read a span later answers the same —
+        // the configuration outlives the disable.
         let disabled = set_insights(&router, &table, index, "DISABLE", None).await;
         assert_eq!(
-            disabled["ContributorInsightsStatus"].clone(),
-            json!("DISABLING"),
-            "case {case}: the disable is in flight, got {disabled}"
+            (
+                disabled["ContributorInsightsStatus"].clone(),
+                disabled["ContributorInsightsMode"].clone(),
+            ),
+            (json!("DISABLED"), json!(expected_mode)),
+            "case {case}: the disable answers the settled status with the mode in force, got \
+             {disabled}"
         );
         settle().await;
         let off = describe_insights(&router, &table, index).await;
@@ -386,8 +392,8 @@ async fn an_enable_is_reported_enabling_then_settles_enabled_with_the_mode_it_as
                 off["ContributorInsightsStatus"].clone(),
                 off["ContributorInsightsMode"].clone(),
             ),
-            (json!("DISABLED"), Value::Null),
-            "case {case}: the disable settled, got {off}"
+            (json!("DISABLED"), json!(expected_mode)),
+            "case {case}: the resource stays off with its mode still reported, got {off}"
         );
     }
 }
@@ -536,7 +542,7 @@ async fn each_resource_carries_its_own_setting_and_the_listing_reports_one_per_r
         );
     }
 
-    // A resource drops out of the listing once its disable settles, while
+    // A resource drops out of the listing when its disable turns its insights off, while
     // `DescribeContributorInsights` still answers for it: both readers report the one
     // stored setting.
     set_insights(&router, "InsightsListed", Some("A.Index"), "DISABLE", None).await;
@@ -573,7 +579,7 @@ async fn each_resource_carries_its_own_setting_and_the_listing_reports_one_per_r
             ],
             json!("DISABLED")
         ),
-        "case after the disable settles: the resource drops out of the listing and \
+        "case after the disable: the resource drops out of the listing and \
          describes DISABLED, got {after_disable} then {described}"
     );
 }
@@ -583,7 +589,8 @@ async fn every_status_reported_is_one_the_model_declares() {
     // `ContributorInsightsStatus` is an enum, so what a read reports must be a value from
     // the model's own table — the generated `CONTRIBUTOR_INSIGHTS_STATUS_VALUES` — and
     // not a spelling this emulator invented. Rows span the states a resource can be read
-    // in: never touched, enabling, enabled, disabling, disabled.
+    // in: never touched, enabling, enabled, and off — the disable that turns it off and a
+    // redundant one after it.
     use service_com_amazonaws_dynamodb_dynamodb_20120810::ops::types::CONTRIBUTOR_INSIGHTS_STATUS_VALUES;
 
     let router = emulator();
@@ -594,8 +601,8 @@ async fn every_status_reported_is_one_the_model_declares() {
         ("never touched", None),
         ("enabling", Some(("ENABLE", false))),
         ("enabled", Some(("ENABLE", true))),
-        ("disabling", Some(("DISABLE", false))),
-        ("disabled", Some(("DISABLE", true))),
+        ("disabled", Some(("DISABLE", false))),
+        ("disabled a second time", Some(("DISABLE", true))),
     ];
     for (case, action) in cases {
         if let Some((action, wait)) = action {

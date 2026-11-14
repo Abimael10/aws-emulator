@@ -53,6 +53,8 @@ mod continuous_backups;
 mod contributor_insights;
 #[path = "all/contributor_insights_cloudwatch_rules.rs"]
 mod contributor_insights_cloudwatch_rules;
+#[path = "all/contributor_insights_disable_admission.rs"]
+mod contributor_insights_disable_admission;
 #[path = "all/create_backup_source_table.rs"]
 mod create_backup_source_table;
 #[path = "all/delete_table_description_projection.rs"]

@@ -7,10 +7,12 @@
 //! [`crate::state::ContributorInsights`].
 //!
 //! A table (or index) no `UpdateContributorInsights` has ever named reports `DISABLED`
-//! with no timestamp: the feature is off until that operation turns it on. A table name
-//! that resolves to no stored table, and an `IndexName` the stored table does not carry,
-//! are both the modelled `ResourceNotFoundException` — "the operation tried to access a
-//! nonexistent table or index".
+//! with no timestamp and no mode: the feature is off until that operation turns it on, and
+//! the mode is what an enable configures. A resource whose insights were turned off keeps
+//! reporting the mode that was in force, since that configuration outlives the disable. A
+//! table name that resolves to no stored table, and an `IndexName` the stored table does
+//! not carry, are both the modelled `ResourceNotFoundException` — "the operation tried to
+//! access a nonexistent table or index".
 //!
 //! `ContributorInsightsRuleList` names the CloudWatch Contributor Insights rules the enable
 //! minted for the resource, read from the CloudWatch store that holds them

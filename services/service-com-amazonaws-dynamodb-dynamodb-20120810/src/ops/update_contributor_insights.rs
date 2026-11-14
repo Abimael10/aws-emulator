@@ -5,12 +5,19 @@
 //! or of the global secondary index it names beside it, and reports the status that
 //! leaves it in.
 //!
-//! Turning the feature on or off is asynchronous, so the call answers `ENABLING` /
-//! `DISABLING` and the clock owes the move to `ENABLED` / `DISABLED` one
-//! [`crate::state::STATUS_TRANSITION`] later: a caller that reads straight back still
-//! sees the transient status, and `DescribeContributorInsights` reports the settled one
-//! afterwards. An `ENABLE` keeps the mode the request named, or the wider of the two the
-//! model declares where it named none; a `DISABLE` leaves the resource tracking neither.
+//! Turning the feature ON is asynchronous, so an `ENABLE` answers `ENABLING` and the clock
+//! owes the move to `ENABLED` one [`crate::state::STATUS_TRANSITION`] later: a caller that
+//! reads straight back still sees the transient status, and `DescribeContributorInsights`
+//! reports the settled one afterwards. Turning it OFF is not: a `DISABLE` deletes the
+//! resource's insight rules there and then, so it answers the settled `DISABLED`. An
+//! `ENABLE` keeps the mode the request named, or the wider of the two the model declares
+//! where it named none, and a `DISABLE` leaves that mode in place — it is the configuration
+//! of the resource's key access insights, which both this call and the reads keep reporting
+//! once they are off.
+//!
+//! Insights can only be turned off for a resource that has a key access insights
+//! configuration: a `DISABLE` against one no enable has ever configured is refused with the
+//! 400 `ValidationException` stating the statuses that action requires, and writes nothing.
 //!
 //! A table name that resolves to no stored table, and an `IndexName` the stored table
 //! does not carry, are both the modelled `ResourceNotFoundException` — "the operation
@@ -209,6 +216,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one and of the table where it named none.
         let has_sort_key = table.resource_declares_sort_key(index_name);
         let insights = table.contributor_insights_mut(index_name).map_err(lift)?;
+        // A `DISABLE` turns off a CONFIGURATION of key access insights: a resource that has
+        // one is served whether its insights are still being turned on, on, or already off,
+        // and a resource no enable has ever configured has nothing for the action to be
+        // performed against, so it is refused rather than accepted as a no-op
+        // ([`crate::state::contributor_insights_not_disableable`]).
+        if !enable && !insights.disableable() {
+            return Err(lift(crate::state::contributor_insights_not_disableable()));
+        }
         insights.apply(enable, input.contributor_insights_mode.as_deref(), now);
         let status = insights.status(now).to_string();
         let mode = insights.mode();

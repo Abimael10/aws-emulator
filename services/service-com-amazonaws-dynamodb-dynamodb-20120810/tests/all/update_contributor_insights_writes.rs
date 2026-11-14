@@ -12,11 +12,11 @@
 //!    the setting of the one resource it resolves to, and answers naming the STORED table
 //!    bare (`UpdateContributorInsightsOutput$TableName`, length 3..255, pattern
 //!    `^[a-zA-Z0-9_.-]+$`), echoing `IndexName` exactly when the request named one;
-//! 2. every accepted call REPLACES that resource's setting and starts the asynchronous
-//!    change again, so the call answers the transient status with the mode it just wrote
-//!    and a read one span later reports the settled status and that same mode — the last
-//!    accepted call's, whatever the resource was set to before it; a `DISABLE` leaves the
-//!    resource tracking no mode at all;
+//! 2. every accepted call REPLACES that resource's setting, so the call answers the status
+//!    it leaves the resource in with the mode then configured and a read agrees: an `ENABLE`
+//!    starts the asynchronous change again, answering the transient status and settling one
+//!    span later, while a `DISABLE` answers the settled `DISABLED` at once and leaves the
+//!    mode it was configured with in place;
 //! 3. a call reaches only the resource it names, in the region its endpoint names: a
 //!    same-named table in another region, another table in the same region and the
 //!    indexes the call did not name all keep the setting they had, and each region's
@@ -69,7 +69,7 @@ fn resource_key(region: &str, table: &str, index: Option<&str>) -> String {
 
 /// One row of the sequence in [`each_accepted_call_replaces_the_setting`]: the case, the
 /// action asked for, the mode asked for, and the mode a read reports once that call has
-/// settled (`None` where the setting then tracks none).
+/// been applied (the mode last configured, which a disable keeps).
 type Step = (
     &'static str,
     &'static str,
@@ -212,7 +212,8 @@ async fn each_accepted_call_replaces_the_setting() {
 
     // Rows are the calls in the order they arrive, which is what the rule generalises
     // over: a first enable naming no mode, a narrowing, a widening, a disable, the same
-    // disable again, and an enable after it.
+    // disable again, and an enable after it. The last column is the mode in force once the
+    // call has been applied: an enable's own, and for a disable the one it leaves in place.
     let steps: [Step; 6] = [
         (
             "the first enable, no mode named",
@@ -232,8 +233,18 @@ async fn each_accepted_call_replaces_the_setting() {
             Some("ACCESSED_AND_THROTTLED_KEYS"),
             Some("ACCESSED_AND_THROTTLED_KEYS"),
         ),
-        ("disabled", "DISABLE", None, None),
-        ("disabled a second time", "DISABLE", None, None),
+        (
+            "disabled",
+            "DISABLE",
+            None,
+            Some("ACCESSED_AND_THROTTLED_KEYS"),
+        ),
+        (
+            "disabled a second time",
+            "DISABLE",
+            None,
+            Some("ACCESSED_AND_THROTTLED_KEYS"),
+        ),
         (
             "enabled again after the disable",
             "ENABLE",
@@ -247,7 +258,9 @@ async fn each_accepted_call_replaces_the_setting() {
     for (resource, index) in [("the table", None), ("its index", Some("Replaced.Index"))] {
         for (case, action, asked, settled_mode) in steps {
             let enabling = action == "ENABLE";
-            let in_flight = if enabling { "ENABLING" } else { "DISABLING" };
+            // An enable leaves the transient status for its span; a disable leaves none, so
+            // the status it answers is the settled one straight away.
+            let answered_status = if enabling { "ENABLING" } else { "DISABLED" };
             let settled_status = if enabling { "ENABLED" } else { "DISABLED" };
 
             let answered = set_insights(&router, "InsightsReplaced", index, action, asked).await;
@@ -260,14 +273,14 @@ async fn each_accepted_call_replaces_the_setting() {
                     reported(&read_in_flight, "ContributorInsightsMode"),
                 ),
                 (
-                    json!(in_flight),
+                    json!(answered_status),
                     or_null(settled_mode),
-                    json!(in_flight),
+                    json!(answered_status),
                     or_null(settled_mode),
                 ),
-                "case {resource}, {case}: the call answers the transient status with the mode \
-                 it wrote and a read straight after agrees, got {answered} then \
-                 {read_in_flight}"
+                "case {resource}, {case}: the call answers the status it leaves the resource in \
+                 with the mode then configured and a read straight after agrees, got {answered} \
+                 then {read_in_flight}"
             );
 
             settle().await;
