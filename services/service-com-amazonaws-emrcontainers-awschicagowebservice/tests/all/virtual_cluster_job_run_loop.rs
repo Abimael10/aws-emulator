@@ -1265,6 +1265,17 @@ async fn a_deleted_virtual_cluster_stays_describable_and_takes_no_more_work() {
         .await;
     let job = text(started.ok(case), "/id", case);
 
+    // A cluster that still holds a live job run is not torn down at all
+    // (`crate::virtual_cluster_delete_preconditions` is that rule's own suite), so the run
+    // is cancelled and left to finish first.
+    emr.delete_cluster(&cluster).await.refused(
+        "deleting a cluster that still holds a live job run",
+        400,
+        "ValidationException",
+    );
+    emr.cancel_job(&cluster, &job).await.ok(case);
+    wait_for_the_clock();
+
     let deleted = emr.delete_cluster(&cluster).await;
     assert_eq!(
         text(deleted.ok(case), "/id", case),

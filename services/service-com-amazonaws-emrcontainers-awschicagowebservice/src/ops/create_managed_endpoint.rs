@@ -9,6 +9,10 @@
 //! An endpoint is provisioned rather than instant, so it is accepted `CREATING` and
 //! reaches `ACTIVE` on the clock ([`crate::state::TRANSITION_SPAN`]).
 //!
+//! `type` is a free-form string in the model, and the values it may carry are the service's
+//! own ([`crate::state::SUPPORTED_ENDPOINT_TYPES`]): a type this service provisions no
+//! gateway for is refused with the modelled `ValidationException` and creates nothing.
+//!
 //! `clientToken` is `@idempotencyToken`, so a token already spent on this operation in
 //! this cluster does NOT mint a second endpoint: the same request replayed answers with
 //! the endpoint the first call minted, and that same token carrying a DIFFERENT request
@@ -284,6 +288,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let region = crate::state::request_region(ctx);
+        // `type` is modelled as a plain string, so the boundary's constraint walk admits any
+        // non-blank value of up to 64 characters and the SERVICE is what decides which of
+        // them name a gateway it can provision
+        // ([`crate::state::endpoint_type_is_supported`]). Checked first, from the request
+        // alone: a type this service serves no gateway for provisions nothing, so nothing
+        // about this store is read or written for it.
+        if !crate::state::endpoint_type_is_supported(&input.r#type) {
+            return Err(CreateManagedEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    // The wording a value outside a service-side value set carries
+                    // ([`crate::state::invalid_argument_message`]): the member's own name,
+                    // and nothing of the value that was rejected.
+                    message: Some(crate::state::invalid_argument_message("type")),
+                },
+            )
+            .into());
+        }
         let scope = crate::state::create_managed_endpoint_scope(&input.virtual_cluster_id);
         // The request this `clientToken` stands for, digested before the store is locked:
         // it depends on nothing in state, and the lock is what serialises racing creates

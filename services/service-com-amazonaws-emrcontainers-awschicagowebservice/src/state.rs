@@ -60,6 +60,11 @@ pub use managed_endpoint_connection::*;
 mod container_cluster_network;
 pub use container_cluster_network::*;
 
+/// Whether the container cluster a virtual cluster is registered against exists at all, as
+/// the service that owns it reports it: resolved, never assumed here.
+mod container_cluster_admission;
+pub use container_cluster_admission::*;
+
 /// The one decision a `clientToken` already spent in its scope is judged by — replay,
 /// conflict or fresh — for every `@idempotencyToken` operation of this service.
 mod spent_client_token;
@@ -147,6 +152,29 @@ pub const ENDPOINT_TERMINAL_STATES: &[&str] =
 /// Whether an `EndpointState` is one a managed endpoint never leaves.
 pub fn endpoint_state_is_terminal(state: &str) -> bool {
     ENDPOINT_TERMINAL_STATES.contains(&state)
+}
+
+/// The `EndpointType` values a managed endpoint can be created with.
+///
+/// `EndpointType` is a plain string in the model — len 1..64, pattern `\S`, with no
+/// enumeration (`smithy_query(query="operation", operation="CreateManagedEndpoint")`) — so
+/// the value set is the SERVICE's, and a value outside it is refused rather than stored
+/// ([`endpoint_type_is_supported`]). It is a catalog rather than a single value, so a type
+/// the service serves later is one entry here.
+///
+/// The one entry is the managed-endpoint type Amazon EMR on EKS serves: the gateway a
+/// managed endpoint is ("a gateway that connects Amazon EMR Studio to Amazon EMR on EKS",
+/// `CreateManagedEndpoint`) is a Jupyter Enterprise Gateway, which is the value AWS
+/// documents the create with and the only one it accepts.
+pub const SUPPORTED_ENDPOINT_TYPES: &[&str] = &["JUPYTER_ENTERPRISE_GATEWAY"];
+
+/// Whether `CreateManagedEndpoint` can provision a gateway of this `EndpointType`.
+///
+/// The comparison is exact: the value set is the service's own spellings, so a value that
+/// differs from one of them in case or in surrounding whitespace — both of which the
+/// member's `\S` pattern admits — names no type the service serves.
+pub fn endpoint_type_is_supported(endpoint_type: &str) -> bool {
+    SUPPORTED_ENDPOINT_TYPES.contains(&endpoint_type)
 }
 
 /// The `JobRunState` values no further transition leaves. A job run that reaches one of
@@ -900,6 +928,26 @@ impl ResourceKind {
         }
     }
 }
+
+/// The `message` a refusal carries when a member's value is outside the set of values the
+/// SERVICE accepts for it — a value the model's own constraints admit, because the member
+/// is modelled as a plain string rather than an enum: `Invalid value for argument <member>`.
+///
+/// The only variable part is the MEMBER's name, as the model spells it; the offending value
+/// is not echoed back, and neither is the set of values that would have been accepted. One
+/// wording for every member of this service whose accepted values are the service's own
+/// ([`SUPPORTED_ENDPOINT_TYPES`] is the first), so two such refusals cannot drift apart.
+pub fn invalid_argument_message(member: &str) -> String {
+    bounded_message(format!("Invalid value for argument {member}"))
+}
+
+/// The `message` `DeleteVirtualCluster` carries for a cluster that still holds resources of
+/// its own that have not finished ([`ComAmazonawsEmrcontainersAwschicagowebserviceState::cluster_holds_active_resources`]).
+///
+/// FIXED text, with no variable part at all: it names neither the cluster nor which of the
+/// resources it holds is still live — a caller that wants to know calls `ListJobRuns` or
+/// `ListManagedEndpoints`.
+pub const VIRTUAL_CLUSTER_ACTIVE_RESOURCES_MESSAGE: &str = "VirtualCluster has active resources";
 
 /// The `message` a refusal carries when the request names a virtual cluster that IS
 /// stored but whose `VirtualClusterState` (RUNNING, TERMINATING, TERMINATED, ARRESTED —
@@ -2895,6 +2943,26 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
         }
     }
 
+    /// Whether this cluster still holds a resource of its own that has not finished: a job
+    /// run in a state no further transition leaves ([`job_state_is_terminal`]) or a managed
+    /// endpoint in one ([`endpoint_state_is_terminal`]).
+    ///
+    /// A job run runs IN a virtual cluster and a managed endpoint is a gateway INTO one, so
+    /// both are resources the cluster HOLDS, and work in flight is what makes a cluster's
+    /// teardown premature: `DeleteVirtualCluster` refuses the call while this answers true
+    /// ([`VIRTUAL_CLUSTER_ACTIVE_RESOURCES_MESSAGE`]) instead of tearing the cluster down
+    /// underneath them. A resource that has reached a terminal state holds nothing: it has
+    /// no further step to take and the cluster can go.
+    ///
+    /// Both walks are bounded by the per-cluster indexes the two listings page.
+    pub fn cluster_holds_active_resources(&self, region: &str, id: &str) -> bool {
+        self.cluster_job_runs(region, id)
+            .any(|record| !job_state_is_terminal(&record.state))
+            || self
+                .cluster_managed_endpoints(region, id)
+                .any(|record| !endpoint_state_is_terminal(&record.state))
+    }
+
     /// Start the teardown of a stored virtual cluster of this region, CARRYING DOWN
     /// everything that lives under it.
     ///
@@ -2913,6 +2981,12 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     /// and `StartJobRun` refuse new work on. It is also what lets the cluster reach the
     /// retired form [`Self::reserve_virtual_cluster`] and [`Self::reserve_managed_endpoint`]
     /// reclaim, rather than holding a slot for ever behind a child that never ends.
+    ///
+    /// `DeleteVirtualCluster` is the one caller, and it refuses the delete while any child
+    /// is still live ([`Self::cluster_holds_active_resources`]), so what this normally finds
+    /// is children that have all ended already. The cascade stays: it is what keeps the
+    /// invariant that no child outlives the cluster that holds it true for any teardown,
+    /// however it was reached.
     pub fn start_virtual_cluster_teardown(&mut self, region: &str, id: &str) {
         // The children are read out of the store before anything is written, so the walk
         // borrows the records it decides on and the moves below borrow them mutably.

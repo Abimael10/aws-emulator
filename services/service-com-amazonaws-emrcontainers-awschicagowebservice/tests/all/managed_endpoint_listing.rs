@@ -81,6 +81,14 @@ pub(crate) fn wait_for_the_clock() {
     std::thread::sleep(state::TRANSITION_SPAN + Duration::from_millis(250));
 }
 
+/// How far apart the two groups of the `createdAt`-bounds fixture are staged, in the
+/// milliseconds every stored timestamp is held in.
+///
+/// Far wider than the one-second resolution an ISO-8601 instant is rendered at on the wire,
+/// so a bound staged between the two groups stays between them whichever way the query
+/// string renders it. It is a staged offset rather than a wait: nothing sleeps for it.
+const GROUP_SPAN_MILLIS: i64 = 10_000;
+
 /// The `endpoints` a list answer carries, in the order it reported them.
 pub(crate) fn listed(body: &Value, case: &str) -> Vec<Value> {
     field(body, "/endpoints", case)
@@ -211,7 +219,7 @@ pub(crate) fn stored_bodies() -> Vec<(&'static str, Value)> {
                 // `ResourceNameString` is len 1..64: the upper bound.
                 "name": "n".repeat(64),
                 "clientToken": "t".repeat(64),
-                "type": "JUPYTER_SERVER",
+                "type": "JUPYTER_ENTERPRISE_GATEWAY",
                 "releaseLabel": "emr-6.10.0-latest",
                 "executionRoleArn": "arn:aws:iam::000000000000:role/EMRStudioRole",
                 "sessionIdleTimeoutInMinutes": 480,
@@ -408,7 +416,7 @@ async fn listing_managed_endpoints_is_scoped_to_one_virtual_cluster() {
     let second = emr.cluster("endpoint-scope-b", "vc-ep-scope-b").await;
 
     let in_first = create_many(&emr, &first, "JUPYTER_ENTERPRISE_GATEWAY", "scope-a", 4).await;
-    let in_second = create_many(&emr, &second, "JUPYTER_SERVER", "scope-b", 2).await;
+    let in_second = create_many(&emr, &second, "JUPYTER_ENTERPRISE_GATEWAY", "scope-b", 2).await;
 
     // Rows differ in which cluster is listed and how many endpoints it holds — including
     // a cluster holding none.
@@ -518,25 +526,18 @@ async fn listing_managed_endpoints_honours_the_state_and_type_filters() {
     let emr = Emr::new();
     let cluster = emr.cluster("endpoint-filters", "vc-ep-filters").await;
 
-    // Rows differ along the `EndpointType` value, which the model leaves free-form
-    // (smithy_query: shape `EndpointType` — len 1..64, pattern \S), and along how many
-    // endpoints share one type.
+    // `types` names `EndpointType` values, which the model leaves free-form (smithy_query:
+    // shape `EndpointType` — len 1..64, pattern \S) while the values an endpoint can be
+    // STORED with are the service's own: a create naming any other type is refused
+    // (`crate::managed_endpoint_type_admission`), so every stored endpoint carries the one
+    // gateway type and the rows differ along what the FILTER asks for — the stored type, a
+    // type no endpoint can carry, that type beside the stored one, and a value differing
+    // from the stored one only in case.
     let gateways = create_many(&emr, &cluster, "JUPYTER_ENTERPRISE_GATEWAY", "filter-jeg", 3).await;
-    let servers = create_many(&emr, &cluster, "JUPYTER_SERVER", "filter-js", 2).await;
-    let custom = create_many(&emr, &cluster, "CUSTOM.endpoint-type_1", "filter-custom", 1).await;
+    let more = create_many(&emr, &cluster, "JUPYTER_ENTERPRISE_GATEWAY", "filter-more", 3).await;
 
-    let everything: BTreeSet<String> = gateways
-        .iter()
-        .chain(servers.iter())
-        .chain(custom.iter())
-        .cloned()
-        .collect();
-    let gateway_set: BTreeSet<String> = gateways.iter().cloned().collect();
-    let server_set: BTreeSet<String> = servers.iter().cloned().collect();
-    let custom_set: BTreeSet<String> = custom.iter().cloned().collect();
+    let everything: BTreeSet<String> = gateways.iter().chain(more.iter()).cloned().collect();
     let nothing: BTreeSet<String> = BTreeSet::new();
-    let mut gateways_and_custom = gateway_set.clone();
-    gateways_and_custom.extend(custom_set.iter().cloned());
 
     // Every endpoint is CREATING until the clock settles it, so the state rows are
     // asserted in BOTH phases: first against CREATING, then against ACTIVE.
@@ -568,18 +569,22 @@ async fn listing_managed_endpoints_honours_the_state_and_type_filters() {
         (
             "one type",
             "?types=JUPYTER_ENTERPRISE_GATEWAY".to_string(),
-            &gateway_set,
-        ),
-        ("another type", "?types=JUPYTER_SERVER".to_string(), &server_set),
-        (
-            "a type only one endpoint carries",
-            "?types=CUSTOM.endpoint-type_1".to_string(),
-            &custom_set,
+            &everything,
         ),
         (
-            "two types",
+            "a type no endpoint can carry",
+            "?types=JUPYTER_SERVER".to_string(),
+            &nothing,
+        ),
+        (
+            "a value differing from the stored type only in case",
+            "?types=jupyter_enterprise_gateway".to_string(),
+            &nothing,
+        ),
+        (
+            "two types, one of them the stored one",
             "?types=JUPYTER_ENTERPRISE_GATEWAY&types=CUSTOM.endpoint-type_1".to_string(),
-            &gateways_and_custom,
+            &everything,
         ),
         (
             "a type no endpoint carries",
@@ -589,15 +594,15 @@ async fn listing_managed_endpoints_honours_the_state_and_type_filters() {
         (
             "a type and the current state together",
             format!(
-                "?types=JUPYTER_SERVER&states={}",
+                "?types=JUPYTER_ENTERPRISE_GATEWAY&states={}",
                 state::ENDPOINT_CREATING
             ),
-            &server_set,
+            &everything,
         ),
         (
             "a type and a state nothing is in together",
             format!(
-                "?types=JUPYTER_SERVER&states={}",
+                "?types=JUPYTER_ENTERPRISE_GATEWAY&states={}",
                 state::ENDPOINT_ACTIVE
             ),
             &nothing,
@@ -630,8 +635,11 @@ async fn listing_managed_endpoints_honours_the_state_and_type_filters() {
         ),
         (
             "the settled state and one type together",
-            format!("?states={}&types=JUPYTER_SERVER", state::ENDPOINT_ACTIVE),
-            &server_set,
+            format!(
+                "?states={}&types=JUPYTER_ENTERPRISE_GATEWAY",
+                state::ENDPOINT_ACTIVE
+            ),
+            &everything,
         ),
     ] {
         let answer = list_endpoints(&emr, &cluster, &query).await;
@@ -647,24 +655,36 @@ async fn listing_managed_endpoints_honours_the_state_and_type_filters() {
 /// RULE 5 for the instant bounds: `createdAfter` and `createdBefore` bound the stored
 /// `createdAt` strictly, so a bound keeps all, some or none of the cluster's endpoints.
 ///
-/// The fixture creates one group, lets the clock move past it, takes a MIDPOINT, lets the
-/// clock move again and creates a second group, so a bound that falls between the two
-/// groups has endpoints on either side of it.
+/// The fixture needs two groups with a MIDPOINT instant between them. Nothing waits for the
+/// clock to produce one: the earlier group is created and its stored `createdAt` is then
+/// moved back through the harness's own store ([`Emr::store`], which is there for a fixture
+/// that has to stage a state no request can set), so the two groups sit a whole
+/// [`GROUP_SPAN_MILLIS`] apart however fast the host runs.
 #[tokio::test]
 async fn listing_managed_endpoints_honours_the_created_at_bounds() {
     let emr = Emr::new();
     let cluster = emr.cluster("endpoint-bounds", "vc-ep-bounds").await;
-    // Wider than the one-second resolution an ISO-8601 instant can be rendered at, so a
-    // bound taken between the two groups stays between them however the wire renders it.
-    let gap = Duration::from_millis(1_100);
 
-    let before_everything = state::now_millis() - 2_000;
+    let late = create_many(&emr, &cluster, "JUPYTER_ENTERPRISE_GATEWAY", "bound-late", 2).await;
     let early = create_many(&emr, &cluster, "JUPYTER_ENTERPRISE_GATEWAY", "bound-early", 3).await;
-    tokio::time::sleep(gap).await;
-    let midpoint = state::now_millis();
-    tokio::time::sleep(gap).await;
-    let late = create_many(&emr, &cluster, "JUPYTER_SERVER", "bound-late", 2).await;
-    let after_everything = state::now_millis() + 2_000;
+    // Both groups were created in the same instant, so the earlier one is MADE earlier:
+    // two spans back, which leaves the midpoint one span before the later group and one
+    // span after this one.
+    let now = state::now_millis();
+    {
+        let store = emr.store();
+        let mut state = store.lock();
+        for id in &early {
+            let record = state
+                .managed_endpoints
+                .get_mut(id)
+                .unwrap_or_else(|| panic!("the endpoint {id} the create minted is stored"));
+            record.created_at_millis = now - 2 * GROUP_SPAN_MILLIS;
+        }
+    }
+    let before_everything = now - 3 * GROUP_SPAN_MILLIS;
+    let midpoint = now - GROUP_SPAN_MILLIS;
+    let after_everything = now + GROUP_SPAN_MILLIS;
 
     let everything: BTreeSet<String> = early.iter().chain(late.iter()).cloned().collect();
     let early_set: BTreeSet<String> = early.iter().cloned().collect();

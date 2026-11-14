@@ -39,7 +39,11 @@ use crate::managed_endpoint_listing::{
 use crate::virtual_cluster_job_run_loop::{field, text, Answer, Emr};
 
 /// `DELETE /virtualclusters/{cluster}/endpoints/{id}` — `DeleteManagedEndpoint`.
-async fn delete_endpoint(emr: &Emr, cluster: &str, id: &str) -> Answer {
+///
+/// `pub(crate)` because the suites that have to RETIRE an endpoint before a cluster can be
+/// torn down drive the same call ([`crate::virtual_cluster_teardown_cascade`],
+/// [`crate::virtual_cluster_delete_preconditions`]), so there is one definition of it.
+pub(crate) async fn delete_endpoint(emr: &Emr, cluster: &str, id: &str) -> Answer {
     emr.send(
         "DELETE",
         &format!("/virtualclusters/{cluster}/endpoints/{id}"),
@@ -227,7 +231,7 @@ async fn deleting_one_endpoint_leaves_every_other_resource_alone() {
             endpoint_body(
                 &format!("scope-other-{target}"),
                 &format!("ep-tok-scope-other-{target}"),
-                "JUPYTER_SERVER",
+                "JUPYTER_ENTERPRISE_GATEWAY",
             ),
         )
         .await;
@@ -378,34 +382,44 @@ async fn deleting_an_endpoint_whose_teardown_already_happened() {
         );
     }
 
-    // An endpoint that reached its terminal state through its CLUSTER's teardown is refused
-    // on the same terms, and one still being carried down by that teardown is left to it.
+    // An endpoint its CLUSTER's teardown has to wait for, and then the end it reached: a
+    // cluster is not torn down while a gateway into it is still live, so the cluster's
+    // delete is refused until the endpoint's own teardown has settled — and an endpoint that
+    // has ended is refused a second teardown on the same terms as above.
     let emr = Emr::new();
-    let case = "an endpoint taken down by its cluster's teardown";
+    let case = "an endpoint its cluster's teardown has to wait for";
     let cluster = emr.cluster("endpoint-delete-cascade", "vc-tok-ep-cascade").await;
     let created = create_endpoint(
         &emr,
         &cluster,
-        endpoint_body("cascade", "ep-tok-cascade", "JUPYTER_SERVER"),
+        endpoint_body("cascade", "ep-tok-cascade", "JUPYTER_ENTERPRISE_GATEWAY"),
     )
     .await;
     let id = text(created.ok(case), "/id", case);
     wait_for_the_clock();
-    emr.delete_cluster(&cluster).await.ok(case);
+    // The gateway is ACTIVE, so the cluster still holds a live resource.
+    emr.delete_cluster(&cluster)
+        .await
+        .refused(case, 400, "ValidationException");
 
+    delete_endpoint(&emr, &cluster, &id).await.ok(case);
     let during = endpoint_record(&emr, &cluster, &id, case).await;
     let state_during = text(&during, "/state", case);
     assert_eq!(
         state_during,
         state::ENDPOINT_TERMINATING,
-        "case {case:?}: the cluster's teardown must have taken the endpoint with it, got \
+        "case {case:?}: the delete must have started the endpoint's teardown, got \
          {state_during:?}"
     );
+    // A teardown in flight has not ended: the cluster still waits for it.
+    emr.delete_cluster(&cluster)
+        .await
+        .refused(case, 400, "ValidationException");
     delete_endpoint(&emr, &cluster, &id).await.ok(case);
     assert_eq!(
         endpoint_record(&emr, &cluster, &id, case).await,
         during,
-        "case {case:?}: a delete during the cluster's teardown must change nothing"
+        "case {case:?}: a delete retried during the teardown must change nothing"
     );
 
     wait_for_the_clock();
@@ -413,11 +427,22 @@ async fn deleting_an_endpoint_whose_teardown_already_happened() {
     assert_eq!(
         settled,
         state::ENDPOINT_TERMINATED,
-        "case {case:?}: the cascade owed this endpoint TERMINATED, got {settled:?}"
+        "case {case:?}: the teardown owed this endpoint TERMINATED, got {settled:?}"
     );
     delete_endpoint(&emr, &cluster, &id)
         .await
         .refused(case, 400, "ValidationException");
+    // With the gateway over, the cluster's own teardown goes through, and it leaves the
+    // endpoint the end it reached.
+    emr.delete_cluster(&cluster).await.ok(case);
+    wait_for_the_clock();
+    let after = endpoint_state(&emr, &cluster, &id, case).await;
+    assert_eq!(
+        after,
+        state::ENDPOINT_TERMINATED,
+        "case {case:?}: the cluster's teardown must leave the ended endpoint as it was, got \
+         {after:?}"
+    );
 }
 
 /// RULE 4: a pair the store does not hold is refused with the modelled

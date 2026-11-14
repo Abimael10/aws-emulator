@@ -93,7 +93,7 @@ async fn active_endpoint(emr: &Emr, label: &str) -> (String, String) {
     let created = create_endpoint(
         emr,
         &cluster,
-        endpoint_body(label, &format!("ep-tok-{label}"), "JUPYTER_SERVER"),
+        endpoint_body(label, &format!("ep-tok-{label}"), "JUPYTER_ENTERPRISE_GATEWAY"),
     )
     .await;
     let endpoint = text(created.ok(label), "/id", label);
@@ -375,7 +375,7 @@ async fn a_pair_the_store_does_not_hold_is_not_found() {
 
 /// RULE 3: only an `ACTIVE` endpoint has a gateway to connect to, so an endpoint in any
 /// other state is refused — in the `CREATING` phase it has not reached yet, and in the
-/// terminal state its virtual cluster's teardown takes it to.
+/// terminal state its own teardown takes it to.
 #[tokio::test]
 async fn an_endpoint_that_is_not_active_issues_no_session() {
     let emr = Emr::new();
@@ -409,15 +409,19 @@ async fn an_endpoint_that_is_not_active_issues_no_session() {
     let answer = issue_session(&emr, &cluster, &endpoint, request_body(json!({}))).await;
     reported_token(answer.ok(case), case);
 
-    // Its virtual cluster's teardown takes the endpoint with it, and a torn-down endpoint
-    // accepts no client either.
-    emr.delete_cluster(&cluster).await.ok("the cluster teardown");
-    let case = "the endpoint while its cluster is tearing down";
+    // The endpoint's own teardown takes it out of ACTIVE, and a torn-down endpoint accepts
+    // no client either. The cluster is torn down after it — a cluster is not torn down while
+    // a gateway into it is still live (`crate::virtual_cluster_delete_preconditions`).
+    crate::managed_endpoint_delete::delete_endpoint(&emr, &cluster, &endpoint)
+        .await
+        .ok("the endpoint teardown");
+    let case = "the endpoint while it is tearing down";
     issue_session(&emr, &cluster, &endpoint, request_body(json!({})))
         .await
         .refused(case, 400, "ValidationException");
     wait_for_the_clock();
-    let case = "the endpoint once its cluster has terminated";
+    emr.delete_cluster(&cluster).await.ok("the cluster teardown");
+    let case = "the endpoint once it and its cluster have terminated";
     issue_session(&emr, &cluster, &endpoint, request_body(json!({})))
         .await
         .refused(case, 400, "ValidationException");

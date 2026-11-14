@@ -196,7 +196,7 @@ async fn describing_an_endpoint_id_the_model_refuses_is_a_validation_error() {
     let created = create_endpoint(
         &emr,
         &cluster,
-        endpoint_body("validation", "ep-tok-validation", "JUPYTER_SERVER"),
+        endpoint_body("validation", "ep-tok-validation", "JUPYTER_ENTERPRISE_GATEWAY"),
     )
     .await;
     let stored = text(created.ok("the stored endpoint"), "/id", "the stored endpoint");

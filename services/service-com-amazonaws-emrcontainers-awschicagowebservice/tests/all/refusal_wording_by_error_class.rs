@@ -212,7 +212,7 @@ async fn an_idempotency_conflict_is_refused_with_one_fixed_sentence() {
         create_endpoint(
             &emr,
             &host,
-            endpoint_body("wording-ep", "tok-wording-ep", "JUPYTER_SERVER"),
+            endpoint_body("wording-ep", "tok-wording-ep", "JUPYTER_ENTERPRISE_GATEWAY"),
         )
         .await
         .ok("an endpoint to issue sessions for"),

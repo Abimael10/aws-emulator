@@ -13,6 +13,11 @@
 //! so no endpoint stays reachable and no run keeps being scheduled inside a cluster that
 //! has been torn down.
 //!
+//! A cluster that still holds work, though, is not torn down at all: while any job run or
+//! managed endpoint of the cluster has not reached a terminal state the delete is refused
+//! with the modelled `ValidationException` and the cluster keeps the state it was in, so a
+//! caller cancels the runs and deletes the endpoints first and then deletes the cluster.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,6 +191,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &current_state,
                         Self::NAME,
                     )),
+                },
+            )
+            .into());
+        }
+
+        // A cluster is torn down only once the resources it HOLDS are over: a job run runs
+        // in it and a managed endpoint is a gateway into it, so while either has not
+        // reached a terminal state the cluster still carries work and the delete is refused
+        // ([`crate::state::ComAmazonawsEmrcontainersAwschicagowebserviceState::cluster_holds_active_resources`]),
+        // leaving the cluster exactly as it was. The caller ends those resources —
+        // `CancelJobRun`, `DeleteManagedEndpoint` — and the same delete then goes through.
+        if state.cluster_holds_active_resources(&region, &input.id) {
+            return Err(DeleteVirtualClusterErrorModeled::ValidationException(
+                ValidationException {
+                    // The one wording this service gives a cluster that still holds live
+                    // resources ([`crate::state::VIRTUAL_CLUSTER_ACTIVE_RESOURCES_MESSAGE`]):
+                    // fixed text, naming neither the cluster nor the resource.
+                    message: Some(
+                        crate::state::VIRTUAL_CLUSTER_ACTIVE_RESOURCES_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

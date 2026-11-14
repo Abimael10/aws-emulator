@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/cluster_scoped_listing_scope.rs"]
 mod cluster_scoped_listing_scope;
+#[path = "all/container_provider_resolution.rs"]
+mod container_provider_resolution;
 #[path = "all/created_metadata_wire_form.rs"]
 mod created_metadata_wire_form;
 #[path = "all/empty_collection_member.rs"]
@@ -43,6 +45,8 @@ mod managed_endpoint_describe;
 mod managed_endpoint_listing;
 #[path = "all/managed_endpoint_session_credentials.rs"]
 mod managed_endpoint_session_credentials;
+#[path = "all/managed_endpoint_type_admission.rs"]
+mod managed_endpoint_type_admission;
 #[path = "all/managed_endpoint_wire_form.rs"]
 mod managed_endpoint_wire_form;
 #[path = "all/not_found_message.rs"]
@@ -85,6 +89,8 @@ mod state_roundtrip;
 mod state_transition_refusal_wording;
 #[path = "all/tagging_resource_arn_form.rs"]
 mod tagging_resource_arn_form;
+#[path = "all/virtual_cluster_delete_preconditions.rs"]
+mod virtual_cluster_delete_preconditions;
 #[path = "all/virtual_cluster_job_run_loop.rs"]
 mod virtual_cluster_job_run_loop;
 #[path = "all/virtual_cluster_listing.rs"]

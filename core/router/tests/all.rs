@@ -5028,3 +5028,8 @@ mod cloudformation_provisions_event_buses_and_bus_policies;
 // doc comment is only legal before the first item, so a `//!` line in this appended tail is
 // fragment of the file's own header landed in the appended tail, where a `//!` line past the
 // first item is `E0753` and compiles nothing.)
+// (A plain comment: an inner doc comment is accepted only before the first item of this
+// crate root, so one appended into this tail is `E0753`.)
+// (The cloudwatch CFN alarm-action topic-policy suite is declared ONCE, at the head of this
+// file: two landings in the same window each appended a declaration of it here, and a
+// module declared twice is `E0428`, so the duplicate is gone rather than re-typed.)

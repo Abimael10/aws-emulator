@@ -49,6 +49,10 @@ pub struct ContainerClusterNetwork {
 
 /// An AWS SDK client for Amazon EKS over the in-process callback into this same emulator.
 ///
+/// The ONE such client of this crate — [`super::container_cluster_admission`] resolves a
+/// container cluster's EXISTENCE through it as well — so there is a single place that says
+/// how this service asks the owner of a container cluster about one.
+///
 /// `region` is the request's own signing region, so the question is asked in the Region the
 /// caller addressed. The endpoint URL is only the address the callback's transport routes
 /// on IN PROCESS: no socket is opened, no name is resolved and nothing leaves this process.
@@ -60,7 +64,7 @@ pub struct ContainerClusterNetwork {
 /// (`service_common::arn::region_label`, the one place this tree states that grammar)
 /// instead of being interpolated as given: `None` for a value that would name an authority
 /// the caller chose rather than the peer service this emulator asks.
-fn eks(
+pub(crate) fn eks_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> Option<::aws_sdk_eks::Client> {
@@ -95,7 +99,7 @@ pub async fn container_cluster_network(
     region: &str,
     container_cluster_id: &str,
 ) -> ContainerClusterNetwork {
-    let Some(client) = eks(ctx, region) else {
+    let Some(client) = eks_client(ctx, region) else {
         ::tracing::warn!("the request names no Region label, so Amazon EKS cannot be asked");
         return ContainerClusterNetwork::default();
     };

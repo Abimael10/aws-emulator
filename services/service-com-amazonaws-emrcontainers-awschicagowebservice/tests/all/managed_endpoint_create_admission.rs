@@ -100,14 +100,24 @@ async fn an_endpoint_is_minted_only_in_a_virtual_cluster_that_can_host_one() {
         create_endpoint(
             &emr,
             &cluster,
-            endpoint_body("orphan", "ep-tok-orphan", "JUPYTER_SERVER"),
+            endpoint_body("orphan", "ep-tok-orphan", "JUPYTER_ENTERPRISE_GATEWAY"),
         )
         .await
         .refused(label, 400, "ResourceNotFoundException");
     }
 
     // A teardown in flight: the cluster is still stored, and still cannot host a gateway.
+    // The gateway it holds has to be over first — a cluster is not torn down while a
+    // resource it holds is still live (`crate::virtual_cluster_delete_preconditions`).
     let case = "the teardown of the winding-down cluster";
+    emr.send(
+        "DELETE",
+        &format!("/virtualclusters/{winding_down}/endpoints/{held}"),
+        None,
+    )
+    .await
+    .ok(case);
+    wait_for_the_clock();
     emr.delete_cluster(&winding_down).await.ok(case);
     let reported = cluster_state(&emr, &winding_down, case).await;
     assert_eq!(
@@ -118,7 +128,7 @@ async fn an_endpoint_is_minted_only_in_a_virtual_cluster_that_can_host_one() {
     create_endpoint(
         &emr,
         &winding_down,
-        endpoint_body("in-flight", "ep-tok-terminating", "JUPYTER_SERVER"),
+        endpoint_body("in-flight", "ep-tok-terminating", "JUPYTER_ENTERPRISE_GATEWAY"),
     )
     .await
     .refused(
@@ -139,7 +149,7 @@ async fn an_endpoint_is_minted_only_in_a_virtual_cluster_that_can_host_one() {
     create_endpoint(
         &emr,
         &winding_down,
-        endpoint_body("torn-down", "ep-tok-terminated", "JUPYTER_SERVER"),
+        endpoint_body("torn-down", "ep-tok-terminated", "JUPYTER_ENTERPRISE_GATEWAY"),
     )
     .await
     .refused(
@@ -161,7 +171,7 @@ async fn an_endpoint_is_minted_only_in_a_virtual_cluster_that_can_host_one() {
     let created = create_endpoint(
         &emr,
         &host,
-        endpoint_body("admitted", "ep-tok-admitted", "JUPYTER_SERVER"),
+        endpoint_body("admitted", "ep-tok-admitted", "JUPYTER_ENTERPRISE_GATEWAY"),
     )
     .await;
     let id = text(created.ok(case), "/id", case);
@@ -186,7 +196,10 @@ async fn an_endpoint_is_minted_only_in_a_virtual_cluster_that_can_host_one() {
 /// Every bound comes from the model (smithy_query, operation `CreateManagedEndpoint`):
 /// `name` len 1..64 pattern `^[\.\-_/#A-Za-z0-9]+$`, `clientToken` len 1..64 pattern
 /// `\S`, `releaseLabel` len 1..64 pattern `^[\.\-_/A-Za-z0-9]+$`, `executionRoleArn` len
-/// 20..2048, `certificateArn` len 44..2048 and `tags` len 0..50.
+/// 20..2048, `certificateArn` len 44..2048 and `tags` len 0..50. `type` is inside the
+/// model's bounds for any non-blank value, and which of those the SERVICE provisions a
+/// gateway for is [`crate::managed_endpoint_type_admission`]'s rule, so the row here is the
+/// type a gateway is provisioned for.
 #[tokio::test]
 async fn a_create_at_each_published_bound_is_accepted_and_reads_back() {
     let emr = Emr::new();
@@ -247,7 +260,6 @@ async fn a_create_at_each_published_bound_is_accepted_and_reads_back() {
             "type",
             json!("JUPYTER_ENTERPRISE_GATEWAY"),
         ),
-        ("the server endpoint type", "type", json!("JUPYTER_SERVER")),
         ("no tags at all, the length minimum", "tags", tags(0)),
         ("tags at the length maximum", "tags", tags(50)),
     ];
@@ -307,7 +319,7 @@ async fn a_create_outside_a_published_bound_is_refused_and_stores_nothing() {
     let created = create_endpoint(
         &emr,
         &cluster,
-        endpoint_body("stored", "ep-tok-stored", "JUPYTER_SERVER"),
+        endpoint_body("stored", "ep-tok-stored", "JUPYTER_ENTERPRISE_GATEWAY"),
     )
     .await;
     let stored = text(created.ok(case), "/id", case);

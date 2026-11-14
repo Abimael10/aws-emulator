@@ -14,6 +14,11 @@
 //! cluster is already registered with is refused with `ValidationException`, since a
 //! virtual cluster maps 1:1 onto a Kubernetes namespace.
 //!
+//! The `containerProvider` itself names a cluster of ANOTHER service, so it is resolved
+//! against that service before anything is minted
+//! ([`crate::state::resolve_container_cluster`]): an id Amazon EKS holds no cluster for
+//! registers nothing and is refused with the modelled `ValidationException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -177,6 +182,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let region = crate::state::request_region(ctx);
+        // The container cluster this registration would be against is NOT a resource of
+        // this service: it is the Amazon EKS cluster `containerProvider.id` names, and a
+        // virtual cluster is the registration of one of its namespaces. So it is resolved
+        // against the service that OWNS it before anything is minted
+        // ([`crate::state::resolve_container_cluster`]) — with no lock held, because the
+        // answer depends on nothing in this store — and a request naming a cluster its
+        // owner reports nothing for registers nothing at all. An owner that could not be
+        // asked reports nothing ABOUT the cluster either, so it grounds no refusal: see
+        // that module for why silence is not a refusal.
+        if crate::state::resolve_container_cluster(ctx, &region, &input.container_provider.id)
+            .await
+            == crate::state::ContainerClusterResolution::NotHeld
+        {
+            return Err(CreateVirtualClusterErrorModeled::ValidationException(
+                ValidationException {
+                    // The wording of a container cluster its owner holds nothing for
+                    // ([`crate::state::container_cluster_not_found_message`]): fixed text
+                    // around the id the request named.
+                    message: Some(crate::state::container_cluster_not_found_message(
+                        &input.container_provider.id,
+                    )),
+                },
+            )
+            .into());
+        }
         // The request this `clientToken` stands for, digested before the store is locked:
         // it depends on nothing in state, and the lock is what serialises racing creates
         // that share one token.

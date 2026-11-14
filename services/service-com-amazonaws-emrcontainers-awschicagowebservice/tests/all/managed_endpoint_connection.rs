@@ -56,7 +56,7 @@ const CERTIFICATE_VALIDITY_DAYS: i64 = 395;
 /// The IAM role an Amazon EKS cluster is created with in this suite. No IAM is mounted
 /// beside the three services, so nothing resolves it; it is there because `CreateCluster`
 /// requires the member.
-const EKS_CLUSTER_ROLE: &str = "arn:aws:iam::000000000000:role/eksClusterRole";
+pub(crate) const EKS_CLUSTER_ROLE: &str = "arn:aws:iam::000000000000:role/eksClusterRole";
 
 /// Long enough past Amazon EKS's own cluster-activation span that the clock owes a fresh
 /// cluster `ACTIVE`, which is when it reports the security group it created for it.
@@ -67,7 +67,7 @@ const PAST_EKS_ACTIVATION: Duration = Duration::from_millis(750);
 ///
 /// The very seam this service's own placement resolution reaches Amazon EKS through, so a
 /// cluster this suite creates is created exactly where a create will look for it.
-fn eks(emr: &Emr, region: &str) -> ::aws_sdk_eks::Client {
+pub(crate) fn eks(emr: &Emr, region: &str) -> ::aws_sdk_eks::Client {
     let config = ::aws_sdk_eks::Config::builder()
         .behavior_version(::aws_sdk_eks::config::BehaviorVersion::latest())
         .region(::aws_sdk_eks::config::Region::new(region.to_string()))
@@ -101,7 +101,7 @@ fn ec2(emr: &Emr, region: &str) -> ::aws_sdk_ec2::Client {
 
 /// `count` subnets the ACCOUNT has in `region`, as Amazon EC2 reports them — never derived
 /// here: a suite that needs a subnet id asks the owner for one.
-async fn account_subnets(emr: &Emr, region: &str, count: usize) -> Vec<String> {
+pub(crate) async fn account_subnets(emr: &Emr, region: &str, count: usize) -> Vec<String> {
     let described = ec2(emr, region)
         .describe_subnets()
         .send()
@@ -132,7 +132,7 @@ async fn account_subnets(emr: &Emr, region: &str, count: usize) -> Vec<String> {
 
 /// The network Amazon EKS reports for one of its clusters: the subnets of its VPC
 /// configuration and the security group it created for the cluster.
-struct ClusterNetwork {
+pub(crate) struct ClusterNetwork {
     subnet_ids: Vec<String>,
     security_group: String,
 }
@@ -142,7 +142,11 @@ struct ClusterNetwork {
 ///
 /// Everything here goes through Amazon EKS's own API: the cluster exists because EKS
 /// created it, and the ids below are the ones EKS answers with.
-async fn create_container_cluster(emr: &Emr, name: &str, count: usize) -> ClusterNetwork {
+///
+/// `pub(crate)` because [`crate::container_provider_resolution`] needs container clusters
+/// Amazon EKS really holds too, so the test binary carries ONE definition of "create a
+/// container cluster".
+pub(crate) async fn create_container_cluster(emr: &Emr, name: &str, count: usize) -> ClusterNetwork {
     let subnets = account_subnets(emr, REGION, count).await;
     eks(emr, REGION)
         .create_cluster()
@@ -554,8 +558,9 @@ async fn the_endpoint_certificate_is_issued_for_the_endpoint() {
 ///
 /// The rows differ along what the rule generalises over: how many subnets the container
 /// cluster spans, how many virtual clusters are backed by it, how many endpoints each of
-/// them has, and whether Amazon EKS holds the container cluster the virtual cluster names
-/// at all. Every subnet id asserted was minted by Amazon EC2 and every group by Amazon EKS.
+/// them has, and whether Amazon EKS still holds the container cluster the virtual cluster
+/// is registered against. Every subnet id asserted was minted by Amazon EC2 and every group
+/// by Amazon EKS.
 #[tokio::test]
 async fn the_placement_is_the_one_the_container_clusters_owner_reports() {
     let emr = Emr::with_container_clusters();
@@ -592,7 +597,7 @@ async fn the_placement_is_the_one_the_container_clusters_owner_reports() {
                     endpoint_body(
                         &format!("placement-{nth}-{endpoint}"),
                         &format!("ep-tok-{container_cluster}-{nth}-{endpoint}"),
-                        "JUPYTER_SERVER",
+                        "JUPYTER_ENTERPRISE_GATEWAY",
                     ),
                 )
                 .await;
@@ -624,16 +629,22 @@ async fn the_placement_is_the_one_the_container_clusters_owner_reports() {
         }
     }
 
-    // The contrasting rows: a virtual cluster backed by a container cluster Amazon EKS
-    // holds nothing for. There is no placement to report, so NEITHER member is reported —
-    // while the address and the certificate, which are this service's own, still are.
-    for (label, container_cluster) in [
-        ("a container cluster that was never created", "eks-absent"),
+    // The contrasting rows: a virtual cluster whose container cluster Amazon EKS holds
+    // nothing for by the time the endpoint is provisioned, because the container cluster was
+    // deleted through EKS's own API after the virtual cluster was registered against it (a
+    // registration naming a cluster EKS never held is refused outright —
+    // `crate::container_provider_resolution`). There is no placement to report, so NEITHER
+    // member is reported — while the address and the certificate, which are this service's
+    // own, still are.
+    for (label, container_cluster, subnets) in [
+        ("a container cluster that was deleted", "eks-deleted", 2_usize),
         (
             "a container cluster whose name is another cluster's with a suffix",
             "eks-placement-one-also",
+            3,
         ),
     ] {
+        create_container_cluster(&emr, container_cluster, subnets).await;
         let cluster = cluster_on(
             &emr,
             &format!("unheld-{container_cluster}"),
@@ -641,6 +652,12 @@ async fn the_placement_is_the_one_the_container_clusters_owner_reports() {
             container_cluster,
         )
         .await;
+        eks(&emr, REGION)
+            .delete_cluster()
+            .name(container_cluster)
+            .send()
+            .await
+            .expect("Amazon EKS must delete the container cluster it created");
         let case = format!("{label} ({container_cluster})");
         let created = create_endpoint(
             &emr,

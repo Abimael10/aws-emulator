@@ -9,20 +9,22 @@
 //! client. Every request helper is the one the suites beside this one drive, so there is
 //! one request path under test rather than a copy per suite.
 //!
-//! The rule under test, asserted over a TABLE of clusters rather than one request:
-//! deleting a parent resource tears down the resources that live under it, so a child that
-//! has not already reached a terminal state takes the terminal transition of its own kind
-//! with the parent — a managed endpoint `TERMINATING` then `TERMINATED`, a job run
-//! `CANCEL_PENDING` then `CANCELLED` — while a child that is already over, or already on
-//! its way out, keeps the end it had. The rows differ along what a cluster holds: nothing,
-//! endpoints in each non-terminal state, runs the clock has started, a run waiting behind
-//! the cluster's concurrency limit, a run that had already finished and a cancellation
-//! still in flight.
+//! The rule under test, asserted over a TABLE of clusters rather than one request: a parent
+//! resource is torn down only once the resources that live under it are over — while a
+//! managed endpoint or a job run of the cluster has not reached a terminal state the delete
+//! is refused and the cluster keeps the state it was in
+//! ([`crate::virtual_cluster_delete_preconditions`] is that refusal's own suite), and once
+//! the caller has ended each of them the same delete goes through: the cluster takes its two
+//! steps and every resource it holds keeps the end it reached. The rows differ along what a
+//! cluster holds: nothing, endpoints in each non-terminal state, runs the clock has started,
+//! a run waiting behind the cluster's concurrency limit, a run that had already finished and
+//! a cancellation still in flight.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_emrcontainers_awschicagowebservice::ops::types::ENDPOINT_STATE_VALUES;
 use service_com_amazonaws_emrcontainers_awschicagowebservice::state;
 
+use crate::managed_endpoint_delete::delete_endpoint;
 use crate::managed_endpoint_listing::{
     create_endpoint, endpoint_body, endpoint_state, list_endpoints, listed_ids,
 };
@@ -150,7 +152,7 @@ async fn set_up(emr: &Emr, case: &TeardownCase, index: usize) -> (String, Vec<(C
                 endpoint_body(
                     &format!("cascade-{index}-{slot}"),
                     &format!("ep-tok-cascade-{index}-{slot}"),
-                    "JUPYTER_SERVER",
+                    "JUPYTER_ENTERPRISE_GATEWAY",
                 ),
             )
             .await;
@@ -169,9 +171,10 @@ async fn set_up(emr: &Emr, case: &TeardownCase, index: usize) -> (String, Vec<(C
     (cluster, children)
 }
 
-/// THE RULE: a cluster's teardown reaches every resource the cluster holds.
+/// THE RULE: a cluster is torn down once the resources it holds are over, and the teardown
+/// leaves each of them the end it reached.
 #[tokio::test]
-async fn a_cluster_teardown_carries_down_the_endpoints_and_runs_it_holds() {
+async fn a_cluster_is_torn_down_once_the_endpoints_and_runs_it_holds_are_over() {
     let cases = [
         TeardownCase {
             label: "a cluster holding nothing",
@@ -228,6 +231,7 @@ async fn a_cluster_teardown_carries_down_the_endpoints_and_runs_it_holds() {
 
         // What the row set up, before the teardown: the premise every assertion below is
         // about.
+        let mut live: Vec<(Child, String)> = Vec::new();
         for (child, id) in &children {
             let before = if child.is_endpoint() {
                 endpoint_state(&emr, &cluster, id, label).await
@@ -246,10 +250,19 @@ async fn a_cluster_teardown_carries_down_the_endpoints_and_runs_it_holds() {
                 "case {label:?}: {child:?} {id} must be in one of {expected:?} before the \
                  teardown, got {before:?}"
             );
+            // A child that has not reached a terminal state is one the cluster still holds,
+            // whichever non-terminal state it is in.
+            let terminal = if child.is_endpoint() {
+                state::endpoint_state_is_terminal(&before)
+            } else {
+                state::job_state_is_terminal(&before)
+            };
+            if !terminal {
+                live.push((*child, id.clone()));
+            }
         }
         // Which of those runs the cluster counts as queued and as running: the row that
-        // means to leave a submission waiting behind the concurrency limit is pinned here,
-        // and this is the pair the teardown has to take to zero.
+        // means to leave a submission waiting behind the concurrency limit is pinned here.
         let status = scheduler_status(&emr, label, &cluster).await;
         assert_eq!(
             status, case.queued_and_running_before,
@@ -258,10 +271,40 @@ async fn a_cluster_teardown_carries_down_the_endpoints_and_runs_it_holds() {
             case.queued_and_running_before
         );
 
+        // While it holds any of them, the cluster is not torn down and nothing about it
+        // moves.
+        if !live.is_empty() {
+            emr.delete_cluster(&cluster).await.refused(
+                label,
+                400,
+                "ValidationException",
+            );
+            let reported = cluster_state(&emr, label, &cluster).await;
+            assert_eq!(
+                reported,
+                state::CLUSTER_RUNNING,
+                "case {label:?}: a refused delete must leave the cluster RUNNING, got \
+                 {reported:?}"
+            );
+        }
+
+        // The caller ends each live resource through its own API — a gateway with
+        // `DeleteManagedEndpoint`, a run with `CancelJobRun` — and waits for it to finish.
+        for (child, id) in &live {
+            if child.is_endpoint() {
+                delete_endpoint(&emr, &cluster, id).await.ok(label);
+            } else {
+                cancel_run(&emr, &cluster, id).await.ok(label);
+            }
+        }
+        if !live.is_empty() {
+            wait_for_the_clock();
+        }
+
         emr.delete_cluster(&cluster).await.ok(label);
 
-        // The teardown is in flight: the cluster is TERMINATING, and so is every child
-        // that had not already ended.
+        // The teardown is in flight: the cluster is TERMINATING, and every resource it
+        // holds keeps the end it reached.
         let reported = cluster_state(&emr, label, &cluster).await;
         assert_eq!(
             reported,
@@ -272,17 +315,12 @@ async fn a_cluster_teardown_carries_down_the_endpoints_and_runs_it_holds() {
             let (reported, expected) = if child.is_endpoint() {
                 (
                     endpoint_state(&emr, &cluster, id, label).await,
-                    state::ENDPOINT_TERMINATING,
+                    state::ENDPOINT_TERMINATED,
                 )
             } else {
                 (
                     run_state(&emr, label, &cluster, id).await,
-                    match child {
-                        // A run that was already over keeps the end it had; one whose
-                        // cancellation was already in flight keeps that cancellation.
-                        Child::FinishedRun => state::JOB_CANCELLED,
-                        _ => state::JOB_CANCEL_PENDING,
-                    },
+                    state::JOB_CANCELLED,
                 )
             };
             assert_eq!(
@@ -303,7 +341,8 @@ async fn a_cluster_teardown_carries_down_the_endpoints_and_runs_it_holds() {
 
         wait_for_the_clock();
 
-        // The teardown has settled: every child reached the terminal state of its kind.
+        // The teardown has settled: the cluster reached TERMINATED and every resource it
+        // held is still in the terminal state of its own kind.
         let reported = cluster_state(&emr, label, &cluster).await;
         assert_eq!(
             reported,

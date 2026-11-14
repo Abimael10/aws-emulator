@@ -206,7 +206,7 @@ async fn case_for(emr: &Emr, operation: Operation, case: &str) -> Case {
             let created = create_endpoint(
                 emr,
                 &cluster,
-                endpoint_body("endpoint.session", "ep-tok-session", "JUPYTER_SERVER"),
+                endpoint_body("endpoint.session", "ep-tok-session", "JUPYTER_ENTERPRISE_GATEWAY"),
             )
             .await;
             let endpoint = text(created.ok(case), "/id", case);
