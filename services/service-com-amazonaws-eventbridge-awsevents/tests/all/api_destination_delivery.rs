@@ -11,13 +11,14 @@
 //! * a matched event whose target ARN names an API destination IS attempted: the
 //!   destination's `HttpMethod` request is made to its `InvocationEndpoint`,
 //!   bounded by the client execution timeout, and an attempt that never reached
-//!   an endpoint is tried AGAIN up to the target's
-//!   `RetryPolicy$MaximumRetryAttempts` — so a target with N extra retries makes
-//!   measurably more attempts than an otherwise identical target with none;
+//!   an endpoint is tried AGAIN until one of the target's two retry bounds is
+//!   met — "retry attempts continue until either the maximum number of attempts
+//!   is made or until the duration of the `MaximumEventAgeInSeconds` is met" —
+//!   so a target with N extra retries makes measurably more attempts than an
+//!   otherwise identical target with none;
 //! * an event no attempt delivered goes to the target's dead-letter queue,
 //!   carrying the rule, the target, the error and — for a delivery that was
-//!   retried — how many retries it made and that the retry allowance is what
-//!   stopped it;
+//!   retried — how many retries it made and WHICH of the two bounds stopped it;
 //! * a target whose ARN names no API destination this account holds is dead
 //!   lettered WITHOUT any retry accounting, because nothing was retried;
 //! * the request is made through the in-process emulator transport and nothing
@@ -26,8 +27,10 @@
 //!
 //! The table spans the class rather than one recorded case: the rows differ along
 //! the retry allowance the target carries — none at all, zero, one, several, and
-//! more than one delivery makes here — and each row has its own dead-letter queue
-//! so the attempts of one row are told apart from another's.
+//! more than the event's age bound admits — and each row has its own dead-letter
+//! queue so the attempts of one row are told apart from another's. Which bound
+//! ends a delivery, over the `RetryPolicy` members that decide it, is
+//! `tests/all/api_destination_retry_bounds.rs`'s.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,15 +51,15 @@ const DETAIL_TYPE: &str = "Hook Fired";
 /// The endpoint every destination below points at: a host this emulator serves
 /// nothing at, which is what an endpoint that never answers looks like from
 /// inside the in-process transport — the attempt reaches no endpoint.
-const ENDPOINT: &str = "https://hooks.invalid.example/orders";
+pub(crate) const ENDPOINT: &str = "https://hooks.invalid.example/orders";
 
 /// The emulator: EventBridge and SQS on one engine.
-struct Emulator {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -109,16 +112,16 @@ async fn rpc(
     (status, parsed)
 }
 
-async fn events(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn events(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
     rpc(emulator, "events", "AWSEvents", "1.1", operation, body).await
 }
 
-async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
     rpc(emulator, "sqs", "AmazonSQS", "1.0", operation, body).await
 }
 
 /// A required string member of a response body.
-fn member(case: &str, body: &Value, name: &str) -> String {
+pub(crate) fn member(case: &str, body: &Value, name: &str) -> String {
     body[name]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: no {name} in {body}"))
@@ -130,7 +133,7 @@ fn member(case: &str, body: &Value, name: &str) -> String {
 /// (`PutTargets`), so one that has granted the service nothing receives nothing —
 /// the rule `tests/all/queue_target_policy_authorization.rs` is the suite for.
 /// Answers its url and the ARN a target names it by.
-async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
+pub(crate) async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
     let (status, body) = sqs(emulator, "CreateQueue", &json!({ "QueueName": name })).await;
     assert_eq!(status, 200, "CreateQueue answered {status} {body}");
     let url = member(name, &body, "QueueUrl");
@@ -159,7 +162,7 @@ async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
 }
 
 /// Every message waiting on the queue at `url`, with its attributes.
-async fn drain(emulator: &Emulator, url: &str) -> Vec<Value> {
+pub(crate) async fn drain(emulator: &Emulator, url: &str) -> Vec<Value> {
     let (status, body) = sqs(
         emulator,
         "ReceiveMessage",
@@ -176,7 +179,7 @@ async fn drain(emulator: &Emulator, url: &str) -> Vec<Value> {
 
 /// The value of one dead-letter attribute of `message`, or `None` when the
 /// message does not carry it.
-fn attribute(message: &Value, name: &str) -> Option<String> {
+pub(crate) fn attribute(message: &Value, name: &str) -> Option<String> {
     message["MessageAttributes"][name]["StringValue"]
         .as_str()
         .map(str::to_string)
@@ -184,7 +187,17 @@ fn attribute(message: &Value, name: &str) -> Option<String> {
 
 /// An API destination over an API-key connection that has settled into
 /// `AUTHORIZED`, so the destination is `ACTIVE`; answers its ARN.
-async fn given_api_destination(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn given_api_destination(emulator: &Emulator, name: &str) -> String {
+    given_api_destination_at(emulator, name, ENDPOINT).await
+}
+
+/// [`given_api_destination`] with the `InvocationEndpoint` the caller names, for
+/// a suite that needs its own endpoint.
+pub(crate) async fn given_api_destination_at(
+    emulator: &Emulator,
+    name: &str,
+    endpoint: &str,
+) -> String {
     let (status, body) = events(
         emulator,
         "CreateConnection",
@@ -199,8 +212,6 @@ async fn given_api_destination(emulator: &Emulator, name: &str) -> String {
     .await;
     assert_eq!(status, 200, "CreateConnection answered {status} {body}");
     let connection_arn = member(name, &body, "ConnectionArn");
-    // A destination is ACTIVE only once its connection is authorized.
-    ::tokio::time::sleep(state::CONNECTION_TRANSITION + Duration::from_millis(250)).await;
 
     let (status, body) = events(
         emulator,
@@ -208,33 +219,44 @@ async fn given_api_destination(emulator: &Emulator, name: &str) -> String {
         &json!({
             "Name": name,
             "ConnectionArn": connection_arn,
-            "InvocationEndpoint": ENDPOINT,
+            "InvocationEndpoint": endpoint,
             "HttpMethod": "POST",
         }),
     )
     .await;
     assert_eq!(status, 200, "CreateApiDestination answered {status} {body}");
     let arn = member(name, &body, "ApiDestinationArn");
-    let (status, body) = events(
-        emulator,
-        "DescribeApiDestination",
-        &json!({ "Name": name }),
-    )
-    .await;
-    assert_eq!(status, 200, "DescribeApiDestination answered {status} {body}");
-    assert_eq!(
-        body["ApiDestinationState"],
-        json!(state::API_DESTINATION_STATE_ACTIVE),
-        "the destination has to be ACTIVE before a delivery is attempted: {body}"
-    );
-    arn
+    // A destination is ACTIVE only once the connection it uses is authorized,
+    // which the connection settles into on its own: the state is LOOKED AT again
+    // until it holds rather than waited out, so the suite neither depends on how
+    // fast the host runs nor on the span the settling takes.
+    let deadline = ::std::time::Instant::now() + ACTIVE_DEADLINE;
+    loop {
+        let (status, body) = events(emulator, "DescribeApiDestination", &json!({ "Name": name })).await;
+        assert_eq!(status, 200, "DescribeApiDestination answered {status} {body}");
+        if body["ApiDestinationState"] == json!(state::API_DESTINATION_STATE_ACTIVE) {
+            return arn;
+        }
+        assert!(
+            ::std::time::Instant::now() < deadline,
+            "case {name:?}: the destination has to be ACTIVE before a delivery is attempted, \
+             got {body}"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
+
+/// How long the loop above looks for an `ACTIVE` destination before giving up:
+/// generous room over the span a connection's authorization settles in, so only
+/// a destination that never becomes active fails the suite.
+const ACTIVE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long that loop waits between looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// One row: the case, the `MaximumRetryAttempts` the target carries (`None` for
 /// no `RetryPolicy` at all), how many RETRIES the dead-letter message must
-/// report, and the condition it must name as what stopped the delivery — `None`
-/// where a bound of this emulator's own stopped it, so the target's allowance
-/// was never reached.
+/// report, and the condition it must name as what stopped the delivery.
 type RetryRow = (&'static str, Option<i32>, &'static str, Option<&'static str>);
 
 /// An api-destination delivery is attempted and retried within the target's
@@ -246,7 +268,15 @@ async fn an_api_destination_delivery_is_retried_within_the_targets_policy_then_d
     // (case, MaximumRetryAttempts, the RETRY_ATTEMPTS the dead letter reports,
     //  the EXHAUSTED_RETRY_CONDITION it names)
     let rows: [RetryRow; 5] = [
-        ("no retry policy at all", None, "5", None),
+        (
+            // No `RetryPolicy` at all is delivered under the defaults AWS
+            // documents — 185 retries over 24 hours — so the age bound is the
+            // one the retries reach first.
+            "no retry policy at all",
+            None,
+            "16",
+            Some("MaximumEventAgeInSeconds"),
+        ),
         (
             "a policy allowing no retry",
             Some(0),
@@ -266,13 +296,13 @@ async fn an_api_destination_delivery_is_retried_within_the_targets_policy_then_d
             Some("MaximumRetryAttempts"),
         ),
         (
-            // Past this emulator's own bound on the attempts one delivery makes,
-            // which is what it stops at — so the target's allowance is NOT the
-            // condition that stopped it, and none is named.
-            "a policy allowing more retries than one delivery makes here",
+            // An allowance larger than the event's age bound admits: the age is
+            // what the retries reach first, so it is the condition reported and
+            // the allowance is never reached.
+            "a policy allowing more retries than the event's age admits",
             Some(50),
-            "5",
-            None,
+            "16",
+            Some("MaximumEventAgeInSeconds"),
         ),
     ];
 
@@ -381,6 +411,12 @@ async fn an_api_destination_delivery_is_retried_within_the_targets_policy_then_d
             *condition,
             "case {case:?}: expected the stopping condition {condition:?}, got {message}"
         );
+        assert_eq!(
+            attribute(message, "ERROR_CODE").as_deref(),
+            Some(state::UNKNOWN_CONDITION),
+            "case {case:?}: a failure the classification does not place carries the unplaced \
+             condition, got {message}"
+        );
         let error = attribute(message, "ERROR_MESSAGE").unwrap_or_default();
         assert!(
             error.contains(ENDPOINT),
@@ -480,6 +516,12 @@ async fn a_target_naming_no_api_destination_is_dead_lettered_without_retries() {
         "case a target naming no destination: the event is dead lettered, got {messages:?}"
     );
     let message = &messages[0];
+    assert_eq!(
+        attribute(message, "ERROR_CODE").as_deref(),
+        Some(state::NO_RESOURCE),
+        "case a target naming no destination: the condition is the one a resource that is not \
+         there carries, got {message}"
+    );
     assert_eq!(
         attribute(message, "RETRY_ATTEMPTS"),
         None,

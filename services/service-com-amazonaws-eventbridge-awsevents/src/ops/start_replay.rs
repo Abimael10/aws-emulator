@@ -392,6 +392,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut budget = crate::ops::put_events::DeliveryBudget::new();
         let mut clients = crate::ops::put_events::Clients::default();
+        // When the events this replay re-publishes are published: a replay
+        // "re-publishes" the archived events onto a bus NOW, so a replayed event
+        // is as old as the replay rather than as old as the archived copy.
+        let republished_at = ::std::time::SystemTime::now();
         let mut deliveries: Vec<crate::state::DeliveredEvent> = Vec::new();
         let mut invocations: Vec<crate::state::TargetInvocation> = Vec::new();
         let mut last_event_time: Option<::std::time::SystemTime> = None;
@@ -441,6 +445,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             // header: `TraceHeader` is a property of the
                             // PUBLICATION, not of the event.
                             trace_header: None,
+                            published: republished_at,
                         },
                         &mut budget,
                     )

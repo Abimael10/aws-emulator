@@ -883,6 +883,13 @@ pub const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 /// which the dead letter's `ERROR_MESSAGE` carries beside this condition.
 pub const UNKNOWN_CONDITION: &str = "UNKNOWN";
 
+/// The condition EventBridge reports for a delivery the target itself ANSWERED
+/// and would not take: the call was made and the target rejected what it was
+/// handed, which is a failure of the event rather than of the identity or of the
+/// resource — so it is not retried, and the target's own answer is what the
+/// dead letter's `ERROR_MESSAGE` carries beside this condition.
+pub const INVALID_PARAMETER: &str = "INVALID_PARAMETER";
+
 /// The condition EventBridge reports for a delivery whose own input was not one a
 /// target may be handed: what it had to send is not a JSON document, so no call
 /// was made with it.
@@ -4785,6 +4792,11 @@ pub mod oauth;
 /// every target invocation begins with, and the one that decides a handover
 /// whose own API call never gets made.
 pub mod role_assumption;
+
+/// The two bounds a target's `RetryPolicy` puts on a RETRIED delivery — its
+/// attempt allowance and the event's age — and which of them ended one, which is
+/// what the dead letter reports beside the attempt count.
+pub mod retry_bounds;
 
 /// The submitted VALUES this service refuses: the reserved namespaces, the
 /// service a referenced resource has to belong to, and the members another

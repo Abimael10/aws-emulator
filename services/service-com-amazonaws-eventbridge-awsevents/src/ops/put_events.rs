@@ -154,6 +154,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The api-destination half of the delivery pass: the HTTP request made at a
+/// destination's `InvocationEndpoint`, and the retries its target's
+/// `RetryPolicy` bounds.
+///
+/// The `#[path]` is what points the child at `ops/put_events/`: this module is
+/// itself declared with one (the generated `ops` module list is `include!`d), so
+/// a bare `mod` would resolve beside `ops/mod.rs` instead.
+#[path = "put_events/api_destination.rs"]
+mod api_destination;
+// The items it holds are this module's own (`pub(super)` there is `pub(self)`
+// here), so the glob brings them in for the delivery pass without widening
+// them.
+use api_destination::*;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -473,6 +487,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             region: region.clone(),
                             rendered,
                             trace_header: accepted.trace_header,
+                            published: accepted.time,
                             hops: 0,
                             matched,
                         });
@@ -567,6 +582,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         target,
                         rendered: &dispatch.rendered,
                         trace_header: dispatch.trace_header.as_deref(),
+                        published: dispatch.published,
                     };
                     // A bus target is reached by re-publishing onto that bus
                     // rather than by an API call to another service, so it is
@@ -1246,6 +1262,10 @@ struct Dispatch {
     rendered: String,
     /// The entry's `TraceHeader`, carried to each target this event reaches.
     trace_header: Option<String>,
+    /// The event's own TIME — the entry's `Time` when it carried one, otherwise
+    /// the instant it was ingested — which is what the age bound of a target's
+    /// `RetryPolicy` is read against ([`crate::state::retry_bounds`]).
+    published: ::std::time::SystemTime,
     /// How many event-bus targets this event has already been re-published
     /// through, which is what bounds a chain of bus-to-bus targets.
     hops: usize,
@@ -1268,6 +1288,10 @@ pub(crate) struct Handover<'a> {
     /// The event's `TraceHeader`, when the publication carried one: an X-Ray
     /// trace header travels WITH the event to the targets it reaches.
     pub(crate) trace_header: Option<&'a str>,
+    /// When the event was published, as its envelope's `time` reports it: how
+    /// old the event already is, which is the second bound on a retried
+    /// delivery ([`crate::state::retry_bounds`]).
+    pub(crate) published: ::std::time::SystemTime,
 }
 
 /// One rule of a bus, ready to route: its name, its parsed `EventPattern`, and
@@ -1377,6 +1401,11 @@ pub(crate) struct CompiledTarget {
     /// retryable invocation failure is tried again (see
     /// [`invoke_api_destination`]).
     maximum_retry_attempts: Option<i32>,
+    /// `RetryPolicy$MaximumEventAgeInSeconds`: "the maximum amount of time, in
+    /// seconds, to continue to make retry attempts" — the SECOND bound on the
+    /// same retries, which ends them when the event outlives it
+    /// ([`crate::state::retry_bounds`]).
+    maximum_event_age_in_seconds: Option<i32>,
     /// The API destination this target names, resolved from the store while the
     /// rule was compiled — `None` for a target that is not one, and for an ARN
     /// naming a destination this account does not hold.
@@ -1533,6 +1562,11 @@ pub(crate) fn compiled_targets(
                 .retry_policy
                 .as_ref()
                 .and_then(|policy| policy.maximum_retry_attempts),
+            maximum_event_age_in_seconds: target
+                .raw
+                .retry_policy
+                .as_ref()
+                .and_then(|policy| policy.maximum_event_age_in_seconds),
             api_destination: api_destination(store, &target.arn),
             http_parameters: target.raw.http_parameters.clone(),
             partition_key_path: target
@@ -1597,12 +1631,15 @@ const MAX_DELIVERED_BYTES_PER_REQUEST: usize = 8 * 1024 * 1024;
 ///
 /// This operation's OWN bound, not a limit AWS publishes. Each attempt is capped
 /// at [`API_DESTINATION_TIMEOUT`] and each delivery at
-/// [`MAX_API_DESTINATION_ATTEMPTS`] attempts, but the PRODUCT with the fan-out is
-/// not: a request matching many targets whose endpoints never answer would
-/// otherwise hold the publisher for as long as that product takes. It is four
-/// full attempt timeouts, so a realistic retry sequence against one slow
-/// endpoint finishes inside it, and a request that exhausts it stops attempting
-/// and says so.
+/// [`crate::state::retry_bounds::MAX_RETRIES_PER_DELIVERY`] retries, but the
+/// PRODUCT with the fan-out is not: a request matching many targets whose
+/// endpoints never answer would otherwise hold the publisher for as long as that
+/// product takes. It is four full attempt timeouts, which a retry sequence
+/// against endpoints that ANSWER — the reachable case, where each attempt costs
+/// what the answer costs — finishes well inside; a request that exhausts it on
+/// endpoints that never answer stops attempting and says so, and names no retry
+/// condition, because a bound of this emulator's own is not one the target's
+/// retry policy produced.
 const MAX_ENDPOINT_WAIT_PER_REQUEST: ::std::time::Duration =
     ::std::time::Duration::from_secs(20);
 
@@ -2244,6 +2281,10 @@ async fn republish(
             region: bus_region,
             rendered: envelope.to_string(),
             trace_header: dispatch.trace_header.clone(),
+            // The copy IS the event that was published, carried onto another
+            // bus: it keeps the envelope's own `time`, so its age is the age of
+            // the event rather than of the forward.
+            published: dispatch.published,
             hops: dispatch.hops + 1,
             matched,
         });
@@ -2761,7 +2802,7 @@ impl TargetKind {
                 // name is resolved and nothing outside this process can be
                 // reached, so the endpoint's host, scheme and address range
                 // decide nothing but which emulated service claims it.
-                invoke_api_destination(callback, target, body, retries, budget).await
+                invoke_api_destination(callback, handover, body, retries, budget).await
             }
             // A Glue workflow is reached through the store of the Glue service
             // in this SAME engine rather than through a client: the ingress
@@ -3045,301 +3086,11 @@ const TARGET_ACCESS_DENIED_CODES: [&str; 9] = [
 struct Retries {
     /// How many times the invocation was tried AGAIN after the first attempt.
     attempts: i32,
-    /// Whether the target's retry allowance is what stopped the delivery, as
-    /// opposed to a failure that is not retried at all.
-    exhausted: bool,
-}
-
-/// What the dead-letter message names as the condition that stopped a delivery
-/// which used its retry allowance up.
-const MAXIMUM_RETRY_ATTEMPTS_CONDITION: &str = "MaximumRetryAttempts";
-
-/// The time ONE attempt at an API destination's endpoint is given.
-///
-/// AWS documents a 5 second client execution timeout for an API destination
-/// endpoint, after which the attempt is abandoned and retried within the
-/// target's retry policy. It is a CAP on an attempt, never a wait: an attempt
-/// that answers sooner costs what it costs.
-const API_DESTINATION_TIMEOUT: ::std::time::Duration = ::std::time::Duration::from_secs(5);
-
-/// How many attempts ONE api-destination delivery may make, whatever the
-/// target's `RetryPolicy` asks for.
-///
-/// This operation's OWN bound, not a limit AWS publishes (`MaximumRetryAttempts`
-/// is modelled up to 185). Every attempt is a real request made while the
-/// publisher waits for `PutEvents` to answer, and the fan-out around it is
-/// already bounded ([`MAX_DELIVERIES_PER_REQUEST`]) while the product with the
-/// retry count is not. A target asking for more is retried this many times and
-/// says so in the log.
-const MAX_API_DESTINATION_ATTEMPTS: i32 = 6;
-
-/// The content type AWS sends an API destination's invocation with.
-const API_DESTINATION_CONTENT_TYPE: &str = "application/json; charset=utf-8";
-/// The user agent AWS sends an API destination's invocation with.
-const API_DESTINATION_USER_AGENT: &str = "Amazon/EventBridge/ApiDestinations";
-
-/// The error code recorded for an api-destination delivery nothing
-/// acknowledged.
-///
-/// No recorded output names this code — what is recorded is that the dead-letter
-/// message carries one — so it names the condition and the detail (the endpoint,
-/// the final status or the timeout, and how many attempts were made) is in the
-/// message beside it.
-const API_DESTINATION_NOT_DELIVERED: &str = "ApiDestinationInvocationFailed";
-
-/// Invoke an API destination target: an HTTP request to the endpoint the stored
-/// destination holds, carrying the event, retried within the target's
-/// `RetryPolicy`.
-///
-/// The rule AWS follows: EventBridge makes the destination's `HttpMethod`
-/// request to its `InvocationEndpoint` with the event as the body, bounded by a
-/// client execution timeout ([`API_DESTINATION_TIMEOUT`]); an answer in the 2xx
-/// range is the delivery, a 4xx is the endpoint REFUSING it and is not tried
-/// again, and a 5xx or an attempt that never answered is tried again up to
-/// `RetryPolicy$MaximumRetryAttempts` — after which the event goes to the
-/// target's dead-letter queue like any other undeliverable one (see [`deliver`]).
-///
-/// The request goes through the IN-PROCESS emulator transport and nothing else
-/// ([`smithy_server_runtime::EmbeddedEmulator::http_connector`]), so an endpoint
-/// a caller stored reaches only what this emulator serves itself: no socket is
-/// opened and no name is resolved. An endpoint this emulator serves nothing at
-/// answers the transport's own refusal, which is an attempt that reached no
-/// endpoint rather than an answer from one — the retryable class, exactly as an
-/// endpoint that never answers is.
-///
-/// The connection's authorization material and both sides' HTTP parameters ARE
-/// merged into the request ([`attempt_api_destination`]).
-async fn invoke_api_destination(
-    callback: &smithy_server_runtime::EmbeddedEmulator,
-    target: &CompiledTarget,
-    body: &str,
-    retries: &mut Option<Retries>,
-    budget: &mut DeliveryBudget,
-) -> crate::state::InvocationOutcome {
-    let Some(destination) = target.api_destination.as_ref() else {
-        return crate::state::InvocationOutcome::Failed {
-            code: API_DESTINATION_NOT_DELIVERED.to_string(),
-            message: format!(
-                "Target {} names no api destination this account holds, so no request was made \
-                 to one.",
-                target.arn
-            ),
-        };
-    };
-    // "An API destination ... is ACTIVE only while the connection it uses is
-    // authorized": an inactive destination is not invoked, so no request is made
-    // and the event is not delivered.
-    if !destination.active {
-        return crate::state::InvocationOutcome::Failed {
-            code: API_DESTINATION_NOT_DELIVERED.to_string(),
-            message: format!(
-                "Api destination {} is not ACTIVE, so no request was made to its invocation \
-                 endpoint.",
-                destination.name
-            ),
-        };
-    }
-    let allowance = target.maximum_retry_attempts.unwrap_or(i32::MAX);
-    let asked = allowance.saturating_add(1);
-    let attempts = asked.clamp(1, MAX_API_DESTINATION_ATTEMPTS);
-    // Whether THIS EMULATOR's bound is what the delivery will stop at, rather
-    // than the allowance the target asked for: a condition the target's retry
-    // policy did not produce must not be reported as one it did.
-    let bounded_by_this_emulator = asked > attempts;
-    if bounded_by_this_emulator {
-        ::tracing::warn!(
-            destination = %destination.name,
-            asked = allowance,
-            bound = MAX_API_DESTINATION_ATTEMPTS,
-            "this target asks for more invocation attempts than one delivery makes in this \
-             emulator; the delivery stops at the bound"
-        );
-    }
-    let transport = callback.http_connector();
-    let mut last = String::new();
-    let mut made = 0;
-    // Whether the REQUEST's endpoint-wait budget is what stopped the attempts,
-    // rather than the target's retry allowance.
-    let mut stopped_by_this_emulator = false;
-    while made < attempts {
-        // One yield per attempt, so a retried delivery stays interruptible.
-        ::tokio::task::yield_now().await;
-        // What the whole REQUEST has left to wait on endpoints, which is what
-        // bounds the product of the fan-out and the per-attempt timeout.
-        if !budget.may_wait_on_an_endpoint() {
-            ::tracing::warn!(
-                destination = %destination.name,
-                bound = ?MAX_ENDPOINT_WAIT_PER_REQUEST,
-                "this request reached the time it may spend waiting on api destination \
-                 endpoints; this delivery makes no further attempt"
-            );
-            last = "this request reached the time this emulator lets one spend waiting on \
-                    api destination endpoints"
-                .to_string();
-            stopped_by_this_emulator = true;
-            break;
-        }
-        made += 1;
-        let started = ::std::time::Instant::now();
-        let attempt = attempt_api_destination(&transport, destination, target, body).await;
-        budget.charge_endpoint_wait(started.elapsed());
-        match attempt {
-            Attempt::Delivered => return crate::state::InvocationOutcome::Invoked,
-            // The endpoint ANSWERED and refused: "a 4xx response is not
-            // retried", so the delivery fails on this attempt.
-            Attempt::Refused(detail) => {
-                *retries = Some(Retries {
-                    attempts: made - 1,
-                    exhausted: false,
-                });
-                return crate::state::InvocationOutcome::Failed {
-                    code: API_DESTINATION_NOT_DELIVERED.to_string(),
-                    message: api_destination_failure(destination, &detail, made),
-                };
-            }
-            Attempt::Retryable(detail) => last = detail,
-        }
-    }
-    if bounded_by_this_emulator {
-        last = format!(
-            "{last}; this emulator stops one delivery at {MAX_API_DESTINATION_ATTEMPTS} \
-             attempts, so the target's retry allowance was not reached"
-        );
-    }
-    *retries = Some(Retries {
-        attempts: (made - 1).max(0),
-        // The retry allowance is the condition only when IT is what ran out —
-        // never when a bound of this emulator's own stopped the attempts first.
-        exhausted: !stopped_by_this_emulator && !bounded_by_this_emulator,
-    });
-    crate::state::InvocationOutcome::Failed {
-        code: API_DESTINATION_NOT_DELIVERED.to_string(),
-        message: api_destination_failure(destination, &last, made),
-    }
-}
-
-/// The message a failed api-destination delivery is recorded and dead-lettered
-/// with: which destination, what the last attempt came to, and how many attempts
-/// were made.
-fn api_destination_failure(destination: &ApiDestination, detail: &str, attempts: i32) -> String {
-    format!(
-        "Api destination {} did not accept the event after {attempts} attempt(s) at {}: {detail}",
-        destination.name, destination.endpoint
-    )
-}
-
-/// What ONE attempt at an API destination's endpoint came to.
-enum Attempt {
-    /// The endpoint acknowledged the event.
-    Delivered,
-    /// The endpoint answered and did not accept it, which is not retried.
-    Refused(String),
-    /// The attempt is one the delivery may make again: the endpoint answered a
-    /// server error, did not answer within the timeout, or was never reached.
-    Retryable(String),
-}
-
-/// Make one attempt, bounded by [`API_DESTINATION_TIMEOUT`], and classify it.
-///
-/// What the request CARRIES is what EventBridge sends an API destination: the
-/// event as the body, the content type and user agent AWS sends it with, the
-/// connection's authorization, and the connection's and the target's header,
-/// query-string, path and body parameters merged with the connection's value
-/// winning ([`crate::state::invocation::api_destination_invocation`]).
-///
-/// `transport` is the in-process emulator connector and the ONLY thing this
-/// request is handed to: the endpoint text decides which emulated service
-/// receives it, and a URL naming anything this emulator does not serve is
-/// answered by the transport's own refusal rather than by a connection.
-async fn attempt_api_destination(
-    transport: &::aws_smithy_runtime_api::client::http::SharedHttpConnector,
-    destination: &ApiDestination,
-    target: &CompiledTarget,
-    body: &str,
-) -> Attempt {
-    use ::aws_smithy_runtime_api::client::http::HttpConnector;
-
-    let method = match ::http::Method::from_bytes(destination.method.as_bytes()) {
-        Ok(method) => method,
-        Err(_) => {
-            return Attempt::Retryable(format!(
-                "its stored HttpMethod {:?} is not an HTTP method",
-                destination.method
-            ))
-        }
-    };
-    let invocation = crate::state::invocation::api_destination_invocation(
-        &destination.endpoint,
-        &destination.secret,
-        target.http_parameters.as_ref(),
-        body,
-        API_DESTINATION_CONTENT_TYPE,
-        API_DESTINATION_USER_AGENT,
-    );
-    // Every value here comes from the stored destination, its connection and
-    // the stored target, so an endpoint or a parameter that is not a URI or a
-    // header fails HERE rather than panicking. Each header is written ONCE:
-    // the content type and user agent AWS sends are part of the merge above, so
-    // a parameter naming one of them replaces it rather than adding a second.
-    let mut builder = ::http::Request::builder()
-        .method(method)
-        .uri(&invocation.uri);
-    for (name, value) in &invocation.headers {
-        builder = builder.header(name, value);
-    }
-    let request = builder
-        .body(::aws_smithy_types::body::SdkBody::from(
-            ::bytes::Bytes::from(invocation.body.clone()),
-        ))
-        .map_err(|error| error.to_string())
-        .and_then(|request| {
-            ::aws_smithy_runtime_api::http::Request::try_from(request)
-                .map_err(|error| error.to_string())
-        });
-    let request = match request {
-        Ok(request) => request,
-        Err(error) => {
-            return Attempt::Retryable(format!(
-                "its stored invocation endpoint does not render a request ({error})"
-            ))
-        }
-    };
-    match ::tokio::time::timeout(API_DESTINATION_TIMEOUT, transport.call(request)).await {
-        // Nothing answered inside the client execution timeout.
-        Err(_elapsed) => Attempt::Retryable(format!(
-            "the endpoint did not answer within {} seconds",
-            API_DESTINATION_TIMEOUT.as_secs()
-        )),
-        Ok(Err(error)) => Attempt::Retryable(format!(
-            "the endpoint could not be reached ({})",
-            ::aws_smithy_types::error::display::DisplayErrorContext(&error)
-        )),
-        Ok(Ok(response)) => {
-            let status = response.status().as_u16();
-            // A refusal the TRANSPORT itself made is not an answer from an
-            // endpoint: the in-process emulator serves nothing at this URL (or
-            // more than one service claims it), so the attempt reached no
-            // endpoint at all — which is the same class as an endpoint that
-            // never answers, not a 4xx the endpoint sent back.
-            if response
-                .body()
-                .bytes()
-                .is_some_and(crate::state::is_transport_refusal)
-            {
-                return Attempt::Retryable(
-                    "no endpoint answered: this emulator serves nothing at that invocation \
-                     endpoint"
-                        .to_string(),
-                );
-            }
-            match status {
-                200..=299 => Attempt::Delivered,
-                // The endpoint answered that it will not take the event.
-                400..=499 => Attempt::Refused(format!("the endpoint answered HTTP {status}")),
-                _ => Attempt::Retryable(format!("the endpoint answered HTTP {status}")),
-            }
-        }
-    }
+    /// WHICH of the target's two retry bounds ended the delivery
+    /// ([`crate::state::retry_bounds`]), or `None` when neither did — a failure
+    /// that is not retried at all, or a bound of this emulator's own that
+    /// stopped the attempts before either of the target's.
+    exhausted: Option<&'static str>,
 }
 
 /// The `DataType` a message attribute carrying text declares
@@ -4338,11 +4089,17 @@ async fn dead_letter(
         ("ERROR_MESSAGE", message.to_string()),
     ];
     if let Some(retries) = retries {
-        attributes.push(("RETRY_ATTEMPTS", retries.attempts.to_string()));
-        if retries.exhausted {
+        attributes.push((
+            crate::state::retry_bounds::RETRY_ATTEMPTS,
+            retries.attempts.to_string(),
+        ));
+        // WHICH of the target's two retry bounds ended the delivery, named only
+        // when one of them did: a delivery nothing retried, and one a bound of
+        // this emulator's own stopped, name none.
+        if let Some(condition) = retries.exhausted {
             attributes.push((
-                "EXHAUSTED_RETRY_CONDITION",
-                MAXIMUM_RETRY_ATTEMPTS_CONDITION.to_string(),
+                crate::state::retry_bounds::EXHAUSTED_RETRY_CONDITION,
+                condition.to_string(),
             ));
         }
     }

@@ -17,6 +17,8 @@ mod api_destination_delivery;
 mod api_destination_invocation_parameters;
 #[path = "all/api_destination_rate_limit_refusal.rs"]
 mod api_destination_rate_limit_refusal;
+#[path = "all/api_destination_retry_bounds.rs"]
+mod api_destination_retry_bounds;
 #[path = "all/api_destination_state_settles_with_its_connection.rs"]
 mod api_destination_state_settles_with_its_connection;
 #[path = "all/api_destination_survives_its_connections_deletion.rs"]

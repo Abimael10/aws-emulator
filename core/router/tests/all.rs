@@ -4726,3 +4726,5 @@ mod bedrock_agentcore_gateway_mcp_transport_path;
 // suite left at the top level of `tests/` fails the build. (A line comment: a fragment of
 // this file's own header, which is `E0753` anywhere but the head of the file.)
 // the fragments above record: an inner doc comment mid-file is `E0753`.)
+// comment is legal only before the first item, so one here is `E0753`.)
+// leaving a note here. (Ordinary comments, for the reason the notes above record.)

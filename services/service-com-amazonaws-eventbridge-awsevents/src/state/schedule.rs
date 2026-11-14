@@ -518,6 +518,9 @@ async fn fire<Eng: Send + Sync + 'static>(
             // A scheduled firing is published by EventBridge itself, so there is no
             // publisher's trace header to carry.
             trace_header: None,
+            // A scheduled firing publishes the event as it fires, so the event
+            // is as old as this firing.
+            published: now,
         };
         let Some(outcome) = crate::ops::put_events::deliver(
             callback,
