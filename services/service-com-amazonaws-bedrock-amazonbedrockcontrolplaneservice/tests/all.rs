@@ -163,6 +163,8 @@ mod published_catalogues;
 mod published_routing_metadata;
 #[path = "all/range_refusal_wording.rs"]
 mod range_refusal_wording;
+#[path = "all/reads_state_the_member_they_report.rs"]
+mod reads_state_the_member_they_report;
 #[path = "all/refusal_message_fidelity.rs"]
 mod refusal_message_fidelity;
 #[path = "all/refused_subject_follows_the_member_shape.rs"]

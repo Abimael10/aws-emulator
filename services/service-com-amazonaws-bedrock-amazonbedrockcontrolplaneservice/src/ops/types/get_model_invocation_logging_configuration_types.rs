@@ -16,9 +16,34 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-bedrock-amazonbedrockco
 pub struct GetModelInvocationLoggingConfigurationInput {
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetModelInvocationLoggingConfigurationResponse")]
+/// `GetModelInvocationLoggingConfigurationResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `loggingConfig` takes the `opt_stated` presence: it is the SINGLE member this
+/// operation reports (`smithy_query(query="operation",
+/// operation="GetModelInvocationLoggingConfiguration")` — no input members, one optional
+/// output member, and no not-found error modelled), so the response states it either way —
+/// the stored configuration, or JSON `null` while none is in force. The derive writes an
+/// `Option` member only when it is `Some`, which would leave a caller unable to tell
+/// "nothing is configured" from "this member was not served"; see
+/// `types/date_time_wire.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct GetModelInvocationLoggingConfigurationOutput {
     pub logging_config: Option<LoggingConfig>,
 }
+
+bedrock_schema_and_codec!(
+    GetModelInvocationLoggingConfigurationOutput,
+    GET_MODEL_INVOCATION_LOGGING_CONFIGURATION_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetModelInvocationLoggingConfigurationResponse",
+    "com.amazonaws.bedrock",
+    "GetModelInvocationLoggingConfigurationResponse",
+    (
+        M_LOGGING_CONFIG,
+        logging_config,
+        "loggingConfig",
+        0,
+        opt_stated,
+        struct_of(LoggingConfig)
+    ),
+);
 

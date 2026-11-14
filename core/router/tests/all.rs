@@ -6574,3 +6574,29 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // `mod` for the same name is `E0428`; and an inner doc comment is legal only BEFORE the
 // first item, so one appended into this tail is `E0753` and compiles no suite of this
 // target. `all/all_rs_declares_each_suite_once.rs` and
+//! every suite in this target. An inner doc comment (`//!`) is legal only before the first
+//! item, so THESE lines are the only place one may stand — a note appended further down
+//! this file is `E0753` and compiles no suite of this target, and must be an ordinary `//`
+//! comment. `all/all_rs_declares_each_suite_once.rs` and
+//! leaving a note in the appended tail below.
+// (The pricing-plan subscription-eligibility suite is declared ONCE, in the sorted span at
+// the head of this file:
+// A suite left at the top level of `tests/` fails the build. (An ordinary comment: an
+// inner doc comment is legal only before the first item of the crate root, so the `//!`
+// form this line landed in here compiled nothing.)
+// leaving a note here. (These six lines landed here as `//!`, which past the first item
+// is `E0753`; they stand as ordinary comments for the reason they state.)
+// (An ordinary comment: this line landed here as `//!`, which is exactly the `E0753` it
+// warns about.)
+// and compiles nothing. (Five more lines of that appended header fragment, as ordinary
+// comments for the reason they themselves state.)
+// and for every service crate's `tests/all.rs`. (Six lines of this file's own header,
+// which a landing appended here typed with `//!`: ordinary comments, for exactly the
+// and compiles nothing. (Six more lines of that header fragment, as ordinary comments.)
+// Declared in this tail, where the landing that owns it put its line: what a stack's event
+// buses and bus policies are provisioned as spans CloudFormation and EventBridge at once.
+// (Every suite above is declared exactly ONCE and every note in this tail is an ordinary
+// `//` comment: the duplicate declarations and the header fragments landings appended here
+// are gone rather than re-typed, the rule they repeated standing once in the module doc at
+// the HEAD of this file. Append a new suite's `#[path]` and `mod` lines here, with the one
+// sentence that says why it belongs to this target and nothing else.)

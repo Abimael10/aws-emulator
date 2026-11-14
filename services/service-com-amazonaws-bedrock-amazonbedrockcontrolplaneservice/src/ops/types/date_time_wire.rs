@@ -65,6 +65,12 @@
 //! on the structures that carry one. `tests/all/guardrail_wire_shape.rs` pins the wire
 //! form, so it fails if the format does not reach the wire.
 //!
+//! ONE OTHER PRESENCE RULE RIDES HERE. The derive writes an `Option` member only when it
+//! is `Some`, so a response member that must be STATED while it holds nothing cannot be
+//! expressed with it either. That is the `opt_stated` presence of
+//! [`bedrock_schema_and_codec!`] below, and a shape taking it stays on these macros even
+//! once the vendored codegen learns `@timestampFormat`.
+//!
 //! The structures that need them are spread across this service's per-operation `types/`
 //! modules, where each shape is declared exactly once, so `types/mod.rs` pulls this module
 //! in with `#[macro_use]` — ahead of those modules, which is what puts these macros in
@@ -294,7 +300,8 @@ macro_rules! bedrock_read_member {
 }
 
 /// Write a member only when the value is there: a `@required` member always, an `Option`
-/// one when it is `Some` — the vendored codegen's own `is_option` split.
+/// one when it is `Some` — the vendored codegen's own `is_option` split — and an
+/// `opt_stated` one always, as `null` while it holds nothing.
 macro_rules! bedrock_write_present_member {
     ($s:ident, $this:ident, $m:path, $field:ident, req, $($kind:tt)+) => {
         bedrock_write_member!($s, &$m, (&$this.$field), $($kind)+);
@@ -304,15 +311,36 @@ macro_rules! bedrock_write_present_member {
             bedrock_write_member!($s, &$m, __v, $($kind)+);
         }
     };
+    // An optional member that is STATED whether or not it holds a value: the value when
+    // there is one, else the member's own key carrying JSON `null`
+    // (`ShapeSerializer::write_null`, which the codec writes at the member position as
+    // `"<member>": null`). For a response whose single member IS the whole of what the
+    // operation reports, that is the difference between "there is nothing to report" and
+    // "this member was not served" — see the shapes that take this presence.
+    ($s:ident, $this:ident, $m:path, $field:ident, opt_stated, $($kind:tt)+) => {
+        match $this.$field.as_ref() {
+            ::std::option::Option::Some(__v) => {
+                bedrock_write_member!($s, &$m, __v, $($kind)+);
+            }
+            ::std::option::Option::None => {
+                $s.write_null(&$m)?;
+            }
+        }
+    };
 }
 
 /// The value a read slot contributes to the struct: a `@required` member absent from the
-/// wire is refused by name, an optional one stays `None`.
+/// wire is refused by name, an optional one stays `None` — including the `opt_stated` one,
+/// whose presence rule is about what a READ REPORTS and so changes nothing on the way in
+/// (the codec reads a `null`-valued member as an absent one).
 macro_rules! bedrock_member_value {
     ($slot:ident, $wire:literal, req) => {
         $slot.ok_or_else(|| ::aws_smithy_schema_server::missing_member($wire))?
     };
     ($slot:ident, $wire:literal, opt) => {
+        $slot
+    };
+    ($slot:ident, $wire:literal, opt_stated) => {
         $slot
     };
 }
@@ -321,9 +349,11 @@ macro_rules! bedrock_member_value {
 /// list: everything `#[smithy_macros::smithy(shape = ...)]` emits for an output shape,
 /// with `@timestampFormat` honoured.
 ///
-/// Each member entry is `(CONST, field, "wireName", index, req|opt, kind)`; `req` is a
-/// `@required` member (a bare Rust field, refused when absent on the wire) and `opt` an
-/// `Option` one. The entries must be given in the model's member order, which is the order
+/// Each member entry is `(CONST, field, "wireName", index, req|opt|opt_stated, kind)`;
+/// `req` is a `@required` member (a bare Rust field, refused when absent on the wire),
+/// `opt` an `Option` one left out of the response while it holds nothing, and `opt_stated`
+/// an `Option` one STATED in the response either way — its value, or JSON `null` while it
+/// holds nothing. The entries must be given in the model's member order, which is the order
 /// `smithy_query(query="shape", shape=...)` lists them in and the order each struct
 /// declares its fields in.
 macro_rules! bedrock_schema_and_codec {

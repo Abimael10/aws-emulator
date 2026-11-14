@@ -11,7 +11,9 @@
 //! the record the last admitted put stored — member for member, nothing merged in from
 //! an earlier put and nothing defaulted in — and while no record is stored (none was
 //! ever put, or `DeleteModelInvocationLoggingConfiguration` removed it) the get answers
-//! 200 with no `loggingConfig` member at all.
+//! 200 stating `loggingConfig` as JSON null. That the member is STATED either way, rather
+//! than left out while nothing is configured, is the rule
+//! `tests/all/reads_state_the_member_they_report.rs` pins.
 //!
 //! A configuration is only ADMITTED when every role it asks Amazon Bedrock to take on is
 //! one this account may hand it. The CloudWatch Logs destination is the one destination
@@ -81,7 +83,9 @@ const PASS_ROLE_REFUSAL: &str = "Cross-account pass role is not allowed.";
 /// The URI `GetModelInvocationLoggingConfiguration`,
 /// `PutModelInvocationLoggingConfiguration` and
 /// `DeleteModelInvocationLoggingConfiguration` are all bound to.
-const LOGGING_URI: &str = "/logging/modelinvocations";
+///
+/// `pub(crate)` for the reason [`get`] is.
+pub(crate) const LOGGING_URI: &str = "/logging/modelinvocations";
 
 /// One configuration this suite puts and reads back.
 struct Case {
@@ -334,7 +338,7 @@ fn cross_account_role_cases() -> Vec<Case> {
 }
 
 /// `PUT /logging/modelinvocations` with `loggingConfig`.
-async fn put(emulator: &Emulator, logging_config: &Value) -> Reply {
+pub(crate) async fn put(emulator: &Emulator, logging_config: &Value) -> Reply {
     emulator
         .call(
             "PUT",
@@ -345,12 +349,16 @@ async fn put(emulator: &Emulator, logging_config: &Value) -> Reply {
 }
 
 /// `GET /logging/modelinvocations`.
-async fn get(emulator: &Emulator) -> Reply {
+///
+/// `pub(crate)` because `tests/all/reads_state_the_member_they_report.rs` — the suite whose
+/// rule is that a read STATES the member it reports — drives the same three calls rather
+/// than a second copy of them.
+pub(crate) async fn get(emulator: &Emulator) -> Reply {
     emulator.call("GET", LOGGING_URI, None).await
 }
 
 /// `DELETE /logging/modelinvocations`.
-async fn delete(emulator: &Emulator) -> Reply {
+pub(crate) async fn delete(emulator: &Emulator) -> Reply {
     emulator.call("DELETE", LOGGING_URI, None).await
 }
 

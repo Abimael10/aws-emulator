@@ -8,10 +8,14 @@
 //! reported member for member as it was stored.
 //!
 //! While no configuration is in force — none was ever put, or
-//! `DeleteModelInvocationLoggingConfiguration` removed the last one — the response
-//! carries NO `loggingConfig` member: the member is optional, so its absence is how
-//! this operation says invocation logging is not configured, and the answer is still
-//! HTTP 200 (nothing was looked up and not found).
+//! `DeleteModelInvocationLoggingConfiguration` removed the last one — the response still
+//! STATES `loggingConfig`, as JSON `null`: the member is the whole of what this operation
+//! reports, and the model gives it no other way to say "invocation logging is not
+//! configured" (no not-found error is modelled and the answer is HTTP 200, since nothing
+//! was looked up and not found), so a caller tells "nothing configured" from "this member
+//! was not served" by the value and never by the key's absence. The member's presence
+//! either way is the `opt_stated` presence of its output shape's codec
+//! (`crate::ops::types::get_model_invocation_logging_configuration_types`).
 //!
 //! This operation is `@readonly`: it reports the stored configuration and writes
 //! nothing, so repeated reads report the same thing and a read never disturbs what a
