@@ -4422,3 +4422,10 @@ mod cloudformation_appsync_custom_domains;
 // `E0428` and a note written with `//!` anywhere but the header is `E0753`, either of
 // which fails every suite in this target. `all/all_rs_declares_each_suite_once.rs` checks
 // the declarations, for this file and for every service crate's `tests/all.rs`.)
+// doc comment past the first item of this crate root is `E0753` and compiles nothing.)
+// (A fragment of this file's own header that a landing appended here as `//!`: past the
+// first item an inner doc comment is `E0753` and compiles no suite of this target, so it
+// stands as an ordinary comment. The rule it repeats is in the module doc at the HEAD of
+// declarations, for this file and for every service crate's `tests/all.rs`. (These lines
+// landed here as `//!`, which is exactly the `E0753` they describe, so they are ordinary
+// comments.)

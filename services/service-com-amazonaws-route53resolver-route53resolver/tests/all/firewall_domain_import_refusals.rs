@@ -88,7 +88,7 @@ fn download_failed(region: &str) -> String {
 
 /// The sentence DNS Firewall states when a call that would change `id` arrives
 /// while the list stands in the in-flight `status`, whose work is `work`.
-fn in_progress_message(id: &str, status: &str, work: &str) -> String {
+pub(crate) fn in_progress_message(id: &str, status: &str, work: &str) -> String {
     format!(
         "[RSLVR-02305] The DNS Firewall domain list is in {step} status: \"{id}\". Try again \
          after the {work} completes.",

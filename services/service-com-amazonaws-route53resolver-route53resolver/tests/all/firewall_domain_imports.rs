@@ -146,7 +146,7 @@ pub(crate) async fn read_list(router: &MultiServiceRouter, id: &str) -> Value {
 }
 
 /// Every domain the list holds, in the order it reports them.
-async fn list_domains(router: &MultiServiceRouter, id: &str) -> Vec<String> {
+pub(crate) async fn list_domains(router: &MultiServiceRouter, id: &str) -> Vec<String> {
     let listed = ok(
         router,
         "ListFirewallDomains",
@@ -177,7 +177,7 @@ const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 /// Look at the list again until the change in flight has settled, so the step
 /// it settles in is the one the case reads — the CONDITION is waited for and
 /// never a span of the clock.
-async fn settle(router: &MultiServiceRouter, id: &str, case: &str) {
+pub(crate) async fn settle(router: &MultiServiceRouter, id: &str, case: &str) {
     let deadline = Instant::now() + SETTLE_DEADLINE;
     loop {
         let status = string_member(&read_list(router, id).await, "Status");

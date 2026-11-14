@@ -47,6 +47,8 @@ mod firewall_domain_list_deletion;
 mod firewall_domain_list_listing;
 #[path = "all/firewall_domain_lists.rs"]
 mod firewall_domain_lists;
+#[path = "all/firewall_domain_plane_contract.rs"]
+mod firewall_domain_plane_contract;
 #[path = "all/firewall_domains.rs"]
 mod firewall_domains;
 #[path = "all/firewall_lifecycle_status_messages.rs"]
