@@ -182,12 +182,13 @@ impl Fixture {
 
     /// The `alias` of the time series `target` names, as the store holds it: a
     /// stream the store cannot resolve, and one whose asset property carries no
-    /// alias, have none.
-    fn alias_of(&self, target: Target) -> &'static str {
+    /// alias, have none — and a summary reports NO `alias` member for them, since
+    /// a `PropertyAlias` admits no empty string to stand for "no alias".
+    fn alias_of(&self, target: Target) -> Option<&'static str> {
         match target {
-            Target::Stream => STREAM_ALIAS,
-            Target::Aliased => CYCLES_ALIAS,
-            Target::Unaliased | Target::Absent => "",
+            Target::Stream => Some(STREAM_ALIAS),
+            Target::Aliased => Some(CYCLES_ALIAS),
+            Target::Unaliased | Target::Absent => None,
         }
     }
 

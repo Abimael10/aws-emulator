@@ -269,8 +269,11 @@ impl AssetRecord {
     /// [`AssetModelRecord::composite_model_summary`] so the model view and the
     /// asset view of one stored composite model cannot disagree.
     ///
-    /// The asset-side summary states its description unconditionally and carries
-    /// the path rooted at the asset, which is the only difference.
+    /// The asset-side summary carries the path rooted at the asset, which is the
+    /// only difference. `description` is modelled required here while the stored
+    /// one is optional, so a composite model with none carries the empty string
+    /// that stands for "unset"; the wire projection in [`crate::service`] leaves
+    /// the member out, because `Description` admits no empty value.
     pub fn composite_model_summary(
         &self,
         model: &AssetModelRecord,

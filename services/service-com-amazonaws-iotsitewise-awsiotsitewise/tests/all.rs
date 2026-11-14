@@ -29,6 +29,13 @@
 // for the reason the notes above give: the sorted list and the END of this file
 // are both stretches every concurrent iotsitewise change puts a declaration of
 // its own in. Fold it into the list once the churn settles.
+// `unset_read_projections` is declared HERE, beside the suites below, for the
+// reason the notes above give: the sorted list and the END of this file are both
+// stretches every concurrent iotsitewise change puts a declaration of its own in.
+// Fold it into the list once the churn settles.
+#[path = "all/unset_read_projections.rs"]
+mod unset_read_projections;
+
 #[path = "all/asset_model_definition_validation.rs"]
 mod asset_model_definition_validation;
 

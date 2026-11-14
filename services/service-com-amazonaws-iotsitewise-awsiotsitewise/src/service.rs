@@ -42,6 +42,13 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! A sixth seam, `override_protocol`, is one this service DOES take: the codec every
+//! modelled response is rendered through omits a string member whose stored value is
+//! unset instead of reporting it as the empty string — see [`unset_string_members`]
+//! for that rule and why it cannot live in a generated shape.
+
+mod unset_string_members;
 
 use crate::ops::invoke_assistant::InvokeAssistant;
 use service_common::event_stream::EventStreamRoute;
@@ -76,6 +83,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// [`Service::override_operation`]. It owns the shared engine, so the conversation it
     /// records and the datasets it reads live in the same store every other handler reads.
     invoke_assistant: EventStreamRoute<InvokeAssistant<Eng>>,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it.
+    protocol: unset_string_members::UnsetStringMembersRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -86,6 +96,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             invoke_assistant: EventStreamRoute(InvokeAssistant::new(Arc::clone(&engine))),
             entry: crate::ServiceDefinition::new(engine),
+            protocol: unset_string_members::UnsetStringMembersRestJson::new(),
         }
     }
 }
@@ -124,6 +135,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let key = self.entry.protocol().routing_key(req).ok()?;
         (key == crate::ops::invoke_assistant::INVOKE_ASSISTANT)
             .then_some(&self.invoke_assistant as &dyn ErasedOperation)
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every description this model declares targets one `Description` shape,
+        // whose `@length` minimum of 1 means the empty string is not a value it can
+        // hold — while each read declares its description `@required` even though
+        // the member that writes it is optional on every create and update. So a
+        // resource created without a description has none to report, and this codec
+        // leaves the member out of the response instead of filling it with a string
+        // the shape rejects. The rule is stated once, over any member whose own
+        // `@length` forbids the empty string, in [`unset_string_members`]; the codec
+        // is otherwise the model's own `restJson1`.
+        Some(&self.protocol)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

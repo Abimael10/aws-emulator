@@ -153,10 +153,11 @@ struct UpdateCase {
     /// a stored property by the id it was read under.
     body: BodyFor,
     name: &'static str,
-    /// What `DescribeAssetModelCompositeModel` reports for the description, which
-    /// the model declares required and so renders as the empty string when the
-    /// update carried none.
-    description: &'static str,
+    /// What `DescribeAssetModelCompositeModel` reports for the description: the one
+    /// the request carried, or `None` for a request that carried none — the member
+    /// is then absent, because `Description` admits no empty string to stand for
+    /// "unset".
+    description: Option<&'static str>,
     external_id: Option<&'static str>,
     properties: Vec<ExpectProperty>,
 }
@@ -175,7 +176,7 @@ async fn an_updated_composite_model_reads_back_the_definition_the_request_carrie
             case: "the name alone, so every property is removed",
             body: Box::new(|_, _| json!({"assetModelCompositeModelName": "Renamed"})),
             name: "Renamed",
-            description: "",
+            description: None,
             external_id: None,
             properties: Vec::new(),
         },
@@ -204,7 +205,7 @@ async fn an_updated_composite_model_reads_back_the_definition_the_request_carrie
                 })
             }),
             name: "Reshaped",
-            description: "a replaced description",
+            description: Some("a replaced description"),
             external_id: None,
             properties: vec![
                 ExpectProperty {
@@ -238,7 +239,7 @@ async fn an_updated_composite_model_reads_back_the_definition_the_request_carrie
                 })
             }),
             name: "Trimmed",
-            description: "",
+            description: None,
             external_id: None,
             properties: vec![ExpectProperty {
                 name: "Cycles",
@@ -270,7 +271,7 @@ async fn an_updated_composite_model_reads_back_the_definition_the_request_carrie
                 })
             }),
             name: "Grown",
-            description: "",
+            description: None,
             external_id: None,
             properties: vec![
                 ExpectProperty {
@@ -305,7 +306,7 @@ async fn an_updated_composite_model_reads_back_the_definition_the_request_carrie
                 })
             }),
             name: "Labelled",
-            description: "",
+            description: None,
             external_id: Some("boiler_custom_one"),
             properties: vec![ExpectProperty {
                 name: "Setpoint",
@@ -331,7 +332,7 @@ async fn an_updated_composite_model_reads_back_the_definition_the_request_carrie
                 })
             }),
             name: "Structured",
-            description: "",
+            description: None,
             external_id: None,
             properties: vec![ExpectProperty {
                 name: "State",
@@ -405,7 +406,7 @@ async fn an_updated_composite_model_reads_back_the_definition_the_request_carrie
         );
         assert_eq!(
             described["assetModelCompositeModelDescription"].as_str(),
-            Some(case.description),
+            case.description,
             "case {name:?}: the new description did not read back, got {described}"
         );
         assert_eq!(

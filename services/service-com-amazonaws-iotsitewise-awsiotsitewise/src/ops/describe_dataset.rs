@@ -224,8 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             dataset_arn: dataset.arn.clone(),
             dataset_name: dataset.name.clone(),
             // The model makes this member required while every member that writes it
-            // is optional, so a dataset nobody described reports the empty string
-            // rather than a description it was never given.
+            // is optional, so a dataset nobody described carries the empty string
+            // that stands for "unset"; the wire projection (`crate::service`) leaves
+            // the member out, because `Description` admits no empty value.
             dataset_description: dataset.description.clone().unwrap_or_default(),
             dataset_type: dataset.dataset_type.clone(),
             dataset_config: dataset.config.clone(),

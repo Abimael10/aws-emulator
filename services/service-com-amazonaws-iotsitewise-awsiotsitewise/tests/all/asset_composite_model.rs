@@ -65,10 +65,12 @@ struct Case {
     /// The label the asset-side read addresses it by — its id, or an
     /// `externalId:` label for a composite model that carries an external id.
     label: String,
-    /// The name, type and description the read must report.
+    /// The name, type and description the read must report. The description is
+    /// `None` for a composite model created without one: `Description` admits no
+    /// empty string, so the read omits the member rather than reporting "".
     name: &'static str,
     r#type: &'static str,
-    description: &'static str,
+    description: Option<&'static str>,
     /// The external id the read must report, if the composite model has one.
     external_id: Option<&'static str>,
     /// How many asset properties the read must report.
@@ -184,7 +186,7 @@ async fn an_assets_composite_model_is_the_instance_of_its_models_composite_model
             label: custom.clone(),
             name: "Custom1",
             r#type: "CUSTOM",
-            description: "a custom grouping",
+            description: Some("a custom grouping"),
             external_id: Some("custom_one"),
             properties: 2,
             path_depth: 1,
@@ -196,7 +198,7 @@ async fn an_assets_composite_model_is_the_instance_of_its_models_composite_model
             label: "externalId:custom_one".to_string(),
             name: "Custom1",
             r#type: "CUSTOM",
-            description: "a custom grouping",
+            description: Some("a custom grouping"),
             external_id: Some("custom_one"),
             properties: 2,
             path_depth: 1,
@@ -208,7 +210,7 @@ async fn an_assets_composite_model_is_the_instance_of_its_models_composite_model
             label: nested.clone(),
             name: "Nested",
             r#type: "CUSTOM",
-            description: "",
+            description: None,
             external_id: None,
             properties: 1,
             path_depth: 2,
@@ -220,7 +222,7 @@ async fn an_assets_composite_model_is_the_instance_of_its_models_composite_model
             label: alarm.clone(),
             name: "HighTemp",
             r#type: "AWS/ALARM",
-            description: "",
+            description: None,
             external_id: None,
             properties: 1,
             path_depth: 1,
@@ -232,7 +234,7 @@ async fn an_assets_composite_model_is_the_instance_of_its_models_composite_model
             label: anomaly.clone(),
             name: "Anomaly",
             r#type: "AWS/L4E_ANOMALY",
-            description: "",
+            description: None,
             external_id: None,
             properties: 0,
             path_depth: 1,
@@ -244,7 +246,7 @@ async fn an_assets_composite_model_is_the_instance_of_its_models_composite_model
             label: reused.clone(),
             name: "Reused",
             r#type: "CUSTOM",
-            description: "",
+            description: None,
             external_id: None,
             properties: 2,
             path_depth: 1,
@@ -281,7 +283,7 @@ async fn an_assets_composite_model_is_the_instance_of_its_models_composite_model
         );
         assert_eq!(
             described["assetCompositeModelDescription"].as_str(),
-            Some(case.description),
+            case.description,
             "case {name:?}: expected description {:?}, got {described}",
             case.description
         );

@@ -266,9 +266,9 @@ fn summary(
         arn: record.arn.clone(),
         name: record.name.clone(),
         // The model makes this member required while every member that writes it is
-        // optional, so a dataset nobody described reports the empty string rather
-        // than a description it was never given — the same way `DescribeDataset`
-        // reports it.
+        // optional, so a dataset nobody described carries the empty string that
+        // stands for "unset" — the same value `DescribeDataset` carries, and the one
+        // the wire projection in `crate::service` omits.
         description: record.description.clone().unwrap_or_default(),
         // `DatasetSource` requires its own `sourceType`, so every stored dataset has
         // one and the summary reports the dataset's own rather than the request's

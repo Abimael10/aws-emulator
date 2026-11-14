@@ -3444,7 +3444,17 @@ pub enum SeriesKey {
 /// sample newer than everything stored \u2014 the shape real ingest takes \u2014 takes an
 /// append-only fast path and costs no element move, so the sorted insert cannot be
 /// driven to quadratic cost under the shared state lock.
+///
+/// The quality is DERIVED ON INGEST: `quality` is optional on the way in, so a
+/// TQV that names none is stored carrying [`DEFAULT_QUALITY`] — the quality it
+/// already counts as everywhere ([`quality_of`]) — and every read of the stored
+/// point therefore reports one of the enum's values rather than leaving a
+/// consumer to invent a default.
 fn record_sample(series: &mut Vec<AssetPropertyValue>, value: AssetPropertyValue) {
+    let value = AssetPropertyValue {
+        quality: Some(quality_of(&value).to_string()),
+        ..value
+    };
     let key = timestamp_key(&value.timestamp);
     if series
         .last()

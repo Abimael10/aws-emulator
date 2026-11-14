@@ -31,6 +31,13 @@ const SEVEN_DAYS: i64 = 7 * 24 * 60 * 60;
 /// Seconds in ten minutes — the published future bound of the ingest window.
 const TEN_MINUTES: i64 = 10 * 60;
 
+/// The `Quality` the service derives for a TQV ingested without one. `GOOD` is the
+/// value an ordinary reading carries, and the one a read of such a point reports —
+/// the member is optional on input and modelled as the `Quality` enum
+/// (`smithy_query(query="shape", shape="Quality")`: GOOD | BAD | UNCERTAIN), so a
+/// read always names one of the three.
+const DERIVED_QUALITY: &str = "GOOD";
+
 /// Create an asset model with `properties`, an asset from it, and return
 /// `(assetId, assetProperties)`.
 async fn asset_with(router: &MultiServiceRouter, properties: Value) -> (String, Value) {
@@ -289,10 +296,14 @@ async fn a_re_put_at_an_occupied_timestamp_overwrites_only_when_the_quality_matc
             "case {case:?}: a re-put is always accepted, got {second}"
         );
 
+        // A stored point always reports a quality: `AssetPropertyValue$quality` is
+        // optional on the way in and the service derives GOOD for a TQV that names
+        // none, so the read reports the DERIVED quality of whichever TQV the rule
+        // left in the series.
         let (expected_value, expected_quality) = if overwrites {
-            (30.0, new_quality)
+            (30.0, new_quality.unwrap_or(DERIVED_QUALITY))
         } else {
-            (20.0, stored_quality)
+            (20.0, stored_quality.unwrap_or(DERIVED_QUALITY))
         };
         // Read twice: a dropped put must not change what a later caller sees, and
         // the answer must be stable across independent reads.
@@ -305,7 +316,7 @@ async fn a_re_put_at_an_occupied_timestamp_overwrites_only_when_the_quality_matc
             );
             assert_eq!(
                 stored["quality"].as_str(),
-                expected_quality,
+                Some(expected_quality),
                 "case {case:?}: read {read} expected quality {expected_quality:?}, got {stored}"
             );
             assert_eq!(

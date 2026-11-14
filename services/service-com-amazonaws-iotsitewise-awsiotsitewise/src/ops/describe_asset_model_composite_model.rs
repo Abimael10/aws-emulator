@@ -254,6 +254,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             asset_model_composite_model_external_id: composite.external_id.clone(),
             asset_model_composite_model_path: record.composite_model_path(&composite_model_id),
             asset_model_composite_model_name: composite.name.clone(),
+            // Modelled required, so a composite model stored without a description
+            // carries the empty string that stands for "unset"; the wire projection
+            // (`crate::service`) leaves the member out.
             asset_model_composite_model_description: composite
                 .description
                 .clone()

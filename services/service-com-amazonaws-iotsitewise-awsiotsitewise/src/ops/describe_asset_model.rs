@@ -314,6 +314,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             asset_model_arn: record.arn.clone(),
             asset_model_name: record.name.clone(),
             asset_model_type: Some(record.model_type.clone()),
+            // A model created or updated without a description HAS none. The member
+            // is modelled required, so this struct can only carry a string; the
+            // empty string stands for "unset" and the wire projection
+            // (`crate::service`) leaves the member out, because `Description`
+            // (`@length` min 1) admits no empty value.
             asset_model_description: record.description.clone().unwrap_or_default(),
             // `excludeProperties` asks for the model without its property definitions.
             // Each reported definition carries the path that addresses it from the

@@ -314,13 +314,13 @@ async fn a_created_composite_model_reads_back_whatever_its_type_or_shape() {
                 "case {name:?}: {member} did not read back, got {described}"
             );
         }
+        // The description the request carried reads back as it was sent, and a
+        // request that carried NONE reads back no description member at all:
+        // `Description` admits no empty string, so there is no value that could
+        // stand for "unset".
         assert_eq!(
             described["assetModelCompositeModelDescription"],
-            body["assetModelCompositeModelDescription"]
-                .as_str()
-                .map_or(Value::String(String::new()), |text| Value::String(
-                    text.to_string()
-                )),
+            body["assetModelCompositeModelDescription"],
             "case {name:?}: the description did not read back, got {described}"
         );
         assert_eq!(

@@ -247,9 +247,11 @@ const DEFAULT_MAX_RESULTS: i32 = 50;
 /// read from THAT version and a listed model reports what `DescribeAssetModel`
 /// reports for it under the same alias: the version's own name, description,
 /// number and last update date, and the status that version is in.
-/// `description` is modelled required here while the stored one is optional,
-/// which is the same `unwrap_or_default` `DescribeAssetModel` answers a model
-/// created without a description with.
+/// `description` is modelled required here while the stored one is optional, so a
+/// model with none is carried as the empty string that stands for "unset" — the
+/// same value `DescribeAssetModel` carries for it, and the same one the wire
+/// projection in `crate::service` omits, which keeps the summary a strict subset
+/// of the read.
 fn summary(
     record: &crate::state::AssetModelRecord,
     now: ::std::time::SystemTime,

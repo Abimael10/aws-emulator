@@ -255,9 +255,10 @@ async fn created_portal_reads_back_through_describe_for_every_input_shape() {
         } else {
             // "The associated IAM Identity Center application ID, IF the portal uses
             // IAM Identity Center" — a portal authenticating through IAM has no such
-            // application, so it names none.
+            // application, so it names none: the member is absent, because the id's
+            // own shape admits no empty string to stand for "no application".
             assert_eq!(
-                sso_application_id, "",
+                sso_application_id, "<absent>",
                 "case {:?}: an IAM portal names no ssoApplicationId, got {created}",
                 case.label
             );
@@ -367,9 +368,10 @@ async fn created_portal_reads_back_through_describe_for_every_input_shape() {
             );
         } else {
             // "IoT SiteWise includes portalClientId for ONLY portals that use IAM
-            // Identity Center to authenticate users."
+            // Identity Center to authenticate users." — so the member is absent for
+            // an IAM portal, not reported as an empty client id.
             assert_eq!(
-                client_id, "",
+                client_id, "<absent>",
                 "case {:?}: an IAM portal names no portalClientId, got {described}",
                 case.label
             );

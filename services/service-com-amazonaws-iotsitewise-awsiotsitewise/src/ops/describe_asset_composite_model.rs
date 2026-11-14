@@ -224,10 +224,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             asset_composite_model_external_id: composite.external_id.clone(),
             asset_composite_model_path: path,
             asset_composite_model_name: composite.name.clone(),
-            // `assetCompositeModelDescription` is a REQUIRED output member, so a
-            // composite model stored without a description reports the empty
-            // string rather than omitting the member — the same answer the asset
-            // model's own view of that composite model gives.
+            // `assetCompositeModelDescription` is modelled required, so a composite
+            // model stored without a description carries the empty string that
+            // stands for "unset" — the same value the asset model's own view of that
+            // composite model carries, and the one the wire projection
+            // (`crate::service`) omits.
             asset_composite_model_description: composite.description.clone().unwrap_or_default(),
             asset_composite_model_type: composite.r#type.clone(),
             asset_composite_model_properties: properties,

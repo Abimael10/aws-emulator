@@ -4226,3 +4226,40 @@ mod cloudformation_appsync_custom_domains;
 // (One more fragment of that header, appended here by a landing as an INNER doc comment —
 // `E0753` anywhere but the head of a file — so it stands as an ordinary comment: a suite
 // left at the top level of `tests/` fails the build.)
+// Declared in this same head region, for the reason the entry above records: whether the
+// same window each appended their own copy, and a module declared twice loads the same file
+// twice and compiles neither.)
+// (`cloudformation_provisions_cloudfront_resources` is declared ONCE, further up this file,
+// for that same reason: the declaration two landings appended here is gone.)
+// Declared ONCE, in the head region of this file, for the reason the entries there record:
+// the IaC form of an EventBridge fan-out — one stack's rule with a Lambda target and a Step
+// Functions, IAM, STS and Amazon SQS at once. The declaration two landings appended here as
+// well is gone: a module declared twice loads the same file twice and compiles neither.
+// comment may only appear before an item, and as `//!` they failed the whole target.)
+// (One more such line: a module doc belongs at the head of this file, so this orphaned
+// fragment of it stands as an ordinary comment — `all_rs_declares_each_suite_once.rs`
+// own header that another merge of two appended tails landed down here, and an inner doc
+// comment is legal only before the first item, so as `//!` they were `E0753`.)
+// (Two more lines of that same header fragment, which landed here as `//!` while branches
+// were merging: an inner doc comment is legal only before the first item, so they stand as
+// ordinary comments.)
+// leaving a note here. (Ordinary comments, for the reason the lines above record.)
+// suite left at the top level of `tests/` fails the build. (One more fragment of that same
+// header, landed here as `//!` by a merge: ordinary comment, since `//!` past the first
+// item is `E0753`.)
+// leaving a note here. (Plain comments, for the reason the lines above record.)
+// suite left at the top level of `tests/` fails the build. (Another line of that same
+// header fragment; a plain comment for the reason above.)
+// leaving a note in the tail. (Plain comments, for the reason they themselves state.)
+// leaving a note in the tail. (Every line of this block is an ordinary comment: each is a
+// fragment of this file's own header that a landing appended here as `//!`, which past the
+// first item is `E0753` and compiles no suite of this target.)
+// declarations, for this file and for every service crate's `tests/all.rs`. (Ordinary
+// comments: another fragment of the header a landing appended here.)
+// the rule it states stands in the module doc at the HEAD of this file. The six lines of it
+// that landed here as `//!` are gone rather than re-typed as comments.)
+// (And one more line of that header, for the reason the note above records.)
+// nothing. The header at the top of this file states the rule they repeated. The thirteen
+// further lines of that header which landed here as `//!` while branches were merging are
+// gone for the same reason: past the first item `//!` is `E0753`, and the header already
+// states the rule once.)
