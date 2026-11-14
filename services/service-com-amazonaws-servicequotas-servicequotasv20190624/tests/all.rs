@@ -75,6 +75,8 @@ mod history_filter_chain;
 mod history_token_under_a_moving_selection;
 #[path = "all/integrated_service_display_names.rs"]
 mod integrated_service_display_names;
+#[path = "all/inventory_registered_display_names.rs"]
+mod inventory_registered_display_names;
 #[path = "all/no_such_quota_wording.rs"]
 mod no_such_quota_wording;
 #[path = "all/no_such_service_wording.rs"]

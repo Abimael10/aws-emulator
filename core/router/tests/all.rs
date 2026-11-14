@@ -8148,3 +8148,32 @@ mod events_rule_fans_out_to_firehose_and_queue_targets;
 // module doc at the HEAD of this file, where an inner doc comment is legal, and past the
 // first item a `//!` line is `E0753` and compiles no suite of this target. Declare each
 // suite ONCE, with its `#[path]` line, in the sorted span above.)
+//! and for every service crate's `tests/all.rs`, so check there rather than leaving a
+//! note in the appended tail below.
+// Declared in this tail, each for the reason its own file's header records: whether the one
+// service that claims the `sdb` signing name serves BOTH of that endpoint's APIs; which app
+// client's token a COGNITO_USER_POOLS authorizer admits; the reservation a Lambda event source
+// mapping holds on an Amazon SQS record, as an INDEPENDENT consumer of that queue sees it;
+// what a build PUTS in and READS out of the account's object store; and the scripted
+// deploy-wait-use-delete workflow a waiter polls. Each spans services that no single service
+// crate's test target mounts together.
+// the other CloudFront suites above: it grades the SAME chain over 4xx shares that do not
+// breach the alarm's threshold, and a module may be declared only once.)
+// `ses_event_destination_reaches_an_eventbridge_rule_target` is declared ONCE, further up
+// this tail: whether a SESv2 send's email events reach the Lambda target of a rule on the
+// bus its event destination names spans SESv2, EventBridge, Lambda, CloudFormation, IAM and
+// Amazon SQS, so no single service crate's test target can wire it. (Two branches landing in
+// the same window each appended a declaration of it here, which compiled neither.)
+// (`cloudformation_eventbridge_fan_out_to_lambda_and_sfn` is declared ONCE, in the sorted
+// span at the head of this file: the IaC form of an EventBridge fan-out spans
+// CloudFormation, EventBridge, Lambda, Step Functions, IAM, STS and Amazon SQS at once, and
+// Notes earlier dedup passes left in this tail are gone: every suite named in them is
+// declared exactly once in the spans above, which is what
+// `all/all_rs_declares_each_suite_once.rs` checks.
+// (Everything that stood from here to the end of this file was remnant: copies of this
+// file's own header that concurrent landings appended into the tail — illegal as `//!`
+// past the first item — and bookkeeping notes about duplicate declarations that are
+// already gone. They are pruned rather than re-typed: the rules stand in the module doc
+// at the HEAD of this file, where an inner doc comment is legal, and the two guard
+// suites check both halves of them. Declare a new suite with its `#[path]` line and a
+// note about the suite itself.)

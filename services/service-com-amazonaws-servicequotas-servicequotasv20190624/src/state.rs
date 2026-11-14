@@ -4226,6 +4226,7 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("datasync", "AWS DataSync"),
     ("datazone", "Amazon DataZone"),
     ("dax", "Amazon DynamoDB Accelerator (DAX)"),
+    ("deadline", "AWS Deadline Cloud"),
     ("deepracer", "AWS DeepRacer"),
     ("detective", "Amazon Detective"),
     ("devicefarm", "AWS Device Farm"),
@@ -4235,17 +4236,23 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("dms", "AWS Database Migration Service (AWS DMS)"),
     ("docdb", "Amazon DocumentDB (with MongoDB compatibility)"),
     ("docdb-elastic", "Amazon DocumentDB Elastic Clusters"),
-    ("drs", "AWS Elastic Disaster Recovery"),
+    // The inventory reports this one as one unspaced word with no prefix at all,
+    // rather than as the console's product name; a display name is reproduced as the
+    // inventory spells it, not normalised.
+    ("drs", "ElasticDisasterRecovery"),
     ("ds", "AWS Directory Service"),
     ("dsql", "Amazon Aurora DSQL"),
     ("dynamodb", "Amazon DynamoDB"),
     ("ebs", "Amazon Elastic Block Store (Amazon EBS)"),
     ("ec2", "Amazon Elastic Compute Cloud (Amazon EC2)"),
-    ("ec2-ipam", "Amazon VPC IP Address Manager"),
-    ("ec2fastlaunch", "Amazon EC2 Fast Launch"),
+    // Two more codes the inventory names WITHOUT the product's `Amazon`/`AWS`
+    // prefix: the bare initialism, and the feature's name alone.
+    ("ec2-ipam", "IPAM"),
+    ("ec2fastlaunch", "EC2 Fast Launch"),
     ("ecr", "Amazon Elastic Container Registry (Amazon ECR)"),
     ("ecs", "Amazon Elastic Container Service (Amazon ECS)"),
     ("eks", "Amazon Elastic Kubernetes Service (Amazon EKS)"),
+    ("eks-mcp", "Amazon EKS MCP"),
     ("elastic-inference", "Amazon Elastic Inference"),
     ("elasticache", "Amazon ElastiCache"),
     ("elasticbeanstalk", "AWS Elastic Beanstalk"),
@@ -4253,6 +4260,7 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("elasticloadbalancing", "Elastic Load Balancing (ELB)"),
     ("elasticmapreduce", "Amazon EMR"),
     ("elastictranscoder", "Amazon Elastic Transcoder"),
+    ("elemental-inference", "AWS Elemental Inference"),
     ("emr-containers", "Amazon EMR on EKS"),
     ("emr-serverless", "Amazon EMR Serverless"),
     ("entityresolution", "AWS Entity Resolution"),
@@ -4263,13 +4271,18 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("evidently", "Amazon CloudWatch Evidently"),
     ("evs", "Amazon Elastic VMware Service"),
     ("fargate", "AWS Fargate"),
+    ("finspace", "Amazon FinSpace"),
     ("firehose", "Amazon Kinesis Data Firehose"),
+    ("fis", "AWS Fault Injection Service (AWS FIS)"),
     ("fms", "AWS Firewall Manager"),
     ("forecast", "Amazon Forecast"),
     ("frauddetector", "Amazon Fraud Detector"),
     ("fsx", "Amazon FSx"),
     ("gamelift", "Amazon GameLift Servers"),
     ("gameliftstreams", "Amazon GameLift Streams"),
+    // The inventory carries the product's short name in parentheses after its full
+    // one, the way it does for a service whose console name is the shorter string.
+    ("geo", "Amazon Location Service (Amazon Location)"),
     ("glacier", "Amazon Glacier"),
     ("globalaccelerator", "AWS Global Accelerator"),
     ("glue", "AWS Glue"),
@@ -4499,8 +4512,6 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     // code is reported as the name rather than inventing one: `ServiceCode` — the
     // member every other operation keys on, and the one the model constrains — stays
     // exactly AWS's, and nothing downstream reads `ServiceName`.
-    ("eks-mcp", "eks-mcp"),
-    ("elemental-inference", "elemental-inference"),
     ("health-agent", "health-agent"),
     ("interconnect", "interconnect"),
     ("networkinsights", "networkinsights"),
