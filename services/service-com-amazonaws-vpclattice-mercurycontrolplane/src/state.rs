@@ -10,13 +10,13 @@
 //! the store through
 //! [`service_state`]; nothing in `src/ops/` keeps a second copy of a resource.
 //!
-//! The host a response ANNOUNCES in a `DnsEntry` is read in the `announced_dns` child
+//! The DNS NAME a response ANNOUNCES in a `DnsEntry` is read in the `announced_dns` child
 //! module, which every operation that serializes one builds its entry through
 //! ([`announced_dns_entry`]).
 
 mod announced_dns;
 
-pub use announced_dns::{announced_dns_entry, announced_dns_host};
+pub use announced_dns::{announced_dns_entry, announced_dns_name, AnnouncedService};
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -488,8 +488,8 @@ pub struct LatticeService {
     pub idle_timeout_seconds: i32,
     /// The hosted zone of this service's DNS entry, minted once with the service and
     /// kept, so every read reports the same zone. The entry's DOMAIN NAME is not stored:
-    /// it is the host this emulator answers on, read per request by
-    /// [`announced_dns_entry`].
+    /// it is this service's own name in the zone this emulator answers in, built per
+    /// request by [`announced_dns_entry`].
     pub dns_hosted_zone_id: String,
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
@@ -530,7 +530,8 @@ pub struct ServiceNetworkServiceAssociation {
     pub service_network_name: String,
     /// The hosted zone of the associated service's DNS entry, copied from that service
     /// when the association is made — the association reports the service's own entry.
-    /// Its DOMAIN NAME is not stored; see [`announced_dns_entry`].
+    /// Its DOMAIN NAME is not stored; see [`ServiceNetworkServiceAssociation::announced_service`]
+    /// and [`announced_dns_entry`].
     pub dns_hosted_zone_id: String,
     pub custom_domain_name: Option<String>,
     pub tags: HashMap<String, String>,

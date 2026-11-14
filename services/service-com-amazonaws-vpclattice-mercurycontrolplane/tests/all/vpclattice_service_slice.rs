@@ -473,14 +473,19 @@ async fn creating_services_persists_them_with_a_dns_entry_and_reads_back_identic
             .as_str()
             .unwrap_or_default()
             .to_string();
-        // The announced host is the one this emulator answers on; this harness addresses
-        // the service's published host on an emulator served at no address of its own, so
-        // that is the unserved base's authority. The whole table of addressings is in
-        // `announced_dns_entry`.
+        // The announced value is this service's own DNS name in the zone this emulator
+        // answers the call in; this harness addresses the service's published host on an
+        // emulator served at no address of its own, so that zone is the unserved base's
+        // host. The whole table of addressings is in `announced_dns_entry`.
         assert_eq!(
             domain,
-            crate::announced_dns_entry::unserved_authority(),
-            "case {case:?}: expected the host this emulator answers on, got {domain:?}"
+            crate::announced_dns_entry::announced_name(
+                crate::announced_dns_entry::unserved_zone(),
+                body["name"].as_str().expect("the case names a service"),
+                &id,
+            ),
+            "case {case:?}: expected this service's own DNS name in the zone this \
+             emulator answers in, got {domain:?}"
         );
         assert!(
             created.body["dnsEntry"]["hostedZoneId"]
