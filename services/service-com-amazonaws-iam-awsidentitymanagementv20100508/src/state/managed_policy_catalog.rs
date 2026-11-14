@@ -189,7 +189,8 @@ fn published_instant(text: &str) -> Option<::aws_smithy_types::DateTime> {
 /// SUBSET of it — the policies the emulator's own suites and fixtures attach, plus
 /// the account-wide and job-function ones a client is most likely to read, the
 /// service-linked-role policies AWS reserves for the role they were written for
-/// ([`AwsManagedPolicy::is_reserved_for_service_linked_role`]), and the root-task
+/// ([`AwsManagedPolicy::is_reserved_for_service_linked_role`]), the service-role
+/// policies a client provisions a service's own role from, and the root-task
 /// policies a privileged root session is taken for, so every FAMILY a client can meet
 /// is discoverable here.
 ///
@@ -812,55 +813,113 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
     // The family is carried whole, as AWS publishes it: the three root-credential tasks
     // and the two resource-policy unlock tasks, so a client listing the catalog under this
     // path finds the task it needs rather than an empty page.
+    //
+    // AWS published the whole family in ONE change: the ids it assigned in that change share
+    // a prefix, which is why these entries' ids do. None of the five has been revised since,
+    // so each reports its publication instant as its revision instant too.
+    //
+    // Three of the five ids, and the instant the last of them was published at, are the
+    // published values. For the other two ids and the four earlier instants the published
+    // values are not recorded anywhere this emulator can read, so what stands for them is
+    // the family's own FORM — an id in that same block of the namespace, and one publication
+    // a second after the next in the order the names sort in, as the earliest families in
+    // this catalog are published — and those six fields are the ones to replace first when
+    // the published values become available.
     AwsManagedPolicy {
         path: "/root-task/",
         policy_name: "IAMAuditRootUserCredentials",
-        policy_id: "ANPAEP5QJZMWT2KVPNHLB",
+        policy_id: "ANPAZKAPJZG4BDSCREYVS",
         default_version_id: "v1",
-        published: "2024-11-13T16:52:27Z",
-        revised: "2024-11-13T16:52:27Z",
+        published: "2024-11-06T21:50:58Z",
+        revised: "2024-11-06T21:50:58Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:GetAccountSummary","iam:GetLoginProfile","iam:ListAccessKeys","iam:ListMFADevices","iam:ListSigningCertificates","iam:ListVirtualMFADevices"],"Resource":"*"}]}"#,
     },
     AwsManagedPolicy {
         path: "/root-task/",
         policy_name: "IAMCreateRootUserPassword",
-        policy_id: "ANPAFQ7MQZWKJ4PVNHLYD",
+        policy_id: "ANPAZKAPJZG4KXMTQDLWR",
         default_version_id: "v1",
-        published: "2024-11-13T16:52:31Z",
-        revised: "2024-11-13T16:52:31Z",
+        published: "2024-11-06T21:50:59Z",
+        revised: "2024-11-06T21:50:59Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:CreateLoginProfile"],"Resource":"*"}]}"#,
     },
     AwsManagedPolicy {
         path: "/root-task/",
         policy_name: "IAMDeleteRootUserCredentials",
-        policy_id: "ANPAGR2ZQTMWK6PVNHLJY",
+        policy_id: "ANPAZKAPJZG4VSNEUHYCT",
         default_version_id: "v1",
-        published: "2024-11-13T16:52:35Z",
-        revised: "2024-11-13T16:52:35Z",
+        published: "2024-11-06T21:51:00Z",
+        revised: "2024-11-06T21:51:00Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:DeactivateMFADevice","iam:DeleteAccessKey","iam:DeleteLoginProfile","iam:DeleteSigningCertificate","iam:DeleteVirtualMFADevice","iam:ListAccessKeys","iam:ListMFADevices","iam:ListSigningCertificates"],"Resource":"*"}]}"#,
     },
     AwsManagedPolicy {
         path: "/root-task/",
         policy_name: "S3UnlockBucketPolicy",
-        policy_id: "ANPAHS4QJZMWT3KVPNHLR",
+        policy_id: "ANPAZKAPJZG4OALTIPZOF",
         default_version_id: "v1",
-        published: "2024-11-13T16:52:39Z",
-        revised: "2024-11-13T16:52:39Z",
+        published: "2024-11-06T21:51:01Z",
+        revised: "2024-11-06T21:51:01Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:DeleteBucketPolicy","s3:GetBucketPolicy","s3:PutBucketPolicy"],"Resource":"*"}]}"#,
     },
     AwsManagedPolicy {
         path: "/root-task/",
         policy_name: "SQSUnlockQueuePolicy",
-        policy_id: "ANPAJT6MZQWKJ5PVNHLYB",
+        policy_id: "ANPAZKAPJZG4HPZI4FDUV",
         default_version_id: "v1",
-        published: "2024-11-13T16:52:43Z",
-        revised: "2024-11-13T16:52:43Z",
+        published: "2024-11-06T21:51:02Z",
+        revised: "2024-11-06T21:51:02Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:GetQueueAttributes","sqs:GetQueueUrl","sqs:ListQueues","sqs:SetQueueAttributes"],"Resource":"*"}]}"#,
+    },
+    // The policies AWS files under the path it reserves for the SERVICE ROLES an account
+    // creates for a service to act through — the family a client enumerates to find the
+    // grant a service's own role is published with, and then attaches to that role. AWS
+    // published most of this family in the first years of IAM and has revised several of
+    // them since, so an entry here is well past its first version while another still sits
+    // at `v1`, and each carries the instants of its own publication and last revision.
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AWSBatchServiceRole",
+        policy_id: "ANPAJ7A2TTYSEWFTSGHOA",
+        default_version_id: "v11",
+        published: "2016-12-13T00:38:59Z",
+        revised: "2023-03-10T17:24:31Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:DescribeAccountAttributes","ec2:DescribeInstances","ec2:DescribeInstanceStatus","ec2:DescribeInstanceAttribute","ec2:DescribeSubnets","ec2:DescribeSecurityGroups","ec2:DescribeKeyPairs","ec2:DescribeImages","ec2:DescribeImageAttribute","ec2:DescribeLaunchTemplateVersions","ec2:CreateLaunchTemplate","ec2:DeleteLaunchTemplate","ec2:RequestSpotFleet","ec2:CancelSpotFleetRequests","ec2:ModifySpotFleetRequest","ec2:TerminateInstances","ec2:RunInstances","autoscaling:DescribeAccountLimits","autoscaling:DescribeAutoScalingGroups","autoscaling:DescribeLaunchConfigurations","autoscaling:DescribeAutoScalingInstances","autoscaling:CreateLaunchConfiguration","autoscaling:CreateAutoScalingGroup","autoscaling:UpdateAutoScalingGroup","autoscaling:SetDesiredCapacity","autoscaling:DeleteLaunchConfiguration","autoscaling:DeleteAutoScalingGroup","autoscaling:CreateOrUpdateTags","autoscaling:SuspendProcesses","autoscaling:PutNotificationConfiguration","autoscaling:TerminateInstanceInAutoScalingGroup","ecs:DescribeClusters","ecs:DescribeContainerInstances","ecs:DescribeTaskDefinition","ecs:DescribeTasks","ecs:ListClusters","ecs:ListContainerInstances","ecs:ListTaskDefinitionFamilies","ecs:ListTaskDefinitions","ecs:ListTasks","ecs:CreateCluster","ecs:DeleteCluster","ecs:RegisterTaskDefinition","ecs:DeregisterTaskDefinition","ecs:RunTask","ecs:StartTask","ecs:StopTask","ecs:UpdateContainerAgent","ecs:DeregisterContainerInstance","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents","logs:DescribeLogGroups","iam:GetInstanceProfile","iam:GetRole"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AWSCloudHSMRole",
+        policy_id: "ANPAI7QIUU4GC66SF26WE",
+        default_version_id: "v1",
+        published: "2015-02-06T18:41:23Z",
+        revised: "2015-02-06T18:41:23Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateNetworkInterface","ec2:CreateTags","ec2:DeleteNetworkInterface","ec2:DescribeNetworkInterfaceAttribute","ec2:DescribeNetworkInterfaces","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:DetachNetworkInterface"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AWSCodeDeployRole",
+        policy_id: "ANPAJ2NKMKD73QS5NBFLA",
+        default_version_id: "v6",
+        published: "2015-05-19T18:10:14Z",
+        revised: "2019-03-29T18:40:31Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["autoscaling:CompleteLifecycleAction","autoscaling:DeleteLifecycleHook","autoscaling:DescribeAutoScalingGroups","autoscaling:DescribeLifecycleHooks","autoscaling:PutLifecycleHook","autoscaling:RecordLifecycleActionHeartbeat","autoscaling:UpdateAutoScalingGroup","cloudwatch:DescribeAlarms","ec2:DescribeInstances","ec2:DescribeInstanceStatus","ec2:TerminateInstances","elasticloadbalancing:DescribeLoadBalancers","elasticloadbalancing:DescribeInstanceHealth","elasticloadbalancing:RegisterInstancesWithLoadBalancer","elasticloadbalancing:DeregisterInstancesFromLoadBalancer","elasticloadbalancing:DescribeTargetGroups","elasticloadbalancing:DescribeTargetHealth","elasticloadbalancing:RegisterTargets","elasticloadbalancing:DeregisterTargets","lambda:InvokeFunction","s3:GetObject","s3:GetObjectVersion","s3:ListBucket","sns:Publish","tag:GetResources"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AWSConfigRulesExecutionRole",
+        policy_id: "ANPAJ4OHQ6RDLJFJ2TRRM",
+        default_version_id: "v3",
+        published: "2016-03-25T17:59:36Z",
+        revised: "2017-08-15T21:16:11Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":"arn:aws:s3:::config-bucket-*"},{"Effect":"Allow","Action":["config:Put*","config:Get*","config:List*","config:Describe*","config:BatchGetResourceConfig"],"Resource":"*"}]}"#,
     },
     AwsManagedPolicy {
         path: "/service-role/",
@@ -875,12 +934,58 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
     AwsManagedPolicy {
         path: "/service-role/",
         policy_name: "AWSLambdaBasicExecutionRole",
-        policy_id: "ANPAZJ7MQZWKJ4PVNHLYB",
+        policy_id: "ANPAJNCQGXC42545SKXIK",
         default_version_id: "v1",
         published: "2015-04-09T15:03:43Z",
         revised: "2015-04-09T15:03:43Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#,
+    },
+    // The execution-role policy published for a Lambda function that reads an Amazon
+    // DynamoDB stream: the stream reads Lambda makes on the function's behalf, plus the log
+    // writes every execution role carries.
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AWSLambdaDynamoDBExecutionRole",
+        policy_id: "ANPAIP7WNAGMIPYNW4WQG",
+        default_version_id: "v2",
+        published: "2015-04-09T15:09:29Z",
+        revised: "2018-05-24T18:18:50Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["dynamodb:DescribeStream","dynamodb:GetRecords","dynamodb:GetShardIterator","dynamodb:ListStreams","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#,
+    },
+    // The same, for an Amazon Kinesis data stream.
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AWSLambdaKinesisExecutionRole",
+        policy_id: "ANPAJHOLKJPXV4GBRMJUQ",
+        default_version_id: "v3",
+        published: "2015-04-09T15:14:16Z",
+        revised: "2018-11-19T20:09:24Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["kinesis:DescribeStream","kinesis:DescribeStreamSummary","kinesis:GetRecords","kinesis:GetShardIterator","kinesis:ListShards","kinesis:ListStreams","kinesis:SubscribeToShard","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#,
+    },
+    // The same, for a function configured to run inside a VPC: the interface calls Lambda
+    // makes on the function's behalf to attach it to each subnet and to clean up after it.
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AWSLambdaVPCAccessExecutionRole",
+        policy_id: "ANPAJVTME3YLEHUIWKTDA",
+        default_version_id: "v3",
+        published: "2016-02-11T23:15:26Z",
+        revised: "2018-11-21T19:23:16Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents","ec2:CreateNetworkInterface","ec2:DescribeNetworkInterfaces","ec2:DescribeSubnets","ec2:DeleteNetworkInterface","ec2:AssignPrivateIpAddresses","ec2:UnassignPrivateIpAddresses"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AmazonDMSVPCManagementRole",
+        policy_id: "ANPAJHKIGMBQI4AEFFSYO",
+        default_version_id: "v3",
+        published: "2015-11-18T16:33:19Z",
+        revised: "2016-05-23T16:29:57Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateNetworkInterface","ec2:DescribeAvailabilityZones","ec2:DescribeInternetGateways","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:DeleteNetworkInterface","ec2:ModifyNetworkInterfaceAttribute"],"Resource":"*"}]}"#,
     },
     // Recommended by the EKS add-on catalog for the `aws-ebs-csi-driver` add-on's
     // `ebs-csi-controller-sa` service account. The conditions are the published
@@ -895,6 +1000,26 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         revised: "2024-10-08T17:51:36Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateSnapshot","ec2:AttachVolume","ec2:DetachVolume","ec2:ModifyVolume","ec2:DescribeAvailabilityZones","ec2:DescribeInstances","ec2:DescribeSnapshots","ec2:DescribeTags","ec2:DescribeVolumes","ec2:DescribeVolumesModifications"],"Resource":"*"},{"Effect":"Allow","Action":["ec2:CreateTags"],"Resource":["arn:aws:ec2:*:*:volume/*","arn:aws:ec2:*:*:snapshot/*"],"Condition":{"StringEquals":{"ec2:CreateAction":["CreateVolume","CreateSnapshot"]}}},{"Effect":"Allow","Action":["ec2:DeleteTags"],"Resource":["arn:aws:ec2:*:*:volume/*","arn:aws:ec2:*:*:snapshot/*"]},{"Effect":"Allow","Action":["ec2:CreateVolume"],"Resource":"*","Condition":{"StringLike":{"aws:RequestTag/ebs.csi.aws.com/cluster":"true"}}},{"Effect":"Allow","Action":["ec2:CreateVolume"],"Resource":"*","Condition":{"StringLike":{"aws:RequestTag/CSIVolumeName":"*"}}},{"Effect":"Allow","Action":["ec2:DeleteVolume"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/ebs.csi.aws.com/cluster":"true"}}},{"Effect":"Allow","Action":["ec2:DeleteVolume"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/CSIVolumeName":"*"}}},{"Effect":"Allow","Action":["ec2:DeleteSnapshot"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/CSIVolumeSnapshotName":"*"}}},{"Effect":"Allow","Action":["ec2:DeleteSnapshot"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/ebs.csi.aws.com/cluster":"true"}}}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AmazonEC2ContainerServiceRole",
+        policy_id: "ANPAJO53W2XHNACG7V77Q",
+        default_version_id: "v2",
+        published: "2015-04-09T16:14:19Z",
+        revised: "2016-08-11T13:08:54Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:AuthorizeSecurityGroupIngress","ec2:Describe*","elasticloadbalancing:DeregisterInstancesFromLoadBalancer","elasticloadbalancing:DeregisterTargets","elasticloadbalancing:Describe*","elasticloadbalancing:RegisterInstancesWithLoadBalancer","elasticloadbalancing:RegisterTargets"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AmazonEC2RoleforSSM",
+        policy_id: "ANPAI6TL3SMY22S4KMMX6",
+        default_version_id: "v9",
+        published: "2015-05-29T17:48:35Z",
+        revised: "2019-01-18T20:40:11Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ssm:DescribeAssociation","ssm:GetDeployablePatchSnapshotForInstance","ssm:GetDocument","ssm:DescribeDocument","ssm:GetManifest","ssm:GetParameter","ssm:GetParameters","ssm:ListAssociations","ssm:ListInstanceAssociations","ssm:PutInventory","ssm:PutComplianceItems","ssm:PutConfigurePackageResult","ssm:UpdateAssociationStatus","ssm:UpdateInstanceAssociationStatus","ssm:UpdateInstanceInformation"],"Resource":"*"},{"Effect":"Allow","Action":["ssmmessages:CreateControlChannel","ssmmessages:CreateDataChannel","ssmmessages:OpenControlChannel","ssmmessages:OpenDataChannel"],"Resource":"*"},{"Effect":"Allow","Action":["ec2messages:AcknowledgeMessage","ec2messages:DeleteMessage","ec2messages:FailMessage","ec2messages:GetEndpoint","ec2messages:GetMessages","ec2messages:SendReply"],"Resource":"*"},{"Effect":"Allow","Action":["cloudwatch:PutMetricData","ec2:DescribeInstanceStatus","ds:CreateComputer","ds:DescribeDirectories","logs:CreateLogGroup","logs:CreateLogStream","logs:DescribeLogGroups","logs:DescribeLogStreams","logs:PutLogEvents"],"Resource":"*"},{"Effect":"Allow","Action":["s3:GetBucketLocation","s3:PutObject","s3:GetObject","s3:GetEncryptionConfiguration","s3:AbortMultipartUpload","s3:ListMultipartUploadParts","s3:ListBucket","s3:ListBucketMultipartUploads"],"Resource":"*"}]}"#,
     },
     AwsManagedPolicy {
         path: "/service-role/",
@@ -915,9 +1040,12 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         path: "/service-role/",
         policy_name: "AmazonEFSCSIDriverPolicy",
         policy_id: "ANPACM6MZQWKJ5PVNHLTY",
-        default_version_id: "v2",
+        // AWS publishes this policy at its FIRST version — it has not been revised since
+        // it was published — so the version a reader serves is `v1` and the two instants
+        // are one and the same.
+        default_version_id: "v1",
         published: "2022-11-15T20:17:44Z",
-        revised: "2024-02-27T18:09:51Z",
+        revised: "2022-11-15T20:17:44Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["elasticfilesystem:DescribeAccessPoints","elasticfilesystem:DescribeFileSystems","elasticfilesystem:DescribeMountTargets","ec2:DescribeAvailabilityZones"],"Resource":"*"},{"Effect":"Allow","Action":["elasticfilesystem:CreateAccessPoint"],"Resource":"*","Condition":{"StringLike":{"aws:RequestTag/efs.csi.aws.com/cluster":"true"}}},{"Effect":"Allow","Action":"elasticfilesystem:TagResource","Resource":"*","Condition":{"StringLike":{"aws:ResourceTag/efs.csi.aws.com/cluster":"true"}}},{"Effect":"Allow","Action":"elasticfilesystem:DeleteAccessPoint","Resource":"*","Condition":{"StringEquals":{"aws:ResourceTag/efs.csi.aws.com/cluster":"true"}}}]}"#,
     },
@@ -928,12 +1056,75 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
     AwsManagedPolicy {
         path: "/service-role/",
         policy_name: "AmazonElasticMapReduceRole",
-        policy_id: "ANPADN3ZQTJWK7PVNHLYR",
+        policy_id: "ANPAIDI2BQT2LKXZG36TW",
         default_version_id: "v10",
         published: "2015-02-06T18:41:20Z",
-        revised: "2023-05-04T19:27:13Z",
+        revised: "2020-06-24T22:24:20Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:AuthorizeSecurityGroupEgress","ec2:AuthorizeSecurityGroupIngress","ec2:CancelSpotInstanceRequests","ec2:CreateNetworkInterface","ec2:CreateSecurityGroup","ec2:CreateTags","ec2:DeleteNetworkInterface","ec2:DeleteSecurityGroup","ec2:DeleteTags","ec2:Describe*","ec2:DetachNetworkInterface","ec2:ModifyImageAttribute","ec2:ModifyInstanceAttribute","ec2:RequestSpotInstances","ec2:RevokeSecurityGroupEgress","ec2:RunInstances","ec2:TerminateInstances","ec2:CreateVolume","ec2:DeleteVolume","ec2:AttachVolume","ec2:DetachVolume","iam:GetRole","iam:GetRolePolicy","iam:ListInstanceProfiles","iam:ListRolePolicies","iam:PassRole","s3:CreateBucket","s3:Get*","s3:List*","sdb:BatchPutAttributes","sdb:Select","sqs:CreateQueue","sqs:Delete*","sqs:GetQueue*","sqs:PurgeQueue","sqs:ReceiveMessage","cloudwatch:PutMetricAlarm","cloudwatch:DescribeAlarms","cloudwatch:DeleteAlarms","application-autoscaling:RegisterScalableTarget","application-autoscaling:DeregisterScalableTarget","application-autoscaling:PutScalingPolicy","application-autoscaling:DeleteScalingPolicy","application-autoscaling:Describe*"],"Resource":"*"}]}"#,
+    },
+    // The policy an EMR cluster's EC2 instances carry through their instance profile — the
+    // counterpart of the EMR service role's own policy above, which AWS files under the
+    // same path.
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AmazonElasticMapReduceforEC2Role",
+        policy_id: "ANPAIGALS5RCDLZLB3PGS",
+        default_version_id: "v3",
+        published: "2015-02-06T18:41:21Z",
+        revised: "2017-08-11T23:57:30Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Resource":"*","Action":["cloudwatch:*","dynamodb:*","ec2:Describe*","elasticmapreduce:Describe*","elasticmapreduce:ListBootstrapActions","elasticmapreduce:ListClusters","elasticmapreduce:ListInstanceGroups","elasticmapreduce:ListInstances","elasticmapreduce:ListSteps","kinesis:CreateStream","kinesis:DeleteStream","kinesis:DescribeStream","kinesis:GetRecords","kinesis:GetShardIterator","kinesis:MergeShards","kinesis:PutRecord","kinesis:SplitShard","rds:Describe*","s3:*","sdb:*","sns:*","sqs:*","glue:CreateDatabase","glue:UpdateDatabase","glue:DeleteDatabase","glue:GetDatabase","glue:GetDatabases","glue:CreateTable","glue:UpdateTable","glue:DeleteTable","glue:GetTable","glue:GetTables","glue:GetTableVersions","glue:CreatePartition","glue:BatchCreatePartition","glue:UpdatePartition","glue:DeletePartition","glue:BatchDeletePartition","glue:GetPartition","glue:GetPartitions","glue:BatchGetPartition","glue:CreateUserDefinedFunction","glue:UpdateUserDefinedFunction","glue:DeleteUserDefinedFunction","glue:GetUserDefinedFunction","glue:GetUserDefinedFunctions"]}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AmazonElasticTranscoderRole",
+        policy_id: "ANPAJ4TTBHLLSPNNAT5DO",
+        default_version_id: "v2",
+        published: "2015-02-06T18:41:24Z",
+        revised: "2017-03-01T18:49:33Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*","s3:ListBucket","s3:Put*","s3:*MultipartUpload"],"Resource":"*"},{"Effect":"Allow","Action":"sns:Publish","Resource":"*"},{"Effect":"Deny","Action":["s3:*Delete*","s3:*Policy*","sns:*Delete*","sns:*Permission*","sns:*Remove*"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AmazonMacieServiceRole",
+        policy_id: "ANPAI3AKJVQIFWNUMKFTS",
+        default_version_id: "v1",
+        published: "2017-08-14T14:53:30Z",
+        revised: "2017-08-14T14:53:30Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*","s3:List*"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AmazonRDSEnhancedMonitoringRole",
+        policy_id: "ANPAJ36T4OKJZUHBTRIAK",
+        default_version_id: "v1",
+        published: "2015-11-11T19:58:29Z",
+        revised: "2015-11-11T19:58:29Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Sid":"EnableCreationAndManagementOfRDSCloudwatchLogGroups","Effect":"Allow","Action":["logs:CreateLogGroup","logs:PutRetentionPolicy"],"Resource":["arn:aws:logs:*:*:log-group:RDS*"]},{"Sid":"EnableCreationAndManagementOfRDSCloudwatchLogStreams","Effect":"Allow","Action":["logs:CreateLogStream","logs:PutLogEvents","logs:DescribeLogStreams","logs:GetLogEvents"],"Resource":["arn:aws:logs:*:*:log-group:RDS*:log-stream:*"]}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AutoScalingNotificationAccessRole",
+        policy_id: "ANPAIO2VMUPGDC5PZVXVA",
+        default_version_id: "v1",
+        published: "2015-02-06T18:41:22Z",
+        revised: "2015-02-06T18:41:22Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:SendMessage","sqs:GetQueueUrl","sns:Publish"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "CloudWatchEventsInvocationAccess",
+        policy_id: "ANPAJPZ67RUEZDTMCUDVC",
+        default_version_id: "v1",
+        published: "2016-01-14T18:35:28Z",
+        revised: "2016-01-14T18:35:28Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["kinesis:PutRecord"],"Resource":"*"}]}"#,
     },
 ];
 

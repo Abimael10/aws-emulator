@@ -5123,3 +5123,8 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // (`cloudwatch_cfn_alarm_action_topic_policy` is declared ONCE, in the sorted span far
 // module declared twice compiles neither copy, so the duplicate is gone rather than
 // re-typed.)
+// (A fragment of this file's header landed here as `//!`, which is `E0753` past the first
+// item: it is gone rather than re-typed, since the rule it repeated stands in the module
+// (Eight more lines of that same header landed here as `//!` and are dropped for the same
+// (Five more lines of that fragment landed here as `//!`, which is `E0753` past the first
+// item, and are dropped rather than re-typed: the rule stands in the header above.)

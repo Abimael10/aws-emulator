@@ -255,6 +255,8 @@ mod policy_version_listing;
 mod principal_policy_context_keys;
 #[path = "all/protected_role_refusals.rs"]
 mod protected_role_refusals;
+#[path = "all/published_catalog_constants.rs"]
+mod published_catalog_constants;
 #[path = "all/published_managed_policy_reads.rs"]
 mod published_managed_policy_reads;
 #[path = "all/published_policy_families.rs"]

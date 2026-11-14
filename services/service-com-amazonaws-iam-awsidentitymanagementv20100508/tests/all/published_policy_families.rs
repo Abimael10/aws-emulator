@@ -71,7 +71,10 @@ fn published_arn(path: &str, policy_name: &str) -> String {
 
 /// Every page of `ListPolicies` for `params`, walked by following the `Marker` the service
 /// hands out, answering the members of one named element across all the pages in order.
-async fn walk_policies(
+///
+/// `pub(crate)` because every suite that walks the catalog over the wire walks it this one
+/// way (`tests/all/published_catalog_constants.rs`).
+pub(crate) async fn walk_policies(
     router: &MultiServiceRouter,
     case: &str,
     params: &[(&str, &str)],
@@ -199,8 +202,7 @@ async fn the_catalog_enumerates_every_published_policy_family() {
 
 /// RULE: every policy the catalog reports carries the publication data of that policy — the
 /// attachability AWS publishes for it, its own id, its own default version and its own two
-/// instants — rather than one value stamped on the whole catalog, so two entries of one
-/// family differ in them.
+/// instants — rather than one value stamped on the whole catalog.
 #[tokio::test]
 async fn each_published_policy_carries_its_own_publication_data() {
     let router = router();
@@ -280,7 +282,7 @@ async fn each_published_policy_carries_its_own_publication_data() {
             selected.len(),
             "case {path:?}: every reported policy carries one UpdateDate, got {updated:?}"
         );
-        for (index, (arn, _)) in selected.iter().enumerate() {
+        for (index, (arn, entry)) in selected.iter().enumerate() {
             assert!(
                 created[index] <= updated[index],
                 "case {arn:?}: a policy is revised no earlier than it is published, got \
@@ -288,13 +290,21 @@ async fn each_published_policy_carries_its_own_publication_data() {
                 created[index],
                 updated[index]
             );
-        }
-        if selected.len() > 1 {
-            let distinct: ::std::collections::BTreeSet<&String> = created.iter().collect();
-            assert!(
-                distinct.len() > 1,
-                "case {path:?}: two policies of a family are published at their own \
-                 instants, got {created:?}"
+            // The two instants are the ones published for THIS policy. A family AWS
+            // published in one change carries one instant across its members, so what
+            // separates published data from a value stamped on the catalog is this
+            // per-entry match, not a difference between two members of a family; that the
+            // catalog as a whole carries more than one instant is asserted by
+            // `aws_managed_policy_catalog`.
+            assert_eq!(
+                created[index], entry.published,
+                "case {arn:?}: expected this policy's publication instant, got {:?}",
+                created[index]
+            );
+            assert_eq!(
+                updated[index], entry.revised,
+                "case {arn:?}: expected this policy's revision instant, got {:?}",
+                updated[index]
             );
         }
     }
