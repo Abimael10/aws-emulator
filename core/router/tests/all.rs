@@ -4194,3 +4194,15 @@ mod cloudformation_appsync_custom_domains;
 // note written with an inner doc comment anywhere but this file's header is `E0753` —
 // either fails every suite in this target. `all/all_rs_declares_each_suite_once.rs`
 // checks the declarations, for this file and for every service crate's `tests/all.rs`.
+// header, appended here by a landing: past the first item a `//!` line is `E0753` and
+// an ordinary comment for the same reason: an inner doc comment is legal only before the
+// first item.)
+// suite left at the top level of `tests/` fails the build. (Appended into this tail by a
+// landing: an inner doc comment is legal only before the first item, so this stands as an
+// this file and every service crate's `tests/all.rs`, so check there rather than
+// leaving a note here. (Appended header fragment: past the first item a `//!` line is
+// `E0753`, so these stand as ordinary comments.)
+// (The thirteen further header fragments that landed here typed with `//!` are gone rather
+// than re-typed: past the first item an inner doc comment is `E0753` and compiles no suite
+// of this target, and the rule they repeated stands in the module doc at the HEAD of this
+// file.)

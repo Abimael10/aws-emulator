@@ -103,6 +103,8 @@ mod export_task_account_slot;
 mod export_task_active_window;
 #[path = "all/export_task_cancellation.rs"]
 mod export_task_cancellation;
+#[path = "all/export_task_object_encryption.rs"]
+mod export_task_object_encryption;
 #[path = "all/export_task_objects.rs"]
 mod export_task_objects;
 #[path = "all/export_task_quota_delivery.rs"]
