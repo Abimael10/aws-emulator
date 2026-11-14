@@ -23,6 +23,11 @@
 //! The rows differ along what the rule generalises over: the target role (one that may make
 //! the call, one that may not, one that cannot be assumed) and what the target receives (the
 //! published envelope, or its own constant input).
+//!
+//! The Region and the IAM/wire helpers below are `pub(crate)`, so a suite driving the same
+//! four services over the same wire — `events_rule_fans_out_to_firehose_and_queue_targets.rs`
+//! — calls them rather than restating them: one encoder, one role builder and one Region for
+//! both.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,7 +38,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::query_wire::{elements, form_encode};
 
 /// The Region every call below is signed for, and the one every ARN here names.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The bucket every stream here delivers into.
 const BUCKET: &str = "events-firehose-delivery";
@@ -135,7 +140,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// A trust policy with one statement, letting `principal` assume the role.
-fn trust_policy(principal: &str) -> String {
+pub(crate) fn trust_policy(principal: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -148,7 +153,7 @@ fn trust_policy(principal: &str) -> String {
 }
 
 /// An identity policy allowing `action` on every resource.
-fn identity_policy(action: &str) -> String {
+pub(crate) fn identity_policy(action: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": action, "Resource": "*" }],
@@ -158,7 +163,7 @@ fn identity_policy(action: &str) -> String {
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name`. The signature
 /// is never checked: this router runs with authentication off.
-fn authorization(signing_name: &str) -> String {
+pub(crate) fn authorization(signing_name: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{signing_name}/aws4_request, \
          SignedHeaders=host, Signature=not-verified"
@@ -166,7 +171,7 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One request to the service `signing_name` serves; answers its status and body bytes.
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     signing_name: &str,
     method: &str,
@@ -220,7 +225,12 @@ async fn json_call(
 }
 
 /// One `awsQuery` IAM action that must succeed.
-async fn iam(router: &MultiServiceRouter, case: &str, action: &str, parameters: &[(&str, &str)]) {
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    case: &str,
+    action: &str,
+    parameters: &[(&str, &str)],
+) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (key, value) in parameters {
         body.push('&');
@@ -247,7 +257,7 @@ async fn iam(router: &MultiServiceRouter, case: &str, action: &str, parameters: 
 
 /// The role `name` trusting `principal`, carrying an identity policy allowing `allowed` when
 /// one is named; answers the ARN that role carries.
-async fn given_role(
+pub(crate) async fn given_role(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,

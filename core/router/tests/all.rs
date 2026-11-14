@@ -7760,3 +7760,58 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // they repeated stands in the module doc at the HEAD of this file, where an inner doc
 // comment is legal and where `all/all_rs_declares_each_suite_once.rs` and
 // run is gone rather than re-typed. It declared no suite: every `mod` of this target stands
+//! ONCE: this is one crate root, so a second `mod` for the same name is `E0428`, and a
+//! suite in this target. `all/all_rs_declares_each_suite_once.rs` and
+// Declared here, in this same head region, for the reason the entry above records: a rule
+// carrying both a Firehose delivery-stream target and an SQS queue target fans one event out
+// across EventBridge, IAM, Firehose, Amazon S3 and Amazon SQS at once, so no single service
+// crate's test target can publish the event and then read both far ends.
+#[path = "all/events_rule_fans_out_to_firehose_and_queue_targets.rs"]
+mod events_rule_fans_out_to_firehose_and_queue_targets;
+// (`cloudtrail_read_only_api_calls` and `zz_probe` are each declared ONCE above: two
+// landings in the same window each appended a second declaration of them here, and a module
+// declared twice is `E0428` and compiles no suite of this target.)
+// region of this file: two landings in the same window each appended a second declaration
+// of them here.)
+// two landings in the same window each appended a declaration of it here, and a module
+// (The SESv2 event-destination suite is declared ONCE, further up this file, for the same
+// reason: the copy that stood here was a second declaration of it.)
+// span above: two landings in the same window each appended a declaration of it here, and a
+// span above: two landings in the same window each appended a declaration of it here.)
+// this file: two landings in the same window each appended a declaration of it here.)
+// CloudFormation span above, for the same reason.)
+// of this file: two landings in the same window each appended a declaration of it here, and a
+// (That suite is declared ONCE, in the head region of this file: two landings in the same
+// (One more fragment of this file's own header that landed in this appended tail typed with
+// `//!`: an inner doc comment is legal only before the first item of a crate root, so it
+// stands as an ordinary comment here.)
+// (`cloudwatch_cfn_alarm_action_topic_policy` is declared ONCE above: a module declared
+// so these lines are ordinary comments where a landing appended them.
+// line past the first item of this crate root is `E0753` and compiles no suite of it.)
+// (The repeated header fragments and duplicate-declaration notes that stood here are gone
+// rather than re-typed: every suite they named is declared exactly once above, and the
+// (And more of the same here.)
+// (And the rest of that commentary with it.)
+// suite left at the top level of `tests/` fails the build. (One more such line, an ordinary
+// comment for the reason the lines above record.)
+// (And more of it here.)
+// (The duplicate-declaration notes and header fragments that stood here are gone: every
+// suite they named is declared exactly once above, and the rules they repeated stand in the
+// (More of the same notes stood here; they are gone for the same reason.)
+// (And the rest of that tail commentary with them.)
+// (More of the same notes stood here, and are gone for the same reason.)
+// (And the rest of that commentary with them.)
+// rather than re-typed once more: every suite they named is declared exactly once above,
+// and the rules they repeated stand in the module doc at the HEAD of this file, which is
+// where both guard suites check them from.)
+// (More of the same notes stood here as well.)
+// (And the rest of that tail commentary with them: the rules those fragments repeated
+// stand in the module doc at the HEAD of this file, and every suite they named is declared
+// (A block of this file's own header that landings appended into this tail, each line typed
+// with `//!`: an inner doc comment is legal only before the first item of a crate root, so
+// every one of them was `E0753` and compiled no suite of this target. They are gone rather
+// than re-typed; the rules they repeated stand in the module doc at the HEAD of this file.)
+// (Two more such lines stood here.)
+// (Three more such lines stood here.)
+// (Seven more such lines stood here.)
+// (And two last ones here.)
