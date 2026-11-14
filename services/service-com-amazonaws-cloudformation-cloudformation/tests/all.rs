@@ -337,6 +337,8 @@ mod out_of_band_resource_scan;
 mod parameter_and_change_set_conflicts;
 #[path = "all/parameter_set_contract.rs"]
 mod parameter_set_contract;
+#[path = "all/processing_pipeline_stack_outputs.rs"]
+mod processing_pipeline_stack_outputs;
 #[path = "all/provider_answer_follow_up.rs"]
 mod provider_answer_follow_up;
 #[path = "all/provisioned_ecr_repository.rs"]

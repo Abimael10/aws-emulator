@@ -4528,3 +4528,21 @@ mod apigateway_lambda_ddb_s3_trace_tree;
 // they themselves state: declare each suite exactly ONCE, since this is one crate root and
 // a second `mod` for the same name is `E0428`, and a note written with `//!` anywhere but
 // this file's head is `E0753` — either fails every suite in this target;
+//! ONCE: this is one crate root, so a second `mod` for the same name is `E0428`, and a
+//! declarations and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks the
+//! notes, for this file and for every service crate's `tests/all.rs`, so check there
+//! rather than leaving a note in this file's tail, where an inner doc comment is `E0753`
+//! and compiles nothing.
+// above: two branches landing in the same window each appended a second copy here, and a
+// file, for the reason the entry there records: whether a flat-rate CloudFront subscription
+// association and then ask Pricing Plan Manager for the subscription.)
+// before the first item, so a `//!` line in this tail is `E0753` and compiles no suite of
+// this target. The rule it states stands in the header at the top of this file.)
+// this file and for every service crate's `tests/all.rs`. (The same appended header
+// fragment, an ordinary comment for the reason the lines above record.)
+// A suite left at the top level of `tests/` fails the build. (The same fragment again, an
+// ordinary comment for the reason the lines above record.)
+// this file and every service crate's `tests/all.rs`, which is where to check rather than
+// one stays in the HEADER: an inner doc comment past the first item is `E0753`, so the same
+// note appended to the tail of this file compiles no suite of this target — which is why
+// these lines are ordinary comments.

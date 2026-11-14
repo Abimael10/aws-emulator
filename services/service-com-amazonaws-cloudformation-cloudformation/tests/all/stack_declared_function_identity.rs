@@ -45,8 +45,10 @@ use service_com_amazonaws_cloudformation_cloudformation::state::status;
 ///
 /// `pub(crate)` with [`settled_stack`], [`trust_policy`], [`MANAGED_POLICY_ARN`] and
 /// [`STATE_ACTIVE`]: the suite over the log group a declared function's first invocation opens
-/// (`declared_function_logs_on_first_invoke.rs`) deploys the same shape and waits on the same
-/// two conditions, so the two cannot drift about what settling is or how long it is given.
+/// (`declared_function_logs_on_first_invoke.rs`) and the suite over a stack whose outputs
+/// publish a table, a function and its log group (`processing_pipeline_stack_outputs.rs`) both
+/// deploy the same shape and wait on the same conditions, so none of them can drift about what
+/// settling is or how long it is given.
 pub(crate) const LOOK_AGAIN: Duration = Duration::from_millis(25);
 pub(crate) const LOOKS: usize = 400;
 
@@ -60,6 +62,8 @@ const ROLE_ARN_OUTPUT: &str = "RoleArn";
 /// An AWS-managed policy ARN: its account segment is `aws`, so it is AWS's own resource and
 /// IAM's `AttachRolePolicy` takes it as present — the policy a Lambda execution role is
 /// normally given.
+///
+/// `pub(crate)` for the reason [`LOOK_AGAIN`] is.
 pub(crate) const MANAGED_POLICY_ARN: &str =
     "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole";
 
@@ -76,6 +80,8 @@ const DEFAULT_TIMEOUT_SECONDS: i64 = 3;
 
 /// The trust policy a function's execution role is declared with: the service principal AWS
 /// Lambda assumes the role as.
+///
+/// `pub(crate)` for the reason [`LOOK_AGAIN`] is.
 pub(crate) fn trust_policy() -> Value {
     json!({
         "Version": "2012-10-17",
@@ -90,7 +96,9 @@ pub(crate) fn trust_policy() -> Value {
 /// The inline source one row's function is declared with, for the runtime family it names —
 /// so the declared text is a handler of that language rather than one language's text under
 /// every runtime.
-fn inline_source(runtime: &str) -> &'static str {
+///
+/// `pub(crate)` for the reason [`LOOK_AGAIN`] is.
+pub(crate) fn inline_source(runtime: &str) -> &'static str {
     if runtime.starts_with("nodejs") {
         "export const handler = async (event) => ({ ok: true });\n"
     } else if runtime.starts_with("ruby") {
@@ -239,7 +247,7 @@ fn identifier_forms(name: &str, arn: &str) -> Vec<(&'static str, String)> {
 /// `GetFunction` for one identifier, as AWS Lambda's model binds it: `GET
 /// /2015-03-31/functions/{FunctionName}`, with the identifier percent-encoded the way a
 /// non-greedy `@httpLabel` is sent.
-async fn get_function(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
+pub(crate) async fn get_function(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
     // The escaping a non-greedy `@httpLabel` gets is the unreserved-set percent-encoding
     // this target already has one spelling of (`stack_lifecycle::form_encode`), so an ARN's
     // colons travel as `%3A` rather than as path separators.
