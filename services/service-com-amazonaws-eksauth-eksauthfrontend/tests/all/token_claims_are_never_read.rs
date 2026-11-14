@@ -10,9 +10,10 @@
 //!   ONE (status, code, message) identity whatever its payload holds — a claim set inside
 //!   its window, one that expired, one addressed to another audience, an empty claim
 //!   object, a payload that is not a JSON object, one that is not even base64url — and no
-//!   claim can select a different modelled error (nothing here is ever answered with
-//!   `ExpiredTokenException`, `AccessDeniedException` or `ResourceNotFoundException`,
-//!   because no `exp`, `aud` or `sub` is read);
+//!   claim can select a different modelled error (no payload is ever answered with
+//!   `ExpiredTokenException` or `AccessDeniedException`, because no `exp` or `sub` is
+//!   read, and the one answer that is a `ResourceNotFoundException` is selected by the
+//!   cluster name in the URI and not by anything in the payload);
 //! * the HEADER still discriminates: dropping `kid` from the same header moves the answer
 //!   to its own message, so the collapse above is a measurement of the payload layer and
 //!   not of a service that answers everything the same way.
@@ -38,6 +39,26 @@ const UNREGISTERED_CLUSTER: &str = "sim2realbehavclaimscluster";
 /// The one message a header naming a key no provider publishes is answered with. Fixed
 /// text apart from the header member name.
 const UNRESOLVABLE_KID: &str = "The token included in the request has invalid header - kid.";
+
+/// The identity a request naming a cluster that is not there is answered with, whatever
+/// its token carries: the modelled not-found, naming the cluster the URI carried.
+fn not_found(cluster: &str) -> Identity {
+    Identity {
+        status: 404,
+        code: "ResourceNotFoundException".to_string(),
+        message: format!("No cluster found for name: {cluster}."),
+    }
+}
+
+/// The identity a header naming a key the NAMED cluster does not publish is answered
+/// with — the collapsed identity every payload under that header shares.
+fn unresolvable_kid() -> Identity {
+    Identity {
+        status: 400,
+        code: "InvalidTokenException".to_string(),
+        message: UNRESOLVABLE_KID.to_string(),
+    }
+}
 
 /// The message a header naming no key at all is answered with — the control identity the
 /// header layer must keep producing.
@@ -184,8 +205,9 @@ async fn identity_of(harness: &Harness, cluster: &str, token: &str) -> Identity 
 }
 
 /// THE RULE, over the wire: one header, every payload — one identity. A header naming a
-/// key no provider publishes is answered on that key id whatever the payload holds, so
-/// the payload cannot be the reason a token was refused.
+/// key the named cluster does not publish is answered on that key id whatever the payload
+/// holds, and a cluster name that resolves to nothing is answered on that name whatever
+/// the payload holds: either way the payload cannot be the reason a token was refused.
 #[tokio::test]
 async fn the_payload_cannot_change_how_a_token_is_refused() {
     let harness = Harness::seeded();
@@ -195,17 +217,15 @@ async fn the_payload_cannot_change_how_a_token_is_refused() {
         "kid": key_id(11),
     });
     let signature = encode_jwt_segment([7_u8; 32]);
-    let expected = Identity {
-        status: 400,
-        code: "InvalidTokenException".to_string(),
-        message: UNRESOLVABLE_KID.to_string(),
-    };
 
-    // Over a registered cluster and over one that is not: neither publishes this key, so
-    // the answer is the same for both, and the payload changes nothing for either. Every
-    // row is compared against the SAME expected identity, which is what "the payloads
-    // collapse onto one identity" means.
-    for cluster in [UNREGISTERED_CLUSTER, CLUSTER, "Prod2"] {
+    // Over a registered cluster, which publishes no such key, and over names that resolve
+    // to no cluster at all. Every row of a given cluster is compared against the SAME
+    // expected identity, which is what "the payloads collapse onto one identity" means.
+    for cluster in [UNREGISTERED_CLUSTER, CLUSTER, "Prod2", "pROD2"] {
+        let expected = match cluster {
+            CLUSTER | "Prod2" => unresolvable_kid(),
+            absent => not_found(absent),
+        };
         for (case, payload) in payload_rows() {
             let token = token_of(&header, &payload, &signature);
             let actual = identity_of(&harness, cluster, &token).await;
@@ -225,15 +245,11 @@ async fn the_signature_segment_cannot_change_how_a_token_is_refused() {
     let harness = Harness::seeded();
     let header = serde_json::json!({ "alg": TOKEN_SIGNING_ALGORITHM, "kid": key_id(12) });
     let payload = claim_set("pods.eks.amazonaws.com", -60, 3600);
-    let expected = Identity {
-        status: 400,
-        code: "InvalidTokenException".to_string(),
-        message: UNRESOLVABLE_KID.to_string(),
-    };
+    let expected = unresolvable_kid();
 
     for (case, signature) in signature_rows() {
         let token = token_of(&header, &payload, &signature);
-        let actual = identity_of(&harness, UNREGISTERED_CLUSTER, &token).await;
+        let actual = identity_of(&harness, CLUSTER, &token).await;
         assert_eq!(
             actual, expected,
             "case {case:?}: expected {expected:?}, got {actual:?}"
@@ -242,7 +258,9 @@ async fn the_signature_segment_cannot_change_how_a_token_is_refused() {
 }
 
 /// No claim selects a modelled error: because `exp`, `aud` and `sub` are never read, the
-/// expired-token, access-denied and not-found shapes are reachable by no payload.
+/// expired-token and access-denied shapes are reachable by no payload, and the one answer
+/// that is a not-found is selected by the cluster the URI names — the same for every
+/// payload.
 #[tokio::test]
 async fn no_payload_selects_another_modelled_error() {
     let harness = Harness::seeded();
@@ -250,11 +268,16 @@ async fn no_payload_selects_another_modelled_error() {
     let signature = encode_jwt_segment([5_u8; 32]);
 
     for cluster in [UNREGISTERED_CLUSTER, CLUSTER] {
+        let expected = if cluster == CLUSTER {
+            "InvalidTokenException"
+        } else {
+            "ResourceNotFoundException"
+        };
         for (case, payload) in payload_rows() {
             let token = token_of(&header, &payload, &signature);
             let actual = identity_of(&harness, cluster, &token).await;
             assert_eq!(
-                actual.code, "InvalidTokenException",
+                actual.code, expected,
                 "case {case:?} against cluster {cluster:?}: no payload may select another \
                  modelled shape, got {actual:?}"
             );

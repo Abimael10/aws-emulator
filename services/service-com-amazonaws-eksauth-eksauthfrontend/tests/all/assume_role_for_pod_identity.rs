@@ -487,12 +487,13 @@ async fn the_worker_node_members_are_recorded_on_the_session() {
     }
 }
 
-/// An unregistered cluster publishes no signing key, so a token presented against one is
-/// answered on the key its header names and never on whether that cluster exists — the
-/// label is looked up in state, and a caller holding none of that cluster's key material
-/// is told about its token.
+/// A `clusterName` that names no cluster is the modelled not-found: the label is a
+/// resource identity, so a caller pointed at a cluster that is not there is told that,
+/// whatever its token is worth — which is what tells "fix the cluster this agent
+/// addresses" from "re-read the projected token". The whole class is in
+/// `tests/all/cluster_label_and_claim_rejections.rs`.
 #[tokio::test]
-async fn an_unregistered_cluster_is_answered_on_the_token() {
+async fn an_unregistered_cluster_is_reported_as_not_found() {
     let harness = Harness::seeded();
     let token = harness.token(&SEEDS[0]);
     // Every name here satisfies the modeled `clusterName` pattern and length, so the
@@ -501,14 +502,14 @@ async fn an_unregistered_cluster_is_answered_on_the_token() {
         let (status, body) = harness.assume(cluster, &token).await;
         assert_eq!(
             error_code(status, &body),
-            "400 InvalidTokenException",
-            "case {cluster:?}: expected the modeled token refusal, got {status} {body}"
+            "404 ResourceNotFoundException",
+            "case {cluster:?}: expected the modeled not-found, got {status} {body}"
         );
         assert_eq!(
             body["message"].as_str(),
-            Some("The token included in the request has invalid header - kid."),
-            "case {cluster:?}: the refusal must name the header that resolves to no key, \
-             got {status} {body}"
+            Some(format!("No cluster found for name: {cluster}.").as_str()),
+            "case {cluster:?}: the refusal must name the cluster the URI carried, got \
+             {status} {body}"
         );
     }
 }

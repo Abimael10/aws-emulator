@@ -24,13 +24,20 @@
 //! layers stay four distinct diagnoses: that is what lets an operator tell "the projected
 //! token is not a JWT" from "the cluster's signing key rotated".
 //!
+//! Layers 1 to 3 are decided from the VALUE, so they are the answer whichever cluster the
+//! URI names. Layer 4 is the one layer that READS STATE for a key id in the form a key id
+//! takes: it resolves that id through the named cluster's OIDC provider, which means the
+//! cluster has to be there — a `clusterName` that names no cluster is the modelled
+//! `ResourceNotFoundException` (404) instead (see
+//! `tests/all/cluster_label_and_claim_rejections.rs`).
+//!
 //! The rows span the class each layer generalises over (the JSON type and the value of
 //! each member, the ways a value can name nothing, the lengths and alphabets a key id can
 //! take, and which cluster publishes it) and are driven over the real request path
 //! through the harness `tests/all/assume_role_for_pod_identity.rs` owns.
 
 use service_com_amazonaws_eksauth_eksauthfrontend::state::{
-    encode_jwt_segment, TOKEN_SIGNING_ALGORITHM,
+    encode_jwt_segment, parse_service_account_token, TOKEN_SIGNING_ALGORITHM,
 };
 
 use crate::assume_role_for_pod_identity::{Harness, SEEDS};
@@ -43,6 +50,9 @@ const OTHER_CLUSTER: &str = SEEDS[3].cluster;
 /// A cluster name inside the modelled `ClusterName` pattern and length that is NOT
 /// registered, so its OIDC provider publishes nothing at all.
 const UNREGISTERED_CLUSTER: &str = "sim2realbehavabsentcluster";
+
+/// The cluster names the harness really registers — the only ones a request can resolve.
+const REGISTERED: &[&str] = &[CLUSTER, OTHER_CLUSTER];
 
 /// Which layer of the header read a row must be reported at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,9 +183,35 @@ async fn assert_layer(
     );
 }
 
+/// Assert the named cluster is reported as the missing resource it is: the answer a
+/// readable header gets when the `clusterName` label resolves to nothing, whatever key
+/// its `kid` names.
+async fn assert_not_found(harness: &Harness, cluster: &str, case: &str, token: &str) {
+    let reply = assume(harness, cluster, token).await;
+    assert_eq!(
+        reply.verdict(),
+        "404 ResourceNotFoundException",
+        "case {case:?} against cluster {cluster:?}: a cluster name that resolves to \
+         nothing is the modelled not-found, got {reply:?}"
+    );
+    assert_eq!(
+        reply.message,
+        format!("No cluster found for name: {cluster}."),
+        "case {case:?} against cluster {cluster:?}: expected the not-found sentence, got \
+         {reply:?}"
+    );
+    assert!(
+        !reply.body.contains(token),
+        "case {case:?} against cluster {cluster:?}: the token value reached the response {}",
+        reply.body
+    );
+}
+
 /// Each layer's class of defective header, over the registered cluster and over one that
-/// is not registered: the layer a header is reported at is decided the same way for both,
-/// because every row names a key neither cluster publishes.
+/// is not registered: a layer decided from the VALUE is reported the same way for both,
+/// while the one layer that resolves a key id through the named cluster's provider needs
+/// that cluster to be there at all — and a name that names no cluster is answered as the
+/// missing resource it is.
 #[tokio::test]
 async fn every_header_defect_is_reported_at_its_own_layer() {
     let harness = Harness::seeded();
@@ -353,7 +389,15 @@ async fn every_header_defect_is_reported_at_its_own_layer() {
     for cluster in [CLUSTER, UNREGISTERED_CLUSTER, "a"] {
         for (case, header, layer) in rows {
             let token = token_with_header(header);
-            assert_layer(&harness, cluster, case, &token, *layer).await;
+            // A header that READS is judged against the named cluster's own provider, so
+            // a name that names no cluster is answered as the missing resource it is; a
+            // header that does not read is the value's own answer, whichever cluster the
+            // URI names.
+            if parse_service_account_token(&token).is_ok() && !REGISTERED.contains(&cluster) {
+                assert_not_found(&harness, cluster, case, &token).await;
+            } else {
+                assert_layer(&harness, cluster, case, &token, *layer).await;
+            }
         }
     }
 }
@@ -435,7 +479,9 @@ async fn fixing_one_layer_moves_the_answer_to_the_next() {
     let mut answered = Vec::new();
     for (step, ((case, header), layer)) in chain.iter().zip(LAYERS).enumerate() {
         let token = token_with_header(header);
-        let reply = assume(&harness, UNREGISTERED_CLUSTER, &token).await;
+        // Against the REGISTERED cluster: the deepest layer resolves the key id through
+        // that cluster's provider, which a name resolving to no cluster never reaches.
+        let reply = assume(&harness, CLUSTER, &token).await;
         assert_eq!(
             reply.message,
             layer.message(),
@@ -488,22 +534,28 @@ async fn the_key_id_resolves_only_against_the_cluster_that_publishes_it() {
             );
         }
 
-        // Against every other cluster name the same key id resolves to nothing.
+        // Against every other REGISTERED cluster name the same key id resolves to
+        // nothing, and a name that resolves to no cluster at all is the missing resource.
         let elsewhere = if cluster == CLUSTER {
             OTHER_CLUSTER
         } else {
             CLUSTER
         };
-        for other in [elsewhere, UNREGISTERED_CLUSTER] {
-            assert_layer(
-                &harness,
-                other,
-                &format!("the key id of {cluster} presented to {other}"),
-                &token,
-                Layer::UnresolvableKeyId,
-            )
-            .await;
-        }
+        assert_layer(
+            &harness,
+            elsewhere,
+            &format!("the key id of {cluster} presented to {elsewhere}"),
+            &token,
+            Layer::UnresolvableKeyId,
+        )
+        .await;
+        assert_not_found(
+            &harness,
+            UNREGISTERED_CLUSTER,
+            &format!("the key id of {cluster} presented to a cluster that is not there"),
+            &token,
+        )
+        .await;
     }
 
     // And the token that cluster really issued is exchanged, so the resolution layer

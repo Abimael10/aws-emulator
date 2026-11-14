@@ -16,22 +16,28 @@
 //!    such whether or not the cluster the URI names exists. Reading the value stops at
 //!    the header, so the segments past it are never decoded and no claim is ever read:
 //!    the modelled `ExpiredTokenException` is reachable only from the issuing cluster's
-//!    own record of what it issued (step 3), never from an `exp` the caller wrote;
-//! 2. the `kid` the header names must resolve to a key the OIDC provider of the cluster
-//!    named by the `clusterName` label publishes — otherwise the header names no key and
-//!    the answer is `InvalidTokenException` (400) again. Resolving the key id is the last
-//!    layer of reading the header, so it is answered before anything is reported about
-//!    the cluster itself; a cluster that is not registered publishes no keys, so a caller
-//!    holding no key material of that cluster learns nothing about whether it exists, and
-//!    the modelled `ResourceNotFoundException` (404) is reachable by no request;
-//! 3. the token must be one that cluster issued for the pod identity audience and still
+//!    own record of what it issued (step 4), never from an `exp` the caller wrote;
+//! 2. the `clusterName` label must name a cluster this service holds — otherwise the
+//!    request addresses a resource that is not there and the answer is the modelled
+//!    `ResourceNotFoundException` (404). The label is a RESOURCE identity, so it is
+//!    resolved as one, and before anything about the presented token is judged against
+//!    state: that is what lets a caller tell "this agent is pointed at a cluster that is
+//!    not there" (non-retryable) from "my projected token is stale" (re-read it and
+//!    retry). Only a caller IAM has allowed this action on that cluster gets this far
+//!    (see `crate::service::identity_authorization`, which runs ahead of this handler);
+//! 3. the `kid` the header names must resolve to a key the OIDC provider of THAT cluster
+//!    publishes — otherwise the header names no key the cluster could have signed with,
+//!    and the answer is `InvalidTokenException` (400) again. Resolving the key id is the
+//!    last layer of reading the header;
+//! 4. the token must be one that cluster issued for the pod identity audience and still
 //!    within its lifetime — otherwise `ExpiredTokenException` or `InvalidTokenException`
 //!    (400), decided by the cluster's own record of what it issued, never by inspecting
-//!    the request;
-//! 4. the cluster must hold a pod identity association for the (namespace, service
+//!    the request; where that verdict is about a CLAIM, the refusal names the claim and
+//!    the value it must carry (see [`token_rejection`]);
+//! 5. the cluster must hold a pod identity association for the (namespace, service
 //!    account) pair the token names — otherwise `ResourceNotFoundException` (404), the
 //!    answer a token whose association was deleted, or never created, gets;
-//! 5. the credentials are minted through the emulator's credential store, so the
+//! 6. the credentials are minted through the emulator's credential store, so the
 //!    session they identify is one the emulator will accept, and the session record is
 //!    stored under its access key id with the instant it expires.
 //!
@@ -44,7 +50,7 @@
 //! BEFORE either of those, in `crate::service::identity_authorization`, which answers the
 //! modelled `AccessDeniedException` (400) itself. So the `AccessDeniedException` this file
 //! constructs is only the other thing that shape says — the cluster holds no pod identity
-//! association for the service account the token names (step 4).
+//! association for the service account the token names (step 5).
 //!
 //! ## Reaching this service's state
 //!
@@ -262,19 +268,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key, and its associations.
         let (association, identity, cluster_arn) = {
             let guard = state.lock();
+            // THE CLUSTER THE LABEL NAMES is resolved first, as the resource it is: a
+            // `clusterName` that names no cluster is the modelled not-found, whatever the
+            // presented token is worth, because the request addresses a resource that is
+            // not there. Only a caller IAM allowed this action on that cluster reaches
+            // this line, so what it learns about the cluster is what it was granted.
+            let cluster = guard.cluster(&input.cluster_name).ok_or_else(|| {
+                refused(&caller_akid, &input.cluster_name, "ResourceNotFoundException");
+                no_cluster(&input.cluster_name)
+            })?;
             // RESOLVING THE KEY THE HEADER NAMES is the last layer of reading that
             // header: a `kid` is resolved through the OIDC provider of the cluster the
-            // request names, and a cluster that is not registered publishes no keys at
-            // all, so no key id resolves there. Either way the answer is about the
-            // token's header — never a report of whether that cluster exists, which a
-            // caller holding none of its key material has not shown it may learn.
-            let cluster = guard
-                .cluster(&input.cluster_name)
-                .filter(|cluster| cluster.publishes_signing_key(&token_headers.key_id))
-                .ok_or_else(|| {
-                    refused(&caller_akid, &input.cluster_name, "InvalidTokenException");
-                    malformed_token(TokenMalformation::InvalidHeader(KEY_ID_HEADER))
-                })?;
+            // request names, so a key id that cluster does not publish names no key this
+            // request could have been signed with. The answer is about the token's
+            // header, and is reached only once the cluster itself resolved.
+            if !cluster.publishes_signing_key(&token_headers.key_id) {
+                refused(&caller_akid, &input.cluster_name, "InvalidTokenException");
+                return Err(malformed_token(TokenMalformation::InvalidHeader(
+                    KEY_ID_HEADER,
+                )));
+            }
             let identity = cluster
                 .verify_service_account_token(&input.token, &token_headers, now)
                 .map_err(|rejection| {
@@ -283,7 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &input.cluster_name,
                         match rejection {
                             TokenRejection::Expired => "ExpiredTokenException",
-                            TokenRejection::Invalid => "InvalidTokenException",
+                            TokenRejection::InvalidClaim { .. } | TokenRejection::Invalid => {
+                                "InvalidTokenException"
+                            }
                         },
                     );
                     token_rejection(rejection)
@@ -475,6 +490,16 @@ fn malformed_token(malformation: TokenMalformation) -> AssumeRoleForPodIdentityE
 /// How the cluster's verdict on a token is reported to the caller: a token whose
 /// lifetime has passed is the modeled expired-token failure, anything else the modeled
 /// invalid-token one.
+///
+/// A verdict about a CLAIM says which claim it was, and the value that claim has to
+/// carry where exactly one value is admissible — so a projected token volume asking for
+/// the wrong `audiences:` is diagnosable from the refusal, rather than collapsing into
+/// one catch-all sentence with every other cluster-side verdict. A value the cluster has
+/// no record of issuing reached no claim, so it is refused on the rule it broke instead.
+///
+/// NO PART OF THE TOKEN IS INTERPOLATED: `token` is `@sensitive` and carries a
+/// credential, so the claim NAME and the value the service requires are the only things
+/// the message states — never the value the rejected token carried.
 fn token_rejection(rejection: TokenRejection) -> AssumeRoleForPodIdentityError {
     match rejection {
         TokenRejection::Expired => AssumeRoleForPodIdentityErrorModeled::ExpiredTokenException(
@@ -483,6 +508,21 @@ fn token_rejection(rejection: TokenRejection) -> AssumeRoleForPodIdentityError {
             },
         )
         .into(),
+        TokenRejection::InvalidClaim { claim, expected } => {
+            // The clause naming the value the claim must carry, for a claim that admits
+            // exactly one; a claim judged against the clock states the claim alone.
+            let expected_clause = expected
+                .map(|expected| format!(" Expected {expected}."))
+                .unwrap_or_default();
+            let message = format!(
+                "The token included in the request has an invalid claim value for \
+                 {claim}.{expected_clause}"
+            );
+            AssumeRoleForPodIdentityErrorModeled::InvalidTokenException(InvalidTokenException {
+                message: Some(message),
+            })
+            .into()
+        }
         TokenRejection::Invalid => AssumeRoleForPodIdentityErrorModeled::InvalidTokenException(
             InvalidTokenException {
                 message: Some(format!(
@@ -493,6 +533,22 @@ fn token_rejection(rejection: TokenRejection) -> AssumeRoleForPodIdentityError {
         )
         .into(),
     }
+}
+
+/// The `clusterName` label names no cluster this service holds, so the request addresses
+/// a resource that is not there: the modelled `ResourceNotFoundException` (404), which is
+/// what a caller pointed at a deleted or misspelled cluster is answered with however good
+/// its token.
+///
+/// AWS's not-found sentence for a cluster name, whose only variable part is the name the
+/// request URI carried — a value the caller sent, so echoing it tells it nothing it did
+/// not already have. `clusterName` is matched exactly, so a differently-cased spelling of
+/// a registered cluster is a different cluster name and is answered here.
+fn no_cluster(cluster_name: &str) -> AssumeRoleForPodIdentityError {
+    AssumeRoleForPodIdentityErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("No cluster found for name: {cluster_name}.")),
+    })
+    .into()
 }
 
 /// The cluster holds no pod identity association for the service account the token

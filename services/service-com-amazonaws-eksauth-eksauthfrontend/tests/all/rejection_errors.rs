@@ -9,9 +9,10 @@
 //! 1. whether the presented value is a JSON Web Token at all is decided from the VALUE,
 //!    before any state is read — so a value that is not a JWT is the modeled
 //!    `InvalidTokenException` (400) whether or not the cluster the URI names exists,
-//!    and the key id a readable header names is then resolved through the OIDC provider
-//!    of the cluster the request names, which a cluster that is not registered does not
-//!    have — so that request too is answered on its token;
+//!    while a readable header is judged against STATE: the cluster the `clusterName`
+//!    label names must be there (otherwise the modelled `ResourceNotFoundException`,
+//!    404) and the key id the header names must be one that cluster's OIDC provider
+//!    publishes;
 //! 2. every refusal of a value against a constraint the MODEL declares is this service's
 //!    own `InvalidParameterException` (400) — the shape the model lists — and not the
 //!    framework's `ValidationException`, which this service's model does not declare;
@@ -503,39 +504,31 @@ async fn a_token_that_is_not_a_jwt_is_invalid_for_every_cluster_name() {
 
 /// The OTHER half of rule 1: deciding the token's form first does not swallow the state
 /// the request is judged against. A readable header's `kid` is resolved through the OIDC
-/// provider of the cluster the request NAMES, so a key id that cluster does not publish
-/// — including every key id against a cluster that is not registered, which publishes
-/// none — is the invalid-`kid` refusal, and the cluster the key DOES resolve against then
-/// judges the token on its own record of what it issued.
+/// provider of the cluster the request NAMES — once that cluster has resolved, since a
+/// name that names no cluster is the modelled not-found instead — so a key id the named
+/// cluster does not publish is the invalid-`kid` refusal, and the cluster the key DOES
+/// resolve against then judges the token on its own record of what it issued.
 #[tokio::test]
 async fn a_readable_header_is_resolved_against_the_named_cluster() {
     let harness = Harness::seeded();
     let cluster_key_id = harness.signing_key_id(CLUSTER);
 
+    // A readable header against a name that names no cluster: the resource the request
+    // addresses is not there, which is what is reported.
     for cluster in [UNREGISTERED_CLUSTER, "no-such-cluster", "DEMO-CLUSTER", "0"] {
         let reply = assume(&harness, cluster, &token_for_key(&cluster_key_id)).await;
         assert_eq!(
             reply.verdict(),
-            "400 InvalidTokenException",
-            "case {cluster:?}: an unregistered cluster publishes no key the header could \
-             name, got {reply:?}"
+            "404 ResourceNotFoundException",
+            "case {cluster:?}: a cluster name that resolves to nothing is the modelled \
+             not-found, got {reply:?}"
         );
-        assert!(
-            reply.message.contains("has invalid header - kid."),
-            "case {cluster:?}: the refusal must name the header that resolves to no key, \
-             got {:?}",
+        assert_eq!(
+            reply.message,
+            format!("No cluster found for name: {cluster}."),
+            "case {cluster:?}: the refusal must name the cluster the URI carried, got {:?}",
             reply.message
         );
-        // Whether that cluster exists is not reported to a caller holding none of its
-        // key material. (Checked on the names long enough that the comparison is about
-        // the name rather than about one of its characters.)
-        if cluster.len() > 1 {
-            assert!(
-                !reply.body.contains(cluster),
-                "case {cluster:?}: the cluster name reached the response {}",
-                reply.body
-            );
-        }
     }
 
     // Registered, and the header names the key it publishes: the token's form is fine, so
@@ -789,8 +782,8 @@ async fn a_constraint_refusal_is_the_modeled_invalid_parameter_failure() {
 
     // The published bounds of the cluster-name length: 1 and 100 characters are inside
     // the constraint, so they are answered from state (no cluster is registered under
-    // either name, so neither publishes the key the token's header names) rather than
-    // refused as parameters.
+    // either name, so the label resolves to no cluster at all) rather than refused as
+    // parameters.
     for characters in [1_usize, 100] {
         let cluster = "c".repeat(characters);
         let reply = post(
@@ -801,7 +794,7 @@ async fn a_constraint_refusal_is_the_modeled_invalid_parameter_failure() {
         .await;
         assert_eq!(
             reply.verdict(),
-            "400 InvalidTokenException",
+            "404 ResourceNotFoundException",
             "case {characters} characters: a name inside the bound is looked up, got {reply:?}"
         );
     }

@@ -17,7 +17,9 @@
 //!   Identity Agent presents to `AssumeRoleForPodIdentity`.
 //! * [`Cluster::verify_service_account_token`] is the other half: only a token THIS
 //!   cluster issued, for the audience pod identity tokens are issued to, and still
-//!   within its lifetime, names a service account.
+//!   within its lifetime, names a service account. A verdict about one of those CLAIMS
+//!   says which claim it was ([`TokenRejection::InvalidClaim`]), so the refusal a caller
+//!   reads names what to fix.
 //! * [`parse_service_account_token`] is the step BEFORE either of those: whether the
 //!   value presented is a JSON Web Token at all. It reads nothing from state, so a
 //!   caller presenting a token that is not a JWT is answered the same way whichever
@@ -146,6 +148,17 @@ const MAX_TOKEN_BYTES: usize = 16 * 1024;
 /// `AssumeRoleForPodIdentity` reports in its `audience` output member: the model
 /// documents it as "always `pods.eks.amazonaws.com`".
 pub const PODS_AUDIENCE: &str = "pods.eks.amazonaws.com";
+
+/// The registered claim naming who a token was issued for (RFC 7519 §4.1.3), the `aud` of
+/// the claim set [`Cluster::issue_service_account_token`] mints — and the claim
+/// [`Cluster::verify_service_account_token`] names when the token was issued to somebody
+/// other than [`PODS_AUDIENCE`].
+pub const AUDIENCE_CLAIM: &str = "aud";
+
+/// The registered claim naming the instant a token was issued at (RFC 7519 §4.1.6), the
+/// `iat` of a minted claim set — the claim named when a token is presented before the
+/// window it was issued for has opened.
+pub const ISSUED_AT_CLAIM: &str = "iat";
 
 /// The region every ARN this service mints is scoped to when a caller of the
 /// registration seam names no other. EKS Auth is a regional service; emulators in this
@@ -587,6 +600,11 @@ impl Cluster {
     /// this cluster does not publish is refused for that reason rather than for being
     /// unknown. It is NOT what authenticates the token: the record lookup below is, which
     /// is why copying a cluster's `kid` into a token of one's own gains nothing.
+    ///
+    /// A rejection says WHICH claim of the token this cluster refused, where the verdict
+    /// is about a claim: the audience it was issued to, and the start of the window it was
+    /// issued for. A value this cluster has no record of issuing failed no claim, since
+    /// none of them was reached.
     pub fn verify_service_account_token(
         &self,
         token: &str,
@@ -605,12 +623,12 @@ impl Cluster {
             .iter()
             .any(|audience| audience == PODS_AUDIENCE)
         {
-            return Err(TokenRejection::Invalid);
+            return Err(TokenRejection::WRONG_AUDIENCE);
         }
         // A token is not yet a token before the instant it was issued at, the way a
         // projected token carries a not-before claim its holder cannot anticipate.
         if now < issued.issued_at {
-            return Err(TokenRejection::Invalid);
+            return Err(TokenRejection::NOT_YET_ISSUED);
         }
         // No leeway: a token whose lifetime has passed is expired, not nearly expired.
         if issued.expires_at <= now {
@@ -935,9 +953,35 @@ const ASSOCIATION_ID_SUFFIX_LEN: usize = 17;
 pub enum TokenRejection {
     /// The instant the token expires has passed.
     Expired,
-    /// The token is not one this cluster issued for pod identity: a token it never
-    /// issued, or one it issued to a different audience.
+    /// A CLAIM of the token carries a value this cluster's verification refuses: which
+    /// claim it was, and the value that claim has to carry where exactly one value is
+    /// admissible.
+    InvalidClaim {
+        /// The registered claim name, spelled as the claim set spells it.
+        claim: &'static str,
+        /// The one value the claim must carry, or `None` for a claim judged against the
+        /// clock rather than against a fixed value.
+        expected: Option<&'static str>,
+    },
+    /// The token is not one this cluster issued at all: a value it never issued, or one
+    /// whose characters were changed, so no claim of it was reached.
     Invalid,
+}
+
+impl TokenRejection {
+    /// The refusal of a token issued to somebody other than [`PODS_AUDIENCE`]: the
+    /// audience claim, and the one audience a pod identity token may carry.
+    pub const WRONG_AUDIENCE: Self = Self::InvalidClaim {
+        claim: AUDIENCE_CLAIM,
+        expected: Some(PODS_AUDIENCE),
+    };
+
+    /// The refusal of a token presented before the window it was issued for opened: the
+    /// issued-at claim, which is judged against the clock and so has no fixed value.
+    pub const NOT_YET_ISSUED: Self = Self::InvalidClaim {
+        claim: ISSUED_AT_CLAIM,
+        expected: None,
+    };
 }
 
 /// Whose service account a verified token names, and the pod it was projected into.
