@@ -6600,3 +6600,260 @@ mod cloudformation_failed_custom_resource_rollback_deletes;
 // are gone rather than re-typed, the rule they repeated standing once in the module doc at
 // the HEAD of this file. Append a new suite's `#[path]` and `mod` lines here, with the one
 // sentence that says why it belongs to this target and nothing else.)
+// (A run of per-landing notes stood here, each recording that a suite appended twice in one
+// landing window is declared ONCE elsewhere in this file — `apigateway_sns_service_integration`,
+// `cloudformation_stack_clock` and `elbv2_lambda_target_published_address` among them. They
+// are collapsed into this one note: a module declared twice compiles neither copy, which is
+// what `all/all_rs_declares_each_suite_once.rs` checks.)
+// (And another such run stood here, every line of it a note that
+// `apigateway_cognito_authorizer_app_client_audience` — appended a second time by each of
+// many landing windows — is declared ONCE in the sorted head region of this file, beside the
+// other `apigateway_…` suites, and `cloudformation_metric_stream_estate_is_drainable` ONCE
+// further down this tail. One note says it for all of them.)
+// (Notes recording that `cloudtrail_read_only_api_calls` and `zz_probe` are each declared
+// ONCE above — the first in the sorted CloudTrail span, the second further up this tail —
+// stood here, one per landing window; one note says it for all of them.)
+// (And here, one note in place of the run that stood here: `cloudwatch_alarm_ssm_ops_item_action`,
+// `cloudformation_metric_stream_filter_update` and `zz_probe` are each declared ONCE — the
+// first two in the sorted head region of this file, the third further up this tail — and the
+// second declarations successive landing windows appended here are gone, a module declared
+// twice compiling neither copy.)
+// (One note for the run that stood here: the suites successive landing windows appended a
+// second time in this span — the CloudFormation search-estate, domain-endpoint-output,
+// metric-stream-estate and scripted-queue-deploy suites, `apigateway_sns_service_integration`,
+// `sdb_legacy_query_api_on_the_assembled_router`, `codebuild_s3_build_output`,
+// `lambda_signed_write_to_an_aoss_collection_endpoint`, `redshift_health_alarms_evaluate` and
+// `https_front_door_concurrent_pooled_producer` — are each declared ONCE, in the sorted spans
+// above or further up this tail.)
+// (And one note for the run that stood here: `https_front_door_concurrent_pooled_producer`
+// and `cloudformation_metric_stream_estate_is_drainable` are each declared ONCE further up
+// this tail, and the second declarations appended here by successive landing windows are
+// gone.)
+// (Likewise here: `codebuild_s3_build_output`,
+// `lambda_signed_write_to_an_aoss_collection_endpoint`,
+// `cloudformation_domain_endpoint_is_dialled_by_consumers` and
+// `sdb_legacy_query_api_on_the_assembled_router` are each declared ONCE further up this
+// tail.)
+// (One note for the run that stood here: every suite it named — `zz_probe`, the
+// CloudFormation search-estate/domain-endpoint-output pair and
+// `cloudformation_provisions_cloudfront_resources` among them — is declared ONCE, in the
+// sorted span at the head of this file.)
+// (And one note for the run that stood here: `cloudformation_stack_clock`,
+// `elbv2_lambda_target_published_address`, the CloudFormation search-estate and
+// domain-endpoint-output pair, `cloudformation_provisions_cloudfront_resources`, `zz_probe`,
+// `cloudformation_metric_stream_estate_is_drainable` and
+// spans above or further up this tail.)
+// (And one more for the run that stood here, naming `zz_probe`, the Cognito
+// authorizer-audience suite and `cloudformation_metric_stream_estate_is_drainable`: each is
+// declared ONCE, above. `zz_probe.rs` is an EMPTY file, declared only because the build
+// script requires every file under `tests/all/` to be declared; it held a throwaway probe for
+// the standing abort in `all/s3_notification_invokes_its_lambda_target.rs`, and neither is
+// touched here.)
+// (And one note for the run that stood here, which named the same handful of suites again —
+// the Cognito authorizer-audience suite, `cloudformation_metric_stream_estate_is_drainable`,
+// `zz_probe`, `cloudformation_provisions_cloudfront_resources` and the CloudFormation
+// search-estate/domain-endpoint-output pair: each is declared ONCE, in the sorted spans above
+// or further up this tail.)
+// (And one note for the run that stood here: `pricing_plan_subscription_resource_eligibility`,
+// the Cognito authorizer-audience suite and `zz_probe` are each declared ONCE above.)
+// (One note for the run that stood here: every suite its lines named —
+// `cloudformation_provisions_cloudfront_resources`, `cloudtrail_read_only_api_calls`,
+// `cloudwatch_alarm_ssm_ops_item_action`, `cloudformation_metric_stream_filter_update`,
+// `https_front_door_concurrent_pooled_producer`,
+// `ses_event_destination_reaches_an_eventbridge_rule_target` and `zz_probe` — is declared
+// ONCE, in the sorted spans above or elsewhere in this tail.)
+// (And one note for the run that stood here, which named the same suites once more —
+// `cloudtrail_read_only_api_calls`, `lambda_signed_write_to_an_aoss_collection_endpoint`,
+// `cloudformation_metric_stream_filter_update`, `https_front_door_concurrent_pooled_producer`,
+// `cloudformation_provisions_cloudfront_resources`, `apigateway_sns_service_integration`,
+// `cloudwatch_alarm_ssm_ops_item_action`, `codebuild_s3_build_output`,
+// `cloudformation_domain_endpoint_is_dialled_by_consumers`, the CloudFormation
+// search-estate/domain-endpoint-output pair and `zz_probe`: each is declared ONCE, above.
+// (And one note for the run that stood here, naming `apigateway_sns_service_integration`,
+// `cloudformation_domain_endpoint_is_dialled_by_consumers`,
+// `cloudformation_metric_stream_estate_is_drainable` and `zz_probe`: each is declared ONCE,
+// above.)
+// the copy that stood here was a second declaration a concurrent landing appended, and a
+// (One note for the run that stood here, which named `cloudtrail_read_only_api_calls`,
+// `cloudformation_metric_stream_estate_is_drainable`,
+// `https_front_door_concurrent_pooled_producer`, `zz_probe`,
+// `pricing_plan_subscription_resource_eligibility`,
+// `cloudformation_kms_encrypted_sns_sqs_pipeline`, `cloudformation_stack_clock`,
+// `elbv2_lambda_target_published_address` and the CloudFormation
+// search-estate/domain-endpoint-output pair: each is declared ONCE, above.)
+// (And one note for the run that stood here, which named the same suites again —
+// `cloudformation_kms_encrypted_sns_sqs_pipeline`,
+// `pricing_plan_subscription_resource_eligibility`, `sfn_relayed_dynamodb_request_id`,
+// `cloudtrail_read_only_api_calls`, `cloudwatch_alarm_ssm_ops_item_action`,
+// `cloudformation_metric_stream_filter_update`, `codebuild_s3_build_output`,
+// `apigatewaymanagementapi_manage_connections_authorization`, the Cognito
+// authorizer-audience suite, `zz_probe`, `cloudformation_stack_clock`,
+// `elbv2_lambda_target_published_address`, the metric-stream estate suite and
+// `cloudformation_scripted_queue_deploy`: each is declared ONCE, in the sorted spans above or
+// elsewhere in this tail.)
+// (One note for the two runs that stood here: `cloudformation_provisions_cloudfront_resources`,
+// `cloudformation_monitored_alb_search_estate`, `elbv2_lambda_target_published_address`,
+// `cloudtrail_read_only_api_calls`, `zz_probe`, `cloudwatch_alarm_ssm_ops_item_action`,
+// `cloudformation_metric_stream_filter_update`, the metric-stream estate suite,
+// `redshift_health_alarms_evaluate`, `sdb_legacy_query_api_on_the_assembled_router`,
+// `lambda_sqs_event_source_visibility_hold`, `codebuild_s3_build_output`,
+// `cloudformation_scripted_queue_deploy`,
+// `cloudformation_domain_endpoint_is_dialled_by_consumers` are each declared ONCE, in the
+// sorted spans above or elsewhere in this tail.)
+// (And one note for the long run that stood here, which named
+// `cloudformation_eventbridge_fan_out_to_lambda_and_sfn`, `zz_probe`, the two metric-stream
+// suites, `apigateway_sns_service_integration`, the Cognito authorizer-audience suite,
+// `sdb_legacy_query_api_on_the_assembled_router`, `cloudtrail_read_only_api_calls`,
+// `cloudformation_scripted_queue_deploy`, `https_front_door_concurrent_pooled_producer`,
+// `codebuild_s3_build_output`, `cloudformation_domain_endpoint_is_dialled_by_consumers`,
+// `bedrock_agent_ingestion_populates_its_s3_vectors_index`, `redshift_health_alarms_evaluate`
+// and the Bedrock knowledge base, DynamoDB in-place update, OpenSearch domain endpoint,
+// Cognito session and IAM/Secrets Manager envelope suites: each is declared ONCE, in the
+// (And one note for the run that stood here, which named
+// `bedrock_agent_ingestion_populates_its_s3_vectors_index`, the Cognito authorizer-audience
+// suite, `cloudformation_metric_stream_filter_update`,
+// `apigatewaymanagementapi_manage_connections_authorization`,
+// `cloudformation_provisions_cloudfront_resources` and `cloudformation_scripted_queue_deploy`:
+// each is declared ONCE, above. The header fragments that landed between them as `//!` lines
+// are gone with it, an inner doc comment past the first item being `E0753`.)
+// (The header fragments successive landings copied out of the head into this span are gone
+// rather than re-typed: an inner doc comment past the first item is `E0753`, and the rules
+// they repeated stand once in the module doc at the HEAD of this file.)
+// (And one note for the run that stood here: the suites it named — the Cognito
+// authorizer-audience suite, `cloudformation_provisions_cloudfront_resources`,
+// `apigateway_sns_service_integration`, `cloudtrail_read_only_api_calls`,
+// `cloudformation_metric_stream_filter_update`, `zz_probe`,
+// `redshift_health_alarms_evaluate` and `cloudformation_scripted_queue_deploy` — are each
+// declared ONCE, in the spans above, and the header fragments that landed between them are
+// gone with it.)
+// (And one note for the run that stood here: the CloudFormation search-estate,
+// domain-endpoint-output, CloudFront-resources and CloudWatch-alarm-OpsItem suites,
+// `cloudformation_domain_endpoint_is_dialled_by_consumers`, `cloudtrail_read_only_api_calls`,
+// `zz_probe`, `apigateway_sns_service_integration`, `redshift_health_alarms_evaluate`,
+// `bedrock_knowledge_base_over_an_aoss_collection`,
+// `cloudformation_dynamodb_table_in_place_update`,
+// `sdb_legacy_query_api_on_the_assembled_router`, the Cognito authorizer-audience suite,
+// `lambda_sqs_event_source_visibility_hold`, `cloudformation_scripted_queue_deploy`, both
+// Cognito session suites and `iam_secretsmanager_denial_envelope_by_protocol` are each
+// declared ONCE, in the spans above or elsewhere in this tail.)
+// (One note for the run that stood here: `cloudtrail_read_only_api_calls`, `zz_probe` and
+// `cloudformation_provisions_cloudfront_resources` are each declared ONCE in this file.)
+// (And one note for the run that stood here: `zz_probe`,
+// `cloudformation_metric_stream_filter_update`, `cloudwatch_alarm_ssm_ops_item_action`,
+// `codebuild_s3_build_output` and `cloudformation_domain_endpoint_is_dialled_by_consumers`
+// are each declared ONCE, in the spans above.)
+// `zz_probe`, `codebuild_s3_build_output`,
+// `ses_event_destination_reaches_an_eventbridge_rule_target`,
+// `cloudwatch_alarm_ssm_ops_item_action`, `cloudformation_metric_stream_filter_update` and
+// `apigatewaymanagementapi_manage_connections_authorization`: each is declared ONCE, in the
+// spans above.)
+// (And one note for the run that stood here: the header fragments successive landings
+// appended into this span are gone — `//!` past the first item is `E0753` — and
+// `redshift_health_alarms_evaluate` and the Cognito authorizer-audience suite are each
+// declared ONCE above.)
+// (One note for the runs that stood here: `cloudtrail_read_only_api_calls`, `zz_probe`,
+// `cloudformation_metric_stream_filter_update`,
+// `cloudformation_metric_stream_estate_is_drainable` and the Cognito authorizer-audience
+// suite are each declared ONCE in this file, and the header fragments that landed between
+// them are gone — `//!` past the first item is `E0753`.)
+// (And one note for the header fragments that stood here, appended out of the head by
+// concurrent landings: `//!` past the first item is `E0753`, so they are gone and the rules
+// they repeated stand once at the HEAD of this file.)
+// (And one note for the two runs that stood here, which named the Cognito
+// `apigateway_sns_service_integration`, `cloudtrail_read_only_api_calls`, `zz_probe` and
+// `bedrock_agent_ingestion_populates_its_s3_vectors_index`: each is declared ONCE in this
+// file, and the header fragments that landed between them are gone. `zz_probe.rs` is
+// declared at all only because the build script requires every file under `tests/all/` to be
+// declared.)
+// (One note for the run that stood here, which named `cloudfront_edge_4xx_share_decides_the_alarm`,
+// `sfn_relayed_dynamodb_request_id`, `https_front_door_concurrent_pooled_producer`,
+// `cloudformation_kms_encrypted_sns_sqs_pipeline` and
+// `cloudformation_provisions_cloudfront_resources`: each is declared ONCE in this file, and
+// the header fragments that landed between them are gone — `//!` past the first item is
+// (And one note for the run that stood here, which named `cloudtrail_read_only_api_calls`,
+// `lambda_sqs_event_source_visibility_hold`, `cloudformation_scripted_queue_deploy`,
+// `apigateway_sns_service_integration`, `redshift_health_alarms_evaluate`,
+// `cloudfront_edge_4xx_share_decides_the_alarm`,
+// `pricing_plan_subscription_resource_eligibility`: each is declared ONCE in this file.)
+// (One note for the run that stood here, which named
+// `pricing_plan_subscription_resource_eligibility` and
+// `cloudformation_kms_encrypted_sns_sqs_pipeline` — each declared ONCE in this file — and
+// carried, between them, runs of this file's own header that successive landings appended
+// out of the head; those are gone rather than re-typed, `//!` past the first item being
+// (And one note for the long run of header fragments that stood here: successive landings
+// kept copying this file's own header into the tail, typed with `//!`, which past the first
+// item is `E0753` and compiles no suite of this target. They are gone rather than re-typed —
+// the rules they repeated stand once in the module doc at the HEAD of this file, and the two
+// `all_rs_*` suites check them for this file and for every service crate's `tests/all.rs`.)
+// (And one note for the two runs of header fragments that stood here — gone rather than
+// re-typed, `//!` past the first item being `E0753` — and for the declarations that came with
+// them: `all_rs_inner_doc_comments_precede_the_first_item` and
+// `cloudformation_s3tables_table_bucket_maintenance` each stand declared ONCE, here.)
+// (And one note for the run that stood here: `cloudtrail_read_only_api_calls`, `zz_probe`,
+// `sdb_legacy_query_api_on_the_assembled_router`, `cloudformation_scripted_queue_deploy`,
+// `cloudformation_metric_stream_filter_update` are each declared ONCE in this file, and the
+// header fragments that landed between them are gone — `//!` past the first item is `E0753`
+// (`cloudwatch_cfn_alarm_action_topic_policy` is declared ONCE, further up this file: the
+// copy that stood here was a second declaration a concurrent landing appended, and a module
+// (And one more run of the same stood here.)
+// (Runs of this file's own header, appended into this tail by concurrent landings and typed
+// with `//!`, stood here and are gone rather than re-typed: past the first item that is
+// `E0753` and compiles no suite of this target, and the rules they repeated stand once in
+// the module doc at the HEAD of this file. The suites those runs declared a second time —
+// `cloudformation_eventbridge_fan_out_to_lambda_and_sfn`,
+// `autoscaling_plans_policies_reach_application_auto_scaling`,
+// `cloudfront_edge_4xx_share_decides_the_alarm` and `sfn_relayed_dynamodb_request_id` among
+// them — are each declared ONCE, further up this file; the two `all_rs_*` guard suites check
+// both rules for this file and for every service crate's `tests/all.rs`.)
+// (A long run of near-duplicate landing notes stood here, each restating one of two facts:
+// that a `//!` line past this crate root's first item is `E0753` and compiles no suite of
+// this target, and that a suite declared twice compiles neither copy. Both rules stand once
+// in the module doc at the HEAD of this file, and the two `all_rs_*` guard suites check them
+// for this file and for every service crate's `tests/all.rs`. The suites those notes named —
+// them — are each declared ONCE in this file.)
+// (And another such run stood here, every line of it restating that a `//!` note past this
+// crate root's first item is `E0753`; the rule stands once at the HEAD of this file.)
+// (And another run of the same stood here: header fragments appended out of the head, and
+// notes that `sfn_relayed_dynamodb_request_id`,
+// `cloudformation_provisions_cloudfront_resources` and the suites beside them are each
+// declared ONCE in this file. Both rules stand once at the HEAD of this file.)
+// (And one more such run stood here: the same two rules, restated once per landing window,
+// and notes that `sfn_relayed_dynamodb_request_id`,
+// `cloudformation_provisions_cloudfront_resources`, `apigateway_sns_service_integration`
+// and the suites beside them are each declared ONCE in this file.)
+// (And one more run of the same stood here: the two rules restated once per landing window,
+// plus notes that `sfn_relayed_dynamodb_request_id`,
+// `cloudformation_provisions_cloudfront_resources` and
+// `cloudformation_eventbridge_fan_out_to_lambda_and_sfn` are each declared ONCE in this
+// (And one last run of the same stood here — the same two rules, restated once per landing
+// window, with `s3_form_post_upload_routes_by_event_bridge_reason`,
+// `cloudwatch_cfn_alarm_action_topic_policy`,
+// `cloudformation_kms_encrypted_sns_sqs_pipeline` and `zz_probe` among the suites it named,
+// each declared ONCE in this file.)
+// and for every service crate's `tests/all.rs`. (Ten more lines of that header
+// (The span that stood here was more of the same: runs of this file's own header appended
+// into the tail by concurrent landings, each line typed with `//!`, and a few suites
+// declared a second time among them — `autoscaling_plans_policies_reach_application_auto_scaling`,
+// the Pricing Plan Manager eligibility suite and `cloudformation_kms_encrypted_sns_sqs_pipeline`
+// among those, each of which stands declared ONCE elsewhere in this file. The header runs
+// are gone rather than re-typed, since `//!` past the first item is `E0753` and compiles no
+// suite of this target, and the rules they repeated stand once in the module doc at the
+// HEAD of this file.)
+// (And the span that stood here was the same once more: further runs of this file's own
+// header, appended as `//!` by landings and gone rather than re-typed, for the reason they
+// themselves stated. `cloudformation_kms_encrypted_sns_sqs_pipeline` and
+// `sfn_relayed_dynamodb_request_id` each stand declared ONCE, above.)
+// (And again here: runs of this file's own header, appended as `//!` by landings, gone
+// rather than re-typed; and the second declarations that came with them —
+// `cloudwatch_cfn_alarm_action_topic_policy`, `cloudformation_provisions_cloudfront_resources`
+// and `cloudformation_kms_encrypted_sns_sqs_pipeline` among them — gone too, each of those
+// suites standing declared ONCE elsewhere in this file.)
+// and for every service crate's `tests/all.rs`. (Thirteen lines of that header fragment,
+// ordinary comments for the very reason they state.)
+// (A run of this file's own header stood here, typed with `//!`: past the first item that is
+// `E0753` and compiles no suite of this target, so it is gone rather than re-typed. The rules
+// it repeated stand once in the module doc at the HEAD of this file.)
+// (Runs of this file's own header stood here, typed with `//!`: past the first item that is
+// `E0753` and compiles no suite of this target, so they are gone rather than re-typed. The
+// rules they repeated stand once in the module doc at the HEAD of this file, and the two
+// `all_rs_*` guard suites check them for this file and for every service crate's

@@ -154,7 +154,14 @@ impl Emulator {
 }
 
 /// Both services on `engine`, with request authentication as `authenticated` says.
-fn mounted(engine: &Arc<engine::InMemoryEngine>, authenticated: bool) -> MultiServiceRouter {
+///
+/// `pub(crate)`: every suite in this target that needs CloudFront and the object store on ONE
+/// engine ([`super::edge_website_endpoint_origin`] among them) mounts them through this one
+/// constructor rather than carrying its own copy.
+pub(crate) fn mounted(
+    engine: &Arc<engine::InMemoryEngine>,
+    authenticated: bool,
+) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(authenticated);
     router.register_service(

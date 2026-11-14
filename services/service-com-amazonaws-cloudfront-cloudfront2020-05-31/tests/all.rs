@@ -152,6 +152,8 @@ mod edge_signed_s3_origin;
 mod edge_standard_logging_v2;
 #[path = "all/edge_web_acl.rs"]
 mod edge_web_acl;
+#[path = "all/edge_website_endpoint_origin.rs"]
+mod edge_website_endpoint_origin;
 #[path = "all/enum_value_set_message.rs"]
 mod enum_value_set_message;
 #[path = "all/error_envelope.rs"]

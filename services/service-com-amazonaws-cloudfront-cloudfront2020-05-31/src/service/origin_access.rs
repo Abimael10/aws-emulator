@@ -445,6 +445,53 @@ pub(crate) fn s3_endpoint_bucket(domain_name: &str) -> Option<(String, String)> 
     Some((bucket, region_of_host(&host, S3_ORIGIN_TYPE)))
 }
 
+/// Whether `domain_name` addresses the Amazon S3 WEBSITE ENDPOINT of a bucket — the surface
+/// a bucket configured for static website hosting is served on — rather than the REST
+/// endpoint its objects are read through.
+///
+/// Amazon S3 publishes that surface at `<bucket>.s3-website-<Region>.amazonaws.com` and at
+/// `<bucket>.s3-website.<Region>.amazonaws.com` (Amazon S3 User Guide, *Website endpoints*),
+/// so the two spellings are the endpoint label carrying [`WEBSITE_LABEL_PREFIX`] with the
+/// Region behind it, and the same label with the Region in the next one. The label is
+/// anchored from the RIGHT, as every other reading of such a host here is
+/// ([`endpoint_label`]), so a bucket whose own name is spelled like that endpoint keeps its
+/// name; and the labels in front of it have to name a bucket, which is what makes the host
+/// one bucket's website endpoint rather than a name that merely looks like one.
+///
+/// It is a different SURFACE, not another address of the same one: what it serves is the
+/// bucket's website configuration (the index document of a directory, the error document of a
+/// failure) and it serves that over plain HTTP alone, which is what an origin addressing it
+/// has to be configured for.
+pub(crate) fn names_an_s3_website_endpoint(domain_name: &str) -> bool {
+    let Some(host) = dns_host(&host_of(domain_name)) else {
+        return false;
+    };
+    if s3_bucket_of_host(&host).is_none() {
+        return false;
+    }
+    let labels = addressing_labels(&host);
+    endpoint_label(&labels, S3_ORIGIN_TYPE)
+        .and_then(|(mark, _region)| labels.get(mark).copied())
+        .is_some_and(names_the_website_surface)
+}
+
+/// Whether one endpoint LABEL is the website surface's: the Amazon S3 endpoint label with
+/// [`WEBSITE_LABEL_PREFIX`] behind it (`s3-website-<Region>`), or that prefix without the
+/// Region, which the dotted spelling carries in the next label (`s3-website.<Region>`).
+fn names_the_website_surface(label: &str) -> bool {
+    let Some(rest) = label
+        .strip_prefix(S3_ORIGIN_TYPE)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    let website = WEBSITE_LABEL_PREFIX.trim_end_matches('-');
+    rest == website
+        || rest
+            .strip_prefix(WEBSITE_LABEL_PREFIX)
+            .is_some_and(|region| !region.is_empty())
+}
+
 /// The labels of `host` with its trailing ZONE labels ([`ZONE_LABELS`]) removed, which is
 /// what leaves the endpoint label and the Region at the END of the list and so anchors both
 /// from the right.
@@ -1195,6 +1242,40 @@ mod tests {
             assert_eq!(
                 read, region,
                 "case {host:?}: expected region {region:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// Which hosts are the WEBSITE surface of a bucket, which is the one AWS endpoint here
+    /// that serves plaintext rather than TLS. The rows span the two spellings Amazon S3
+    /// publishes, a bucket whose own name is spelled like that endpoint, the REST endpoint of
+    /// the same bucket, a label that merely begins like the website one, and hosts that name
+    /// no bucket at all.
+    #[test]
+    fn only_a_buckets_website_endpoint_host_is_read_as_the_website_surface() {
+        let rows: [(&str, bool); 10] = [
+            ("reports.s3-website-us-east-1.amazonaws.com", true),
+            ("reports.s3-website.eu-west-1.amazonaws.com", true),
+            ("my.reports.s3-website-us-east-1.amazonaws.com", true),
+            ("reports.s3-website-cn-north-1.amazonaws.com.cn", true),
+            // A bucket whose own name is spelled like the website endpoint: the endpoint
+            // label is anchored from the right, so the surface is still the website one.
+            ("s3-website.s3-website-us-east-1.amazonaws.com", true),
+            // The REST endpoint of the same bucket, in both of its forms.
+            ("reports.s3.us-east-1.amazonaws.com", false),
+            ("reports.s3-us-east-1.amazonaws.com", false),
+            // A label that merely begins with the website one is another host.
+            ("reports.s3-websitely.us-east-1.amazonaws.com", false),
+            // Hosts that name no bucket: the path-style endpoint, and a customer domain.
+            ("s3-website-us-east-1.amazonaws.com", false),
+            ("edge.example.com", false),
+        ];
+        for (host, expected) in rows {
+            let actual = names_an_s3_website_endpoint(host);
+            assert_eq!(
+                actual, expected,
+                "case {host:?}: expected names_an_s3_website_endpoint == {expected}, got \
+                 {actual}"
             );
         }
     }

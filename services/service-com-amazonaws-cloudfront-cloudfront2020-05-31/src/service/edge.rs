@@ -69,10 +69,12 @@
 //! origin that did not answer, and nothing off this machine is ever addressed.
 //!
 //! The SCHEME of that request is the origin's own, from its `OriginProtocolPolicy`, and an
-//! origin addressed over a scheme it does not serve is the same `502`: every AWS service
-//! endpoint this emulator serves answers over TLS alone, so an origin whose policy
-//! addresses one of them over plaintext is an origin connection that cannot be opened
-//! ([`origin_accepts_scheme`]).
+//! origin addressed over a scheme the endpoint it names does not serve is the same `502`:
+//! every AWS service endpoint this emulator serves answers over TLS alone, so an origin
+//! whose policy addresses one of them over plaintext is an origin connection that cannot be
+//! opened — while a bucket's WEBSITE endpoint is the other way round, serving plain HTTP and
+//! no HTTPS at all, so an origin over one of those is reachable over plaintext and
+//! unreachable over TLS ([`origin_accepts_scheme`]).
 //!
 //! One origin shape is worth naming because it is the one the Lambda-function-URL
 //! topology uses: a function URL host is served by Lambda's own function-URL data plane
@@ -1701,6 +1703,13 @@ fn carries_cloudfront_via(req: &RtRequest) -> bool {
 /// a bucket endpoint is served there and is this `502` here, because this emulator serves
 /// that endpoint over TLS only.
 ///
+/// The one AWS endpoint that is the other way round is an Amazon S3 WEBSITE ENDPOINT
+/// ([`origin_access::names_an_s3_website_endpoint`]): a bucket's website surface serves plain
+/// HTTP and no HTTPS at all — "Amazon S3 website endpoints do not support HTTPS" — which is
+/// why CloudFront's own guidance for a website-endpoint origin is to address it with HTTP
+/// Only. So such an origin is reachable over plaintext and is the unreachable-origin `502`
+/// over TLS, whichever way round its protocol policy puts it.
+///
 /// Two kinds of host are NOT such an endpoint. A per-resource listener this emulator opens
 /// negotiates its encryption in band, so it answers both schemes at one address — a
 /// distribution's own edge domain among them ([`crate::state::edge_endpoint`]). And a host
@@ -1710,13 +1719,19 @@ fn origin_accepts_scheme(uri: &str) -> bool {
     let Some((scheme, _rest)) = uri.split_once("://") else {
         return true;
     };
-    if !scheme.eq_ignore_ascii_case(PLAINTEXT_SCHEME) {
-        return true;
-    }
     let Some(authority) = authority_of(uri) else {
         return true;
     };
-    !names_a_service_endpoint(bare_host(authority))
+    let host = bare_host(authority);
+    let plaintext = scheme.eq_ignore_ascii_case(PLAINTEXT_SCHEME);
+    // The website surface of a bucket, which serves plaintext and nothing else.
+    if origin_access::names_an_s3_website_endpoint(host) {
+        return plaintext;
+    }
+    if !plaintext {
+        return true;
+    }
+    !names_a_service_endpoint(host)
 }
 
 /// Whether `host` is an AWS SERVICE ENDPOINT of this emulator: a host the front door
@@ -2541,10 +2556,11 @@ mod tests {
     fn an_origin_addressed_over_a_scheme_it_does_not_serve_cannot_be_connected_to() {
         // Rows differ along the scheme the origin request is addressed over and along the
         // KIND of host it names: an AWS service endpoint this emulator serves (which is
-        // served over TLS alone), a bucket's own virtual-hosted endpoint, a per-resource
+        // served over TLS alone), a bucket's own virtual-hosted endpoint, a bucket's WEBSITE
+        // endpoint (which is the other way round: plaintext and no TLS), a per-resource
         // listener of this emulator (which negotiates its encryption in band), and a host
         // nothing here serves.
-        let cases: [(&str, &str, bool); 9] = [
+        let cases: [(&str, &str, bool); 13] = [
             (
                 "an api stage over TLS",
                 "https://abcdef1234.execute-api.us-east-1.amazonaws.com/live/echo",
@@ -2563,6 +2579,31 @@ mod tests {
             (
                 "a bucket endpoint over plaintext",
                 "http://shelf.s3.us-east-1.amazonaws.com/key",
+                false,
+            ),
+            (
+                "a bucket's website endpoint over plaintext",
+                "http://shelf.s3-website-us-east-1.amazonaws.com/index.html",
+                true,
+            ),
+            (
+                "a bucket's website endpoint over TLS, which it does not serve",
+                "https://shelf.s3-website-us-east-1.amazonaws.com/index.html",
+                false,
+            ),
+            (
+                "the dotted spelling of a website endpoint over plaintext",
+                "http://shelf.s3-website.us-east-1.amazonaws.com/index.html",
+                true,
+            ),
+            (
+                "the dotted spelling of a website endpoint over TLS",
+                "https://shelf.s3-website.us-east-1.amazonaws.com/index.html",
+                false,
+            ),
+            (
+                "a host whose label merely begins like the website endpoint, over plaintext",
+                "http://shelf.s3-websitely.us-east-1.amazonaws.com/index.html",
                 false,
             ),
             (
@@ -2585,7 +2626,6 @@ mod tests {
                 "http://d111111abcdef8.cloudfront.net/index.html",
                 true,
             ),
-            ("an origin-form URI", "/index.html", true),
         ];
         for (case, uri, expected) in cases {
             let actual = origin_accepts_scheme(uri);
@@ -2595,6 +2635,12 @@ mod tests {
                  {actual}"
             );
         }
+        // An origin-form URI names no scheme at all, so there is nothing to refuse.
+        assert!(
+            origin_accepts_scheme("/index.html"),
+            "an origin-form URI names no scheme, so it is addressed over the one the request \
+             is made on"
+        );
     }
 
     #[test]
