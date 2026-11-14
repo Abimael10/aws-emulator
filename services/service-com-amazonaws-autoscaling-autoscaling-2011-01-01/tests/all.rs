@@ -89,6 +89,8 @@ mod set_desired_capacity_on_subnet_placed_groups;
 mod sns_notifications;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/suspend_processes.rs"]
+mod suspend_processes;
 // The shared harness the suites above drive the service through: the awsQuery POST
 // and the XML readers, defined once.
 #[path = "all/support.rs"]

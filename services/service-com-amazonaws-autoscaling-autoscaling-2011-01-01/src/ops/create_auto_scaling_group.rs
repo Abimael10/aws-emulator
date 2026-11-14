@@ -741,6 +741,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A group is created with no warm pool either: the create carries no warm pool
             // member, so the first one comes from `PutWarmPool`.
             warm_pool: None,
+            // Every process of a new group runs: the create carries no process member, so
+            // the first suspension comes from `SuspendProcesses`.
+            suspended_processes: crate::state::SuspendedProcesses::new(),
         };
         state.groups.insert(name.clone(), group);
 

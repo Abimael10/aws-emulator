@@ -360,12 +360,13 @@ fn group_view(group: &crate::state::StoredGroup, include_instances: bool) -> Aut
         health_check_grace_period: group.health_check_grace_period,
         instances,
         created_time: crate::state::to_date_time(group.created_time),
-        // No process of a group can be suspended and no metric collection enabled in this
-        // emulator (`SuspendProcesses` and `EnableMetricsCollection` are scaffold stubs,
-        // each owned by its own issue), so every group holds NONE of either — which is an
-        // empty list, on the same footing as its attachments above, rather than an absent
-        // member.
-        suspended_processes: Some(Vec::new()),
+        // The processes the group has suspended, through the one projection of a stored
+        // suspension ([`crate::state::StoredGroup::suspended_process_views`]): a list,
+        // empty for a group running every process, on the same footing as its attachments
+        // above rather than an absent member. (No metric collection can be enabled in this
+        // emulator yet — `EnableMetricsCollection` is a scaffold stub owned by its own
+        // issue — so every group holds none of those.)
+        suspended_processes: Some(group.suspended_process_views()),
         placement_group: group.placement_group.clone(),
         vpc_zone_identifier: group.vpc_zone_identifier.clone(),
         enabled_metrics: Some(Vec::new()),

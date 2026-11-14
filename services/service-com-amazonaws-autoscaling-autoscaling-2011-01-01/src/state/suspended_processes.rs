@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The scaling processes a group has suspended: which of the service's own processes are
+//! turned off for one Auto Scaling group, and when each was turned off.
+//!
+//! A suspension is a fact about ONE group, so it is stored on [`StoredGroup`] itself
+//! ([`StoredGroup::suspended_processes`]): the one collection `SuspendProcesses` writes
+//! into, `DescribeAutoScalingGroups` projects from, and the group's own delete takes with
+//! the group. Nothing in this crate holds a second copy.
+//!
+//! # What a suspension names
+//!
+//! The processes a request may name are the service's own catalog
+//! ([`super::SCALING_PROCESS_TYPES`], the same set `DescribeScalingProcessTypes`
+//! publishes), and "if you omit this property, all processes are specified"
+//! (`ScalingProcessQuery$ScalingProcesses`) — so a request that names none suspends every
+//! process of the catalog. A name outside the catalog names no process of this service, so
+//! the request is refused and nothing is written
+//! ([`ProcessRefusal::UnknownProcess`]).
+//!
+//! The collection is keyed by process name, so naming a process twice in one request, or
+//! naming one a later request names again, leaves ONE suspension: a process is either
+//! suspended or it is not. The instant kept beside the name is when the process was
+//! suspended, which is what the group reports as the reason it is
+//! ([`suspension_reason`]) — so a process that is already suspended keeps the instant its
+//! own suspension was recorded at.
+//!
+//! # What a suspended process stops
+//!
+//! A suspension is not only a record: the process is what the group would otherwise do.
+//! `Launch` "adds instances to the Auto Scaling group when the group scales out" and
+//! `Terminate` "removes instances from the Auto Scaling group when the group scales in"
+//! (`ProcessType$ProcessName`'s own catalog, as the user guide describes each type), so
+//! while one of them is suspended a capacity change still records the capacity the caller
+//! asked for while the group adds — or removes — nothing
+//! ([`super::AutoScalingState::apply_capacity`]).
+
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use crate::ops::types::SuspendedProcess;
+
+use super::StoredGroup;
+
+/// The process that adds instances to a group when it scales out, as the catalog names it.
+pub const PROCESS_LAUNCH: &str = "Launch";
+
+/// The process that removes instances from a group when it scales in, as the catalog names
+/// it.
+pub const PROCESS_TERMINATE: &str = "Terminate";
+
+/// The suspended processes of ONE group: the instant each process was suspended at, keyed
+/// by the process name.
+///
+/// A map rather than a list, because a process is either suspended or it is not: a request
+/// naming the same process twice suspends one, and the group reports one entry per
+/// suspended process, in the order this collection holds them.
+pub type SuspendedProcesses = BTreeMap<String, SystemTime>;
+
+/// Why a suspension could not be recorded, for the operation to answer the error class the
+/// situation belongs to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProcessRefusal {
+    /// The request names a process outside this service's own catalog; carries what it
+    /// named.
+    UnknownProcess(String),
+}
+
+impl ProcessRefusal {
+    /// What the caller is told. ONE spelling per situation, so no two writers of a
+    /// suspension refuse the same request differently.
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnknownProcess(process) => unknown_process_message(process),
+        }
+    }
+}
+
+impl StoredGroup {
+    /// Suspend the processes `requested` names — or every process of the catalog when it
+    /// names none — as of `now`.
+    ///
+    /// Every name is checked BEFORE the first write, so a refused request leaves the
+    /// group's suspensions exactly as they were. A process already suspended keeps the
+    /// instant it was suspended at, since it has been suspended since then.
+    pub fn suspend_processes(
+        &mut self,
+        requested: &[String],
+        now: SystemTime,
+    ) -> Result<(), ProcessRefusal> {
+        let named = named_processes(requested)?;
+        for process in named {
+            self.suspended_processes.entry(process).or_insert(now);
+        }
+        Ok(())
+    }
+
+    /// Whether `process` is suspended for this group, so the group does not do what that
+    /// process does.
+    #[must_use]
+    pub fn is_process_suspended(&self, process: &str) -> bool {
+        self.suspended_processes.contains_key(process)
+    }
+
+    /// This group's suspensions as the API reports them — one `SuspendedProcess` each.
+    ///
+    /// THE ONE projection of a stored suspension onto the wire shape, so every read of the
+    /// group reports a suspension identically.
+    #[must_use]
+    pub fn suspended_process_views(&self) -> Vec<SuspendedProcess> {
+        self.suspended_processes
+            .iter()
+            .map(|(process_name, suspended_at)| SuspendedProcess {
+                process_name: Some(process_name.clone()),
+                suspension_reason: Some(suspension_reason(*suspended_at)),
+            })
+            .collect()
+    }
+}
+
+/// The processes a request names: the ones it listed, or the whole catalog when it listed
+/// none.
+///
+/// A name outside the catalog is refused here, so neither a suspension nor a resumption
+/// can write a process this service does not have.
+pub fn named_processes(requested: &[String]) -> Result<Vec<String>, ProcessRefusal> {
+    if requested.is_empty() {
+        return Ok(super::SCALING_PROCESS_TYPES
+            .iter()
+            .map(|process| (*process).to_string())
+            .collect());
+    }
+    if let Some(unknown) = requested
+        .iter()
+        .find(|candidate| !super::SCALING_PROCESS_TYPES.contains(&candidate.as_str()))
+    {
+        return Err(ProcessRefusal::UnknownProcess(unknown.clone()));
+    }
+    Ok(requested.to_vec())
+}
+
+/// The reason a group reports a process as suspended for: that a caller suspended it, and
+/// the instant they did.
+///
+/// One variable part — the instant, in RFC 3339 UTC to the second, which is the form this
+/// member carries it in; the rest is fixed text.
+pub fn suspension_reason(suspended_at: SystemTime) -> String {
+    format!("User suspended at {}", whole_seconds_text(suspended_at))
+}
+
+/// `at` as RFC 3339 UTC text truncated to the second, which is the precision a suspension
+/// reason states an instant to.
+fn whole_seconds_text(at: SystemTime) -> String {
+    let seconds = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    ::aws_smithy_types::DateTime::from_secs(i64::try_from(seconds).unwrap_or(i64::MAX))
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+}
+
+/// The message a request naming a process outside this service's own catalog is refused
+/// with, in the shape this service refuses every value outside one of its catalogs: the
+/// member as the model names it, the value from the request, and the catalog the caller has
+/// to choose from.
+pub fn unknown_process_message(process: &str) -> String {
+    format!(
+        "The ScalingProcesses value {process} is not valid: it must be one of {}",
+        super::stated_value_set(super::SCALING_PROCESS_TYPES.iter().copied())
+    )
+}

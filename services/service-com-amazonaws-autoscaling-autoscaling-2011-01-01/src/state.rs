@@ -117,6 +117,16 @@ pub use warm_pools::{
     WARMED_STATE_PREFIX, WARMED_TERMINATING,
 };
 
+/// The scaling processes a group has suspended: the collection `SuspendProcesses` writes
+/// into and `DescribeAutoScalingGroups` projects from, and what a suspended process stops
+/// the group from doing.
+pub mod suspended_processes;
+
+pub use suspended_processes::{
+    named_processes, suspension_reason, unknown_process_message, ProcessRefusal,
+    SuspendedProcesses, PROCESS_LAUNCH, PROCESS_TERMINATE,
+};
+
 /// The scaling policies of a group — what `PutScalingPolicy` creates and
 /// `DescribePolicies` reports — and the CloudWatch alarms a target-tracking policy is
 /// driven by, which live in the account's own CloudWatch store.
@@ -581,6 +591,10 @@ pub struct StoredGroup {
     /// reader and writer of this group's warm pool reaches ([`warm_pools`]), so deleting
     /// the group takes its warm pool — and the instances it holds — with it.
     pub warm_pool: Option<StoredWarmPool>,
+    /// The scaling processes suspended for this group, keyed by process name: the ONE
+    /// collection every reader and writer of a suspension of this group reaches
+    /// ([`suspended_processes`]), so deleting the group takes its suspensions with it.
+    pub suspended_processes: SuspendedProcesses,
 }
 
 impl StoredGroup {
@@ -1294,6 +1308,12 @@ impl AutoScalingState {
     /// of capacity Amazon EC2 could not place records a failed activity instead of an
     /// instance, since there is no instance to report.
     ///
+    /// A group that has suspended the process the change would use moves no instance
+    /// for it: [`PROCESS_LAUNCH`] is what adds instances on a scale-out and
+    /// [`PROCESS_TERMINATE`] is what removes them on a scale-in, so while one is
+    /// suspended the group records the capacity asked for and leaves its instances where
+    /// they are ([`suspended_processes`]).
+    ///
     /// Does nothing when `group_name` names no group. The capacity is clamped to
     /// [`MAX_GROUP_CAPACITY`] here as well as refused by the handlers, so the
     /// allocation below is bounded however it is reached.
@@ -1314,8 +1334,14 @@ impl AutoScalingState {
         let cooldown = group.default_cooldown.max(0);
         let previous = group.active_instance_count();
         let headroom = group.launch_headroom();
+        // A scale-out is the `Launch` process and a scale-in is the `Terminate` process, so
+        // a group that has either suspended does not do that half of the change: the
+        // capacity the caller asked for is still what the group holds, while the instances
+        // stay as they are ([`suspended_processes`]).
+        let launch_suspended = group.is_process_suspended(PROCESS_LAUNCH);
+        let terminate_suspended = group.is_process_suspended(PROCESS_TERMINATE);
 
-        let to_launch = if zoneless {
+        let to_launch = if zoneless || launch_suspended {
             // Without a zone to place an instance in, nothing can be launched; the
             // handlers refuse such a request before reaching here.
             0
@@ -1328,7 +1354,11 @@ impl AutoScalingState {
                 .clamp(0, MAX_GROUP_CAPACITY)
                 .min(headroom)
         };
-        let to_terminate = (previous - desired_capacity).max(0);
+        let to_terminate = if terminate_suspended {
+            0
+        } else {
+            (previous - desired_capacity).max(0)
+        };
         let due = now + LIFECYCLE_TRANSITION;
 
         let wanted = usize::try_from(to_launch).unwrap_or(0);
