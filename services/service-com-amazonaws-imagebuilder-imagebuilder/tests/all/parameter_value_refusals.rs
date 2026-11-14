@@ -14,7 +14,8 @@
 //! response answers named in the body's `requestId`.
 //!
 //! The rows span what the rule generalises over: the constraint class the value broke (a
-//! pattern, either `@range` bound, an enumerated value set), how deep in the request the
+//! pattern, either `@range` bound, an enumerated value set, a list below its `@length`
+//! minimum), how deep in the request the
 //! parameter sits (a top-level member, a member of a structure, a member inside a list
 //! element, a list element's own structure member), which operation carries it, and — for
 //! the expression an ARN member's value had to match — whether the value was read out of the
@@ -540,6 +541,99 @@ async fn a_requirement_over_two_parameters_together_names_both() {
         let answered = call(&router, case, "PUT", "/CreateComponent", Some(body)).await;
         assert_refused(case, &answered, expected);
     }
+}
+
+/// One row of the collection-minimum table: the case, the request (method, URI, body), the
+/// parameter the refusal names and the requirement it states for it.
+type CollectionRow<'a> = (&'a str, &'a str, &'a str, Option<Value>, &'a str, &'a str);
+
+#[tokio::test]
+async fn a_list_shorter_than_its_minimum_is_refused_as_that_parameters_value() {
+    let router = emulator();
+
+    // The modelled minimums each row breaks, from
+    // `smithy_query(query="shape",shape="ComponentConfigurationList,OsVersionList,TagMap")`:
+    // a recipe's `components` is a list of at least 1, `supportedOsVersions` a list of 1..25,
+    // and `tags` a MAP of 1..50.
+    let rows: Vec<CollectionRow> = vec![
+        (
+            "an empty components list on an image recipe",
+            "PUT",
+            "/CreateImageRecipe",
+            Some(json!({
+                "name": "probe-recipe",
+                "semanticVersion": "1.0.0",
+                "parentImage": "ami-0123456789abcdef0",
+                "clientToken": "ltok-0001",
+                "components": [],
+            })),
+            "components",
+            "components must contain at least 1 items",
+        ),
+        (
+            // The same member on another operation: the clause follows the constraint, not
+            // the operation.
+            "an empty components list on a container recipe",
+            "PUT",
+            "/CreateContainerRecipe",
+            Some(json!({
+                "name": "probe-container-recipe",
+                "semanticVersion": "1.0.0",
+                "containerType": "DOCKER",
+                "parentImage": "amazonlinux:latest",
+                "targetRepository": {"service": "ECR", "repositoryName": "probe"},
+                "clientToken": "ltok-0002",
+                "components": [],
+            })),
+            "components",
+            "components must contain at least 1 items",
+        ),
+        (
+            "an empty supportedOsVersions list on a component",
+            "PUT",
+            "/CreateComponent",
+            Some(component_body(
+                "probe-component",
+                "1.0.0",
+                "ltok-0003",
+                json!({"supportedOsVersions": []}),
+            )),
+            "supportedOsVersions",
+            "supportedOsVersions must contain at least 1 items",
+        ),
+    ];
+
+    for (case, method, uri, body, parameter, requirement) in &rows {
+        let answered = call(&router, case, method, uri, body.as_ref()).await;
+        assert_refused(case, &answered, &expected_message(parameter, requirement));
+    }
+
+    // A MAP under its own minimum is a different finding — the walk counts its ENTRIES, not
+    // items — so it keeps the wording the framework states for it rather than this sentence.
+    let case = "an empty tags map on a component";
+    let answered = call(
+        &router,
+        case,
+        "PUT",
+        "/CreateComponent",
+        Some(&component_body(
+            "probe-component",
+            "1.0.0",
+            "ltok-0004",
+            json!({"tags": {}}),
+        )),
+    )
+    .await;
+    assert_eq!(
+        answered.status, 400,
+        "case {case:?}: expected HTTP 400, got {} with {}",
+        answered.status, answered.body
+    );
+    assert!(
+        !answered.message.contains("must contain at least"),
+        "case {case:?}: expected the framework's own wording for a map, got {:?}",
+        answered.message
+    );
 }
 
 #[tokio::test]

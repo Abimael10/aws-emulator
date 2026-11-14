@@ -44,6 +44,11 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 # names against the account's own IAM before writing anything. Only the generated client is
 # needed — the emulator supplies the transport.
 aws-sdk-iam = { version = "1", default-features = false }
+# The AWS SDK for EC2, driven over the same in-process callback: `CreateImageRecipe`
+# resolves an AMI id named by `parentImage` against the account's own EC2 before writing
+# anything, an AMI being EC2's resource. Only the generated client is needed — the emulator
+# supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -60,6 +65,10 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # names is one a `CreateInstanceProfile` really created — and a name nothing created
 # resolves to nothing.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# EC2, mounted beside imagebuilder on one engine so the AMI a recipe's `parentImage` names
+# is one the account's own image catalog really holds — and an id nothing holds resolves to
+# nothing.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

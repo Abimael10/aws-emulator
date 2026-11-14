@@ -22,12 +22,14 @@
 //! ## Which requirement it states
 //!
 //! The one the value broke, for the constraint classes this service's recorded refusals
-//! establish a clause for: a `@pattern`, a `@range` bound, and an enumerated value set. A
-//! class they do not — a `@length` bound, a repeated element of a `@uniqueItems` list, a
-//! member the shape requires and the request omits — is left to the framework's own
+//! establish a clause for: a `@pattern`, a `@range` bound, an enumerated value set, and the
+//! `@length` MINIMUM of a COLLECTION ([`must_contain_at_least`]). A class they do not — a
+//! `@length` bound on a STRING, a `@length` maximum, a repeated element of a `@uniqueItems`
+//! list, a member the shape requires and the request omits — is left to the framework's own
 //! refusal rather than being given a clause this service has never been seen to state.
-//! One of them, the `@range` MINIMUM, this service words its own way
-//! ([`must_be_at_least`]); every other clause is the shared statement of it.
+//! Two of them, the `@range` MINIMUM and a collection's, this service words its own way
+//! ([`must_be_at_least`], [`must_contain_at_least`]); every other clause is the shared
+//! statement of it.
 //!
 //! ## How it quotes an ARN expression, and why that is per BINDING
 //!
@@ -56,7 +58,7 @@
 
 use service_common::validation::SubmittedEcho;
 use service_common::validation_message::{
-    api_parameter_path, must_be_at_most, must_be_one_of, must_match_pattern,
+    api_parameter_path, list_item_count, must_be_at_most, must_be_one_of, must_match_pattern,
     parameter_value_mismatch, pattern_requirement_unstated,
 };
 use smithy_server_runtime::{Refused, Violation, ViolationKind};
@@ -141,6 +143,18 @@ fn must_be_at_least(member: &str, bound: &str) -> String {
     format!("{member} must be bigger than or equal to {bound}")
 }
 
+/// The requirement clause this service states for a COLLECTION member carrying fewer items
+/// than its `@length` minimum: how many items that member has to carry.
+///
+/// A collection has no scalar rendering, so the clause states the COUNT the member had to
+/// reach rather than the length of a value — which is how this service's recorded refusal of
+/// an empty list reads, and why the clause is stated here instead of being taken from
+/// `service_common::validation_message`. The count is written as the model declares the bound,
+/// so a minimum of one reads the same way a minimum of several does.
+fn must_contain_at_least(member: &str, bound: i64) -> String {
+    format!("{member} must contain at least {bound} items")
+}
+
 /// The requirement clause this service states for `violation`, naming the parameter as
 /// `member` spells it, or `None` for a constraint class no recorded refusal of this service
 /// establishes a clause for — which keeps the framework's own wording for it rather than
@@ -151,6 +165,16 @@ fn requirement(member: &str, violation: &Violation, form: StatedPattern) -> Opti
         ViolationKind::MaxValue(bound) => Some(must_be_at_most(member, bound)),
         ViolationKind::MinValue(bound) => Some(must_be_at_least(member, bound)),
         ViolationKind::EnumValue(values) => Some(must_be_one_of(member, values)),
+        // A `@length` minimum is stated for a LIST and left to the framework for a string:
+        // which one broke it is read from the validating walk's own rendering of the size it
+        // checked (`<n> items`), through this tree's one reading of that rendering, so a
+        // string whose minimum was broken — and an absent member, which the walk renders no
+        // size for — keeps the framework's wording.
+        ViolationKind::MinLength(bound) => violation
+            .value
+            .as_deref()
+            .and_then(list_item_count)
+            .map(|_| must_contain_at_least(member, *bound)),
         _ => None,
     }
 }
@@ -362,8 +386,66 @@ mod tests {
                 ),
             ),
             (
-                "a length bound, which this service has not been seen to state",
+                "a length bound on a string, which this service has not been seen to state",
                 violation("description", ViolationKind::MaxLength(1024)),
+                None,
+            ),
+            (
+                "an empty list under its minimum",
+                (
+                    Violation {
+                        path: "components".to_owned(),
+                        kind: ViolationKind::MinLength(1),
+                        value: Some("0 items".to_owned()),
+                        sensitive: false,
+                    },
+                    SubmittedEcho::Rendered("[]".to_owned()),
+                ),
+                Some(
+                    "The value supplied for parameter 'components' is not valid. components \
+                     must contain at least 1 items",
+                ),
+            ),
+            (
+                "a list under a minimum of several, inside a structure member",
+                (
+                    Violation {
+                        path: "supportedOsVersions".to_owned(),
+                        kind: ViolationKind::MinLength(2),
+                        value: Some("1 items".to_owned()),
+                        sensitive: false,
+                    },
+                    SubmittedEcho::Rendered("[one]".to_owned()),
+                ),
+                Some(
+                    "The value supplied for parameter 'supportedOsVersions' is not valid. \
+                     supportedOsVersions must contain at least 2 items",
+                ),
+            ),
+            (
+                "a string under its minimum, which keeps the framework's wording",
+                (
+                    Violation {
+                        path: "nextToken".to_owned(),
+                        kind: ViolationKind::MinLength(1),
+                        value: Some(String::new()),
+                        sensitive: false,
+                    },
+                    SubmittedEcho::Rendered(String::new()),
+                ),
+                None,
+            ),
+            (
+                "an absent member carrying a length minimum, which renders no size",
+                (
+                    Violation {
+                        path: "components".to_owned(),
+                        kind: ViolationKind::MinLength(1),
+                        value: None,
+                        sensitive: false,
+                    },
+                    SubmittedEcho::Unrendered,
+                ),
                 None,
             ),
             (

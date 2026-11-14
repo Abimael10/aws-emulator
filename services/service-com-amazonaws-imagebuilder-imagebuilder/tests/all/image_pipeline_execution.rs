@@ -473,8 +473,9 @@ async fn pipeline_over_a_recipe(router: &MultiServiceRouter, slug: &str) -> Stri
     .await
 }
 
-/// A start that names an ARN this Region holds no pipeline under is reported missing, and
-/// so is a start whose pipeline no longer has a recipe to build.
+/// A start that names an ARN this Region holds no pipeline under is reported missing; and a
+/// stored pipeline always has a recipe to build, because a recipe a pipeline references
+/// cannot be deleted while that pipeline stands.
 #[tokio::test]
 async fn a_start_naming_nothing_stored_is_reported_missing() {
     let router = emulator();
@@ -501,28 +502,39 @@ async fn a_start_naming_nothing_stored_is_reported_missing() {
     )
     .await;
 
-    // A pipeline whose recipe is deleted after the pipeline was created: the run has
-    // nothing to build, and the resource it names is the RECIPE.
-    let orphan_component = create_component(&router, REGION, "orphan-component").await;
-    let orphan_recipe = create_recipe(
+    // A pipeline whose recipe is still stored: the recipe cannot be deleted out from under
+    // it — a delete of a resource a pipeline references is refused — so a stored pipeline
+    // always has a recipe to build, and the only way a start is answered MISSING is the
+    // pipeline itself.
+    let standing_component = create_component(&router, REGION, "standing-component").await;
+    let standing_recipe = create_recipe(
         &router,
         REGION,
-        "orphan-recipe",
+        "standing-recipe",
         "1.0.0",
-        &orphan_component,
+        &standing_component,
     )
     .await;
-    let orphan_configuration = create_configuration(&router, REGION, "orphan-infra").await;
-    let orphan = create_pipeline(
+    let standing_configuration = create_configuration(&router, REGION, "standing-infra").await;
+    create_pipeline(
         &router,
         REGION,
-        "orphan-pipeline",
-        &orphan_recipe,
-        &orphan_configuration,
+        "standing-pipeline",
+        &standing_recipe,
+        &standing_configuration,
     )
     .await;
-    let (status, body) = delete_recipe(&router, REGION, &orphan_recipe).await;
-    assert_ok("delete the recipe the orphan pipeline builds", status, body);
+    let case = "delete the recipe the standing pipeline builds";
+    let (status, body) = delete_recipe(&router, REGION, &standing_recipe).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400 while the pipeline stands, got {status} with {body}"
+    );
+    let code = error_code(case, &body);
+    assert_eq!(
+        code, "ResourceDependencyException",
+        "case {case:?}: expected ResourceDependencyException, got {code:?} with {body}"
+    );
 
     for (case, arn, resource_type, named) in [
         (
@@ -542,12 +554,6 @@ async fn a_start_naming_nothing_stored_is_reported_missing() {
             pipeline_arn(REGION, "kept-pipeline-2"),
             "ImagePipeline",
             None,
-        ),
-        (
-            "a pipeline whose recipe was deleted",
-            orphan.clone(),
-            "ImageRecipe",
-            Some(orphan_recipe.clone()),
         ),
     ] {
         let (status, body) = start_pipeline(&router, REGION, &arn, &format!("token-{case}"), &[]).await;

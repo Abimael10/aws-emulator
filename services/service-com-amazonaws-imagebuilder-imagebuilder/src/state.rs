@@ -110,6 +110,16 @@ pub use imported_component::*;
 mod instance_profile;
 pub use instance_profile::*;
 
+/// Which identifiers name the base image a recipe builds from, and whether the image one
+/// names exists.
+mod parent_image;
+pub use parent_image::*;
+
+/// Which stored resource still references the resource a delete names. The module adds
+/// methods to this service's state rather than items of its own, so there is nothing to
+/// re-export from it.
+mod dependents;
+
 /// How a workflow step that has paused for a caller to respond is FILED in this store.
 mod waiting_workflow_steps;
 pub use waiting_workflow_steps::*;
@@ -4353,8 +4363,19 @@ pub fn incomplete_filter_message() -> String {
 /// acts on, and a resource a create has to resolve a reference to.
 #[must_use]
 pub fn required_resource_not_found_message(arn: &str) -> String {
-    let resource_type = arn_resource_type(arn);
-    format!("The following required resource '{resource_type}' cannot be found: '{arn}'.")
+    missing_resource_message(&arn_resource_type(arn), arn)
+}
+
+/// [`required_resource_not_found_message`] for a resource whose KIND the identifier does not
+/// carry: the resource type is named by the caller instead.
+///
+/// One sentence for every missing resource this service reports, whether the identifier that
+/// named it is an ARN of this service (whose own resource type is read from it) or an
+/// identifier of another service's resource a create had to resolve — an AMI id, which names
+/// EC2's [`IMAGE_RESOURCE_TYPE`]. The identifier is reported as the request carried it.
+#[must_use]
+pub fn missing_resource_message(resource_type: &str, identifier: &str) -> String {
+    format!("The following required resource '{resource_type}' cannot be found: '{identifier}'.")
 }
 
 /// The resource-type token a missing-resource report names the resource `arn` identifies

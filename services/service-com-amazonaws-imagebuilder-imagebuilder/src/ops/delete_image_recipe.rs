@@ -9,6 +9,12 @@
 //! it does not hold, so a repeat of a delete that already succeeded is reported the same
 //! way.
 //!
+//! A recipe another stored resource still REFERENCES is not removed at all:
+//! `ResourceDependencyException` is the modelled answer for "a resource with a dependency
+//! that prohibits this action", and an image pipeline holds the recipe reference each of its
+//! runs builds ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::pipeline_depending_on_image_recipe`]),
+//! so while such a pipeline stands the delete is refused and the recipe stays readable.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -182,11 +188,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
-        let removed = state
-            .lock()
-            .remove_image_recipe(&input.image_recipe_arn, &region);
+        // The dependency check and the removal happen under ONE lock, so a pipeline cannot
+        // be created against the recipe between the two.
+        let mut store = state.lock();
 
-        let Some(removed) = removed else {
+        // The modelled input names one stored recipe exactly, so an ARN this Region holds
+        // nothing under is reported MISSING before anything else is asked. The record's own
+        // ARN is read here, which is what the answer below reports: the response names the
+        // record this call removed rather than echoing the request.
+        let Some(arn) = store
+            .image_recipe(&input.image_recipe_arn, &region)
+            .map(|record| record.arn.clone())
+        else {
             return Err(DeleteImageRecipeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::required_resource_not_found_message(
@@ -197,11 +210,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A recipe an image pipeline still references is not removed: the pipeline's
+        // reference is what each of its runs builds, so while it stands the recipe is in
+        // use.
+        if store
+            .pipeline_depending_on_image_recipe(&input.image_recipe_arn)
+            .is_some()
+        {
+            return Err(DeleteImageRecipeErrorModeled::ResourceDependencyException(
+                ResourceDependencyException {
+                    message: Some(crate::state::resource_dependency_message(
+                        &input.image_recipe_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.remove_image_recipe(&input.image_recipe_arn, &region);
+        drop(store);
+
         Ok(DeleteImageRecipeOutput {
             request_id: Some(crate::state::new_request_id()),
-            // The ARN of the record this call removed, read back from it rather than
-            // echoed from the request.
-            image_recipe_arn: Some(removed.arn),
+            // The ARN of the record this call removed, read off that record above rather
+            // than echoed from the request.
+            image_recipe_arn: Some(arn),
         })
     }
 }

@@ -12,6 +12,15 @@
 //!   that bound, and the `x` wildcard the version pattern admits for FILTERING, are values
 //!   of that parameter this service cannot accept, refused the way it refuses every such
 //!   value;
+//! * `parentImage` names the base image the recipe builds from, "using one of the following
+//!   options: AMI ID, Image Builder image Amazon Resource Name (ARN), … Systems Manager
+//!   (SSM) Parameter Store Parameter, prefixed by `ssm:` … Marketplace product ID", so a
+//!   value in none of those forms is a value of that parameter this service cannot accept,
+//!   refused the way it refuses every such value; and since "if you enter an AMI ID … you
+//!   must have access to the AMI. The AMI must also be in the Region where you're creating
+//!   the recipe", an AMI id is RESOLVED against Amazon EC2 before anything is stored
+//!   ([`crate::state::parent_image_resolved`]) and one EC2 reports no image for is reported
+//!   MISSING;
 //! * every `componentArn` must name a stored component, resolved the way every other
 //!   component reference is, each component named only once "regardless of version", at
 //!   most the documented 20 per recipe, and the components of one recipe all target one
@@ -308,8 +317,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // "The base image for customizations specified in the image recipe. You can specify
+        // the parent image using one of the following options: AMI ID, Image Builder image
+        // Amazon Resource Name (ARN), ... Systems Manager (SSM) Parameter Store Parameter,
+        // prefixed by ssm:, ... Marketplace product ID". The modelled member is an
+        // unconstrained non-empty string, so a value that is none of those forms names no
+        // base image at all and is refused as that parameter's value
+        // ([`crate::state::is_supported_parent_image`]) — BEFORE the store is read, so the
+        // form of the value is examined whatever else the request would have collided with.
+        if !crate::state::is_supported_parent_image(&input.parent_image) {
+            return Err(
+                CreateImageRecipeErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::unsupported_parent_image_message(
+                            &input.parent_image,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let fingerprint = crate::state::image_recipe_request_fingerprint(&input);
         let arn = crate::state::image_recipe_arn(&region, &input.name, &input.semantic_version);
+
+        // "If you retry a request with the same client token, Image Builder returns the
+        // original response without running the operation again" — answered BEFORE the base
+        // image is resolved, so a retry carrying a token that already succeeded runs
+        // nothing and cannot be refused for an image that has since been deregistered. The
+        // check is repeated under the lock that writes, which is what settles a token two
+        // requests carry at once.
+        if let Some(answered) =
+            answered_before(&state.lock(), &region, &input.client_token, &fingerprint)
+        {
+            return answered;
+        }
+
+        // "If you enter an AMI ID or an SSM parameter that contains the AMI ID, you must
+        // have access to the AMI. The AMI must also be in the Region where you're creating
+        // the recipe" — an AMI is Amazon EC2's resource, so the identifier is resolved
+        // against EC2 before anything is written, and an id it reports no image for is
+        // reported MISSING. A lookup nothing answered establishes nothing and refuses
+        // nothing (see [`crate::state::parent_image_resolved`]).
+        if crate::state::parent_image_resolved(ctx, &region, &input.parent_image).await
+            == crate::state::ParentImageLookup::Absent
+        {
+            return Err(CreateImageRecipeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::missing_parent_image_message(
+                        &input.parent_image,
+                    )),
+                },
+            )
+            .into());
+        }
 
         // "A recipe can contain a maximum of 20 build and test components in any
         // combination, by default." The modelled list carries no maximum of its own, so
@@ -334,35 +395,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to take the lock stores the recipe and every other one sees it.
         let mut store = state.lock();
 
-        // "If you retry a request with the same client token, Image Builder returns the
-        // original response without running the operation again" — down to its
-        // `requestId`.
-        if let Some(receipt) = store.create_receipt(
-            crate::state::CREATE_IMAGE_RECIPE_OPERATION,
-            &region,
-            &input.client_token,
-        ) {
-            if receipt.fingerprint != fingerprint {
-                return Err(
-                    CreateImageRecipeErrorModeled::IdempotentParameterMismatchException(
-                        IdempotentParameterMismatchException {
-                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            return Ok(CreateImageRecipeOutput {
-                request_id: Some(receipt.request_id.clone()),
-                client_token: Some(receipt.client_token.clone()),
-                image_recipe_arn: Some(receipt.arn.clone()),
-                // The ORIGINAL response, down to the wildcard references the resource
-                // that request created is reached by.
-                latest_version_references: crate::state::latest_version_references(
-                    &receipt.arn,
-                    crate::state::IMAGE_RECIPE_ARN_PREFIX,
-                ),
-            });
+        // The token again, now under the lock that writes: a token this request did not see
+        // above because another request was carrying it at the same time is settled here.
+        if let Some(answered) = answered_before(&store, &region, &input.client_token, &fingerprint)
+        {
+            return answered;
         }
 
         if store.image_recipes.contains_key(&arn) {
@@ -476,4 +513,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         })
     }
+}
+
+/// What this request has ALREADY been answered, when its `clientToken` names a create that
+/// succeeded: the original response, or the mismatch a token carrying different creation
+/// parameters earns. `None` when the token names nothing yet, which is the request's to run.
+///
+/// "If you retry a request with the same client token, Image Builder returns the original
+/// response without running the operation again" — down to its `requestId` — so this is
+/// answered before the base image is resolved, and again under the lock that writes.
+fn answered_before(
+    store: &crate::state::ComAmazonawsImagebuilderImagebuilderState,
+    region: &str,
+    client_token: &str,
+    fingerprint: &str,
+) -> Option<Result<CreateImageRecipeOutput, CreateImageRecipeError>> {
+    let receipt =
+        store.create_receipt(crate::state::CREATE_IMAGE_RECIPE_OPERATION, region, client_token)?;
+    if receipt.fingerprint != fingerprint {
+        return Some(Err(
+            CreateImageRecipeErrorModeled::IdempotentParameterMismatchException(
+                IdempotentParameterMismatchException {
+                    message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                },
+            )
+            .into(),
+        ));
+    }
+    Some(Ok(CreateImageRecipeOutput {
+        request_id: Some(receipt.request_id.clone()),
+        client_token: Some(receipt.client_token.clone()),
+        image_recipe_arn: Some(receipt.arn.clone()),
+        // The ORIGINAL response, down to the wildcard references the resource that request
+        // created is reached by.
+        latest_version_references: crate::state::latest_version_references(
+            &receipt.arn,
+            crate::state::IMAGE_RECIPE_ARN_PREFIX,
+        ),
+    }))
 }

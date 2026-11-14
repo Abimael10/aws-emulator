@@ -49,6 +49,8 @@ mod infrastructure_configuration_update;
 mod modelled_range_bounds;
 #[path = "all/parameter_value_refusals.rs"]
 mod parameter_value_refusals;
+#[path = "all/parent_image_and_dependencies.rs"]
+mod parent_image_and_dependencies;
 #[path = "all/recipe_group_and_pipeline_listing.rs"]
 mod recipe_group_and_pipeline_listing;
 #[path = "all/resource_not_found.rs"]

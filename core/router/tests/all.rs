@@ -3777,6 +3777,8 @@ mod iam_denial_reason_attribution;
 // which is `E0753` anywhere but the head of a file — so it is an ordinary comment here.)
 // This file and every service crate's `tests/all.rs` are checked by that suite.
 // A suite left at the top level of `tests/` fails the build.
+// (And the same line again, which a landing left typed with `//!` in this tail: an inner
+// doc comment is `E0753` anywhere but the head of a crate root, so it is a plain comment.)
 // (The line above once more, as it was appended here with `//!`: an inner doc comment is
 // only legal before the first item, so it is a plain comment.)
 // suite left at the top level of `tests/` fails the build. (An ordinary comment, for the
@@ -3843,6 +3845,13 @@ mod cloudformation_provisions_redshift_snapshot_copy_grants;
 // top level of `tests/` fails the build.)
 // only before the first item, so it stands as an ordinary comment — the suite-declaration
 // check covers this file and every service crate's `tests/all.rs`.)
+// (One more fragment of this file's own header landed in this tail typed with `//!`: an
+// inner doc comment is legal only before the first item of a crate root, so it is `E0753`
+// here. The rule it repeated — declare each suite exactly ONCE, since a second `mod` for
+// one name is `E0428` and fails every suite in this target — stands in the module doc at
+// the HEAD of this file, and `all/all_rs_declares_each_suite_once.rs` and
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` are what check both halves of
+// it, so the fragment is gone rather than re-typed.)
 #[path = "all/cloudwatch_cfn_alarm_action_topic_policy.rs"]
 mod cloudwatch_cfn_alarm_action_topic_policy;
 // Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the
@@ -3910,6 +3919,9 @@ mod cloudwatch_cfn_alarm_action_topic_policy;
 // doc comment is legal only before the first item of this crate root, so a `//!` line in
 // this tail is `E0753` and compiles no suite of this target.)
 // doc comment is only legal before the first item of this crate root.)
+// (Two more lines of that header fragment, plain comments here for the same reason:
+// `all/all_rs_declares_each_suite_once.rs` checks this file and every service crate's
+// `tests/all.rs`, so check there rather than leaving a note in this tail.)
 // this file and for every service crate's `tests/all.rs`, and
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks that a note like this
 // one stays HERE: an inner doc comment past the first item is `E0753`, so the same note
@@ -3943,6 +3955,12 @@ mod cloudwatch_cfn_alarm_action_topic_policy;
 // (An appended fragment of the module doc: it stands as an ordinary comment because an
 // inner doc comment is only legal before the first item.) This file and every service
 // crate's `tests/all.rs` are checked by `all/all_rs_declares_each_suite_once.rs`.
+// (Four more lines of that same header fragment, appended into this tail by a landing and
+// kept as ordinary comments for the reason above: declare each suite exactly ONCE, since
+// this is one crate root and a second `mod` for one name is `E0428`, and a note written
+// with `//!` anywhere but the header is `E0753` — either fails every suite in this target;
+// `all/all_rs_declares_each_suite_once.rs` checks the declarations, for this file and for
+// every service crate's `tests/all.rs`.)
 // header that a landing appended here: past the first item a `//!` line is `E0753` and
 // compiles no suite in this target, so it stands as an ordinary comment.)
 // an ordinary comment for the reason the lines around it record.)
