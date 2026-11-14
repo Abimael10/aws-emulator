@@ -244,14 +244,14 @@ async fn the_refusal_is_the_same_sentence_for_every_rejected_value() {
     }
 }
 
-/// A refusal of another constraint class keeps the framework's own wording, value and all:
-/// only the `@pattern` class is reworded, and an absent required member is still stated as
-/// `Value null at '<member>'`.
+/// A refusal of another constraint class states no value either — the clause names the member
+/// and the requirement whatever class it is about, and a member the request did NOT carry is
+/// stated the same way: `Value at '<member>' … Member must not be null`.
 #[tokio::test]
-async fn another_constraint_class_keeps_its_own_clause() {
+async fn another_constraint_class_states_the_requirement_and_no_value() {
     let router = router();
 
-    // An absent required member: the deserializer's refusal, not the constraint walk's.
+    // An absent required member, which carried no value to withhold in the first place.
     let (status, error_type, body) = send_in(
         &router,
         "PUT",
@@ -269,13 +269,13 @@ async fn another_constraint_class_keeps_its_own_clause() {
     assert_eq!(
         body["message"].as_str(),
         Some(
-            "1 validation error detected: Value null at 'kmsKeyId' failed to satisfy constraint: \
+            "1 validation error detected: Value at 'kmsKeyId' failed to satisfy constraint: \
              Member must not be null"
         ),
         "an absent kmsKeyId: unexpected refusal wording, got {body}"
     );
 
-    // A value outside a `@length` bound: the clause still quotes what was submitted.
+    // A value outside a `@length` bound: the clause states the bound and not the value.
     let too_long = "x".repeat(129);
     let (status, _, body) = send_in(
         &router,
@@ -289,11 +289,8 @@ async fn another_constraint_class_keeps_its_own_clause() {
     assert_eq!(
         body["message"].as_str(),
         Some(
-            format!(
-                "1 validation error detected: Value '{too_long}' at 'arn' failed to satisfy \
-                 constraint: Member must have length less than or equal to 128"
-            )
-            .as_str()
+            "1 validation error detected: Value at 'arn' failed to satisfy constraint: Member \
+             must have length less than or equal to 128"
         ),
         "a filter ARN over its bound: unexpected refusal wording, got {body}"
     );

@@ -655,6 +655,33 @@ pub fn in_pattern_first_order(violations: &[Violation]) -> Vec<&Violation> {
     keyed.into_iter().map(|(_, violation)| violation).collect()
 }
 
+/// The violations of ONE refusal in the order a front door states them that reports its
+/// clauses by MEMBER PATH: the paths compared as text, so a request breaking two members'
+/// constraints is refused with the same message whichever order it listed those members in.
+///
+/// The framework's walk reports violations in the order it REACHED them — the input shape's
+/// member order for a value it read, the deserializer's for a member that was absent — which
+/// is a fact about the model rather than about the request. A front door that holds its
+/// findings by the member they name states them in this order instead.
+///
+/// STABLE, and over the path alone, so two requirements of ONE member keep the order the walk
+/// collected them in and only the members move. Only the ORDER changes: each clause, its
+/// member path and its requirement stay the framework's, so a service that takes this cannot
+/// word a constraint differently from one that does not. A service hands its violations
+/// through this before the envelope is rendered.
+///
+/// THE HOME for this order:
+/// `services/service-com-amazonaws-personalizeevents-amazonpersonalizeevents`'s
+/// `in_member_path_order`, and `directoryservicedata-directoryservicedata` and
+/// `osis-amazonopensearchingestionservice` inline, each carry the same sort, written before
+/// this module had one, and are to be migrated onto this function rather than copied again.
+#[must_use]
+pub fn in_member_path_order(violations: &[Violation]) -> Vec<&Violation> {
+    let mut ordered: Vec<&Violation> = violations.iter().collect();
+    ordered.sort_by(|one, other| one.path.cmp(&other.path));
+    ordered
+}
+
 /// A service's own statement of the value sets it lists in an order of its own: one row
 /// per enumerated type, holding the values as the MODEL declares them and the values as
 /// the SERVICE states them, in the order it states them.
@@ -1973,7 +2000,7 @@ mod tests {
         aws_validation_refusal_withholding_with, element_set_requirement, enum_value_bucket,
         enum_value_not_found,
         envelope_over, float_value_text, hashed_enum_order, in_float_value_rendering,
-        in_hashed_enum_order, in_pattern_first_order, in_stated_enum_order,
+        in_hashed_enum_order, in_member_path_order, in_pattern_first_order, in_stated_enum_order,
         instance_type_mismatch, map_key_refusal,
         map_key_refusal_quoting, map_key_requirements_refusal, must_be_at_least, must_be_at_most,
         must_be_one_of,
@@ -2067,6 +2094,67 @@ mod tests {
                     ("second", true),
                     ("second", false),
                 ],
+            ),
+            ("no violation at all", Vec::new(), Vec::new()),
+        ];
+
+        for (case, violations, expected) in cases {
+            let actual = stated(&violations);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the order {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the clauses come out ordered by the member path each is stated at, with two
+    /// requirements of one member in the order the walk collected them.
+    ///
+    /// The rows span what the order generalises over: two members the walk reported in the
+    /// wrong order and in the right one, a nested path against a top-level one, a member with
+    /// two requirements, and the empty refusal.
+    #[test]
+    fn the_clauses_come_out_ordered_by_member_path() {
+        /// The `(path, is a pattern)` pairs one ordering produced, as a reader sees them.
+        fn stated(violations: &[Violation]) -> Vec<(&str, bool)> {
+            in_member_path_order(violations)
+                .into_iter()
+                .map(|violation| {
+                    (
+                        violation.path.as_str(),
+                        matches!(violation.kind, ViolationKind::Pattern(_)),
+                    )
+                })
+                .collect()
+        }
+
+        let pattern = |path: &str| violation(path, ViolationKind::Pattern("^[a-z]+$".to_owned()), "NOPE");
+        let length = |path: &str| violation(path, ViolationKind::MinLength(1), "");
+
+        /// One row: the case, the violations the walk collected, and the order they come out
+        /// in.
+        type Row = (&'static str, Vec<Violation>, Vec<(&'static str, bool)>);
+
+        let cases: [Row; 5] = [
+            (
+                "two members the walk reported in the other order",
+                vec![length("name"), pattern("accountId")],
+                vec![("accountId", true), ("name", false)],
+            ),
+            (
+                "the same two in the order the paths already sort",
+                vec![pattern("accountId"), length("name")],
+                vec![("accountId", true), ("name", false)],
+            ),
+            (
+                "a nested member beside a top-level one",
+                vec![length("resourceId"), pattern("filterCriteria.comparison")],
+                vec![("filterCriteria.comparison", true), ("resourceId", false)],
+            ),
+            (
+                "two requirements of one member, which keep the walk's order",
+                vec![length("name"), pattern("name")],
+                vec![("name", false), ("name", true)],
             ),
             ("no violation at all", Vec::new(), Vec::new()),
         ];

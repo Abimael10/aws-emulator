@@ -17,6 +17,8 @@ mod cis_scan_configurations;
 mod cis_sessions;
 #[path = "all/code_security_scan_configurations.rs"]
 mod code_security_scan_configurations;
+#[path = "all/constraint_refusal_wording.rs"]
+mod constraint_refusal_wording;
 #[path = "all/ec2_deep_inspection.rs"]
 mod ec2_deep_inspection;
 #[path = "all/encryption_key.rs"]
