@@ -14,6 +14,11 @@
 //! reports `OfflineStoreStatus` `Blocked` with a `BlockedReason` until the permission is
 //! restored.
 //!
+//! A DELETION is replicated into the same store, under the same role — "In both cases,
+//! Feature Store appends the deleted record marker to the OfflineStore" (`DeleteRecord`) — so
+//! the store is APPEND-ONLY either way: every write this data plane accepts adds one more
+//! object and changes none of the objects already there.
+//!
 //! The four services the rule spans are mounted on ONE shared engine, exactly as the router
 //! mounts them: this data plane, the SageMaker control plane that defines the group, IAM
 //! which holds the role and answers what it may do, and Amazon S3 which holds the objects.
@@ -134,6 +139,12 @@ impl Aws {
             None,
         )
         .await
+    }
+
+    /// `DELETE /FeatureGroup/<group>?…` — one `DeleteRecord`, answering its status and body.
+    async fn delete_record(&self, group: &str, query: &str) -> (u16, Value) {
+        self.data_plane("DELETE", &format!("/FeatureGroup/{group}?{query}"), None)
+            .await
     }
 
     /// One path-style Amazon S3 request.
@@ -841,5 +852,451 @@ async fn a_batch_write_replicates_every_entry_including_a_historic_one() {
         vec!["newer".to_string()],
         "case {case:?}: the historic entry must not overwrite the online record, got \
          {answered}"
+    );
+}
+
+/// The event time the record seeded before a deletion run carries.
+const SEED_EVENT_TIME: &str = "2026-06-01T07:08:09Z";
+
+/// The payload that seeded record carries, so an INGESTED row can be told from a marker.
+const SEEDED_PAYLOAD: &str = "seeded";
+
+/// The `is_deleted` column of a DELETE MARKER row, as a Parquet row renders it.
+const DELETED_COLUMN_TRUE: &str = "is_deleted: true";
+
+/// The `is_deleted` column of an ingested row; see [`DELETED_COLUMN_TRUE`].
+const DELETED_COLUMN_FALSE: &str = "is_deleted: false";
+
+/// One deletion of a run.
+struct Deletion {
+    /// The `DeletionMode` the request carries, as the query string spells it — empty for the
+    /// defaulted mode, which is `SoftDelete`.
+    mode: &'static str,
+    /// The record the deletion names.
+    identifier: &'static str,
+    /// The `EventTime` it carries.
+    event_time: &'static str,
+    /// The status it must answer.
+    status: u16,
+    /// The partition the marker it appends must land in, and `None` for a deletion that
+    /// appends none.
+    partition: Option<&'static str>,
+}
+
+/// One row of the deletion-run table: a feature group, the records seeded into it and the
+/// deletions then made against it, in order.
+struct Run {
+    case: &'static str,
+    /// The feature group the deletions are made against.
+    group: &'static str,
+    /// The bucket its offline store lives in; a row's own, so its listing holds only its
+    /// own objects.
+    bucket: &'static str,
+    /// Whether the group keeps an OnlineStore beside its OfflineStore.
+    online: bool,
+    /// The records ingested before the run, each at [`SEED_EVENT_TIME`].
+    seeded: &'static [&'static str],
+    /// The deletions, made in this order.
+    deletions: &'static [Deletion],
+}
+
+/// RULE: a deletion of this data plane is replicated into the feature group's offline store
+/// just as an ingestion is — "In both cases, Feature Store appends the deleted record marker
+/// to the OfflineStore" (`DeleteRecord`) — so every deletion the service accepts APPENDS one
+/// more object, under the group's resolved output path, in the partition of the deletion's own
+/// `EventTime`, holding the marker of the record it names, and changes no object already in
+/// the store; a deletion the service refuses appends none.
+///
+/// The rows differ along what the rule generalises over: the NUMBER of deletions made in a
+/// run, whether their event times fall in one partition or several, the deletion MODES they
+/// mix, how many distinct records they name, a refused deletion in the middle of a run, and
+/// whether the feature group keeps an OnlineStore at all.
+#[tokio::test]
+async fn every_deletion_the_service_accepts_appends_one_more_marker() {
+    let runs: [Run; 6] = [
+        Run {
+            case: "two deletions of one record, in different hours",
+            group: "deleterising",
+            bucket: "features-delete-rising",
+            online: true,
+            seeded: &["C1"],
+            deletions: &[
+                Deletion {
+                    mode: "",
+                    identifier: "C1",
+                    event_time: "2026-06-02T08:00:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=06/day=02/hour=08"),
+                },
+                Deletion {
+                    mode: "&DeletionMode=SoftDelete",
+                    identifier: "C1",
+                    event_time: "2026-06-02T09:30:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=06/day=02/hour=09"),
+                },
+            ],
+        },
+        Run {
+            case: "two deletions landing in the same partition",
+            group: "deletesamehour",
+            bucket: "features-delete-same-hour",
+            online: true,
+            seeded: &["C1"],
+            deletions: &[
+                Deletion {
+                    mode: "&DeletionMode=SoftDelete",
+                    identifier: "C1",
+                    event_time: "2026-06-02T08:00:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=06/day=02/hour=08"),
+                },
+                Deletion {
+                    mode: "&DeletionMode=SoftDelete",
+                    identifier: "C1",
+                    event_time: "2026-06-02T08:45:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=06/day=02/hour=08"),
+                },
+            ],
+        },
+        Run {
+            case: "a soft delete followed by a hard delete of the same record",
+            group: "deletesoftthenhard",
+            bucket: "features-delete-soft-then-hard",
+            online: true,
+            seeded: &["C1"],
+            deletions: &[
+                Deletion {
+                    mode: "&DeletionMode=SoftDelete",
+                    identifier: "C1",
+                    event_time: "2026-06-02T08:00:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=06/day=02/hour=08"),
+                },
+                Deletion {
+                    mode: "&DeletionMode=HardDelete",
+                    identifier: "C1",
+                    event_time: "2026-06-03T09:00:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=06/day=03/hour=09"),
+                },
+            ],
+        },
+        Run {
+            case: "deletions naming three different records",
+            group: "deletethree",
+            bucket: "features-delete-three",
+            online: true,
+            seeded: &["C1", "C2", "C3"],
+            deletions: &[
+                Deletion {
+                    mode: "",
+                    identifier: "C1",
+                    event_time: "2026-06-02T08:00:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=06/day=02/hour=08"),
+                },
+                Deletion {
+                    mode: "&DeletionMode=HardDelete",
+                    identifier: "C2",
+                    event_time: "2026-07-02T13:00:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=07/day=02/hour=13"),
+                },
+                Deletion {
+                    mode: "&DeletionMode=SoftDelete",
+                    identifier: "C3",
+                    event_time: "2026-12-31T23:00:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=12/day=31/hour=23"),
+                },
+            ],
+        },
+        Run {
+            case: "a refused hard delete between two accepted deletions",
+            group: "deleterefusedbetween",
+            bucket: "features-delete-refused-between",
+            online: true,
+            seeded: &["C1"],
+            deletions: &[
+                Deletion {
+                    mode: "&DeletionMode=SoftDelete",
+                    identifier: "C1",
+                    event_time: "2026-06-02T08:00:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=06/day=02/hour=08"),
+                },
+                // "HardDelete returns EventTime: 400 ValidationException … No delete record
+                // marker is written to the OfflineStore."
+                Deletion {
+                    mode: "&DeletionMode=HardDelete",
+                    identifier: "C1",
+                    event_time: "2026-01-01T00:00:00Z",
+                    status: 400,
+                    partition: None,
+                },
+                Deletion {
+                    mode: "&DeletionMode=HardDelete",
+                    identifier: "C1",
+                    event_time: "2026-06-03T09:00:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=06/day=03/hour=09"),
+                },
+            ],
+        },
+        Run {
+            case: "a feature group with no OnlineStore at all",
+            group: "deleteofflineonly",
+            bucket: "features-delete-offline-only",
+            online: false,
+            seeded: &["C1"],
+            deletions: &[
+                Deletion {
+                    mode: "",
+                    identifier: "C1",
+                    event_time: "2026-06-02T08:00:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=06/day=02/hour=08"),
+                },
+                Deletion {
+                    mode: "&DeletionMode=SoftDelete",
+                    identifier: "C1",
+                    event_time: "2026-06-02T09:00:00Z",
+                    status: 200,
+                    partition: Some("year=2026/month=06/day=02/hour=09"),
+                },
+            ],
+        },
+    ];
+
+    for run in runs {
+        let case = run.case;
+        let aws = Aws::new();
+        aws.create_bucket(run.bucket).await;
+        let role_name = format!("{}-role", run.group);
+        let role_arn = aws.create_role(case, &role_name).await;
+        aws.grant_write(case, &role_name, &format!("arn:aws:s3:::{}/*", run.bucket))
+            .await;
+        let described = aws
+            .create_feature_group(
+                case,
+                run.group,
+                run.online,
+                Some((
+                    &format!("s3://{}/offline", run.bucket),
+                    role_arn.as_str(),
+                )),
+            )
+            .await;
+        let resolved = resolved_key(&described);
+
+        for identifier in run.seeded {
+            aws.put_record(
+                case,
+                run.group,
+                record(identifier, SEED_EVENT_TIME, SEEDED_PAYLOAD),
+            )
+            .await;
+        }
+        let ingested = aws.keys(run.bucket).await;
+        assert_eq!(
+            ingested.len(),
+            run.seeded.len(),
+            "case {case:?}: expected one object per seeded record, got {ingested:?}"
+        );
+        let mut seen = ingested.clone();
+
+        for deletion in run.deletions {
+            let identifier = deletion.identifier;
+            let event_time = deletion.event_time;
+            let (status, answered) = aws
+                .delete_record(
+                    run.group,
+                    &format!(
+                        "RecordIdentifierValueAsString={identifier}&EventTime={event_time}{}",
+                        deletion.mode
+                    ),
+                )
+                .await;
+            assert_eq!(
+                status, deletion.status,
+                "case {case:?}: expected HTTP {} from the deletion of {identifier} at \
+                 {event_time}, got {status} with {answered}",
+                deletion.status
+            );
+
+            let keys = aws.keys(run.bucket).await;
+            let appended: Vec<String> = keys
+                .iter()
+                .filter(|key| !seen.contains(*key))
+                .cloned()
+                .collect();
+            let Some(partition) = deletion.partition else {
+                assert!(
+                    appended.is_empty() && keys.len() == seen.len(),
+                    "case {case:?}: expected the refused deletion of {identifier} at \
+                     {event_time} to append nothing, got {keys:?}"
+                );
+                continue;
+            };
+            assert_eq!(
+                appended.len(),
+                1,
+                "case {case:?}: expected exactly one object appended by the deletion of \
+                 {identifier} at {event_time}, got {keys:?}"
+            );
+            let marker = &appended[0];
+            let expected_prefix = format!("{resolved}/{partition}/");
+            assert!(
+                marker.starts_with(&expected_prefix) && marker.ends_with(".parquet"),
+                "case {case:?}: expected the marker of {identifier} at {event_time} under \
+                 {expected_prefix:?}, got {marker:?}"
+            );
+            let held = parquet_rows(aws.object(run.bucket, marker).await);
+            assert_eq!(
+                held.len(),
+                1,
+                "case {case:?}: expected the marker of {identifier} to hold one row, got \
+                 {held:?}"
+            );
+            // "The deleted record marker is a record with the same RecordIdentifer as the
+            // original, but with is_deleted value set to True, EventTime set to the delete
+            // input EventTime, and other feature values set to null."
+            for expected in [identifier, event_time, DELETED_COLUMN_TRUE] {
+                assert!(
+                    held[0].contains(expected),
+                    "case {case:?}: expected the marker row of {identifier} at {event_time} \
+                     to carry {expected:?}, got {:?}",
+                    held[0]
+                );
+            }
+            assert!(
+                !held[0].contains(SEEDED_PAYLOAD),
+                "case {case:?}: expected the marker of {identifier} to carry no feature \
+                 values of the record, got {:?}",
+                held[0]
+            );
+            seen = keys;
+        }
+
+        // The store is APPEND-ONLY: every object the seeding wrote is still exactly what it
+        // was written as, whatever the run then deleted.
+        for key in &ingested {
+            let held = parquet_rows(aws.object(run.bucket, key).await);
+            assert!(
+                held.first().is_some_and(|row| row
+                    .contains(DELETED_COLUMN_FALSE)
+                    && row.contains(SEEDED_PAYLOAD)),
+                "case {case:?}: expected the ingested object {key:?} left as written, got \
+                 {held:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a deletion's marker is written UNDER THE FEATURE GROUP'S OWN ROLE, exactly as an
+/// ingestion is, so a group whose role has lost the object write retains no marker — and
+/// reports `Blocked` — while a deletion made once the permission is back is retained again.
+#[tokio::test]
+async fn a_deletions_marker_is_written_only_while_the_groups_role_may_write_it() {
+    let case = "a deletion made with the permission withheld, then restored";
+    let bucket = "features-delete-withheld";
+    let group = "offlinedeletewithheld";
+    let aws = Aws::new();
+    aws.create_bucket(bucket).await;
+    let role_name = format!("{group}-role");
+    let role_arn = aws.create_role(case, &role_name).await;
+    let resource = format!("arn:aws:s3:::{bucket}/*");
+    aws.grant_write(case, &role_name, &resource).await;
+    let described = aws
+        .create_feature_group(
+            case,
+            group,
+            true,
+            Some((&format!("s3://{bucket}/offline"), role_arn.as_str())),
+        )
+        .await;
+    let resolved = resolved_key(&described);
+    aws.put_record(case, group, record("C1", SEED_EVENT_TIME, SEEDED_PAYLOAD))
+        .await;
+    let ingested = aws.keys(bucket).await;
+    assert_eq!(
+        ingested.len(),
+        1,
+        "case {case:?}: the seeded ingestion must be retained, got {ingested:?}"
+    );
+
+    // The permission goes away. The deletion is still served — the replication is the
+    // service's own asynchronous work — and nothing is retained for it.
+    aws.revoke_write(case, &role_name).await;
+    let (status, answered) = aws
+        .delete_record(
+            group,
+            "RecordIdentifierValueAsString=C1&EventTime=2026-06-02T08:00:00Z\
+             &DeletionMode=SoftDelete",
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DeleteRecord, got {status} with {answered}"
+    );
+    let keys = aws.keys(bucket).await;
+    assert_eq!(
+        keys, ingested,
+        "case {case:?}: a marker the role may not write retains nothing, got {keys:?}"
+    );
+    let described = aws.describe_feature_group(case, group).await;
+    let (status, reason) = offline_status(&described);
+    assert_eq!(
+        status.as_deref(),
+        Some("Blocked"),
+        "case {case:?}: a revoked permission blocks the offline store, got {described}"
+    );
+    let reason = reason.unwrap_or_default();
+    for expected in [role_arn.as_str(), WRITE_ACTION] {
+        assert!(
+            reason.contains(expected),
+            "case {case:?}: expected the blocked reason to name {expected:?}, got {reason:?}"
+        );
+    }
+
+    // And back again: the next deletion's marker is appended, in its own event time's
+    // partition.
+    aws.grant_write(case, &role_name, &resource).await;
+    let (status, answered) = aws
+        .delete_record(
+            group,
+            "RecordIdentifierValueAsString=C1&EventTime=2026-06-03T09:00:00Z\
+             &DeletionMode=HardDelete",
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from the deletion made once the permission is \
+         back, got {status} with {answered}"
+    );
+    let keys = aws.keys(bucket).await;
+    let appended: Vec<String> = keys
+        .iter()
+        .filter(|key| !ingested.contains(*key))
+        .cloned()
+        .collect();
+    assert_eq!(
+        appended.len(),
+        1,
+        "case {case:?}: expected the marker appended once the permission is back, got {keys:?}"
+    );
+    let expected_prefix = format!("{resolved}/year=2026/month=06/day=03/hour=09/");
+    assert!(
+        appended[0].starts_with(&expected_prefix) && appended[0].ends_with(".parquet"),
+        "case {case:?}: expected a Parquet marker under {expected_prefix:?}, got {:?}",
+        appended[0]
+    );
+    let held = parquet_rows(aws.object(bucket, &appended[0]).await);
+    assert!(
+        held.first()
+            .is_some_and(|row| row.contains(DELETED_COLUMN_TRUE) && row.contains("C1")),
+        "case {case:?}: expected the appended row to be the delete marker of C1, got {held:?}"
     );
 }
