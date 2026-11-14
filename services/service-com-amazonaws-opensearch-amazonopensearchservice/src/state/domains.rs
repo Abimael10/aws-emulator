@@ -81,11 +81,22 @@ pub struct Domain {
     /// ([`fgac::is_master`]) — the decision every request to a domain with fine-grained
     /// access control switched on is taken by — and it is reachable from nowhere else: the
     /// `AdvancedSecurityOptions` shape every read path reports declares no member for
-    /// either, so neither is ever reported back, and the master user's PASSWORD is not
-    /// held at all.
+    /// either, so neither is ever reported back.
     pub master_user_arn: Option<String>,
     /// See [`Self::master_user_arn`].
     pub master_user_name: Option<String>,
+    /// The password `MasterUserOptions$MasterUserPassword` named for an INTERNAL master
+    /// user, which is what a request presenting HTTP Basic credentials is authenticated
+    /// against ([`fgac::authentication`]).
+    ///
+    /// `@sensitive`, and held for that one comparison alone ([`fgac::Secret`]): no read
+    /// path reports it, the security API answers no hash for it, and nothing logs it.
+    pub master_user_password: Option<fgac::Secret>,
+    /// The users this domain's INTERNAL USER DATABASE holds, keyed by their name — unique
+    /// in the database, so the name IS the key. Written and reported by the security
+    /// plugin's own internal-user API ([`crate::service::domain_rest`]), and what a
+    /// Basic-authenticated request is authenticated against beside the master user.
+    pub internal_users: BTreeMap<String, fgac::InternalUser>,
     /// The roles this domain's security configuration holds, keyed by their name — unique
     /// in the configuration, so the name IS the key. Written and reported by the domain's
     /// own security API ([`crate::service::domain_rest`]).

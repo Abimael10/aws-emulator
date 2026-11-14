@@ -19,6 +19,7 @@
 //! this crate's ONE test harness: a sibling suite reaches it as
 //! `super::domain_lifecycle::…` rather than growing a second copy.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -68,6 +69,10 @@ pub(crate) struct Answer {
     pub(crate) status: u16,
     pub(crate) error: Option<String>,
     pub(crate) body: Value,
+    /// The response headers, keyed by their LOWERCASED name — for an answer a client acts
+    /// on one of rather than reads for information, the way a `401`'s authentication
+    /// challenge is acted on.
+    pub(crate) headers: BTreeMap<String, String>,
 }
 
 impl Emulator {
@@ -317,6 +322,13 @@ impl Emulator {
             .get("x-amzn-errortype")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let headers: BTreeMap<String, String> = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                Some((name.as_str().to_ascii_lowercase(), value.to_str().ok()?.to_owned()))
+            })
+            .collect();
         let bytes = response.into_body();
         let body = if bytes.is_empty() {
             Value::Null
@@ -327,6 +339,7 @@ impl Emulator {
             status,
             error,
             body,
+            headers,
         }
     }
 

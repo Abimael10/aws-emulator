@@ -542,6 +542,9 @@ fn searched(
         // A search owes no notification, so whether one could be handed over says nothing
         // about it; the run that drove it carries that.
         can_notify: request.can_notify,
+        // The monitor's own input is searched AS the principal whose request drove the
+        // run, so the authentication that admitted that request admits this search too.
+        internal_user: request.internal_user,
     };
     let answer = super::search(domain, &searching, pattern, &CrossCluster::default(), files);
     // The searches a run performed are work the domain's log publishing has a record of, so

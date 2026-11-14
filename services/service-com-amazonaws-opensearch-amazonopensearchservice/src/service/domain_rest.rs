@@ -54,20 +54,32 @@
 //! requests that are writes — an index create, a document write, a template or a security
 //! record.
 //!
-//! Two authorization decisions, in the order AWS takes them, and neither re-implemented
-//! here:
+//! One AUTHENTICATION decision and two authorization decisions, in the order AWS takes
+//! them, and none of them re-implemented here:
 //!
+//! 0. The CLUSTER's own authentication, on a domain with fine-grained access control
+//!    switched on: such a cluster admits nobody anonymously, and a request presenting HTTP
+//!    Basic credentials is admitted only as a user its own INTERNAL USER DATABASE holds, at
+//!    that user's password — the one decision [`crate::state::fgac::authentication`] owns.
+//!    A request it refuses is answered `401`, and never reaches either decision below; one
+//!    it admits is decided for the user it authenticated AS, which is why the security
+//!    plugin's own records ([`security_records`], [`internal_users`]) are reachable with a
+//!    Basic credential and not only with an AWS one.
 //! 1. IAM, at the service's front door: the principal's identity policies and the domain's
 //!    own access policy, against the data-plane action the request's METHOD names
 //!    (`es:ESHttpGet`, `es:ESHttpPost`, …) on the domain resource its PATH names — the one
-//!    decision [`crate::state::ingest::iam_decision`] owns.
+//!    decision [`crate::state::ingest::iam_decision`] owns. A request the cluster
+//!    authenticated out of its internal user database speaks for an identity that exists
+//!    only inside the cluster, so there is no AWS principal for this decision to be taken
+//!    for and it is not taken.
 //! 2. The CLUSTER: on a domain with fine-grained access control switched on, a principal
-//!    that is neither the master user nor bound by a role mapping may do nothing, which is
-//!    the one decision [`crate::state::fgac`] owns. What that decision does NOT narrow is
-//!    which of the actions below a MAPPED principal may perform: a role's own
-//!    `index_permissions`/`cluster_permissions` are stored and reported back by the
-//!    security API, and are not evaluated, so a principal any role mapping binds is
-//!    permitted every action this surface names.
+//!    that is neither the master user nor bound by a role mapping may do nothing, and one
+//!    its mappings DO bind may do only what one of its roles permits — the action groups and
+//!    index patterns that role's own document carries
+//!    ([`crate::state::fgac_permissions`]). What a role narrows beside that is WHICH
+//!    documents of a named index it may read and which fields of each (`dls`/`fls`): neither
+//!    refuses a request, both narrow what it is answered with, so a document or a field a
+//!    role hides is answered exactly as one the index does not hold.
 //!
 //! The REST surface served is the one this emulator can answer out of persisted state:
 //! the cluster banner and health, the cluster's nodes and its own settings, the compact
@@ -82,7 +94,8 @@
 //! ([`analyze`]), index templates and the component templates they are composed of
 //! ([`component_templates`]), ingest pipelines (declared, simulated and applied to a write
 //! that names one), the index-management plugin's policy API, the security plugin's
-//! role and role-mapping API, the ALERTING plugin's monitors, the runs of one and the alerts
+//! role and role-mapping API ([`security_records`]), its internal user database and account
+//! API ([`internal_users`]), the ALERTING plugin's monitors, the runs of one and the alerts
 //! they leave ([`alerting`], [`monitor_run`]), and the NOTIFICATIONS plugin's channel
 //! configurations a monitor's action sends through ([`notifications`]), and the SNAPSHOT API:
 //! the repositories a cluster registers, the snapshots it takes into the Amazon S3 bucket one
@@ -105,8 +118,8 @@ use ::service_common::data_plane_addressing::{
 };
 
 use crate::state::{
-    self, fgac, ingest, service_state, ComAmazonawsOpensearchAmazonopensearchserviceState as Store,
-    Domain, IndexTemplate,
+    self, fgac, fgac_permissions, ingest, service_state,
+    ComAmazonawsOpensearchAmazonopensearchserviceState as Store, Domain, IndexTemplate,
 };
 
 /// The segment that names THIS service's data plane behind `EMULATOR_PATH_NAMESPACE`: the
@@ -167,6 +180,15 @@ mod template_patterns;
 /// The SNAPSHOT API: the repositories a cluster registers, the snapshots it takes into one,
 /// and the restore of one — served against the Amazon S3 bucket the repository names.
 mod snapshot;
+
+/// The security plugin's INTERNAL USER DATABASE: the users a domain holds of its own, and
+/// the account API that tells one who it is.
+mod internal_users;
+
+/// The security plugin's ROLE and ROLE-MAPPING records: what a role permits, and which
+/// principals hold it.
+mod security_records;
+use security_records::{security_role, security_role_mapping};
 
 /// The most bytes one data-plane request body is read as JSON.
 ///
@@ -443,6 +465,77 @@ pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
 /// The scheme an AWS API call's credential is presented under.
 const SIGV4_SCHEME: &str = "AWS4-HMAC-SHA256";
 
+/// The scheme HTTP Basic credentials are presented under (RFC 7617 §2).
+const BASIC_SCHEME: &str = "Basic ";
+
+/// The most bytes of a presented Basic credential this plane decodes. The emulator's OWN
+/// bound, like [`MAX_REQUEST_BODY_BYTES`]: a user name and a password are each bounded by
+/// the model (`MasterUserName` 1..64, `MasterUserPassword` 8..128), so a header past this
+/// names no credential of any domain and is not decoded at all.
+const MAX_CREDENTIAL_BYTES: usize = 1024;
+
+/// The user name and password `req` presents as HTTP Basic credentials — `Basic` followed
+/// by the base64 of `user-id ":" password` (RFC 7617 §2) — or `None` when it presents
+/// none.
+///
+/// A header this reading cannot take apart presents no credential, which is the same
+/// position as carrying none: what the cluster then requires of the request is the
+/// authentication decision's ([`fgac::authentication`]), not this reading's.
+fn presented_credential(req: &RtRequest) -> Option<(String, String)> {
+    let header = req.headers().get("authorization")?;
+    if header.len() > MAX_CREDENTIAL_BYTES {
+        return None;
+    }
+    let scheme = header.get(..BASIC_SCHEME.len())?;
+    if !scheme.eq_ignore_ascii_case(BASIC_SCHEME) {
+        return None;
+    }
+    let encoded = header.get(BASIC_SCHEME.len()..)?.trim();
+    let decoded = ::aws_smithy_types::base64::decode(encoded).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (user, password) = text.split_once(':')?;
+    (!user.is_empty()).then(|| (user.to_string(), password.to_string()))
+}
+
+/// The realm the security plugin names in the challenge it answers an unauthenticated
+/// request with.
+const SECURITY_REALM: &str = "OpenSearch Security";
+
+/// What the security plugin answers a request it authenticated nobody for: `401`, and the
+/// one word it says about it.
+///
+/// The body names no cluster, no domain and no user: nothing about the cluster has been
+/// authorized to be told yet, so the only thing the answer states is that the request was
+/// not authenticated. `challenged` is a request that presented no credential at all, which
+/// is the one the plugin tells HOW to present one — the `WWW-Authenticate` challenge; a
+/// credential that was presented and refused is told nothing further.
+fn unauthorized(challenged: bool) -> RtResponse {
+    let mut response = RtResponse::new(
+        StatusCode::try_from(401).unwrap_or_else(|_| fallback_status()),
+        SdkBody::from(UNAUTHORIZED),
+    );
+    let mut header = |name: &str, value: String| {
+        if let Err(refused) = response.headers_mut().try_insert(name.to_string(), value) {
+            ::tracing::warn!(
+                error = %refused,
+                "the data plane's authentication header cannot be sent on the wire and is \
+                 left off"
+            );
+        }
+    };
+    header("content-type", "text/plain; charset=UTF-8".to_string());
+    if challenged {
+        header(
+            "www-authenticate",
+            format!("Basic realm=\"{SECURITY_REALM}\""),
+        );
+    }
+    response
+}
+
+/// The body that answer carries.
+const UNAUTHORIZED: &str = "Unauthorized";
+
 /// Which domain `addressed` addresses, and the path within its endpoint, or `None` when
 /// this data plane serves the request not at all.
 fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) -> Option<Resolved> {
@@ -619,6 +712,47 @@ pub fn served<Eng: Send + Sync + 'static>(
     // be READ is reported with that grant marked, which is a different thing.
     let held_identity = ctx.and_then(|ctx| state::authorization::request_identity(engine, ctx));
     let now = SystemTime::now();
+    let Some(state) = service_state(engine) else {
+        return Served::of(error(
+            503,
+            "cluster_block_exception",
+            "blocked by: [SERVICE_UNAVAILABLE]",
+        ));
+    };
+    // AUTHENTICATION, before anything of the cluster is read: on a domain with
+    // fine-grained access control switched on the cluster admits nobody anonymously, and a
+    // request presenting HTTP Basic credentials is admitted only as a user its own internal
+    // database holds ([`fgac::authentication`]). The decision is taken under a lock of its
+    // own and the store released again, the way the claim above resolves the domain, so the
+    // serving below still reads the domain exactly once.
+    let presented = presented_credential(req);
+    let authenticated = {
+        let store = state.lock();
+        let Some(domain) = store.domains.get(&resolved.domain_name) else {
+            return Served::of(error(
+                503,
+                "cluster_block_exception",
+                "blocked by: [SERVICE_UNAVAILABLE]",
+            ));
+        };
+        fgac::authentication(
+            domain,
+            presented
+                .as_ref()
+                .map(|(user, password)| (user.as_str(), password.as_str())),
+            carries_sigv4_credential(req),
+        )
+    };
+    // Who the request speaks for: the user the cluster authenticated it as, where it
+    // authenticated one, and otherwise the AWS principal the front door resolved.
+    let internal_user = matches!(authenticated, fgac::Authentication::User(_));
+    let principal = match authenticated {
+        fgac::Authentication::Refused => {
+            return Served::of(unauthorized(presented.is_none()));
+        }
+        fgac::Authentication::User(name) => name,
+        fgac::Authentication::Unauthenticated => principal,
+    };
     let request = Request {
         method: &method,
         path: &resolved.request_path,
@@ -636,13 +770,7 @@ pub fn served<Eng: Send + Sync + 'static>(
         pending_run: ::std::cell::RefCell::new(None),
         pending_snapshot: ::std::cell::RefCell::new(None),
         can_notify: ctx.is_some(),
-    };
-    let Some(state) = service_state(engine) else {
-        return Served::of(error(
-            503,
-            "cluster_block_exception",
-            "blocked by: [SERVICE_UNAVAILABLE]",
-        ));
+        internal_user,
     };
     let mut store = state.lock();
     // The dictionary files this domain's packages mount, resolved out of the store before
@@ -1008,6 +1136,14 @@ struct Request<'a> {
     /// request carrying no AWS credential has none of. An action of such a request reports
     /// that rather than a send nothing performed.
     can_notify: bool,
+    /// Whether the CLUSTER authenticated this request out of its own internal user
+    /// database rather than the front door having authenticated an AWS credential for it
+    /// ([`fgac::authentication`]).
+    ///
+    /// Such a request speaks for an identity that exists only inside the cluster, so there
+    /// is no AWS principal for IAM to decide about and the cluster's own decision is the
+    /// whole of its authorization ([`serve_resolved`]).
+    internal_user: bool,
 }
 
 impl Request<'_> {
@@ -1033,6 +1169,21 @@ impl Request<'_> {
     /// segment of its own.
     fn segments(&self) -> Vec<&str> {
         self.path.split('/').filter(|part| !part.is_empty()).collect()
+    }
+
+    /// The index this request's own path ADDRESSES, or `None` for a path that addresses the
+    /// cluster rather than one index.
+    ///
+    /// Every index-level route of this surface carries that index as its FIRST segment, and
+    /// a first segment beginning with the reserved prefix names an API of the engine's own
+    /// and never an index ([`reserved`]) — so this is the ONE reading of which index a
+    /// request is about, which is what the cluster's own authorization decision is narrowed
+    /// by ([`guarded`]).
+    fn addressed_index(&self) -> Option<&str> {
+        self.segments()
+            .first()
+            .copied()
+            .filter(|first| !reserved(first))
     }
 
     /// The value the query string gives `name`, PERCENT-DECODED, or `None`.
@@ -1102,16 +1253,21 @@ fn serve_resolved(
     across: &CrossCluster,
     files: &state::analysis::PackageFiles,
 ) -> RtResponse {
-    // IAM first, as AWS takes it: the resource is the domain path the request addresses.
+    // IAM first, as AWS takes it: the resource is the domain path the request addresses. A
+    // request the CLUSTER authenticated out of its own internal user database speaks for an
+    // identity that exists only inside the cluster, so there is no AWS principal for IAM to
+    // decide about and the cluster's own decision below is the whole of its authorization.
     let resource = format!("{}/{}", domain.arn, request.path.trim_start_matches('/'));
-    if let Err(refusal) = ingest::iam_decision(
-        domain,
-        request.principal,
-        request.iam_action(),
-        &resource,
-        request.identity,
-    ) {
-        return iam_refused(&refusal);
+    if !request.internal_user {
+        if let Err(refusal) = ingest::iam_decision(
+            domain,
+            request.principal,
+            request.iam_action(),
+            &resource,
+            request.identity,
+        ) {
+            return iam_refused(&refusal);
+        }
     }
     let segments = request.segments();
     match segments.as_slice() {
@@ -1253,6 +1409,18 @@ fn serve_resolved(
             "GET" => ok(&auth_info(domain, request)),
             _ => wrong_method(request, "GET"),
         },
+        // The plugin's own account route, answered for the authenticated caller for the
+        // same reason `authinfo` is: it is what a client checks its credential with.
+        ["_plugins", "_security", "api", "account"] => {
+            internal_users::account_request(domain, request)
+        }
+        // The INTERNAL USER DATABASE, which only the master user may change.
+        ["_plugins", "_security", "api", "internalusers"] => {
+            internal_users::users_request(domain, request, None)
+        }
+        ["_plugins", "_security", "api", "internalusers", name] => {
+            internal_users::users_request(domain, request, Some(name))
+        }
         ["_plugins", "_security", "api", "roles", name] => security_role(domain, request, name),
         ["_plugins", "_security", "api", "rolesmapping", name] => {
             security_role_mapping(domain, request, name)
@@ -1297,11 +1465,17 @@ fn serve_resolved(
         [index, "_doc"] if !reserved(index) => {
             document_write(domain, request, index, None, Creates::Upsert, now)
         }
-        [index, "_doc", id] if !reserved(index) => {
-            document_request(domain, request, index, id, requested_op_type(request), now)
-        }
+        [index, "_doc", id] if !reserved(index) => document_request(
+            domain,
+            request,
+            index,
+            id,
+            requested_op_type(request),
+            now,
+            files,
+        ),
         [index, "_create", id] if !reserved(index) => {
-            document_request(domain, request, index, id, Creates::Only, now)
+            document_request(domain, request, index, id, Creates::Only, now, files)
         }
         [index, "_count"] if !reserved(index) => match request.method {
             "GET" | "POST" => guarded(domain, request, fgac::ACTION_COUNT, |domain| {
@@ -1600,10 +1774,29 @@ fn guarded(
     action: &str,
     answer: impl FnOnce(&mut Domain) -> RtResponse,
 ) -> RtResponse {
-    if let Some(reason) = fgac::refusal(domain, request.principal, action) {
+    if let Some(reason) =
+        fgac::refusal(domain, request.principal, action, request.addressed_index())
+    {
         return error(403, ingest::SECURITY_EXCEPTION, &reason);
     }
     answer(domain)
+}
+
+/// The security roles this request's caller holds on `domain`, as the plugin reports them:
+/// the ones its role mappings and its own user record bind it to, with the all-permitting
+/// role first for the MASTER user — the mapping the control plane itself makes when
+/// `MasterUserOptions` names a principal.
+///
+/// One reading, because two routes report it: the plugin's `authinfo` and its account API
+/// ([`internal_users`]).
+fn held_roles(domain: &Domain, request: &Request<'_>) -> Vec<String> {
+    let mut roles = fgac::mapped_roles(domain, request.principal);
+    if fgac::is_master(domain, request.principal)
+        && !roles.iter().any(|role| role == fgac::ALL_ACCESS_ROLE)
+    {
+        roles.insert(0, fgac::ALL_ACCESS_ROLE.to_string());
+    }
+    roles
 }
 
 /// `GET /_plugins/_security/authinfo` — who the caller is, as the security plugin knows
@@ -1618,12 +1811,7 @@ fn guarded(
 /// Every value is read from the request's principal and the domain's own security
 /// configuration.
 fn auth_info(domain: &Domain, request: &Request<'_>) -> Value {
-    let mut roles = fgac::mapped_roles(domain, request.principal);
-    // The master user holds the all-permitting role: that is the mapping the control
-    // plane itself makes when `MasterUserOptions` names a principal.
-    if fgac::is_master(domain, request.principal) && !roles.iter().any(|role| role == fgac::ALL_ACCESS_ROLE) {
-        roles.insert(0, fgac::ALL_ACCESS_ROLE.to_string());
-    }
+    let roles = held_roles(domain, request);
     // "user_requested_tenant" is the tenant this request asked for, and it asked for
     // none; the tenant a user always has is its own.
     let mut tenants = ::serde_json::Map::new();
@@ -2038,27 +2226,32 @@ const X_CONTENT_PARSE_EXCEPTION: &str = "x_content_parse_exception";
 /// Flatten one scope of a settings body to `(the setting's dotted name, its value)` pairs,
 /// `None` for a setting the body resets.
 ///
-/// Iterative in the sense that matters: the recursion is on the body's own nesting, which
-/// [`state::INDEX_SCHEMA_MAX_DEPTH`] bounds here too — a body nesting deeper than a setting
-/// name may is refused rather than walked.
+/// Iterative in the sense that matters: the recursion is on the body's own nesting, and the
+/// bound is on the NAME the walk composes rather than on that nesting — a setting's name is
+/// as deep as its DOTS say, however the body spelled them, so one key carrying a hundred of
+/// them names a setting exactly as deep as a body nesting a hundred levels does.
+/// [`state::INDEX_SCHEMA_MAX_DEPTH`] bounds both here, so a name past it is refused rather
+/// than stored: that is what keeps the recursion below, and the expansion the report
+/// performs over a stored name ([`reported_settings`]), bounded by a constant instead of by
+/// the body a caller sent.
 fn flatten_settings(
     written: &Map<String, Value>,
     prefix: &mut String,
     into: &mut Vec<WrittenSetting>,
 ) -> Result<(), Box<RtResponse>> {
-    if prefix.matches('.').count() > state::INDEX_SCHEMA_MAX_DEPTH {
-        return Err(Box::new(error(
-            400,
-            ingest::ILLEGAL_ARGUMENT_EXCEPTION,
-            &format!("setting [{prefix}] nests deeper than a setting name may"),
-        )));
-    }
     for (key, value) in written {
         let name = if prefix.is_empty() {
             key.clone()
         } else {
             format!("{prefix}.{key}")
         };
+        if name.matches('.').count() > state::INDEX_SCHEMA_MAX_DEPTH {
+            return Err(Box::new(error(
+                400,
+                ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+                &format!("setting [{name}] nests deeper than a setting name may"),
+            )));
+        }
         match value {
             Value::Object(nested) => {
                 let mut nested_prefix = name;
@@ -2078,7 +2271,10 @@ fn flatten_settings(
 /// A name whose expansion would run THROUGH a setting the scope also holds as a value of its
 /// own (`a` beside `a.b`) has no object to nest under, so it is reported under the name it
 /// has rather than displacing the other: both settings the cluster holds are reported, which
-/// is what a client reading its own configuration back needs.
+/// is what a client reading its own configuration back needs. So is a name carrying more
+/// segments than a setting name may ([`state::INDEX_SCHEMA_MAX_DEPTH`], the bound the write
+/// path holds a name to): the expansion a report performs is therefore nested by a constant
+/// at most, whatever name the store was found holding.
 fn reported_settings<'a>(
     held: impl IntoIterator<Item = (&'a str, Value)>,
     request: &Request<'_>,
@@ -2087,7 +2283,7 @@ fn reported_settings<'a>(
     let mut reported = Map::new();
     for (name, value) in held {
         let segments: Vec<&str> = name.split('.').collect();
-        if flat || segments.len() == 1 {
+        if flat || segments.len() == 1 || segments.len() > state::INDEX_SCHEMA_MAX_DEPTH {
             reported.insert(name.to_string(), value);
             continue;
         }
@@ -2741,13 +2937,20 @@ fn document_request(
     id: &str,
     creates: Creates,
     now: SystemTime,
+    files: &state::analysis::PackageFiles,
 ) -> RtResponse {
     match request.method {
         "PUT" | "POST" => document_write(domain, request, index_name, Some(id), creates, now),
         "GET" => guarded(domain, request, fgac::ACTION_GET_DOCUMENT, |domain| {
             // A read addressed to an alias reads the index that alias names.
             let held = read_index_name(domain, index_name, id);
-            read_document(domain, held.as_deref().unwrap_or(index_name), id)
+            read_document(
+                domain,
+                request,
+                held.as_deref().unwrap_or(index_name),
+                id,
+                files,
+            )
         }),
         "DELETE" => guarded(domain, request, fgac::ACTION_DELETE_DOCUMENT, |domain| {
             let index_name = read_index_name(domain, index_name, id)
@@ -2802,25 +3005,115 @@ fn document_request(
 /// The `_seq_no`/`_primary_term` pair is reported beside the version because it is what a
 /// client feeds back as `if_seq_no`/`if_primary_term` to change the document only while it
 /// is still the one that was read.
-fn read_document(domain: &Domain, index_name: &str, id: &str) -> RtResponse {
+///
+/// What the caller may SEE of it is the narrowing its own roles impose ([`visible_to`]): a
+/// document the document-level security in force does not admit is reported exactly as one
+/// the index does not hold, and the fields the field-level security hides are not in the
+/// source — a realtime read of a document is narrowed the way a search over it is.
+fn read_document(
+    domain: &Domain,
+    request: &Request<'_>,
+    index_name: &str,
+    id: &str,
+    files: &state::analysis::PackageFiles,
+) -> RtResponse {
     let Some(index) = domain.indexes.get(index_name) else {
         return index_not_found(index_name);
     };
-    match index.documents.get(id) {
-        Some(document) => ok(&json!({
-            "_index": index_name,
-            "_id": id,
-            "_version": document.version,
-            "_seq_no": document.seq_no,
-            "_primary_term": document.primary_term,
-            "found": true,
-            "_source": document.source,
-        })),
-        None => rendered(
+    let missing = || {
+        rendered(
             404,
             &json!({ "_index": index_name, "_id": id, "found": false }),
-        ),
+        )
+    };
+    let Some(document) = index.documents.get(id) else {
+        return missing();
+    };
+    let visibility = visible_to(domain, request, index_name);
+    if !admits_document(index, &visibility, files, id, &document.source) {
+        return missing();
     }
+    ok(&json!({
+        "_index": index_name,
+        "_id": id,
+        "_version": document.version,
+        "_seq_no": document.seq_no,
+        "_primary_term": document.primary_term,
+        "found": true,
+        "_source": visibility.visible(&document.source),
+    }))
+}
+
+/// What the principal this request speaks for may SEE of the index `index`: the document-
+/// and field-level narrowing its own roles impose.
+///
+/// Narrowed by nothing — the open visibility — for a domain without fine-grained access
+/// control and for the master user, which is the principal the cluster grants everything.
+fn visible_to(
+    domain: &Domain,
+    request: &Request<'_>,
+    index: &str,
+) -> fgac_permissions::Visibility {
+    if !fgac::enforced(domain) || fgac::is_master(domain, request.principal) {
+        return fgac_permissions::Visibility::default();
+    }
+    fgac_permissions::visibility(domain, &fgac::mapped_roles(domain, request.principal), index)
+}
+
+/// The ONE selector the document-level security queries in force compose: a document is
+/// admitted when ANY of them selects it, which is how a principal holding two narrowed
+/// roles sees the union of what each lets it see.
+///
+/// `None` where no query is in force, which is every request but one a role narrowed. A
+/// query this surface cannot READ states a narrowing that cannot be evaluated, and a
+/// narrowing that cannot be evaluated admits nothing rather than everything — the empty
+/// `ids` clause, which no document's id is one of.
+fn dls_selector(visibility: &fgac_permissions::Visibility) -> Option<Selector> {
+    if visibility.documents.is_empty() {
+        return None;
+    }
+    let clauses = visibility
+        .documents
+        .iter()
+        .map(|document| {
+            // The member travels as the query itself, which is the form the plugin's own
+            // `dls` carries, and a document that wraps it in `query` names the same thing.
+            let query = document.get("query").unwrap_or(document);
+            selector(Some(query), 0).unwrap_or_else(|_| Selector::Ids(Vec::new()))
+        })
+        .collect();
+    Some(Selector::Any(clauses))
+}
+
+/// Whether the document-level security in force admits the document `id`/`source` of
+/// `index` — the composed query, evaluated through that index's own analysis chains exactly
+/// as a search evaluates a query over it.
+///
+/// `true` where no query is in force. A chain the index names that this engine cannot
+/// build leaves the narrowing unevaluated, and an unevaluated narrowing admits nothing.
+fn admits_document(
+    index: &state::Index,
+    visibility: &fgac_permissions::Visibility,
+    files: &state::analysis::PackageFiles,
+    id: &str,
+    source: &Value,
+) -> bool {
+    let Some(select) = dls_selector(visibility) else {
+        return true;
+    };
+    let mut clauses = BTreeSet::new();
+    select.analyzed_clauses(&mut clauses);
+    let budget = ::std::cell::Cell::new(0_usize);
+    let Ok(terms) = Terms::of(
+        state::analysis::IndexAnalysis::of(&index.schema),
+        files,
+        &clauses,
+        &BTreeSet::new(),
+        &budget,
+    ) else {
+        return false;
+    };
+    select.matches(id, source, &terms)
 }
 
 /// Write one document into the index the request names, through the ONE data-plane write
@@ -3344,13 +3637,29 @@ fn selected_documents(
                 &fielddata_disabled(field),
             )));
         }
-        let reading = Reading::of(analysis, files, &analyzed, &select, asked, &budget)?;
+        // What the caller may SEE of THIS index, which is its own roles' narrowing of it:
+        // the documents the document-level security admits are the only ones the scan
+        // considers, and the fields the field-level security hides are not in the document
+        // the scan is handed at all — so such a field matches no clause of the query and
+        // appears in no hit, which is the one effect hiding a field has.
+        let visibility = visible_to(domain, request, &index.index_name);
+        let reading = Reading::of(
+            analysis,
+            files,
+            &analyzed,
+            &select,
+            asked,
+            &budget,
+            dls_selector(&visibility),
+        )?;
         for document in index.documents.values() {
+            let visible = (!visibility.fields.is_empty())
+                .then(|| visibility.visible(&document.source));
             scan.consider(
                 &select,
                 &index.index_name,
                 &document.id,
-                &document.source,
+                visible.as_ref().unwrap_or(&document.source),
                 &reading,
             )?;
         }
@@ -3365,6 +3674,7 @@ fn selected_documents(
         &select,
         asked,
         &budget,
+        None,
     )?;
     for (index_name, id, source) in remote
         .into_iter()
@@ -3386,10 +3696,19 @@ struct Reading<'r> {
     terms: Terms<'r>,
     highlighted: search::Highlighted<'r>,
     wanted: Wanted,
+    /// The document-level security in force on this index, as the ONE selector its
+    /// queries compose ([`dls_selector`]): a document it does not select is not the
+    /// caller's to see, so the scan counts it in no total and puts it on no page. `None`
+    /// where the caller's roles narrow this index's documents not at all.
+    admits: Option<Selector>,
 }
 
 impl<'r> Reading<'r> {
     /// What the index whose mappings are `analysis` is read against.
+    ///
+    /// `admits` is the document-level narrowing in force on that index: its own clauses are
+    /// analyzed through the index's chains alongside the request's, because the narrowing is
+    /// asked of every document the scan reaches exactly as the query is.
     fn of(
         analysis: state::analysis::IndexAnalysis,
         files: &state::analysis::PackageFiles,
@@ -3397,9 +3716,14 @@ impl<'r> Reading<'r> {
         select: &Selector,
         asked: &'r Answering<'r>,
         budget: &'r ::std::cell::Cell<usize>,
+        admits: Option<Selector>,
     ) -> Result<Self, Box<RtResponse>> {
         let highlighted = asked.highlighting.of_index(&analysis);
-        let terms = Terms::of(analysis, files, analyzed, &highlighted.fields(), budget)?;
+        let mut clauses = analyzed.clone();
+        if let Some(admits) = &admits {
+            admits.analyzed_clauses(&mut clauses);
+        }
+        let terms = Terms::of(analysis, files, &clauses, &highlighted.fields(), budget)?;
         let mut wanted = Wanted::new();
         if !asked.highlighting.is_empty() {
             select.wanted(&terms, &mut wanted);
@@ -3408,6 +3732,7 @@ impl<'r> Reading<'r> {
             terms,
             highlighted,
             wanted,
+            admits,
         })
     }
 }
@@ -3495,7 +3820,15 @@ impl Scan<'_> {
                 &format!("a request may visit at most {MAX_DOCUMENTS_VISITED} documents"),
             )));
         }
-        let selected = select.matches(id, source, terms);
+        let selected = select.matches(id, source, terms)
+            // The document-level security in force is asked of the document too, and a
+            // document it does not admit is not selected at all: it is counted in no total
+            // and reported on no page, which is what makes it indistinguishable from one
+            // the index does not hold.
+            && reading
+                .admits
+                .as_ref()
+                .is_none_or(|admits| admits.matches(id, source, terms));
         // The budget the scan's analyses share is CHARGED and CHECKED where each analysis
         // happens ([`charged`]), so nothing past it is ever analyzed; this is where a scan
         // that reached it is refused, rather than answering from a document pass that
@@ -4364,181 +4697,6 @@ fn write_template(
     ok(&json!({ "acknowledged": true }))
 }
 
-/// A request on the security plugin's role API.
-fn security_role(domain: &mut Domain, request: &Request<'_>, name: &str) -> RtResponse {
-    if let Some(refusal) = security_api_guard(domain, request) {
-        return refusal;
-    }
-    match request.method {
-        "PUT" | "PATCH" => {
-            let definition = match request.json() {
-                Ok(Some(Value::Object(members))) => Value::Object(members),
-                Ok(_) => {
-                    return error(
-                        400,
-                        PARSE_EXCEPTION,
-                        "failed to parse: expected the body to be a JSON object",
-                    )
-                }
-                Err(refusal) => return *refusal,
-            };
-            if !domain.security_roles.contains_key(name)
-                && domain.security_roles.len() >= SECURITY_RECORD_QUOTA
-            {
-                return over_security_quota(domain, "roles");
-            }
-            let existed = domain
-                .security_roles
-                .insert(
-                    name.to_string(),
-                    fgac::SecurityRole {
-                        name: name.to_string(),
-                        definition,
-                    },
-                )
-                .is_some();
-            written(name, existed)
-        }
-        "GET" => match domain.security_roles.get(name) {
-            Some(role) => ok(&json!({ name: role.definition })),
-            None => rendered(
-                404,
-                &json!({ "status": "NOT_FOUND", "message": format!("role {name} not found.") }),
-            ),
-        },
-        "DELETE" => match domain.security_roles.remove(name) {
-            Some(_) => ok(
-                &json!({ "status": "OK", "message": format!("'{name}' deleted.") }),
-            ),
-            None => rendered(
-                404,
-                &json!({ "status": "NOT_FOUND", "message": format!("role {name} not found.") }),
-            ),
-        },
-        _ => wrong_method(request, "PUT, PATCH, GET, DELETE"),
-    }
-}
-
-/// A request on the security plugin's role-mapping API — the records that decide which
-/// principals hold a role, and so what any principal but the master user may do.
-fn security_role_mapping(domain: &mut Domain, request: &Request<'_>, name: &str) -> RtResponse {
-    if let Some(refusal) = security_api_guard(domain, request) {
-        return refusal;
-    }
-    match request.method {
-        "PUT" | "PATCH" => {
-            let definition = match request.json() {
-                Ok(Some(Value::Object(members))) => Value::Object(members),
-                Ok(_) => {
-                    return error(
-                        400,
-                        PARSE_EXCEPTION,
-                        "failed to parse: expected the body to be a JSON object",
-                    )
-                }
-                Err(refusal) => return *refusal,
-            };
-            let listed = |member: &str| -> Vec<String> {
-                definition
-                    .get(member)
-                    .and_then(Value::as_array)
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            if !domain.security_role_mappings.contains_key(name)
-                && domain.security_role_mappings.len() >= SECURITY_RECORD_QUOTA
-            {
-                return over_security_quota(domain, "rolesmapping");
-            }
-            let existed = domain
-                .security_role_mappings
-                .insert(
-                    name.to_string(),
-                    fgac::SecurityRoleMapping {
-                        role: name.to_string(),
-                        backend_roles: listed("backend_roles"),
-                        users: listed("users"),
-                        hosts: listed("hosts"),
-                    },
-                )
-                .is_some();
-            written(name, existed)
-        }
-        "GET" => match domain.security_role_mappings.get(name) {
-            Some(mapping) => ok(&json!({
-                name: {
-                    "hosts": mapping.hosts,
-                    "users": mapping.users,
-                    "backend_roles": mapping.backend_roles,
-                }
-            })),
-            None => rendered(
-                404,
-                &json!({
-                    "status": "NOT_FOUND",
-                    "message": format!("rolesmapping {name} not found."),
-                }),
-            ),
-        },
-        "DELETE" => match domain.security_role_mappings.remove(name) {
-            Some(_) => ok(
-                &json!({ "status": "OK", "message": format!("'{name}' deleted.") }),
-            ),
-            None => rendered(
-                404,
-                &json!({
-                    "status": "NOT_FOUND",
-                    "message": format!("rolesmapping {name} not found."),
-                }),
-            ),
-        },
-        _ => wrong_method(request, "PUT, PATCH, GET, DELETE"),
-    }
-}
-
-/// What the security API answers a write past [`SECURITY_RECORD_QUOTA`]: the record is not
-/// stored, so the configuration this emulator holds stays bounded.
-fn over_security_quota(domain: &Domain, kind: &str) -> RtResponse {
-    error(
-        400,
-        ingest::ILLEGAL_ARGUMENT_EXCEPTION,
-        &format!(
-            "domain [{}] already holds the maximum of {SECURITY_RECORD_QUOTA} {kind} records",
-            domain.domain_name
-        ),
-    )
-}
-
-/// What the security API answers a request on a domain it is not reachable on: the plugin
-/// is part of fine-grained access control, so a domain without it has no such handler at
-/// all, and only the MASTER user may change the security configuration of a domain that
-/// has it.
-fn security_api_guard(domain: &Domain, request: &Request<'_>) -> Option<RtResponse> {
-    if !fgac::enforced(domain) {
-        return Some(no_handler(request));
-    }
-    fgac::security_api_refusal(domain, request.principal)
-        .map(|reason| error(403, ingest::SECURITY_EXCEPTION, &reason))
-}
-
-/// What the security API answers a write: the record was created, or the one that was
-/// there was replaced.
-fn written(name: &str, existed: bool) -> RtResponse {
-    if existed {
-        return ok(&json!({ "status": "OK", "message": format!("'{name}' updated.") }));
-    }
-    rendered(
-        201,
-        &json!({ "status": "CREATED", "message": format!("'{name}' created.") }),
-    )
-}
-
 /// The answer AWS's own IAM layer refuses a signed data-plane request with, BEFORE the
 /// cluster is asked anything: `403` carrying a `Message` member — the envelope every AWS
 /// service refuses an unauthorized request in, and not one of the engine's error documents,
@@ -4720,145 +4878,4 @@ fn rendered(status: u16, body: &Value) -> RtResponse {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// RULE: the data plane is addressed either at the host a domain publishes or under
-    /// the reserved path namespace naming this plane and the domain; nothing else names it.
-    #[test]
-    fn a_prefixed_path_names_this_plane_the_domain_and_the_request_path() {
-        // (the case, the path, the domain it names, the request path within it)
-        struct Row {
-            case: &'static str,
-            path: &'static str,
-            names: Option<(&'static str, &'static str)>,
-        }
-        let rows: &[Row] = &[
-            Row {
-                case: "a domain name and a cluster path",
-                path: "/_aws/es/search-target/_cluster/health",
-                names: Some(("search-target", "/_cluster/health")),
-            },
-            Row {
-                case: "a domain name and the root path",
-                path: "/_aws/es/search-target",
-                names: Some(("search-target", "/")),
-            },
-            Row {
-                case: "another plane under the same namespace",
-                path: "/_aws/execute-api/abc/stage",
-                names: None,
-            },
-            Row {
-                case: "no namespace at all",
-                path: "/_cluster/health",
-                names: None,
-            },
-            Row {
-                case: "the namespace and this plane but no domain",
-                path: "/_aws/es",
-                names: None,
-            },
-        ];
-        for row in rows {
-            let named = prefixed_addressing(row.path);
-            assert_eq!(
-                named, row.names,
-                "case {:?}: expected {:?}, got {named:?}",
-                row.case, row.names
-            );
-        }
-    }
-
-    /// RULE: a query selects documents by the clause it states, and a clause the engine
-    /// registers no query for is refused rather than selecting everything.
-    #[test]
-    fn a_query_selects_by_the_clause_it_states() {
-        let source = json!({ "level": "warn", "code": 7, "tags": ["a", "b"] });
-        // (the case, the query, whether it selects the document)
-        let rows: &[(&str, Value, bool)] = &[
-            ("no query at all", json!({ "match_all": {} }), true),
-            ("a term on a text field", json!({ "term": { "level": "warn" } }), true),
-            ("a term on another value", json!({ "term": { "level": "info" } }), false),
-            ("a term on a numeric field", json!({ "term": { "code": 7 } }), true),
-            ("a term with an explicit value", json!({ "term": { "code": { "value": 7 } } }), true),
-            ("a match clause", json!({ "match": { "level": "warn" } }), true),
-            ("a terms clause", json!({ "terms": { "level": ["info", "warn"] } }), true),
-            ("a term on one element of an array", json!({ "term": { "tags": "b" } }), true),
-            ("an ids clause naming the document", json!({ "ids": { "values": ["one"] } }), true),
-            ("an ids clause naming another", json!({ "ids": { "values": ["two"] } }), false),
-            (
-                "a bool composing a filter and a must_not",
-                json!({ "bool": {
-                    "filter": [{ "term": { "level": "warn" } }],
-                    "must_not": [{ "term": { "code": 8 } }]
-                } }),
-                true,
-            ),
-            (
-                "a bool whose must_not excludes it",
-                json!({ "bool": { "must_not": [{ "term": { "level": "warn" } }] } }),
-                false,
-            ),
-        ];
-        for (case, query, expected) in rows {
-            let select = selector(Some(query), 0)
-                .map_err(|_| ())
-                .unwrap_or_else(|()| panic!("case {case:?}: expected the query to be read"));
-            // No index schema and no mounted file: the fields a `match` names are analyzed
-            // by the default chain, which is what an index with no analysis settings of
-            // its own uses.
-            let mut analyzed = BTreeSet::new();
-            select.analyzed_clauses(&mut analyzed);
-            let budget = ::std::cell::Cell::new(0_usize);
-            let terms = Terms::of(
-                state::analysis::IndexAnalysis::default(),
-                &state::analysis::PackageFiles::default(),
-                &analyzed,
-                &BTreeSet::new(),
-                &budget,
-            )
-            .map_err(|_| ())
-            .unwrap_or_else(|()| panic!("case {case:?}: expected the chains to resolve"));
-            let matched = select.matches("one", &source, &terms);
-            assert_eq!(
-                matched, *expected,
-                "case {case:?}: expected {expected}, got {matched}"
-            );
-        }
-        let refused = selector(Some(&json!({ "wildcard": { "level": "w*" } })), 0);
-        assert!(
-            refused.is_err(),
-            "case \"a clause the engine registers no query for\": expected a refusal"
-        );
-        // And a `bool` nested past the engine's own bound is refused rather than walked.
-        let mut nested = json!({ "match_all": {} });
-        for _ in 0..=MAX_BOOL_NESTING {
-            nested = json!({ "bool": { "must": [nested] } });
-        }
-        assert!(
-            selector(Some(&nested), 0).is_err(),
-            "case \"a bool nested past the engine's bound\": expected a refusal"
-        );
-    }
-
-    /// RULE: the version banner reports the distribution and the version number the
-    /// domain's own `EngineVersion` names.
-    #[test]
-    fn the_banner_version_comes_from_the_domains_engine_version() {
-        // (the case, the stored EngineVersion, the distribution, the number)
-        let rows: &[(&str, &str, &str, &str)] = &[
-            ("an OpenSearch version", "OpenSearch_2.11", "opensearch", "2.11.0"),
-            ("an Elasticsearch version", "Elasticsearch_7.10", "elasticsearch", "7.10.0"),
-            ("a three-part version", "OpenSearch_2.11.1", "opensearch", "2.11.1"),
-        ];
-        for (case, stored, distribution, number) in rows {
-            let answered = engine_distribution(stored);
-            assert_eq!(
-                answered,
-                ((*distribution).to_string(), (*number).to_string()),
-                "case {case:?}: expected {distribution}/{number}, got {answered:?}"
-            );
-        }
-    }
-}
+mod tests;

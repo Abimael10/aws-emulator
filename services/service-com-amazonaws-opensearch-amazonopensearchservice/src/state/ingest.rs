@@ -276,6 +276,7 @@ pub(crate) fn index_into(
         domain,
         write.principal_arn,
         super::fgac::ACTION_INDEX_DOCUMENT,
+        Some(write.index_name),
     ) {
         return Err(WriteRefusal::Rejected {
             error_type: SECURITY_EXCEPTION,

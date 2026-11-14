@@ -49,6 +49,11 @@ pub mod ingest;
 /// one decision every request that reaches the domain is taken by.
 pub mod fgac;
 
+/// What a ROLE of that configuration permits, and what it lets the principals it binds
+/// see: the action groups, index patterns and document- and field-level rules its own
+/// document carries.
+pub mod fgac_permissions;
+
 /// Whether the fine-grained access control a request asks for is a configuration the
 /// service can provision — the prerequisites, the master principal and the one-way
 /// switches the create path and the update path judge alike.

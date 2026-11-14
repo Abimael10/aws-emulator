@@ -570,7 +570,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // grants everything to on a domain whose `AdvancedSecurityOptions$Enabled` is set
         // (`crate::state::fgac`). Read BEFORE the options are stored, because
         // `MasterUserOptions` is dropped on the way into the stored shape — no read path
-        // reports it — and the password it also carries is never held at all.
+        // reports it — and the password it also carries is held for one comparison alone:
+        // authenticating a request that presents HTTP Basic credentials against the
+        // internal user database (`crate::state::fgac::authentication`).
         let master_user_options = input
             .advanced_security_options
             .as_ref()
@@ -581,6 +583,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let master_user_name = master_user_options
             .as_ref()
             .and_then(|master| master.master_user_name.clone());
+        let master_user_password = master_user_options
+            .as_ref()
+            .and_then(|master| master.master_user_password.clone())
+            .map(crate::state::fgac::Secret::new);
 
         let mut domain = Domain {
             domain_id: domain_id(&name),
@@ -640,6 +646,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(stored_advanced_security_options),
             master_user_arn,
             master_user_name,
+            master_user_password,
+            // A new domain's internal user database holds only the master user the create
+            // named, which lives beside it; the security plugin's own internal-user API is
+            // what writes another.
+            internal_users: BTreeMap::new(),
             // A new domain's security configuration holds no role and no role mapping;
             // the domain's own security API is what writes one.
             security_roles: BTreeMap::new(),

@@ -430,6 +430,153 @@ async fn an_index_settings_put_changes_every_index_the_path_names_and_nothing_el
     }
 }
 
+/// RULE: a setting's name is as deep as its DOTS say, however the body spelled them, so one
+/// key carrying them is bounded exactly as a body nesting that far is — a name past the
+/// maximum is refused and stored by nothing, whichever spelling it arrived in, while a name
+/// the bound admits is written and reported as before.
+///
+/// The rows span the two spellings the same depth arrives in (one dotted key and a nested
+/// body) and a name far past the bound, each over the index-settings route and the cluster's
+/// own.
+#[tokio::test]
+async fn a_setting_name_deeper_than_the_maximum_is_refused_in_either_spelling() {
+    let emulator = Emulator::new();
+    created_domain(&emulator, "settings-depth").await;
+    let host = endpoint_of(&emulator, "settings-depth");
+    let created = rest(
+        &emulator,
+        DEFAULT_ACCESS_KEY_ID,
+        &host,
+        "PUT",
+        &format!("/{INDEX}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case \"creating the index\": expected 200, got {} with {:?}",
+        created.status, created.body
+    );
+
+    /// How many dots one setting's name may carry — `state::INDEX_SCHEMA_MAX_DEPTH`, the
+    /// bound an index schema's own nesting is held to, stated here independently of the
+    /// constant the implementation reads it from.
+    const MAX_DOTS: usize = 100;
+
+    /// A name of `dots` dots as ONE key: `a.a.a…`.
+    fn dotted(dots: usize) -> String {
+        vec!["a"; dots + 1].join(".")
+    }
+
+    /// The same depth as a NESTED body: `{"a": {"a": … "x"}}`.
+    fn nested(dots: usize) -> Value {
+        let mut body = json!("x");
+        for _ in 0..=dots {
+            body = json!({ "a": body });
+        }
+        body
+    }
+
+    /// One body sent, and the route it is sent to.
+    struct Case {
+        case: &'static str,
+        body: Value,
+    }
+    let rows = [
+        Case {
+            case: "one dotted key one past the maximum",
+            body: json!({ dotted(MAX_DOTS + 1): "x" }),
+        },
+        Case {
+            case: "a nested body one past the maximum",
+            body: nested(MAX_DOTS + 1),
+        },
+        Case {
+            case: "one dotted key far past the maximum",
+            body: json!({ dotted(MAX_DOTS * 10): "x" }),
+        },
+    ];
+    for Case { case, body } in rows {
+        for (route, path) in [
+            ("the index settings", format!("/{INDEX}/_settings")),
+            (
+                "the cluster's own settings",
+                "/_cluster/settings".to_string(),
+            ),
+        ] {
+            // The cluster's own settings name the scope they are written in; an index's do
+            // not.
+            let sent = if route.starts_with("the cluster") {
+                json!({ "persistent": body.clone() })
+            } else {
+                body.clone()
+            };
+            let answered =
+                rest(&emulator, DEFAULT_ACCESS_KEY_ID, &host, "PUT", &path, Some(sent)).await;
+            assert_eq!(
+                (answered.status, error_type(&answered)),
+                (400, "illegal_argument_exception".to_string()),
+                "case {case:?} on {route}: expected the engine's refusal, got {} with {:?}",
+                answered.status,
+                answered.body
+            );
+        }
+    }
+
+    // A name the bound admits is still written and reported, so what the bound refuses is
+    // the depth and not the dots: this is the same setting the table above writes nested.
+    let shallow = rest(
+        &emulator,
+        DEFAULT_ACCESS_KEY_ID,
+        &host,
+        "PUT",
+        &format!("/{INDEX}/_settings"),
+        Some(json!({ "index.blocks.read_only": true })),
+    )
+    .await;
+    assert_eq!(
+        shallow.status, 200,
+        "case \"a name the bound admits\": expected the write to be taken, got {} with {:?}",
+        shallow.status, shallow.body
+    );
+
+    // And both reports still answer, so nothing a refused request carried reached the
+    // expansion a report performs.
+    for (case, path) in [
+        ("the index's settings", format!("/{INDEX}/_settings")),
+        (
+            "the cluster's own settings",
+            "/_cluster/settings".to_string(),
+        ),
+    ] {
+        let reported = rest(&emulator, DEFAULT_ACCESS_KEY_ID, &host, "GET", &path, None).await;
+        assert_eq!(
+            reported.status, 200,
+            "case \"reading {case} back\": expected 200, got {} with {:?}",
+            reported.status, reported.body
+        );
+    }
+    let held = rest(
+        &emulator,
+        DEFAULT_ACCESS_KEY_ID,
+        &host,
+        "GET",
+        &format!("/{INDEX}/_settings"),
+        None,
+    )
+    .await;
+    let settings = held.body[INDEX]["settings"]["index"].clone();
+    assert_eq!(
+        settings["blocks"]["read_only"].as_str(),
+        Some("true"),
+        "case \"the admitted setting read back\": expected it to be held, got {settings:?}"
+    );
+    assert!(
+        settings.get("a").is_none(),
+        "case \"a refused name\": expected nothing of it to be stored, got {settings:?}"
+    );
+}
+
 /// One row of the static-settings table: the setting a body names and whether the index may
 /// be given it after it exists.
 struct Dynamic {

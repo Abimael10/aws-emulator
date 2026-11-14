@@ -5,11 +5,14 @@
 //! taken by.
 //!
 //! A domain created with `AdvancedSecurityOptions$Enabled` set has fine-grained access
-//! control switched on, and on such a domain the cluster — not IAM alone — decides what a
-//! principal may do: the master user the create named may do everything, and every other
-//! principal may do only what a ROLE MAPPING binds it to. A principal no mapping binds is
-//! refused, whatever its IAM policies allow, and the cluster states that refusal as a
-//! `security_exception`.
+//! control switched on, and on such a domain the cluster — not IAM alone — decides who a
+//! request speaks for and what that identity may do. Who: the cluster admits nobody
+//! anonymously, and a request presenting HTTP Basic credentials is admitted only as a user
+//! its INTERNAL USER DATABASE holds ([`authentication`]). What: the master user the create
+//! named may do everything, and every other principal may do only what a ROLE MAPPING binds
+//! it to and what the roles it is bound to permit ([`super::fgac_permissions`]). A principal
+//! no mapping binds is refused, whatever its IAM policies allow, and the cluster states that
+//! refusal as a `security_exception`.
 //!
 //! Both paths into a domain take the decision HERE so they cannot drift:
 //!
@@ -23,6 +26,8 @@
 //! stored domain and the principal, so the same request decides the same way twice.
 
 use ::service_common::iam_authorization::wildcard_match;
+
+use std::collections::BTreeMap;
 
 use super::Domain;
 
@@ -219,6 +224,134 @@ pub const ACTION_RESTORE_SNAPSHOT: &str = "cluster:admin/snapshot/restore";
 /// which is why the master is reported holding it.
 pub const ALL_ACCESS_ROLE: &str = "all_access";
 
+/// One user of a domain's INTERNAL USER DATABASE, as the security plugin's internal-user
+/// API holds it.
+///
+/// A domain created with `AdvancedSecurityOptions$InternalUserDatabaseEnabled` keeps its
+/// own users beside the IAM principals that reach it, and a request presenting HTTP Basic
+/// credentials is authenticated against them ([`authentication`]). The master user the
+/// create named is the first of them, held on the domain record itself because the control
+/// plane — not this API — wrote it.
+#[derive(Debug, Clone, Default)]
+pub struct InternalUser {
+    /// The user's name — unique in the database, so the name IS the key.
+    pub name: String,
+    /// The credential the user authenticates with ([`Secret`]).
+    pub password: Secret,
+    /// `backend_roles` — the external identities this user is also known by, which a role
+    /// mapping may name it under.
+    pub backend_roles: Vec<String>,
+    /// `opendistro_security_roles` — the security roles the user holds DIRECTLY, without a
+    /// role mapping naming it.
+    pub security_roles: Vec<String>,
+    /// `attributes` — kept so the API reports back what it was given.
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// A credential a domain holds only to COMPARE a presented one against.
+///
+/// A type of its own rather than a `String` for one reason: its `Debug` writes a fixed
+/// placeholder, so a password cannot reach a log or a trace through the DERIVED `Debug` of
+/// any record that holds it. The value is reachable from nowhere else — [`Self::matches`]
+/// is the one thing anything does with it, and no read path reports it.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    /// The credential `value` is, as this domain will hold it.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Whether `presented` IS this credential.
+    ///
+    /// An EMPTY credential matches nothing, in either direction: a user the database holds
+    /// no password for cannot be authenticated at all, and neither can one that presented
+    /// no password.
+    #[must_use]
+    pub fn matches(&self, presented: &str) -> bool {
+        !self.0.is_empty() && self.0 == presented
+    }
+}
+
+impl ::std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+/// What the cluster's authentication layer makes of the credential ONE request presented.
+///
+/// Authentication comes before authorization: a request the layer refuses is answered
+/// `401` and never reaches the decision [`refusal`] takes, and a request it authenticates
+/// is decided for the user it authenticated AS rather than for any AWS principal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Authentication {
+    /// The request presented no credential this layer reads, and the domain does not
+    /// require one of it: it is decided for whatever principal the front door resolved.
+    Unauthenticated,
+    /// It authenticated as this user of the internal database.
+    User(String),
+    /// Refused: the request presented no credential at all to a cluster that admits none
+    /// anonymously, or named a user the database does not hold, or not with that password.
+    Refused,
+}
+
+/// Whether `domain` keeps an internal user database:
+/// `AdvancedSecurityOptions$InternalUserDatabaseEnabled`, "true to enable the internal
+/// user database".
+#[must_use]
+pub fn internal_user_database(domain: &Domain) -> bool {
+    domain
+        .advanced_security_options
+        .as_ref()
+        .and_then(|options| options.internal_user_database_enabled)
+        == Some(true)
+}
+
+/// What the cluster makes of the credential a request to `domain` presented.
+///
+/// `presented` is the user name and password of an HTTP Basic credential, where the
+/// request carried one, and `carries_aws_credential` whether it instead presented an AWS
+/// one — which the front door has already authenticated by verifying its signature.
+///
+/// A domain without fine-grained access control runs no security plugin, so it
+/// authenticates nobody and nothing is refused here: such a request is decided by IAM
+/// exactly as it was before. On a domain that has the boundary switched on every request
+/// must arrive as SOMEBODY — that is what a cluster behind fine-grained access control
+/// requires — so one presenting neither credential is refused, and one presenting Basic
+/// credentials is admitted only as a user the database holds, at that user's own password.
+#[must_use]
+pub fn authentication(
+    domain: &Domain,
+    presented: Option<(&str, &str)>,
+    carries_aws_credential: bool,
+) -> Authentication {
+    if !enforced(domain) {
+        return Authentication::Unauthenticated;
+    }
+    let Some((name, password)) = presented else {
+        if carries_aws_credential {
+            return Authentication::Unauthenticated;
+        }
+        return Authentication::Refused;
+    };
+    // An empty password authenticates nobody, and neither does a user the database holds
+    // none for: the comparison [`Secret::matches`] performs refuses both.
+    let master = domain
+        .master_user_name
+        .as_deref()
+        .zip(domain.master_user_password.as_ref());
+    if master.is_some_and(|(held, secret)| held == name && secret.matches(password)) {
+        return Authentication::User(name.to_string());
+    }
+    match domain.internal_users.get(name) {
+        Some(user) if user.password.matches(password) => Authentication::User(name.to_string()),
+        _ => Authentication::Refused,
+    }
+}
+
 /// One role of a domain's security configuration, as its security API holds it.
 ///
 /// The definition is kept VERBATIM as the document that was written, because the API
@@ -303,10 +436,14 @@ pub fn is_master(domain: &Domain, principal_arn: &str) -> bool {
 }
 
 /// The roles this domain's role mappings bind `principal_arn` to, in configuration order.
+///
+/// A user of the internal database may also hold roles DIRECTLY — the
+/// `opendistro_security_roles` its own record names — so those are reported beside the
+/// mapped ones: the plugin grants a user the union of both.
 #[must_use]
 pub fn mapped_roles(domain: &Domain, principal_arn: &str) -> Vec<String> {
     let identities = identities(principal_arn);
-    domain
+    let mut roles: Vec<String> = domain
         .security_role_mappings
         .values()
         .filter(|mapping| {
@@ -321,20 +458,45 @@ pub fn mapped_roles(domain: &Domain, principal_arn: &str) -> Vec<String> {
                 })
         })
         .map(|mapping| mapping.role.clone())
-        .collect()
+        .collect();
+    if let Some(user) = domain.internal_users.get(principal_arn) {
+        for role in &user.security_roles {
+            if !roles.contains(role) {
+                roles.push(role.clone());
+            }
+        }
+    }
+    roles
 }
 
-/// The reason fine-grained access control refuses `principal_arn` the `action`, or `None`
-/// when it permits it.
+/// The reason fine-grained access control refuses `principal_arn` the `action` on the index
+/// `index` names, or `None` when it permits it.
 ///
 /// `None` for every domain the boundary is not switched on for, so a domain without
 /// fine-grained access control is decided by IAM exactly as it was before.
+///
+/// Two narrowings, in the order the plugin takes them: a principal no role mapping binds
+/// and that holds no role of its own may do nothing at all, and a principal its roles DO
+/// bind may do only what one of those roles permits — the action groups and index patterns
+/// [`super::fgac_permissions`] reads off the role documents the security API stored.
+///
+/// `index` is the index the request's own path addresses, and `None` for a request that
+/// addresses the cluster rather than an index.
 #[must_use]
-pub fn refusal(domain: &Domain, principal_arn: &str, action: &str) -> Option<String> {
+pub fn refusal(
+    domain: &Domain,
+    principal_arn: &str,
+    action: &str,
+    index: Option<&str>,
+) -> Option<String> {
     if !enforced(domain) || is_master(domain, principal_arn) {
         return None;
     }
-    if !mapped_roles(domain, principal_arn).is_empty() {
+    let roles = mapped_roles(domain, principal_arn);
+    if roles.is_empty() {
+        return Some(no_permissions(principal_arn, action));
+    }
+    if super::fgac_permissions::permitted(domain, &roles, action, index) {
         return None;
     }
     Some(no_permissions(principal_arn, action))

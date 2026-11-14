@@ -157,6 +157,8 @@ mod encryption_at_rest_key_resolution;
 mod engine_version_resolution;
 #[path = "all/exploratory_order.rs"]
 mod exploratory_order;
+#[path = "all/fgac_internal_user_database.rs"]
+mod fgac_internal_user_database;
 #[path = "all/fgac_master_role_probe.rs"]
 mod fgac_master_role_probe;
 #[path = "all/fixed_sentence_refusals.rs"]

@@ -293,6 +293,10 @@ fn merge(
             if master_user.master_user_name.is_some() {
                 domain.master_user_name = master_user.master_user_name.clone();
             }
+            if let Some(password) = master_user.master_user_password.clone() {
+                domain.master_user_password =
+                    Some(crate::state::fgac::Secret::new(password));
+            }
         }
         domain.advanced_security_options =
             Some(stored_advanced_security_options(advanced_security_options));
