@@ -364,11 +364,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A delivery-status feedback role this create names is held to the SAME trust
         // relationship a write through `SetTopicAttributes` is: SNS has to assume that role
-        // to write the records the attribute asks for, so a role whose trust policy
-        // withholds the assume takes no create either, and no topic is left behind
-        // carrying it.
+        // to write the records the attribute asks for, for the topic being created, so a
+        // role whose trust policy withholds that assume takes no create either, and no
+        // topic is left behind carrying it.
         if let Some(message) =
-            state::feedback_role::untrusted_roles_refusal(ctx, &region, &attributes).await
+            state::feedback_role::untrusted_roles_refusal(ctx, &region, &arn, &attributes).await
         {
             return Err(invalid_parameter(message));
         }

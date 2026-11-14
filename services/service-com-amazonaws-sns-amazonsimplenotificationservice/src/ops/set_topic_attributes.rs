@@ -283,14 +283,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         // A delivery-status feedback role is a role SNS has to ASSUME to write the records
-        // the attribute asks for, so the role is resolved in the account's own IAM records
-        // and refused here when its trust policy withholds that assume: the attribute never
+        // the attribute asks for, FOR THIS TOPIC, so the role is resolved in the account's own
+        // IAM records and refused here when its trust policy withholds that assume — the
+        // conditions a trust statement narrows the grant by included: the attribute never
         // lands, and the topic does not read back as configured for logging that could
         // never happen.
         if let Some(value) = requested.as_deref() {
             if let Some(message) = state::feedback_role::untrusted_role_refusal(
                 ctx,
                 &region,
+                &input.topic_arn,
                 &input.attribute_name,
                 value,
             )

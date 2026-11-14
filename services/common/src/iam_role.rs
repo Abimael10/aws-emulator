@@ -248,15 +248,9 @@ pub async fn role_assume_is_unauthorized_through(
         return false;
     };
     match role_answer(callback, region, role_name).await {
-        RoleAnswer::Held(document) => !document.is_some_and(|document| {
-            crate::iam_trust_policy::grants_service_principal(
-                &document,
-                service_principal,
-                role_arn,
-                context,
-            )
-            .unwrap_or(false)
-        }),
+        RoleAnswer::Held(document) => {
+            grant_withholds(document.as_deref(), service_principal, role_arn, context)
+        }
         RoleAnswer::Absent => true,
         RoleAnswer::Unknown => false,
     }
@@ -323,6 +317,46 @@ pub async fn held_role_is_unassumable_by_every(
     }
 }
 
+/// Whether IAM ANSWERED that `role_arn` is a role it HOLDS whose trust policy does not grant
+/// `service_principal` the assume a named piece of work would make — the request whose
+/// condition keys `context` states, as `(key, value)` pairs.
+///
+/// [`held_role_is_unassumable`] asked about ONE assume rather than about the trust relationship
+/// as a whole. A service that takes a role on TO ACT FOR one of its resources presents the
+/// confused-deputy keys of that work when it assumes the role (`aws:SourceArn`,
+/// `aws:SourceAccount`, naming the resource the work is for), so a statement's `Condition` is
+/// part of its grant: a role whose trust is narrowed to one resource is a role the service
+/// cannot assume for another, and a configuration naming it for that other resource could
+/// never work. That is why a service validating such a configuration reads the question here —
+/// the strongest reading it can take of a role it will later have to assume — and refuses only
+/// what the stored trust document itself withholds for THAT resource.
+///
+/// The rule over one document is [`crate::iam_trust_policy::grants_service_principal`]'s, and
+/// the keys the assume carries are the caller's to state: nothing is guessed for a key it does
+/// not, so a clause the request cannot be shown to satisfy is no grant.
+///
+/// `false` — do not refuse — in exactly the cases [`held_role_is_unassumable`] answers it: a
+/// value that names no role of this account, a role this account's IAM holds nothing under (no
+/// evidence about a role provisioned out of band), an answer this emulator could not read, and
+/// an emulator with no IAM mounted at all.
+pub async fn held_role_assume_is_unauthorized(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    service_principal: &str,
+    context: &[(String, String)],
+) -> bool {
+    let Some(role_name) = role_name(role_arn) else {
+        return false;
+    };
+    match role_answer(ctx.callback(), region, role_name).await {
+        RoleAnswer::Held(document) => {
+            grant_withholds(document.as_deref(), service_principal, role_arn, context)
+        }
+        RoleAnswer::Absent | RoleAnswer::Unknown => false,
+    }
+}
+
 /// Whether IAM ANSWERED that this account holds no role under the name `role_arn` carries.
 ///
 /// The EXISTENCE half of the question the readings above answer, on its own: a service that
@@ -363,6 +397,33 @@ fn trust_withholds(document: Option<&str>, service_principal: &str) -> bool {
     })
 }
 
+/// Whether the trust document IAM reported for a role it HOLDS withholds `service_principal`
+/// the ONE assume the request `context` describes: the ONE reading of a stored trust document
+/// every CONTEXT-AWARE reading here takes, so a role IAM answered about is judged the same way
+/// whichever of them asked.
+///
+/// [`trust_withholds`] is this question asked of the trust RELATIONSHIP rather than of one
+/// assume; the two differ only in how much of the request the document is read against
+/// ([`crate::iam_trust_policy`]). The non-answers are the same: a document IAM carried none of,
+/// and one this emulator cannot read as a policy, carry no grant that can be acted on, so they
+/// withhold it.
+fn grant_withholds(
+    document: Option<&str>,
+    service_principal: &str,
+    role_arn: &str,
+    context: &[(String, String)],
+) -> bool {
+    !document.is_some_and(|document| {
+        crate::iam_trust_policy::grants_service_principal(
+            document,
+            service_principal,
+            role_arn,
+            context,
+        )
+        .unwrap_or(false)
+    })
+}
+
 /// Whether IAM ANSWERED that `role_arn` is a role this account cannot hand to
 /// `service_principal` for the request `context` describes: the value names no role of this
 /// account, this account holds no such role, or the trust policy the role carries does not
@@ -394,15 +455,9 @@ pub async fn role_pass_is_unauthorized(
         return true;
     };
     match role_answer(ctx.callback(), region, role_name).await {
-        RoleAnswer::Held(document) => !document.is_some_and(|document| {
-            crate::iam_trust_policy::grants_service_principal(
-                &document,
-                service_principal,
-                role_arn,
-                context,
-            )
-            .unwrap_or(false)
-        }),
+        RoleAnswer::Held(document) => {
+            grant_withholds(document.as_deref(), service_principal, role_arn, context)
+        }
         RoleAnswer::Absent => true,
         RoleAnswer::Unknown => false,
     }

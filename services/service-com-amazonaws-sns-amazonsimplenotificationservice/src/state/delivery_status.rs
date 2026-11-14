@@ -18,8 +18,10 @@
 //! which is why the feedback attributes are a per-protocol pair rather than one switch.
 //!
 //! What makes this the role being EXERCISED rather than merely stored: the role is resolved
-//! in the account's own IAM records, its trust policy has to admit this service's principal
-//! ([`crate::state::SERVICE_PRINCIPAL`]) for `sts:AssumeRole` — through the tree's one
+//! in the account's own IAM records, its trust policy has to grant this service's principal
+//! ([`crate::state::SERVICE_PRINCIPAL`]) the `sts:AssumeRole` FOR THIS TOPIC — the assume
+//! carries the topic it is made for ([`super::feedback_role::assume_context`]), so a trust
+//! statement conditioned on another topic grants it nothing — through the tree's one
 //! reading of a trust document (`service_common::iam_trust_policy`) — and the permissions in
 //! force ON that role have to allow the CloudWatch Logs calls the write makes
 //! ([`LOG_WRITE_ACTIONS`]), which is the question `service_common::iam_role` puts to IAM
@@ -468,7 +470,7 @@ impl Logged {
             .unwrap_or(super::DEFAULT_REGION)
             .to_string();
         let log_group = status.log_group(&self.feedback.log_group);
-        if !assumable(ctx, &region, role_arn).await {
+        if !assumable(ctx, &region, role_arn, topic_arn).await {
             return;
         }
         if !writes_logs(ctx, &region, role_arn, &log_group).await {
@@ -489,19 +491,24 @@ impl Logged {
     }
 }
 
-/// Whether this service can act as the role `role_arn` names: the role is one of this
-/// account's IAM roles and its trust policy admits [`SERVICE_PRINCIPAL`] for
-/// `sts:AssumeRole`.
+/// Whether this service can act as the role `role_arn` names FOR the topic `topic_arn`: the
+/// role is one of this account's IAM roles and its trust policy grants [`SERVICE_PRINCIPAL`]
+/// the `sts:AssumeRole` this record's write would make.
 ///
 /// The role is resolved in the IAM service's own store over the in-process callback, so what
 /// decides this is the document a client's `CreateRole` or `UpdateAssumeRolePolicy` left on
-/// it, and the reading of that document is the tree's one reading of a trust policy. A role
-/// IAM does not hold, and a trust document that cannot be read as a policy at all, are both
-/// roles nothing can be assumed under.
+/// it, and the reading of that document is the tree's one reading of a trust policy. The
+/// assume is made FOR one topic and carries the confused-deputy keys of that work
+/// ([`super::feedback_role::assume_context`]), so a trust statement's `Condition` is part of
+/// its grant and a role trusted only for another topic cannot be assumed for this one — the
+/// same reading the write of the attribute was held to. A role IAM does not hold, and a trust
+/// document that cannot be read as a policy at all, are both roles nothing can be assumed
+/// under.
 async fn assumable(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     role_arn: &str,
+    topic_arn: &str,
 ) -> bool {
     let Some(name) = ::service_common::iam_role::role_name(role_arn) else {
         ::tracing::warn!(
@@ -528,14 +535,20 @@ async fn assumable(
             return false;
         }
     };
-    let admitted = document.as_deref().and_then(|document| {
-        ::service_common::iam_trust_policy::admits_service_principal(document, SERVICE_PRINCIPAL)
+    let granted = document.as_deref().and_then(|document| {
+        ::service_common::iam_trust_policy::grants_service_principal(
+            document,
+            SERVICE_PRINCIPAL,
+            role_arn,
+            &super::feedback_role::assume_context(topic_arn),
+        )
     });
-    if admitted != Some(true) {
+    if granted != Some(true) {
         ::tracing::warn!(
             role = %role_arn,
-            "a topic's delivery-status feedback role does not trust this service, so it cannot \
-             be assumed and no delivery-status record is written"
+            topic = %topic_arn,
+            "a topic's delivery-status feedback role does not trust this service for this \
+             topic, so it cannot be assumed and no delivery-status record is written"
         );
         return false;
     }

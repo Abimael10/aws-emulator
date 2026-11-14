@@ -7,18 +7,24 @@
 //! The RULE asserted here: "The <ENDPOINT>SuccessFeedbackRoleArn and
 //! <ENDPOINT>FailureFeedbackRoleArn attributes are used to give Amazon SNS write access to use
 //! CloudWatch Logs on your behalf" (`SetTopicAttributesInput$AttributeName` doc) — the value
-//! names an IAM role Amazon SNS ASSUMES, so a write of one is refused `400 InvalidParameter`
-//! when the role this account's IAM holds under that name carries a trust policy that does not
-//! let `sns.amazonaws.com` assume it, and the attribute does NOT land on the topic. A role whose
-//! trust policy admits this service is accepted and reads back. The rule is the same whichever
-//! call carried the write, so `CreateTopic` refuses the same value and leaves no topic behind.
+//! names an IAM role Amazon SNS ASSUMES FOR THE TOPIC being configured, so a write of one is
+//! refused `400 InvalidParameter` when the role this account's IAM holds under that name carries
+//! a trust policy that does not grant `sns.amazonaws.com` that assume, and the attribute does NOT
+//! land on the topic. The assume is made for one topic and carries the keys a trust statement may
+//! be narrowed by — `aws:SourceArn` naming the topic, `aws:SourceAccount` naming its owner — so a
+//! statement's `Condition` is part of its grant: a role scoped to one topic is accepted on that
+//! topic and refused on a sibling. A role whose trust policy grants the assume is accepted and
+//! reads back. The rule is the same whichever call carried the write, so `CreateTopic` refuses the
+//! same value and leaves no topic behind.
 //!
 //! The rows differ along what the rule generalises over: which of the ten feedback-role
-//! attributes the write carried (the catalog of the doc above), and what the role's trust policy
+//! attributes the write carried (the catalog of the doc above), what the role's trust policy
 //! says — this service named alone, among several, through an action wildcard, the account root
 //! instead, another service, an explicit deny beside the allow, and another STS action only —
 //! plus a role this account's IAM holds nothing under, which is no evidence about a role
-//! provisioned out of band and is therefore not refused.
+//! provisioned out of band and is therefore not refused; and, for the conditioned grant, the
+//! operator the clause is written under, which key it is over, which topic or account it names,
+//! negation, several clauses at once, and a key the assume carries no value for.
 
 use std::sync::Arc;
 
@@ -216,6 +222,23 @@ fn trusts(principal: serde_json::Value, action: serde_json::Value) -> String {
         }],
     })
     .to_string()
+}
+
+/// The same policy, with `condition` as the statement's `Condition` element — the narrowing a
+/// least-privilege logging role carries, and `None` for a statement that carries none.
+fn trusts_under(condition: Option<serde_json::Value>) -> String {
+    let mut statement = json!({
+        "Effect": "Allow",
+        "Principal": {"Service": SNS_PRINCIPAL},
+        "Action": "sts:AssumeRole",
+    });
+    if let Some(condition) = condition {
+        statement
+            .as_object_mut()
+            .expect("a statement is a JSON object")
+            .insert("Condition".to_string(), condition);
+    }
+    json!({"Version": "2012-10-17", "Statement": [statement]}).to_string()
 }
 
 /// The sentence SNS states for a value it cannot use as a delivery-status logging role, stated
@@ -535,5 +558,215 @@ async fn the_trust_relationship_is_read_at_every_write() {
     assert!(
         !held.contains_key("SQSFailureFeedbackRoleArn"),
         "case {case:?}: the refused write must leave no SQSFailureFeedbackRoleArn, got {held:?}"
+    );
+}
+
+/// One row of the conditioned-trust table: the case, the `Condition` element the role's trust
+/// statement carries (`None` for a statement that carries none) and whether a write naming that
+/// role on the configured topic must be refused.
+type ConditionCase = (&'static str, Option<serde_json::Value>, bool);
+
+/// The conditioned trust grants a feedback role is judged by, each with the answer a write on
+/// `topic` must produce.
+///
+/// `sibling` is another topic of the same account and Region, and `account` is the account both
+/// belong to — the two values a confused-deputy clause on a logging role is written over.
+fn condition_rows(topic: &str, sibling: &str, account: &str) -> Vec<ConditionCase> {
+    let every_topic = format!("arn:aws:sns:{REGION}:{account}:*");
+    let other_names = format!("arn:aws:sns:{REGION}:{account}:feedback-condition-other-*");
+    vec![
+        ("an unconditioned grant", None, false),
+        (
+            "ArnEquals on the very topic the write configures",
+            Some(json!({"ArnEquals": {"aws:SourceArn": topic}})),
+            false,
+        ),
+        (
+            "ArnEquals on a sibling topic of the same account",
+            Some(json!({"ArnEquals": {"aws:SourceArn": sibling}})),
+            true,
+        ),
+        (
+            "ArnLike over every topic of this account and Region",
+            Some(json!({"ArnLike": {"aws:SourceArn": every_topic}})),
+            false,
+        ),
+        (
+            "ArnLike over another family of topic names",
+            Some(json!({"ArnLike": {"aws:SourceArn": other_names}})),
+            true,
+        ),
+        (
+            "StringEquals on the account the topic belongs to",
+            Some(json!({"StringEquals": {"aws:SourceAccount": account}})),
+            false,
+        ),
+        (
+            "StringEquals on another account",
+            Some(json!({"StringEquals": {"aws:SourceAccount": "999999999999"}})),
+            true,
+        ),
+        (
+            "ArnNotEquals on a sibling topic, which this topic is not",
+            Some(json!({"ArnNotEquals": {"aws:SourceArn": sibling}})),
+            false,
+        ),
+        (
+            "ArnNotEquals on the topic itself",
+            Some(json!({"ArnNotEquals": {"aws:SourceArn": topic}})),
+            true,
+        ),
+        (
+            "both keys the assume carries, each satisfied",
+            Some(json!({
+                "ArnEquals": {"aws:SourceArn": topic},
+                "StringEquals": {"aws:SourceAccount": account},
+            })),
+            false,
+        ),
+        (
+            "this topic's own ARN beside another account",
+            Some(json!({
+                "ArnEquals": {"aws:SourceArn": topic},
+                "StringEquals": {"aws:SourceAccount": "999999999999"},
+            })),
+            true,
+        ),
+        (
+            "a clause over a key the assume carries no value for",
+            Some(json!({"StringEquals": {"aws:SourceVpc": "vpc-1"}})),
+            true,
+        ),
+    ]
+}
+
+/// RULE, over the CONDITION on an otherwise-trusting role: the grant has to cover the assume SNS
+/// would make FOR THE TOPIC in the request, so a trust statement's `Condition` is decided against
+/// the keys that assume carries — the topic's own ARN and the account it belongs to — and a clause
+/// the assume cannot be shown to satisfy is no grant. The write is refused with the service's own
+/// parameter sentence and the attribute does not land.
+///
+/// The attribute written is `HTTPSuccessFeedbackRoleArn`: an entry of the catalog above that no
+/// recorded case of this rule cited, so the rule is asserted away from its one instance.
+#[tokio::test]
+async fn a_trust_condition_is_decided_against_the_topic_the_write_configures() {
+    const ATTRIBUTE: &str = "HTTPSuccessFeedbackRoleArn";
+
+    let emulator = Emulator::new();
+    let topic = emulator.topic("feedback-condition-configured").await;
+    let sibling = emulator.topic("feedback-condition-sibling").await;
+    let account = account_of(&topic);
+
+    for (index, (case, condition, refused)) in condition_rows(&topic, &sibling, &account)
+        .into_iter()
+        .enumerate()
+    {
+        let role = emulator
+            .role(
+                &format!("sns-logs-conditioned-{index}"),
+                &trusts_under(condition),
+            )
+            .await;
+        let answer = emulator.set_attribute(&topic, ATTRIBUTE, &role).await;
+        let held = emulator.attributes(&topic).await;
+        if refused {
+            assert_refused(case, &answer, ATTRIBUTE, &role);
+            assert!(
+                !held.contains_key(ATTRIBUTE),
+                "case {case:?}: a refused write must leave the topic carrying no {ATTRIBUTE}, \
+                 got {held:?}"
+            );
+        } else {
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected 200, got {} / {}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                held.get(ATTRIBUTE).map(String::as_str),
+                Some(role.as_str()),
+                "case {case:?}: the accepted role must read back, got {held:?}"
+            );
+            // Cleared again, so the next row's assertion is about its own write.
+            let cleared = emulator
+                .sns(
+                    "SetTopicAttributes",
+                    &[("TopicArn", &topic), ("AttributeName", ATTRIBUTE)],
+                )
+                .await;
+            assert_eq!(
+                cleared.status, 200,
+                "case {case:?}: clearing {ATTRIBUTE} must succeed, got {} / {}",
+                cleared.status, cleared.body
+            );
+        }
+    }
+}
+
+/// RULE, per topic: ONE role scoped by `aws:SourceArn` to one topic is accepted on that topic and
+/// refused on every sibling — through `SetTopicAttributes` and through the `CreateTopic` that
+/// carries the same attribute, which leaves no topic behind.
+#[tokio::test]
+async fn a_role_scoped_to_one_topic_takes_no_write_on_a_sibling() {
+    const ATTRIBUTE: &str = "SQSSuccessFeedbackRoleArn";
+
+    let emulator = Emulator::new();
+    let scoped_to = emulator.topic("feedback-scope-owner").await;
+    let sibling = emulator.topic("feedback-scope-sibling").await;
+    let account = account_of(&scoped_to);
+    let role = emulator
+        .role(
+            "sns-logs-scoped",
+            &trusts_under(Some(json!({
+                "ArnEquals": {"aws:SourceArn": scoped_to},
+                "StringEquals": {"aws:SourceAccount": account},
+            }))),
+        )
+        .await;
+
+    let case = "the topic the role's trust is scoped to";
+    let answer = emulator.set_attribute(&scoped_to, ATTRIBUTE, &role).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected 200, got {} / {}",
+        answer.status, answer.body
+    );
+    let held = emulator.attributes(&scoped_to).await;
+    assert_eq!(
+        held.get(ATTRIBUTE).map(String::as_str),
+        Some(role.as_str()),
+        "case {case:?}: the accepted role must read back, got {held:?}"
+    );
+
+    let case = "a sibling topic the role's trust says nothing about";
+    let answer = emulator.set_attribute(&sibling, ATTRIBUTE, &role).await;
+    assert_refused(case, &answer, ATTRIBUTE, &role);
+    let held = emulator.attributes(&sibling).await;
+    assert!(
+        !held.contains_key(ATTRIBUTE),
+        "case {case:?}: the refused write must leave the sibling carrying no {ATTRIBUTE}, got \
+         {held:?}"
+    );
+
+    let case = "a create carrying the same value for a topic the role is not scoped to";
+    let created = emulator
+        .create_topic_with("feedback-scope-created", ATTRIBUTE, &role)
+        .await;
+    assert_refused(case, &created, ATTRIBUTE, &role);
+    let read = emulator
+        .sns(
+            "GetTopicAttributes",
+            &[(
+                "TopicArn",
+                &format!("arn:aws:sns:{REGION}:{account}:feedback-scope-created"),
+            )],
+        )
+        .await;
+    assert_eq!(
+        read.code(),
+        "NotFound",
+        "case {case:?}: a refused create must leave no topic, got {} / {}",
+        read.status,
+        read.body
     );
 }
