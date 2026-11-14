@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendOTPMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendOTPMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints one one-time passcode for an application and stores it as the challenge a
+//! later `VerifyOTPMessage` is answered from: the code is generated here, carried by
+//! the message and reported to nobody, and the request's `ReferenceId`,
+//! `DestinationIdentity`, `AllowedAttempts` and `ValidityPeriod` are what decide which
+//! verification can spend it and for how long. An unknown application is a
+//! `NotFoundException`; a request this service cannot mint a code for — a channel other
+//! than SMS, a blank required identity, a non-positive or oversized `CodeLength`,
+//! `AllowedAttempts` or `ValidityPeriod` — is a `BadRequestException`, and nothing is
+//! stored for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendOTPMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The code goes out over the application's SMS channel, so the destination's
+//! `DeliveryStatus` is computed from that channel's stored state the same way a direct
+//! send to an SMS address is: an application with no SMS channel enabled has nothing to
+//! send the code over, so the send answers a permanent failure for the destination and
+//! mints no code at all — and a verification quoting a code for that reference finds no
+//! challenge to match. That channel's own `UpdateSmsChannel` is still a scaffold, so
+//! until it is implemented the enabled side of this gate is reachable only by a caller
+//! of this crate (a test) rather than over the wire; the refusal a caller sees until
+//! then is the same one a direct SMS send answers for an application that has not
+//! enabled the channel.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +91,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The `DeliveryStatus` and `StatusCode` vocabulary every send of this service answers
+// out of, defined once beside the store it is computed from.
+use crate::state::{DELIVERY_PERMANENT_FAILURE, DELIVERY_SUCCESSFUL, STATUS_NOT_FOUND, STATUS_OK};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,20 +167,220 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendOTPMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendOTPMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendOTPMessage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+
+        let SendOTPMessageInput {
+            application_id,
+            send_otp_message_request_parameters: parameters,
+        } = input;
+        let SendOTPMessageRequestParameters {
+            allowed_attempts,
+            brand_name,
+            channel,
+            code_length,
+            destination_identity,
+            // `EntityId`, `Language` and `TemplateId` tailor the message BODY the code
+            // is carried in — the DLT registration it is sent under and the language it
+            // is worded in. This service does not render that body, and nothing about
+            // the challenge or the result follows from any of them.
+            entity_id: _,
+            language: _,
+            origination_identity,
+            reference_id,
+            template_id: _,
+            validity_period,
+        } = parameters;
+
+        // The required identities name who the message is from, who it goes to and what
+        // a verification has to quote back. A blank one names nothing, so the request is
+        // refused before a code is minted.
+        for (member, value) in [
+            ("BrandName", &brand_name),
+            ("Channel", &channel),
+            ("DestinationIdentity", &destination_identity),
+            ("OriginationIdentity", &origination_identity),
+            ("ReferenceId", &reference_id),
+        ] {
+            if value.trim().is_empty() {
+                return Err(bad_request(format!("{member} must not be blank")));
+            }
+        }
+
+        if !channel.eq_ignore_ascii_case(crate::state::CHANNEL_TYPE_SMS) {
+            return Err(bad_request(format!(
+                "Channel {channel} is not supported for OTP messages. Supported values: [{}]",
+                crate::state::CHANNEL_TYPE_SMS
+            )));
+        }
+
+        let requested_code_length = code_length.unwrap_or(crate::state::DEFAULT_CODE_LENGTH);
+        let Some(code_length) = usize::try_from(requested_code_length)
+            .ok()
+            .filter(|length| {
+                (crate::state::MIN_CODE_LENGTH..=crate::state::MAX_CODE_LENGTH).contains(length)
+            })
+        else {
+            return Err(bad_request(format!(
+                "CodeLength must be between {} and {}; this request asks for {requested_code_length}",
+                crate::state::MIN_CODE_LENGTH,
+                crate::state::MAX_CODE_LENGTH
+            )));
+        };
+
+        let allowed_attempts = allowed_attempts.unwrap_or(crate::state::DEFAULT_ALLOWED_ATTEMPTS);
+        if allowed_attempts < 1 {
+            return Err(bad_request(format!(
+                "AllowedAttempts must be at least 1; this request asks for {allowed_attempts}"
+            )));
+        }
+
+        let validity_period = validity_period.unwrap_or(crate::state::DEFAULT_VALIDITY_PERIOD_MINUTES);
+        let validity = u64::try_from(validity_period)
+            .ok()
+            .filter(|minutes| *minutes >= 1)
+            .map(|minutes| ::std::time::Duration::from_secs(minutes.saturating_mul(SECONDS_PER_MINUTE)));
+        let Some(validity) = validity else {
+            return Err(bad_request(format!(
+                "ValidityPeriod must be at least 1 minute; this request asks for {validity_period}"
+            )));
+        };
+        let sent_instant = ::std::time::SystemTime::now();
+        let Some(expires_at) = sent_instant.checked_add(validity) else {
+            return Err(bad_request(format!(
+                "ValidityPeriod of {validity_period} minutes names an expiry this service cannot represent"
+            )));
+        };
+        let sent_at = crate::state::now_iso8601();
+
+        let mut store = state.lock();
+        let Some(app) = store.apps.get(&application_id) else {
+            return Err(SendOTPMessageErrorModeled::NotFoundException(NotFoundException {
+                // The service's text for this class is fixed: it names the class of
+                // resource and carries no value out of the request.
+                message: Some("Application not found".to_string()),
+                request_id: None,
+            })
+            .into());
+        };
+
+        // The OTP goes out over the SMS channel, and a channel the API configures as a
+        // channel of the application is delivered over only while that channel is
+        // enabled for it — the same rule a direct send to an SMS address is answered
+        // by. An application that never enabled the channel, or disabled it again, has
+        // no SMS to send the code over, so the destination's outcome is a permanent
+        // failure and no code is minted for it.
+        let outcome = match app.deliverable_channel(crate::state::CHANNEL_TYPE_SMS) {
+            Some(_) => Outcome {
+                delivery_status: DELIVERY_SUCCESSFUL,
+                status_code: STATUS_OK,
+                status_message: "Message accepted for delivery".to_string(),
+            },
+            None => Outcome {
+                delivery_status: DELIVERY_PERMANENT_FAILURE,
+                status_code: STATUS_NOT_FOUND,
+                status_message: crate::state::channel_not_found_message(
+                    crate::state::CHANNEL_TYPE_SMS,
+                    &app.id,
+                ),
+            },
+        };
+        let delivered = outcome.delivery_status == DELIVERY_SUCCESSFUL;
+
+        // A code and a message id are minted only for a destination the message was
+        // accepted for, so a code in the store always belongs to a message that went
+        // out and an id in a response always names an accepted delivery.
+        let request_id = store.mint_id();
+        let code = delivered.then(|| store.mint_otp_code(code_length));
+        let message_id = delivered.then(|| store.mint_id());
+        // The application was read above under this same guard, so it is still there.
+        if let Some(app) = store.apps.get_mut(&application_id) {
+            if let Some(code) = code {
+                app.put_otp(crate::state::OtpChallenge {
+                    reference_id,
+                    destination_identity: destination_identity.clone(),
+                    code,
+                    attempts_remaining: allowed_attempts,
+                    sent_at: sent_at.clone(),
+                    expires_at,
+                });
+            }
+            app.record_send(crate::state::MessageSend {
+                request_id: request_id.clone(),
+                // An OTP send carries no caller `TraceId`: the request models none.
+                trace_id: None,
+                sent_at,
+                deliveries: vec![crate::state::MessageDelivery {
+                    endpoint_id: None,
+                    address: Some(destination_identity.clone()),
+                    channel_type: Some(crate::state::CHANNEL_TYPE_SMS.to_string()),
+                    delivery_status: outcome.delivery_status.to_string(),
+                    status_code: outcome.status_code,
+                    message_id: message_id.clone(),
+                }],
+            });
+        }
+
+        // One destination, so one result, reported under the destination the code was
+        // sent to — the key `MessageResponse$Result` is "the address ... that the
+        // message was sent to".
+        let mut result: ::std::collections::HashMap<String, MessageResult> =
+            ::std::collections::HashMap::with_capacity(1);
+        result.insert(
+            destination_identity,
+            MessageResult {
+                delivery_status: outcome.delivery_status.to_string(),
+                message_id,
+                status_code: outcome.status_code,
+                status_message: Some(outcome.status_message),
+                updated_token: None,
+            },
+        );
+
+        Ok(SendOTPMessageOutput {
+            message_response: MessageResponse {
+                application_id,
+                // An OTP message is addressed to an identity, never to one of the
+                // application's endpoints, so there is no per-endpoint result.
+                endpoint_result: None,
+                request_id: Some(request_id),
+                result: Some(result),
+            },
+        })
     }
+}
+
+/// Seconds in the minute `ValidityPeriod` is expressed in.
+const SECONDS_PER_MINUTE: u64 = 60;
+
+/// What this service answered for the one destination the OTP was addressed to,
+/// before any code or id is minted for it.
+struct Outcome {
+    delivery_status: &'static str,
+    status_code: i32,
+    status_message: String,
+}
+
+/// Refuse a request this service cannot mint a code for, through the modelled
+/// client-error channel this operation declares. Names the member that is wrong and
+/// the rule it breaks, so the caller can fix the request from the text alone.
+fn bad_request(message: String) -> SendOTPMessageError {
+    SendOTPMessageErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        request_id: None,
+    })
+    .into()
+}
+
+/// The `InternalServerErrorException` this operation answers with when the shared
+/// store cannot be reached — never a fresh engine, which would be a private store.
+fn store_unavailable() -> SendOTPMessageError {
+    SendOTPMessageErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some("the pinpoint state store is unavailable".to_string()),
+        request_id: None,
+    })
+    .into()
 }

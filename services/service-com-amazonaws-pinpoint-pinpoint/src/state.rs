@@ -4,14 +4,16 @@
 //!
 //! The store is keyed the way the API is: applications (what the Pinpoint console
 //! calls projects) by `ApplicationId`, and each application owns its endpoints by
-//! `EndpointId`. Both maps are [`BTreeMap`]s so every listing — and the pagination
-//! token built from it — has one deterministic order.
+//! `EndpointId`, its channels by `ChannelType` and its live one-time passcodes by the
+//! pair a verification matches on. Every map is a [`BTreeMap`] so every listing — and
+//! the pagination token built from it — has one deterministic order.
 //!
 //! Handlers reach it through [`service_state`] and share the small helpers below
 //! (id minting, the ISO 8601 clock, the signing region) rather than each growing
 //! its own copy.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
@@ -82,6 +84,71 @@ pub const MAX_DESTINATIONS_PER_SEND: usize = 100;
 /// emulator's own ceiling, not an AWS-published one.
 pub const MAX_SENDS_PER_APP: usize = 100;
 
+/// The most one-time passcode challenges one application holds at once.
+///
+/// `SendOTPMessage` stores one challenge per reference identifier and destination, so
+/// without a ceiling a caller sending codes for fresh reference identifiers could grow
+/// one application without limit. The challenge nearest the end of its own validity is
+/// dropped once the store is full, so however many codes a caller sends, the store's
+/// size stays bounded by the live applications. The emulator's own ceiling, not an
+/// AWS-published one.
+pub const MAX_OTPS_PER_APP: usize = 100;
+
+/// The number of digits a minted one-time passcode carries when the request names no
+/// `CodeLength` ("the number of characters in the generated OTP"): six, the length an
+/// OTP message carries unless the caller asks for another.
+pub const DEFAULT_CODE_LENGTH: i32 = 6;
+
+/// The fewest digits a minted one-time passcode can carry: a code of no characters
+/// could never be supplied for verification, so a request asking for fewer than this
+/// is refused instead of served.
+pub const MIN_CODE_LENGTH: usize = 1;
+
+/// The most digits a minted one-time passcode can carry, so the work one send costs
+/// and the state it leaves behind cannot grow with the number the request asks for.
+/// The emulator's own ceiling, not an AWS-published one.
+pub const MAX_CODE_LENGTH: usize = 10;
+
+/// The verifications one challenge answers when the request names no
+/// `AllowedAttempts` ("the attempts allowed to validate an OTP").
+pub const DEFAULT_ALLOWED_ATTEMPTS: i32 = 5;
+
+/// The minutes a minted code stays valid for when the request names no
+/// `ValidityPeriod` ("the time in minutes before the OTP is no longer valid"). A
+/// request that names one gets exactly the period it named; this default is the
+/// emulator's own.
+pub const DEFAULT_VALIDITY_PERIOD_MINUTES: i32 = 30;
+
+/// The `ChannelType` value of the SMS channel, which is the only channel an OTP
+/// message is sent over: `SendOTPMessageRequestParameters$Channel` is "channel type
+/// for the OTP message. Supported values: [SMS]".
+pub const CHANNEL_TYPE_SMS: &str = "SMS";
+
+/// The `DeliveryStatus` values a send reports for one destination, over the values the
+/// model's `DeliveryStatus` enum lists. Every send operation answers out of this one
+/// vocabulary, so two of them cannot describe the same outcome differently.
+///
+/// The message was accepted for delivery to the destination.
+pub const DELIVERY_SUCCESSFUL: &str = "SUCCESSFUL";
+
+/// The destination cannot take the message, and a retry of the same send cannot
+/// change that.
+pub const DELIVERY_PERMANENT_FAILURE: &str = "PERMANENT_FAILURE";
+
+/// The destination's user has opted out of receiving messages.
+pub const DELIVERY_OPT_OUT: &str = "OPT_OUT";
+
+/// The destination's address already took delivery in this same send.
+pub const DELIVERY_DUPLICATE: &str = "DUPLICATE";
+
+/// `MessageResult$StatusCode` is "the downstream service status code for delivering
+/// the message": accepted, refused by the request or the destination's own state,
+/// refused because the destination's user opted out, or no such destination or channel.
+pub const STATUS_OK: i32 = 200;
+pub const STATUS_REFUSED: i32 = 400;
+pub const STATUS_FORBIDDEN: i32 = 403;
+pub const STATUS_NOT_FOUND: i32 = 404;
+
 /// The number of hex characters in a minted id, and so in an `ApplicationId`.
 const MINTED_ID_LEN: usize = 32;
 
@@ -134,6 +201,9 @@ pub struct App {
     /// The sends this application accepted, oldest first and at most
     /// [`MAX_SENDS_PER_APP`] of them.
     pub sends: Vec<MessageSend>,
+    /// The live one-time passcode challenges of this application, by the pair a
+    /// verification has to match: [`otp_key`]. At most [`MAX_OTPS_PER_APP`] of them.
+    pub otps: BTreeMap<(String, String), OtpChallenge>,
 }
 
 impl App {
@@ -198,6 +268,121 @@ impl App {
         self.channels
             .get(channel_type)
             .filter(|channel| channel.enabled && !channel.is_archived)
+    }
+
+    /// Store one freshly minted OTP challenge against this application.
+    ///
+    /// A new code for a reference identifier and destination this application already
+    /// holds a challenge for REPLACES it: the code last sent to a destination is the
+    /// one that verifies, and an earlier code for the same pair is spent. When the
+    /// store is already at [`MAX_OTPS_PER_APP`], the challenge nearest the end of its
+    /// own validity is dropped to make room — the one that was going to stop verifying
+    /// first anyway.
+    pub fn put_otp(&mut self, challenge: OtpChallenge) {
+        let key = otp_key(&challenge.reference_id, &challenge.destination_identity);
+        while !self.otps.contains_key(&key) && self.otps.len() >= MAX_OTPS_PER_APP {
+            // Iteration is in key order and the first minimum wins, so which of two
+            // challenges expiring at the same instant is dropped is deterministic.
+            let evicted = self
+                .otps
+                .iter()
+                .min_by_key(|(_, held)| held.expires_at)
+                .map(|(held_key, _)| held_key.clone());
+            match evicted {
+                Some(held_key) => {
+                    self.otps.remove(&held_key);
+                }
+                None => break,
+            }
+        }
+        self.otps.insert(key, challenge);
+    }
+
+    /// Answer one verification of a stored OTP challenge, as of `now`, and record what
+    /// the verification did to it.
+    ///
+    /// A code is valid only while the challenge it was minted for is still held, has
+    /// not run out of validity and still answers an attempt, and only for the exact
+    /// code stored for that reference identifier and destination. Each verification
+    /// that reaches the comparison spends one of the challenge's attempts, and a code
+    /// that verifies is consumed: a one-time passcode verifies once.
+    pub fn verify_otp(
+        &mut self,
+        reference_id: &str,
+        destination_identity: &str,
+        code: &str,
+        now: SystemTime,
+    ) -> bool {
+        let key = otp_key(reference_id, destination_identity);
+        let Some(challenge) = self.otps.get_mut(&key) else {
+            // Nothing was sent for this pair — or what was sent has already been
+            // consumed or evicted — so there is no code this request could match.
+            return false;
+        };
+        if challenge.expires_at <= now {
+            // Owed by the clock: the challenge stopped being valid at that instant
+            // whether or not anybody verified it, so drop it now it is observed.
+            self.otps.remove(&key);
+            return false;
+        }
+        if challenge.attempts_remaining <= 0 {
+            return false;
+        }
+        challenge.attempts_remaining = challenge.attempts_remaining.saturating_sub(1);
+        if challenge.code != code {
+            return false;
+        }
+        self.otps.remove(&key);
+        true
+    }
+}
+
+/// The key one OTP challenge is stored under: the developer-supplied reference
+/// identifier together with the destination the code was sent to — the pair a
+/// verification carries, since `SendOTPMessageRequestParameters$ReferenceId` is
+/// "required to match during OTP verification" and `VerifyOTPMessageRequestParameters`
+/// requires the destination as well.
+pub fn otp_key(reference_id: &str, destination_identity: &str) -> (String, String) {
+    (
+        reference_id.to_string(),
+        destination_identity.to_string(),
+    )
+}
+
+/// One live one-time passcode of an application: what `SendOTPMessage` minted and
+/// stored, and the only thing `VerifyOTPMessage` answers from.
+#[derive(Clone)]
+pub struct OtpChallenge {
+    /// The caller's own reference identifier for the code.
+    pub reference_id: String,
+    /// The destination the code was sent to.
+    pub destination_identity: String,
+    /// The code the message carried. No operation of this service reports it: it is
+    /// only ever compared against the code a verification supplies.
+    pub code: String,
+    /// The verifications this challenge still answers: `AllowedAttempts` when it was
+    /// minted, one fewer after each verification that reaches the comparison.
+    pub attempts_remaining: i32,
+    /// ISO 8601, the instant the code was sent.
+    pub sent_at: String,
+    /// The instant the code stops being valid: `ValidityPeriod` minutes after it was
+    /// sent.
+    pub expires_at: SystemTime,
+}
+
+/// Written by hand rather than derived so the code itself cannot reach a formatter:
+/// everything else about a challenge is safe to print, and the code is the one part
+/// that is only ever compared.
+impl ::std::fmt::Debug for OtpChallenge {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("OtpChallenge")
+            .field("reference_id", &self.reference_id)
+            .field("destination_identity", &self.destination_identity)
+            .field("code_length", &self.code.chars().count())
+            .field("attempts_remaining", &self.attempts_remaining)
+            .field("sent_at", &self.sent_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
     }
 }
 
@@ -355,6 +540,24 @@ impl ComAmazonawsPinpointPinpointState {
         let seed = format!("{}:{}", self.mint_counter, nanos_since_epoch());
         let digest = Sha256::digest(seed.as_bytes());
         hex::encode(&digest[..MINTED_ID_LEN / 2])
+    }
+
+    /// Mint a fresh one-time passcode of `length` decimal digits.
+    ///
+    /// Drawn the same way as [`Self::mint_id`], so two codes minted inside one clock
+    /// tick still differ and a caller holding one code cannot work out the next.
+    /// `length` is bounded by [`MAX_CODE_LENGTH`], which is well inside the digest's
+    /// own width, so the code always has as many digits as was asked for.
+    pub fn mint_otp_code(&mut self, length: usize) -> String {
+        self.mint_counter = self.mint_counter.wrapping_add(1);
+        let seed = format!("otp:{}:{}", self.mint_counter, nanos_since_epoch());
+        let digest = Sha256::digest(seed.as_bytes());
+        digest
+            .iter()
+            .copied()
+            .take(length)
+            .map(|byte| char::from(b'0' + byte % 10))
+            .collect()
     }
 }
 

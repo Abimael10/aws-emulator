@@ -17,5 +17,7 @@ mod app_endpoint_lifecycle;
 mod channel_responses;
 #[path = "all/direct_message_send.rs"]
 mod direct_message_send;
+#[path = "all/otp_messages.rs"]
+mod otp_messages;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

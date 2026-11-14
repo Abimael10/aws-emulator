@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VerifyOTPMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VerifyOTPMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VerifyOTPMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers whether the code a caller supplies is the one `SendOTPMessage` stored for
+//! that `ReferenceId` and `DestinationIdentity`: `Valid` is true only while the
+//! challenge is still held, still inside its validity period and still answering an
+//! attempt, and only for the exact code stored for that pair. Each verification that
+//! reaches the comparison spends one of the challenge's `AllowedAttempts`, and a code
+//! that verifies is consumed — a one-time passcode verifies once. An unknown
+//! application is a `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +151,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VerifyOTPMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VerifyOTPMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VerifyOTPMessage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+
+        let VerifyOTPMessageInput {
+            application_id,
+            verify_otp_message_request_parameters: parameters,
+        } = input;
+        let VerifyOTPMessageRequestParameters {
+            destination_identity,
+            otp,
+            reference_id,
+        } = parameters;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(app) = store.apps.get_mut(&application_id) else {
+            return Err(VerifyOTPMessageErrorModeled::NotFoundException(NotFoundException {
+                // The service's text for this class is fixed: it names the class of
+                // resource and carries no value out of the request.
+                message: Some("Application not found".to_string()),
+                request_id: None,
+            })
+            .into());
+        };
+
+        // A pair this application never sent a code for, a code whose validity period
+        // has run out, one whose attempts are spent and one that simply does not match
+        // are all answered the same way: not valid. The verification itself is what
+        // spends an attempt and what consumes a code that matched.
+        let valid = app.verify_otp(&reference_id, &destination_identity, &otp, now);
+
+        Ok(VerifyOTPMessageOutput {
+            verification_response: VerificationResponse { valid: Some(valid) },
+        })
     }
+}
+
+/// The `InternalServerErrorException` this operation answers with when the shared
+/// store cannot be reached — never a fresh engine, which would be a private store.
+fn store_unavailable() -> VerifyOTPMessageError {
+    VerifyOTPMessageErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some("the pinpoint state store is unavailable".to_string()),
+        request_id: None,
+    })
+    .into()
 }

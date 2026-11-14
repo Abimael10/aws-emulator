@@ -78,6 +78,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The `DeliveryStatus` and `StatusCode` vocabulary every send of this service answers
+// out of, defined once beside the store it is computed from.
+use crate::state::{
+    DELIVERY_DUPLICATE, DELIVERY_OPT_OUT, DELIVERY_PERMANENT_FAILURE, DELIVERY_SUCCESSFUL,
+    STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OK, STATUS_REFUSED,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -380,27 +386,6 @@ fn store_unavailable() -> SendMessagesError {
     })
     .into()
 }
-
-/// The message was accepted for delivery to the destination.
-const DELIVERY_SUCCESSFUL: &str = "SUCCESSFUL";
-
-/// The destination cannot take the message, and a retry of the same send cannot
-/// change that.
-const DELIVERY_PERMANENT_FAILURE: &str = "PERMANENT_FAILURE";
-
-/// The destination's user has opted out of receiving messages.
-const DELIVERY_OPT_OUT: &str = "OPT_OUT";
-
-/// The destination's address already took delivery in this same send.
-const DELIVERY_DUPLICATE: &str = "DUPLICATE";
-
-/// `MessageResult$StatusCode` is "the downstream service status code for delivering
-/// the message": accepted, no such destination, refused by the destination's own
-/// state, or refused because nothing deliverable was supplied for its channel.
-const STATUS_OK: i32 = 200;
-const STATUS_REFUSED: i32 = 400;
-const STATUS_FORBIDDEN: i32 = 403;
-const STATUS_NOT_FOUND: i32 = 404;
 
 /// The `OptOut` value that means the endpoint's user wants no messages at all, per
 /// `EndpointResponse$OptOut`: "ALL, the user has opted out and doesn't want to receive
