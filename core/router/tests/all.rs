@@ -4430,3 +4430,16 @@ mod cloudformation_appsync_custom_domains;
 // landed here as `//!`, which is exactly the `E0753` they describe, so they are ordinary
 // comments.)
 // leaving a note in the tail. (Ordinary comments here, for the reason they record.)
+// (`sfn_relayed_dynamodb_request_id` is declared ONCE, just above: two landings in the same
+// window each appended a declaration of it here, and a module declared twice is `E0428`.)
+// above: two landings in the same window each appended a declaration of it here, and a
+// module declared twice is `E0428`.)
+// sorted head region of this file: two landings in the same window each appended a
+// declaration of it here, and a module declared twice is `E0428`.)
+// (One more fragment of that header, an ordinary comment for the reason the lines above
+// record: a suite left at the top level of `tests/` fails the build.)
+// (Another copy of this file's header landed in this tail typed with `//!`, which is
+// `E0753` past the first item of a crate root and compiles no suite of this target, so it
+// stands as ordinary comments: declare each suite exactly ONCE, since this is one crate
+// root and a second `mod` for the same name is `E0428`, and keep a note like this one at
+// the HEAD of the file. `all/all_rs_declares_each_suite_once.rs` and

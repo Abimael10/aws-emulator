@@ -41,6 +41,8 @@ mod framework_update_idempotency;
 mod job_state_change_events;
 #[path = "all/legal_hold.rs"]
 mod legal_hold;
+#[path = "all/legal_hold_cancel_record_retention.rs"]
+mod legal_hold_cancel_record_retention;
 #[path = "all/legal_hold_cancel_state_refusal.rs"]
 mod legal_hold_cancel_state_refusal;
 #[path = "all/legal_hold_coverage.rs"]
