@@ -62,6 +62,11 @@
 //!
 //! * `InternalErrorException` (HTTP 500) — An error on the server occurred during the
 //!   processing of your request. Try again later.
+//! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
+//!   by an Amazon Web Services service. Widened onto the error enum through `extra_errors`
+//!   (see below): the SERVICE models this shape (`@error client`, `@httpError` 400) and it
+//!   is this service's only client-input error, so it is what refuses a `NextToken` this
+//!   operation never issued, while the operation's own `errors` list does not name it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -77,10 +82,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-costandusagereportservi
 // here — hence the `DescribeReportDefinitionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.costandusagereportservice#DescribeReportDefinitions")]
+// `ValidationException` — the shape this SERVICE models for a request it will not accept
+// (`@error client`, `@httpError` 400) and the one every other refusal in this crate
+// returns — is widened in through `extra_errors`, because this operation's own `errors`
+// list does not repeat it. That is what makes the bad-`NextToken` refusal below the
+// service's MODELLED error shape, carrying its modelled `Message` member, rather than a
+// synthetic shape outside the model.
+#[smithy_macros::operation_error(
+    "com.amazonaws.costandusagereportservice#DescribeReportDefinitions",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum DescribeReportDefinitionsErrorModeled {
     InternalErrorException(InternalErrorException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -218,14 +233,13 @@ fn encode_page_token(key: crate::state::PageTokenKey, resume_at: usize) -> Strin
 
 /// The index in `store` the token resumes at.
 ///
-/// Refused with a 400 `ValidationException` when the token is not one this operation
-/// issued — one that is not hex, one too short to carry an authenticator, one whose
-/// authenticator does not match the position it travels with (so one minted under another
-/// store's key as well), one whose position is no number, and one naming a position past
-/// the end of a store that has since shrunk: this operation models no client-input error
-/// of its own, so the framework's validation channel carries the refusal rather than a 501
-/// (which would claim the operation is unimplemented) or a silent restart from the first
-/// report (which would hand a paginating client the same reports twice).
+/// Refused with [`invalid_page_token`] when the token is not one this operation issued —
+/// one that is not hex, one too short to carry an authenticator, one whose authenticator
+/// does not match the position it travels with (so one minted under another store's key as
+/// well), one whose position is no number, and one naming a position past the end of a
+/// store that has since shrunk: refusing is what keeps a 501 (which would claim the
+/// operation is unimplemented) and a silent restart from the first report (which would hand
+/// a paginating client the same reports twice) off the wire.
 ///
 /// A position the shrunken store exactly REACHES is still honoured, and answers the empty
 /// last page: the reports that page would have held were deleted, which is the walk ending
@@ -236,9 +250,8 @@ fn resolve_page_token(
     store: &crate::state::ComAmazonawsCostandusagereportserviceAwsorigamiservicegatewayserviceState,
 ) -> Result<usize, DescribeReportDefinitionsError> {
     let invalid = || {
-        crate::scaffolded::Scaffolded::validation(
-            "The NextToken in the request is not valid. Pass the NextToken a previous \
-             DescribeReportDefinitions response returned.",
+        DescribeReportDefinitionsError::from(
+            DescribeReportDefinitionsErrorModeled::ValidationException(invalid_page_token()),
         )
     };
     let resume_at: usize = hex::decode(token)
@@ -250,4 +263,27 @@ fn resolve_page_token(
         return Err(invalid());
     }
     Ok(resume_at)
+}
+
+/// The refusal for a `NextToken` this operation did not issue.
+///
+/// The shape is the one THIS SERVICE's model declares for a request it will not accept —
+/// `com.amazonaws.costandusagereportservice#ValidationException`, widened onto this
+/// operation's error enum above — so the refusal reaches the wire under the same error
+/// shape, and with the detail under the same modelled `Message` member, as every other
+/// refusal this crate answers.
+///
+/// It carries a message, unlike the resource-state refusals this service answers with their
+/// code alone ([`crate::state::report_not_found`]): this error code is the service's only
+/// client-input error and so multiplexes several conditions, which makes the message the
+/// discriminator between them. It states what is wrong with the member and what the caller
+/// has to pass instead, and echoes none of the rejected token back.
+fn invalid_page_token() -> ValidationException {
+    ValidationException {
+        message: Some(
+            "The NextToken in the request is not valid. Pass the NextToken a previous \
+             DescribeReportDefinitions response returned."
+                .to_string(),
+        ),
+    }
 }

@@ -15,6 +15,8 @@
 mod held_report_name_refusal;
 #[path = "all/modelled_constraints.rs"]
 mod modelled_constraints;
+#[path = "all/modelled_refusal_shape.rs"]
+mod modelled_refusal_shape;
 #[path = "all/page_token_issuance.rs"]
 mod page_token_issuance;
 #[path = "all/refusal_envelope.rs"]
