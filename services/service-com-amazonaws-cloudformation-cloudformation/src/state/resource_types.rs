@@ -246,6 +246,8 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // AWS AppSync
     "AWS::AppSync::ApiKey",
     "AWS::AppSync::DataSource",
+    crate::state::provisioning::appsync_domain_names::APPSYNC_DOMAIN_NAME,
+    crate::state::provisioning::appsync_domain_names::APPSYNC_DOMAIN_NAME_API_ASSOCIATION,
     "AWS::AppSync::FunctionConfiguration",
     "AWS::AppSync::GraphQLApi",
     "AWS::AppSync::GraphQLSchema",

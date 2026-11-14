@@ -199,6 +199,12 @@ use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
 mod apigateway_rest_api;
+/// The two AppSync custom-domain types a stack declares — the domain itself and the mapping
+/// of an API onto it: visible to the rest of this service's state because the types' own
+/// NAMES live here, beside the arms that provision them (the naming rules read the property
+/// each takes its identifier from, and the replacement rules the one that is fixed when the
+/// domain is made).
+pub(in crate::state) mod appsync_domain_names;
 /// The four `AWS::AppConfig::*` types a stack declares — the application, its environment,
 /// the configuration profile that reads a configuration and the deployment strategy that
 /// rolls one out: created in AWS AppConfig itself ([`appconfig_resources`]).
@@ -1004,6 +1010,10 @@ pub(super) enum Owner {
     /// target, and the scaling policy that steers one. Which of them it is travels with the
     /// owner, as it does for the types above.
     ApplicationAutoScaling(application_auto_scaling::Kind),
+    /// One of the two AppSync custom-domain types [`appsync_domain_names`] creates in
+    /// AppSync: the custom domain, and the mapping that makes a declared API answer on it.
+    /// Which of them it is travels with the owner, as it does for the types above.
+    AppSyncDomainName(appsync_domain_names::Kind),
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -1089,6 +1099,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = cloudfront_resources::kind_of(resource_type) {
         return Some(Owner::CloudFrontResource(kind));
+    }
+    if let Some(kind) = appsync_domain_names::kind_of(resource_type) {
+        return Some(Owner::AppSyncDomainName(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }

@@ -194,6 +194,13 @@ impl Owner {
                 ))
                 .await
             }
+            // A custom DOMAIN is taggable: its `Tags` property is the tag map
+            // `CreateDomainName` takes, so it carries the tags CloudFormation gives the
+            // resource beside its own. The MAPPING is not: it publishes no `Tags` property
+            // and `AssociateApi` takes none, so CloudFormation propagates no tag to one.
+            Self::AppSyncDomainName(kind) => {
+                appsync_domain_names::create(ctx, region, kind, resource, propagated).await
+            }
         }
     }
 
@@ -313,6 +320,12 @@ impl Owner {
             Self::ElasticLoadBalancing(kind) => {
                 elastic_load_balancing::readiness(ctx, region, kind, physical_resource_id).await
             }
+            // A custom domain exists as `CreateDomainName` answers; a MAPPING is reported
+            // `PROCESSING` until AppSync has deployed it, which that arm waits out
+            // ([`appsync_domain_names::readiness`]).
+            Self::AppSyncDomainName(kind) => {
+                appsync_domain_names::readiness(ctx, region, kind, physical_resource_id).await
+            }
         }
     }
 
@@ -367,6 +380,10 @@ impl Owner {
             // ones their own creates answered with, so there is nothing left to read once
             // either resource is up.
             Self::CloudFrontResource(_) => Ok(BTreeMap::new()),
+            // A custom domain's endpoint, zone and ARN are the ones `CreateDomainName`
+            // answered with, and a mapping's identifier is the domain it was made on, so
+            // there is nothing left to read once either resource is up.
+            Self::AppSyncDomainName(_) => Ok(BTreeMap::new()),
             // A task-definition revision's `TaskDefinitionArn` is the one its own
             // registration answered with, so there is nothing left to read once it is up.
             Self::EcsTaskDefinition => Ok(BTreeMap::new()),
@@ -558,6 +575,10 @@ impl Owner {
             // service reports no state a deleted load balancer, target group, listener or rule
             // is still being removed in.
             Self::ElasticLoadBalancing(_) => Ok(elastic_load_balancing::removal()),
+            // `DeleteDomainName` takes the domain away as it answers — the mapping it
+            // carried with it — and `DisassociateApi` leaves the domain carrying none, so
+            // there is nothing to wait for either.
+            Self::AppSyncDomainName(_) => Ok(appsync_domain_names::removal()),
         }
     }
 
@@ -718,6 +739,12 @@ impl Owner {
             Self::ElasticLoadBalancing(kind) => {
                 elastic_load_balancing::update(ctx, region, kind, resource, declared).await
             }
+            // A domain takes its DESCRIPTION, which is the one member `UpdateDomainName`
+            // carries, and a mapping takes its API, `AssociateApi` on a domain that already
+            // carries one replacing the mapping ([`appsync_domain_names::update`]).
+            Self::AppSyncDomainName(kind) => {
+                appsync_domain_names::update(ctx, region, kind, resource, declared).await
+            }
         }
     }
 
@@ -820,6 +847,9 @@ impl Owner {
             // exists are reconciled by no arm here yet ([`Provisioner::retag`]'s own default),
             // so nothing is asked about them.
             Self::ElasticLoadBalancing(_) => Ok(()),
+            // Nor are the tags of a custom domain that already exists; a mapping is not
+            // taggable at all.
+            Self::AppSyncDomainName(_) => Ok(()),
         }
     }
 
@@ -976,6 +1006,12 @@ impl Owner {
             Self::ElasticLoadBalancing(kind) => {
                 elastic_load_balancing::delete(ctx, region, kind, resource).await
             }
+            // AppSync takes no snapshot of a custom domain or of a mapping on the way out:
+            // there is no such call, so a `Snapshot` deletion policy on either type deletes
+            // the resource with no snapshot invented for it.
+            Self::AppSyncDomainName(kind) => {
+                appsync_domain_names::delete(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -1107,6 +1143,9 @@ impl Owner {
             Self::ElasticLoadBalancing(kind) => {
                 elastic_load_balancing::actual_configuration(ctx, region, kind, resource).await?
             }
+            Self::AppSyncDomainName(kind) => {
+                appsync_domain_names::actual_configuration(ctx, region, kind, resource).await?
+            }
         };
         Ok(ActualConfiguration::read(reported))
     }
@@ -1156,6 +1195,8 @@ impl Owner {
             Self::AppSyncResource(_) => message.to_string(),
             // Elastic Load Balancing's does the same.
             Self::ElasticLoadBalancing(_) => message.to_string(),
+            // AppSync's does the same.
+            Self::AppSyncDomainName(_) => message.to_string(),
         }
     }
 

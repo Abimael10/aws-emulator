@@ -2736,6 +2736,15 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         | APIGATEWAYV2_STAGE
         | APIGATEWAYV2_AUTHORIZER => &["ApiId"],
         APIGATEWAYV2_DEPLOYMENT => &["ApiId", "StageName"],
+        // An AppSync custom domain is served with the certificate it was created with:
+        // `certificateArn` is a member of `CreateDomainName`, `UpdateDomainName` takes the
+        // description alone, and no other call of that service re-certifies a domain — so a
+        // declaration naming another certificate asks for a different domain, which the
+        // deployment replaces. (The MAPPING of an API onto a domain has none beyond its own
+        // identity: its `ApiId` is what `AssociateApi` changes in place.)
+        crate::state::provisioning::appsync_domain_names::APPSYNC_DOMAIN_NAME => {
+            &["CertificateArn"]
+        }
         // An AppConfig environment and configuration profile belong to the application their
         // `ApplicationId` names, and a profile reads its configuration from the source its
         // `LocationUri` and `Type` fix: each is a member of that type's create and of no

@@ -675,6 +675,16 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         // type's last segment is `DomainName`, so neither `DomainNameName` nor `Name` finds
         // it.
         APIGATEWAY_DOMAIN_NAME | APIGATEWAYV2_DOMAIN_NAME => Some("DomainName"),
+        // AppSync addresses a custom domain, and the mapping of an API onto it, by the
+        // `DomainName` the resource IS: every operation on either binds that name as its
+        // `@httpLabel` and the service mints no identifier of its own, so it is the
+        // identifier each type publishes — the domain's `Ref` and the mapping's
+        // `ApiAssociationIdentifier`. The domain type's last segment is `DomainName` and the
+        // mapping's is `DomainNameApiAssociation`, so neither convention finds it.
+        crate::state::provisioning::appsync_domain_names::APPSYNC_DOMAIN_NAME
+        | crate::state::provisioning::appsync_domain_names::APPSYNC_DOMAIN_NAME_API_ASSOCIATION => {
+            Some("DomainName")
+        }
         ECR_PUBLIC_REPOSITORY => Some("RepositoryName"),
         // Amazon SES's `CreateReceiptRuleSet` takes a `RuleSetName` — "Ref returns the rule
         // set name" — so the type publishes `RuleSetName`; the type's last segment is

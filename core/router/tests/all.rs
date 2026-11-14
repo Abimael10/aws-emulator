@@ -4164,3 +4164,22 @@ mod lambda_in_function_cloudwatch_authorization;
 // A suite left at the top level of `tests/` fails the build. (A line comment: an inner
 // doc comment is legal only before the first item of the crate root.)
 // one stays in the HEADER: an inner doc comment past the first item is `E0753`, so the
+//! suite left at the top level of `tests/` fails the build.
+// At the head for the same reason as the two entries above it.
+#[path = "all/cloudformation_appsync_custom_domains.rs"]
+mod cloudformation_appsync_custom_domains;
+// (The SESv2 event-destination suite is declared ONCE, further up this file: whether a
+// SESv2 send's email events reach the Lambda target of a rule on the bus its event
+// destination names spans SESv2, EventBridge, Lambda, CloudFormation, IAM and Amazon SQS,
+// and a module declared twice compiles neither copy.)
+// (`sfn_relayed_dynamodb_request_id` and `cloudformation_provisions_cloudfront_resources`
+// are declared ONCE each, above: two landings in the same window each appended their own
+// copy here, and a module declared twice compiles neither copy.)
+// region of this file: the IaC form of an EventBridge fan-out spans CloudFormation,
+// EventBridge, Lambda, Step Functions, IAM, STS and Amazon SQS at once, and a module
+// declared twice compiles neither copy — two landings each appended their own line here.)
+// (A line comment for the reason above: this file and every service crate's `tests/all.rs`
+// are checked by `all/all_rs_declares_each_suite_once.rs`.)
+// leaving a note here. (Ordinary comments, for the reason they state themselves.)
+// the notes around it record.)
+// comment past the first item is `E0753`.)

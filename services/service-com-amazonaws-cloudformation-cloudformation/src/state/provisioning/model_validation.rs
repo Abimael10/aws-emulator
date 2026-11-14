@@ -64,6 +64,18 @@ pub(super) struct RequiredProperties {
 /// The types whose provider's model validation this stage runs — see the module docs for what
 /// a row carries and where it comes from.
 pub(super) const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
+    // `AWS::AppSync::DomainName`: a custom domain IS a name served with a certificate, and
+    // `CreateDomainName` declares both members required.
+    RequiredProperties {
+        resource_type: super::appsync_domain_names::APPSYNC_DOMAIN_NAME,
+        required: &["CertificateArn", "DomainName"],
+    },
+    // `AWS::AppSync::DomainNameApiAssociation` IS the mapping of one API onto one domain, and
+    // `AssociateApi` declares both members required.
+    RequiredProperties {
+        resource_type: super::appsync_domain_names::APPSYNC_DOMAIN_NAME_API_ASSOCIATION,
+        required: &["ApiId", "DomainName"],
+    },
     // `AWS::IoT::Authorizer`: the authorizer IS the function that authorizes, so
     // `AuthorizerFunctionArn` is published "Required: Yes" and is the member
     // `CreateAuthorizer` declares required beside the name.
