@@ -107,6 +107,14 @@ hex = { workspace = true }
 # The objects an export writes are asserted where Amazon S3 holds them, through that
 # service's OWN client over the emulator's in-process callback (`tests/all/table_exports`).
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The identities a resource-based policy names are IAM's own records: the suite that pins the
+# unique id a policy holds a principal by makes and deletes them through that service's own
+# API, mounted beside this one on the shared engine
+# (`tests/all/resource_policy_principal_unique_ids`).
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# ... and IAM speaks awsQuery, so that suite's request bodies are percent-encoded by the
+# maintained encoder rather than by hand.
+percent-encoding = "2"
 
 [lints]
 workspace = true

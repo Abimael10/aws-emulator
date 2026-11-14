@@ -323,7 +323,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant its `RevisionId` names.
         let resource_policy = match input.resource_policy.as_deref() {
             Some(document) => crate::state::ResourcePolicySlot::seeded(
-                crate::state::AttachedPolicy::attach(document, now).map_err(lift_policy_fault)?,
+                crate::state::AttachedPolicy::attach(
+                    document,
+                    now,
+                    // The identities of this account, resolved before the store is locked:
+                    // a policy holds an identity principal by that identity's unique id
+                    // whichever call attaches it ([`crate::state::policy_principals`]).
+                    &crate::state::request_principal_identities(&*self.engine),
+                )
+                .map_err(lift_policy_fault)?,
             ),
             None => crate::state::ResourcePolicySlot::default(),
         };

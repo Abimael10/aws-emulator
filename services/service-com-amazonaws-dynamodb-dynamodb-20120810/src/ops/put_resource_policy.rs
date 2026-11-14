@@ -239,8 +239,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // It is numbered as the revision it replaces once the resource it is attached to
         // is known, below.
-        let policy = crate::state::AttachedPolicy::attach(&input.policy, now)
-            .map_err(lift_policy_fault)?;
+        let policy = crate::state::AttachedPolicy::attach(
+            &input.policy,
+            now,
+            // WHICH identity each principal of this account the document names IS, resolved
+            // before this service's store is locked: the policy holds such a principal by
+            // that identity's unique id, which is what makes a later read report the
+            // identity's current ARN — and the id itself once the identity is gone
+            // ([`crate::state::policy_principals`]).
+            &crate::state::request_principal_identities(&*self.engine),
+        )
+        .map_err(lift_policy_fault)?;
         // A policy over the STREAM decides requests to the stream, so every action it
         // names has to be one a stream has: a table action in it could never be decided
         // by the resource it is attached to.

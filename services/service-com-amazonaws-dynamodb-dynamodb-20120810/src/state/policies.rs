@@ -90,6 +90,14 @@ pub struct AttachedPolicy {
     prepared: iam::PreparedDocument,
     /// The parsed statements, in document order.
     pub(super) statements: Vec<PolicyStatement>,
+    /// The unique id this policy HOLDS each identity of this account the document names by,
+    /// keyed by the ARN the document names it under: "AWS transforms the ARN to the
+    /// underlying unique principal ID when you save the policy", so what a read reports for
+    /// such a principal is resolved from the id rather than taken from the stored text
+    /// ([`Self::document_as_read`], [`stored_principal_ids`]). Empty for a document naming
+    /// no identity this account holds — nothing of it is resolved, so it reads exactly as it
+    /// was attached.
+    principal_ids: ::std::collections::BTreeMap<String, String>,
 }
 
 impl AttachedPolicy {
@@ -99,7 +107,15 @@ impl AttachedPolicy {
     /// `RevisionId` names ([`policy_revision_token`]). The policy is numbered as the
     /// revision that replaces the one the resource carries when the slot it is attached to
     /// places it there ([`Self::revise_after`], [`ResourcePolicySlot::attach`]).
-    pub fn attach(document: &str, revised_at: SystemTime) -> Result<Self, PolicyFault> {
+    ///
+    /// `identities` are the account's identities at the instant of the attach, which is what
+    /// the policy holds each identity principal it names BY — its unique id rather than the
+    /// ARN the document spells it with (see [`policy_principals`]).
+    pub fn attach(
+        document: &str,
+        revised_at: SystemTime,
+        identities: &PrincipalIdentities,
+    ) -> Result<Self, PolicyFault> {
         if document.len() > MAX_RESOURCE_POLICY_BYTES {
             return Err(PolicyFault::TooLarge);
         }
@@ -133,12 +149,46 @@ impl AttachedPolicy {
         canonical_elements(&mut canonical);
         default_version(&mut canonical);
         let document = canonical.to_string();
+        // WHAT this policy holds each identity principal by: "AWS transforms the ARN to the
+        // underlying unique principal ID when you save the policy", so the resolution
+        // happens HERE, once, over the document as it is stored — through the same walk a
+        // read writes those principals back with, so the two cannot disagree. A read
+        // resolves the held ids and never looks an ARN up again
+        // ([`Self::document_as_read`]), and the decision reads the caller's spellings
+        // through them ([`Self::spellings_decided`]).
+        let principal_ids = stored_principal_ids(&document, identities);
         Ok(Self {
             prepared: iam::PreparedDocument::read(&document),
             revision: policy_revision_token(revised_at),
             document,
             statements,
+            principal_ids,
         })
+    }
+
+    /// The document a READ of this policy reports, given the account's identities at the
+    /// instant of that read: every principal this policy holds by a unique id written as the
+    /// ARN the identity carrying that id has NOW, and as the bare unique id once the account
+    /// holds no such identity — "if you delete the principal, the relationship is broken and
+    /// the policy displays the unique principal ID" (the IAM user guide's `Principal`
+    /// reference). Every other byte is the stored document's
+    /// ([`document_naming_identities`]).
+    ///
+    /// A pure READ: what the resource holds is the document plus the ids, and neither is
+    /// touched here.
+    pub fn document_as_read(&self, identities: &PrincipalIdentities) -> String {
+        document_naming_identities(&self.document, &self.principal_ids, identities)
+    }
+
+    /// The spellings THIS document decides a caller by: a principal it holds by one of the
+    /// caller's own unique ids names that caller whatever ARN the identity carries now, and
+    /// one it holds by another id names the identity that id belongs to rather than this
+    /// caller ([`spellings_decided`]).
+    ///
+    /// `spellings` are the caller's own ([`authorization::Caller`]) and `unique_ids` the ids
+    /// the identities behind them carry at the instant of the request.
+    pub fn spellings_decided(&self, spellings: &[String], unique_ids: &[String]) -> Vec<String> {
+        spellings_decided(&self.principal_ids, spellings, unique_ids)
     }
 
     /// `RevisionId` as the wire carries it: this revision's token in decimal.
@@ -281,11 +331,15 @@ impl ResourcePolicySlot {
     /// resource using the same policy document will return the same revision id" (the
     /// `PutResourcePolicy` doc): re-attaching the document the resource already carries
     /// changes nothing and reports the revision it already has, so neither the revision
-    /// nor its propagation moves.
+    /// nor its propagation moves. The identities it holds its principals by are re-resolved
+    /// even then, because the attach resolved them again: the document is the same text, so
+    /// it is the same revision, while the identity an ARN in it names may since have been
+    /// deleted and remade (see [`policy_principals`]).
     pub fn attach(&mut self, mut policy: AttachedPolicy, now: SystemTime) -> String {
         policy.revise_after(self.stored.as_ref());
-        if let Some(current) = &self.stored {
+        if let Some(current) = &mut self.stored {
             if current.document == policy.document {
+                current.principal_ids = policy.principal_ids;
                 return current.revision_id();
             }
         }

@@ -4683,3 +4683,23 @@ mod cognito_vended_session_principal_tag_scoped_read;
 // (Every line of this block is an ordinary comment: the rule they state stands in the
 // module header at the HEAD of this file, the only place an inner doc comment is legal.)
 // leaving a note in the tail. (Ordinary comments here, for exactly that reason.)
+// (`sfn_relayed_dynamodb_request_id` is declared ONCE, a few lines above in this same tail,
+// and `cloudformation_provisions_cloudfront_resources` ONCE in the sorted span at the head
+// of this file: two landings in the same window each appended a declaration of them here,
+// and a module declared twice is `E0428` and compiles neither copy, so the duplicates are
+// gone and the first declarations stand.)
+// Declared ONCE in the head region of this file (line 102), for the reason the entry there
+// records: the IaC form of an EventBridge fan-out — one stack's rule with a Lambda target and
+// a Step Functions target under a target role — spans CloudFormation, EventBridge, Lambda,
+// Step Functions, IAM, STS and Amazon SQS at once. Two landings in the same window each
+// appended a declaration of it here, and a module declared twice is `E0428`, so this copy is
+// a note rather than a second `mod`.
+// (Declared ONCE further up this file, at line 33, for the reason recorded there: two
+// landings in the same window each appended a declaration of it here, and a module declared
+// twice is `E0428` and compiles neither copy, so this stands as a note.)
+// doc comment is only legal before the first item of a crate root, so this appended
+// fragment of this file's header stands as `//` rather than `//!`.)
+// leaving a note here. (An ordinary comment, for the reason the lines above record.)
+// (Every line of this block is a fragment of this file's own header that a landing
+// appended here as an INNER doc comment: past the first item a `//!` line is `E0753` and
+// compiles no suite of this target, so each stands as an ordinary comment.)

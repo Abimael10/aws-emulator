@@ -213,6 +213,8 @@ mod resource_policy_conditions_and_read_lag;
 mod resource_policy_default_version;
 #[path = "all/resource_policy_not_found_messages.rs"]
 mod resource_policy_not_found_messages;
+#[path = "all/resource_policy_principal_unique_ids.rs"]
+mod resource_policy_principal_unique_ids;
 #[path = "all/resource_policy_revision_tokens.rs"]
 mod resource_policy_revision_tokens;
 #[path = "all/resource_policy_stored_version_round_trip.rs"]

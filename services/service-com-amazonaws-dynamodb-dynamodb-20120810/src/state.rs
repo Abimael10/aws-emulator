@@ -4532,6 +4532,13 @@ mod reads;
 mod policies;
 pub use policies::*;
 
+/// WHICH identity a resource-based policy names and the unique id the policy holds it by,
+/// in its own file: it is about the account's IDENTITIES, held in another service's store,
+/// while the module beside it is the document and the decision it drives. Re-exported
+/// below, so every caller still names them `crate::state::…`.
+mod policy_principals;
+pub use policy_principals::*;
+
 /// The table record itself — its key schema, its secondary indexes, its items and
 /// everything one table answers about itself. Re-exported below, so every caller still
 /// names them `crate::state::…`.

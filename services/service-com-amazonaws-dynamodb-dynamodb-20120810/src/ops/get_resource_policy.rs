@@ -16,6 +16,12 @@
 //! ([`crate::state::ResourcePolicySlot`]), so the data plane and this reader honour the
 //! same revision.
 //!
+//! A principal the document names by an identity of this account is held by that identity's
+//! UNIQUE ID rather than by the ARN the document spells it with, so this read reports the
+//! ARN that id resolves to NOW — and the bare unique id once the account holds no identity
+//! with it, which is what an operator sees after that identity is deleted
+//! ([`crate::state::policy_principals`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -179,6 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::request_region(ctx.parts()),
         )
         .map_err(lift)?;
+        // WHICH identity each principal the stored policy holds by a unique id names NOW,
+        // read before this service's store is locked: a policy holds an identity principal
+        // by that identity's unique id, so what this read reports for one is the ARN the
+        // identity carrying that id has now — and the bare unique id once the account holds
+        // no such identity ([`crate::state::policy_principals`]).
+        let identities = crate::state::request_principal_identities(&*self.engine);
 
         let mut store = state.lock();
         // The only write a reporting operation makes: finishing the status changes the
@@ -206,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(GetResourcePolicyOutput {
-            policy: Some(policy.document.clone()),
+            policy: Some(policy.document_as_read(&identities)),
             revision_id: Some(policy.revision_id()),
         })
     }

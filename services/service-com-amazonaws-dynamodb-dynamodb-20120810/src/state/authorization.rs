@@ -152,6 +152,13 @@ pub struct Caller {
     /// `<provider>:<claim>` clause, and a policy variable naming one, hold for a request
     /// this credential signs. Empty for a credential no such exchange minted.
     pub federated_claims: Vec<(String, String)>,
+    /// The UNIQUE IDS the identities behind this caller's spellings carry now, as IAM holds
+    /// them. A resource-based policy holds an identity principal by its unique id rather than
+    /// by the ARN its document spells it with (see [`super::policy_principals`]), so these
+    /// are what decide which of that document's principals name THIS caller
+    /// ([`AttachedPolicy::spellings_decided`]). Empty for a caller no identity of this
+    /// account stands behind.
+    pub unique_ids: Vec<String>,
 }
 
 impl Caller {
@@ -271,6 +278,14 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
             caller.documents = policies.documents;
             caller.unreadable_attachment = !policies.uncarried.is_empty();
         }
+        // WHICH identity of the account each spelling names, read off the same store while
+        // it is open: a resource-based policy holds an identity principal by that identity's
+        // unique id, so this is what decides which of its principals name this caller.
+        caller.unique_ids = caller
+            .principals
+            .iter()
+            .filter_map(|spelling| identity_unique_id(iam, spelling).cloned())
+            .collect();
     }
     // What the credential itself was scoped to, read at the instant of the request so a
     // managed scoping policy edited since the mint scopes by what it says NOW; the inline
@@ -476,7 +491,13 @@ pub fn denial_addressing(
     // `Condition` this request does not satisfy refuses nothing.
     if let Some(policy) = policy {
         let denied = caller.denied_spellings();
-        let denying = iam::Request::new(action, &table.arn, &denied)
+        // The spellings THIS document decides the caller by: it holds an identity principal
+        // by that identity's unique id, so an ARN it holds by one of the caller's own ids
+        // names the caller whatever name that identity carries now, and one it holds by
+        // another id names the identity that id belongs to rather than this caller
+        // ([`super::AttachedPolicy::spellings_decided`]).
+        let named = policy.spellings_decided(&denied, &caller.unique_ids);
+        let denying = iam::Request::new(action, &table.arn, &named)
             .with_context(&context)
             .with_published_keys(&published);
         if policy.decision(&denying) == Decision::Denied {
@@ -516,7 +537,15 @@ pub fn denial_addressing(
     // principal carrying one is granted where the readable documents neither grant nor
     // deny.
     let granted = decided == Decision::Allowed
-        || policy.is_some_and(|policy| policy.decision(&granting) == Decision::Allowed)
+        || policy.is_some_and(|policy| {
+            // Read by the same holding the deny above was: the document's principals name
+            // the identities their unique ids belong to.
+            let named = policy.spellings_decided(&caller.principals, &caller.unique_ids);
+            let granting = iam::Request::new(action, &table.arn, &named)
+                .with_context(&context)
+                .with_published_keys(&published);
+            policy.decision(&granting) == Decision::Allowed
+        })
         || caller.unreadable_attachment;
     if !granted {
         return refusal(&format!(
