@@ -272,6 +272,25 @@ pub fn settle_invalidations(
     }
 }
 
+/// How many objects the invalidations in `invalidations` still have in flight: the paths of
+/// every batch that has not finished, counted across batches.
+///
+/// What CloudFront's invalidation quota bounds is "files that you can invalidate per
+/// distribution at one time", so the count is over the PATHS of the batches that are still
+/// `InProgress` rather than over the batches themselves: two batches of five paths each put
+/// ten objects in flight, and a batch the clock has already finished puts none. Read from the
+/// stored records, which is what makes it agree with what a listing of those invalidations
+/// reports, and bounded by the invalidations one resource may hold.
+pub fn in_progress_invalidation_objects(
+    invalidations: &BTreeMap<String, StoredInvalidation>,
+) -> usize {
+    invalidations
+        .values()
+        .filter(|invalidation| invalidation.status != STATUS_COMPLETED)
+        .map(|invalidation| invalidation.paths().len())
+        .sum()
+}
+
 /// `invalidations` in the order a list serves them.
 ///
 /// CloudFront documents the order on the `Marker` of every invalidation listing: "the

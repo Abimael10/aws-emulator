@@ -123,3 +123,35 @@ Cause 10 — cloudfront-icc-sdk-batch-construction-mistakes#task#3 CreateInvalid
 2. Replay the simparity-wire-aws-v1 wire corpus.
 3. Replay fixture cfetag-function-etag-chain and inspect step task#4 (the representative). Then replay, in order: cfetag-key-group-etag-chain#teardown#9, cloudfront-field-level-encryption-config-workflow#teardown#9, cloudfront-public-key-and-key-group-lifecycle#teardown#19, cloudfront-anycast-ip-list-create-limit-exceeded#task#1, cloudfront-icc-per-object-batch-too-large#task#2, cloudfront-cfode-attach-rewrite-request-shape-mistakes#task#8, cloudfront-cfode-rewrite-fix-function-state-and-etag-chain#task#7, cloudfront-cfode-attach-rewrite-request-shape-mistakes#task#10, cloudfront-icc-sdk-batch-construction-mistakes#task#3.
 4. Compare each step's HTTP status and ErrorResponse/Error/Code+Message against the recorded response. All ten must match before the issue is closed.
+
+## Resolution
+
+Causes 1, 6, 7, 9 and 10 are FIXED here; causes 2, 3, 4 and 8 were already fixed on the
+mainline this branch forked from and are verified by the replay (`cfetag-function-etag-chain`
+passes end to end, and the field-level-encryption and key-group teardowns delete their public
+keys); cause 5 is DECLINED.
+
+- Cause 1 FIXED: `DeleteFunction` tells the two halves of "missing or not valid" apart the way
+  every other conditional mutation of this service does — a header carrying no version token
+  at all is `InvalidIfMatchVersion` (400), a well-formed token that is not the function's
+  current version is `PreconditionFailed` (412).
+- Cause 6 FIXED: the paths an invalidation request names count toward the objects one
+  distribution (or tenant) may have invalidating at one time, so a batch whose paths beside the
+  objects already in flight pass that quota is `TooManyInvalidationsInProgress` (400). The SIZE
+  of the request document is the other condition and is answered on its bytes alone with the
+  transport's 413, which is what `BatchTooLarge` states.
+- Causes 7, 9 and 10 FIXED: `ValidationException` is no code this model declares, so every
+  constraint broken by a member NESTED inside the request's payload is answered `MalformedXML`
+  (400) under the sentence that names the member and the constraint, with a `@pattern` reported
+  as the service publishes it (unanchored, partition-generalised). The set a function
+  association's event type admits is stated in one sentence whichever layer read the value, and
+  an `InconsistentQuantities` sentence names the wrapper by its own member name.
+- Cause 5 DECLINED: this emulator already enforces an account entitlement for Anycast static IP
+  lists before the handler mutates state, answering the recorded 400 `EntityLimitExceeded` with
+  exactly the recorded sentence. What the recorded step shows is the entitlement of the ACCOUNT
+  the corpus was recorded against — already exhausted before its first call — which an emulator
+  account holding no Anycast static IP list has no rule to derive from the request. The sibling
+  behavioural corpus records the same condition as "account/quota state rather than emulator
+  state" and did not file it as a cause (see
+  `issues/things-that-now-work/20261102T072100Z-cloudfront-three-refusal-divergences-oversized-tenant-invalidation-batch.md`,
+  cause 3's closing paragraph).

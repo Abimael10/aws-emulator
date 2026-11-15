@@ -12,10 +12,10 @@
 //!   name is free for a later create to claim, while every other function stands;
 //! * the removal only happens at the version its caller read: `IfMatch` is "The current
 //!   version (ETag value) of the function that you are deleting, which you can get using
-//!   DescribeFunction", so a header that does not carry THIS function's current version —
-//!   one that is no version token at all, and one that is a well-formed but superseded or
-//!   foreign token alike — is missing or not valid (`InvalidIfMatchVersion`, HTTP 400), and a
-//!   refused delete removes NOTHING;
+//!   DescribeFunction", so a header carrying no version token at all is missing or not valid
+//!   (`InvalidIfMatchVersion`, HTTP 400) while a well-formed token that is superseded or
+//!   foreign is a precondition that evaluated to false (`PreconditionFailed`, HTTP 412), and
+//!   a refused delete removes NOTHING either way;
 //! * a name no function holds is "The specified function does not exist."
 //!   (`NoSuchFunctionExists`, HTTP 404), whatever the `If-Match` carries, and removes
 //!   nothing — and a function that was deleted is refused with exactly that sentence, the
@@ -342,12 +342,12 @@ async fn a_delete_needs_the_current_version_of_the_function() {
         Precondition {
             case: "a well-formed token no function holds",
             token: Token::Literal(UNHELD_VERSION_TOKEN.to_string()),
-            refusal: Some((400, "InvalidIfMatchVersion")),
+            refusal: Some((412, "PreconditionFailed")),
         },
         Precondition {
             case: "the version token of another function",
             token: Token::Literal(foreign.clone()),
-            refusal: Some((400, "InvalidIfMatchVersion")),
+            refusal: Some((412, "PreconditionFailed")),
         },
     ];
 
@@ -438,14 +438,14 @@ async fn the_version_an_update_superseded_no_longer_deletes() {
 
         let refused = delete_function(&router, &create.name, &stale).await;
         assert_eq!(
-            refused.status, 400,
-            "case {case}: expected HTTP 400 deleting the superseded version, got {} with {}",
+            refused.status, 412,
+            "case {case}: expected HTTP 412 deleting the superseded version, got {} with {}",
             refused.status, refused.raw
         );
         assert_eq!(
             refused.error_code(),
-            "InvalidIfMatchVersion",
-            "case {case}: expected InvalidIfMatchVersion, got {}",
+            "PreconditionFailed",
+            "case {case}: expected PreconditionFailed, got {}",
             refused.raw
         );
         let still = describe_function(&router, &create.name, None).await;

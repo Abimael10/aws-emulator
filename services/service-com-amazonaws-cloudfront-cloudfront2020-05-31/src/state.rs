@@ -371,6 +371,21 @@ pub fn illegal_update_connection_mode() -> crate::ops::types::IllegalUpdate {
 /// other half belongs to the Lambda@Edge associations beside it.
 pub const FUNCTION_ASSOCIATION_EVENT_TYPES: &[&str] = &["viewer-request", "viewer-response"];
 
+/// The CONSTRAINT clause a value outside the set a CloudFront function association's event
+/// type admits is refused with: the set ([`FUNCTION_ASSOCIATION_EVENT_TYPES`]), stated as the
+/// set the MEMBER admits rather than as the one its enum declares.
+///
+/// The one place that clause is written, so the refusal an operation makes for a value the
+/// enum admits and the one the request boundary makes for a value it does not
+/// (`crate::service::envelope`) state the same set in the same words: which values a member
+/// admits is a property of the member, not of the layer that read it.
+pub fn function_association_event_set_clause() -> String {
+    format!(
+        "Member must satisfy value set: [{}]",
+        FUNCTION_ASSOCIATION_EVENT_TYPES.join(", ")
+    )
+}
+
 /// The validation sentence a configuration whose CloudFront function association names an
 /// event type no function runs on is refused with, or `None` when every association it
 /// carries names a viewer event.
@@ -383,6 +398,12 @@ pub const FUNCTION_ASSOCIATION_EVENT_TYPES: &[&str] = &["viewer-request", "viewe
 /// the same kind of defect in the same member. Which is also why it is answered under the
 /// one code an unreadable request document is answered with rather than under a code of its
 /// own.
+///
+/// The constraint it states is "Member must satisfy VALUE set" rather than the boundary's
+/// "Member must satisfy ENUM value set": the set this rule admits is NOT the one the member's
+/// enum declares — `EventType` admits the origin-facing events too, and they are values of
+/// that member everywhere a Lambda@Edge association carries one — so what the request broke
+/// is the set documented for THIS member rather than the shape's own value set.
 ///
 /// Every value it reads comes from the submitted document through `Option` combinators and
 /// an iterator: nothing is indexed, sliced, parsed or unwrapped, and the only arithmetic is
@@ -407,10 +428,10 @@ pub fn function_association_event_refusal(config: &DistributionConfig) -> Option
             return Some(format!(
                 "1 validation errors detected: Value '{}' at \
                  'distributionConfig.{label}.functionAssociations.items.{}.member.eventType' \
-                 failed to satisfy constraint: Member must satisfy enum value set: [{}]",
+                 failed to satisfy constraint: {}",
                 association.event_type,
                 position + 1,
-                FUNCTION_ASSOCIATION_EVENT_TYPES.join(", ")
+                function_association_event_set_clause()
             ));
         }
     }
@@ -526,15 +547,22 @@ pub const MAX_TRUSTED_SIGNERS: usize = 5;
 /// distribution is more than the maximum allowed."
 pub const MAX_TRUSTED_KEY_GROUPS: usize = 4;
 
-/// The most paths ONE invalidation batch may name.
+/// The most objects ONE distribution, or ONE distribution tenant, may have invalidating at
+/// one time.
 ///
-/// CloudFront's published quota for an invalidation request is 3,000 files, and the
-/// batch is stored whole, so this bounds a single request's contribution to the store as
-/// well. Over it, the refusal is the modelled `BatchTooLarge` (HTTP 413): "Invalidation
-/// batch specified is too large." — on every create that takes an invalidation batch, since
-/// the bound is a property of the request alone. A document whose BYTES are past what this
-/// API reads never reaches that check: it is refused unread by the request boundary
-/// (`crate::service::envelope::MAX_REQUEST_BODY_BYTES`).
+/// CloudFront's published quota is 3,000 files that you can invalidate per distribution at
+/// one time, and the paths a request names count toward it: the refusal over it is the
+/// modelled `TooManyInvalidationsInProgress` (HTTP 400), whose sentence states exactly that
+/// arithmetic — "Processing your request will cause you to exceed the maximum number of
+/// in-progress invalidations." So a batch is weighed against the objects the resource already
+/// has in flight ([`in_progress_invalidation_objects`]) plus the ones it names, and the same
+/// batch lands once the earlier ones have finished.
+///
+/// It bounds a single request's contribution to the store as well, since the batch is stored
+/// whole. The OTHER invalidation refusal is about the request DOCUMENT rather than about the
+/// quota: a document larger than this API reads is refused on its bytes alone
+/// (`crate::service::envelope::MAX_REQUEST_BODY_BYTES`), which is the `BatchTooLarge` (HTTP
+/// 413) condition — "Invalidation batch specified is too large."
 pub const MAX_INVALIDATION_PATHS: usize = 3_000;
 
 /// The most tags ONE CloudFront resource may carry.

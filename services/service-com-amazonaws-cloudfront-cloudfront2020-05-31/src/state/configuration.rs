@@ -251,46 +251,38 @@ impl BehaviorLists<'_> {
         None
     }
 
-    /// Record every wrapper this behaviour carries, under `label`.
-    pub(super) fn collect(&self, label: &str, counts: &mut Vec<(String, i32, usize)>) {
+    /// Record every wrapper this behaviour carries, each under its OWN member name.
+    pub(super) fn collect(&self, counts: &mut Vec<(&'static str, i32, usize)>) {
         if let Some(signers) = self.trusted_signers {
             counts.push((
-                format!("{label}.TrustedSigners"),
+                "TrustedSigners",
                 signers.quantity,
                 items_len(&signers.items),
             ));
         }
         if let Some(groups) = self.trusted_key_groups {
             counts.push((
-                format!("{label}.TrustedKeyGroups"),
+                "TrustedKeyGroups",
                 groups.quantity,
                 items_len(&groups.items),
             ));
         }
         if let Some(methods) = self.allowed_methods {
-            counts.push((
-                format!("{label}.AllowedMethods"),
-                methods.quantity,
-                methods.items.len(),
-            ));
+            counts.push(("AllowedMethods", methods.quantity, methods.items.len()));
             if let Some(cached) = &methods.cached_methods {
-                counts.push((
-                    format!("{label}.AllowedMethods.CachedMethods"),
-                    cached.quantity,
-                    cached.items.len(),
-                ));
+                counts.push(("CachedMethods", cached.quantity, cached.items.len()));
             }
         }
         if let Some(lambdas) = self.lambda_function_associations {
             counts.push((
-                format!("{label}.LambdaFunctionAssociations"),
+                "LambdaFunctionAssociations",
                 lambdas.quantity,
                 items_len(&lambdas.items),
             ));
         }
         if let Some(functions) = self.function_associations {
             counts.push((
-                format!("{label}.FunctionAssociations"),
+                "FunctionAssociations",
                 functions.quantity,
                 items_len(&functions.items),
             ));
@@ -298,21 +290,17 @@ impl BehaviorLists<'_> {
         if let Some(forwarded) = self.forwarded_values {
             if let Some(names) = &forwarded.cookies.whitelisted_names {
                 counts.push((
-                    format!("{label}.ForwardedValues.Cookies.WhitelistedNames"),
+                    "WhitelistedNames",
                     names.quantity,
                     items_len(&names.items),
                 ));
             }
             if let Some(headers) = &forwarded.headers {
-                counts.push((
-                    format!("{label}.ForwardedValues.Headers"),
-                    headers.quantity,
-                    items_len(&headers.items),
-                ));
+                counts.push(("Headers", headers.quantity, items_len(&headers.items)));
             }
             if let Some(keys) = &forwarded.query_string_cache_keys {
                 counts.push((
-                    format!("{label}.ForwardedValues.QueryStringCacheKeys"),
+                    "QueryStringCacheKeys",
                     keys.quantity,
                     items_len(&keys.items),
                 ));
@@ -718,26 +706,26 @@ pub(super) fn behavior_views(config: &DistributionConfig) -> Vec<BehaviorLists<'
 /// disagree: "The value of Quantity and the size of Items don't match." The rule holds
 /// for EVERY wrapper, not for a chosen few, so this walks all of the ones a
 /// `DistributionConfig` reaches.
+///
+/// Each wrapper is named by its OWN member name, as the model declares it, and by nothing of
+/// the path that reaches it: the condition is a property of that one wrapper — its stated
+/// length against the list beside it — so the behaviour or the origin that happens to hold
+/// it is no part of what the caller has to fix.
 pub fn config_quantity_mismatch(config: &DistributionConfig) -> Option<String> {
-    let mut counts: Vec<(String, i32, usize)> = Vec::new();
+    let mut counts: Vec<(&'static str, i32, usize)> = Vec::new();
 
     if let Some(aliases) = &config.aliases {
-        counts.push((
-            "Aliases".to_string(),
-            aliases.quantity,
-            items_len(&aliases.items),
-        ));
+        counts.push(("Aliases", aliases.quantity, items_len(&aliases.items)));
     }
     counts.push((
-        "Origins".to_string(),
+        "Origins",
         config.origins.quantity,
         config.origins.items.len(),
     ));
     for origin in &config.origins.items {
-        let label = format!("Origins.Items[{}]", origin.id);
         if let Some(headers) = &origin.custom_headers {
             counts.push((
-                format!("{label}.CustomHeaders"),
+                "CustomHeaders",
                 headers.quantity,
                 items_len(&headers.items),
             ));
@@ -748,59 +736,45 @@ pub fn config_quantity_mismatch(config: &DistributionConfig) -> Option<String> {
             .and_then(|custom| custom.origin_ssl_protocols.as_ref())
         {
             counts.push((
-                format!("{label}.CustomOriginConfig.OriginSslProtocols"),
+                "OriginSslProtocols",
                 protocols.quantity,
                 protocols.items.len(),
             ));
         }
     }
     if let Some(groups) = &config.origin_groups {
-        counts.push((
-            "OriginGroups".to_string(),
-            groups.quantity,
-            items_len(&groups.items),
-        ));
+        counts.push(("OriginGroups", groups.quantity, items_len(&groups.items)));
         for group in groups.items.as_deref().unwrap_or_default() {
-            let label = format!("OriginGroups.Items[{}]", group.id);
             let codes = &group.failover_criteria.status_codes;
+            counts.push(("StatusCodes", codes.quantity, codes.items.len()));
             counts.push((
-                format!("{label}.FailoverCriteria.StatusCodes"),
-                codes.quantity,
-                codes.items.len(),
-            ));
-            counts.push((
-                format!("{label}.Members"),
+                "Members",
                 group.members.quantity,
                 group.members.items.len(),
             ));
         }
     }
-    BehaviorLists::from(&config.default_cache_behavior).collect("DefaultCacheBehavior", &mut counts);
+    BehaviorLists::from(&config.default_cache_behavior).collect(&mut counts);
     if let Some(behaviors) = &config.cache_behaviors {
         counts.push((
-            "CacheBehaviors".to_string(),
+            "CacheBehaviors",
             behaviors.quantity,
             items_len(&behaviors.items),
         ));
         for behavior in behaviors.items.as_deref().unwrap_or_default() {
-            let label = format!("CacheBehaviors.Items[{}]", behavior.path_pattern);
-            BehaviorLists::from(behavior).collect(&label, &mut counts);
+            BehaviorLists::from(behavior).collect(&mut counts);
         }
     }
     if let Some(responses) = &config.custom_error_responses {
         counts.push((
-            "CustomErrorResponses".to_string(),
+            "CustomErrorResponses",
             responses.quantity,
             items_len(&responses.items),
         ));
     }
     if let Some(restrictions) = &config.restrictions {
         let geo = &restrictions.geo_restriction;
-        counts.push((
-            "Restrictions.GeoRestriction".to_string(),
-            geo.quantity,
-            items_len(&geo.items),
-        ));
+        counts.push(("GeoRestriction", geo.quantity, items_len(&geo.items)));
     }
 
     counts
@@ -814,10 +788,10 @@ pub fn config_quantity_mismatch(config: &DistributionConfig) -> Option<String> {
 ///
 /// The SAME rule [`config_quantity_mismatch`] applies to a distribution configuration:
 /// every CloudFront list travels in a wrapper stating its own length beside the list
-/// itself, and the service refuses a request where the two disagree. This walks all of
-/// the wrappers a `ResponseHeadersPolicyConfig` reaches — the three CORS lists that are
-/// required when `CorsConfig` is named, the optional exposed-headers list, and the
-/// custom-header and remove-header lists.
+/// itself, and the service refuses a request where the two disagree, naming the wrapper by
+/// its own member name. This walks all of the wrappers a `ResponseHeadersPolicyConfig`
+/// reaches — the three CORS lists that are required when `CorsConfig` is named, the optional
+/// exposed-headers list, and the custom-header and remove-header lists.
 pub fn response_headers_policy_quantity_mismatch(
     config: &ResponseHeadersPolicyConfig,
 ) -> Option<String> {
@@ -826,25 +800,25 @@ pub fn response_headers_policy_quantity_mismatch(
     if let Some(cors) = &config.cors_config {
         let origins = &cors.access_control_allow_origins;
         counts.push((
-            "CorsConfig.AccessControlAllowOrigins",
+            "AccessControlAllowOrigins",
             origins.quantity,
             origins.items.len(),
         ));
         let headers = &cors.access_control_allow_headers;
         counts.push((
-            "CorsConfig.AccessControlAllowHeaders",
+            "AccessControlAllowHeaders",
             headers.quantity,
             headers.items.len(),
         ));
         let methods = &cors.access_control_allow_methods;
         counts.push((
-            "CorsConfig.AccessControlAllowMethods",
+            "AccessControlAllowMethods",
             methods.quantity,
             methods.items.len(),
         ));
         if let Some(exposed) = &cors.access_control_expose_headers {
             counts.push((
-                "CorsConfig.AccessControlExposeHeaders",
+                "AccessControlExposeHeaders",
                 exposed.quantity,
                 items_len(&exposed.items),
             ));
@@ -1785,15 +1759,22 @@ pub fn invalidation_not_found() -> EntityNotFound {
 /// named and the bound it broke are no part of the text.
 pub const BATCH_TOO_LARGE_MESSAGE: &str = "Invalidation batch specified is too large.";
 
-/// The modelled `BatchTooLarge` (HTTP 413) for an invalidation batch naming more objects than
-/// one request may — the per-batch bound ([`MAX_INVALIDATION_PATHS`]).
+/// The modelled `BatchTooLarge` (HTTP 413) for an invalidation batch this API cannot read as
+/// a batch at all.
 ///
-/// The condition is the SIZE of the batch submitted, a property of the request alone, so every
-/// create that takes an invalidation batch answers it under this code — the distribution-scoped
-/// one and the tenant-scoped one alike. The invalidations a resource ALREADY holds are the
-/// other, concurrency-driven condition and carry the quota's own code
-/// ([`too_many_invalidations_in_progress`], HTTP 400): a client tells the two apart to decide
-/// whether retrying the same batch can ever succeed.
+/// The condition is the SIZE of the request DOCUMENT, a property of the request alone, and it
+/// is decided before any operation runs — on the bytes the request carries
+/// (`crate::service::envelope::MAX_REQUEST_BODY_BYTES`), which is why a document past that
+/// ceiling is answered with the transport's 413 carrying no error document at all. The objects
+/// a resource may have invalidating at one time are the other, quota-driven condition and
+/// carry the quota's own code ([`too_many_invalidations_in_progress`], HTTP 400): a client
+/// tells the two apart to decide whether retrying the same batch can ever succeed.
+///
+/// NO handler constructs this today, and that is the point: the condition is decided before
+/// any operation runs, so the 413 a caller reads for it is the envelope's, carrying no
+/// document. The shape and its sentence stay here because the model declares both, so a
+/// reader looking for what this service answers an oversized batch with finds the answer and
+/// where it is made.
 pub fn batch_too_large() -> crate::ops::types::BatchTooLarge {
     crate::ops::types::BatchTooLarge {
         message: Some(BATCH_TOO_LARGE_MESSAGE.to_string()),
@@ -1812,9 +1793,11 @@ pub const TOO_MANY_INVALIDATIONS_MESSAGE: &str =
     "Processing your request will cause you to exceed the maximum number of in-progress \
      invalidations.";
 
-/// The modelled `TooManyInvalidationsInProgress` for a request the invalidation quota cannot
-/// admit: one that would take the invalidations held for a resource past what this emulator
-/// keeps. The SIZE of one batch is the other condition and carries [`batch_too_large`].
+/// The modelled `TooManyInvalidationsInProgress` for a batch the invalidation quota cannot
+/// admit: one whose paths, beside the objects the resource already has in flight, would pass
+/// what one resource may have invalidating at one time ([`MAX_INVALIDATION_PATHS`]) — or one
+/// that would take the invalidations held for a resource past what this emulator keeps. The
+/// SIZE of the request document is the other condition and carries [`batch_too_large`].
 pub fn too_many_invalidations_in_progress() -> crate::ops::types::TooManyInvalidationsInProgress {
     crate::ops::types::TooManyInvalidationsInProgress {
         message: Some(TOO_MANY_INVALIDATIONS_MESSAGE.to_string()),

@@ -506,10 +506,12 @@ async fn tags_are_read_from_the_resource_record() {
 
 /// A tag set no resource can carry, and the error each one is refused with.
 ///
-/// `(case, tags, expected status, expected error code)`. The two `InvalidTagging` rows
+/// `(case, tags, expected status, expected error code)`. The three `InvalidTagging` rows
 /// are the rules the model cannot state — at most one tag per key, at most
-/// [`MAX_TAGS_PER_RESOURCE`] tags — and the two `ValidationException` rows are one past
-/// `TagKey`'s documented maximum length (128) and one past `TagValue`'s (256).
+/// [`MAX_TAGS_PER_RESOURCE`] tags — and the two `MalformedXML` rows are one past
+/// `TagKey`'s documented maximum length (128) and one past `TagValue`'s (256): a value
+/// outside the constraint its member carries makes the request DOCUMENT one this API cannot
+/// read, which CloudFront answers under that code.
 ///
 /// `pub(crate)` so a sibling suite asserting the SAME tagging rule on another resource
 /// kind runs the same rows rather than declaring a second copy of them.
@@ -544,13 +546,13 @@ pub(crate) fn tag_sets_no_resource_can_carry() -> Vec<(&'static str, Vec<Submitt
             "key-one-past-its-maximum-length",
             vec![tag(&"k".repeat(129), Some("v"))],
             400,
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "value-one-past-its-maximum-length",
             vec![tag("size", Some(&"v".repeat(257)))],
             400,
-            "ValidationException",
+            "MalformedXML",
         ),
     ]
 }

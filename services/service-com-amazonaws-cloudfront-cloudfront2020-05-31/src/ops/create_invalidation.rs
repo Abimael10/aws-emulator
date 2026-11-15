@@ -207,15 +207,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "Invalidation batch specified is too large." The batch is stored whole, so the
-        // number of paths one request may name is bounded before anything is stored, and
-        // the sentence states the condition rather than the count submitted.
+        // "Processing your request will cause you to exceed the maximum number of in-progress
+        // invalidations." What CloudFront's invalidation quota bounds is the objects one
+        // distribution may have invalidating AT ONE TIME, and the paths this request names
+        // count toward it — which is what the sentence states — so the batch is weighed
+        // against the objects already in flight plus the ones it asks for. Refused before
+        // anything is stored, and the same batch lands once the earlier ones have finished.
+        //
+        // The SIZE of the request document is the other condition and is decided on its bytes
+        // alone, before any operation runs (`crate::service::envelope`), which is the
+        // `BatchTooLarge` (413) this operation models.
         let path_count = crate::state::batch_path_count(&input.invalidation_batch);
-        if path_count > crate::state::MAX_INVALIDATION_PATHS {
-            return Err(CreateInvalidationErrorModeled::BatchTooLarge(
-                crate::state::batch_too_large(),
-            )
-            .into());
+        let in_flight = crate::state::in_progress_invalidation_objects(&stored.invalidations);
+        if in_flight + path_count > crate::state::MAX_INVALIDATION_PATHS {
+            return Err(
+                CreateInvalidationErrorModeled::TooManyInvalidationsInProgress(
+                    crate::state::too_many_invalidations_in_progress(),
+                )
+                .into(),
+            );
         }
 
         // "The path is relative to the distribution and must begin with a slash", and the
@@ -268,11 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "You have exceeded the maximum number of allowable InProgress invalidation
-        // batch requests, or invalidation objects." The invalidations of one
-        // distribution grow only here and a record cannot be evicted (a later
-        // GetInvalidation has to answer with what this create returned), so the bound is
-        // an entry count refused BEFORE anything is stored.
+        // The invalidations of one distribution grow only here and a record cannot be evicted
+        // (a later GetInvalidation has to answer with what this create returned), so the entry
+        // count this emulator holds is bounded too, refused BEFORE anything is stored and
+        // under the same modelled code the quota above is.
         if stored.invalidations.len() >= crate::state::MAX_INVALIDATIONS_PER_DISTRIBUTION {
             return Err(
                 CreateInvalidationErrorModeled::TooManyInvalidationsInProgress(

@@ -1793,8 +1793,9 @@ async fn invalidations_are_stored_under_their_distribution() {
     );
 }
 
-/// A batch names at most the quota's worth of paths, and the distribution counts exactly
-/// the batches created under it while they are all still in progress.
+/// A batch is weighed against the objects the distribution already has invalidating, and the
+/// distribution counts exactly the batches created under it while they are all still in
+/// progress.
 #[tokio::test]
 async fn an_invalidation_batch_is_bounded_and_counted() {
     let router = emulator();
@@ -1806,7 +1807,8 @@ async fn an_invalidation_batch_is_bounded_and_counted() {
         .unwrap_or_default()
         .to_string();
 
-    // A batch at the quota is accepted; one path more is too large.
+    // A batch of the whole quota is accepted on a distribution with nothing in flight; one
+    // path more than the quota is not.
     let at_limit: Vec<String> = (0..MAX_INVALIDATION_PATHS)
         .map(|index| format!("/object-{index}"))
         .collect();
@@ -1826,21 +1828,20 @@ async fn an_invalidation_batch_is_bounded_and_counted() {
         accepted.root().text_at("InvalidationBatch/Paths/Quantity")
     );
 
-    let mut over_limit = at_limit.clone();
-    over_limit.push("/one-too-many".to_string());
-    let over_limit_refs: Vec<&str> = over_limit.iter().map(String::as_str).collect();
+    // The quota is full, so one further object is refused — "Processing your request will
+    // cause you to exceed the maximum number of in-progress invalidations."
     let refused =
-        create_invalidation(&router, &id, &batch_xml("inv-over-limit", &over_limit_refs)).await;
+        create_invalidation(&router, &id, &batch_xml("inv-over-limit", &["/one-too-many"])).await;
     assert_eq!(
-        refused.status, 413,
-        "case over-the-quota: expected HTTP 413, got {} with {}",
+        refused.status, 400,
+        "case over-the-quota: expected HTTP 400, got {} with {}",
         refused.status,
         refused.raw.chars().take(400).collect::<String>()
     );
     assert_eq!(
         refused.error_code(),
-        "BatchTooLarge",
-        "case over-the-quota: expected BatchTooLarge, got {:?}",
+        "TooManyInvalidationsInProgress",
+        "case over-the-quota: expected TooManyInvalidationsInProgress, got {:?}",
         refused.error_code()
     );
 

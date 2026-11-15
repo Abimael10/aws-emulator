@@ -3,17 +3,17 @@
 //! Which CONDITION a refusal reports when more than one rule could refuse the request, end
 //! to end over HTTP. Two rules, each about a refusal a caller branches on:
 //!
-//! * the SIZE of an invalidation batch is a property of the request alone, so a batch naming
-//!   more invalidation objects than one request may is refused with the modelled
-//!   `BatchTooLarge` (HTTP 413) — on every create that takes an invalidation batch, and
-//!   whatever invalidations the resource already holds. The quota over the invalidations a
-//!   resource HOLDS is the other condition and keeps its own code, so the two never answer
-//!   for each other: one is permanent and asks the caller to split the batch, the other is
-//!   transient and asks it to wait. A document larger than this API READS is a third
-//!   condition, decided on its bytes alone and BEFORE either of them: the transport's own
-//!   `413`, carrying no error document, since nothing parsed the request far enough to name
-//!   an operation or one of its modelled errors — which is the answer the recorded batch of
-//!   60,000 real-looking paths gets, whichever surface it is submitted to.
+//! * the objects one resource may have invalidating AT ONE TIME are a quota, and the paths a
+//!   request names count toward it — which is what the refusal's own sentence states
+//!   ("Processing your request will cause you to exceed the maximum number of in-progress
+//!   invalidations.") — so a batch is weighed against the objects already in flight plus the
+//!   ones it asks for, and refused with `TooManyInvalidationsInProgress` (HTTP 400) when the
+//!   two together pass the quota. On every create that takes an invalidation batch. A document
+//!   larger than this API READS is the other condition, decided on its bytes alone and BEFORE
+//!   the quota: the transport's own `413`, carrying no error document, since nothing parsed
+//!   the request far enough to name an operation or one of its modelled errors — which is
+//!   what `BatchTooLarge` states, and the answer the recorded batch of 60,000 real-looking
+//!   paths gets, whichever surface it is submitted to.
 //! * `ListDomainConflicts` evaluates the `DomainControlValidationResource` — the caller's
 //!   proof that it controls the domain — BEFORE the `Domain` string's own shape, so a
 //!   validation resource holding no certificate that covers the domain is refused in the
@@ -22,12 +22,13 @@
 //!
 //! The rows span what each rule generalises over: for the first, the surface the batch is
 //! submitted on (a distribution and a distribution tenant), how many paths it names (at the
-//! published bound, one past it, far past it) and whether the resource already holds an
-//! invalidation; for the second, the validation resource (a distribution on CloudFront's own
-//! default certificate, a tenant whose certificate covers another name, and — as the control
-//! — a distribution on a custom certificate) and the form of the domain (well formed, a
-//! wildcard, upper case, a single label, an empty label, whitespace and punctuation, a label
-//! past the length a label may carry, and the empty value).
+//! published quota, one past it, far past it, and half of it) and how many objects the
+//! resource already has in flight (none, half the quota and the whole quota); for the second,
+//! the validation resource (a distribution on CloudFront's own default certificate, a tenant
+//! whose certificate covers another name, and — as the control — a distribution on a custom
+//! certificate) and the form of the domain (well formed, a wildcard, upper case, a single
+//! label, an empty label, whitespace and punctuation, a label past the length a label may
+//! carry, and the empty value).
 //!
 //! The harness is [`crate::distribution_lifecycle`]'s; the tenant invalidation surface is
 //! reached through [`crate::tenant_invalidations`]'s helpers and the domain-conflict surface
@@ -35,8 +36,8 @@
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::service::envelope::MAX_REQUEST_BODY_BYTES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    BATCH_TOO_LARGE_MESSAGE, INVALID_DOMAIN_NAME_MESSAGE, MAX_DOMAIN_LABEL_LEN,
-    MAX_INVALIDATION_PATHS, MISSING_CERTIFICATE_FOR_DOMAIN_MESSAGE,
+    INVALID_DOMAIN_NAME_MESSAGE, MAX_DOMAIN_LABEL_LEN, MAX_INVALIDATION_PATHS,
+    MISSING_CERTIFICATE_FOR_DOMAIN_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -140,62 +141,86 @@ fn paths(count: usize) -> Vec<String> {
     (0..count).map(|index| format!("/{index:06}.html")).collect()
 }
 
-/// An oversized batch is refused for its SIZE — `BatchTooLarge` (413) — on every surface
-/// that takes an invalidation batch, whatever that resource already holds, and persists
-/// nothing; a batch AT the published bound is accepted.
+/// `count` distinct paths that name no object any of the first `from` paths does, so a batch
+/// built from them puts `count` FURTHER objects in flight.
+fn paths_from(from: usize, count: usize) -> Vec<String> {
+    (from..from + count)
+        .map(|index| format!("/{index:06}.html"))
+        .collect()
+}
+
+/// The sentence CloudFront refuses a batch the in-progress invalidation quota cannot admit
+/// with, as a literal here so a wrong constant in the crate cannot make this suite pass.
+const TOO_MANY_INVALIDATIONS: &str =
+    "Processing your request will cause you to exceed the maximum number of in-progress \
+     invalidations.";
+
+/// The objects a resource may have invalidating at one time are a QUOTA the paths a request
+/// names count toward: a batch whose paths, beside the objects already in flight, pass the
+/// quota is refused with `TooManyInvalidationsInProgress` (400) and persists nothing, on every
+/// surface that takes an invalidation batch, while one the quota still admits is accepted.
 #[tokio::test]
-async fn an_oversized_invalidation_batch_is_refused_for_its_size_on_every_surface() {
+async fn an_invalidation_batch_is_weighed_against_the_objects_already_in_flight() {
     let router = emulator();
 
-    // Each row: how many paths the batch names, and whether the service accepts it.
-    // `MAX_INVALIDATION_PATHS` is the service's published per-request object bound, so the
-    // rows sit at it, one past it and far past it.
-    let rows: &[(&str, usize, bool)] = &[
-        ("at the bound", MAX_INVALIDATION_PATHS, true),
-        ("one past the bound", MAX_INVALIDATION_PATHS + 1, false),
-        ("far past the bound", MAX_INVALIDATION_PATHS * 2, false),
+    // Each row: how many objects the resource already has in flight, how many paths the batch
+    // names, and whether the service accepts it. `MAX_INVALIDATION_PATHS` is the published
+    // quota, so the rows sit at it, one past it, far past it, and either side of it once half
+    // of it is already in flight.
+    let half = MAX_INVALIDATION_PATHS / 2;
+    let rows: &[(&str, usize, usize, bool)] = &[
+        ("the whole quota, nothing in flight", 0, MAX_INVALIDATION_PATHS, true),
+        ("one object past the quota", 0, MAX_INVALIDATION_PATHS + 1, false),
+        ("far past the quota", 0, MAX_INVALIDATION_PATHS * 2, false),
+        ("a batch the quota still admits beside what is in flight", half, half, true),
+        ("a batch one object too many beside what is in flight", half, half + 1, false),
+        ("one object beside a quota already full", MAX_INVALIDATION_PATHS, 1, false),
     ];
 
     for surface in [Surface::Distribution, Surface::Tenant] {
-        let id = resource_for(&router, surface, &format!("size-{}", surface.label())).await;
+        for (index, (case, in_flight, count, is_accepted)) in rows.iter().enumerate() {
+            let label = format!("{}/{case}", surface.label());
+            // One resource per row, so what a row puts in flight is exactly what the row says.
+            let id = resource_for(&router, surface, &format!("quota-{}-{index}", surface.label()))
+                .await;
 
-        // One accepted batch FIRST, so every refusal below is answered on a resource that
-        // already holds an invalidation: the size of the batch submitted is the condition,
-        // not what the resource holds.
-        let seeded = submit(
-            &router,
-            surface,
-            &id,
-            &batch_xml("size-seed", &["/seed.html"]),
-        )
-        .await;
-        assert_eq!(
-            seeded.status,
-            201,
-            "case {}/seed: expected HTTP 201, got {} with {}",
-            surface.label(),
-            seeded.status,
-            seeded.raw.chars().take(400).collect::<String>()
-        );
+            if *in_flight > 0 {
+                let owned = paths(*in_flight);
+                let seed: Vec<&str> = owned.iter().map(String::as_str).collect();
+                let seeded = submit(
+                    &router,
+                    surface,
+                    &id,
+                    &batch_xml(&format!("quota-seed-{index}"), &seed),
+                )
+                .await;
+                assert_eq!(
+                    seeded.status,
+                    201,
+                    "case {label}: expected HTTP 201 putting {in_flight} objects in flight, got \
+                     {} with {}",
+                    seeded.status,
+                    seeded.raw.chars().take(400).collect::<String>()
+                );
+            }
 
-        for (case, count, is_accepted) in rows {
-            let owned = paths(*count);
+            let owned = paths_from(*in_flight, *count);
             let batch: Vec<&str> = owned.iter().map(String::as_str).collect();
             let before = held(&router, surface, &id).await;
             let answer = submit(
                 &router,
                 surface,
                 &id,
-                &batch_xml(&format!("size-{case}-{count}"), &batch),
+                &batch_xml(&format!("quota-{index}-{count}"), &batch),
             )
             .await;
             let after = held(&router, surface, &id).await;
-            let label = format!("{}/{case}", surface.label());
 
             if *is_accepted {
                 assert_eq!(
                     answer.status, 201,
-                    "case {label}: expected HTTP 201 for {count} paths, got {} with {}",
+                    "case {label}: expected HTTP 201 for {count} paths beside {in_flight} in \
+                     flight, got {} with {}",
                     answer.status,
                     answer.raw.chars().take(400).collect::<String>()
                 );
@@ -208,24 +233,24 @@ async fn an_oversized_invalidation_batch_is_refused_for_its_size_on_every_surfac
                 continue;
             }
 
-            // "Invalidation batch specified is too large." — the modelled `BatchTooLarge`,
-            // whose status the model binds to 413.
             assert_eq!(
-                answer.status, 413,
-                "case {label}: expected HTTP 413 for {count} paths, got {} with {}",
+                answer.status, 400,
+                "case {label}: expected HTTP 400 for {count} paths beside {in_flight} in \
+                 flight, got {} with {}",
                 answer.status,
                 answer.raw.chars().take(400).collect::<String>()
             );
             assert_eq!(
                 answer.error_code(),
-                "BatchTooLarge",
-                "case {label}: expected BatchTooLarge for {count} paths, got {:?}",
+                "TooManyInvalidationsInProgress",
+                "case {label}: expected TooManyInvalidationsInProgress for {count} paths, got \
+                 {:?}",
                 answer.error_code()
             );
             assert_eq!(
                 answer.root().find_text("Message"),
-                Some(BATCH_TOO_LARGE_MESSAGE),
-                "case {label}: expected the batch-size sentence, got {:?}",
+                Some(TOO_MANY_INVALIDATIONS),
+                "case {label}: expected the quota sentence, got {:?}",
                 answer.root().find_text("Message")
             );
             assert_eq!(
@@ -260,23 +285,23 @@ fn batch_over(reference: &str, count: usize, floor: usize) -> String {
 
 /// A request whose DOCUMENT is larger than this API reads is refused on its bytes alone: the
 /// transport's 413 carrying no error document at all, on every surface, whatever the batch
-/// itself describes — while a document the API DOES read and that names more objects than one
-/// request may is the modelled `BatchTooLarge`, which carries its code under the same status.
+/// itself describes — while a document the API DOES read is weighed against the invalidation
+/// quota instead, which answers under its own code and status.
 #[tokio::test]
 async fn a_document_larger_than_the_api_reads_is_refused_with_no_error_document() {
     let router = emulator();
 
     // Each row: how many paths the document names, whether its bytes are past the API's
     // document ceiling, and so which of the two refusals answers it. The ceiling bounds
-    // BYTES and the object bound bounds COUNT, so the rows cross the two.
+    // BYTES and the quota bounds OBJECTS, so the rows cross the two.
     let rows: &[(&str, usize, bool)] = &[
-        // A count the object bound admits, in a document too large to read.
-        ("a path count the bound admits", MAX_INVALIDATION_PATHS / 4, true),
-        // A count past the object bound as well, so the two rules are told apart by the
-        // bytes and not by the count.
-        ("a path count past the bound", MAX_INVALIDATION_PATHS + 1, true),
-        // The same count, in a document the API reads: the modelled refusal.
-        ("a readable document past the bound", MAX_INVALIDATION_PATHS + 1, false),
+        // A count the quota admits, in a document too large to read.
+        ("a path count the quota admits", MAX_INVALIDATION_PATHS / 4, true),
+        // A count past the quota as well, so the two rules are told apart by the bytes and
+        // not by the count.
+        ("a path count past the quota", MAX_INVALIDATION_PATHS + 1, true),
+        // The same count, in a document the API reads: the quota's own refusal.
+        ("a readable document past the quota", MAX_INVALIDATION_PATHS + 1, false),
     ];
 
     for surface in [Surface::Distribution, Surface::Tenant] {
@@ -319,15 +344,15 @@ async fn a_document_larger_than_the_api_reads_is_refused_with_no_error_document(
                 );
             } else {
                 assert_eq!(
-                    answer.status, 413,
-                    "case {label}: expected HTTP 413, got {} with {}",
+                    answer.status, 400,
+                    "case {label}: expected HTTP 400, got {} with {}",
                     answer.status,
                     answer.raw.chars().take(400).collect::<String>()
                 );
                 assert_eq!(
                     answer.error_code(),
-                    "BatchTooLarge",
-                    "case {label}: expected the modelled BatchTooLarge, got {:?} in {}",
+                    "TooManyInvalidationsInProgress",
+                    "case {label}: expected the quota's own refusal, got {:?} in {}",
                     answer.error_code(),
                     answer.raw.chars().take(400).collect::<String>()
                 );
@@ -368,12 +393,11 @@ fn recorded_oversized_document(reference: &str) -> String {
     batch_xml(reference, &batch)
 }
 
-/// The two oversized-batch conditions are told apart by the document's BYTES, which is what
-/// reconciles the two recordings of this surface: a batch of 60,000 real-looking paths is a
-/// document past what this API reads, so it is refused unread with a bare `413` carrying no
-/// error document (a client's SDK reports that refusal's code as the status string), while a
-/// document the API DOES read and that names more objects than one request may is the
-/// modelled `BatchTooLarge` the object bound answers for a document the API does read.
+/// The two oversized-batch conditions are told apart by the document's BYTES: a batch of
+/// 60,000 real-looking paths is a document past what this API reads, so it is refused unread
+/// with a bare `413` carrying no error document (a client's SDK reports that refusal's code as
+/// the status string), while a document the API DOES read is weighed against the objects the
+/// resource may have invalidating at one time, which answers under the quota's own code.
 #[tokio::test]
 async fn the_recorded_oversized_batch_is_past_the_document_ceiling_on_every_surface() {
     let router = emulator();

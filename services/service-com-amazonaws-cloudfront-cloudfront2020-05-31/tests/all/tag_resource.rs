@@ -272,7 +272,7 @@ fn add_table() -> Vec<AddCase> {
 ///
 /// The `InvalidTagging` rows are the rules the model cannot state — at most one tag per
 /// key, and at most [`MAX_TAGS_PER_RESOURCE`] tags counted over the union of the carried
-/// and the added keys — and the `ValidationException` rows are one past `TagKey`'s
+/// and the added keys — and the `MalformedXML` rows are one past `TagKey`'s
 /// documented maximum length (128) and one past `TagValue`'s (256).
 #[allow(clippy::type_complexity)]
 fn tag_sets_no_resource_can_carry() -> Vec<(
@@ -322,14 +322,14 @@ fn tag_sets_no_resource_can_carry() -> Vec<(
             vec![tag("keep", Some("yes"))],
             vec![tag(&"k".repeat(129), Some("v"))],
             400,
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "value-one-past-its-maximum-length",
             vec![tag("keep", Some("yes"))],
             vec![tag("size", Some(&"v".repeat(257)))],
             400,
-            "ValidationException",
+            "MalformedXML",
         ),
     ]
 }

@@ -576,7 +576,10 @@ async fn an_absent_payload_is_malformed_xml_naming_the_payload_member() {
 #[tokio::test]
 async fn a_body_that_is_present_but_incomplete_is_not_an_absent_payload() {
     // The rule is about a request with NO body: one that carries a document the service
-    // can read keeps the member-level refusal, so a client can tell the two apart.
+    // can read keeps the MEMBER-level refusal, so a client can tell the two apart. Both are
+    // request documents this API cannot read, so both answer `MalformedXML`; what differs is
+    // the member the sentence names — the payload itself where there is no document at all,
+    // and the member nested inside it where there is one.
     let router = emulator();
     let answer = call(
         &router,
@@ -594,10 +597,13 @@ async fn a_body_that_is_present_but_incomplete_is_not_an_absent_payload() {
         "an incomplete configuration is refused: {}",
         answer.raw
     );
-    assert_ne!(
-        answer.error_code(),
-        "MalformedXML",
-        "a body that was read is not an absent payload: {}",
+    let expected = "1 validation error detected: Value null at \
+                    'distributionConfig.callerReference' failed to satisfy constraint: Member \
+                    must not be null";
+    assert_eq!(
+        message(&answer),
+        expected,
+        "a body that was read names the member inside the payload, not the payload: {}",
         answer.raw
     );
 }

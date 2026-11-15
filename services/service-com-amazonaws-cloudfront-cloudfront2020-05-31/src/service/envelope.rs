@@ -38,7 +38,7 @@
 //! operation's input with `400 ValidationException` and the codec's own text;
 //! `ValidationException` is not a shape this service's model declares at all, so a client
 //! branching on the error code falls through to a generic failure and never reaches its
-//! input-correction path. Three such refusals have a modelled CloudFront answer, and each
+//! input-correction path. Four such refusals have a modelled CloudFront answer, and each
 //! is read off the REQUEST and the refusal rather than off the operation:
 //!
 //! * a `MaxItems` the parameter's integer type cannot take is `InvalidArgument` (400),
@@ -47,7 +47,7 @@
 //!   ([`crate::state::MAX_ITEMS_INVALID_MESSAGE`]) — and only where the refusal shows
 //!   that value as the one it refused, so a request refused for something else keeps
 //!   the cause its caller has to fix;
-//! * a value the model's ENUM does not admit is no value of that member at all: the value
+//! * a value outside the SET its member admits is no value of that member at all: the value
 //!   set is part of the schema this API publishes for the request, so a request naming a
 //!   value outside it is one this API cannot read, and the answer is `MalformedXML` (400)
 //!   under the sentence the boundary already wrote, which names the member and the value
@@ -57,14 +57,20 @@
 //!   and nothing else. Neither does the LAYER that read the set: a set the model documents
 //!   in prose but declares nowhere (the event types a function association admits) is
 //!   checked by the operation, which states the same sentence, and the same code answers
-//!   it. The value set that sentence lists is a property of the ENUM, so it
-//!   is listed in the order this service publishes that enum's values
-//!   ([`STATED_VALUE_ORDERS`]);
+//!   it. The value set that sentence lists is a property of the SHAPE or of the member's
+//!   documentation rather than of the request, so it is listed in the order this service
+//!   publishes it ([`STATED_VALUE_ORDERS`]);
 //! * a body-bearing request that carries NO body cannot have a payload at all, so the
 //!   null member the boundary reports is one nested inside that payload and the member
 //!   that is really absent is the payload itself: the answer is `MalformedXML` (400)
 //!   naming that payload member. A refusal naming a member nested in nothing is about a
-//!   member bound outside the body, and keeps the boundary's own wording.
+//!   member bound outside the body, and keeps the boundary's own wording;
+//! * every OTHER constraint the boundary reports on a member nested inside the payload — a
+//!   member that is absent, too short or long, outside its range or outside its pattern — is
+//!   a request document this API cannot read just as surely, so it too is `MalformedXML`
+//!   (400) under the sentence the boundary wrote. The one part of that sentence this service
+//!   states itself is a PATTERN, which it reports as the pattern it enforces rather than as
+//!   the one the model spells ([`stated_pattern`]).
 //!
 //! All of them leave every other refusal exactly as the layer that made it rendered it: a
 //! request the boundary read, and an operation's refusal that reports another rule, are
@@ -177,6 +183,32 @@ pub const MAX_REQUEST_BODY_BYTES: usize =
 /// serves.
 const ENUM_VALUE_SET_MARKER: &str = "Member must satisfy enum value set:";
 
+/// How a refusal states the constraint of a value set the member's own shape does NOT declare
+/// (`Member must satisfy value set: [...]`) — the set a member's documentation admits where
+/// the shape it targets admits more (a CloudFront function association's event type, whose
+/// `EventType` enum carries the origin-facing events a Lambda@Edge association uses).
+///
+/// The two markers are the two ways one defect is stated, so every value-set rewrite below
+/// reads whichever of them the refusal carries.
+const VALUE_SET_MARKER: &str = "Member must satisfy value set:";
+
+/// Every marker a refusal states a value-set constraint with, longest first so the enum one
+/// is recognised as itself rather than as the bare set it ends with.
+const VALUE_SET_MARKERS: [&str; 2] = [ENUM_VALUE_SET_MARKER, VALUE_SET_MARKER];
+
+/// How the request boundary states the constraint a `@pattern` member carries, up to the
+/// pattern itself.
+const PATTERN_MARKER: &str = "Member must satisfy regular expression pattern: ";
+
+/// The partition segment an ARN pattern the MODEL carries names, and the one the service
+/// reports for it.
+///
+/// The model writes its ARN patterns for the `aws` partition alone, while the service accepts
+/// an ARN of whichever partition the account is in, so the pattern a refusal reports
+/// generalises that segment. Nothing else of the pattern is touched.
+const MODELLED_ARN_PARTITION: &str = "arn:aws:";
+const STATED_ARN_PARTITION: &str = "arn:aws(-[a-z]+)*:";
+
 /// The marker the framework's refusal message states an absent member with
 /// (`Value null at '<member path>' failed to satisfy constraint: Member must not be
 /// null`), with the apostrophes as the XML envelope escapes them.
@@ -184,6 +216,31 @@ const NULL_MEMBER_MARKERS: [(&str, &str); 2] = [
     ("Value null at &apos;", "&apos;"),
     ("Value null at '", "'"),
 ];
+
+/// The markers a constraint refusal names the MEMBER it is about with (`... at '<member
+/// path>' failed to satisfy constraint: ...`), with the apostrophes as they stand raw and as
+/// the XML envelope escapes them.
+const CONSTRAINED_MEMBER_MARKERS: [(&str, &str); 2] = [
+    (" at &apos;", "&apos; failed to satisfy constraint"),
+    (" at '", "' failed to satisfy constraint"),
+];
+
+/// The separator the request boundary joins the clauses of one refusal with
+/// (`N validation errors detected: <clause>; <clause>`).
+const CLAUSE_SEPARATOR: &str = "; ";
+
+/// How the request boundary counts ONE violation, and how the validator that reads a
+/// distribution configuration counts it: that validator writes the plural noun whatever the
+/// count is, which is the wording recorded for every refusal of that document
+/// (`crate::state::function_association_event_refusal` states the same count).
+const SINGULAR_COUNT: &str = "1 validation error detected:";
+const PLURAL_COUNT: &str = "1 validation errors detected:";
+
+/// The step a member path takes from a structure into one of its members, which is what makes
+/// a path NESTED: a member reached through another member travelled inside the request's
+/// payload, since the members bound outside the body (a header, a query parameter, a label of
+/// the URI) are members of the input structure itself and name no parent.
+const MEMBER_PATH_STEP: char = '.';
 
 /// A fresh request id for one response, from the one mint this service has for it
 /// ([`crate::state::new_request_id`]).
@@ -371,17 +428,35 @@ fn refused_over_max_items(req: &RtRequest, refusal: &str) -> bool {
         .any(|marker| refusal.contains(marker))
 }
 
-/// Whether `refusal` is the boundary refusing the request over a value an enum-constrained
-/// member of it carries.
+/// Whether `refusal` is a refusal of the request over a value outside the set its member
+/// admits — the set the member's shape declares, or the set its documentation does.
 ///
-/// Read off the REFUSAL alone: the value set an enum declares is part of the schema this API
+/// Read off the REFUSAL alone: the value set a member admits is part of the schema this API
 /// publishes for the request, so the binding the value travelled in — a query parameter, a
 /// member of the request's document, a member nested inside its payload — says nothing about
 /// whether the request describes something this API can read. What identifies the refusal is
-/// the CONSTRAINT it reports, which holds for every enum-constrained member of every
-/// operation this service serves.
-fn refused_over_enum_value(refusal: &str) -> bool {
-    element_text(refusal, "Message").is_some_and(|message| message.contains(ENUM_VALUE_SET_MARKER))
+/// the CONSTRAINT it reports ([`VALUE_SET_MARKERS`]), which holds for every value-set
+/// constrained member of every operation this service serves.
+fn refused_over_value_set(refusal: &str) -> bool {
+    element_text(refusal, "Message")
+        .is_some_and(|message| VALUE_SET_MARKERS.iter().any(|marker| message.contains(marker)))
+}
+
+/// The member path a constraint refusal is about, as the layer that wrote it rendered it, or
+/// `None` when the refusal states no member at all.
+fn constrained_member_path(refusal: &str) -> Option<&str> {
+    let message = element_text(refusal, "Message")?;
+    CONSTRAINED_MEMBER_MARKERS.iter().find_map(|(open, close)| {
+        let after = message.split_once(open)?.1;
+        Some(after.split_once(close)?.0)
+    })
+}
+
+/// Whether `refusal` is about a member NESTED inside the request's payload — a member reached
+/// through another member, which is what a member of the request DOCUMENT is
+/// ([`MEMBER_PATH_STEP`]).
+fn refused_over_a_document_member(refusal: &str) -> bool {
+    constrained_member_path(refusal).is_some_and(|path| path.contains(MEMBER_PATH_STEP))
 }
 
 /// The value sets this service publishes in an order of its own, each listed in that order.
@@ -417,11 +492,12 @@ const STATED_VALUE_ORDERS: &[&[&str]] = &[
 /// ([`STATED_VALUE_ORDERS`]) and nothing the emulator chooses: a set whose published order is
 /// the order it arrived in is handed back untouched.
 fn with_stated_enum_values(refusal: &str) -> String {
-    let Some(message) = element_text(refusal, "Message") else {
-        return refusal.to_string();
+    let refusal = with_narrowed_value_set(refusal);
+    let Some(message) = element_text(&refusal, "Message") else {
+        return refusal;
     };
     let Some(stated) = stated_enum_values(message) else {
-        return refusal.to_string();
+        return refusal.clone();
     };
     refusal.replacen(
         &format!("<Message>{message}</Message>"),
@@ -430,12 +506,62 @@ fn with_stated_enum_values(refusal: &str) -> String {
     )
 }
 
-/// `message` with the value set it lists after [`ENUM_VALUE_SET_MARKER`] listed in this
+/// Whether `path` addresses the EVENT TYPE of a CloudFront function association: the member
+/// travels in the `member` of the `items` list of a cache behaviour's `functionAssociations`,
+/// whichever behaviour of whichever payload holds it.
+fn is_function_association_event_type(path: &str) -> bool {
+    path.contains(".functionAssociations.items.") && path.ends_with(".member.eventType")
+}
+
+/// `refusal` with the value set stated for a member whose own documentation admits a NARROWER
+/// set than the shape it targets, in the sentence the operation that owns that rule states.
+///
+/// Which values a member admits is a property of the MEMBER, so one member is refused in one
+/// sentence whichever layer read the value: the request boundary reads the set the SHAPE
+/// declares and refuses a value outside it before any handler runs, while the narrower set the
+/// member documents is read by the operation ([`crate::state::function_association_event_refusal`]).
+/// Left as it stands for every other member, whose shape's set is the set it admits.
+///
+/// Today that is the event type of a CloudFront function association: `FunctionAssociation`'s
+/// `EventType` targets the enum the Lambda@Edge associations share, whose origin-facing values
+/// no CloudFront function runs on.
+fn with_narrowed_value_set(refusal: &str) -> String {
+    if !constrained_member_path(refusal).is_some_and(is_function_association_event_type) {
+        return refusal.to_string();
+    }
+    let Some(message) = element_text(refusal, "Message") else {
+        return refusal.to_string();
+    };
+    let Some(marker_at) = VALUE_SET_MARKERS
+        .iter()
+        .find_map(|marker| message.find(marker))
+    else {
+        return refusal.to_string();
+    };
+    // One clause, so the set it lists runs to the end of the sentence: the head names the
+    // member and the value, which the boundary already stated, and the tail is the set this
+    // member admits.
+    let stated = format!(
+        "{}{}",
+        &message[..marker_at],
+        crate::state::function_association_event_set_clause()
+    )
+    .replacen(SINGULAR_COUNT, PLURAL_COUNT, 1);
+    refusal.replacen(
+        &format!("<Message>{message}</Message>"),
+        &format!("<Message>{stated}</Message>"),
+        1,
+    )
+}
+
+/// `message` with the value set it lists after one of [`VALUE_SET_MARKERS`] listed in this
 /// service's order for that set, or `None` when it lists no set or lists one this service
 /// states in the order it already stands in — the rewrite reads the MESSAGE rather than the
 /// document, so nothing else the envelope carries can be touched by it.
 fn stated_enum_values(message: &str) -> Option<String> {
-    let marker_at = message.find(ENUM_VALUE_SET_MARKER)?;
+    let marker_at = VALUE_SET_MARKERS
+        .iter()
+        .find_map(|marker| message.find(marker))?;
     let tail = &message[marker_at..];
     let open = tail.find('[')?;
     let close = open + tail[open..].find(']')?;
@@ -462,6 +588,51 @@ fn stated_value_order(values: &[&str]) -> Option<Vec<&'static str>> {
 /// so equal lengths plus containment is set equality.
 fn is_same_value_set(stated: &[&str], values: &[&str]) -> bool {
     stated.len() == values.len() && stated.iter().all(|value| values.contains(value))
+}
+
+/// `refusal` with every pattern it reports stated as the SERVICE states one.
+///
+/// What a caller has to satisfy is the pattern the service enforces, not the one the model
+/// happens to spell: a `@pattern` is a containment test, so the anchors a model writes around
+/// one say nothing about the value, and an ARN pattern the model writes for the `aws`
+/// partition alone is satisfied by an ARN of whichever partition the account is in. A refusal
+/// that reports the model's spelling tells the caller its value is wrong for a reason that is
+/// not the rule \u2014 that no other partition is allowed, and that the value has to match end to
+/// end \u2014 so the pattern is restated ([`stated_pattern`]) and nothing else of the refusal is.
+fn with_stated_pattern(refusal: &str) -> String {
+    let Some(message) = element_text(refusal, "Message") else {
+        return refusal.to_string();
+    };
+    let stated: Vec<String> = message
+        .split(CLAUSE_SEPARATOR)
+        .map(|clause| match clause.split_once(PATTERN_MARKER) {
+            Some((head, pattern)) => {
+                format!("{head}{PATTERN_MARKER}{}", stated_pattern(pattern))
+            }
+            None => clause.to_string(),
+        })
+        .collect();
+    let stated = stated.join(CLAUSE_SEPARATOR);
+    if stated == message {
+        return refusal.to_string();
+    }
+    refusal.replacen(
+        &format!("<Message>{message}</Message>"),
+        &format!("<Message>{stated}</Message>"),
+        1,
+    )
+}
+
+/// `pattern` as the service states it: unanchored, with the partition segment of an ARN
+/// pattern generalised over the partitions an ARN can name.
+///
+/// The anchor pair is dropped by the ONE rule this workspace owns for it
+/// (`service_common::validation::unanchored`), which drops the pair positionally and leaves an
+/// escaped `$` alone, so this service cannot disagree with its siblings about what an
+/// unanchored expression is. The partition generalisation is this API's own, so it stays here.
+fn stated_pattern(pattern: &str) -> String {
+    service_common::validation::unanchored(pattern)
+        .replace(MODELLED_ARN_PARTITION, STATED_ARN_PARTITION)
 }
 
 /// `refusal` answered under `code`, with everything else the boundary rendered — its
@@ -532,8 +703,9 @@ fn operation_refusal(resp: &RtResponse) -> Option<(&str, &str)> {
 ///
 /// Reads the REQUEST and the REFUSAL, not the operation: every condition is a property of
 /// one of them (the value the request gives its page-size parameter, the constraint the
-/// refusal reports, and whether the request carries a body at all), so they hold for every
-/// operation that binds them rather than for a list of operations named here.
+/// refusal reports, the member it is about, and whether the request carries a body at all),
+/// so they hold for every operation that binds them rather than for a list of operations
+/// named here.
 fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     // A value outside the set its member admits is no value of that member at all,
     // whichever layer read the set: the boundary refuses one outside a set the SCHEMA
@@ -542,7 +714,7 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     // the same sentence, so both are answered under `MalformedXML` — the code this API
     // answers a request document it cannot read with.
     if let Some((refusal, code)) = operation_refusal(resp) {
-        if refused_over_enum_value(refusal) {
+        if refused_over_value_set(refusal) {
             return Some(recoded(&with_stated_enum_values(refusal), code, MALFORMED_XML));
         }
         return None;
@@ -567,7 +739,7 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     // boundary's own sentence states, so the code is restated and the sentence is left as it
     // stands — except for the ORDER the value set is listed in, which belongs to the enum and
     // is this service's own for it.
-    if refused_over_enum_value(refusal) {
+    if refused_over_value_set(refusal) {
         return Some(recoded(
             &with_stated_enum_values(refusal),
             FRAMEWORK_REFUSAL_CODE,
@@ -583,11 +755,34 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     // nothing is about a member bound somewhere other than the body (a header, a query
     // parameter), so it keeps the wording the boundary gave it.
     if matches!(req.method(), "POST" | "PUT") && body_is_blank(req) {
-        let (payload, _) = null_member_path(refusal)?.split_once('.')?;
-        return Some(error_response(
-            REFUSED,
+        if let Some((payload, _)) = null_member_path(refusal).and_then(|path| path.split_once('.'))
+        {
+            return Some(error_response(
+                REFUSED,
+                MALFORMED_XML,
+                &missing_member_message(payload),
+            ));
+        }
+    }
+
+    // EVERY other constraint the boundary reports on a member NESTED inside the request's
+    // payload — a member that is absent, too long, outside its range or outside its pattern —
+    // is a request DOCUMENT this API cannot read, which it answers with `MalformedXML` (400):
+    // `ValidationException` is no code this service's model declares, so a caller branching on
+    // CloudFront's own vocabulary would fall through to a generic failure and never reach its
+    // input-correction path. The member and the constraint it broke are what the boundary's
+    // sentence already states, so the code is restated and the sentence is left as it stands —
+    // except for a PATTERN, which is restated as the service states one
+    // ([`with_stated_pattern`]).
+    //
+    // A refusal about a member bound OUTSIDE the body (a header, a query parameter, a label of
+    // the URI) names a member of the input structure itself rather than one reached through
+    // another member, so it is not a defect of the document and keeps the boundary's wording.
+    if refused_over_a_document_member(refusal) {
+        return Some(recoded(
+            &with_stated_pattern(refusal),
+            FRAMEWORK_REFUSAL_CODE,
             MALFORMED_XML,
-            &missing_member_message(payload),
         ));
     }
 

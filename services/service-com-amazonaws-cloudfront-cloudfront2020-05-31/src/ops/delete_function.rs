@@ -5,9 +5,10 @@
 //! its stages, its code, its configuration, its version tokens and its tags — once the
 //! version the caller read is still current and no stored cache behaviour attaches it, so
 //! every later read of that name reports a function that does not exist and the name is
-//! free for a later create. An `If-Match` that is not this function's current version is
-//! `InvalidIfMatchVersion` (400) here, whether it is no version token at all or a
-//! superseded one. This is the ONLY file to touch for this operation.
+//! free for a later create. An `If-Match` that carries no version token at all is
+//! `InvalidIfMatchVersion` (400); one that carries a well-formed token that is not the
+//! function's current version is a failed precondition, `PreconditionFailed` (412). This is
+//! the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -202,16 +203,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The precondition is checked first, the way HTTP evaluates one: a caller holding a
         // version that is no longer current is told that before anything about what the
-        // function is attached to. This operation reads "missing or not valid" as "not valid
-        // FOR THIS FUNCTION", so a token that is no version token at all and a well-formed
-        // token that is not the function's current one are the one `InvalidIfMatchVersion` —
-        // the classification `DeleteContinuousDeploymentPolicy` makes for the same split, and
-        // not the `PreconditionFailed` the policy and entity surfaces answer with.
+        // function is attached to. The two halves of "missing or not valid" are told apart,
+        // the way every other mutation of this service tells them apart
+        // ([`crate::state::check_if_match`]): a header carrying no version token at all is a
+        // request this operation cannot read a precondition out of at all
+        // (`InvalidIfMatchVersion`, 400), while a well-formed token that is not the
+        // function's current version is a precondition that EVALUATED to false
+        // (`PreconditionFailed`, 412) — so a caller that re-reads the version and retries,
+        // which is the recovery a 412 asks for, is told to do exactly that.
         match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
             IfMatch::Current => {}
-            IfMatch::Invalid | IfMatch::Stale => {
+            IfMatch::Invalid => {
                 return Err(DeleteFunctionErrorModeled::InvalidIfMatchVersion(
                     crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(DeleteFunctionErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
                 )
                 .into());
             }

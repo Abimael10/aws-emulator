@@ -323,9 +323,9 @@ impl From<UpdateDistributionErrorModeled> for UpdateDistributionError {
 }
 
 /// The stored distribution this update would land on, as the two reads of it below share one
-/// reading: the caller reference it holds and the connection mode it declares, or the
-/// modelled refusal that says the update cannot land at all — the store holds no
-/// distribution under that id, or the precondition does not match the version it holds.
+/// reading: the version it stands at, the caller reference it holds and the connection mode
+/// it declares, or the modelled refusal that says there is no distribution under that id to
+/// land on at all.
 ///
 /// Read TWICE. Once BEFORE the submitted configuration's Lambda@Edge associations are
 /// resolved against the services that hold the function and its execution role
@@ -336,22 +336,33 @@ impl From<UpdateDistributionErrorModeled> for UpdateDistributionError {
 fn current_record(
     store: &crate::state::ComAmazonawsCloudfrontCloudfront20200531State,
     id: &str,
-    if_match: Option<&str>,
-) -> Result<(String, &'static str), UpdateDistributionError> {
-    let Some((etag, caller_reference, connection_mode)) = store.distribution(id).map(|stored| {
-        (
-            stored.etag.clone(),
-            stored.config.caller_reference.clone(),
-            crate::state::connection_mode_declared(&stored.config),
-        )
-    }) else {
-        return Err(UpdateDistributionErrorModeled::NoSuchDistribution(
-            crate::state::no_such_distribution(),
-        )
-        .into());
-    };
-    match crate::state::check_if_match(&etag, if_match) {
-        IfMatch::Current => Ok((caller_reference, connection_mode)),
+) -> Result<(String, String, &'static str), UpdateDistributionError> {
+    store
+        .distribution(id)
+        .map(|stored| {
+            (
+                stored.etag.clone(),
+                stored.config.caller_reference.clone(),
+                crate::state::connection_mode_declared(&stored.config),
+            )
+        })
+        .ok_or_else(|| {
+            UpdateDistributionErrorModeled::NoSuchDistribution(crate::state::no_such_distribution())
+                .into()
+        })
+}
+
+/// The modelled refusal an `If-Match` that is not `etag` carries, or `Ok(())` when the
+/// request carries the version the record stands at.
+///
+/// Evaluated AFTER everything the submitted configuration can be refused for on its own: a
+/// precondition says which VERSION of the resource the request may land on, which is a
+/// question about a document the API could read in the first place. A caller told its version
+/// is stale re-reads the configuration and submits the same defective document again, so a
+/// request carrying both faults learns the one it has to fix rather than the one it does not.
+fn check_precondition(etag: &str, if_match: Option<&str>) -> Result<(), UpdateDistributionError> {
+    match crate::state::check_if_match(etag, if_match) {
+        IfMatch::Current => Ok(()),
         IfMatch::Invalid => Err(UpdateDistributionErrorModeled::InvalidIfMatchVersion(
             crate::state::invalid_if_match_version(),
         )
@@ -403,14 +414,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
         let now = SystemTime::now();
-        // The stored record and its precondition first, under a lock taken and released for
-        // that read alone: an update the store refuses on its own terms — no distribution
-        // under that id, or a version that is not the one its caller read — is answered
-        // before anything of another service's records is read for it.
+        // The stored record first, under a lock taken and released for that read alone: an
+        // update the store holds no distribution for is answered before anything of another
+        // service's records is read for it. The PRECONDITION is not evaluated here — it says
+        // which version of the resource this request may land on, which is a question about a
+        // document this API could read at all, so it is weighed once the submitted
+        // configuration has been ([`check_precondition`]).
         {
             let mut store = state.lock();
             store.settle(now);
-            current_record(&store, &input.id, input.if_match.as_deref())?;
+            current_record(&store, &input.id)?;
         }
 
         // Everything that can be refused from the SUBMITTED CONFIGURATION ALONE is answered
@@ -577,8 +590,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             store.settle(now);
 
-            let (current_caller_reference, current_connection_mode) =
-                current_record(&store, &input.id, input.if_match.as_deref())?;
+            let (current_etag, current_caller_reference, current_connection_mode) =
+                current_record(&store, &input.id)?;
+
+            // Every refusal the submitted configuration earns on its own has been answered,
+            // so the question left is which VERSION of the record this request may land on.
+            check_precondition(&current_etag, input.if_match.as_deref())?;
 
             // The same rule the create path applies: a cache behaviour runs the code a
             // CloudFront function's `LIVE` stage holds, so an update cannot leave a

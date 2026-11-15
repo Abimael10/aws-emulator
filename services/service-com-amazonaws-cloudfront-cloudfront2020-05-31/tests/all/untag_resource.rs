@@ -8,7 +8,7 @@
 //! is idempotent in the set it leaves behind), and the resulting set is what a tag read
 //! reports — for every resource kind the store holds and tags; an ARN the store holds no
 //! resource for is `NoSuchResource` (404), a request naming a key no tag key can be is
-//! refused (`ValidationException` 400) and leaves the resource carrying exactly the tags
+//! refused (`MalformedXML` 400) and leaves the resource carrying exactly the tags
 //! it carried before, and a tag set is associated with the resource rather than part of
 //! its configuration, so untagging mints no new version token.
 //!
@@ -301,21 +301,21 @@ fn removal_table() -> Vec<RemovalCase> {
 /// error code)`.
 ///
 /// Both rows are constraints the model states for `TagKey` — a length "between 1 and 128
-/// characters" — so each is one PAST a published bound, and the refusal is the one the
-/// framework answers for a modelled constraint.
+/// characters" — so each is one PAST a published bound, and the refusal is the one this API
+/// answers a request DOCUMENT it cannot read with.
 fn keys_no_tag_key_can_be() -> Vec<(&'static str, String, u16, &'static str)> {
     vec![
         (
             "key-one-past-its-maximum-length",
             "k".repeat(129),
             400,
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "key-one-below-its-minimum-length",
             String::new(),
             400,
-            "ValidationException",
+            "MalformedXML",
         ),
     ]
 }

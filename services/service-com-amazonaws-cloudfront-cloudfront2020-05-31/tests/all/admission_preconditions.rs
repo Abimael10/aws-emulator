@@ -794,7 +794,7 @@ async fn a_function_association_names_a_viewer_event() {
             "case an update at {event_type}: expected the member path stated, got {message:?}"
         );
         assert!(
-            message.ends_with("Member must satisfy enum value set: [viewer-request, viewer-response]"),
+            message.ends_with("Member must satisfy value set: [viewer-request, viewer-response]"),
             "case an update at {event_type}: expected the admitted set stated, got {message:?}"
         );
 

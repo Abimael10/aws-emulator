@@ -18,9 +18,6 @@
 //!   request policies and the key groups) reports the precondition of the operation, and the
 //!   resource-DOCUMENT surface (a distribution, an identity, a function, a key value store, a
 //!   field-level encryption record) reports it of the request's header fields;
-//! * `DeleteFunction` is the one operation that reads "missing or not valid" as "not valid
-//!   FOR THIS FUNCTION", so a well-formed token that is not the function's current one is
-//!   `InvalidIfMatchVersion` (400) there instead;
 //! * every one of those sentences is FIXED text: it carries neither the token the request
 //!   sent nor the resource it addressed, so two callers whose only difference is the token
 //!   they held read the same sentence;
@@ -132,18 +129,6 @@ const OPS: &[(Op, Family)] = &[
         Family::ResourceDocument,
     ),
 ];
-
-impl Op {
-    /// What a WELL-FORMED token this resource does not hold is refused with: the family's
-    /// failed precondition, except for the one operation that classifies it as a version that
-    /// is not valid for the resource.
-    fn stale(self, family: Family) -> (u16, &'static str, &'static str) {
-        match self {
-            Self::DeleteFunction => (400, "InvalidIfMatchVersion", INVALID_IF_MATCH_VERSION),
-            _ => (412, "PreconditionFailed", family.sentence()),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The mutation each row drives
@@ -425,7 +410,9 @@ async fn a_failed_precondition_is_worded_by_the_operations_api_family() {
             )
             .await;
             let (status, code, sentence) = if is_version {
-                op.stale(*family)
+                // A WELL-FORMED token the addressed resource does not hold is the failed
+                // precondition, worded by the operation's API family.
+                (412, "PreconditionFailed", family.sentence())
             } else {
                 (400, "InvalidIfMatchVersion", INVALID_IF_MATCH_VERSION)
             };

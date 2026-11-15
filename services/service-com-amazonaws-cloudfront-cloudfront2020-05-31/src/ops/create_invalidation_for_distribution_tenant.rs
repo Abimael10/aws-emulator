@@ -222,20 +222,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The SIZE of the batch submitted: a batch naming more invalidation objects than one
-        // request may is refused with the modelled `BatchTooLarge` ("Invalidation batch
-        // specified is too large.", HTTP 413), which is the refusal recorded for this
-        // condition on this surface as on the distribution's. It is a property of this
-        // request alone, so it is decided here — before, and independently of, what the
-        // tenant already holds, which is the other condition and carries
-        // `TooManyInvalidationsInProgress` — and the batch is stored whole, so the bound is
-        // checked before anything is stored. The sentence states the condition rather than
-        // the count submitted.
+        // "Processing your request will cause you to exceed the maximum number of in-progress
+        // invalidations." What CloudFront's invalidation quota bounds is the objects one
+        // resource may have invalidating AT ONE TIME, and the paths this request names count
+        // toward it, so the batch is weighed against what the tenant already has in flight
+        // plus what it asks for — the SAME arithmetic the distribution's own invalidation
+        // path applies, since a tenant's batch invalidates objects the same way. Refused
+        // before anything is stored, and the same batch lands once the earlier ones have
+        // finished.
+        //
+        // The SIZE of the request document is the other condition and is decided on its bytes
+        // alone, before any operation runs (`crate::service::envelope`), which is the
+        // `BatchTooLarge` (413) this operation models.
         let path_count = crate::state::batch_path_count(&input.invalidation_batch);
-        if path_count > crate::state::MAX_INVALIDATION_PATHS {
+        let in_flight = crate::state::in_progress_invalidation_objects(&tenant.invalidations);
+        if in_flight + path_count > crate::state::MAX_INVALIDATION_PATHS {
             return Err(
-                CreateInvalidationForDistributionTenantErrorModeled::BatchTooLarge(
-                    crate::state::batch_too_large(),
+                CreateInvalidationForDistributionTenantErrorModeled::TooManyInvalidationsInProgress(
+                    crate::state::too_many_invalidations_in_progress(),
                 )
                 .into(),
             );
@@ -295,11 +299,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // "You have exceeded the maximum number of allowable InProgress invalidation batch
-        // requests, or invalidation objects." The invalidations of one tenant grow only
-        // here and a record cannot be evicted (a later read has to answer with what this
-        // create returned), so the bound is an entry count refused BEFORE anything is
-        // stored.
+        // The invalidations of one tenant grow only here and a record cannot be evicted (a
+        // later read has to answer with what this create returned), so the entry count this
+        // emulator holds is bounded too, refused BEFORE anything is stored and under the same
+        // modelled code the quota above is.
         if tenant.invalidations.len() >= crate::state::MAX_INVALIDATIONS_PER_DISTRIBUTION {
             return Err(
                 CreateInvalidationForDistributionTenantErrorModeled::TooManyInvalidationsInProgress(

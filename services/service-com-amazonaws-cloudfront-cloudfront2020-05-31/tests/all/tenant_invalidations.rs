@@ -19,8 +19,9 @@
 //! * a page size that names no page, a `Marker` that is no resume point this service handed
 //!   out, and a tenant or an invalidation that does not exist are refused with the errors the
 //!   operations model (`InvalidArgument` 400, `EntityNotFound` 404);
-//! * a batch over the published per-request object bound is refused with `BatchTooLarge`
-//!   (413) and persists nothing, so the listing after it is the listing before it;
+//! * a batch whose paths, beside the objects the tenant already has in flight, would pass the
+//!   published in-progress object quota is refused with `TooManyInvalidationsInProgress`
+//!   (400) and persists nothing, so the listing after it is the listing before it;
 //! * a repeated `CallerReference` carrying the same batch returns the invalidation already
 //!   created rather than a second one;
 //! * a list and a read are READS: the status they report is the one the clock owes the
@@ -30,7 +31,8 @@
 //! one tenant holds (none, one, a few, more than a whole page), how many paths each batch
 //! names and in which form, the page size requested (absent, one, several, exactly the
 //! collection size, past it), whether a `Marker` is carried at all, and — for the quota —
-//! the published bound itself and one past it.
+//! how much of the quota is already in flight and how many paths the batch asks for beside
+//! it.
 //!
 //! The harness (the router, the request helpers and the element scanner) is the
 //! distribution lifecycle suite's, reused rather than copied; the multi-tenant
@@ -39,8 +41,8 @@
 use std::time::Duration;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    id_format_invalid_message, BATCH_TOO_LARGE_MESSAGE, MAX_INVALIDATION_PATHS, MAX_ITEMS,
-    PROPAGATION_DELAY,
+    id_format_invalid_message, MAX_INVALIDATION_PATHS, MAX_ITEMS, PROPAGATION_DELAY,
+    TOO_MANY_INVALIDATIONS_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -672,28 +674,38 @@ async fn unusable_arguments_and_unknown_tenants_are_refused() {
     }
 }
 
-/// The published per-request object bound: a batch AT the bound is accepted, one PAST it is
-/// refused with `BatchTooLarge` (413) and persists nothing — the size of the batch submitted,
-/// which every create that takes an invalidation batch answers under that code.
+/// The published in-progress object quota: the paths a batch names count toward the objects
+/// the tenant may have invalidating at one time, so a batch the quota still admits is accepted
+/// and one that would pass it is refused with `TooManyInvalidationsInProgress` (400) and
+/// persists nothing.
 #[tokio::test]
 async fn a_batch_past_the_object_quota_is_refused_and_persists_nothing() {
     let router = emulator();
     let tenant_id = distribution_with_tenant(&router, "quota").await;
 
-    // Each row: how many paths the batch names, and whether the service accepts it.
-    // `MAX_INVALIDATION_PATHS` is the service's published bound, so the rows sit at it,
-    // just under it and just past it.
+    // Each row: how many paths the batch names, and whether the service accepts it. Every row
+    // runs against the SAME tenant, so each accepted batch leaves its paths in flight and the
+    // rows walk the quota up to it: 1 + 1,499 + 1,500 objects fill it exactly, and everything
+    // after that is refused however few paths it names.
+    let half = MAX_INVALIDATION_PATHS / 2;
     let rows: &[(&str, usize, bool)] = &[
         ("one path", 1, true),
-        ("one under the bound", MAX_INVALIDATION_PATHS - 1, true),
-        ("exactly the bound", MAX_INVALIDATION_PATHS, true),
-        ("one past the bound", MAX_INVALIDATION_PATHS + 1, false),
-        ("far past the bound", MAX_INVALIDATION_PATHS * 2, false),
+        ("just under half the quota", half - 1, true),
+        ("the rest of the quota", half, true),
+        ("one path beside a quota already full", 1, false),
+        ("a batch of the whole quota beside it", MAX_INVALIDATION_PATHS, false),
+        ("a batch far past the quota", MAX_INVALIDATION_PATHS * 2, false),
     ];
 
     let mut accepted = 0usize;
+    let mut minted = 0usize;
     for (case, count, is_accepted) in rows {
-        let owned: Vec<String> = (0..*count).map(|index| format!("/{index:05}.html")).collect();
+        // Paths no earlier row named, so an accepted batch puts `count` FURTHER objects in
+        // flight rather than repeating ones already there.
+        let owned: Vec<String> = (minted..minted + *count)
+            .map(|index| format!("/{index:05}.html"))
+            .collect();
+        minted += *count;
         let paths: Vec<&str> = owned.iter().map(String::as_str).collect();
         let before = summary_ids(
             list_invalidations_for_tenant(&router, &tenant_id, "")
@@ -703,7 +715,7 @@ async fn a_batch_past_the_object_quota_is_refused_and_persists_nothing() {
         let answer = create_invalidation_for_tenant(
             &router,
             &tenant_id,
-            &batch_xml(&format!("quota-{count}"), &paths),
+            &batch_xml(&format!("quota-{case}-{count}"), &paths),
         )
         .await;
         let after = summary_ids(
@@ -728,25 +740,26 @@ async fn a_batch_past_the_object_quota_is_refused_and_persists_nothing() {
                 before.len()
             );
         } else {
-            // "Invalidation batch specified is too large."
+            // "Processing your request will cause you to exceed the maximum number of
+            // in-progress invalidations."
             assert_eq!(
-                answer.status, 413,
-                "case {case}: expected HTTP 413 for {count} paths, got {} with {}",
+                answer.status, 400,
+                "case {case}: expected HTTP 400 for {count} paths, got {} with {}",
                 answer.status,
                 answer.raw.chars().take(400).collect::<String>()
             );
             assert_eq!(
                 answer.error_code(),
-                "BatchTooLarge",
-                "case {case}: expected BatchTooLarge, got {:?}",
+                "TooManyInvalidationsInProgress",
+                "case {case}: expected TooManyInvalidationsInProgress, got {:?}",
                 answer.error_code()
             );
             // The sentence CloudFront states for this refusal: fixed service text, naming
             // nothing the request carried.
             assert_eq!(
                 answer.root().find_text("Message"),
-                Some(BATCH_TOO_LARGE_MESSAGE),
-                "case {case}: expected the batch-size sentence the service states, got {:?}",
+                Some(TOO_MANY_INVALIDATIONS_MESSAGE),
+                "case {case}: expected the quota sentence the service states, got {:?}",
                 answer.root().find_text("Message")
             );
             assert_eq!(

@@ -1814,3 +1814,15 @@ mod cloudtrail_iam_credential_write_audit;
 // `all/all_rs_declares_each_suite_once.rs` (a second `mod` for one name is `E0428`),
 // `all/all_rs_is_a_canonical_declaration_list.rs` (one sorted pair per suite, nothing else)
 // and `all/every_suite_file_is_declared.rs`.
+//! This file is a CANONICAL DECLARATION LIST: its module doc, then one
+//! had grown re-typed copies of this header, some of them written as inner doc comments past
+//! the first item (`E0753`), so no suite of this target compiled at all.
+//! `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` pin the two rules a landing
+//! breaks: a module declared twice is `E0428`, and an inner doc comment past the first item
+//! is `E0753`. Both fail every suite in this target, so put a new suite at
+//! `tests/all/<name>.rs`, insert its pair into the sorted list below, and leave what it
+//! covers to that suite's own module doc. The `#[path]` is what points each declaration into
+//! `tests/all/`: this file is a test-target CRATE ROOT, where a bare `mod` would resolve to a
+//! sibling of it, which the layout check refuses. The notes earlier landings appended to this
+//! file's tail live in `all/appended_notes.rs`, declared below like any other suite.

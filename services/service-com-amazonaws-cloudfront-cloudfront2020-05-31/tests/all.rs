@@ -130,6 +130,8 @@ mod distributions_by_response_headers_policy_id;
 mod distributions_by_vpc_origin_id;
 #[path = "all/distributions_by_web_acl_id.rs"]
 mod distributions_by_web_acl_id;
+#[path = "all/document_refusal_vocabulary.rs"]
+mod document_refusal_vocabulary;
 #[path = "all/domain_conflicts.rs"]
 mod domain_conflicts;
 #[path = "all/duplicate_name_conflict_wording.rs"]
