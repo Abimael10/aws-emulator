@@ -3,9 +3,10 @@
 //! @op CreateNamedQuery
 //! IMPLEMENTED: saves the query in the workgroup the request named — the account's default
 //! workgroup when it named none — and answers with the `NamedQueryId` it minted, which
-//! `GetNamedQuery` reads that same record back by. A named query is one of the contents a
-//! workgroup holds, so `DeleteWorkGroup` is refused while the workgroup still holds it
-//! unless the delete asked for its contents too.
+//! `GetNamedQuery` reads that same record back by. A workgroup that has been disabled holds
+//! no new saved query, so a create addressing one is refused. A named query is one of the
+//! contents a workgroup holds, so `DeleteWorkGroup` is refused while the workgroup still
+//! holds it unless the delete asked for its contents too.
 //!
 //! ## Shape of an operation
 //!
@@ -191,6 +192,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not hold has nowhere to put it.
         if !store.holds_work_group(&work_group) {
             return Err(invalid_request(crate::state::WORK_GROUP_NOT_FOUND));
+        }
+
+        // A workgroup's state is what decides whether its members may use it: Athena
+        // documents that the users of a disabled workgroup can neither run queries in it
+        // nor create new named queries in it, so a create addressing a DISABLED workgroup
+        // is refused rather than saved — judged, like a query submission, by the state
+        // `UpdateWorkGroup` stored. Asked before the token index below, so a token is
+        // neither answered from nor recorded against a workgroup that may not take the
+        // query.
+        if store.work_group_is_disabled(&work_group) {
+            return Err(invalid_request(crate::state::work_group_disabled(
+                &work_group,
+            )));
         }
 
         // "If another CreateNamedQuery request is received, the same response is returned

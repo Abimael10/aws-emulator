@@ -2038,6 +2038,21 @@ impl ComAmazonawsAthenaAmazonathenaState {
         name == DEFAULT_WORK_GROUP || self.work_groups.contains_key(name)
     }
 
+    /// Whether the workgroup `name` is in state [`WORK_GROUP_STATE_DISABLED`].
+    ///
+    /// A workgroup's state is what decides whether its members may use it: Athena
+    /// documents that a disabled workgroup's users can neither run queries in it nor save
+    /// new named queries to it, so every operation that would do one of those two things
+    /// asks THIS question of the state an update stored, and no caller re-reads the record
+    /// to compare states itself. A workgroup the registry holds no record for — the
+    /// account's default workgroup ([`DEFAULT_WORK_GROUP`]), which no request created — is
+    /// not disabled: nothing has stored a state for it.
+    pub fn work_group_is_disabled(&self, name: &str) -> bool {
+        self.work_groups
+            .get(name)
+            .is_some_and(|record| record.state == WORK_GROUP_STATE_DISABLED)
+    }
+
     /// Every workgroup this account holds, as the summaries a listing reports, in name
     /// order.
     ///

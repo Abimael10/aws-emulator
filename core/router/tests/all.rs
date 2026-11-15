@@ -1696,3 +1696,8 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 //!   sibling of this file, which the layout check refuses: the `#[path]` above each `mod` is
 //!   what points it into `tests/all/`.
 //! top level of `tests/` is a test target of its own, which fails the build.
+//! Single integration-test target for the router: the declaration list and nothing else.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted. These header
+//! lines are the only place an inner doc comment may stand in this file;
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, here and in every
+//! service crate's `tests/all.rs`. What a suite covers belongs in its own module doc.
