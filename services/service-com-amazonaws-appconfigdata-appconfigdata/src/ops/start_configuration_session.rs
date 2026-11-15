@@ -2,7 +2,9 @@
 
 //! @op StartConfigurationSession
 //!
-//! Implemented: resolves the requested (application, environment, configuration
+//! Implemented: refuses an identifier whose FORM is neither an id nor a name (a value
+//! written as an ARN) with the modelled `BadRequestException` before any lookup, then
+//! resolves the requested (application, environment, configuration
 //! profile) triple against the AppConfig control plane's own state — an identifier
 //! given as a NAME through this service's own name bindings
 //! ([`crate::state::NameBindings`]), so a control-plane rename neither breaks the old
@@ -134,6 +136,105 @@ impl From<StartConfigurationSessionErrorModeled> for StartConfigurationSessionEr
     }
 }
 
+/// The modelled `InvalidParameterProblem` reported for an identifier this service cannot
+/// read as the id or the name of its level.
+///
+/// `Corrupted` is documented as "the parameter was corrupted and could not be understood
+/// by the service", which is what a value in another form is; the other two modelled
+/// values (`Expired`, `PollIntervalNotSatisfied`) describe WHEN a parameter was
+/// presented, not what it says. See `INVALID_PARAMETER_PROBLEM_VALUES` in
+/// `crate::ops::types`.
+const PROBLEM_CORRUPTED: &str = "Corrupted";
+
+/// This operation's input members documented as "the ID or the name" of a level of the
+/// AppConfig hierarchy, in the order the model declares them, each with the identifier
+/// the request carried.
+fn identifier_members(input: &StartConfigurationSessionInput) -> [(&'static str, &str); 3] {
+    [
+        (
+            crate::state::APPLICATION_IDENTIFIER_MEMBER,
+            input.application_identifier.as_str(),
+        ),
+        (
+            crate::state::ENVIRONMENT_IDENTIFIER_MEMBER,
+            input.environment_identifier.as_str(),
+        ),
+        (
+            crate::state::CONFIGURATION_PROFILE_IDENTIFIER_MEMBER,
+            input.configuration_profile_identifier.as_str(),
+        ),
+    ]
+}
+
+/// Whether `identifier` is written as an Amazon Resource Name.
+///
+/// Read through the one shared ARN parse (`service_common::arn`), so this service cannot
+/// disagree with another about what an ARN is: six colon-separated fields opening with
+/// the literal `arn`, with a partition, a vendor and a resource. An ARN of ANY vendor is
+/// in that form, and none of them is an id or a name.
+fn is_arn_form(identifier: &str) -> bool {
+    ::service_common::arn::parse(identifier).is_some()
+}
+
+/// Refuse the call when an identifier is in a form this operation's members do not
+/// accept, and `None` when every identifier is one the service can read.
+///
+/// Each of the three identifiers is "the ID or the name" of its level, and `Identifier`
+/// bounds only the LENGTH of such a value (1..128), so the FORM is decided here: a value
+/// written as an ARN is neither an id nor a name, and is therefore input that fails the
+/// service's constraints — the modelled `BadRequestException` (HTTP 400) — rather than an
+/// identifier that resolves to nothing. The refusal is the same whichever member carried
+/// it, and `Details.InvalidParameters` names EVERY member at fault, so a caller that got
+/// more than one wrong learns them all in one answer.
+///
+/// It is decided on the REQUEST alone, before anything is resolved against the control
+/// plane, so a malformed identifier can never become a `ResourceNotFoundException`: the
+/// status class is what a client branches on, and a permanent, caller-side mistake must
+/// not read as a resource that is merely absent.
+fn malformed_identifier_refusal(
+    input: &StartConfigurationSessionInput,
+) -> Option<StartConfigurationSessionError> {
+    let malformed: Vec<&'static str> = identifier_members(input)
+        .into_iter()
+        .filter(|(_, identifier)| is_arn_form(identifier))
+        .map(|(member, _)| member)
+        .collect();
+    if malformed.is_empty() {
+        return None;
+    }
+    debug_assert!(
+        INVALID_PARAMETER_PROBLEM_VALUES.contains(&PROBLEM_CORRUPTED),
+        "the reported problem must be a modelled InvalidParameterProblem value"
+    );
+    // An attribution record for the refusal: WHICH members were malformed. The values
+    // are not recorded — a caller-supplied ARN carries an account id.
+    tracing::debug!(
+        operation = "StartConfigurationSession",
+        outcome = "BadRequestException",
+        members = malformed.join(","),
+        "refused identifiers that are neither an id nor a name"
+    );
+    let invalid_parameters: std::collections::HashMap<String, InvalidParameterDetail> = malformed
+        .into_iter()
+        .map(|member| {
+            (
+                member.to_string(),
+                InvalidParameterDetail {
+                    problem: Some(PROBLEM_CORRUPTED.to_string()),
+                },
+            )
+        })
+        .collect();
+    Some(
+        StartConfigurationSessionErrorModeled::BadRequestException(BadRequestException {
+            message: Some(INPUT_FAILS_CONSTRAINTS_MESSAGE.to_string()),
+            reason: Some(REASON_INVALID_PARAMETERS.to_string()),
+            details: Some(BadRequestDetails::InvalidParameters(invalid_parameters)),
+        })
+        .into(),
+    )
+}
+
 /// The `StartConfigurationSession` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -199,6 +300,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
 
+        // The FORM of each identifier is decided on the request alone, ahead of every
+        // lookup: a value that is neither an id nor a name is input that fails the
+        // service's constraints, so it is refused as such instead of being looked up and
+        // missed. See [`malformed_identifier_refusal`].
+        if let Some(refusal) = malformed_identifier_refusal(&input) {
+            return Err(refusal);
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartConfigurationSessionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -215,7 +324,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lengths, and `RequiredMinimumPollIntervalInSeconds`'s 15..86400 range) is
         // refused before the session is minted — the schema walk for a value outside a
         // bound, `crate::service`'s own precheck for an absent required member — and
-        // both are worded as the modelled `BadRequestException`.
+        // both are worded as the modelled `BadRequestException`, as is an identifier
+        // whose FORM the members do not accept (above).
         //
         // The three identifiers are resolved against the AppConfig CONTROL PLANE
         // before anything is minted: each is "the ID or the name" of its level, and a

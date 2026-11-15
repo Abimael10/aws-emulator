@@ -171,10 +171,6 @@ impl<Eng> GetLatestConfiguration<Eng> {
 /// `@httpQuery(configuration_token)` name it travels under.
 const CONFIGURATION_TOKEN_MEMBER: &str = "ConfigurationToken";
 
-/// `BadRequestReason` has exactly one value in the model (`InvalidParameters`): the
-/// request carried a parameter the service could not use.
-const REASON_INVALID_PARAMETERS: &str = "InvalidParameters";
-
 /// What AppConfigData says when a request supplies no usable `ConfigurationToken`.
 ///
 /// The service's OWN fixed text for that member rather than the standard validation
@@ -225,9 +221,7 @@ fn bad_configuration_token(problem: &str) -> GetLatestConfigurationError {
         .iter()
         .find(|(modelled, _)| *modelled == problem)
         .map(|(_, message)| (*message).to_string())
-        .unwrap_or_else(|| {
-            "The input fails to satisfy the constraints specified by the service.".to_string()
-        });
+        .unwrap_or_else(|| INPUT_FAILS_CONSTRAINTS_MESSAGE.to_string());
     let invalid_parameters = std::collections::HashMap::from([(
         CONFIGURATION_TOKEN_MEMBER.to_string(),
         InvalidParameterDetail {

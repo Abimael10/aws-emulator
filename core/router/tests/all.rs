@@ -2443,3 +2443,12 @@ mod cloudformation_provisions_glue_table_optimizers;
 mod appended_header_notes;
 #[path = "all/appended_prose.rs"]
 mod appended_prose;
+// file under `tests/all/`, and nothing else — one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair each, sorted by name, with no other line anywhere in this file.
+// EVERY comment here is an ordinary `//` one, this header included: an inner doc comment
+// (and an inner attribute) is legal only before the first item, so with none in the file no
+// landing can leave one past the declarations, which would compile no suite of this target.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair in order; what it covers
+// belongs in its own module header, and a note about THIS file in `all/appended_notes.rs`.
+// The guard suites `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs` pin these rules rather than restating them.

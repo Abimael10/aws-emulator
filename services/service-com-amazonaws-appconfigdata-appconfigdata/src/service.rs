@@ -359,10 +359,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // which names the member and the constraint it failed.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
-                code: "BadRequestException".to_string(),
+                code: BAD_REQUEST_EXCEPTION.to_string(),
                 message: aws_smithy_schema_server::envelope(violations).unwrap_or_else(|| {
-                    "The input fails to satisfy the constraints specified by the service."
-                        .to_string()
+                    crate::ops::types::INPUT_FAILS_CONSTRAINTS_MESSAGE.to_string()
                 }),
             }),
             // An authentication refusal is not a modelled input error: leave the

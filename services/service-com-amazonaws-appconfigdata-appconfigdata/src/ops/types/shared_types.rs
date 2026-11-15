@@ -55,6 +55,17 @@ pub struct ThrottlingException {
 /// The values `BadRequestReason` accepts on the wire.
 pub const BAD_REQUEST_REASON_VALUES: &[&str] = &["InvalidParameters"];
 
+/// The one value of [`BAD_REQUEST_REASON_VALUES`], named once for the operations that
+/// report it: the request carried a parameter the service could not use.
+pub const REASON_INVALID_PARAMETERS: &str = BAD_REQUEST_REASON_VALUES[0];
+
+/// What `BadRequestException` itself documents, which is what both operations say when the
+/// request's own input is what it got wrong: fixed text that interpolates nothing. WHICH
+/// parameter is at fault, and why, travels in `Reason` and `Details`. Declared beside the
+/// shape so the two operations and `crate::service` cannot word one refusal two ways.
+pub const INPUT_FAILS_CONSTRAINTS_MESSAGE: &str =
+    "The input fails to satisfy the constraints specified by the service.";
+
 
 /// The values `InvalidParameterProblem` accepts on the wire.
 pub const INVALID_PARAMETER_PROBLEM_VALUES: &[&str] = &["Corrupted", "Expired", "PollIntervalNotSatisfied"];

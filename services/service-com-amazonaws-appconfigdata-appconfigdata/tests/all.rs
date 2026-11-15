@@ -17,6 +17,8 @@ mod configuration_session_poll;
 mod deletion_does_not_break_a_bound_session;
 #[path = "all/feature_flag_resolution.rs"]
 mod feature_flag_resolution;
+#[path = "all/identifier_form_refusals.rs"]
+mod identifier_form_refusals;
 #[path = "all/identity_authorization.rs"]
 mod identity_authorization;
 #[path = "all/name_bindings_survive_renames.rs"]
@@ -37,6 +39,8 @@ mod state_roundtrip;
 mod stop_mid_rollout_withdraws_the_release;
 #[path = "all/token_validation_and_lifetime.rs"]
 mod token_validation_and_lifetime;
+#[path = "all/unresolvable_tier_precedence.rs"]
+mod unresolvable_tier_precedence;
 // Clock-driven suites: they wait out a rollout's growth intervals rather than writing a
 // percentage into the store, so their file names sort them last.
 #[path = "all/zz_growth_schedule_gates_sessions.rs"]
