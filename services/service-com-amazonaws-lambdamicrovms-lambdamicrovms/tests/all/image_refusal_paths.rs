@@ -29,7 +29,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::ops::types::MICROVM_IMAGE_STATE_VALUES;
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    access_denied_message, image_not_updatable_message, invalid_arn_format_message,
+    image_not_updatable_message, invalid_arn_format_message,
     managed_base_image_arn, service_state, FIRST_IMAGE_VERSION, IMAGE_STATE_CREATE_FAILED,
     MANAGED_BASE_IMAGE_IDS,
 };
@@ -39,8 +39,8 @@ use crate::image_build_read_path::{get_build, list_builds, page_build_ids};
 use crate::image_version_listing::list_versions;
 use crate::microvm_image_and_instance_paths::{delete_image, get_image};
 use crate::microvm_lifecycle::{
-    as_uri_value, call, emulator, emulator_with_engine, expected_image_arn, image_body, ACCOUNT,
-    PAST_THE_SPAN, REGION,
+    as_uri_value, call, emulator, emulator_with_engine, expected_image_arn, image_body, poll_until,
+    ACCOUNT, PAST_THE_SPAN, REGION,
 };
 
 /// A build role ARN: `RoleArn`, pattern
@@ -183,10 +183,18 @@ async fn an_address_holding_no_children_gets_a_terminal_empty_page() {
 
     // An image this account holds whose deletion the clock has already completed: the
     // record is gone, so the identifier names nothing here.
-    create_image(&router, "removed", json!({})).await;
+    let removed_arn = create_image(&router, "removed", json!({})).await;
     let (status, deleted) = delete_image(&router, "removed").await;
     assert_eq!(status, 200, "the delete expected 200, got {status} {deleted}");
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    // The removal is clock-owed: wait for the CONDITION — the record reported gone through
+    // its own ARN — rather than for a span of time, so a loaded host only makes the test
+    // look again.
+    poll_until(
+        "a record the clock has removed",
+        "the removed image's record is gone",
+        || async { get_image(&router, &removed_arn).await.0 == 404 },
+    )
+    .await;
 
     // Rows differ in HOW the address of this account's own namespace comes to hold no
     // children: a name nothing was created under, another region's ARN for a held name, a
@@ -280,37 +288,40 @@ async fn an_address_holding_no_children_gets_a_terminal_empty_page() {
 
     // The refusals the enumerations KEEP: an identifier of another namespace is denied
     // before anything is looked up, and a value that is no identifier of this API at all
-    // is a request that can never succeed.
+    // is a request that can never succeed. A denied row carries no expected message of
+    // its own because a denial's sentence is worded per OPERATION — it names the IAM
+    // action being refused — so it is this service's own for that operation and
+    // identifier.
     let managed = managed_base_image_arn(REGION, MANAGED_BASE_IMAGE_IDS[0]);
     let other_account = format!("arn:aws:lambda:{REGION}:210987654321:microvm-image:someone-elses");
-    let refusals: Vec<(&str, String, u16, &str, String)> = vec![
+    let refusals: Vec<(&str, String, u16, &str, Option<String>)> = vec![
         (
             "the AWS-owned namespace",
             managed.clone(),
             403,
             "AccessDeniedException",
-            access_denied_message(),
+            None,
         ),
         (
             "another account's namespace",
             other_account.clone(),
             403,
             "AccessDeniedException",
-            access_denied_message(),
+            None,
         ),
         (
             "a bare name no image of this account carries",
             "never-created".to_string(),
             400,
             "ValidationException",
-            invalid_arn_format_message("never-created"),
+            Some(invalid_arn_format_message("never-created")),
         ),
         (
             "no identifier of this API at all",
             "not-an-identifier".to_string(),
             400,
             "ValidationException",
-            invalid_arn_format_message("not-an-identifier"),
+            Some(invalid_arn_format_message("not-an-identifier")),
         ),
     ];
 
@@ -334,10 +345,13 @@ async fn an_address_holding_no_children_gets_a_terminal_empty_page() {
                 Some(expected_type),
                 "case {case:?} on {operation}: expected {expected_type}, got {body}"
             );
+            let expected_message = expected_message.clone().unwrap_or_else(|| {
+                crate::image_denial_message::expected_denial_sentence(operation, &identifier)
+            });
             assert_eq!(
                 body["message"].as_str(),
                 Some(expected_message.as_str()),
-                "case {case:?} on {operation}: expected the refusal of that namespace, got {:?}",
+                "case {case:?} on {operation}: expected {expected_message:?}, got {:?}",
                 body["message"]
             );
         }

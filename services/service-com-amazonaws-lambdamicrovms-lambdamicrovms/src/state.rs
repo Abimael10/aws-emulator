@@ -933,7 +933,18 @@ pub fn image_build_not_found_message(image: &str, image_version: &str, build_id:
     format!("Build not found for MicroVMImageID: {image}, VersionID: {image_version}, BuildID: {build_id}")
 }
 
-/// The `message` of the 403 a read answers for a resource the caller may not read.
+/// The namespace this service's IAM actions are published under, which is the prefix an
+/// authorization refusal names the action with (`lambda:GetMicrovmImage`).
+///
+/// It is this service's own `aws.api#service$arnNamespace`
+/// (`smithy_query(query="service_info")`: `arnNamespace: lambda`), the same namespace
+/// every ARN this service mints carries, so the action a denial names and the resource it
+/// names are published under one name.
+pub const IAM_ACTION_NAMESPACE: &str = "lambda";
+
+/// The `message` of the 403 a call answers for an identifier in a namespace NO policy of
+/// the calling account can grant — AWS's own published catalogue, which belongs to AWS
+/// rather than to any account.
 ///
 /// `AccessDeniedException`'s documented sentence ("You do not have sufficient access to
 /// perform this action.") describes the error CLASS; what AWS puts on the wire for this
@@ -941,12 +952,44 @@ pub fn image_build_not_found_message(image: &str, image_version: &str, build_id:
 /// this operation", whose one variable part is the identity that signed the request
 /// (recorded AWS behaviour). That identity is this emulator's own published principal,
 /// the same one `sts:GetCallerIdentity` answers with
-/// (`service_common::caller_principal`), so the sentence carries nothing of the request
-/// and a denial says nothing about what the identifier it refused names.
+/// (`service_common::caller_principal`), so the sentence carries nothing of the request:
+/// the service refuses the OPERATION on a resource of AWS's own, naming neither an action
+/// nor a resource a caller could ever be granted.
 pub fn access_denied_message() -> String {
     format!(
         "User: {} is not authorized to perform this operation",
         ::service_common::caller_principal::ambient_user_arn()
+    )
+}
+
+/// The `message` of the 403 a customer-facing call addressed at a
+/// `MicrovmImageIdentifier` answers, for the operation `operation` and the identifier the
+/// request carried.
+///
+/// A denial is worded by WHY the caller holds no grant on the identifier, in the two forms
+/// AWS records for this service:
+///
+/// * an identifier of AWS's OWN image namespace ([`is_managed_microvm_image_arn`]) is a
+///   resource no account's policy can name, so the service refuses the operation itself
+///   and names only the principal ([`access_denied_message`]);
+/// * every OTHER identifier the caller holds no grant on is one IAM evaluated this
+///   action against, so the sentence is IAM's own — the principal, the fully qualified
+///   action (`<`[`IAM_ACTION_NAMESPACE`]`>:<OperationName>`, the IAM action of the API
+///   being refused) and the identifier the request carried, verbatim
+///   (`service_common::iam_authorization::not_authorized_to_perform`, the one spelling of
+///   that sentence in this tree).
+///
+/// Nothing is looked up to word either form: both are decided from the request and the
+/// calling identity alone, which is why the refusal can be stated before the identifier is
+/// resolved and why neither form says whether the identifier names anything.
+pub fn image_access_denied_message(operation: &str, identifier: &str) -> String {
+    if is_managed_microvm_image_arn(identifier) {
+        return access_denied_message();
+    }
+    ::service_common::iam_authorization::not_authorized_to_perform(
+        &::service_common::caller_principal::ambient_user_arn(),
+        &format!("{IAM_ACTION_NAMESPACE}:{operation}"),
+        identifier,
     )
 }
 

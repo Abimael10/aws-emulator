@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     image_build_not_found_message, image_version_not_found_message, invalid_arn_format_message,
-    managed_base_image_arn, published_managed_base_image_versions, access_denied_message,
+    managed_base_image_arn, published_managed_base_image_versions,
     BUILD_STATE_IN_PROGRESS, BUILD_STATE_SUCCESSFUL, BUILD_TARGETS,
     DEFAULT_MINIMUM_MEMORY_IN_MIB, FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS, MAX_LIST_PAGE,
 };
@@ -121,8 +121,10 @@ pub(crate) fn arm64_targets() -> Vec<(&'static str, &'static str)> {
 /// catalogue, another account's, another region's or another service's — is refused with
 /// `AccessDeniedException` (HTTP 403), on both build reads and whatever version or build
 /// id accompanies it, so no caller can use the refusal to learn whether the identifier
-/// exists. An identifier OF that namespace holding no builds here is answered about the
-/// records instead: the listing serves an empty page.
+/// exists. The sentence is the refusal of the OPERATION for an identifier of AWS's own
+/// namespace and IAM's action-and-resource refusal, naming `lambda:<the read>` and the
+/// identifier, for every other one. An identifier OF that namespace holding no builds
+/// here is answered about the records instead: the listing serves an empty page.
 #[tokio::test]
 async fn a_build_read_outside_this_accounts_own_images_is_denied() {
     let router = emulator();
@@ -170,12 +172,24 @@ async fn a_build_read_outside_this_accounts_own_images_is_denied() {
         for image_version in versions {
             let case = format!("{namespace} {identifier:?} version {image_version:?}");
             let (status, body) = list_builds(&router, identifier, image_version, "").await;
-            assert_denied(status, &body, &format!("ListMicrovmImageBuilds {case}"));
+            assert_denied(
+                status,
+                &body,
+                "ListMicrovmImageBuilds",
+                identifier,
+                &format!("ListMicrovmImageBuilds {case}"),
+            );
 
             for build_id in build_ids {
                 let case = format!("{case} build {build_id:?}");
                 let (status, body) = get_build(&router, identifier, image_version, build_id).await;
-                assert_denied(status, &body, &format!("GetMicrovmImageBuild {case}"));
+                assert_denied(
+                    status,
+                    &body,
+                    "GetMicrovmImageBuild",
+                    identifier,
+                    &format!("GetMicrovmImageBuild {case}"),
+                );
             }
         }
     }
@@ -215,8 +229,9 @@ async fn a_build_read_outside_this_accounts_own_images_is_denied() {
     );
 }
 
-/// The refusal every denied row must carry.
-fn assert_denied(status: u16, body: &Value, case: &str) {
+/// The refusal every denied row must carry: the modelled status, code and the sentence
+/// this service words a denial of `operation` on `identifier` with.
+fn assert_denied(status: u16, body: &Value, operation: &str, identifier: &str, case: &str) {
     assert_eq!(
         status, 403,
         "case {case}: expected 403, got {status} {body}"
@@ -226,10 +241,11 @@ fn assert_denied(status: u16, body: &Value, case: &str) {
         Some("AccessDeniedException"),
         "case {case}: expected AccessDeniedException, got {body}"
     );
+    let expected = crate::image_denial_message::expected_denial_sentence(operation, identifier);
     assert_eq!(
         body["message"].as_str(),
-        Some(access_denied_message().as_str()),
-        "case {case}: expected the modelled denial sentence, got {:?}",
+        Some(expected.as_str()),
+        "case {case}: expected {expected:?}, got {:?}",
         body["message"]
     );
 }

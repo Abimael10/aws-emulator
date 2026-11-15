@@ -23,6 +23,8 @@ mod image_build_read_path;
 mod image_build_scope;
 #[path = "all/image_configuration_update.rs"]
 mod image_configuration_update;
+#[path = "all/image_denial_message.rs"]
+mod image_denial_message;
 #[path = "all/image_identity_and_version_generations.rs"]
 mod image_identity_and_version_generations;
 #[path = "all/image_listing.rs"]

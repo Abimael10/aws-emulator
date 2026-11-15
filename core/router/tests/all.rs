@@ -1428,3 +1428,16 @@ mod zz_probe_whole_emulator;
 // This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of it
 // (`tests/<name>.rs`) and the layout check refuses that: the `#[path]` above each `mod` is
 // what points it into `tests/all/`.
+// suite file under `tests/all/`, and nothing else — one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file, sorted by name, with no other
+// line, so two branches landing at once insert two lines in two places and have no prose to
+// duplicate, re-word or mistype.
+// EVERY comment in this file is an ORDINARY `//` one, this header included, and that is
+// deliberate: an inner doc comment is legal only before the first item, so one appended past
+// the declarations is `E0753` and compiles no suite of this target. With no `//!` anywhere in
+// the file, no merge of two landings can leave one past the first item.
+// declaration into `tests/all/`. Declare each suite exactly ONCE — a second `mod` for one
+// name is `E0428` and fails every suite in this target too.
+// What a suite covers belongs in that suite's own module header, beside the test it
+// explains; a note about this file belongs in `all/appended_notes.rs`. The suites
+// `all/every_suite_file_is_declared.rs` check the rules above rather than restating them.

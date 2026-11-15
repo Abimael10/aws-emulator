@@ -24,7 +24,8 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::code_artifact::BUCKET_ABSENT_REASON;
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    access_denied_message, image_not_found_message, image_version_not_found_message,
+    image_not_found_message,
+    image_version_not_found_message,
     invalid_arn_format_message, managed_base_image_arn, next_image_version,
     no_image_build_message, FIRST_IMAGE_VERSION, IMAGE_STATE_UPDATED, MANAGED_BASE_IMAGE_IDS,
     VERSION_STATE_FAILED, VERSION_STATE_SUCCESSFUL, VERSION_STATUS_ACTIVE, VERSION_STATUS_INACTIVE,
@@ -378,7 +379,7 @@ async fn a_status_publication_outside_this_accounts_own_versions_is_refused() {
             managed.clone(),
             FIRST_IMAGE_VERSION,
             403,
-            access_denied_message(),
+            crate::image_denial_message::operation_denial_sentence(),
             "AccessDeniedException",
         ),
         (
@@ -386,7 +387,10 @@ async fn a_status_publication_outside_this_accounts_own_versions_is_refused() {
             other_account.clone(),
             FIRST_IMAGE_VERSION,
             403,
-            access_denied_message(),
+            crate::image_denial_message::action_denial_sentence(
+                "UpdateMicrovmImageVersion",
+                &other_account,
+            ),
             "AccessDeniedException",
         ),
         (

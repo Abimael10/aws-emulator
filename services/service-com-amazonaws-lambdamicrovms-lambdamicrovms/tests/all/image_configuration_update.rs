@@ -26,7 +26,7 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     base_image_not_found_message, default_log_group, image_not_found_message,
     image_not_updatable_message, invalid_arn_format_message, managed_base_image_arn,
     managed_network_connector_arn, next_image_version, service_state,
-    too_many_image_versions_message, access_denied_message, CODE_ARTIFACT_URI_REQUIREMENT,
+    too_many_image_versions_message, CODE_ARTIFACT_URI_REQUIREMENT,
     DEFAULT_CPU_ARCHITECTURE, DEFAULT_EGRESS_NETWORK_CONNECTOR, DEFAULT_MINIMUM_MEMORY_IN_MIB,
     FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS, MAX_MICROVM_IMAGE_VERSIONS,
 };
@@ -35,8 +35,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::image_version_listing::list_versions;
 use crate::microvm_image_and_instance_paths::{delete_image, get_image};
 use crate::microvm_lifecycle::{
-    as_uri_value, call, emulator, emulator_with_engine, expected_image_arn, image_body, ACCOUNT,
-    PAST_THE_SPAN, REGION,
+    as_uri_value, call, emulator, emulator_with_engine, expected_image_arn, image_body, poll_until,
+    ACCOUNT, PAST_THE_SPAN, REGION,
 };
 
 /// A build role ARN: `RoleArn`, pattern
@@ -556,7 +556,7 @@ async fn an_identifier_naming_no_image_of_this_account_is_refused() {
             managed.clone(),
             403,
             "AccessDeniedException",
-            access_denied_message(),
+            crate::image_denial_message::operation_denial_sentence(),
         ),
         (
             "an ARN for a name never created",
@@ -619,8 +619,16 @@ async fn an_identifier_naming_no_image_of_this_account_is_refused() {
     // deletion in flight answers.
     let (status, deleted) = delete_image(&router, "held").await;
     assert_eq!(status, 200, "the delete got {status} {deleted}");
-    tokio::time::sleep(PAST_THE_SPAN).await;
     let held_arn = expected_image_arn("held");
+    // The removal is clock-owed: wait for the CONDITION — the read reporting the record
+    // gone — rather than for a span of time, so a loaded host only makes the test look
+    // again.
+    poll_until(
+        "an image the clock has removed",
+        "the held image's record is gone",
+        || async { get_image(&router, &held_arn).await.0 == 404 },
+    )
+    .await;
     let (status, body) = update_image(&router, &held_arn, update_body(json!({}))).await;
     assert_eq!(
         status, 404,

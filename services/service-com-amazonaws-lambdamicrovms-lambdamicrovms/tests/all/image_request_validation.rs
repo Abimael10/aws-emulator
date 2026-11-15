@@ -11,13 +11,13 @@ use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     base_image_not_found_message, default_log_group, image_name_conflict_message,
     image_not_found_message, invalid_arn_format_message, managed_base_image_arn,
-    access_denied_message, CODE_ARTIFACT_URI_REQUIREMENT, DEFAULT_CPU_ARCHITECTURE,
+    CODE_ARTIFACT_URI_REQUIREMENT, DEFAULT_CPU_ARCHITECTURE,
     DEFAULT_MINIMUM_MEMORY_IN_MIB, MANAGED_BASE_IMAGE_IDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::microvm_lifecycle::{
-    as_uri_value, call, emulator, expected_image_arn, image_body, PAST_THE_SPAN, REGION,
+    as_uri_value, call, emulator, expected_image_arn, image_body, poll_until, PAST_THE_SPAN, REGION,
 };
 
 /// `POST /2025-09-09/microvm-images`.
@@ -331,7 +331,14 @@ async fn an_image_lookup_separates_a_malformed_identifier_from_an_absent_one() {
     let released_arn = expected_image_arn(released);
     let (status, deleted) = delete_image(&router, &released_arn).await;
     assert_eq!(status, 200, "delete the released image: got {deleted}");
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    // The removal is clock-owed: wait for the CONDITION — the record reported gone —
+    // rather than for a span of time, so a loaded host only makes the test look again.
+    poll_until(
+        "the ARN of a record this account deleted",
+        "the released image's record is gone",
+        || async { get_image(&router, &released_arn).await.0 == 404 },
+    )
+    .await;
 
     // Rows span the four outcomes, and within the malformed refusal every way an ARN
     // can be malformed that `service_common::arn` names: a missing field, an empty
@@ -399,8 +406,14 @@ async fn an_image_lookup_separates_a_malformed_identifier_from_an_absent_one() {
                 );
                 assert_eq!(
                     body["message"].as_str(),
-                    Some(access_denied_message().as_str()),
-                    "case {case:?}: expected the modelled denial sentence, got {:?}",
+                    Some(
+                        crate::image_denial_message::expected_denial_sentence(
+                            "GetMicrovmImage",
+                            &identifier
+                        )
+                        .as_str()
+                    ),
+                    "case {case:?}: expected the denial sentence for {identifier:?}, got {:?}",
                     body["message"]
                 );
             }

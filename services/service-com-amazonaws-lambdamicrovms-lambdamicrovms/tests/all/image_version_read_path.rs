@@ -21,7 +21,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     image_version_not_found_message, invalid_arn_format_message, managed_base_image_arn,
-    next_image_version, version_address_image_not_found_message, access_denied_message,
+    next_image_version, version_address_image_not_found_message,
     FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -165,18 +165,23 @@ async fn listed_version(
         .unwrap_or_else(|| panic!("case {case}: the listing carries {image_version}, got {body}"))
 }
 
-/// The refusal every denied row must carry: the modelled status, code and sentence.
-fn assert_denied(status: u16, body: &Value, case: &str) {
+/// The refusal every denied row must carry: the modelled status, code and the sentence
+/// this service words a denial on `identifier` with.
+fn assert_denied(status: u16, body: &Value, identifier: &str, case: &str) {
     assert_eq!(status, 403, "case {case}: expected 403, got {status} {body}");
     assert_eq!(
         body["__type"].as_str(),
         Some("AccessDeniedException"),
         "case {case}: expected AccessDeniedException, got {body}"
     );
+    let expected = crate::image_denial_message::expected_denial_sentence(
+        "GetMicrovmImageVersion",
+        identifier,
+    );
     assert_eq!(
         body["message"].as_str(),
-        Some(access_denied_message().as_str()),
-        "case {case}: expected the modelled denial sentence, got {:?}",
+        Some(expected.as_str()),
+        "case {case}: expected {expected:?}, got {:?}",
         body["message"]
     );
 }
@@ -559,7 +564,10 @@ async fn a_version_the_image_does_not_hold_is_not_found() {
 /// ACCOUNT's scope, so a version read on an `imageIdentifier` OUTSIDE this account's own
 /// image namespace — the AWS-owned managed catalogue, another account's, partition's or
 /// vendor's — is refused 403 `AccessDeniedException`, identically whether or not the
-/// identifier names a resource; an identifier of this account's own namespace that this
+/// identifier names a resource — worded as the refusal of the OPERATION for an identifier
+/// of AWS's own namespace and as IAM's action-and-resource refusal, naming
+/// `lambda:GetMicrovmImageVersion` and the identifier, for every other one; an identifier
+/// of this account's own namespace that this
 /// region holds no record of is reported absent (404), and a value that is no identifier
 /// this API can address is HTTP 400 `ValidationException`.
 #[tokio::test]
@@ -616,18 +624,21 @@ async fn a_version_read_outside_this_accounts_own_images_is_denied() {
         for image_version in [FIRST_IMAGE_VERSION, "9.9"] {
             let row = format!("{case} ({identifier}) version {image_version}");
             let (status, body) = get_version(&router, identifier, image_version).await;
-            assert_denied(status, &body, &row);
+            assert_denied(status, &body, identifier, &row);
             refusals.push((row, body));
         }
     }
 
-    // The refusal says NOTHING about existence: every row's answer is byte for byte the
-    // same envelope.
-    let (first_case, first) = refusals
+    // The refusal says NOTHING about existence: for one identifier, the answer does not
+    // depend on the version asked for, and the AWS-owned rows — a catalogue entry that
+    // unambiguously exists and one the catalogue does not publish — answer byte for byte
+    // the same envelope.
+    let aws_owned = &refusals[..(MANAGED_BASE_IMAGE_IDS.len() + 1) * 2];
+    let (first_case, first) = aws_owned
         .first()
         .cloned()
-        .unwrap_or_else(|| panic!("the rows are not empty"));
-    for (case, body) in &refusals {
+        .unwrap_or_else(|| panic!("the AWS-owned rows are not empty"));
+    for (case, body) in aws_owned {
         assert_eq!(
             body, &first,
             "case {case}: the denial must be indistinguishable from {first_case}'s, got {body}"

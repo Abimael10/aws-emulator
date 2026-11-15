@@ -267,7 +267,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
             return Err(UpdateMicrovmImageErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: Some(crate::state::access_denied_message()),
+                    message: Some(crate::state::image_access_denied_message(
+                        Self::NAME,
+                        &input.image_identifier,
+                    )),
                 },
             )
             .into());

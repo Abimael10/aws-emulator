@@ -8,7 +8,12 @@
 //! own image namespace is refused with the modelled authorization error (HTTP 403
 //! `AccessDeniedException`) whether or not it names a resource, so the read never reports
 //! absence for an identifier the caller may not read and cannot be used to probe AWS's
-//! own catalogue or another account's images. EXISTENCE is the REGION's: an identifier of
+//! own catalogue or another account's images. The refusal is WORDED by why the caller
+//! holds no grant: an identifier of AWS's own namespace names a resource no policy of
+//! this account can name, so the operation itself is refused and the sentence names only
+//! the calling principal, while every other refused identifier is one IAM evaluated this
+//! action against, so its sentence names the principal, the IAM action and the identifier
+//! the request carried. EXISTENCE is the REGION's: an identifier of
 //! this account's own namespace gets an answer about the record — the record while this
 //! region holds it, and the modelled not-found (HTTP 404 `ResourceNotFoundException`)
 //! when it does not, which is the one answer a name nothing was created under, a record
@@ -69,17 +74,13 @@ async fn delete_image(router: &MultiServiceRouter, identifier: &str) -> (u16, Va
     .await
 }
 
-/// The sentence AWS words this refusal with, spelled out here rather than read from the
-/// crate so a change to the wording fails this suite: fixed text `User: ` and ` is not
-/// authorized to perform this operation`, with the one variable part the identity that
-/// signed the request — the account's own IAM user, which `sts:GetCallerIdentity`
-/// reports as `arn:aws:iam::<account>:user/emulator`.
-fn expected_denial_sentence() -> String {
-    format!("User: arn:aws:iam::{ACCOUNT}:user/emulator is not authorized to perform this operation")
-}
+/// The two sentences a MicroVM-image denial carries, spelled out once for the whole crate
+/// in the suite that states the wording rule — `image_denial_message` — rather than a
+/// second time here, so one change to the wording fails every suite that pins it.
+use crate::image_denial_message::{action_denial_sentence, operation_denial_sentence};
 
 /// The refusal every denied row must carry: the modelled status, code and sentence.
-fn assert_denied(status: u16, body: &Value, case: &str) {
+fn assert_denied(status: u16, body: &Value, case: &str, expected_message: &str) {
     assert_eq!(status, 403, "case {case}: expected 403, got {status} {body}");
     assert_eq!(
         body["__type"].as_str(),
@@ -88,8 +89,8 @@ fn assert_denied(status: u16, body: &Value, case: &str) {
     );
     assert_eq!(
         body["message"].as_str(),
-        Some(expected_denial_sentence().as_str()),
-        "case {case}: expected the denial sentence naming the caller, got {:?}",
+        Some(expected_message),
+        "case {case}: expected {expected_message:?}, got {:?}",
         body["message"]
     );
 }
@@ -112,7 +113,9 @@ fn assert_absent(status: u16, body: &Value, identifier: &str, case: &str) {
 
 /// RULE: every well-formed `imageIdentifier` OUTSIDE this account's own image namespace
 /// is denied 403 `AccessDeniedException`, whichever other namespace it names and whether
-/// or not it names a resource that exists — while an identifier of this account's own
+/// or not it names a resource that exists — worded as the refusal of the OPERATION for an
+/// identifier of AWS's own namespace and as IAM's action-and-resource refusal for every
+/// other one — while an identifier of this account's own
 /// namespace that this region holds no record of is reported absent (404), the answer
 /// that says nothing about any other account's resources.
 #[tokio::test]
@@ -144,43 +147,70 @@ async fn a_read_of_an_identifier_this_account_was_never_granted_is_denied() {
     // names: AWS's own catalogue (an entry that exists, and one that does not), another
     // account's, another partition's, another vendor's, another resource type's, and this
     // account's own resource type spelled in a form `MicrovmImageArn`'s pattern does not
-    // admit (`microvm-image/<name>` rather than `microvm-image:<name>`).
-    let mut denied: Vec<(String, String)> = MANAGED_BASE_IMAGE_IDS
+    // admit (`microvm-image/<name>` rather than `microvm-image:<name>`). The AWS-owned
+    // rows are refused as an OPERATION on a resource no account's policy can name; every
+    // other row is one IAM evaluated this action against, so its sentence names the
+    // action and the identifier.
+    let mut denied: Vec<(String, String, String)> = MANAGED_BASE_IMAGE_IDS
         .iter()
         .map(|image_id| {
             (
                 format!("an AWS-owned image the catalogue publishes {image_id:?}"),
                 managed_base_image_arn(REGION, image_id),
+                operation_denial_sentence(),
             )
         })
         .collect();
+    let managed_rows = denied.len() + 1;
     denied.extend([
         (
             "an AWS-owned ARN the catalogue does not publish".to_string(),
             managed_base_image_arn(REGION, "no-such-base-image"),
+            operation_denial_sentence(),
         ),
         (
             "another account's ARN for a name this one holds".to_string(),
             format!("arn:aws:lambda:{REGION}:210987654321:microvm-image:{held}"),
+            action_denial_sentence(
+                "GetMicrovmImage",
+                &format!("arn:aws:lambda:{REGION}:210987654321:microvm-image:{held}"),
+            ),
         ),
         (
             "another partition's ARN for a name this account holds".to_string(),
             format!("arn:aws-us-gov:lambda:{REGION}:{ACCOUNT}:microvm-image:{held}"),
+            action_denial_sentence(
+                "GetMicrovmImage",
+                &format!("arn:aws-us-gov:lambda:{REGION}:{ACCOUNT}:microvm-image:{held}"),
+            ),
         ),
         (
             "another vendor's ARN".to_string(),
             format!("arn:aws:s3:{REGION}:{ACCOUNT}:microvm-image:{held}"),
+            action_denial_sentence(
+                "GetMicrovmImage",
+                &format!("arn:aws:s3:{REGION}:{ACCOUNT}:microvm-image:{held}"),
+            ),
         ),
         (
             "another resource type of this account".to_string(),
             format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{held}"),
+            action_denial_sentence(
+                "GetMicrovmImage",
+                &format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{held}"),
+            ),
         ),
     ]);
 
     let mut refusals: Vec<(String, Value)> = Vec::new();
-    for (case, identifier) in &denied {
+    for (case, identifier, expected_message) in &denied {
         let (status, body) = get_image(&router, identifier).await;
-        assert_denied(status, &body, &format!("{case} ({identifier})"));
+        assert_denied(
+            status,
+            &body,
+            &format!("{case} ({identifier})"),
+            expected_message,
+        );
         refusals.push((case.clone(), body));
     }
 
@@ -206,14 +236,15 @@ async fn a_read_of_an_identifier_this_account_was_never_granted_is_denied() {
         assert_absent(status, &body, identifier, &format!("{case} ({identifier})"));
     }
 
-    // The refusal says NOTHING about existence: the answer for an AWS-owned image the
-    // catalogue publishes — a resource that unambiguously exists — is byte for byte the
-    // answer for an identifier of another account's namespace that names nothing.
-    let (first_case, first) = refusals
+    // The refusal of AWS's own namespace says NOTHING about existence: the answer for an
+    // AWS-owned image the catalogue publishes — a resource that unambiguously exists — is
+    // byte for byte the answer for an AWS-owned identifier that names nothing.
+    let aws_owned = &refusals[..managed_rows];
+    let (first_case, first) = aws_owned
         .first()
         .cloned()
-        .unwrap_or_else(|| panic!("the rows are not empty"));
-    for (case, body) in &refusals {
+        .unwrap_or_else(|| panic!("the AWS-owned rows are not empty"));
+    for (case, body) in aws_owned {
         assert_eq!(
             body, &first,
             "case {case:?}: the denial must be indistinguishable from {first_case:?}'s, got \
@@ -357,20 +388,24 @@ async fn the_denial_does_not_depend_on_which_resource_form_the_arn_uses() {
 
     // Rows are the same account, region and resource type in both resource forms, for a
     // name nothing was created under and for one this account DOES hold: neither is a
-    // record the account holds under that identifier, so both are denied. The `/` is
-    // percent-encoded because it is not a legal character in a single path segment.
-    let rows: Vec<(&str, String)> = vec![
+    // record the account holds under that identifier, so both are denied — and the
+    // refusal names the identifier the request carried, decoded as the path label spells
+    // it. The `/` is percent-encoded because it is not a legal character in a single path
+    // segment.
+    let rows: Vec<(&str, String, String)> = vec![
         (
             "the `type/id` form, a name nothing was created under",
             format!("arn:aws:lambda:{REGION}:{ACCOUNT}:microvm-image%2Fnever-created"),
+            format!("arn:aws:lambda:{REGION}:{ACCOUNT}:microvm-image/never-created"),
         ),
         (
             "the `type/id` form, a name this account holds",
             format!("arn:aws:lambda:{REGION}:{ACCOUNT}:microvm-image%2F{held}"),
+            format!("arn:aws:lambda:{REGION}:{ACCOUNT}:microvm-image/{held}"),
         ),
     ];
 
-    for (case, path_identifier) in rows {
+    for (case, path_identifier, identifier) in rows {
         let (status, body) = call(
             &router,
             "GET",
@@ -378,6 +413,11 @@ async fn the_denial_does_not_depend_on_which_resource_form_the_arn_uses() {
             None,
         )
         .await;
-        assert_denied(status, &body, &format!("{case} ({path_identifier})"));
+        assert_denied(
+            status,
+            &body,
+            &format!("{case} ({path_identifier})"),
+            &action_denial_sentence("GetMicrovmImage", &identifier),
+        );
     }
 }

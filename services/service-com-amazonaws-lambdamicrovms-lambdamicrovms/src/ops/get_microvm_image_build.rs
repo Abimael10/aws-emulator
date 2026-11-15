@@ -187,7 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ImageReference::Absent => {
                 return Err(GetMicrovmImageBuildErrorModeled::AccessDeniedException(
                     AccessDeniedException {
-                        message: Some(crate::state::access_denied_message()),
+                        message: Some(crate::state::image_access_denied_message(
+                            Self::NAME,
+                            &input.image_identifier,
+                        )),
                     },
                 )
                 .into());
