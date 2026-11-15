@@ -35,8 +35,9 @@ use serde_json::{json, Value};
 use super::dashboard_lifecycle::{call, error_code, graph_config, ok_call, router};
 use super::scheduled_report_lifecycle::{source_dashboard, EXECUTION_ROLE_ARN};
 
-/// The `message` of an error body.
-fn error_message(body: &Value) -> String {
+/// The `message` of an error body. Shared with the sibling sweep over the values a declared
+/// range refuses (`tests/all/refused_value_echo.rs`), so one clause format serves both.
+pub(crate) fn error_message(body: &Value) -> String {
     body.get("message")
         .and_then(Value::as_str)
         .unwrap_or("<no message>")
@@ -44,34 +45,35 @@ fn error_message(body: &Value) -> String {
 }
 
 /// The envelope a single-clause refusal carries.
-fn one_error(clause: &str) -> String {
+pub(crate) fn one_error(clause: &str) -> String {
     format!("1 validation error detected: {clause}")
 }
 
 /// The clause a `@range` violation states: the value the request submitted, the member path
 /// it sat at and the bound its values have to respect.
-fn range_clause(submitted: i64, path: &str, requirement: &str) -> String {
+pub(crate) fn range_clause(submitted: i64, path: &str, requirement: &str) -> String {
     format!("Value '{submitted}' at '{path}' failed to satisfy constraint: {requirement}")
 }
 
 /// The requirement a value above `max` broke, as the framework words that class.
-fn at_most(max: i64) -> String {
+pub(crate) fn at_most(max: i64) -> String {
     format!("Member must have value less than or equal to {max}")
 }
 
 /// The requirement a value below `min` broke, as the framework words that class.
-fn at_least(min: i64) -> String {
+pub(crate) fn at_least(min: i64) -> String {
     format!("Member must have value greater than or equal to {min}")
 }
 
 /// A well-formed dashboard ARN, so a row that breaks a widget's range on an update breaks
 /// only that. It names no stored dashboard: the boundary refusal is answered before any
 /// handler looks one up.
-const WELL_FORMED_DASHBOARD_ARN: &str = "arn:aws:bcm-dashboards::000000000000:dashboard/no-such";
+pub(crate) const WELL_FORMED_DASHBOARD_ARN: &str =
+    "arn:aws:bcm-dashboards::000000000000:dashboard/no-such";
 
 /// One widget, with `extra` merged over it — the member whose range a row breaks or
 /// respects.
-fn widget(title: &str, extra: Value) -> Value {
+pub(crate) fn widget(title: &str, extra: Value) -> Value {
     let mut widget = json!({
         "title": title,
         "configs": [graph_config("UnblendedCost", "LINE", "MONTHLY")]

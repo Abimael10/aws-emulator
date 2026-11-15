@@ -5,7 +5,7 @@
 //! The centralized walk enforces the modelled input constraints and hands [`Refusal`] to
 //! [`crate::service`] STRUCTURALLY — one [`Violation`] per offending member, carrying the
 //! dotted path it sits at, what it failed and what it held — because no model records the
-//! sentence a service says. Two choices about that sentence are this service's, and each is
+//! sentence a service says. ONE choice about that sentence is this service's, and it is
 //! made for a constraint CLASS rather than for an operation or a member:
 //!
 //! * a `@pattern` requirement is quoted as the expression this service publishes, without
@@ -18,11 +18,21 @@
 //! states that number, a string outside a `@length` or a `@pattern` the string it
 //! submitted, and a member absent from the request the `null` it was.
 //!
+//! That half is not to be dropped again for any of those classes. Two captures of this one
+//! sentence disagree about it — one states the submitted value, the other has nothing
+//! between `Value` and `at` — and the one that STATES it is the authoritative reading: the
+//! standard clause reserves that position for the value the request submitted, so a capture
+//! with the position empty has lost a caller-supplied value rather than observed a service
+//! that never states one, and a client parsing the refused input out of the sentence can
+//! only read it from the capture that keeps it.
+//!
 //! The envelope, its error count, the clause, the member paths and every constraint class's
 //! requirement sentence belong to [`service_common::validation_message`] — the shared home
 //! for this wording — and to the framework behind it. None of them is spelled here, so this
 //! service cannot word a constraint differently from the services that state the same
-//! sentence. `tests/all/range_refusal_wording.rs` pins the range clause over the wire.
+//! sentence. `tests/all/range_refusal_wording.rs` pins the range clause over the wire, and
+//! `tests/all/refused_value_echo.rs` pins the value half over the whole numeric domain a
+//! declared range refuses.
 
 use service_common::validation_message::aws_validation_refusal;
 use smithy_server_runtime::{Refusal, Refused};

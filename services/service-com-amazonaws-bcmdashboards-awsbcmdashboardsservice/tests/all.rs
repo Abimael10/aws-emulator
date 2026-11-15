@@ -57,6 +57,8 @@ mod name_pattern_enforcement;
 mod published_catalog;
 #[path = "all/range_refusal_wording.rs"]
 mod range_refusal_wording;
+#[path = "all/refused_value_echo.rs"]
+mod refused_value_echo;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_not_found.rs"]

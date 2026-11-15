@@ -1507,3 +1507,19 @@ mod lambda_in_function_assumed_role_session;
 // check refuses.
 // each declaration into `tests/all/`. Notes that belong to this file rather than to a suite
 // live in `all/appended_notes.rs`.
+//! Single integration-test target for the router: its cross-service suites.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted in sorted position. The list
+//! is those pairs and nothing else, so two branches landing at once insert two lines in two
+//! places and have no prose to keep consistent.
+//! Three rules fail the whole target rather than one suite, which is why nothing else
+//! belongs here:
+//! * these header lines are the ONLY place an inner doc comment (`//!`) may stand — past
+//!   the first declaration one is `E0753`.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules for this file and for
+//! every service crate's own root, so a note about them below is unnecessary and, as `//!`,
+//! fatal.
+//! What a suite covers, and why it lives in this cross-service target rather than in one
+//! service crate's own, belongs in that suite's module header, where it is read beside the
+//! test it describes.
+//! (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each `mod` is
+//! what points the declaration into `tests/all/`.
