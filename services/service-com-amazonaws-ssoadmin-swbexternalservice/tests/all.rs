@@ -173,6 +173,8 @@ mod listed_instance_state_source;
 mod listed_instance_state_through_a_call_sequence;
 #[path = "all/listed_instance_state_under_any_name.rs"]
 mod listed_instance_state_under_any_name;
+#[path = "all/listed_instance_state_under_interleaved_clients.rs"]
+mod listed_instance_state_under_interleaved_clients;
 #[path = "all/listed_instance_state_without_a_name.rs"]
 mod listed_instance_state_without_a_name;
 #[path = "all/managed_policies.rs"]

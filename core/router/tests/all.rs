@@ -2140,3 +2140,5 @@ mod s3_notification_lambda_invoke_grant_gates_delivery;
 // to a SIBLING of this file, which the layout check refuses: the `#[path]` above each `mod` is
 // what points it into `tests/all/`.
 // test it explains; the notes earlier landings appended to this file live in
+// the declarations is `E0753` and compiles no suite of this target. With no inner doc comment
+// in the file at all, no merge of two landings can leave one past the first item.
