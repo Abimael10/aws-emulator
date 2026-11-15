@@ -23,7 +23,9 @@
 //! run slot exists, the store's lock is released and the matching is performed —
 //! the records of each input source's AWS Glue table are read out of Amazon S3, resolved
 //! into match groups by the workflow's rules, and written as the output table under the
-//! job's `outputS3Path` ([`crate::state::matching_run`]). What that work reached is
+//! WORKFLOW's `outputS3Path` ([`crate::state::matching_run`]) — this operation models no
+//! output-source override of its own, so the destination is the workflow's. What that
+//! work reached is
 //! recorded against the job as its [`crate::state::JobOutcome`], and the clock decides
 //! only WHEN the job reports it. A run that could not read its input or write its output
 //! therefore ends `FAILED` carrying the reason on the modelled `ErrorDetails`, and a run
@@ -214,8 +216,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (job_id, plan) = {
             let mut store = state.lock();
 
-            // The workflow this job would run has to exist, and its stored output
-            // configuration is what the job reports as its own `outputSourceConfig`.
+            // The workflow this job would run has to exist: a job is a run OF a
+            // workflow, and the workflow is what says where that run reads and writes.
             let workflow = store
                 .matching_workflows
                 .get(&input.workflow_name)
@@ -230,7 +232,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                 })?;
-            let output_source_config = crate::state::job_output_source_config(&workflow);
 
             // Decided on the CURRENT status of that workflow's jobs, so the clock-owed
             // transitions are materialised first: a job whose run is already over by now
@@ -274,7 +275,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 start_time: started,
                 end_time: None,
                 error_message: None,
-                output_source_config,
                 next_transition_at: Some(started.saturating_add(span)),
                 // Filled in below, by the run this start performs.
                 outcome: None,

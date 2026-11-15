@@ -35,6 +35,8 @@ mod identity_authorization;
 mod match_id_generation;
 #[path = "all/matching_job_lifecycle.rs"]
 mod matching_job_lifecycle;
+#[path = "all/matching_job_output_source_config.rs"]
+mod matching_job_output_source_config;
 #[path = "all/matching_run.rs"]
 mod matching_run;
 #[path = "all/matching_workflow_update.rs"]

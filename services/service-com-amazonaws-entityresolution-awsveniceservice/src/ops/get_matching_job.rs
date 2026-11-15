@@ -4,7 +4,7 @@
 //!
 //! Reports one matching job of one workflow from PERSISTED state: the status its
 //! clock-driven lifecycle has reached, when it started and (once terminal) ended, the
-//! `errorDetails` of a failed run, and the `outputSourceConfig` recorded for that run.
+//! `errorDetails` of a failed run and the `metrics` that run counted.
 //!
 //! ## A read that materialises only what the clock already owed
 //!
@@ -22,6 +22,13 @@
 //! `QUEUED` or `RUNNING` and on one whose run could not read its input at all
 //! ([`crate::state::MatchingJob::reported_metrics`]). No count is invented for a run
 //! that produced none.
+//!
+//! `outputSourceConfig` is the OPTIONAL output-source override a job itself carries,
+//! which is what tells a caller the job overrode where its workflow writes. Starting a
+//! matching job takes `workflowName` and nothing else
+//! (`smithy_query(query="operation",operation="StartMatchingJob")`), so no job of this
+//! workflow can carry such an override and the member is OMITTED. Where a run writes is
+//! a property of the matching workflow, read back through `GetMatchingWorkflow`.
 //!
 //! ## Shape of an operation
 //!
@@ -236,7 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             error_details: job.error_message.clone().map(|error_message| ErrorDetails {
                 error_message: Some(error_message),
             }),
-            output_source_config: job.output_source_config.clone(),
+            // Only an override the JOB carries is echoed here, and no start can supply
+            // one for a matching job, so the member is absent rather than filled in
+            // from the owning workflow's output configuration.
+            output_source_config: None,
         })
     }
 }

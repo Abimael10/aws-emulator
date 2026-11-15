@@ -221,12 +221,11 @@ pub fn plan(store: &State, workflow: &MatchingWorkflow, job_id: &str) -> RunPlan
         );
     }
 
-    // Where the matched records go. `JobOutputSourceConfig` is `length 1..1`, and a
-    // workflow whose output source names no S3 path yields none at all
-    // ([`super::job_output_source_config`]), so such a run has nowhere to write.
-    let Some(output) = super::job_output_source_config(workflow)
-        .and_then(|sources| sources.into_iter().next())
-    else {
+    // Where the matched records go: the WORKFLOW's output configuration, which is
+    // where a batch run's destination lives. A workflow whose output source names no
+    // S3 path yields none at all ([`super::run_output_source`]), so such a run has
+    // nowhere to write.
+    let Some(output) = super::run_output_source(workflow) else {
         return RunPlan::Unperformable(
             "The workflow's output source names no S3 path, so the run has nowhere to \
              write its matched records."

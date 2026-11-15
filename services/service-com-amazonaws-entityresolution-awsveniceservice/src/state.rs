@@ -249,11 +249,6 @@ pub struct MatchingJob {
     pub end_time: Option<i64>,
     /// `errorDetails.errorMessage`: set only on a `FAILED` job.
     pub error_message: Option<String>,
-    /// `outputSourceConfig`, as it was derived from the workflow when the job started
-    /// (see [`job_output_source_config`]). It is kept ON THE JOB, not re-derived on
-    /// read, because a job reports where THAT RUN would write — a later
-    /// `UpdateMatchingWorkflow` must not rewrite the history of a job already started.
-    pub output_source_config: Option<Vec<JobOutputSource>>,
     /// The instant the next status transition becomes due, while one is owed.
     pub next_transition_at: Option<i64>,
     /// What this job's RUN produced — the terminal status the work reached, the records
@@ -382,33 +377,34 @@ impl MatchingJob {
     }
 }
 
-/// The `outputSourceConfig` a job of `workflow` reports, derived from the workflow's
+/// Where a RUN of `workflow` writes its matched records, derived from the workflow's
 /// own `outputSourceConfig`.
 ///
-/// `JobOutputSourceConfig` is `length 1..1`
-/// (`smithy_query(query="shape",shape="JobOutputSourceConfig")`), so at most the
-/// workflow's FIRST output source becomes the job's. A `JobOutputSource` is
-/// `roleArn` + `outputS3Path` (both @required) + optional `KMSArn`: the role is the
-/// workflow's `roleArn` — the role Entity Resolution assumes for the run — and the
-/// path and KMS key are that output source's.
+/// This is the destination of the work ([`matching_run`]), NOT a value any response
+/// echoes: the output destination of a batch matching job is a property of the
+/// WORKFLOW, read back through `GetMatchingWorkflow`.
+///
+/// `OutputSourceConfig` is `length 1..1`
+/// (`smithy_query(query="shape",shape="OutputSourceConfig")`), so the workflow's FIRST
+/// output source is the one a run writes to. The role is the workflow's `roleArn` —
+/// the role Entity Resolution assumes for the run — and the path and KMS key are that
+/// output source's.
 ///
 /// `OutputSource$outputS3Path` targets `OptionalS3Path`, whose pattern admits the
-/// EMPTY string and whose default IS the empty string, while the job member's
-/// `S3Path` is `length 1..1024` and must match `^s3://…`
-/// (`smithy_query(query="shape",shape="OutputSource")`). A workflow configured with
-/// no output path therefore yields no job output config at all, rather than an
-/// invented path or an empty one the job member cannot hold.
-pub fn job_output_source_config(workflow: &MatchingWorkflow) -> Option<Vec<JobOutputSource>> {
+/// EMPTY string and whose default IS the empty string
+/// (`smithy_query(query="shape",shape="OutputSource")`). A workflow configured with no
+/// output path therefore yields no destination at all, rather than an invented one.
+pub fn run_output_source(workflow: &MatchingWorkflow) -> Option<JobOutputSource> {
     let first = workflow.output_source_config.first()?;
     let output_s3_path = first
         .output_s3_path
         .clone()
         .filter(|path| !path.is_empty())?;
-    Some(vec![JobOutputSource {
+    Some(JobOutputSource {
         role_arn: workflow.role_arn.clone(),
         output_s3_path,
         kms_arn: first.kms_arn.clone(),
-    }])
+    })
 }
 
 /// One provider service as this service persists it: an entry of the AWS-managed

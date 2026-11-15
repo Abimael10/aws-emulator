@@ -2652,3 +2652,12 @@ mod autoscaling_plans_delete_withdraws_its_registration;
 // `all/all_rs_is_a_canonical_declaration_list.rs`. What a suite covers, and why it lives in
 // this cross-service target rather than in one service crate's own, belongs in that suite's
 // own module header; a note about THIS file belongs in `all/appended_notes.rs`.
+// Single integration-test target for the router: the canonical declaration list of its
+// insert two lines in two places and have no prose to duplicate, re-word or mistype.
+// A suite no `mod` here names is compiled nowhere and its tests never run; a suite left at
+// the top level of `tests/` fails the build; a suite declared twice is `E0428`; and an inner
+// doc comment past the first item is `E0753`. Each of those fails EVERY suite of this
+// target, so every comment in this file is an ordinary `//` one, this header included, and
+// what goes below it is a declaration rather than a note about one.
+// explains; the notes landings had appended to this file live in `all/appended_notes.rs`.
+// `all/all_rs_is_a_canonical_declaration_list.rs` check the rules above, for this file and

@@ -12,8 +12,10 @@
 //!
 //! 1. `StartMatchingJob` MINTS a job of an existing matching workflow — a `jobId`
 //!    matching the modelled `JobId` pattern `^[a-f0-9]{32}$`, distinct per start — and
-//!    PERSISTS it, so `GetMatchingJob` answers that job's status, `startTime` and the
-//!    `outputSourceConfig` derived from the workflow's own output configuration.
+//!    PERSISTS it, so `GetMatchingJob` answers that job's status and `startTime`. A
+//!    matching job carries no output-source override of its own, so it reports no
+//!    `outputSourceConfig` — the sibling [`crate::matching_job_output_source_config`]
+//!    suite is the one that pins that rule across workflow output configurations.
 //! 2. The job's status is CLOCK-DRIVEN and never regresses: it is `QUEUED` when the
 //!    caller reads it straight after starting it, then `RUNNING`, then the terminal
 //!    status its run reached, carrying `errorDetails` when that run produced nothing
@@ -105,15 +107,11 @@ async fn get_matching_job(emulator: &Emulator, workflow_name: &str, job_id: &str
         .await
 }
 
-/// One workflow to run jobs against, plus what the rule says a job of it must report
-/// as its `outputSourceConfig`.
+/// One workflow to run jobs against.
 struct JobCase {
     case: &'static str,
     workflow_name: &'static str,
     request: Value,
-    /// The single `JobOutputSource` a job of this workflow reports, or `None` when the
-    /// workflow's output configuration carries no S3 path for a job to write to.
-    expected_output_source: Option<Value>,
 }
 
 /// The schema mappings every row's `inputSourceConfig` references.
@@ -158,10 +156,6 @@ fn job_cases() -> Vec<JobCase> {
                 },
                 "roleArn": role_arn(),
             }),
-            expected_output_source: Some(json!({
-                "roleArn": role_arn(),
-                "outputS3Path": "s3://er-output/rules",
-            })),
         },
         JobCase {
             case: "ML matching over three input sources, output source with a KMS key",
@@ -183,11 +177,6 @@ fn job_cases() -> Vec<JobCase> {
                 "resolutionTechniques": { "resolutionType": "ML_MATCHING" },
                 "roleArn": role_arn(),
             }),
-            expected_output_source: Some(json!({
-                "roleArn": role_arn(),
-                "outputS3Path": "s3://er-output/ml",
-                "KMSArn": kms_arn(),
-            })),
         },
         JobCase {
             case: "an uppercase workflow name and a deep output path with a KMS key",
@@ -210,14 +199,9 @@ fn job_cases() -> Vec<JobCase> {
                 "resolutionTechniques": { "resolutionType": "ML_MATCHING" },
                 "roleArn": role_arn(),
             }),
-            expected_output_source: Some(json!({
-                "roleArn": role_arn(),
-                "outputS3Path": "s3://er-output-2/matches/2026/01",
-                "KMSArn": kms_arn(),
-            })),
         },
         JobCase {
-            case: "no output S3 path configured: a job reports no outputSourceConfig",
+            case: "no output S3 path configured: the workflow has nowhere to write",
             workflow_name: "job3",
             request: json!({
                 "workflowName": "job3",
@@ -230,7 +214,6 @@ fn job_cases() -> Vec<JobCase> {
                 "resolutionTechniques": { "resolutionType": "ML_MATCHING" },
                 "roleArn": role_arn(),
             }),
-            expected_output_source: None,
         },
     ]
 }
@@ -396,12 +379,10 @@ async fn start_matching_job_mints_a_job_get_matching_job_reads_it_back() {
             start_time > 0.0,
             "case {label:?}: startTime must be the instant the job started, got {start_time}"
         );
-        assert_eq!(
-            read.body.get("outputSourceConfig").cloned(),
-            case.expected_output_source
-                .clone()
-                .map(|source| Value::Array(vec![source])),
-            "case {label:?}: outputSourceConfig must be derived from the workflow, got {:?}",
+        assert!(
+            read.body.get("outputSourceConfig").is_none(),
+            "case {label:?}: a job carries no output-source override, so GetMatchingJob \
+             must omit outputSourceConfig, got {:?}",
             read.body
         );
         // Nothing ran yet: a job just started has counted nothing.
@@ -453,13 +434,10 @@ async fn start_matching_job_mints_a_job_get_matching_job_reads_it_back() {
             "case {label:?}: errorMessage must satisfy the modelled length 1..2048, got \
              {error_message:?}"
         );
-        assert_eq!(
-            settled.body.get("outputSourceConfig").cloned(),
-            case.expected_output_source
-                .clone()
-                .map(|source| Value::Array(vec![source])),
-            "case {label:?}: the settled job must keep the outputSourceConfig it started \
-             with, got {:?}",
+        assert!(
+            settled.body.get("outputSourceConfig").is_none(),
+            "case {label:?}: a settled job still carries no output-source override, got \
+             {:?}",
             settled.body
         );
 
@@ -644,8 +622,8 @@ async fn jobs_of_different_workflows_run_independently() {
     seed(&emulator).await;
 
     // Every workflow gets a job: one workflow's in-progress job must not block
-    // another's start, and each job keeps its own workflow's output configuration.
-    let mut jobs: Vec<(&'static str, String, Option<Value>)> = Vec::new();
+    // another's start, and each workflow reads back its own job.
+    let mut jobs: Vec<(&'static str, String)> = Vec::new();
     for case in job_cases() {
         let reply = start_matching_job(&emulator, case.workflow_name).await;
         assert_eq!(
@@ -653,14 +631,10 @@ async fn jobs_of_different_workflows_run_independently() {
             "case {:?}: a job of another workflow must not block this start, got {reply:?}",
             case.case
         );
-        jobs.push((
-            case.workflow_name,
-            string_member(&reply.body, "jobId"),
-            case.expected_output_source.clone(),
-        ));
+        jobs.push((case.workflow_name, string_member(&reply.body, "jobId")));
     }
 
-    for (workflow_name, job_id, expected_output_source) in &jobs {
+    for (workflow_name, job_id) in &jobs {
         let settled = settle(workflow_name, &emulator, workflow_name, job_id)
             .await
             .reply;
@@ -668,14 +642,6 @@ async fn jobs_of_different_workflows_run_independently() {
             string_member(&settled.body, "jobId"),
             *job_id,
             "case {workflow_name:?}: each workflow must read back its OWN job"
-        );
-        assert_eq!(
-            settled.body.get("outputSourceConfig").cloned(),
-            expected_output_source
-                .clone()
-                .map(|source| Value::Array(vec![source])),
-            "case {workflow_name:?}: each job keeps its own workflow's output config, got {:?}",
-            settled.body
         );
     }
 }
