@@ -13798,6 +13798,7 @@ dependencies = [
 name = "service-com-amazonaws-firehose-firehose-20150804"
 version = "0.1.0"
 dependencies = [
+ "apache-avro",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",

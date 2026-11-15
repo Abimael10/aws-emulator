@@ -210,13 +210,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nothing in this emulator fails a create, a delete or an encryption
                 // change, so no stream carries a KMS failure description.
                 failure_description: None,
-                // Always reported: a stream always has an SSE state, and a stream SSE was
-                // never configured on reports the documented disabled one.
-                delivery_stream_encryption_configuration: Some(
-                    stream
-                        .encryption
-                        .clone()
-                        .unwrap_or_else(crate::state::disabled_encryption),
+                // Reported for a stream SSE can be in force on: server-side encryption is
+                // a direct-put-only feature ("You can enable SSE for a Firehose stream only
+                // if it's a Firehose stream that uses DirectPut as its source"), so such a
+                // stream always carries the member and reports the documented disabled
+                // state when nothing was ever configured on it — while a stream fed by a
+                // configured source has no encryption state at all and carries none.
+                delivery_stream_encryption_configuration: stream.encryption.clone().or_else(
+                    || {
+                        (stream.stream_type == crate::state::DIRECT_PUT_STREAM_TYPE)
+                            .then(crate::state::disabled_encryption)
+                    },
                 ),
                 delivery_stream_type: stream.stream_type.clone(),
                 version_id: stream.version_id.to_string(),
@@ -240,6 +244,14 @@ const DEFAULT_COMPRESSION_FORMAT: &str = "UNCOMPRESSED";
 const DEFAULT_BUFFERING_SIZE_IN_MBS: i32 = 5;
 /// `BufferingHints.IntervalInSeconds`: "The default value is 300."
 const DEFAULT_BUFFERING_INTERVAL_IN_SECONDS: i32 = 300;
+/// The `S3BackupMode` of an Iceberg destination created without one: "Describes how Firehose
+/// will backup records. Currently, Firehose only supports `FailedDataOnly`"
+/// (`IcebergDestinationDescription$S3BackupMode`) — so a destination that named no mode backs
+/// up the failed records alone.
+const DEFAULT_ICEBERG_S3_BACKUP_MODE: &str = "FailedDataOnly";
+/// `RetryOptions.DurationInSeconds` when the destination names none: "the default value is
+/// 300 (5 minutes)", the span every `RetryOptions` member of this API documents.
+const DEFAULT_RETRY_DURATION_IN_SECONDS: i32 = 300;
 /// The `S3BackupMode` of an Amazon S3 or Amazon Redshift destination created without one:
 /// "After you create a Firehose stream, you can update it to enable Amazon S3 backup if
 /// it is disabled" (`ExtendedS3DestinationConfiguration$S3BackupMode`,
@@ -481,13 +493,23 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                     .clone(),
                 schema_evolution_configuration: config.schema_evolution_configuration.clone(),
                 table_creation_configuration: config.table_creation_configuration.clone(),
-                buffering_hints: config.buffering_hints.clone(),
+                // "The buffering option. If no value is specified, BufferingHints object
+                // default values are used"
+                // (`IcebergDestinationDescription$BufferingHints`), so the description
+                // carries the member with those defaults materialised, exactly as an Amazon
+                // S3 destination's does.
+                buffering_hints: Some(buffering_hints(config.buffering_hints.as_ref())),
                 cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                 processing_configuration: config.processing_configuration.clone(),
-                s3_backup_mode: config.s3_backup_mode.clone(),
-                retry_options: config.retry_options.clone(),
+                s3_backup_mode: Some(s3_backup_mode(
+                    config.s3_backup_mode.as_ref(),
+                    DEFAULT_ICEBERG_S3_BACKUP_MODE,
+                )),
+                retry_options: Some(retry_options(config.retry_options.as_ref())),
                 role_arn: Some(config.role_arn.clone()),
-                append_only: config.append_only,
+                // "The default value is false" (`AppendOnly`), materialised like every other
+                // documented default of this description.
+                append_only: Some(config.append_only.unwrap_or(false)),
                 catalog_configuration: Some(config.catalog_configuration.clone()),
                 s3_destination_description: Some(s3_description(&config.s3_configuration)),
             }),
@@ -546,6 +568,18 @@ fn buffering_hints(hints: Option<&BufferingHints>) -> BufferingHints {
         interval_in_seconds: hints
             .and_then(|hints| hints.interval_in_seconds)
             .or(Some(DEFAULT_BUFFERING_INTERVAL_IN_SECONDS)),
+    }
+}
+
+/// "The retry behavior in case Firehose is unable to deliver data to a destination"
+/// (`RetryOptions`), reported with its documented default materialised: a destination that
+/// named no retry duration retries for "the default value … 300 (5 minutes)", the span every
+/// `RetryOptions` member of this API documents as its default.
+fn retry_options(options: Option<&RetryOptions>) -> RetryOptions {
+    RetryOptions {
+        duration_in_seconds: options
+            .and_then(|options| options.duration_in_seconds)
+            .or(Some(DEFAULT_RETRY_DURATION_IN_SECONDS)),
     }
 }
 

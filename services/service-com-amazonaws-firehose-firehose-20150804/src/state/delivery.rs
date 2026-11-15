@@ -107,6 +107,9 @@ pub mod destination_logging;
 /// Converting a buffer's records to the format a `DataFormatConversionConfiguration` asks
 /// for, against the column information of the Glue table it binds.
 pub mod format_conversion;
+/// The delivery of a buffer to an Apache Iceberg table of the Data Catalog, and the commit
+/// that makes the delivered rows part of that table.
+pub mod iceberg;
 /// The delivery of a buffer to a destination in Splunk.
 pub mod splunk;
 /// The zone a destination's time fields are rendered in.
@@ -787,6 +790,8 @@ pub struct PendingDelivery {
     pub searches: Vec<SearchTarget>,
     /// Every Splunk HTTP Event Collector this buffer is POSTed to.
     pub splunks: Vec<splunk::SplunkTarget>,
+    /// Every Apache Iceberg table this buffer's records are committed to.
+    pub icebergs: Vec<iceberg::IcebergTarget>,
 }
 
 /// One object a delivery writes.
@@ -1342,6 +1347,15 @@ fn stream_splunks(stream: &DeliveryStream) -> Vec<splunk::SplunkTarget> {
         .collect()
 }
 
+/// Every Apache Iceberg table this stream's destinations commit to right now.
+fn stream_icebergs(stream: &DeliveryStream) -> Vec<iceberg::IcebergTarget> {
+    stream
+        .destinations
+        .iter()
+        .flat_map(|destination| iceberg::iceberg_targets(&destination.config))
+        .collect()
+}
+
 /// When this stream's buffer comes due for delivery, or `None` when nothing is owed — an
 /// empty buffer, or a destination with no location, no endpoint and no index to deliver
 /// to.
@@ -1371,6 +1385,11 @@ pub fn due_at(stream: &DeliveryStream) -> Option<SystemTime> {
             stream_splunks(stream)
                 .iter()
                 .map(|splunk| delivery_window(splunk.hints.as_ref(), buffered)),
+        )
+        .chain(
+            stream_icebergs(stream)
+                .iter()
+                .map(|iceberg| delivery_window(iceberg.hints.as_ref(), buffered)),
         )
         .min()?;
     let due = opened_at + window;
@@ -1431,7 +1450,12 @@ pub fn take_due(
         let endpoints = stream_endpoints(stream);
         let searches = stream_searches(stream);
         let splunks = stream_splunks(stream);
-        if targets.is_empty() && endpoints.is_empty() && searches.is_empty() && splunks.is_empty()
+        let icebergs = stream_icebergs(stream);
+        if targets.is_empty()
+            && endpoints.is_empty()
+            && searches.is_empty()
+            && splunks.is_empty()
+            && icebergs.is_empty()
         {
             continue;
         }
@@ -1453,6 +1477,7 @@ pub fn take_due(
             endpoints,
             searches,
             splunks,
+            icebergs,
         });
     }
     due
@@ -1655,6 +1680,26 @@ pub async fn deliver_due<Eng: Send + Sync + 'static>(
             continue;
         };
         objects.append(&mut parked);
+        // Then the Apache Iceberg tables: the records of the buffer are read against each
+        // destination table's columns and committed to it — the data object, the manifest,
+        // the manifest list and the new metadata file — with the records the table does not
+        // hold going to the destination's error output. A commit this emulator could not work
+        // out leaves the whole buffer owed again, like any other delivery it could not write.
+        let mut advances = Vec::new();
+        for table in &delivery.icebergs {
+            match iceberg::commit_buffer(engine, &delivery, table, now).await {
+                Some(commit) => {
+                    objects.extend(commit.objects);
+                    advances.extend(commit.advances);
+                }
+                None => owed = true,
+            }
+        }
+        if owed {
+            let mut store = state.lock();
+            restore(&mut store, delivery, now);
+            continue;
+        }
         // The write is the destination ROLE's to make, so what that role is allowed to do
         // decides whether it is made at all: a delivery the role may not write is not
         // written, is reported through the destination's own logging and is owed again, which
@@ -1688,6 +1733,10 @@ pub async fn deliver_due<Eng: Send + Sync + 'static>(
             now,
         );
         if written.any {
+            // The objects of an Iceberg commit are there, so the catalog pointer may move to
+            // the metadata file they hold: the catalog never points at a metadata file that
+            // was not written.
+            iceberg::advance_catalog(engine, &advances, now);
             // Written, so these records are no longer held anywhere in this process and
             // the budget they were charged against is theirs no longer.
             let mut store = state.lock();

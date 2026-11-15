@@ -816,17 +816,12 @@ impl IcebergTableMarker {
 /// store, never from here.
 pub fn new_iceberg_metadata_location(location: &str) -> String {
     let base = location.trim_end_matches('/');
-    let digits = mint_hex_id(&MINTED_ICEBERG_METADATA_FILES, ICEBERG_METADATA_ID_WORDS);
-    // The 32 hexadecimal characters grouped 8-4-4-4-12, the way a UUID is spelled. Built
-    // by walking the characters rather than by slicing, so the spelling cannot depend on
-    // the id's width.
-    let mut id = String::with_capacity(digits.len() + 4);
-    for (position, character) in digits.chars().enumerate() {
-        if matches!(position, 8 | 12 | 16 | 20) {
-            id.push('-');
-        }
-        id.push(character);
-    }
+    // The 32 hexadecimal characters grouped the way a UUID is spelled, through the one
+    // spelling this crate has for that ([`super::iceberg_metadata::uuid_spelling`]).
+    let id = super::iceberg_metadata::uuid_spelling(&mint_hex_id(
+        &MINTED_ICEBERG_METADATA_FILES,
+        ICEBERG_METADATA_ID_WORDS,
+    ));
     format!("{base}/{ICEBERG_METADATA_DIRECTORY}/00000-{id}.metadata.json")
 }
 

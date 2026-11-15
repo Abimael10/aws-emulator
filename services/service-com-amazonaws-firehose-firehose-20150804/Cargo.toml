@@ -65,6 +65,10 @@ parquet = { version = "60", default-features = false, features = [
     "snap",
     "flate2-rust_backend",
 ] }
+# The Apache implementation of the Avro container format, which writes the manifest and the
+# manifest-list objects an Iceberg commit records its data files in. Only the container format
+# is used, so no codec feature is enabled: the containers are written uncompressed.
+apache-avro = { version = "0.17", default-features = false }
 # The UTC calendar fields the `IndexRotationPeriod` suffix of a destination index carries —
 # including the ISO week a `OneWeek` rotation names — read from a maintained date library
 # rather than computed here.

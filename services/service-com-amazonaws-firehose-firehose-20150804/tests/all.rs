@@ -79,6 +79,8 @@ mod http_endpoint_delivery;
 mod http_endpoint_error_output_forms;
 #[path = "all/http_endpoint_lambda_error_output.rs"]
 mod http_endpoint_lambda_error_output;
+#[path = "all/iceberg_destination_delivery.rs"]
+mod iceberg_destination_delivery;
 #[path = "all/kinesis_source_fan_out.rs"]
 mod kinesis_source_fan_out;
 #[path = "all/kinesis_source_ingestion.rs"]

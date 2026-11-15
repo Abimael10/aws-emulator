@@ -15,10 +15,12 @@
 //! stored like any other, plus the three parameters that make it an open-table-format
 //! table — `table_type`, the `metadata_location` of the metadata file this create minted
 //! under the table's own location, and the `format-version` the request asked for
-//! ([`crate::state::IcebergTableMarker`]) — so a later read serves an Iceberg table a
-//! client, a table optimizer or an Iceberg-destination consumer can use. A `TableInput`
-//! carrying a `ViewDefinition` still answers 501: a Glue view's dialect representations
-//! are a layer this slice does not keep.
+//! ([`crate::state::IcebergTableMarker`]) — AND the metadata file itself is written into
+//! Amazon S3 at exactly that location
+//! ([`crate::state::write_table_metadata`]), so a later read serves an Iceberg table a
+//! client, a table optimizer or an Iceberg-destination consumer can actually open. A
+//! `TableInput` carrying a `ViewDefinition` still answers 501: a Glue view's dialect
+//! representations are a layer this slice does not keep.
 //!
 //! `PartitionIndexes` registers the table's partition indexes with it: each one is resolved
 //! against the partition keys of the definition being stored and recorded beside the table
@@ -270,6 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The Iceberg metadata this create mints for the table, recorded on the definition
         // about to be stored: an Iceberg table's metadata lives under the table's own
         // location, so a create that names no location has nowhere to mint it.
+        let mut iceberg_metadata = None;
         if let Some(iceberg) = iceberg_input {
             let Some(location) = crate::state::iceberg_table_location(
                 &definition,
@@ -293,8 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get_or_insert_with(StorageDescriptor::default)
                 .location
                 .get_or_insert(location.clone());
-            crate::state::IcebergTableMarker::mint(&location, iceberg.version.as_deref())
-                .apply(&mut definition);
+            let marker =
+                crate::state::IcebergTableMarker::mint(&location, iceberg.version.as_deref());
+            marker.apply(&mut definition);
+            iceberg_metadata = Some((location, marker));
         }
         let table_input = &definition;
 
@@ -418,84 +423,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a principal any AWS rule renders into an IAM ARN.
         let created_by = crate::state::request_principal();
 
-        let mut store = state.lock();
-        // The store is resident memory and this create is reachable by any caller, so
-        // the number of records one process will hold is bounded, store-wide as well as
-        // per database. The store-wide answer is read BEFORE the parent database is
-        // borrowed, but used AFTER it is resolved, so a request naming a database that
-        // does not exist still gets the precise `EntityNotFoundException`.
-        let store_can_hold_another_table = store.can_store_table();
-        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
-            return Err(CreateTableErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::database_not_found(
-                        &input.database_name,
-                    )),
-                    from_federation_source: None,
-                },
-            )
-            .into());
+        // The catalog's guard is held for THIS block alone and released at its end, so the
+        // metadata-object write that follows — a write to another service — is made with no
+        // lock of this one held.
+        let (database_name, stored_columns, registered_indexes) = {
+            let mut store = state.lock();
+            // The store is resident memory and this create is reachable by any caller, so
+            // the number of records one process will hold is bounded, store-wide as well as
+            // per database. The store-wide answer is read BEFORE the parent database is
+            // borrowed, but used AFTER it is resolved, so a request naming a database that
+            // does not exist still gets the precise `EntityNotFoundException`.
+            let store_can_hold_another_table = store.can_store_table();
+            let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+                return Err(CreateTableErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::database_not_found(
+                            &input.database_name,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+
+            if database.tables.contains_key(&folded_table) {
+                return Err(CreateTableErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(crate::state::messages::TABLE_ALREADY_EXISTS.to_string()),
+                    },
+                )
+                .into());
+            }
+            if !store_can_hold_another_table {
+                return Err(
+                    CreateTableErrorModeled::ResourceNumberLimitExceededException(
+                        ResourceNumberLimitExceededException {
+                            message: Some(format!(
+                                "the Data Catalog already holds the maximum of {} tables",
+                                crate::state::MAX_STORED_TABLES
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if !database.can_store_table() {
+                return Err(
+                    CreateTableErrorModeled::ResourceNumberLimitExceededException(
+                        ResourceNumberLimitExceededException {
+                            message: Some(format!(
+                                "Database {} already holds the maximum of {} tables",
+                                database.name,
+                                crate::state::MAX_TABLES_PER_DATABASE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            let database_name = database.name.clone();
+            let mut entry = crate::state::TableEntry::from_input(
+                table_input,
+                &database_name,
+                &catalog_id,
+                Some(created_by),
+                created_at,
+            );
+            // The key material this write was encrypted under, which every later read of
+            // the table has to recover before it can answer the definition.
+            entry.encryption = encryption;
+            // The indexes belong to the table this create stores, so their records are keyed
+            // by that stored table — and written while the catalog's guard is still held, so
+            // no reader can resolve the new table before the indexes it was registered with
+            // are there. The lock order is the catalog's store and then the records', which
+            // is the order the read path takes them in too.
+            let indexed_table = crate::service::partition_indexes::TableIndexKey::of(&entry);
+            // The columns the STORED definition declares, which the metadata document's
+            // schema is built from.
+            let stored_columns =
+                crate::state::definition_columns(entry.storage_descriptor.as_ref());
+            database.tables.insert(folded_table.clone(), entry);
+            let registered_indexes = partition_indexes.len();
+            if let Some(records) = index_records {
+                records.lock().record(indexed_table, partition_indexes);
+            }
+            (database_name, stored_columns, registered_indexes)
         };
-
-        if database.tables.contains_key(&folded_table) {
-            return Err(CreateTableErrorModeled::AlreadyExistsException(
-                AlreadyExistsException {
-                    message: Some(crate::state::messages::TABLE_ALREADY_EXISTS.to_string()),
-                },
+        // The METADATA OBJECT of an Iceberg table, written at exactly the location the
+        // stored row's `metadata_location` points at: an Iceberg reader resolves that
+        // pointer, so a catalog row naming an object that does not exist is a table nothing
+        // can open. The write is made after the row is stored and outside the store's
+        // guard, because it is a write to ANOTHER service (the one object store this
+        // emulator holds) and the two locks are never held at once.
+        if let Some((location, marker)) = iceberg_metadata {
+            let document = crate::state::initial_table_metadata(
+                &location,
+                &marker.format_version,
+                &crate::state::new_table_uuid(),
+                &stored_columns,
+                created_at,
+            );
+            if let Err(error) = crate::state::write_table_metadata(
+                ctx,
+                &region,
+                &marker.metadata_location,
+                &document,
             )
-            .into());
+            .await
+            {
+                // The row is stored either way, which is what a client reading the catalog
+                // sees; what could not be written is the object, so that is what is
+                // reported.
+                ::tracing::warn!(
+                    operation = "CreateTable",
+                    table = %folded_table,
+                    metadata_location = %marker.metadata_location,
+                    %error,
+                    "the Iceberg metadata object of this table could not be written"
+                );
+            }
         }
-        if !store_can_hold_another_table {
-            return Err(
-                CreateTableErrorModeled::ResourceNumberLimitExceededException(
-                    ResourceNumberLimitExceededException {
-                        message: Some(format!(
-                            "the Data Catalog already holds the maximum of {} tables",
-                            crate::state::MAX_STORED_TABLES
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-        if !database.can_store_table() {
-            return Err(
-                CreateTableErrorModeled::ResourceNumberLimitExceededException(
-                    ResourceNumberLimitExceededException {
-                        message: Some(format!(
-                            "Database {} already holds the maximum of {} tables",
-                            database.name,
-                            crate::state::MAX_TABLES_PER_DATABASE
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        let database_name = database.name.clone();
-        let mut entry = crate::state::TableEntry::from_input(
-            table_input,
-            &database_name,
-            &catalog_id,
-            Some(created_by),
-            created_at,
-        );
-        // The key material this write was encrypted under, which every later read of the
-        // table has to recover before it can answer the definition.
-        entry.encryption = encryption;
-        // The indexes belong to the table this create stores, so their records are keyed by
-        // that stored table — and written while the catalog's guard is still held, so no
-        // reader can resolve the new table before the indexes it was registered with are
-        // there. The lock order is the catalog's store and then the records', which is the
-        // order the read path takes them in too.
-        let indexed_table = crate::service::partition_indexes::TableIndexKey::of(&entry);
-        database.tables.insert(folded_table.clone(), entry);
-        let registered_indexes = partition_indexes.len();
-        if let Some(records) = index_records {
-            records.lock().record(indexed_table, partition_indexes);
-        }
-        drop(store);
         ::tracing::info!(
             operation = "CreateTable",
             catalog_id = %catalog_id,

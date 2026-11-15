@@ -195,6 +195,8 @@ mod get_mapping;
 mod get_plan;
 #[path = "all/get_table_entity_not_found.rs"]
 mod get_table_entity_not_found;
+#[path = "all/iceberg_table_metadata_object.rs"]
+mod iceberg_table_metadata_object;
 #[path = "all/iceberg_tables.rs"]
 mod iceberg_tables;
 #[path = "all/identity_center_configuration.rs"]

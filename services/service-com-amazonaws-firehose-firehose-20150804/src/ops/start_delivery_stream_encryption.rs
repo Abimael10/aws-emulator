@@ -228,18 +228,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "You can enable SSE for a Firehose stream only if it's a Firehose stream that
-        // uses DirectPut as its source."
+        // uses DirectPut as its source." The refusal is worded as the service words it: the
+        // fixed sentence, carrying the stream the request named and the type the stream was
+        // created with.
         if stream.stream_type != crate::state::DIRECT_PUT_STREAM_TYPE {
             return Err(
                 StartDeliveryStreamEncryptionErrorModeled::InvalidArgumentException(
                     InvalidArgumentException {
                         message: Some(format!(
-                            "server-side encryption cannot be enabled for Firehose stream {} \
-                             because its type is {}; only a stream that uses {} as its source \
-                             supports it",
-                            stream.name,
-                            stream.stream_type,
-                            crate::state::DIRECT_PUT_STREAM_TYPE
+                            "Cannot enable encryption for a delivery stream {} with delivery \
+                             stream type {}",
+                            input.delivery_stream_name, stream.stream_type
                         )),
                     },
                 )

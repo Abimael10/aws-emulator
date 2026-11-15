@@ -1214,3 +1214,10 @@ mod zz_probe_whole_emulator;
 //! THIS FILE: past the first item one is `E0753` and compiles no suite of this target, so
 //! add a declaration below, never a note about one.
 //! `all/all_rs_declares_each_suite_once.rs` and
+//! the declaration into `tests/all/`.
+//! THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past
+//! DECLARATION — never a note about one, and never a `//!` line.
+//! The list below is the declarations and nothing else. What a suite covers, and why it has
+//! to live in THIS target rather than in a service crate's own, belongs in that suite's own
+//! module header, where it is read beside the test it explains — not here, where one note per
+//! suite buries the list this file exists to be.
