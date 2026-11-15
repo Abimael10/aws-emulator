@@ -4391,30 +4391,31 @@ pub fn invalid_replicator_arn() -> BadRequestException {
     parameter_refusal(REPLICATOR_ARN_MEMBER, VALUE_NOT_VALID_MESSAGE)
 }
 
-/// The refusal a DELETE whose version pre-condition is OPT-IN answers a resource
-/// reference it cannot read with — and which input that refusal blames.
+/// The refusal the CLUSTER delete, whose version pre-condition is OPT-IN,
+/// answers a cluster reference it cannot read with — and which input that
+/// refusal blames.
 ///
-/// The two deletes of this service take the resource's version on the optional
+/// The cluster delete takes the cluster's version on the optional
 /// `currentVersion` query parameter, so a request that sends one asks for the
-/// delete to go through only while the resource is still at that version. A
-/// reference the service cannot read at all resolves no resource, so that
-/// pre-condition can never be satisfied: the input the refusal names is the
+/// delete to go through only while the cluster is still at that version. A
+/// reference the service cannot read at all resolves no cluster, so that
+/// pre-condition can never be satisfied: the input that refusal names is the
 /// version it could not check ([`CURRENT_VERSION_MEMBER`]). A request that sent
 /// no version states no such pre-condition, so the same refusal names the member
-/// that carried the unreadable reference (`arn_member`).
+/// that carried the unreadable reference ([`CLUSTER_ARN_MEMBER`]).
 ///
-/// The sentence is the surface's own either way ([`BAD_REQUEST_MESSAGE`] for the
-/// cluster delete, [`VALUE_NOT_VALID_MESSAGE`] for the replicator one), fixed end
-/// to end: only which input is blamed depends on the request, and neither the
+/// The attribution is the SURFACE's, not this condition's: the replicator
+/// delete, whose version is optional in the same way, blames the path-bound ARN
+/// it could not read whether or not the request quoted a version
+/// ([`invalid_replicator_arn`]), so it does not come through here.
+///
+/// The sentence is this surface's own ([`BAD_REQUEST_MESSAGE`]), fixed end to
+/// end: only which input is blamed depends on the request, and neither the
 /// reference nor the version reaches the message.
-pub fn unreadable_delete_reference(
-    current_version: Option<&str>,
-    arn_member: &str,
-    message: &str,
-) -> BadRequestException {
+pub fn unreadable_cluster_reference(current_version: Option<&str>) -> BadRequestException {
     match current_version {
-        Some(_) => parameter_refusal(CURRENT_VERSION_MEMBER, message),
-        None => parameter_refusal(arn_member, message),
+        Some(_) => parameter_refusal(CURRENT_VERSION_MEMBER, BAD_REQUEST_MESSAGE),
+        None => parameter_refusal(CLUSTER_ARN_MEMBER, BAD_REQUEST_MESSAGE),
     }
 }
 
@@ -4431,6 +4432,26 @@ pub fn unreadable_delete_reference(
 /// Named here, beside the shape refusal, so no handler composes a sentence of
 /// its own around the reference it was handed.
 pub const UNRESOLVED_REFERENCE_MESSAGE: &str = BAD_REQUEST_MESSAGE;
+
+/// The member every paginated listing of this service carries its resume token
+/// in, as the request spells it on the wire (`NextToken`'s `httpQuery` name), so
+/// a refusal names the query parameter the caller actually sent.
+pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
+
+/// The refusal every paginated listing answers a `nextToken` it cannot read
+/// with: a `BadRequestException` (HTTP 400) naming [`NEXT_TOKEN_MEMBER`] and
+/// carrying the service's GENERIC parameter sentence
+/// ([`BAD_REQUEST_MESSAGE`]) — the service has no sentence of its own for a
+/// resume token, so an unusable one is told the same thing as any other
+/// parameter it cannot read, and the token itself never reaches the message.
+///
+/// Built HERE, like [`malformed_arn`], so no listing composes its own wording
+/// for a token: one condition, one envelope, whichever listing met it. A token
+/// this service DID mint but that names an entry the caller's registry no longer
+/// holds is not this refusal — it resumes an empty page.
+pub fn invalid_page_token() -> BadRequestException {
+    parameter_refusal(NEXT_TOKEN_MEMBER, BAD_REQUEST_MESSAGE)
+}
 
 /// One `BadRequestException` naming a request member and carrying one of the
 /// service's fixed sentences, so the two refusals above cannot drift apart on

@@ -625,19 +625,19 @@ async fn an_unresolvable_request_is_refused() {
             "a token minted for another cluster",
             live.clone(),
             format!("?nextToken={}", pct(&foreign_token)),
-            "NextToken",
+            "nextToken",
         ),
         (
             "a token that is not base64",
             live.clone(),
             "?nextToken=not-a-token".to_string(),
-            "NextToken",
+            "nextToken",
         ),
         (
             "base64 of something else",
             live.clone(),
             "?nextToken=bm90LWEtdG9rZW4%3D".to_string(),
-            "NextToken",
+            "nextToken",
         ),
     ];
 

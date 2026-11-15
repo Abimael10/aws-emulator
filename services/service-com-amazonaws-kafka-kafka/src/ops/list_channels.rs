@@ -233,10 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(name) => Some(name),
                 None => {
                     return Err(ListChannelsErrorModeled::BadRequestException(
-                        BadRequestException {
-                            invalid_parameter: Some("NextToken".to_string()),
-                            message: Some("The pagination token is not valid.".to_string()),
-                        },
+                        crate::state::invalid_page_token(),
                     )
                     .into())
                 }

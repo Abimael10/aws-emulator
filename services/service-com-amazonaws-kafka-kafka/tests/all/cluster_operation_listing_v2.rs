@@ -37,12 +37,14 @@ use crate::kafka_harness::{
 /// finished; `PROVISIONED` and `SERVERLESS` are the members of the model's
 /// `ClusterType` enum, which `ClusterOperationV2Summary$ClusterType` targets;
 /// the not-found wording is the one this service answers for a resource that
-/// does not exist (its apostrophe is U+2019, as the service writes it).
+/// does not exist (its apostrophe is U+2019, as the service writes it). A resume
+/// token this listing cannot read is answered with the service's GENERIC
+/// parameter sentence — it has none of its own for a token.
 const OPERATION_STATE_COMPLETE: &str = "UPDATE_COMPLETE";
 const CLUSTER_TYPE_PROVISIONED: &str = "PROVISIONED";
 const CLUSTER_TYPE_SERVERLESS: &str = "SERVERLESS";
 const NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
-const INVALID_TOKEN_MESSAGE: &str = "The pagination token is not valid.";
+const INVALID_TOKEN_MESSAGE: &str = "One or more of the parameters are not valid.";
 
 /// The members `ClusterOperationV2Summary` declares, from
 /// `smithy_query(query="shape", shape="com.amazonaws.kafka#ClusterOperationV2Summary")`:

@@ -8,14 +8,14 @@
 //! the two deletes of this service take their resource's version on the OPTIONAL
 //! `currentVersion` query parameter (`smithy_query(query="operation",
 //! operation="DeleteCluster,DeleteReplicator")`: `CurrentVersion` is an
-//! `@httpQuery` member and only the ARN `@httpLabel` is required), so a request
-//! that sends one asks for the delete to go through only while the resource is
-//! still at that version. A reference the service cannot read at all resolves no
-//! resource, so that pre-condition can never be satisfied: the HTTP 400
-//! `BadRequestException` names `currentVersion` in `invalidParameter`. A request
-//! that sent no version states no such pre-condition, so the same refusal names
-//! the member that carried the unreadable reference. The sentence is the
-//! surface's own either way and does not depend on the request.
+//! `@httpQuery` member and only the ARN `@httpLabel` is required), and each
+//! surface blames the input Amazon MSK blames for a reference it cannot read:
+//! the CLUSTER delete names the version pre-condition it could not check
+//! (`currentVersion`) when the request quoted a version, and the member that
+//! carried the reference when it quoted none; the REPLICATOR delete names the
+//! path-bound ARN member whether or not a version was quoted, because the ARN is
+//! what it could not read and the optional version is never examined. The
+//! sentence is the surface's own either way and does not depend on the request.
 //!
 //! The rows span what the rule generalises over: which delete answers (the
 //! cluster one and the replicator one, each with its own ARN member and its own
@@ -23,8 +23,8 @@
 //! ARN at all" to a cluster ARN missing a segment and a non-ASCII value), and
 //! which version the request quotes (absent, a well-formed version token, one no
 //! cluster is ever minted at, a lower-cased one and a value that is not shaped
-//! like a version at all) — the attribution is the pre-condition's, not one
-//! version string's.
+//! like a version at all) — the attribution is the surface's, not one version
+//! string's.
 //!
 //! The controls hold the rest of the surface fixed: a reference the service CAN
 //! read is answered on the resource (a well-formed ARN holding nothing is the
@@ -53,14 +53,16 @@ use super::kafka_harness::{
 const GHOST_ID: &str = "11111111-2222-4333-8444-555555555555-1";
 
 /// One delete the rule covers: the route the model binds it to, the member its
-/// reference travels in and the fixed sentence that surface answers a reference
-/// it cannot read with.
+/// reference travels in, the fixed sentence that surface answers a reference it
+/// cannot read with, and whether that surface blames the version pre-condition
+/// when the request quotes one.
 struct Delete {
     name: &'static str,
     /// The path the resource's ARN is percent-encoded into, as a prefix.
     prefix: &'static str,
     arn_member: &'static str,
     message: &'static str,
+    blames_quoted_version: bool,
 }
 
 impl Delete {
@@ -73,6 +75,15 @@ impl Delete {
             None => base,
         }
     }
+
+    /// The input this surface blames for a reference it cannot read, given the
+    /// version the request quoted.
+    fn blamed(&self, current_version: Option<&str>) -> &'static str {
+        match current_version {
+            Some(_) if self.blames_quoted_version => CURRENT_VERSION_MEMBER,
+            _ => self.arn_member,
+        }
+    }
 }
 
 /// The two deletes of this service whose version pre-condition is opt-in.
@@ -83,12 +94,14 @@ fn deletes() -> Vec<Delete> {
             prefix: "/v1/clusters/",
             arn_member: CLUSTER_ARN_MEMBER,
             message: BAD_REQUEST_MESSAGE,
+            blames_quoted_version: true,
         },
         Delete {
             name: "DeleteReplicator",
             prefix: "/replication/v1/replicators/",
             arn_member: REPLICATOR_ARN_MEMBER,
             message: VALUE_NOT_VALID_MESSAGE,
+            blames_quoted_version: false,
         },
     ]
 }
@@ -187,13 +200,13 @@ fn assert_blamed(
 }
 
 /// RULE: a delete handed a reference it cannot read refuses it with HTTP 400
-/// `BadRequestException` naming the version pre-condition the request asked for
-/// (`currentVersion`) when the request quoted a version, and the member that
-/// carried the reference when it quoted none — whichever delete answers,
-/// whatever makes the reference unreadable and whatever version is quoted, with
-/// that surface's one fixed sentence either way.
+/// `BadRequestException` naming the input that surface blames — the version
+/// pre-condition the request asked for (`currentVersion`) on the cluster delete
+/// when the request quoted a version, and the member that carried the reference
+/// otherwise — whatever makes the reference unreadable and whatever version is
+/// quoted, with that surface's one fixed sentence either way.
 #[tokio::test]
-async fn an_unreadable_reference_is_blamed_on_the_version_precondition_it_states() {
+async fn an_unreadable_reference_is_blamed_on_the_input_its_surface_names() {
     let emulator = Emulator::new();
 
     for delete in deletes() {
@@ -203,10 +216,7 @@ async fn an_unreadable_reference_is_blamed_on_the_version_precondition_it_states
                 let reply = emulator
                     .call("DELETE", &delete.uri(&reference, probe), None)
                     .await;
-                let expected = match probe {
-                    Some(_) => CURRENT_VERSION_MEMBER,
-                    None => delete.arn_member,
-                };
+                let expected = delete.blamed(probe);
                 assert_blamed(
                     &reply,
                     &case,
@@ -220,11 +230,12 @@ async fn an_unreadable_reference_is_blamed_on_the_version_precondition_it_states
     }
 }
 
-/// RULE: the attribution follows the pre-condition, not the operation — so for
+/// RULE: on the cluster delete the attribution follows the pre-condition — for
 /// one and the same unreadable reference the only thing that changes which input
-/// is named is whether the request quoted a version at all.
+/// is named is whether the request quoted a version at all — while the
+/// replicator delete names the ARN it could not read either way.
 #[tokio::test]
-async fn one_reference_is_blamed_two_ways_by_whether_a_version_is_quoted() {
+async fn one_reference_is_blamed_by_whether_its_surface_reads_the_quoted_version() {
     let emulator = Emulator::new();
 
     for delete in deletes() {
@@ -244,10 +255,11 @@ async fn one_reference_is_blamed_two_ways_by_whether_a_version_is_quoted() {
                 without.at("/invalidParameter").as_str(),
                 with.at("/invalidParameter").as_str(),
             ),
-            (Some(delete.arn_member), Some(CURRENT_VERSION_MEMBER)),
-            "case {}: expected {} without a version and {CURRENT_VERSION_MEMBER} with one, got {} and {}",
+            (Some(delete.arn_member), Some(delete.blamed(Some("any")))),
+            "case {}: expected {} without a version and {} with one, got {} and {}",
             delete.name,
             delete.arn_member,
+            delete.blamed(Some("any")),
             without.body,
             with.body
         );

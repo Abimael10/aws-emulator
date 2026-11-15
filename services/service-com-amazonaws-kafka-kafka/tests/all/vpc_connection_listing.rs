@@ -510,8 +510,8 @@ async fn a_pagination_token_from_elsewhere_is_refused() {
         );
         assert_eq!(
             reply.at("/invalidParameter").as_str(),
-            Some("NextToken"),
-            "case {case}: expected the refusal to name NextToken, got {}",
+            Some("nextToken"),
+            "case {case}: expected the refusal to name nextToken, got {}",
             reply.body
         );
     }

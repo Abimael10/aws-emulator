@@ -12,10 +12,9 @@
 //! this service waits for one.
 //!
 //! The replicator is resolved as the readers resolve it: a value that is not shaped
-//! like a replicator ARN is a `BadRequestException` — naming the version
-//! pre-condition the request asked for and this service cannot check against a
-//! reference that resolves no replicator, or the ARN member itself when the request
-//! supplied no version ([`crate::state::unreadable_delete_reference`]) — and a
+//! like a replicator ARN is a `BadRequestException` naming the member that carried
+//! it ([`crate::state::invalid_replicator_arn`]) — the path-bound ARN is what could
+//! not be read, whether or not the request also quoted a version — and a
 //! well-formed one this endpoint's region holds no replicator for is a
 //! `NotFoundException` naming the input member at fault. A `CurrentVersion` the
 //! caller supplies must be the version the replicator is actually at, so a delete
@@ -173,16 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         // A value that is not a replicator ARN at all names no replicator: the
         // service's one fixed sentence for an unusable value, which echoes none of
-        // it. A request that supplied `currentVersion` asked for a version
-        // pre-condition that no unreadable reference can ever satisfy, so that is
-        // the input the refusal names.
+        // it, blaming the member that carried the value this call could not read —
+        // the path-bound ARN. The optional `currentVersion` is never the input at
+        // fault here: it is unconstrained by the model and was never even reached,
+        // so the reference is resolved before anything looks at it.
         if !crate::state::is_replicator_arn(&input.replicator_arn) {
             return Err(DeleteReplicatorErrorModeled::BadRequestException(
-                crate::state::unreadable_delete_reference(
-                    input.current_version.as_deref(),
-                    crate::state::REPLICATOR_ARN_MEMBER,
-                    crate::state::VALUE_NOT_VALID_MESSAGE,
-                ),
+                crate::state::invalid_replicator_arn(),
             )
             .into());
         }

@@ -125,6 +125,8 @@ mod list_clusters_v2;
 mod monitoring_update;
 #[path = "all/node_listing.rs"]
 mod node_listing;
+#[path = "all/pagination_token_refusal.rs"]
+mod pagination_token_refusal;
 #[path = "all/placement_subnet_resolution.rs"]
 mod placement_subnet_resolution;
 #[path = "all/rebalancing_update.rs"]

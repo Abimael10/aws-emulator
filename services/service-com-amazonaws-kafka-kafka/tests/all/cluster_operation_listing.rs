@@ -36,12 +36,13 @@ use crate::kafka_harness::{
 /// finished; the two messages are the ones this service answers for a resource
 /// that does not exist and for a call against a cluster that has no customer
 /// broker nodes (the apostrophe in the first is U+2019, as the service writes
-/// it).
+/// it). A resume token this listing cannot read is answered with the service's
+/// GENERIC parameter sentence — it has none of its own for a token.
 const OPERATION_STATE_COMPLETE: &str = "UPDATE_COMPLETE";
 const NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
 const PROVISIONED_ONLY_MESSAGE: &str =
     "The cluster is a serverless cluster; this operation applies to provisioned clusters only.";
-const INVALID_TOKEN_MESSAGE: &str = "The pagination token is not valid.";
+const INVALID_TOKEN_MESSAGE: &str = "One or more of the parameters are not valid.";
 
 /// One update a row files: the route under the cluster its `http` binding
 /// names, the body it submits beside `currentVersion`, and the `operationType`

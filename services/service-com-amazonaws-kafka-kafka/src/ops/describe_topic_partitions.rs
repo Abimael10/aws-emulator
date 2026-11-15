@@ -325,10 +325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(partition) => Some(partition),
                     None => {
                         return Err(DescribeTopicPartitionsErrorModeled::BadRequestException(
-                            BadRequestException {
-                                invalid_parameter: Some("nextToken".to_string()),
-                                message: Some("The pagination token is not valid.".to_string()),
-                            },
+                            crate::state::invalid_page_token(),
                         )
                         .into())
                     }

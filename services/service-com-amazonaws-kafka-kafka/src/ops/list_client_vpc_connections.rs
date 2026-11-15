@@ -263,10 +263,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => match decode_next_token(token, &cluster_arn) {
                 Some(arn) => Some(arn),
                 None => {
-                    return Err(bad_request(
-                        "NextToken",
-                        "The pagination token is not valid.".to_string(),
-                    ))
+                    return Err(ListClientVpcConnectionsErrorModeled::BadRequestException(
+                        crate::state::invalid_page_token(),
+                    )
+                    .into())
                 }
             },
         };

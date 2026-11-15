@@ -17,7 +17,7 @@
 //! `BadRequestException` naming the version pre-condition the request asked for
 //! and this service cannot check against a reference that resolves no cluster
 //! (`currentVersion`), or the ARN member itself when the request supplied no
-//! version ([`crate::state::unreadable_delete_reference`]); a well-formed one
+//! version ([`crate::state::unreadable_cluster_reference`]); a well-formed one
 //! this endpoint's region holds no cluster for — absent, or belonging to another
 //! region — is a `NotFoundException`.
 //!
@@ -178,11 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that supplied none is told about the reference itself.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
             return Err(DeleteClusterErrorModeled::BadRequestException(
-                crate::state::unreadable_delete_reference(
-                    input.current_version.as_deref(),
-                    crate::state::CLUSTER_ARN_MEMBER,
-                    crate::state::BAD_REQUEST_MESSAGE,
-                ),
+                crate::state::unreadable_cluster_reference(input.current_version.as_deref()),
             )
             .into());
         }
