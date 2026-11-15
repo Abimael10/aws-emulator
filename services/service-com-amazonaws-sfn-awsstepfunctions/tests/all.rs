@@ -257,6 +257,8 @@ mod state_machine_versions;
 mod state_roundtrip;
 #[path = "all/states_metric_families.rs"]
 mod states_metric_families;
+#[path = "all/stop_execution_on_a_terminal_execution.rs"]
+mod stop_execution_on_a_terminal_execution;
 #[path = "all/stuck_state_cause.rs"]
 mod stuck_state_cause;
 #[path = "all/sync_execution.rs"]

@@ -2226,3 +2226,16 @@ mod zz_probe_whole_emulator;
 // `tests/all.rs` is a test-target CRATE ROOT, where a bare `mod` resolves to a SIBLING under
 // `tests/` that the layout check refuses: the `#[path]` above each declaration is what points
 // it into `tests/all/`.
+// One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`,
+// sorted by name, and no other line: two branches landing at once then insert two lines
+// in two places and have no prose to duplicate, re-word or mistype. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair in sorted position; what that suite covers,
+// suite's own module header, where it is read beside the test it explains.
+// deliberate: a comment opening with a `/` `/` `!` run documents the module it stands in,
+// so the language accepts it only ahead of the first item and one appended past the
+// declarations is `E0753`, which compiles no suite of this target. With none anywhere in
+// the file, no merge of two landings can leave one there. A second pair for one name is
+// `E0428`, and a suite file no pair names is compiled nowhere.
+// `all/every_suite_file_is_declared.rs` pin all of it, for this root and for every
+// service crate's `tests/all.rs`, so a note about any of those rules belongs there
+// rather than here; the notes earlier landings had appended to this file live in
