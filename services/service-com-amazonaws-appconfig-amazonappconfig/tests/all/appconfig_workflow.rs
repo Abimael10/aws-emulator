@@ -426,6 +426,42 @@ pub(crate) async fn host_version(
         .unwrap_or_else(|| panic!("case {case:?}: no Version-Number on the create response"))
 }
 
+/// Create a deployment strategy with no rollout window and no bake time, answering its
+/// minted id: a deployment it paces has nothing to wait out but the one growth interval
+/// every rollout takes, so a suite that needs a settled deployment does not wait on a
+/// schedule.
+///
+/// `pub(crate)` because more than one suite in this target deploys with such a strategy.
+pub(crate) async fn instant_deployment_strategy(
+    router: &MultiServiceRouter,
+    name: &str,
+) -> String {
+    let answer = json_call(
+        router,
+        "POST",
+        "/deploymentstrategies",
+        &serde_json::json!({
+            "Name": name,
+            "DeploymentDurationInMinutes": 0,
+            "GrowthFactor": 100.0,
+            "GrowthType": "LINEAR",
+            "FinalBakeTimeInMinutes": 0,
+            "ReplicateTo": "NONE",
+        }),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        201,
+        "case {name:?}: CreateDeploymentStrategy must answer 201, got {} / {}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    answer
+        .string("Id")
+        .unwrap_or_else(|| panic!("case {name:?}: CreateDeploymentStrategy answered no Id"))
+}
+
 /// Whether `id` satisfies the model's `Id` shape, `^[a-z0-9]{4,7}$`.
 pub(crate) fn is_modelled_id(id: &str) -> bool {
     (4..=7).contains(&id.chars().count())

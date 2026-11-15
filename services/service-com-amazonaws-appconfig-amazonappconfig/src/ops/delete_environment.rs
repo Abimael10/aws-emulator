@@ -194,8 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An environment only exists under an application, so the parent is resolved
         // first and whichever level is missing is the resource the 404 names — the same
-        // order `GetEnvironment` and `UpdateEnvironment` resolve in.
-        let Some(application) = store.application_mut(&input.application_id) else {
+        // order `GetEnvironment` and `UpdateEnvironment` resolve in, each level by its id
+        // or by its name.
+        let Some(application) = store.resolve_application_mut(&input.application_id) else {
             return Err(DeleteEnvironmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(
@@ -219,11 +220,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under it. For the same reason the deployment RECORDS are not destroyed with the
         // environment: `Application::delete_environment` keeps them, so a caller settling
         // such a deployment with `StopDeployment` still reaches it.
-        let Some(removed) = application.delete_environment(&input.environment_id) else {
+        // The level that DID resolve is named by the id it resolved to; the level that did
+        // not is named as the request spelled it.
+        let application_id = application.id.clone();
+        let Some(removed) = application.delete_resolved_environment(&input.environment_id) else {
             return Err(DeleteEnvironmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::environment_not_found(
-                        &input.application_id,
+                        &application_id,
                         &input.environment_id,
                     )),
                     resource_name: Some(input.environment_id),
@@ -238,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         tracing::info!(
             operation = "DeleteEnvironment",
             outcome = "deleted",
-            application_id = input.application_id.as_str(),
+            application_id = application_id.as_str(),
             environment_id = removed.id.as_str(),
             state = removed.state.as_str(),
             "deleted an environment"

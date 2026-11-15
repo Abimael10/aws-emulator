@@ -217,22 +217,24 @@ fn document(deployment: &crate::state::Deployment) -> StopDeploymentOutput {
 /// verb it asked for, the state the stop was judged against, and the reason the record
 /// refused it.
 fn refused(
+    application_id: &str,
+    environment_id: &str,
     input: &StopDeploymentInput,
     state_before: &str,
     refusal: crate::state::StopRefusal,
 ) -> StopDeploymentError {
     bad_request(match refusal {
         crate::state::StopRefusal::NotStoppable => crate::state::deployment_cannot_be_stopped(
-            &input.application_id,
-            &input.environment_id,
+            application_id,
+            environment_id,
             input.deployment_number,
             crate::state::StopVerb::of(input.allow_revert.unwrap_or(false)),
             state_before,
         ),
         crate::state::StopRefusal::RevertWindowElapsed => {
             crate::state::deployment_revert_window_elapsed(
-                &input.application_id,
-                &input.environment_id,
+                application_id,
+                environment_id,
                 input.deployment_number,
             )
         }
@@ -240,15 +242,16 @@ fn refused(
 }
 
 /// The `ResourceNotFoundException` for a deployment this application holds no record of,
-/// under the environment id and number the request named.
-fn deployment_missing(input: &StopDeploymentInput) -> StopDeploymentError {
+/// under the environment and number the request named — each named by the id it resolved
+/// to, or as the request spelled it where it resolved to nothing.
+fn deployment_missing(
+    application_id: &str,
+    environment_id: &str,
+    deployment_number: i32,
+) -> StopDeploymentError {
     not_found(
-        crate::state::deployment_not_found(
-            &input.application_id,
-            &input.environment_id,
-            input.deployment_number,
-        ),
-        input.deployment_number.to_string(),
+        crate::state::deployment_not_found(application_id, environment_id, deployment_number),
+        deployment_number.to_string(),
     )
 }
 
@@ -301,43 +304,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let allow_revert = input.allow_revert.unwrap_or(false);
 
         // The application the stop is scoped to is resolved first, as every operation
-        // addressed through an application id resolves it. BELOW that level the resource
-        // this request addresses is the DEPLOYMENT, so an environment that holds no such
-        // deployment and a number nothing ever issued are both reported as the deployment
-        // that could not be found — the same way `GetDeployment` reports them.
-        let Some(application) = store.application_mut(&input.application_id) else {
+        // addressed through an application id resolves it — by that id or by the
+        // application's name, the two forms the member accepts. BELOW that level the
+        // resource this request addresses is the DEPLOYMENT, so an environment that holds no
+        // such deployment and a number nothing ever issued are both reported as the
+        // deployment that could not be found — the same way `GetDeployment` reports them.
+        let Some(application) = store.resolve_application_mut(&input.application_id) else {
             return Err(not_found(
                 crate::state::application_not_found(&input.application_id),
                 input.application_id,
             ));
         };
+        // The levels that DID resolve are named by the ids they resolved to; an environment
+        // that resolved to nothing is named as the request spelled it, and misses below.
+        let application_id = application.id.clone();
+        let environment_id = application
+            .resolve_environment_id(&input.environment_id)
+            .unwrap_or_else(|| input.environment_id.clone());
 
         // A deployment record outlives the environment it was started into, so the
         // environment named by the path may be gone while the deployment it issued is
         // still a record this application holds — which is exactly the deployment a
         // caller tearing an environment down settles with this operation.
-        if !application.environments.contains_key(&input.environment_id) {
+        if !application.environments.contains_key(&environment_id) {
             let Some(deployment) = application
-                .deployment_without_environment_mut(&input.environment_id, input.deployment_number)
+                .deployment_without_environment_mut(&environment_id, input.deployment_number)
             else {
-                return Err(deployment_missing(&input));
+                return Err(deployment_missing(
+                    &application_id,
+                    &environment_id,
+                    input.deployment_number,
+                ));
             };
             // Only a rollback already under way is still owed to this record: see
             // `Deployment::materialize_without_environment`.
             deployment.materialize_without_environment(now);
             let state_before = deployment.state.clone();
             if let Err(refusal) = deployment.stop(allow_revert, now) {
-                return Err(refused(&input, &state_before, refusal));
+                return Err(refused(
+                    &application_id,
+                    &environment_id,
+                    &input,
+                    &state_before,
+                    refusal,
+                ));
             }
             // Answered from the stored record, after the stop was written to it.
             return Ok(document(deployment));
         }
 
-        let Some(environment) = application.environments.get_mut(&input.environment_id) else {
+        let Some(environment) = application.environments.get_mut(&environment_id) else {
             // Unreachable: the branch above answered every request whose environment this
             // application does not hold. Reported as the deployment that could not be
             // found rather than panicking on a request.
-            return Err(deployment_missing(&input));
+            return Err(deployment_missing(
+                &application_id,
+                &environment_id,
+                input.deployment_number,
+            ));
         };
 
         // Bring the environment up to date first: whether a stop applies depends on the
@@ -346,13 +370,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         environment.materialize(now);
 
         let Some(deployment) = environment.deployments.get_mut(&input.deployment_number) else {
-            return Err(deployment_missing(&input));
+            return Err(deployment_missing(
+                &application_id,
+                &environment_id,
+                input.deployment_number,
+            ));
         };
 
         // The state the refusal reports is the one the stop was judged against.
         let state_before = deployment.state.clone();
         if let Err(refusal) = deployment.stop(allow_revert, now) {
-            return Err(refused(&input, &state_before, refusal));
+            return Err(refused(
+                &application_id,
+                &environment_id,
+                &input,
+                &state_before,
+                refusal,
+            ));
         }
 
         // Answered from the stored record, after the stop was written to it.

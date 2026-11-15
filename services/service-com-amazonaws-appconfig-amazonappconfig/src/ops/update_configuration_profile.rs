@@ -188,15 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The resource this update acts on is the configuration profile, so the whole path
-        // is resolved as one lookup and a path that resolves no profile is refused as that
-        // profile — whichever of the two identifiers is the unresolvable one.
-        let Some(profile) = store.configuration_profile_mut(
+        // is resolved as one lookup — each level by its id or by its name, the two forms
+        // these members accept — and a path that resolves no profile is refused as that
+        // profile, whichever of the two identifiers is the unresolvable one.
+        let Some(profile) = store.resolve_configuration_profile_mut(
             &input.application_id,
             &input.configuration_profile_id,
         ) else {
             return Err(UpdateConfigurationProfileErrorModeled::ResourceNotFoundException(
                 crate::state::configuration_profile_not_found_exception(
-                    &input.application_id,
+                    &store.application_label(&input.application_id),
                     &input.configuration_profile_id,
                 ),
             )

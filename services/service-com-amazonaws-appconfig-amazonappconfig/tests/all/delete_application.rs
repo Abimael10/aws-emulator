@@ -649,9 +649,10 @@ async fn a_deleted_application_is_gone_with_everything_still_stored_under_it() {
 /// application's own `ResourceNotFoundException` template.
 ///
 /// Rows differ along the form of the identifier — its length at both `Name` bounds
-/// (1..64), a value shaped like a minted id, and an application's NAME, which this
-/// operation's `ApplicationId` member ("the ID of the application to delete") does not
-/// address — so a refusal is pinned for each, together with the store being unchanged.
+/// (1..64), a value shaped like a minted id, and a name no application in the account
+/// holds, since this operation's `ApplicationId` member addresses an application by its id
+/// or by its name — so a refusal is pinned for each, together with the store being
+/// unchanged.
 #[tokio::test]
 async fn a_delete_that_resolves_no_application_removes_nothing() {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -686,7 +687,10 @@ async fn a_delete_that_resolves_no_application_removes_nothing() {
             "an identifier at the 64-character Name bound",
             "u".repeat(MAX_NAME),
         ),
-        ("the application's name rather than its id", name.to_string()),
+        (
+            "a name no application in the account holds",
+            format!("{name}-not-held"),
+        ),
     ];
 
     for (case, identifier) in unknown {

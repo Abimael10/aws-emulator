@@ -194,20 +194,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _requested_check = input.deletion_protection_check;
 
         // The resource this delete acts on is the configuration profile, so the whole path
-        // is resolved as one lookup and a path that resolves no profile is refused as that
-        // profile — whichever of the two identifiers is the unresolvable one, the same
+        // is resolved as one lookup — each level by its id or by its name, the two forms
+        // these members accept — and a path that resolves no profile is refused as that
+        // profile, whichever of the two identifiers is the unresolvable one: the same
         // refusal `GetConfigurationProfile` and `UpdateConfigurationProfile` answer.
-        let Some(profile) =
-            store.configuration_profile(&input.application_id, &input.configuration_profile_id)
-        else {
+        let Some(profile) = store.resolve_configuration_profile(
+            &input.application_id,
+            &input.configuration_profile_id,
+        ) else {
             return Err(DeleteConfigurationProfileErrorModeled::ResourceNotFoundException(
                 crate::state::configuration_profile_not_found_exception(
-                    &input.application_id,
+                    &store.application_label(&input.application_id),
                     &input.configuration_profile_id,
                 ),
             )
             .into());
         };
+
+        let application_id = profile.application_id.clone();
+        let configuration_profile_id = profile.id.clone();
 
         // A profile OWNS the hosted configuration versions written into it, and AppConfig
         // does not cascade that ownership away: while any version is still there the
@@ -223,8 +228,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tracing::debug!(
                 operation = "DeleteConfigurationProfile",
                 outcome = "BadRequestException",
-                application_id = input.application_id.as_str(),
-                configuration_profile_id = input.configuration_profile_id.as_str(),
+                application_id = application_id.as_str(),
+                configuration_profile_id = configuration_profile_id.as_str(),
                 hosted_versions = profile.hosted_versions.len(),
                 "refused a configuration profile delete"
             );
@@ -232,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 BadRequestException {
                     message: Some(
                         crate::state::configuration_profile_still_has_hosted_versions(
-                            &input.configuration_profile_id,
+                            &configuration_profile_id,
                         ),
                     ),
                     reason: None,
@@ -250,15 +255,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hosted-content budget is freed here and no other resource is touched: the
         // deployments an environment holds are that environment's records, and they keep
         // reporting the configuration they were started with.
-        store.remove_configuration_profile(&input.application_id, &input.configuration_profile_id);
+        store.remove_resolved_configuration_profile(
+            &input.application_id,
+            &input.configuration_profile_id,
+        );
 
         // An attribution record for the removal, so the one call that takes a stored
         // resource out of this service's state is observable beside its refusals.
         tracing::debug!(
             operation = "DeleteConfigurationProfile",
             outcome = "deleted",
-            application_id = input.application_id.as_str(),
-            configuration_profile_id = input.configuration_profile_id.as_str(),
+            application_id = application_id.as_str(),
+            configuration_profile_id = configuration_profile_id.as_str(),
             "deleted a configuration profile"
         );
 

@@ -251,10 +251,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let hosted_feature_flags_profile = {
             let store = state.lock();
             store
-                .application(&input.application_id)
-                .and_then(|application| {
-                    application.profiles.get(&input.configuration_profile_id)
-                })
+                .resolve_configuration_profile(
+                    &input.application_id,
+                    &input.configuration_profile_id,
+                )
                 .is_some_and(|profile| {
                     profile.profile_type == crate::state::FEATURE_FLAGS_PROFILE_TYPE
                         && profile.location_uri == crate::state::HOSTED_LOCATION_URI
@@ -270,10 +270,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `PRE_CREATE_HOSTED_CONFIGURATION_VERSION` invocation below cannot be made while
         // it is held, so the guard is confined to this block and the version is stored
         // from a second look at the store afterwards.
-        let (mut content, targets, event, profile_type, previously_stored) = {
+        let (mut content, targets, event, profile_type, previously_stored, resolved) = {
         let mut store = state.lock();
 
-        let Some(application) = store.application(&input.application_id) else {
+        // A version only exists under a profile, which only exists under an application, so
+        // both parents are resolved outermost-first — each by its id or by its name, the two
+        // forms these members accept — and whichever level is missing is the resource the
+        // 404 names. What the lookup resolved is what the record, the action point's scope
+        // and the refusals below name.
+        let Some(application) = store.resolve_application(&input.application_id) else {
             return Err(CreateHostedConfigurationVersionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(
@@ -284,11 +289,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
+        let application_id = application.id.clone();
+        let Some(profile) = application.resolve_profile(&input.configuration_profile_id) else {
             return Err(CreateHostedConfigurationVersionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::configuration_profile_not_found(
-                        &input.application_id,
+                        &application_id,
                         &input.configuration_profile_id,
                     )),
                     resource_name: Some(input.configuration_profile_id),
@@ -296,6 +302,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let configuration_profile_id = profile.id.clone();
 
         // A hosted configuration version only exists in AppConfig's own hosted store,
         // which a profile selects with the `LocationUri` the model documents as
@@ -307,7 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(format!(
                         "Configuration profile {} has LocationUri {}, not {}, so it does not use \
                          the AppConfig hosted configuration store.",
-                        input.configuration_profile_id,
+                        configuration_profile_id,
                         profile.location_uri,
                         crate::state::HOSTED_LOCATION_URI
                     )),
@@ -404,12 +411,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .latest_hosted_version()
             .map(|version| version.content.clone());
         let scope = crate::state::extension_actions::Scope {
-            application_id: &input.application_id,
+            application_id: &application_id,
             // A hosted configuration version is written against a profile, which no
             // environment is part of, so an association bound to an environment is not
             // bound to this workflow.
             environment_id: None,
-            configuration_profile_id: Some(&input.configuration_profile_id),
+            configuration_profile_id: Some(&configuration_profile_id),
         };
         let targets = crate::state::extension_actions::targets_at(
             &mut store,
@@ -421,10 +428,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &std::collections::HashMap::new(),
         );
         let mut event = crate::state::extension_actions::ActionEvent::new()
-            .resource("Application", &input.application_id, &application_name)
+            .resource("Application", &application_id, &application_name)
             .resource(
                 "ConfigurationProfile",
-                &input.configuration_profile_id,
+                &configuration_profile_id,
                 &profile_name,
             )
             .content(&input.content_type, &version_number.to_string(), &content);
@@ -432,8 +439,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             event = event.member("PreviousContent", previous);
         }
 
-        (content, targets, event, profile_type, previously_stored)
+        (
+            content,
+            targets,
+            event,
+            profile_type,
+            previously_stored,
+            (application_id, configuration_profile_id),
+        )
         };
+        let (application_id, configuration_profile_id) = resolved;
 
         // The action point is consulted BEFORE the version is created: a target that
         // refuses the action refuses this write and stores nothing, and a target that
@@ -551,16 +566,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(profile) = store
-            .application(&input.application_id)
-            .and_then(|application| application.profiles.get(&input.configuration_profile_id))
+            .application(&application_id)
+            .and_then(|application| application.profiles.get(&configuration_profile_id))
         else {
             return Err(CreateHostedConfigurationVersionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::configuration_profile_not_found(
-                        &input.application_id,
-                        &input.configuration_profile_id,
+                        &application_id,
+                        &configuration_profile_id,
                     )),
-                    resource_name: Some(input.configuration_profile_id),
+                    resource_name: Some(configuration_profile_id),
                 },
             )
             .into());
@@ -627,7 +642,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(format!(
                             "Cannot create another hosted configuration version: configuration \
                              profile {} already holds the maximum of {}.",
-                            input.configuration_profile_id,
+                            configuration_profile_id,
                             crate::state::MAX_HOSTED_CONFIGURATION_VERSIONS_PER_PROFILE
                         )),
                     },
@@ -657,12 +672,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(profile) = store
-            .application_mut(&input.application_id)
-            .and_then(|application| {
-                application
-                    .profiles
-                    .get_mut(&input.configuration_profile_id)
-            })
+            .application_mut(&application_id)
+            .and_then(|application| application.profiles.get_mut(&configuration_profile_id))
         else {
             return Err(CreateHostedConfigurationVersionErrorModeled::InternalServerException(
                 InternalServerException {

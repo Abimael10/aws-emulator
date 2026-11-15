@@ -43,6 +43,9 @@ pub mod extension_actions;
 /// methods every operation reaches them through.
 mod extension_store;
 pub mod feature_flags;
+/// Resolving an application, environment or configuration-profile identifier by id or by
+/// the resource's name, which every operation taking one of those members does.
+mod identifiers;
 pub mod rollout;
 pub mod treatment_assignments;
 pub mod validators;

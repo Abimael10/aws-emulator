@@ -145,7 +145,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = state.lock();
 
-        let Some(application) = store.application(&input.application_id) else {
+        // `ApplicationId` is the application's id OR its name — the member targets `Name`
+        // (len 1..64) and carries none of the `Id` pattern this operation's own `Id` output
+        // does — so it is resolved the way every member addressing an application is, and
+        // the record it resolves to is reported with its logical `Id`.
+        let Some(application) = store.resolve_application(&input.application_id) else {
             return Err(GetApplicationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(

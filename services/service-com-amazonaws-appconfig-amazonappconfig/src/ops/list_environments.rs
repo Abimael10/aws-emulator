@@ -167,8 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // An environment only exists under an application, so an unresolvable application
-        // is not an empty listing: it is the 404 this operation models.
-        let Some(application) = store.application_mut(&input.application_id) else {
+        // is not an empty listing: it is the 404 this operation models. `ApplicationId` is
+        // the application's id or its name, the two forms the member accepts.
+        let Some(application) = store.resolve_application_mut(&input.application_id) else {
             return Err(ListEnvironmentsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(

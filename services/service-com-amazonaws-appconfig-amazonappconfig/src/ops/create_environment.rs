@@ -188,8 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // An environment only exists under an application, so the parent is resolved
-        // before an id is minted for the child.
-        let Some(application) = store.application(&input.application_id) else {
+        // before an id is minted for the child — by its id or by its name, the two forms
+        // `ApplicationId` accepts.
+        let Some(application) = store.resolve_application(&input.application_id) else {
             return Err(CreateEnvironmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(
@@ -211,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(format!(
                         "Cannot create another environment: application {} already holds the \
                          maximum of {} environments.",
-                        input.application_id,
+                        application.id,
                         crate::state::MAX_ENVIRONMENTS_PER_APPLICATION
                     )),
                 },
@@ -220,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_id();
-        let Some(application) = store.application_mut(&input.application_id) else {
+        let Some(application) = store.resolve_application_mut(&input.application_id) else {
             return Err(CreateEnvironmentErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(

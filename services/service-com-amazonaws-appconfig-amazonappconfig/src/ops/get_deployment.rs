@@ -203,26 +203,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = std::time::SystemTime::now();
+        // The ids the request's identifiers resolved to, which everything below this block
+        // reads the store and drives the clock by.
+        let application_id;
+        let environment_id;
         {
             let mut store = state.lock();
 
             // The application the lookup is scoped to is resolved first, as every operation
-            // addressed through an application id resolves it. BELOW that level the
+            // addressed through an application id resolves it — by that id or by the
+            // application's name, the two forms the member accepts. BELOW that level the
             // resource this request addresses is the DEPLOYMENT, so an environment that no
             // longer holds it — a deleted environment took its deployments with it — and a
             // number the environment never issued are both reported as the deployment that
             // could not be found, which is the refusal recorded for the first of those. The
             // deployment's own template names both parent ids, so nothing a level-by-level
             // refusal would say is withheld by reporting the miss that way.
-            if store.application(&input.application_id).is_none() {
+            let Some(resolved_application_id) = store.resolve_application_id(&input.application_id)
+            else {
                 return Err(not_found(
                     crate::state::application_not_found(&input.application_id),
                     input.application_id,
                 ));
-            }
+            };
+            application_id = resolved_application_id;
+            // The environment is named by the id it resolved to, or as the request spelled
+            // it when it resolved to nothing — in which case the lookup below misses and
+            // the deployment is reported as the resource that could not be found.
+            environment_id = store
+                .resolve_environment_id(&application_id, &input.environment_id)
+                .unwrap_or_else(|| input.environment_id.clone());
             let resolved = store
-                .application_mut(&input.application_id)
-                .and_then(|application| application.environments.get_mut(&input.environment_id))
+                .application_mut(&application_id)
+                .and_then(|application| application.environments.get_mut(&environment_id))
                 .is_some_and(|environment| {
                     // Reporting a deployment materialises only what the CLOCK already made
                     // due — the growth steps, the bake period and the completion the
@@ -237,8 +250,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !resolved {
                 return Err(not_found(
                     crate::state::deployment_not_found(
-                        &input.application_id,
-                        &input.environment_id,
+                        &application_id,
+                        &environment_id,
                         input.deployment_number,
                     ),
                     input.deployment_number.to_string(),
@@ -254,22 +267,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::extension_actions::drive_deployment(
             &*self.engine,
             ctx,
-            &input.application_id,
-            &input.environment_id,
+            &application_id,
+            &environment_id,
             input.deployment_number,
         )
         .await;
 
         let store = state.lock();
         let Some(deployment) = store
-            .application(&input.application_id)
-            .and_then(|application| application.environments.get(&input.environment_id))
+            .application(&application_id)
+            .and_then(|application| application.environments.get(&environment_id))
             .and_then(|environment| environment.deployments.get(&input.deployment_number))
         else {
             return Err(not_found(
                 crate::state::deployment_not_found(
-                    &input.application_id,
-                    &input.environment_id,
+                    &application_id,
+                    &environment_id,
                     input.deployment_number,
                 ),
                 input.deployment_number.to_string(),

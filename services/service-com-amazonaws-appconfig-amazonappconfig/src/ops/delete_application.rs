@@ -173,10 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        // `ApplicationId` is an id rather than an "ID or name" identifier, so it is
-        // looked up as the stored key, exactly as `GetApplication` and
-        // `UpdateApplication` look it up.
-        let Some(application) = store.application(&input.application_id) else {
+        // `ApplicationId` is the application's id OR its name — the member targets `Name`,
+        // not the `Id` pattern — so it is resolved the way `GetApplication` and
+        // `UpdateApplication` resolve it.
+        let Some(application) = store.resolve_application(&input.application_id) else {
             // An attribution record for the refusal: which resource was addressed and
             // what this call answered, so a destructive call that changed nothing leaves
             // a trace beside the ones that did.
@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tracing::debug!(
                 operation = "DeleteApplication",
                 outcome = "BadRequestException",
-                application_id = input.application_id.as_str(),
+                application_id = application.id.as_str(),
                 environments = application.environments.len(),
                 configuration_profiles = application.profiles.len(),
                 experiment_definitions = application.experiment_definitions.len(),
@@ -231,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteApplicationErrorModeled::BadRequestException(
                 BadRequestException {
                     message: Some(crate::state::application_still_has_children(
-                        &input.application_id,
+                        &application.id,
                         children,
                     )),
                     reason: None,
@@ -248,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `UpdateApplication`, `ListApplications`, the tagging operations and every
         // operation addressed through this application id all miss on it, because each of
         // them reads the map this took it out of.
-        let Some(removed) = store.remove_application(&input.application_id) else {
+        let Some(removed) = store.remove_resolved_application(&input.application_id) else {
             // The application was resolved under this same guard a moment ago, so this is
             // reachable only if the store stopped holding it while the lock was held.
             return Err(DeleteApplicationErrorModeled::InternalServerException(

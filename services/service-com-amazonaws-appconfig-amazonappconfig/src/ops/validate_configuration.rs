@@ -173,19 +173,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // block and the validators run after it. Nothing is written either way: this
         // operation reports a verdict about a configuration version, it does not change
         // one.
-        let (validators, location_uri, content) = {
+        let (application_id, configuration_profile_id, validators, location_uri, content) = {
             let store = state.lock();
 
-            let Some(application) = store.application(&input.application_id) else {
+            // Each level of the path is addressed by the resource's id or by its name, the
+            // two forms these members accept; what the lookup resolved is what the
+            // validators and the refusals below name.
+            let Some(application) = store.resolve_application(&input.application_id) else {
                 return Err(not_found(
                     crate::state::application_not_found(&input.application_id),
                     input.application_id,
                 ));
             };
-            let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
+            let Some(profile) = application.resolve_profile(&input.configuration_profile_id)
+            else {
                 return Err(not_found(
                     crate::state::configuration_profile_not_found(
-                        &input.application_id,
+                        &application.id,
                         &input.configuration_profile_id,
                     ),
                     input.configuration_profile_id,
@@ -200,13 +204,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(version) = profile.resolve_hosted_version(&input.configuration_version) else {
                 return Err(not_found(
                     crate::state::configuration_version_not_hosted(
-                        &input.configuration_profile_id,
+                        &profile.id,
                         &input.configuration_version,
                     ),
                     input.configuration_version,
                 ));
             };
             (
+                profile.application_id.clone(),
+                profile.id.clone(),
                 profile.validators.clone(),
                 profile.location_uri.clone(),
                 profile.served_content(&version.content),
@@ -218,8 +224,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // verdict that it is non-compliant is what this operation reports — the same gate,
         // over the same shared evaluation, that refuses a deployment of the version.
         let candidate = crate::state::validators::Candidate {
-            application_id: &input.application_id,
-            configuration_profile_id: &input.configuration_profile_id,
+            application_id: &application_id,
+            configuration_profile_id: &configuration_profile_id,
             configuration_version: &input.configuration_version,
             location_uri: &location_uri,
             content: &content,

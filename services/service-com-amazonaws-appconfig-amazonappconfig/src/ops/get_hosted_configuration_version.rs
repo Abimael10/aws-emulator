@@ -172,16 +172,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = state.lock();
 
-        let Some(application) = store.application(&input.application_id) else {
+        // A hosted configuration version is addressed through its two parents, each by its
+        // id or by its name — the two forms these members accept — and the version number
+        // within the profile they resolve to.
+        let Some(application) = store.resolve_application(&input.application_id) else {
             return Err(not_found(
                 crate::state::application_not_found(&input.application_id),
                 input.application_id,
             ));
         };
-        let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
+        let Some(profile) = application.resolve_profile(&input.configuration_profile_id) else {
             return Err(not_found(
                 crate::state::configuration_profile_not_found(
-                    &input.application_id,
+                    &application.id,
                     &input.configuration_profile_id,
                 ),
                 input.configuration_profile_id,
@@ -190,8 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(version) = profile.hosted_versions.get(&input.version_number) else {
             return Err(not_found(
                 crate::state::hosted_configuration_version_not_found(
-                    &input.application_id,
-                    &input.configuration_profile_id,
+                    &profile.application_id,
+                    &profile.id,
                     input.version_number,
                 ),
                 input.version_number.to_string(),

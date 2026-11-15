@@ -162,16 +162,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // invariant `CreateApplication` enforces holds over a patch, because an
         // application's name addresses it within the account and a rename onto a name
         // another application holds would leave two answering to one name. Renaming a
-        // record to the name it already carries collides with nothing.
+        // record to the name it already carries collides with nothing. The record being
+        // renamed is the one `ApplicationId` resolves to, by id or by name.
+        let renaming = store.resolve_application_id(&input.application_id);
         let name_held_by = input.name.as_deref().and_then(|name| {
             store
-                .application_named(name, Some(&input.application_id))
+                .application_named(name, renaming.as_deref())
                 .map(|holder| (name, holder.id.clone()))
         });
 
         // The application the path names must exist: this call patches a record, it never
-        // creates one.
-        let Some(application) = store.application_mut(&input.application_id) else {
+        // creates one. `ApplicationId` is the application's id or its name, the two forms
+        // the member accepts.
+        let Some(application) = store.resolve_application_mut(&input.application_id) else {
             return Err(UpdateApplicationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(

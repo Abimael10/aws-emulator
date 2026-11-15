@@ -39,6 +39,8 @@ mod configuration_profile_type;
 mod configuration_profile_validators;
 #[path = "all/control_plane_fidelity.rs"]
 mod control_plane_fidelity;
+#[path = "all/control_plane_identifier_by_id_or_name.rs"]
+mod control_plane_identifier_by_id_or_name;
 #[path = "all/create_deployment_strategy.rs"]
 mod create_deployment_strategy;
 #[path = "all/delete_application.rs"]

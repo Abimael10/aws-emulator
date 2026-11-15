@@ -166,16 +166,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A deployment only exists under an environment, which only exists under an
         // application, so an unresolvable level of the path is not an empty listing: it is
-        // the 404 this operation models, worded exactly as `GetDeployment` words it.
-        let Some(application) = store.application_mut(&input.application_id) else {
+        // the 404 this operation models, worded exactly as `GetDeployment` words it. Each
+        // level is addressed by its id or by its name, the two forms these members accept.
+        let Some(application) = store.resolve_application_mut(&input.application_id) else {
             return Err(not_found(
                 crate::state::application_not_found(&input.application_id),
                 input.application_id,
             ));
         };
-        let Some(environment) = application.environments.get_mut(&input.environment_id) else {
+        // The level that DID resolve is named by the id it resolved to; the level that did
+        // not is named as the request spelled it.
+        let application_id = application.id.clone();
+        let Some(environment) = application.resolve_environment_mut(&input.environment_id) else {
             return Err(not_found(
-                crate::state::environment_not_found(&input.application_id, &input.environment_id),
+                crate::state::environment_not_found(&application_id, &input.environment_id),
                 input.environment_id,
             ));
         };

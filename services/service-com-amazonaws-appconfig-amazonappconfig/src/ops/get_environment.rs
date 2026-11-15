@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         let mut store = state.lock();
 
-        let Some(application) = store.application_mut(&input.application_id) else {
+        let Some(application) = store.resolve_application_mut(&input.application_id) else {
             return Err(GetEnvironmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(
@@ -170,11 +170,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(environment) = application.environments.get_mut(&input.environment_id) else {
+        // The level that DID resolve is named by the id it resolved to, whichever form the
+        // request wrote it in; the level that did not is named as the request spelled it.
+        let application_id = application.id.clone();
+        let Some(environment) = application.resolve_environment_mut(&input.environment_id) else {
             return Err(GetEnvironmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::environment_not_found(
-                        &input.application_id,
+                        &application_id,
                         &input.environment_id,
                     )),
                     resource_name: Some(input.environment_id),

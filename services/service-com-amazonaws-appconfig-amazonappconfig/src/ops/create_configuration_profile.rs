@@ -286,8 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A profile only exists under an application, so the parent is resolved before
-        // an id is minted for the child.
-        let Some(application) = store.application(&input.application_id) else {
+        // an id is minted for the child — by its id or by its name, the two forms
+        // `ApplicationId` accepts.
+        let Some(application) = store.resolve_application(&input.application_id) else {
             return Err(CreateConfigurationProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(
@@ -310,7 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(format!(
                             "Cannot create another configuration profile: application {} already \
                              holds the maximum of {} configuration profiles.",
-                            input.application_id,
+                            application.id,
                             crate::state::MAX_CONFIGURATION_PROFILES_PER_APPLICATION
                         )),
                     },
@@ -320,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_id();
-        let Some(application) = store.application_mut(&input.application_id) else {
+        let Some(application) = store.resolve_application_mut(&input.application_id) else {
             return Err(CreateConfigurationProfileErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(

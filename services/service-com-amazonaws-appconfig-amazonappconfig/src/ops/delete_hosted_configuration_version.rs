@@ -178,27 +178,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A hosted configuration version is addressed through its two parents, so they
-        // are resolved outermost-first and whichever level is missing is the resource the
-        // 404 names — the same order `CreateHostedConfigurationVersion` and
-        // `GetHostedConfigurationVersion` resolve this path in.
-        let Some(application) = store.application_mut(&input.application_id) else {
+        // are resolved outermost-first — each by its id or by its name, the two forms these
+        // members accept — and whichever level is missing is the resource the 404 names: the
+        // same order `CreateHostedConfigurationVersion` and `GetHostedConfigurationVersion`
+        // resolve this path in.
+        let Some(application) = store.resolve_application_mut(&input.application_id) else {
             return Err(not_found(
                 crate::state::application_not_found(&input.application_id),
                 input.application_id,
             ));
         };
-        let Some(profile) = application
-            .profiles
-            .get_mut(&input.configuration_profile_id)
+        // The level that DID resolve is named by the id it resolved to; the level that did
+        // not is named as the request spelled it.
+        let application_id = application.id.clone();
+        let Some(profile) = application.resolve_profile_mut(&input.configuration_profile_id)
         else {
             return Err(not_found(
                 crate::state::configuration_profile_not_found(
-                    &input.application_id,
+                    &application_id,
                     &input.configuration_profile_id,
                 ),
                 input.configuration_profile_id,
             ));
         };
+        let profile_id = profile.id.clone();
 
         // The delete IS the removal of the stored version: once this answers 204,
         // `GetHostedConfigurationVersion` and a second delete both miss on this version
@@ -214,8 +217,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(removed) = profile.hosted_versions.remove(&input.version_number) else {
             return Err(not_found(
                 crate::state::hosted_configuration_version_not_found(
-                    &input.application_id,
-                    &input.configuration_profile_id,
+                    &application_id,
+                    &profile_id,
                     input.version_number,
                 ),
                 input.version_number.to_string(),
