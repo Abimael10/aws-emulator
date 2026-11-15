@@ -2024,3 +2024,15 @@ mod all_rs_carries_no_inner_doc_comment;
 //! the first item, so one appended past the declarations is `E0753`
 //! (`all/all_rs_inner_doc_comments_precede_the_first_item.rs`).
 //! `all/all_rs_is_a_canonical_declaration_list.rs` pins the shape above, for this file and for
+// Every comment in this file is an ordinary one, this block included: a doc comment of the
+// enclosing module is legal only before the first item, so one appended past the
+// declarations compiles no suite of this target at all, and with none anywhere no merge of
+// two landings can leave one there.
+// A suite no `mod` here names is compiled nowhere and its tests never run; a suite left at
+// the top level of `tests/` fails the build; and one name declared twice compiles neither
+// copy. `all/all_rs_declares_each_suite_once.rs`,
+// service crate's own `tests/all.rs`. What a suite covers, and why it drives the assembled
+// router rather than one service crate, belongs in that suite's own module header;
+// `all/appended_notes.rs` keeps the notes earlier landings had appended here.
+// `tests/all.rs` is a test-target crate root, so a bare `mod <name>;` would resolve to a
+// sibling of this file, which the layout check refuses: the `#[path]` above each declaration

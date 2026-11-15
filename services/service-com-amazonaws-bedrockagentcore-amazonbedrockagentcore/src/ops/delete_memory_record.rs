@@ -170,6 +170,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The same container pre-condition the read keeps, in the same order and against
+        // the same owning component: a `memoryId` that names no container is refused at the
+        // CONTAINER level, so the record sentence below answers only for a record a live
+        // container does not hold. The inventory is read and released before this service's
+        // own store is taken.
+        crate::state::memory_record_container_resolved(&*self.engine, &input.memory_id).map_err(
+            |missing| match missing {
+                Some(message) => DeleteMemoryRecordErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                ),
+                None => DeleteMemoryRecordErrorModeled::ServiceException(ServiceException {
+                    message: "the shared engine does not carry the AgentCore resource inventory"
+                        .to_string(),
+                }),
+            },
+        )?;
+
         let memory_id = crate::state::normalize_memory_id(&input.memory_id);
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

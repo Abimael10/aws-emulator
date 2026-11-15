@@ -327,6 +327,18 @@ pub const MEMORY_RECORD_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 /// id nor the namespace the request spelled appears in it.
 pub const MEMORY_RECORD_NOT_FOUND_MESSAGE: &str = "The memory record was not found";
 
+/// The message a memory-record read or delete is refused with when its `memoryId` names no
+/// memory container at all — the OTHER not-found precondition of the same request, one
+/// level further out than [`MEMORY_RECORD_NOT_FOUND_MESSAGE`].
+///
+/// The memory-records API words this refusal after the item store the container is held in
+/// rather than after the identifier the request spelled, so the sentence carries no
+/// variable part either: the memory id, the record id and the namespace appear in neither
+/// level's sentence. Status (404) and error class are the same for both, so the sentence is
+/// all a client has to tell "re-create the container" from "re-ingest the record" by, and
+/// the two constants are what keeps them apart service-wide.
+pub const MEMORY_RECORD_CONTAINER_NOT_FOUND_MESSAGE: &str = "MemoryItem does not exist";
+
 /// The `memoryStrategyId` reported for a record whose creating request named no
 /// strategy.
 ///
@@ -2431,6 +2443,30 @@ pub fn memory_container_resolved<Eng: Send + Sync + 'static>(
             NotFoundResource::Memory,
             memory_id,
         ))),
+        Some(true) => Ok(()),
+    }
+}
+
+/// The container pre-condition every memory-RECORD call keeps: the same read as
+/// [`memory_container_resolved`] — against the component that OWNS the container, never
+/// against this plane's index of what has been written into it — worded as the
+/// memory-records API words its container level
+/// ([`MEMORY_RECORD_CONTAINER_NOT_FOUND_MESSAGE`]).
+///
+/// A record lookup keeps it BEFORE it addresses a record, so a request naming no container
+/// is refused at the container level and the record sentence is reached only once the
+/// container exists.
+///
+/// `Err(Some(message))` is the `ResourceNotFoundException` message; `Err(None)` says the
+/// shared engine does not carry the inventory at all, which a handler answers with a
+/// modelled server error.
+pub fn memory_record_container_resolved<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    memory_id: &str,
+) -> Result<(), Option<String>> {
+    match holds_memory(engine, memory_id) {
+        None => Err(None),
+        Some(false) => Err(Some(MEMORY_RECORD_CONTAINER_NOT_FOUND_MESSAGE.to_string())),
         Some(true) => Ok(()),
     }
 }

@@ -249,6 +249,21 @@ impl MemoryWrite {
         }
     }
 
+    /// The whole `ResourceNotFoundException` message this write is refused with when the
+    /// memory container its path names was never created.
+    ///
+    /// The event and ingest surfaces name the resource that did not resolve and the
+    /// identifier the request spelled; the memory-RECORDS surface words its container level
+    /// after the item store the container is held in, with no variable part at all — the
+    /// same sentence `GetMemoryRecord` and `DeleteMemoryRecord` refuse an absent container
+    /// with, so that API reports one level consistently.
+    fn absent_container_message(self, memory: &str) -> String {
+        match self {
+            Self::BatchCreateMemoryRecords => "MemoryItem does not exist".to_string(),
+            Self::CreateEvent | Self::IngestData => format!("Memory not found: {memory}"),
+        }
+    }
+
     async fn send(self, router: &MultiServiceRouter, memory: &str) -> (u16, Value) {
         match self {
             Self::CreateEvent => create_event(router, memory).await,
@@ -279,8 +294,8 @@ async fn the_memory_plane_writes_only_into_a_container_the_control_plane_created
              {status} with {body:?}"
         );
 
-        // The same call, on an id no create minted, is the modelled 404 — worded with the
-        // identifier the request spelled.
+        // The same call, on an id no create minted, is the modelled 404 — worded as that
+        // write's own API words an absent container.
         let (status, refused) = write.send(&router, GHOST_MEMORY).await;
         assert_eq!(
             status, 404,
@@ -295,7 +310,7 @@ async fn the_memory_plane_writes_only_into_a_container_the_control_plane_created
         );
         assert_eq!(
             message(&refused),
-            format!("Memory not found: {GHOST_MEMORY}"),
+            write.absent_container_message(GHOST_MEMORY),
             "case {case:?} on a container never created: expected the documented message, got \
              {:?}",
             message(&refused)

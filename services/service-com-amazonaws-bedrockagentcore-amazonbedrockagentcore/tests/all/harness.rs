@@ -33,6 +33,16 @@ pub(crate) fn create_memory(engine: &engine::InMemoryEngine, memory_id: &str) {
         .register_memory(memory_id);
 }
 
+/// Delete an AgentCore Memory container the way the CONTROL plane's `DeleteMemory` does:
+/// the account no longer holds it, so every data-plane call addressing something inside it
+/// is refused however much this plane still has indexed under its id.
+pub(crate) fn delete_memory(engine: &engine::InMemoryEngine, memory_id: &str) {
+    engine
+        .state::<AgentCoreResourceInventory>()
+        .lock()
+        .forget_memory(memory_id);
+}
+
 /// Create a code interpreter the way the CONTROL plane's `CreateCodeInterpreter` does,
 /// in the same inventory and for the same reason. The interpreter the service provides to
 /// every account needs no such call: the inventory holds it without a registration.

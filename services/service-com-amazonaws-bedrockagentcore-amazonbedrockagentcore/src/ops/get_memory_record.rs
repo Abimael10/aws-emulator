@@ -169,6 +169,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The OUTERMOST step of this path is the memory container, which is created
+        // through the CONTROL plane: whether the account holds one is resolved against the
+        // component that owns it, before any record is looked up, so a `memoryId` naming
+        // no container is refused at the CONTAINER level and the record sentence below is
+        // reached only for a record a live container does not hold. The inventory is read
+        // and released before this service's own store is taken, which is the lock order
+        // every reader of it keeps.
+        crate::state::memory_record_container_resolved(&*self.engine, &input.memory_id).map_err(
+            |missing| match missing {
+                Some(message) => GetMemoryRecordErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                ),
+                None => GetMemoryRecordErrorModeled::ServiceException(ServiceException {
+                    message: "the shared engine does not carry the AgentCore resource inventory"
+                        .to_string(),
+                }),
+            },
+        )?;
+
         let memory_id = crate::state::normalize_memory_id(&input.memory_id);
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

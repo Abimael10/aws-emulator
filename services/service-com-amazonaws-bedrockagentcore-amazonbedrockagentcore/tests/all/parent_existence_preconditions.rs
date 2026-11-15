@@ -5,9 +5,12 @@
 //! THE RULE: a data-plane write whose request path names a resource the AgentCore CONTROL
 //! plane owns resolves that identifier against what the control plane created BEFORE it
 //! persists anything or mints an id, and refuses an identifier nothing created with
-//! `ResourceNotFoundException` (`@httpError 404`) whose `message` is that resource's label,
-//! `": "`, then the identifier exactly as the request spelled it. Only the code interpreter
-//! the service provides to every account resolves without a create.
+//! `ResourceNotFoundException` (`@httpError 404`) whose `message` is the sentence that
+//! write's API words an absent parent with: for most of this plane the resource's label,
+//! `": "`, then the identifier exactly as the request spelled it, and for the memory-RECORDS
+//! API the fixed container sentence its readers also refuse with, which names nothing the
+//! request spelled. Only the code interpreter the service provides to every account
+//! resolves without a create.
 //!
 //! The rows span what the rule generalises over:
 //!
@@ -124,6 +127,21 @@ impl Write {
             Self::StartCodeInterpreterSession | Self::InvokeCodeInterpreter => {
                 Resource::CodeInterpreter
             }
+        }
+    }
+
+    /// The whole `ResourceNotFoundException` sentence this write is refused with when the
+    /// parent it names does not exist.
+    ///
+    /// Most of this data plane names the resource that did not resolve and the identifier
+    /// the request spelled. The memory-RECORDS API words its container level after the
+    /// item store the container is held in instead, with no variable part at all — the
+    /// same sentence its readers refuse an absent container with, so the record plane
+    /// reports one level consistently.
+    fn absent_parent_message(self, parent: &str) -> String {
+        match self {
+            Self::BatchCreateMemoryRecords => "MemoryItem does not exist".to_string(),
+            _ => format!("{} not found: {parent}", self.parent().label()),
         }
     }
 
@@ -344,7 +362,7 @@ async fn a_write_naming_a_parent_nothing_created_is_refused_with_404() {
             RESOURCE_NOT_FOUND,
             "case {case:?}: expected {RESOURCE_NOT_FOUND}, got {body:?}"
         );
-        let expected = format!("{} not found: {parent}", write.parent().label());
+        let expected = write.absent_parent_message(&parent);
         assert_eq!(
             message(&body),
             expected,

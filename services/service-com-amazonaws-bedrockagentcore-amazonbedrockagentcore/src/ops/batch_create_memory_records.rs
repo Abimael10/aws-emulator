@@ -205,27 +205,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same pre-condition `CreateEvent` keeps, for the same reason: a Memory
         // container is created through the CONTROL plane, so records cannot be written
-        // into one that does not exist. The inventory is read and released before this
-        // service's own store is taken.
-        let held = crate::state::holds_memory(&*self.engine, &input.memory_id).ok_or_else(|| {
-            BatchCreateMemoryRecordsErrorModeled::ServiceException(ServiceException {
-                message: "the shared engine does not carry the AgentCore resource inventory"
-                    .to_string(),
-            })
-        })?;
-        if !held {
-            return Err(
-                BatchCreateMemoryRecordsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message(
-                            crate::state::NotFoundResource::Memory,
-                            &input.memory_id,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
+        // into one that does not exist. The memory-RECORDS API words its container level
+        // with its own sentence, the one its readers refuse with, so the container level
+        // of this plane reads the same whichever record operation reports it. The
+        // inventory is read and released before this service's own store is taken.
+        crate::state::memory_record_container_resolved(&*self.engine, &input.memory_id).map_err(
+            |missing| match missing {
+                Some(message) => {
+                    BatchCreateMemoryRecordsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                None => BatchCreateMemoryRecordsErrorModeled::ServiceException(ServiceException {
+                    message: "the shared engine does not carry the AgentCore resource inventory"
+                        .to_string(),
+                }),
+            },
+        )?;
 
         let mut store = state.lock();
         // A record expiry is a time-to-live, so records the clock has already run out on
