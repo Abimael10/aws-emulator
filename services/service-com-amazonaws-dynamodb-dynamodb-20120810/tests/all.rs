@@ -253,6 +253,8 @@ mod resource_tags;
 mod restore_table_from_backup;
 #[path = "all/resume_token_schema_refusals.rs"]
 mod resume_token_schema_refusals;
+#[path = "all/s3_sourced_derived_key_schema.rs"]
+mod s3_sourced_derived_key_schema;
 #[path = "all/scan_filter_value_types_and_segments.rs"]
 mod scan_filter_value_types_and_segments;
 #[path = "all/scan_indexes_and_projections.rs"]

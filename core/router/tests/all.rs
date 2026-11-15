@@ -2036,3 +2036,17 @@ mod all_rs_carries_no_inner_doc_comment;
 // `all/appended_notes.rs` keeps the notes earlier landings had appended here.
 // `tests/all.rs` is a test-target crate root, so a bare `mod <name>;` would resolve to a
 // sibling of this file, which the layout check refuses: the `#[path]` above each declaration
+// `mod <name>;` pair into the sorted list below. One pair per suite and no other line, so two
+// re-word or mistype. NOTHING follows the last pair.
+// A suite no `mod` here names is compiled nowhere and its tests never run (this crate's build
+// script refuses it); a suite left at the top level of `tests/` fails the build; and a suite
+// declared twice is `E0428`. Each of those takes EVERY suite of this target down with it.
+// the declarations is `E0753` and compiles no suite of this target — and with no `//!`
+// anywhere here, no merge of two landings can leave one there.
+// Three suites check those rules rather than restating them:
+// `all/all_rs_is_a_canonical_declaration_list.rs`, for this file and for every service
+// crate's own `tests/all.rs`. What a suite covers, and why it lives in this cross-service
+// target rather than in one service crate's own, belongs in that suite's own module header;
+// a note about THIS file belongs in `all/appended_notes.rs`.
+#[path = "all/s3_sourced_table_derived_key_schema.rs"]
+mod s3_sourced_table_derived_key_schema;
