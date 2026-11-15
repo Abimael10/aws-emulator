@@ -265,6 +265,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // "Limits the response to buckets that are located in the specified Amazon Web
+        // Services Region. The Amazon Web Services Region must be expressed according to the
+        // Amazon Web Services Region code" (`ListBucketsRequest$BucketRegion`): a filter that
+        // names no Region narrows the listing to nothing, so S3 refuses the request for it
+        // rather than answering a listing the caller did not ask for — including the filter
+        // stated EMPTY, which names no Region either. Read from the request's own query
+        // ([`crate::service::wire::rejected_bucket_region`]) because the refusal echoes the
+        // value as sent in a member of its own, beside the `<ArgumentName>` naming the
+        // parameter ([`crate::state::invalid_region_message`] is the sentence).
+        if let Some(value) = crate::service::wire::rejected_bucket_region(
+            ctx.parts(),
+            super::types::LIST_BUCKETS_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                crate::state::BUCKET_REGION_ARGUMENT,
+                Some(&value),
+                crate::state::invalid_region_message(&value),
+            ));
+        }
+
         // How many buckets this page may carry. `MaxBuckets` is modeled
         // `range {min 1, max 10000}`, and a value outside it is refused above, so the clamp
         // is what keeps this handler total rather than a second statement of that bound.

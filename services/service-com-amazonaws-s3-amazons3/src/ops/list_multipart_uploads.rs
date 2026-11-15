@@ -626,9 +626,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect()
             }),
             // `EncodingType` is "included in the response" exactly when the request asked
-            // for one, which is when the elements above are encoded; `RequestCharged`
-            // reports a Requester Pays charge this emulator does not model.
-            encoding_type: input.encoding_type.clone(),
+            // for one, which is when the elements above are encoded — reported as the REQUEST
+            // SPELLED it ([`crate::service::wire::encoding_type_as_sent`]), because S3 reads
+            // the value as a mode name and answers the text it was asked with;
+            // `RequestCharged` reports a Requester Pays charge this emulator does not model.
+            encoding_type: crate::service::wire::encoding_type_as_sent(ctx.parts()),
             request_charged: None,
         })
     }

@@ -1641,7 +1641,7 @@ pub(crate) fn rejected_object_ownership<'p>(
 /// as sent, which only a handler's envelope can carry. A value that is no INTEGER the
 /// boundary cannot word at all — its codec reports a parse failure, in a sentence about Rust
 /// types — so such a value is withheld from the codec
-/// ([`without_withheld_max_buckets`]) and the operation answers both faults, through the one
+/// ([`without_withheld_parameters`]) and the operation answers both faults, through the one
 /// reading of them ([`crate::state::max_buckets_fault`]).
 pub(crate) fn rejected_max_buckets(
     parts: &::http::request::Parts,
@@ -1656,9 +1656,87 @@ fn rejected_max_buckets_in(
     query: &str,
     input_schema: &Schema,
 ) -> Option<(String, crate::state::MaxBucketsFault)> {
-    query_member(input_schema, crate::state::MAX_BUCKETS_ARGUMENT)?;
-    let value = super::sigv4::query_parameter(query, crate::state::MAX_BUCKETS_ARGUMENT)?;
+    let value = bound_query_value(query, input_schema, crate::state::MAX_BUCKETS_ARGUMENT)?;
     crate::state::max_buckets_fault(&value).map(|fault| (value, fault))
+}
+
+/// The `max-keys` value `parts` carried that bounds no page of objects, with the fault it
+/// carries — or `None` for a request bounding one, and for an operation that binds no such
+/// parameter.
+///
+/// The page bound of the OBJECT listings, read the way the page bound of the bucket listing
+/// is ([`rejected_max_buckets`]) and for the same reason: S3's refusal of it names the
+/// parameter and echoes the value in members only a handler's envelope can carry, and a value
+/// that is no integer of the member's type is one the boundary can only word as a parse
+/// failure, so it is withheld from the codec ([`without_withheld_parameters`]).
+pub(crate) fn rejected_max_keys(
+    parts: &::http::request::Parts,
+    input_schema: &Schema,
+) -> Option<(String, crate::state::MaxKeysFault)> {
+    let value = bound_query_value(
+        parts.uri.query().unwrap_or_default(),
+        input_schema,
+        crate::state::MAX_KEYS_ARGUMENT,
+    )?;
+    crate::state::max_keys_fault(&value).map(|fault| (value, fault))
+}
+
+/// The `bucket-region` value `parts` carried that names no AWS Region, or `None` for a
+/// request naming one, carrying none, and for an operation that binds no such parameter.
+///
+/// Read from the request's own query rather than from the bound member for the same reason
+/// the page bounds above are: the filter stated with an EMPTY value is a value the request
+/// SENT, and S3's refusal of it echoes it in an `<ArgumentValue>` of its own, so what the
+/// refusal names has to be the text the query carried.
+pub(crate) fn rejected_bucket_region(
+    parts: &::http::request::Parts,
+    input_schema: &Schema,
+) -> Option<String> {
+    let value = bound_query_value(
+        parts.uri.query().unwrap_or_default(),
+        input_schema,
+        crate::state::BUCKET_REGION_ARGUMENT,
+    )?;
+    (!crate::state::names_an_aws_region(&value)).then_some(value)
+}
+
+/// The `encoding-type` text `parts` carried, or `None` for a listing that carried none and
+/// for one that carried it with no value, which asks for no encoding
+/// ([`crate::state::withholds_empty_listing_value`]).
+///
+/// What a listing ECHOES in its `<EncodingType>`: S3 reads the value as a MODE NAME, so it
+/// serves a listing that spells it in another case ([`MODE_QUERY_VALUES`] is the fold the
+/// codec is given) and reports it back as the REQUEST spelled it — recorded behavior. The
+/// bound member carries the model's spelling, which is what decides whether the key-name
+/// elements are encoded; this is the text that says what was asked for.
+pub(crate) fn encoding_type_as_sent(parts: &::http::request::Parts) -> Option<String> {
+    super::sigv4::query_parameter(
+        parts.uri.query().unwrap_or_default(),
+        crate::state::ENCODING_TYPE_PARAMETER,
+    )
+    .filter(|value| !value.is_empty())
+}
+
+/// The `response-expires` text `parts` carried, or `None` for a read that carried none and
+/// for one that carried it with no value at all, which overrides nothing.
+///
+/// The one reading of that parameter: it is text the answer ECHOES rather than an instant
+/// anything is computed from, so it never goes through the codec at all
+/// ([`crate::state::withholds_response_expires`] is what keeps it from one).
+pub(crate) fn response_expires_as_sent(parts: &::http::request::Parts) -> Option<String> {
+    super::sigv4::query_parameter(
+        parts.uri.query().unwrap_or_default(),
+        crate::state::RESPONSE_EXPIRES_ARGUMENT,
+    )
+    .filter(|value| !value.is_empty())
+}
+
+/// The value `query` states for the parameter `name`, for an operation whose input really
+/// binds that parameter — `None` for one that binds nothing from it, so no reading is ever
+/// made of a parameter another operation's query happens to carry under the same name.
+fn bound_query_value(query: &str, input_schema: &Schema, name: &str) -> Option<String> {
+    query_member(input_schema, name)?;
+    super::sigv4::query_parameter(query, name)
 }
 
 /// The INPUT member `input_schema` binds to the request query parameter `name`, or `None` for
@@ -1675,24 +1753,121 @@ fn query_member<'s>(input_schema: &'s Schema, name: &str) -> Option<&'s Schema> 
         .copied()
 }
 
-/// `query` with the `max-buckets` parameter removed when its value is one the codec must not
-/// be handed ([`crate::state::withholds_max_buckets`]) — a value bounding no page, which the
-/// operation refuses itself ([`rejected_max_buckets`]), and a parameter stated with no value,
-/// which states no bound at all. `None` when the query carries nothing to withhold, which
-/// leaves it exactly as it arrived.
-fn without_withheld_max_buckets(query: &str, input_schema: &Schema) -> Option<String> {
-    query_member(input_schema, crate::state::MAX_BUCKETS_ARGUMENT)?;
-    let value = super::sigv4::query_parameter(query, crate::state::MAX_BUCKETS_ARGUMENT)?;
-    if !crate::state::withholds_max_buckets(&value) {
+/// Whether the codec must not be handed the value a request stated a judged parameter with —
+/// the reading [`QUERY_PARAMETERS_JUDGED_BY_THE_HANDLER`] pairs with each parameter's name.
+type WithholdsValue = fn(&str) -> bool;
+
+/// The request QUERY PARAMETERS whose value the OPERATION judges rather than the boundary,
+/// each WITHHELD from the codec when its text is one the codec must not be handed.
+///
+/// Each is a SCALAR the model binds to a query parameter and whose text S3 answers for
+/// itself: a page bound S3 refuses in an envelope with members of its own — the
+/// `<ArgumentName>` / `<ArgumentValue>` pair naming the parameter and the value as sent,
+/// which only a handler can answer, where the codec can only report a parse failure in a
+/// sentence about Rust types; a narrowing parameter stated with NO value, which states
+/// nothing at all ([`crate::state::withholds_empty_listing_value`]); and a response override
+/// S3 ECHOES as the text it arrived as, which the codec would refuse the whole read for.
+///
+/// So the value is kept from the codec, exactly as the two headers an operation judges are
+/// ([`HEADERS_JUDGED_BY_THE_HANDLER`]), and the operation reads it from the request's own
+/// query ([`rejected_max_buckets`], [`rejected_max_keys`], [`response_expires_as_sent`]).
+/// Each rule is still enforced, in that one place.
+const QUERY_PARAMETERS_JUDGED_BY_THE_HANDLER: [(&str, WithholdsValue); 5] = [
+    (
+        crate::state::MAX_BUCKETS_ARGUMENT,
+        crate::state::withholds_max_buckets,
+    ),
+    (
+        crate::state::MAX_KEYS_ARGUMENT,
+        crate::state::withholds_max_keys,
+    ),
+    (
+        crate::state::DELIMITER_PARAMETER,
+        crate::state::withholds_empty_listing_value,
+    ),
+    (
+        crate::state::ENCODING_TYPE_PARAMETER,
+        crate::state::withholds_empty_listing_value,
+    ),
+    (
+        crate::state::RESPONSE_EXPIRES_ARGUMENT,
+        crate::state::withholds_response_expires,
+    ),
+];
+
+/// The request QUERY PARAMETERS whose VALUE S3 reads as a MODE NAME rather than as a
+/// case-sensitive identifier, each with the spellings the model gives that mode.
+///
+/// `encoding-type` is the one such parameter this service binds: it asks for the encoding the
+/// key-name elements of a listing are written in, and its target enum has exactly ONE
+/// permitted value ([`crate::ops::types::ENCODING_TYPE_VALUES`], `["url"]`), so a
+/// case-insensitive match cannot be ambiguous. S3 serves the listing however a client spells
+/// it, where refusing it answers `InvalidArgument` for a request AWS serves 200. No other
+/// value is accepted: an encoding the model does not list is still refused
+/// ([`crate::state::INVALID_ENCODING_METHOD_MESSAGE`]), because only the CASE is folded here.
+///
+/// The same rule the headers carry ([`MODE_HEADER_VALUES`]), over the query half, and from
+/// the same source: the GENERATED value set the model's own enum produced, so a value the
+/// enum gains cannot drift from this fold.
+const MODE_QUERY_VALUES: &[(&str, &[&str])] = &[(
+    crate::state::ENCODING_TYPE_PARAMETER,
+    crate::ops::types::ENCODING_TYPE_VALUES,
+)];
+
+/// One `name=value` pair of a query string re-spelled with its MODE value in the spelling the
+/// model gives that mode — `None` when `parameter` carries no value, when it names no
+/// [`MODE_QUERY_VALUES`] parameter, when the operation binds no such parameter, and when the
+/// value is already spelled the way the model spells it.
+fn folded_query_parameter(parameter: &str, input_schema: &Schema) -> Option<String> {
+    let (name, value) = parameter.split_once('=')?;
+    let spelled = super::sigv4::percent_decoded(value);
+    let modelled = MODE_QUERY_VALUES
+        .iter()
+        .filter(|(published, _)| *published == name)
+        .flat_map(|(_, modelled)| modelled.iter())
+        .find(|modelled| **modelled != spelled && modelled.eq_ignore_ascii_case(&spelled))
+        .copied()?;
+    query_member(input_schema, name)?;
+    Some(format!("{name}={modelled}"))
+}
+
+/// `query` as the codec behind this protocol is given it, or `None` when nothing about it
+/// changes — which is every request that needs neither rule below.
+///
+/// Both rules are driven off `input_schema`, so each applies only to a parameter the operation
+/// being served really binds, and each is about a value the framework's own codec would
+/// otherwise read as something the request did not say:
+///
+/// * a value the OPERATION judges is withheld
+///   ([`QUERY_PARAMETERS_JUDGED_BY_THE_HANDLER`]);
+/// * a MODE value spelled in another case is folded to the model's spelling
+///   ([`folded_query_parameter`]).
+fn normalized_query(query: &str, input_schema: &Schema) -> Option<String> {
+    if query.is_empty() {
         return None;
     }
-    let kept: Vec<&str> = query
-        .split('&')
-        .filter(|parameter| {
-            parameter.split('=').next().unwrap_or(parameter) != crate::state::MAX_BUCKETS_ARGUMENT
+    let withheld: Vec<&str> = QUERY_PARAMETERS_JUDGED_BY_THE_HANDLER
+        .iter()
+        .filter(|(name, withholds)| {
+            bound_query_value(query, input_schema, name).is_some_and(|value| withholds(&value))
         })
+        .map(|(name, _)| *name)
         .collect();
-    Some(kept.join("&"))
+    let mut changed = !withheld.is_empty();
+    let mut kept: Vec<String> = Vec::new();
+    for parameter in query.split('&') {
+        if withheld.contains(&parameter.split('=').next().unwrap_or(parameter)) {
+            continue;
+        }
+        match folded_query_parameter(parameter, input_schema) {
+            Some(folded) => {
+                kept.push(folded);
+                changed = true;
+            }
+            None => kept.push(parameter.to_string()),
+        }
+    }
+    changed.then(|| kept.join("&"))
 }
 
 /// The member a create's configuration names the Region the bucket is to be created in, as
@@ -2960,13 +3135,15 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // value an OPERATION judges ([`normalized_headers`]). `None` leaves the headers
         // exactly as they arrived, which is every request that needs no normalization.
         let folded_headers = normalized_headers(request, input_schema);
-        // The QUERY the bound members are read from, with the one PARAMETER an OPERATION
-        // judges withheld: a `max-buckets` that bounds no page is kept from the codec, whose
-        // own report of a value that is no integer is a sentence about Rust types, so
-        // `ListBuckets` answers the refusal S3 publishes for it instead
-        // ([`rejected_max_buckets`]), and so is one stated with no value at all, which states
-        // no bound. `None` leaves the query exactly as it arrived.
-        let folded_query = without_withheld_max_buckets(request_query(request.uri()), input_schema);
+        // The QUERY the bound members are read from, with every PARAMETER an OPERATION judges
+        // withheld ([`QUERY_PARAMETERS_JUDGED_BY_THE_HANDLER`]) and a MODE value spelled in
+        // another case folded onto the model's spelling ([`normalized_query`]): a page bound
+        // that bounds no page is kept from the codec, whose own report of a value that is no
+        // integer is a sentence about Rust types, so the listing answers the refusal S3
+        // publishes for it instead, and so is one stated with no value at all, which states no
+        // bound; and so is a response override the answer only echoes. `None` leaves the query
+        // exactly as it arrived.
+        let folded_query = normalized_query(request_query(request.uri()), input_schema);
         // Only a request whose BODY IS AN XML DOCUMENT can carry a member the framework's
         // codec cannot bind as the document spells it, and only a body that actually
         // spells one needs normalizing; everything else — every request whose body is not

@@ -26,7 +26,11 @@
 //!   condition evaluates to true; then, S3 returns 304 Not Modified" — so the entity-tag
 //!   condition of each pair decides the read on its own.
 //! * The dates are HTTP-dates (the members' `timestampFormat` is `http-date`), compared at
-//!   the one-second resolution such a date carries (RFC 9110 §5.6.7).
+//!   the one-second resolution such a date carries (RFC 9110 §5.6.7). An `If-Modified-Since`
+//!   LATER than the server's current time is invalid — "a date which is later than the
+//!   server's current time is invalid" (RFC 2616 §14.25) — and an invalid date is one "a
+//!   recipient MUST ignore" (RFC 7232 §3.3, the RFC `$IfModifiedSince` cites), so the read is
+//!   served.
 //! * A 304 carries no content and does carry the validators of the representation the caller
 //!   already holds: "the server generating a 304 response MUST generate … ETag,
 //!   Last-Modified" and "MUST NOT generate content" (RFC 9110 §15.4.5).
@@ -97,13 +101,14 @@ struct ConditionRow {
 /// The rows differ along which condition is stated, the FORM of the entity-tag value (the
 /// exact tag, a tag that names another representation, the `*` wildcard, a comma-separated
 /// list and the weak marker), where the date falls relative to the object's own instant
-/// (before, exactly on, and after it), and which pair of conditions is stated together —
+/// (before it, exactly on it, and later than the server's own clock), and which pair of
+/// conditions is stated together —
 /// which is what the precedence rule is about.
 fn condition_rows(etag: &str, last_modified: SystemTime) -> Vec<ConditionRow> {
     let other_etag = "\"00000000000000000000000000000000\"";
     let before = http_date(last_modified - Duration::from_secs(1));
     let exactly = http_date(last_modified);
-    let after = http_date(last_modified + Duration::from_secs(60));
+    let later = http_date(last_modified + Duration::from_secs(3_600));
     let row = |case: &'static str, headers: Vec<(&str, String)>, answered: Answered| ConditionRow {
         case,
         headers: headers
@@ -150,9 +155,9 @@ fn condition_rows(etag: &str, last_modified: SystemTime) -> Vec<ConditionRow> {
             Answered::NotModified,
         ),
         row(
-            "If-Modified-Since after the object was written",
-            vec![("if-modified-since", after.clone())],
-            Answered::NotModified,
+            "If-Modified-Since later than the server's own clock, which states no condition",
+            vec![("if-modified-since", later.clone())],
+            Answered::Served,
         ),
         row(
             "If-Match naming the object's own tag",
@@ -171,7 +176,7 @@ fn condition_rows(etag: &str, last_modified: SystemTime) -> Vec<ConditionRow> {
         ),
         row(
             "If-Unmodified-Since after the object was written",
-            vec![("if-unmodified-since", after.clone())],
+            vec![("if-unmodified-since", later.clone())],
             Answered::Served,
         ),
         // The precedence inside each pair.
@@ -195,7 +200,7 @@ fn condition_rows(etag: &str, last_modified: SystemTime) -> Vec<ConditionRow> {
             "If-None-Match not matching beside an If-Modified-Since that does not hold",
             vec![
                 ("if-none-match", other_etag.to_string()),
-                ("if-modified-since", after.clone()),
+                ("if-modified-since", exactly.clone()),
             ],
             Answered::Served,
         ),

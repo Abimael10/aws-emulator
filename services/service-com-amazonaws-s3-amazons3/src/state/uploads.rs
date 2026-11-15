@@ -502,19 +502,32 @@ pub fn unmet_read_precondition(
 /// has (RFC 9110 §5.6.7), so an object stored within the same second as the date it is
 /// judged against counts as not modified since it.
 ///
+/// A date LATER THAN `now` states no condition at all and is IGNORED: "a date which is later
+/// than the server's current time is invalid" (RFC 2616 §14.25, *If-Modified-Since*), and an
+/// invalid date is one "a recipient MUST ignore" (RFC 7232 §3.3 — the RFC
+/// `GetObjectRequest$IfModifiedSince` itself cites), so such a read is SERVED. The condition
+/// revalidates a copy the caller ALREADY HOLDS, and no caller can hold one read at an instant
+/// that has not happened, so answering 304 would withhold the bytes for a condition the
+/// request cannot have meant. Recorded behavior. The copy-source conditions
+/// ([`unmet_copy_source_precondition`]) are not judged this way: those members gate whether a
+/// copy RUNS rather than revalidating a representation the caller holds.
+///
 /// ONE place for the rule, so a GET and a HEAD of the same object cannot disagree about
 /// whether the caller's copy is current.
 pub fn read_is_not_modified(
     etag: &str,
     last_modified: SystemTime,
+    now: SystemTime,
     if_none_match: Option<&str>,
     if_modified_since: Option<SystemTime>,
 ) -> bool {
     if let Some(expected) = if_none_match {
         return entity_tag_matches(expected, etag);
     }
-    if_modified_since
-        .is_some_and(|since| whole_seconds(last_modified) <= whole_seconds(since))
+    if_modified_since.is_some_and(|since| {
+        whole_seconds(since) <= whole_seconds(now)
+            && whole_seconds(last_modified) <= whole_seconds(since)
+    })
 }
 
 /// `instant` truncated to whole seconds since the epoch, the resolution an HTTP date carries

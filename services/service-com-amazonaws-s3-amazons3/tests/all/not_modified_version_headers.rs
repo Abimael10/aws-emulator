@@ -34,7 +34,7 @@
 //! literal one: each row's expectation is the id a write reported or the id a served read of
 //! the same address reports.
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use super::bucket_lifecycle::{router, Answer};
 use super::object_and_tagging_roundtrip::{bucket, expected_etag, get_object, put_object, text};
@@ -124,7 +124,7 @@ async fn a_not_modified_read_names_the_version_it_evaluated() {
 
     let older_etag = expected_etag(OLDER_BODY);
     let newer_etag = expected_etag(NEWER_BODY);
-    let future = http_date(SystemTime::now() + Duration::from_secs(3_600));
+    let at_this_read = http_date(SystemTime::now());
     let row = |case: &'static str,
                bucket: &'static str,
                key: &'static str,
@@ -188,11 +188,11 @@ async fn a_not_modified_read_names_the_version_it_evaluated() {
             Some(&newer_version),
         ),
         row(
-            "the current version, If-Modified-Since after it was written",
+            "the current version, If-Modified-Since at the instant of this read",
             "revalidate-versioned",
             "held.bin",
             String::new(),
-            vec![("if-modified-since", future.clone())],
+            vec![("if-modified-since", at_this_read.clone())],
             &newer_etag,
             Some(&newer_version),
         ),
@@ -206,11 +206,11 @@ async fn a_not_modified_read_names_the_version_it_evaluated() {
             Some(&older_version),
         ),
         row(
-            "a noncurrent version addressed by id, If-Modified-Since after it was written",
+            "a noncurrent version addressed by id, If-Modified-Since at the instant of this read",
             "revalidate-versioned",
             "held.bin",
             format!("?versionId={older_version}"),
-            vec![("if-modified-since", future.clone())],
+            vec![("if-modified-since", at_this_read.clone())],
             &older_etag,
             Some(&older_version),
         ),

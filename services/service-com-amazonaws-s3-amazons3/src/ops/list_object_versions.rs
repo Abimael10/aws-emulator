@@ -289,20 +289,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let max_keys = match input.max_keys {
-            Some(requested) if requested < 0 => {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    "InvalidArgument",
-                    400,
-                    format!(
-                        "Argument max-keys must be an integer between 0 and 2147483647: \
-                         {requested}"
-                    ),
-                ))
-            }
-            Some(requested) => requested,
-            None => MAX_KEYS_PER_PAGE,
-        };
+        // The page bound this request asks for has to be one a page can be bounded by. The
+        // value is judged HERE rather than at the boundary because the refusal carries
+        // members of its own — the `<ArgumentName>` / `<ArgumentValue>` pair naming the
+        // parameter and the value as sent — see
+        // [`crate::service::wire::rejected_max_keys`], which is where the request's own query
+        // is read and which withholds such a value from the codec, and
+        // [`crate::state::max_keys_refusal`], which is the sentence S3 states for each way a
+        // value fails on THIS listing.
+        if let Some((value, fault)) = crate::service::wire::rejected_max_keys(
+            ctx.parts(),
+            super::types::LIST_OBJECT_VERSIONS_INPUT_SCHEMA,
+        ) {
+            let (argument, message) =
+                crate::state::max_keys_refusal(fault, crate::state::ObjectListing::Legacy);
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                argument,
+                Some(&value),
+                message,
+            ));
+        }
+
+        // `MaxKeys` publishes no range of its own and a value that bounds no page is refused
+        // above, so what reaches here is a non-negative bound or none at all.
+        let max_keys = input.max_keys.unwrap_or(MAX_KEYS_PER_PAGE);
         // The ceiling bounds the PAGE, not the echo: a listing asked for more entries than
         // one page may carry is answered with [`MAX_KEYS_PER_PAGE`] of them and reports the
         // number the caller asked for.
@@ -602,9 +612,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect()
             }),
             // `EncodingType` is "included in the response" exactly when the request asked
-            // for one, which is when the elements above are encoded; `RequestCharged`
-            // reports a Requester Pays charge this emulator does not model.
-            encoding_type: input.encoding_type.clone(),
+            // for one, which is when the elements above are encoded — reported as the REQUEST
+            // SPELLED it ([`crate::service::wire::encoding_type_as_sent`]), because S3 reads
+            // the value as a mode name and answers the text it was asked with;
+            // `RequestCharged` reports a Requester Pays charge this emulator does not model.
+            encoding_type: crate::service::wire::encoding_type_as_sent(ctx.parts()),
             request_charged: None,
         })
     }

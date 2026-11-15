@@ -624,6 +624,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::read_is_not_modified(
             &object.etag,
             object.last_modified,
+            now,
             input.if_none_match.as_deref(),
             input
                 .if_modified_since
@@ -727,13 +728,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `response-*` query parameters override the matching response headers
         // ("Sets the Content-Type header of the response", and so on for each), so the
         // request's value wins over the stored one when it carries any.
-        let expires = input
-            .response_expires
-            .and_then(|expires| {
-                expires
-                    .fmt(::aws_smithy_types::date_time::Format::HttpDate)
-                    .ok()
-            })
+        //
+        // The `Expires` override is the TEXT the request sent, read from its own query
+        // ([`crate::service::wire::response_expires_as_sent`]): the header this sets is
+        // published as a string, so the override is echoed rather than read as an instant —
+        // which is also why a read whose override is no date at all is served.
+        let expires = crate::service::wire::response_expires_as_sent(ctx.parts())
             .or_else(|| object.expires.clone());
 
         // "To retrieve the checksum, this mode must be enabled"

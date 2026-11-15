@@ -610,6 +610,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::read_is_not_modified(
             &object.etag,
             object.last_modified,
+            now,
             input.if_none_match.as_deref(),
             input
                 .if_modified_since
@@ -657,12 +658,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (`HeadObjectOutput$PartsCount`) — both conditions, or no count.
             parts_count: input.part_number.and(object.parts_count()),
             last_modified: Some(::aws_smithy_types::DateTime::from(object.last_modified)),
-            content_type: object.content_type.clone(),
-            cache_control: object.cache_control.clone(),
-            content_disposition: object.content_disposition.clone(),
-            content_encoding: object.content_encoding.clone(),
-            content_language: object.content_language.clone(),
-            expires: object.expires.clone(),
+            // The `response-*` query parameters override the matching response headers
+            // ("Sets the Content-Type header of the response", and so on for each), the same
+            // overrides a GET of this request answers with
+            // ([`super::get_object`]), so a HEAD and a GET cannot disagree about the headers
+            // the caller asked for — and the `Expires` one is the TEXT the request sent, read
+            // from its own query ([`crate::service::wire::response_expires_as_sent`]),
+            // because the header it sets is published as a string.
+            content_type: input
+                .response_content_type
+                .clone()
+                .or_else(|| object.content_type.clone()),
+            cache_control: input
+                .response_cache_control
+                .clone()
+                .or_else(|| object.cache_control.clone()),
+            content_disposition: input
+                .response_content_disposition
+                .clone()
+                .or_else(|| object.content_disposition.clone()),
+            content_encoding: input
+                .response_content_encoding
+                .clone()
+                .or_else(|| object.content_encoding.clone()),
+            content_language: input
+                .response_content_language
+                .clone()
+                .or_else(|| object.content_language.clone()),
+            expires: crate::service::wire::response_expires_as_sent(ctx.parts())
+                .or_else(|| object.expires.clone()),
             website_redirect_location: object.website_redirect_location.clone(),
             metadata: Some(
                 object

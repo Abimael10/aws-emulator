@@ -32,7 +32,9 @@
 //! `<ArgumentName>` / `<ArgumentValue>` pair naming the parameter as the API publishes it —
 //! the refusal of an `encoding-type` that names no encoding method, and of a
 //! `continuation-token` no listing issued, whose token the document does not echo because it
-//! "is obfuscated and is not a real key".
+//! "is obfuscated and is not a real key". An `encoding-type` the request spells in another
+//! CASE names the one method the model declares and is served, echoed as the request spelled
+//! it, and one stated with NO value states no encoding at all.
 //!
 //! The tables span what each rule generalises over: WHICH listing answers (all four, by
 //! their four addresses), whether the request stated each echoed member, the page sizes
@@ -336,14 +338,13 @@ async fn a_listing_refuses_an_encoding_type_by_naming_the_parameter_and_the_valu
     bucket(&router, bucket_name).await;
     store_keys(&router, bucket_name, KEYS).await;
 
-    // Values an `encoding-type` may carry that name no encoding method: a word, the declared
-    // value in the wrong case (the enum is exact), another encoding a client might guess at,
-    // and the empty value.
+    // Values an `encoding-type` may carry that name no encoding method: a word, and another
+    // encoding a client might guess at. The DECLARED value in another case is NOT among them —
+    // S3 reads the value as a mode name — and neither is the empty value, which states no
+    // encoding at all; both are served below.
     let rejected: &[(&str, &str)] = &[
         ("a word that is no encoding method", "bogus"),
-        ("the declared value upper-cased", "URL"),
         ("an encoding this service does not write", "base64"),
-        ("no value at all", ""),
     ];
 
     for surface in SURFACES {
@@ -394,29 +395,55 @@ async fn a_listing_refuses_an_encoding_type_by_naming_the_parameter_and_the_valu
             );
         }
 
-        // The ONE value the model declares is served, so every refusal above was about the
-        // method named rather than about the parameter being there.
-        let case = format!("{}/encoding-type={ENCODING_TYPE_URL}", surface.call);
-        let served = list(
-            &router,
-            bucket_name,
-            surface,
-            &format!("&encoding-type={ENCODING_TYPE_URL}"),
-        )
-        .await;
+        // The value the model declares is served HOWEVER the request spells it — S3 reads it
+        // as a mode name — and the answer echoes the spelling the request used, so every
+        // refusal above was about the method named rather than about its case or about the
+        // parameter being there.
+        for spelled in [ENCODING_TYPE_URL, "URL", "Url"] {
+            let case = format!("{}/encoding-type={spelled}", surface.call);
+            let served = list(
+                &router,
+                bucket_name,
+                surface,
+                &format!("&encoding-type={spelled}"),
+            )
+            .await;
+            assert_eq!(
+                served.status,
+                200,
+                "case {case:?}: the declared encoding type is served however it is spelled, \
+                 got {} with body {:?}",
+                served.status,
+                text(&served)
+            );
+            assert_eq!(
+                element(&served, "EncodingType").as_deref(),
+                Some(spelled),
+                "case {case:?}: a listing that applied an encoding echoes it as the request \
+                 spelled it, got {:?} in {:?}",
+                element(&served, "EncodingType"),
+                text(&served)
+            );
+        }
+
+        // And the parameter stated with NO value asks for no encoding at all: the listing is
+        // served and reports no encoding type, exactly as one that left the parameter out.
+        let case = format!("{}/encoding-type=", surface.call);
+        let unencoded = list(&router, bucket_name, surface, "&encoding-type=").await;
         assert_eq!(
-            served.status,
+            unencoded.status,
             200,
-            "case {case:?}: the declared encoding type is served, got {} with body {:?}",
-            served.status,
-            text(&served)
+            "case {case:?}: a parameter stated with no value states no encoding, got {} with \
+             body {:?}",
+            unencoded.status,
+            text(&unencoded)
         );
         assert_eq!(
-            element(&served, "EncodingType").as_deref(),
-            Some(ENCODING_TYPE_URL),
-            "case {case:?}: a listing that applied an encoding echoes it, got {:?} in {:?}",
-            element(&served, "EncodingType"),
-            text(&served)
+            element(&unencoded, "EncodingType"),
+            None,
+            "case {case:?}: a listing that applied no encoding reports none, got {:?} in {:?}",
+            element(&unencoded, "EncodingType"),
+            text(&unencoded)
         );
     }
 }

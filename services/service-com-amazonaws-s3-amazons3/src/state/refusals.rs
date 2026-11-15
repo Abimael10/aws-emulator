@@ -253,6 +253,193 @@ pub fn withholds_max_buckets(value: &str) -> bool {
     value.is_empty() || max_buckets_fault(value).is_some()
 }
 
+/// The request field a refused page bound of OBJECTS is reported against — the query
+/// parameter every object listing binds it from
+/// (`smithy_query(query="operation",operation="ListObjects,ListObjectsV2,ListObjectVersions")`
+/// reports `MaxKeys: {httpQuery: "max-keys"}` for each).
+pub const MAX_KEYS_ARGUMENT: &str = "max-keys";
+
+/// The spelling the V2 listing names that same field by when it refuses a page bound BELOW
+/// the range: recorded behavior, where both the `<ArgumentName>` and the sentence carry the
+/// member's own name rather than the parameter's.
+pub const MAX_KEYS_V2_ARGUMENT: &str = "maxKeys";
+
+/// The bounds a page of objects may be asked for within.
+///
+/// `MaxKeys` publishes no `@range` of its own (`smithy_query(query="shape",shape="MaxKeys")`
+/// is a bare `integer`), so the bound is the one S3 states in its own refusal of a value
+/// outside it: zero up to the largest value that type holds. A larger bound is not refused —
+/// a page carries what the listing caps it at — so the only integer outside this range is a
+/// negative one.
+pub const MAX_KEYS_BOUNDS: ::std::ops::RangeInclusive<i32> = 0..=i32::MAX;
+
+/// Why a `max-keys` value cannot bound a page of objects.
+///
+/// The two faults S3 states different sentences for: a value that is no integer of the
+/// member's own type, and an integer outside [`MAX_KEYS_BOUNDS`]. See [`max_keys_refusal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxKeysFault {
+    /// The value is not an integer of the member's type (`abc`, `1.5`, a number past the
+    /// range that type holds), so it names no number of keys.
+    NotAnInteger,
+    /// The value is an integer below [`MAX_KEYS_BOUNDS`].
+    Negative,
+}
+
+/// WHICH object listing a refused page bound arrived on.
+///
+/// S3 serves the legacy bucket listings and the V2 listing on routes of their own
+/// (`GET /{Bucket}`, `GET /{Bucket}?versions` and `GET /{Bucket}?list-type=2`,
+/// `smithy_query(query="operation",operation="ListObjects,ListObjectVersions,ListObjectsV2")`),
+/// and it words a NEGATIVE page bound differently on them — recorded behavior. A value that
+/// is no integer at all is worded the same way on either, because the coercion that rejects
+/// it is in front of both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectListing {
+    /// `ListObjects` and `ListObjectVersions`, served on the bucket's own route.
+    Legacy,
+    /// `ListObjectsV2`, served on the route its `list-type` names.
+    V2,
+}
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a negative page bound on a
+/// LEGACY object listing.
+///
+/// Fixed text, naming the parameter and the rule it broke and nothing of the value, which
+/// travels in the envelope's `<ArgumentValue>`.
+pub const NEGATIVE_MAX_KEYS_MESSAGE: &str = "max-keys cannot be negative";
+
+/// The `<ArgumentName>` and the `<Message>` S3 refuses `fault` on `listing` with — the pair a
+/// handler hands [`crate::scaffolded::Scaffolded::invalid_argument`] beside the value as the
+/// request sent it.
+///
+/// Each sentence is fixed text: the one for a value that is no integer says so, and the one
+/// for an integer outside the range states the BOUNDS rather than the value.
+pub fn max_keys_refusal(fault: MaxKeysFault, listing: ObjectListing) -> (&'static str, String) {
+    match (fault, listing) {
+        (MaxKeysFault::NotAnInteger, _) => (
+            MAX_KEYS_ARGUMENT,
+            format!("Provided {MAX_KEYS_ARGUMENT} not an integer or within integer range"),
+        ),
+        (MaxKeysFault::Negative, ObjectListing::Legacy) => {
+            (MAX_KEYS_ARGUMENT, NEGATIVE_MAX_KEYS_MESSAGE.to_string())
+        }
+        (MaxKeysFault::Negative, ObjectListing::V2) => (
+            MAX_KEYS_V2_ARGUMENT,
+            format!(
+                "Argument {MAX_KEYS_V2_ARGUMENT} must be an integer between {} and {}",
+                MAX_KEYS_BOUNDS.start(),
+                MAX_KEYS_BOUNDS.end()
+            ),
+        ),
+    }
+}
+
+/// How `value` fails to bound a page of objects, or `None` for a value that bounds one.
+///
+/// A parameter stated with NO value states no bound at all — `?max-keys=` names no number —
+/// so it is no fault either, exactly as for [`max_buckets_fault`]: such a request is served
+/// the page an absent parameter asks for.
+///
+/// One reading, so the boundary that WITHHOLDS such a value from the codec and the listing
+/// that refuses it cannot disagree about which values are servable.
+pub fn max_keys_fault(value: &str) -> Option<MaxKeysFault> {
+    if value.is_empty() {
+        return None;
+    }
+    match value.parse::<i32>() {
+        Err(_) => Some(MaxKeysFault::NotAnInteger),
+        Ok(bound) if !MAX_KEYS_BOUNDS.contains(&bound) => Some(MaxKeysFault::Negative),
+        Ok(_) => None,
+    }
+}
+
+/// Whether the codec must not be handed the `max-keys` value `value` — the rule
+/// [`withholds_max_buckets`] states for the other page bound, over this one.
+pub fn withholds_max_keys(value: &str) -> bool {
+    value.is_empty() || max_keys_fault(value).is_some()
+}
+
+/// The query parameter every listing binds the string it rolls keys up at from: `delimiter`
+/// (`smithy_query(query="operation",operation="ListObjects,ListObjectsV2,ListObjectVersions,ListMultipartUploads")`
+/// reports `Delimiter: {httpQuery: "delimiter"}` on each of them).
+pub const DELIMITER_PARAMETER: &str = "delimiter";
+
+/// Whether the codec must not be handed the value `value` a listing stated one of its
+/// NARROWING parameters with: one stated with NO value at all.
+///
+/// A parameter stated empty states nothing — the same reading [`withholds_max_buckets`] and
+/// [`withholds_max_keys`] make of a page bound stated with no value: `?delimiter=` rolls no
+/// key up and `?encoding-type=` asks for no encoding, so S3 serves such a request exactly as
+/// one that left the parameter out. Recorded behavior. The codec instead binds the empty text
+/// as a VALUE, which a listing then echoes as an empty element — and which the boundary
+/// refuses the whole request for when the member publishes a value set the empty text is not
+/// in ([`INVALID_ENCODING_METHOD_MESSAGE`]) — so the empty text is kept from it and the
+/// listing answers from the parameters the request really stated.
+///
+/// Read for the two narrowing parameters whose ANSWER tells an absent value from an empty
+/// one; every other (`prefix` and the markers) is echoed as the empty value
+/// whether it was stated empty or left out, so for those the two requests are already the
+/// same answer.
+pub fn withholds_empty_listing_value(value: &str) -> bool {
+    value.is_empty()
+}
+
+/// The request field a refused Region filter is reported against — the query parameter
+/// `ListBuckets` binds it from (`smithy_query(query="operation",operation="ListBuckets")`
+/// reports `BucketRegion: {httpQuery: "bucket-region"}`).
+pub const BUCKET_REGION_ARGUMENT: &str = "bucket-region";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a Region filter that names no
+/// Region: the fixed clause and the value as the request sent it, which is its one variable
+/// part — so a filter stated EMPTY names an empty value in it.
+pub fn invalid_region_message(value: &str) -> String {
+    format!("Argument value {value} is not a valid AWS Region")
+}
+
+/// Whether `value` is an AWS Region code.
+///
+/// "The Amazon Web Services Region must be expressed according to the Amazon Web Services
+/// Region code, such as us-west-2" (`ListBucketsRequest$BucketRegion`). The codes are the
+/// ones the model itself publishes for a bucket's location
+/// ([`crate::ops::types::BUCKET_LOCATION_CONSTRAINT_VALUES`], the same set
+/// `CreateBucket`'s configuration is judged by), plus [`DEFAULT_BUCKET_REGION`], which that
+/// enum expresses as the ABSENT constraint rather than as a value of its own — and without
+/// the one LEGACY ALIAS among them, which names a Region without being a Region code.
+///
+/// So the set is as current as the model: a Region S3 has launched but this model's enum does
+/// not publish yet is refused here, which is the same bound this service already judges a
+/// create's location constraint by — one place to widen when the model is updated, rather
+/// than a second catalogue written out here.
+pub fn names_an_aws_region(value: &str) -> bool {
+    if value == DEFAULT_BUCKET_REGION {
+        return true;
+    }
+    value != EU_LOCATION_CONSTRAINT
+        && crate::ops::types::BUCKET_LOCATION_CONSTRAINT_VALUES.contains(&value)
+}
+
+/// The request field a read carries the `Expires` of its answer on — the query parameter
+/// every object read binds it from
+/// (`smithy_query(query="operation",operation="GetObject,HeadObject")` reports
+/// `ResponseExpires: {httpQuery: "response-expires"}` for both).
+pub const RESPONSE_EXPIRES_ARGUMENT: &str = "response-expires";
+
+/// Whether the codec must not be handed the `response-expires` value `value`: EVERY value a
+/// request states it with.
+///
+/// "Sets the `Expires` header of the response" (`GetObjectRequest$ResponseExpires`), and that
+/// header is published as a STRING (`smithy_query(query="shape",shape="Expires")`), so the
+/// parameter is text the read ECHOES rather than an instant it computes anything from: a read
+/// whose override is no date at all is SERVED, with the text as sent. The member is modelled
+/// a timestamp, so the codec refuses the whole read for text it cannot read as one — and
+/// reads a text it can into an instant that then has to be spelled back — so the value is
+/// kept from it in full and the one reading of it is the request's own query
+/// ([`crate::service::wire::response_expires_as_sent`]).
+pub fn withholds_response_expires(_value: &str) -> bool {
+    true
+}
+
 /// The request field a refused Object Ownership setting is reported against — the header
 /// `CreateBucket` binds it from (`smithy_query(query="operation",operation="CreateBucket")`
 /// reports `ObjectOwnership: {httpHeader: "x-amz-object-ownership"}`).
