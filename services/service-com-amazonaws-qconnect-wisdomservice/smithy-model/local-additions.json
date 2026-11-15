@@ -1,0 +1,157 @@
+{
+  "smithy": "2.0",
+  "shapes": {
+    "com.amazonaws.qconnect#QuickResponseData": {
+      "type": "structure",
+      "members": {
+        "quickResponseArn": {
+          "target": "com.amazonaws.qconnect#Arn",
+          "traits": { "smithy.api#required": {} }
+        },
+        "quickResponseId": {
+          "target": "com.amazonaws.qconnect#Uuid",
+          "traits": { "smithy.api#required": {} }
+        },
+        "knowledgeBaseArn": {
+          "target": "com.amazonaws.qconnect#Arn",
+          "traits": { "smithy.api#required": {} }
+        },
+        "knowledgeBaseId": {
+          "target": "com.amazonaws.qconnect#Uuid",
+          "traits": { "smithy.api#required": {} }
+        },
+        "name": {
+          "target": "com.amazonaws.qconnect#QuickResponseName",
+          "traits": { "smithy.api#required": {} }
+        },
+        "contentType": {
+          "target": "com.amazonaws.qconnect#QuickResponseType",
+          "traits": { "smithy.api#required": {} }
+        },
+        "status": {
+          "target": "com.amazonaws.qconnect#QuickResponseStatus",
+          "traits": { "smithy.api#required": {} }
+        },
+        "createdTime": {
+          "target": "smithy.api#Timestamp",
+          "traits": {
+            "smithy.api#required": {},
+            "smithy.api#timestampFormat": "epoch-seconds"
+          }
+        },
+        "lastModifiedTime": {
+          "target": "smithy.api#Timestamp",
+          "traits": {
+            "smithy.api#required": {},
+            "smithy.api#timestampFormat": "epoch-seconds"
+          }
+        },
+        "contents": { "target": "com.amazonaws.qconnect#QuickResponseContents" },
+        "description": { "target": "com.amazonaws.qconnect#QuickResponseDescription" },
+        "groupingConfiguration": { "target": "com.amazonaws.qconnect#GroupingConfiguration" },
+        "shortcutKey": { "target": "com.amazonaws.qconnect#ShortCutKey" },
+        "lastModifiedBy": { "target": "com.amazonaws.qconnect#GenericArn" },
+        "isActive": { "target": "smithy.api#Boolean" },
+        "channels": { "target": "com.amazonaws.qconnect#Channels" },
+        "language": { "target": "com.amazonaws.qconnect#LanguageCode" },
+        "tags": { "target": "com.amazonaws.qconnect#Tags" },
+        "attributeList": { "target": "com.amazonaws.qconnect#ContactAttributeKeys" }
+      }
+    },
+    "com.amazonaws.qconnect#Arn": {
+      "type": "string",
+      "traits": {
+        "smithy.api#pattern": "^arn:[a-z-]*?:wisdom:[a-z0-9-]*?:[0-9]{12}:[a-z-]*?/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?:/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}){0,2}$"
+      }
+    },
+    "com.amazonaws.qconnect#Uuid": {
+      "type": "string",
+      "traits": {
+        "smithy.api#pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+      }
+    },
+    "com.amazonaws.qconnect#QuickResponseName": {
+      "type": "string",
+      "traits": { "smithy.api#length": { "min": 1, "max": 100 } }
+    },
+    "com.amazonaws.qconnect#QuickResponseType": {
+      "type": "string",
+      "traits": {
+        "smithy.api#pattern": "^(application/x\\.quickresponse;format=(plain|markdown))$"
+      }
+    },
+    "com.amazonaws.qconnect#QuickResponseStatus": {
+      "type": "string",
+      "traits": {
+        "smithy.api#enum": [
+          { "value": "CREATE_IN_PROGRESS", "name": "CREATE_IN_PROGRESS" },
+          { "value": "CREATE_FAILED", "name": "CREATE_FAILED" },
+          { "value": "CREATED", "name": "CREATED" },
+          { "value": "DELETE_IN_PROGRESS", "name": "DELETE_IN_PROGRESS" },
+          { "value": "DELETE_FAILED", "name": "DELETE_FAILED" },
+          { "value": "DELETED", "name": "DELETED" },
+          { "value": "UPDATE_IN_PROGRESS", "name": "UPDATE_IN_PROGRESS" },
+          { "value": "UPDATE_FAILED", "name": "UPDATE_FAILED" }
+        ]
+      }
+    },
+    "com.amazonaws.qconnect#QuickResponseContents": { "type": "structure", "members": {} },
+    "com.amazonaws.qconnect#QuickResponseDescription": {
+      "type": "string",
+      "traits": { "smithy.api#length": { "min": 1, "max": 255 } }
+    },
+    "com.amazonaws.qconnect#GroupingConfiguration": { "type": "structure", "members": {} },
+    "com.amazonaws.qconnect#ShortCutKey": {
+      "type": "string",
+      "traits": { "smithy.api#length": { "min": 1, "max": 10 } }
+    },
+    "com.amazonaws.qconnect#GenericArn": {
+      "type": "string",
+      "traits": {
+        "smithy.api#length": { "min": 1, "max": 2048 },
+        "smithy.api#pattern": "^arn:[a-z-]+?:[a-z-]+?:[a-z0-9-]*?:([0-9]{12})?:[a-zA-Z0-9-:/]+$"
+      }
+    },
+    "com.amazonaws.qconnect#Channels": {
+      "type": "list",
+      "member": { "target": "com.amazonaws.qconnect#Channel" },
+      "traits": { "smithy.api#uniqueItems": {} }
+    },
+    "com.amazonaws.qconnect#Channel": {
+      "type": "string",
+      "traits": {
+        "smithy.api#length": { "min": 1, "max": 10 },
+        "smithy.api#sensitive": {}
+      }
+    },
+    "com.amazonaws.qconnect#LanguageCode": {
+      "type": "string",
+      "traits": { "smithy.api#length": { "min": 2, "max": 5 } }
+    },
+    "com.amazonaws.qconnect#Tags": {
+      "type": "map",
+      "key": { "target": "com.amazonaws.qconnect#TagKey" },
+      "value": { "target": "com.amazonaws.qconnect#TagValue" }
+    },
+    "com.amazonaws.qconnect#TagKey": {
+      "type": "string",
+      "traits": {
+        "smithy.api#length": { "min": 1, "max": 128 },
+        "smithy.api#pattern": "^(?!aws:)[a-zA-Z+-=._:/]+$"
+      }
+    },
+    "com.amazonaws.qconnect#TagValue": {
+      "type": "string",
+      "traits": { "smithy.api#length": { "min": 1, "max": 256 } }
+    },
+    "com.amazonaws.qconnect#ContactAttributeKeys": {
+      "type": "list",
+      "member": { "target": "com.amazonaws.qconnect#ContactAttributeKey" },
+      "traits": {
+        "smithy.api#uniqueItems": {},
+        "smithy.api#sensitive": {}
+      }
+    },
+    "com.amazonaws.qconnect#ContactAttributeKey": { "type": "string" }
+  }
+}

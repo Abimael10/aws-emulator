@@ -327,12 +327,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let content = match &input.content {
             QuickResponseDataProvider::Content(content) => content.clone(),
         };
+        // Every optional member of the request the record below is built from is stored
+        // as the caller gave it, and the ones the caller named NONE of are stored with
+        // this service's own default for them, so a read of the record reports a value for
+        // each — see the constants' own docs in `crate::state` for what each default is
+        // and why.
+        //
         // `contentType` is optional on the request while `QuickResponseData.contentType`
-        // is required, so a create that names none stores the plain-text media type the
-        // member documents for content written as nothing else.
+        // is required, so a create that names none stores the default media type.
         let content_type = input
             .content_type
-            .unwrap_or_else(|| crate::state::QUICK_RESPONSE_TYPE_PLAIN.to_string());
+            .unwrap_or_else(|| crate::state::QUICK_RESPONSE_TYPE_BY_DEFAULT.to_string());
+        // A create that names no channel scopes the quick response to every contact
+        // channel this service supports, and one that names no language to the service's
+        // default language code.
+        let channels = input
+            .channels
+            .unwrap_or_else(|| vec![crate::state::QUICK_RESPONSE_CHANNEL_CHAT.to_string()]);
+        let language = input
+            .language
+            .unwrap_or_else(|| crate::state::QUICK_RESPONSE_LANGUAGE_BY_DEFAULT.to_string());
+        // …and one that does not say whether the quick response is active creates it
+        // active, which is what answering it already `CREATED` means.
+        let is_active = input
+            .is_active
+            .unwrap_or(crate::state::QUICK_RESPONSE_ACTIVE_BY_DEFAULT);
 
         let quick_response_id = crate::state::new_resource_id();
         let quick_response_arn =
@@ -351,9 +370,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             grouping_configuration: input.grouping_configuration,
             shortcut_key: input.shortcut_key,
-            is_active: input.is_active,
-            channels: input.channels,
-            language: input.language,
+            is_active: Some(is_active),
+            channels: Some(channels),
+            language: Some(language),
             tags,
             created_at: now,
             // Nothing has modified the record yet, so it was last written when it was

@@ -43,6 +43,8 @@ mod notify_recommendations_error_text;
 mod quick_response;
 #[path = "all/quick_response_mutations.rs"]
 mod quick_response_mutations;
+#[path = "all/quick_response_optional_members.rs"]
+mod quick_response_optional_members;
 #[path = "all/quick_response_search.rs"]
 mod quick_response_search;
 #[path = "all/relayed_knowledge_base_refusal.rs"]

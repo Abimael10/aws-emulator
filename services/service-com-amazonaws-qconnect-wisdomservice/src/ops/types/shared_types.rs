@@ -1508,29 +1508,11 @@ pub enum QuickResponseDataProvider {
     Content(String),
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.qconnect#QuickResponseData")]
-#[derive(Debug, Clone)]
-pub struct QuickResponseData {
-    pub quick_response_arn: String,
-    pub quick_response_id: String,
-    pub knowledge_base_arn: String,
-    pub knowledge_base_id: String,
-    pub name: String,
-    pub content_type: String,
-    pub status: String,
-    pub created_time: ::aws_smithy_types::DateTime,
-    pub last_modified_time: ::aws_smithy_types::DateTime,
-    pub contents: Option<QuickResponseContents>,
-    pub description: Option<String>,
-    pub grouping_configuration: Option<GroupingConfiguration>,
-    pub shortcut_key: Option<String>,
-    pub last_modified_by: Option<String>,
-    pub is_active: Option<bool>,
-    pub channels: Option<Vec<String>>,
-    pub language: Option<String>,
-    pub tags: Option<std::collections::HashMap<String, String>>,
-}
-
+/// `QuickResponseData` is NOT declared here: AWS answers the quick-response operations
+/// with one member this crate's model snapshot does not declare, so the type is generated
+/// from the overlay model instead — see `quick_response_data_types.rs` and
+/// `smithy-model/LOCAL-ADDITIONS.md`.
+///
 /// The values `AIAgentAssociationConfigurationType` accepts on the wire.
 pub const A_I_AGENT_ASSOCIATION_CONFIGURATION_TYPE_VALUES: &[&str] = &["KNOWLEDGE_BASE"];
 

@@ -783,10 +783,8 @@ pub const MAX_QUICK_RESPONSES_PER_KNOWLEDGE_BASE: usize = 100;
 /// removes the record outright).
 pub const QUICK_RESPONSE_STATUS_CREATED: &str = "CREATED";
 
-/// The `QuickResponseType` of a quick response written in plain text, and the media type
-/// a create that names none is stored with: the member is optional on the request while
-/// `QuickResponseData.contentType` is required, and plain text is the form the content is
-/// read as when the caller marks it up as nothing else
+/// The `QuickResponseType` of a quick response written in plain text: the form the
+/// content is read as when the caller marks it up as nothing else
 /// (`smithy_query(query="doc",shape="CreateQuickResponseRequest",member="contentType")`:
 /// "Use application/x.quickresponse;format=plain for a quick response written in plain
 /// text").
@@ -794,9 +792,43 @@ pub const QUICK_RESPONSE_TYPE_PLAIN: &str = "application/x.quickresponse;format=
 
 /// The `QuickResponseType` of a quick response written in richtext — the same member's
 /// other documented value ("Use application/x.quickresponse;format=markdown for a quick
-/// response written in richtext"), which decides which `QuickResponseContents` member
-/// carries the stored content.
+/// response written in richtext"), which decides which `QuickResponseContents` members
+/// carry the stored content.
 pub const QUICK_RESPONSE_TYPE_MARKDOWN: &str = "application/x.quickresponse;format=markdown";
+
+/// The media type a create that names NO `contentType` is stored with.
+///
+/// `contentType` is optional on `CreateQuickResponse` while
+/// `QuickResponseData.contentType` is required, so the service decides the media type of
+/// a quick response whose create named none: it is the richtext one, which is what the
+/// recorded wire answer of this endpoint reports for such a create (corpus
+/// `simparity-wire-aws-v1`, fixture `wisdom-quick-response-error-paths`, step `setup#3`,
+/// a create carrying only a name, a content and a shortcut key). Richtext is also the
+/// media type that carries the content in BOTH forms a client may read it as — see
+/// [`QuickResponse::contents`].
+pub const QUICK_RESPONSE_TYPE_BY_DEFAULT: &str = QUICK_RESPONSE_TYPE_MARKDOWN;
+
+/// The contact channels a quick response whose create named NO `channels` applies to.
+///
+/// `channels` is optional on `CreateQuickResponse`, and a quick response the caller did
+/// not scope to a channel applies to every contact channel this service supports —
+/// "<p>The Connect Customer contact channels this quick response applies to. The
+/// supported contact channel types include <code>Chat</code>.</p>"
+/// (`smithy_query(query="shape",shape="QuickResponseData")`, member `channels`), so the
+/// whole supported set is the one value below. The recorded wire answers of this endpoint
+/// report exactly that for a create that named no channel (corpus
+/// `simparity-wire-aws-v1`, fixtures `wisdom-quick-response-error-paths` and
+/// `wisdom-quick-response-lifecycle`).
+pub const QUICK_RESPONSE_CHANNEL_CHAT: &str = "Chat";
+
+/// The `LanguageCode` a quick response whose create named NO `language` is written in:
+/// the service's default language code, which the recorded wire answers of this endpoint
+/// report for such a create (corpus `simparity-wire-aws-v1`, the `wisdom-quick-response-*`
+/// fixtures). It is one of the codes the member documents
+/// (`smithy_query(query="doc",shape="CreateQuickResponseRequest",member="language")`: "The
+/// supported language codes include de_DE, en_US, es_ES, fr_FR, id_ID, it_IT, ja_JP,
+/// ko_KR, pt_BR, zh_CN, zh_TW").
+pub const QUICK_RESPONSE_LANGUAGE_BY_DEFAULT: &str = "en_US";
 
 /// Whether a quick response whose create named no `isActive` is in service.
 ///
@@ -2356,24 +2388,88 @@ pub struct QuickResponse {
     pub last_modified_by: String,
 }
 
+/// The contact-attribute keys `content` names, each once and in the order the content
+/// first names it.
+///
+/// A placeholder is `{{<key>}}`, as the service's own render path describes a template
+/// variable ("the rendered message content will keep the variable placeholder as it is
+/// and return the attribute keys that are missing",
+/// `smithy_query(query="operation",operation="RenderMessageTemplate")`), with the key
+/// trimmed of surrounding whitespace; an unterminated or empty placeholder names no
+/// attribute and is ignored, so no key this emulator cannot read off the content is ever
+/// claimed.
+///
+/// One linear pass, no recursion, and nothing retained but the keys found: the input is
+/// the stored content, whose own `@length` (`QuickResponseContent`, 1..4000) bounds how
+/// much there is to walk.
+fn content_attribute_keys(content: &str) -> Vec<String> {
+    const OPEN: &str = "{{";
+    const CLOSE: &str = "}}";
+
+    let mut keys: Vec<String> = Vec::new();
+    let mut rest = content;
+    while let Some(open) = rest.find(OPEN) {
+        rest = &rest[open + OPEN.len()..];
+        let Some(close) = rest.find(CLOSE) else {
+            break;
+        };
+        // A placeholder the content opens again before closing the first one names only
+        // what the LAST opener began, so an unclosed `{{` swallows no key.
+        let span = &rest[..close];
+        let key = match span.rfind(OPEN) {
+            Some(reopened) => span[reopened + OPEN.len()..].trim(),
+            None => span.trim(),
+        };
+        if !key.is_empty() && !keys.iter().any(|held| held == key) {
+            keys.push(key.to_string());
+        }
+        rest = &rest[close + CLOSE.len()..];
+    }
+    keys
+}
+
 impl QuickResponse {
-    /// The stored content as the modelled `QuickResponseContents` union: the member that
-    /// carries it is the one this record's `contentType` names, so a plain-text quick
-    /// response reports its content under `plainText` and a richtext one under
-    /// `markdown`.
+    /// The stored content as the modelled `QuickResponseContents`: "<p>The content of the
+    /// quick response stored in different media types.</p>"
+    /// (`smithy_query(query="shape",shape="QuickResponseContents")`), so the structure
+    /// reports the content under EVERY member whose media type this quick response can be
+    /// read as.
+    ///
+    /// Plain text is always one of them — the stored text is readable as plain text
+    /// whatever it is marked up as — and `markdown` is reported as well when the quick
+    /// response is written in richtext, which is the media type its `contentType` names.
+    /// A plain-text quick response therefore reports `plainText` alone, and a richtext one
+    /// reports both; that is what the recorded wire answers of this endpoint carry (corpus
+    /// `simparity-wire-aws-v1`, fixtures `wisdom-quick-response-error-paths` and
+    /// `wisdom-quick-response-lifecycle`).
     fn contents(&self) -> QuickResponseContents {
         let provider = QuickResponseContentProvider::Content(self.content.clone());
-        if self.content_type == QUICK_RESPONSE_TYPE_MARKDOWN {
-            QuickResponseContents {
-                plain_text: None,
-                markdown: Some(provider),
-            }
-        } else {
-            QuickResponseContents {
-                plain_text: Some(provider),
-                markdown: None,
-            }
+        QuickResponseContents {
+            plain_text: Some(provider.clone()),
+            markdown: (self.content_type == QUICK_RESPONSE_TYPE_MARKDOWN).then_some(provider),
         }
+    }
+
+    /// The contact attributes this quick response's content references, which the service
+    /// reports beside the content as `attributeList`.
+    ///
+    /// A quick response carries no attribute member of its own — neither
+    /// `CreateQuickResponse` nor `UpdateQuickResponse` declares one — so the attributes it
+    /// holds are the ones its CONTENT names, as a placeholder `{{<key>}}`; the model's own
+    /// `QuickResponseSearchResultData` reports which of those a search resolved
+    /// (`attributesInterpolated`) and which it did not
+    /// (`attributesNotInterpolated`, target `ContactAttributeKeys`), so the keys are
+    /// contact-attribute keys and this list is their set. Each key is reported once, in
+    /// the order the content first names it, and a content that names none reports the
+    /// EMPTY list rather than no list at all — which is what the recorded wire answers of
+    /// this endpoint carry for a quick response whose content references no attribute
+    /// (corpus `simparity-wire-aws-v1`, the `wisdom-quick-response-*` fixtures).
+    ///
+    /// What the recording pins is that answer for a content naming no attribute; the keys
+    /// of a content that DOES name one are read off the stored content, which is the only
+    /// place this service holds any, rather than claimed from anywhere else.
+    pub fn attribute_list(&self) -> Vec<String> {
+        content_attribute_keys(&self.content)
     }
 
     /// This quick response as the `QuickResponseData` shape `CreateQuickResponse` and
@@ -2399,6 +2495,9 @@ impl QuickResponse {
             is_active: self.is_active,
             channels: self.channels.clone(),
             language: self.language.clone(),
+            // The contact attributes the content names, empty when it names none — see
+            // [`Self::attribute_list`].
+            attribute_list: Some(self.attribute_list()),
             tags: tags_out(&self.tags),
         }
     }

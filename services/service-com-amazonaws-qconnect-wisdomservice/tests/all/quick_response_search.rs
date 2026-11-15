@@ -532,7 +532,9 @@ async fn filters_restrict_the_selection_to_the_records_they_admit() {
             selects: &[1],
         },
         FilterCase {
-            label: "a channel two records share, with the channel-less ones admitted",
+            // Every record carries a channel: a create that names none is stored scoped
+            // to every channel this service supports, which is `Chat`.
+            label: "a channel the records share, absence admitted too",
             field: "channels",
             operator: "EQUALS",
             values: &["Chat"],
@@ -703,7 +705,7 @@ async fn filters_restrict_the_selection_to_the_records_they_admit() {
     let actual = hit_ids("two filters", &reply);
     assert_eq!(
         actual,
-        seeded.expected(&[0, 1]),
+        seeded.expected(&[0, 1, 4]),
         "case \"two filters\": expected only the records both admit, got {actual:?} from {}",
         reply.body
     );

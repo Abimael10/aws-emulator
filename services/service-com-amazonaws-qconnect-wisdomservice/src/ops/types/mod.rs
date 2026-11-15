@@ -84,6 +84,7 @@ pub mod list_tags_for_resource_types;
 pub mod notify_recommendations_received_types;
 pub mod put_feedback_types;
 pub mod query_assistant_types;
+pub mod quick_response_data_types;
 pub mod remove_assistant_ai_agent_types;
 pub mod remove_knowledge_base_template_uri_types;
 pub mod render_message_template_types;
@@ -250,6 +251,8 @@ pub use notify_recommendations_received_types::*;
 pub use put_feedback_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use query_assistant_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use quick_response_data_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use remove_assistant_ai_agent_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

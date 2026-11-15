@@ -221,7 +221,10 @@ fn update_cases() -> Vec<UpdateCase> {
                 ("contentType", Some(json!(CONTENT_TYPE_MARKDOWN))),
                 (
                     "contents",
-                    Some(json!({ "markdown": { "content": "The baseline reply" } })),
+                    Some(json!({
+                        "plainText": { "content": "The baseline reply" },
+                        "markdown": { "content": "The baseline reply" },
+                    })),
                 ),
             ],
         },
@@ -235,7 +238,10 @@ fn update_cases() -> Vec<UpdateCase> {
                 ("contentType", Some(json!(CONTENT_TYPE_MARKDOWN))),
                 (
                     "contents",
-                    Some(json!({ "markdown": { "content": "# Heading\n\nthe rich reply" } })),
+                    Some(json!({
+                        "plainText": { "content": "# Heading\n\nthe rich reply" },
+                        "markdown": { "content": "# Heading\n\nthe rich reply" },
+                    })),
                 ),
             ],
         },
@@ -319,7 +325,10 @@ fn update_cases() -> Vec<UpdateCase> {
                 ("name", Some(json!("wholly-updated"))),
                 (
                     "contents",
-                    Some(json!({ "markdown": { "content": "# Everything" } })),
+                    Some(json!({
+                        "plainText": { "content": "# Everything" },
+                        "markdown": { "content": "# Everything" },
+                    })),
                 ),
                 ("contentType", Some(json!(CONTENT_TYPE_MARKDOWN))),
                 ("description", Some(json!("a wholly new description"))),

@@ -60,13 +60,23 @@ const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
 /// the literal rather than imported from the implementation, so the assertion pins the
 /// modelled value (`smithy_query(query="shape",shape="QuickResponseStatus")` declares it
 /// beside the transient `CREATE_IN_PROGRESS`, `UPDATE_IN_PROGRESS` and the rest).
-const STATUS_CREATED: &str = "CREATED";
+pub(crate) const STATUS_CREATED: &str = "CREATED";
 
 /// Both values the modelled `QuickResponseType` pattern admits
 /// (`smithy_query(query="operation",operation="CreateQuickResponse")`: `contentType`
 /// matches `^(application/x\.quickresponse;format=(plain|markdown))$`).
-const CONTENT_TYPE_PLAIN: &str = "application/x.quickresponse;format=plain";
-const CONTENT_TYPE_MARKDOWN: &str = "application/x.quickresponse;format=markdown";
+pub(crate) const CONTENT_TYPE_PLAIN: &str = "application/x.quickresponse;format=plain";
+pub(crate) const CONTENT_TYPE_MARKDOWN: &str = "application/x.quickresponse;format=markdown";
+
+/// What this endpoint fills the optional members a create names NONE of with, written
+/// out here rather than imported from the implementation: the media type, the contact
+/// channels, the language code and the active flag a quick response created without them
+/// carries. All four are what the recorded wire answers of this endpoint report for such
+/// a create (`quick_response_optional_members.rs` states the rule).
+pub(crate) const CONTENT_TYPE_BY_DEFAULT: &str = CONTENT_TYPE_MARKDOWN;
+pub(crate) const CHANNEL_CHAT: &str = "Chat";
+pub(crate) const LANGUAGE_BY_DEFAULT: &str = "en_US";
+pub(crate) const ACTIVE_BY_DEFAULT: bool = true;
 
 /// Every language code the model documents for `language`
 /// (`smithy_query(query="doc",shape="CreateQuickResponseRequest",member="language")`:
@@ -97,19 +107,19 @@ const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     error_type: String,
     content_type: String,
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn field(&self, pointer: &str) -> Option<&Value> {
+    pub(crate) fn field(&self, pointer: &str) -> Option<&Value> {
         self.body.pointer(pointer).filter(|v| !v.is_null())
     }
 
-    fn string(&self, pointer: &str) -> Option<String> {
+    pub(crate) fn string(&self, pointer: &str) -> Option<String> {
         self.field(pointer)
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -118,12 +128,12 @@ impl Reply {
 
 /// An emulator with just this service mounted on a fresh engine, driven in-process
 /// through the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these tests are about; the router still routes by the
@@ -133,7 +143,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{ROUTE_KEY}/aws4_request, \
              SignedHeaders=host, Signature=not-verified-in-this-suite"
@@ -243,7 +253,7 @@ impl Emulator {
     }
 
     /// A fresh knowledge base, answering with the id its create minted.
-    async fn knowledge_base_id(&self, name: &str) -> String {
+    pub(crate) async fn knowledge_base_id(&self, name: &str) -> String {
         let reply = self.create_knowledge_base(name).await;
         assert_eq!(
             reply.status, 200,
@@ -259,7 +269,7 @@ impl Emulator {
 
 /// A `UuidOrArn` label as one URI path segment: an ARN carries `/`, which must not be
 /// read as path structure.
-fn path(label: &str) -> String {
+pub(crate) fn path(label: &str) -> String {
     label.replace('/', "%2F")
 }
 
@@ -370,19 +380,38 @@ impl QuickResponseCase {
         body
     }
 
-    /// The media type the record is stored with: the one the request named, or the
-    /// plain-text default for a request that named none.
+    /// The media type the record is stored with: the one the request named, or this
+    /// service's default for a request that named none.
     fn expected_content_type(&self) -> &str {
-        self.content_type.unwrap_or(CONTENT_TYPE_PLAIN)
+        self.content_type.unwrap_or(CONTENT_TYPE_BY_DEFAULT)
     }
 
-    /// Which `QuickResponseContents` member carries the content back.
-    fn expected_contents_pointer(&self) -> &'static str {
-        if self.expected_content_type() == CONTENT_TYPE_MARKDOWN {
-            "/quickResponse/contents/markdown/content"
+    /// Whether the record carries `markdown` beside `plainText`: a quick response
+    /// written in richtext is readable both ways, a plain-text one only as plain text.
+    fn expects_markdown_contents(&self) -> bool {
+        self.expected_content_type() == CONTENT_TYPE_MARKDOWN
+    }
+
+    /// The contact channels the record is stored with: the ones the request named, or
+    /// every channel this service supports for a request that named none.
+    fn expected_channels(&self) -> Vec<String> {
+        if self.channels.is_empty() {
+            vec![CHANNEL_CHAT.to_string()]
         } else {
-            "/quickResponse/contents/plainText/content"
+            self.channels.clone()
         }
+    }
+
+    /// The language code the record is stored with: the one the request named, or this
+    /// service's default for a request that named none.
+    fn expected_language(&self) -> &str {
+        self.language.unwrap_or(LANGUAGE_BY_DEFAULT)
+    }
+
+    /// Whether the record is active: what the request said, or active for a request that
+    /// did not say.
+    fn expected_is_active(&self) -> bool {
+        self.is_active.unwrap_or(ACTIVE_BY_DEFAULT)
     }
 }
 
@@ -542,24 +571,22 @@ fn assert_reported_quick_response(
         "case {label:?} ({source}): expected status {STATUS_CREATED}, got {:?}",
         reply.field("/quickResponse/status")
     );
+    // The content is reported in every media type the quick response can be read as:
+    // plain text always, markdown as well when it is written in richtext.
     assert_eq!(
-        reply.string(case.expected_contents_pointer()),
+        reply.string("/quickResponse/contents/plainText/content"),
         Some(case.content.clone()),
-        "case {label:?} ({source}): expected the content under {}, got body {}",
-        case.expected_contents_pointer(),
+        "case {label:?} ({source}): expected the content under contents.plainText, got body {}",
         reply.body
     );
-    // The content is reported under exactly ONE member of the union-valued contents.
-    let other_pointer = if case.expected_contents_pointer().contains("markdown") {
-        "/quickResponse/contents/plainText"
-    } else {
-        "/quickResponse/contents/markdown"
-    };
-    assert!(
-        reply.field(other_pointer).is_none(),
-        "case {label:?} ({source}): {other_pointer} must be absent for contentType {}, got {:?}",
+    assert_eq!(
+        reply.string("/quickResponse/contents/markdown/content"),
+        case.expects_markdown_contents()
+            .then(|| case.content.clone()),
+        "case {label:?} ({source}): contents.markdown must carry the content for contentType \
+         {} and be absent otherwise, got body {}",
         case.expected_content_type(),
-        reply.field(other_pointer)
+        reply.body
     );
     assert_eq!(
         reply.string("/quickResponse/description"),
@@ -575,8 +602,8 @@ fn assert_reported_quick_response(
     );
     assert_eq!(
         reply.field("/quickResponse/isActive").and_then(Value::as_bool),
-        case.is_active,
-        "case {label:?} ({source}): expected the requested isActive, got {:?}",
+        Some(case.expected_is_active()),
+        "case {label:?} ({source}): expected the stored isActive, got {:?}",
         reply.field("/quickResponse/isActive")
     );
     let reported_channels: Vec<String> = reply
@@ -591,14 +618,15 @@ fn assert_reported_quick_response(
         })
         .unwrap_or_default();
     assert_eq!(
-        reported_channels, case.channels,
-        "case {label:?} ({source}): expected the requested channels, got {:?}",
+        reported_channels,
+        case.expected_channels(),
+        "case {label:?} ({source}): expected the stored channels, got {:?}",
         reply.field("/quickResponse/channels")
     );
     assert_eq!(
         reply.string("/quickResponse/language").as_deref(),
-        case.language,
-        "case {label:?} ({source}): expected the requested language, got {:?}",
+        Some(case.expected_language()),
+        "case {label:?} ({source}): expected the stored language, got {:?}",
         reply.field("/quickResponse/language")
     );
     assert_eq!(

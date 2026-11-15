@@ -69,6 +69,8 @@ mod quick_response;
 mod quick_response_delete_reach;
 #[path = "all/quick_response_mutations.rs"]
 mod quick_response_mutations;
+#[path = "all/quick_response_optional_members.rs"]
+mod quick_response_optional_members;
 #[path = "all/quick_response_plane_gate.rs"]
 mod quick_response_plane_gate;
 #[path = "all/quick_response_search.rs"]

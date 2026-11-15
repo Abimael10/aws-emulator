@@ -7052,3 +7052,14 @@ mod all_rs_is_a_canonical_declaration_list;
 //! it describes and cannot collide with another landing's note. A landing that appends prose
 //! here instead grows a file every suite in the target depends on, and this crate root has
 //! the project's 5000-line ceiling to stay under.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted. This file is
+//! that LIST and nothing else: one pair per suite, no prose between them, so a landing has
+//! one place to insert and nothing to keep consistent. What a suite covers, and why it
+//! belongs to this cross-service target rather than to one service crate's own, is stated
+//! in that suite's own module doc, where it is read beside the test it describes.
+//! A suite no `mod` names compiles nowhere and its tests never run (the build script
+//! refuses an undeclared file under `tests/all/`); a suite left at the top level of
+//! suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod`
+//! resolves to a SIBLING of this file, which the layout check refuses: the `#[path]` is
+//! declaration — never a note about one, and never a copy of this header.
+//! leaving a note here; `all/appended_notes.rs` holds the notes landings had appended.
