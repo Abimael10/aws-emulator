@@ -61,6 +61,9 @@ struct RefusedCase {
 /// CloudWatch alarm, so no other service's store is reached by this suite.
 fn router() -> MultiServiceRouter {
     let engine = new_engine();
+    // A group launches from a launch template the account holds, so the one this suite's
+    // groups name is put in the account's own Amazon EC2 store first.
+    crate::support::seed_launch_templates(&engine, &[LAUNCH_SOURCE.1]);
     let mut router = MultiServiceRouter::new();
     router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));
     router

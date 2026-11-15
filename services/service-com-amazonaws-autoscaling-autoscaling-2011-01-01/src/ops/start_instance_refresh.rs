@@ -210,6 +210,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(preferences) = input.preferences.as_ref() {
             check_preferences(preferences)?;
         }
+        // The desired configuration states the launch source the refresh moves the group's
+        // instances onto, so the launch template it names is resolved against the account's
+        // own Amazon EC2 store exactly as the one a create or an update names is: a refresh
+        // could launch nothing from a template Amazon EC2 does not have. Asked BEFORE this
+        // service's store is locked, so only one store is ever held at a time.
+        if let Some(desired) = input.desired_configuration.as_ref() {
+            if let Some(refusal) =
+                crate::state::group_configuration::unresolvable_launch_template_error(
+                    &*self.engine,
+                    desired.launch_template.as_ref(),
+                    desired.mixed_instances_policy.as_ref(),
+                )
+            {
+                return Err(refusal);
+            }
+            if let Some(refusal) = crate::state::group_configuration::duplicate_override_error(
+                desired.mixed_instances_policy.as_ref(),
+            ) {
+                return Err(refusal);
+            }
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
@@ -358,22 +379,19 @@ fn check_preferences(preferences: &RefreshPreferences) -> Result<(), StartInstan
                  100 and 200"
             )));
         }
-        let Some(min_healthy) = preferences.min_healthy_percentage else {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                "If you specify MaxHealthyPercentage, you must also specify \
-                 MinHealthyPercentage",
-            ));
-        };
-        // Both operands are inside the ranges checked above, and the subtraction
-        // saturates rather than wrapping, so no request can reach the comparison with
-        // a difference this arithmetic cannot represent.
-        if max_healthy.saturating_sub(min_healthy) > 100 {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The difference between MinHealthyPercentage and MaxHealthyPercentage cannot be \
-                 greater than 100, but MinHealthyPercentage is {min_healthy} and \
-                 MaxHealthyPercentage is {max_healthy}"
-            )));
-        }
+    }
+    // The two healthy-percentage thresholds a refresh states are the SAME pair a group's
+    // instance maintenance policy carries — stated for this refresh rather than stored on the
+    // group — so the rules that hold them together, and the sentences the service states for
+    // them, are that pair's ([`crate::state::group_configuration::healthy_percentage_error`]).
+    if let Some(refusal) = crate::state::group_configuration::healthy_percentage_error(
+        preferences.min_healthy_percentage,
+        preferences.max_healthy_percentage,
+        // The preferences of ONE refresh state the pair for that refresh alone, which is
+        // the wording the service answers them with.
+        crate::state::group_configuration::HealthyThresholds::Refreshed,
+    ) {
+        return Err(refusal);
     }
     if let Some(checkpoints) = preferences.checkpoint_percentages.as_ref() {
         if checkpoints.windows(2).any(|pair| pair[0] >= pair[1]) {

@@ -48,10 +48,36 @@ const SECRETS: &str = "secretsmanager";
 /// Auto Scaling group an ECS capacity provider binds onto.
 const AUTO_SCALING: &str = "autoscaling";
 
+/// The launch template the Auto Scaling group below launches from, put in the account's own
+/// Amazon EC2 records by [`emulator`]: a group launches from a launch template the account
+/// holds, and this router mounts no Amazon EC2 endpoint to create one through.
+const CAPACITY_LAUNCH_TEMPLATE: &str = "tagging-capacity";
+
+/// Put that launch template in the account's own Amazon EC2 store, through Amazon EC2's own
+/// writer.
+fn seed_capacity_launch_template(engine: &Arc<engine::InMemoryEngine>) {
+    let ec2 = service_com_amazonaws_ec2_amazonec2::state::service_state(&**engine)
+        .expect("the shared engine carries the Amazon EC2 store");
+    let mut store = ec2.lock();
+    store.insert_launch_template(
+        service_com_amazonaws_ec2_amazonec2::state::LaunchTemplateSpec {
+            name: CAPACITY_LAUNCH_TEMPLATE.to_string(),
+            created_by: engine::emulator_arn("iam", "", "root"),
+            create_time: SystemTime::now(),
+            tags: Vec::new(),
+            operator: None,
+            version_description: None,
+            data: service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData::default(
+            ),
+        },
+    );
+}
+
 /// A router carrying the tagging API and the owning services it resolves ARNs
 /// against, all over ONE engine — exactly the arrangement `core/router` builds.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    seed_capacity_launch_template(&engine);
     let mut router = MultiServiceRouter::new();
     // The tests exercise handler behaviour, not SigV4: the `Authorization`
     // header below is present because it is what routes a request to a signing
@@ -84,7 +110,7 @@ async fn create_auto_scaling_group(router: &MultiServiceRouter, name: &str) {
         ("Action", "CreateAutoScalingGroup"),
         ("Version", "2011-01-01"),
         ("AutoScalingGroupName", name),
-        ("LaunchTemplate.LaunchTemplateName", "tagging-capacity"),
+        ("LaunchTemplate.LaunchTemplateName", CAPACITY_LAUNCH_TEMPLATE),
         ("MinSize", "0"),
         ("MaxSize", "0"),
         ("AvailabilityZones.member.1", zone.as_str()),

@@ -14,8 +14,9 @@
 //! `autoscaling:<OperationName>` over every resource, and otherwise refuses it with HTTP
 //! 403 `AccessDenied` naming the principal, the action and which of IAM's rules withheld
 //! the grant — without reading or changing anything. An action IAM judges against a
-//! resource's own ARN is NOT decided here, so a caller holding no policy still reaches the
-//! operation's own answer for it.
+//! resource's own ARN is decided on the readings that ARN cannot change: a caller whose
+//! documents hold no `Allow` of the action at all is refused, and a grant scoped to resource
+//! ARNs reaches the operation's own answer.
 //!
 //! The rows span what the rule generalises over: the operation (three of the `Describe`
 //! family, plus one operation outside it), the documents in force (none at all, an inline
@@ -68,11 +69,16 @@ enum Expect {
     NoAllow,
 }
 
+/// The launch template the group this suite creates launches from, put in the account's own
+/// Amazon EC2 store by [`emulator`]: a group launches from a template the account holds.
+const LAUNCH_TEMPLATE: &str = "lt-authorization";
+
 /// The emulator the rows drive: Auto Scaling beside the IAM and STS services on ONE shared
 /// engine, so the policies a row stores and the session it mints are the ones the gate
 /// reads.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    crate::support::seed_launch_templates(&engine, &[LAUNCH_TEMPLATE]);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));
@@ -263,12 +269,33 @@ async fn user_key_of(router: &MultiServiceRouter, case: &str, user_name: &str) -
 /// The refusal this service words for `principal` asking for `action`, with the clause the
 /// rule the decision was taken under states.
 fn refusal_message(principal: &str, action: &str, expected: Expect) -> String {
-    let reason = match expected {
+    format!(
+        "User: {principal} is not authorized to perform: {action} {}",
+        refusal_reason(action, expected)
+    )
+}
+
+/// The same, for an action judged against the ARN of the resource the request addresses:
+/// the sentence names that resource between the action and the clause.
+fn resource_refusal_message(
+    principal: &str,
+    action: &str,
+    resource: &str,
+    expected: Expect,
+) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} {}",
+        refusal_reason(action, expected)
+    )
+}
+
+/// The clause a refusal closes with, naming which of IAM's rules withheld the grant.
+fn refusal_reason(action: &str, expected: Expect) -> String {
+    match expected {
         Expect::ExplicitDeny => "with an explicit deny in an identity-based policy".to_string(),
         Expect::NoAllow => format!("because no identity-based policy allows the {action} action"),
         Expect::Served => unreachable!("a served call carries no refusal"),
-    };
-    format!("User: {principal} is not authorized to perform: {action} {reason}")
+    }
 }
 
 /// Assert that the call `read` signed by `akid` answered what `expected` requires of it,
@@ -477,14 +504,13 @@ async fn the_credential_decides_which_principal_the_read_is_judged_on() {
     }
 }
 
-/// RULE: only the actions IAM judges over EVERY resource are decided by this gate. An
-/// action IAM judges against the ARN of the resource the request addresses reaches the
-/// operation's own answer, so a caller holding no policy is not refused 403 for it.
+/// RULE: an action IAM judges against the ARN of the resource the request addresses is
+/// decided on the readings that ARN cannot change — a caller whose documents hold no `Allow`
+/// of the action is refused 403, and a grant scoped to resource ARNs reaches the operation's
+/// own answer, because the resources it covers are not ones this gate read.
 #[tokio::test]
-async fn an_action_judged_against_a_resource_is_not_decided_here() {
+async fn an_action_judged_against_a_resource_is_decided_on_the_action_alone() {
     let router = emulator();
-    let case = "a role carrying no policy at all";
-    let (akid, _) = session_of(&router, case, "resource-action-role", &[]).await;
     // (the action, the parameters a client sends with it)
     let rows: &[(&str, &[(&str, &str)])] = &[
         (
@@ -499,12 +525,46 @@ async fn an_action_judged_against_a_resource_is_not_decided_here() {
             &[("AutoScalingGroupName", "no-such-group")],
         ),
     ];
+
+    let case = "a role carrying no policy at all";
+    let (akid, _) = session_of(&router, case, "resource-action-role", &[]).await;
+    for (action, params) in rows {
+        let (status, body) = autoscaling_as(&router, &akid, action, params).await;
+        assert_eq!(
+            status, 403,
+            "case {case:?} / {action}: no readable document allows the action at all, got \
+             {status} {body}"
+        );
+        assert_eq!(
+            tag_value(&body, "Code"),
+            ACCESS_DENIED,
+            "case {case:?} / {action}: expected {ACCESS_DENIED}, got {status} {body}"
+        );
+    }
+
+    let case = "a role whose grant of the action is scoped to one group's ARN";
+    let scoped = format!(
+        "arn:aws:autoscaling:{REGION}:{}:autoScalingGroup:*:autoScalingGroupName/no-such-group",
+        account()
+    );
+    let (akid, _) = session_of(
+        &router,
+        case,
+        "resource-scoped-role",
+        &[
+            (
+                "allow-on-one-group",
+                statement("Allow", "autoscaling:*", &scoped),
+            ),
+        ],
+    )
+    .await;
     for (action, params) in rows {
         let (status, body) = autoscaling_as(&router, &akid, action, params).await;
         assert_ne!(
             status, 403,
-            "case {case:?} / {action}: an action judged against a resource is left to the \
-             operation, got {status} {body}"
+            "case {case:?} / {action}: a resource-scoped grant is left to the operation, got \
+             {status} {body}"
         );
         assert_eq!(
             tag_value(&body, "Code"),
@@ -531,7 +591,7 @@ async fn a_refused_read_reports_nothing_and_changes_nothing() {
             ("MinSize", "0"),
             ("MaxSize", "1"),
             ("AvailabilityZones.member.1", "us-west-2a"),
-            ("LaunchTemplate.LaunchTemplateName", "absent-template"),
+            ("LaunchTemplate.LaunchTemplateName", LAUNCH_TEMPLATE),
             ("Tags.member.1.Key", "env"),
             ("Tags.member.1.Value", "prod"),
             ("Tags.member.1.PropagateAtLaunch", "true"),
@@ -589,4 +649,119 @@ async fn a_refused_read_reports_nothing_and_changes_nothing() {
         reported.contains("env") && reported.contains("prod"),
         "case {case:?}: expected the group's tag to still be reported, got {reported}"
     );
+}
+
+/// RULE: a MUTATION is authorized before it touches the store, so a caller whose documents
+/// hold no `Allow` of the action is refused 403 `AccessDenied` and nothing is created; a
+/// caller the documents allow is served.
+///
+/// The rows span the documents in force on the principal: none at all, an allow of the whole
+/// service, an allow of this one action, and an explicit deny beside that allow.
+#[tokio::test]
+async fn a_mutation_is_authorized_before_it_reaches_the_store() {
+    let router = emulator();
+    let action = format!("{ACTION_PREFIX}:CreateAutoScalingGroup");
+    /// One row: the case, the role's name, its inline policies, and what the create answers.
+    type MutationRow = (&'static str, &'static str, Vec<(&'static str, String)>, Expect);
+    // (case, the role's inline policies, what the create must answer)
+    let rows: Vec<MutationRow> = vec![
+        (
+            "a role carrying no policy at all",
+            "create-bare-role",
+            vec![],
+            Expect::NoAllow,
+        ),
+        (
+            "a role allowed the whole service",
+            "create-service-role",
+            vec![("allow-all", statement("Allow", "autoscaling:*", "*"))],
+            Expect::Served,
+        ),
+        (
+            "a role allowed exactly this action",
+            "create-action-role",
+            vec![(
+                "allow-create",
+                statement("Allow", "autoscaling:CreateAutoScalingGroup", "*"),
+            )],
+            Expect::Served,
+        ),
+        (
+            "a role whose allow is overridden by a deny",
+            "create-denied-role",
+            vec![
+                ("allow-all", statement("Allow", "autoscaling:*", "*")),
+                (
+                    "deny-create",
+                    statement("Deny", "autoscaling:CreateAutoScalingGroup", "*"),
+                ),
+            ],
+            Expect::ExplicitDeny,
+        ),
+    ];
+
+    for (index, (case, role_name, inline, expected)) in rows.iter().enumerate() {
+        let (akid, principal) = session_of(&router, case, role_name, inline).await;
+        let name = format!("asg-authorized-{index}");
+        let (status, body) = autoscaling_as(
+            &router,
+            &akid,
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", name.as_str()),
+                ("MinSize", "0"),
+                ("MaxSize", "1"),
+                ("AvailabilityZones.member.1", "us-west-2a"),
+                ("LaunchTemplate.LaunchTemplateName", LAUNCH_TEMPLATE),
+            ],
+        )
+        .await;
+        if *expected == Expect::Served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the permitted create must be served, got {status} {body}"
+            );
+        } else {
+            assert_eq!(
+                status, 403,
+                "case {case:?}: the unauthorized create must be refused, got {status} {body}"
+            );
+            assert_eq!(
+                tag_value(&body, "Code"),
+                ACCESS_DENIED,
+                "case {case:?}: expected {ACCESS_DENIED}, got {body}"
+            );
+            // The action is judged against the ARN of the group the request addresses, and a
+            // request names the group by NAME: the resource id segment is the wildcard, the
+            // group having none of its own until it is created.
+            let resource = format!(
+                "arn:aws:autoscaling:{REGION}:{}:autoScalingGroup:*:autoScalingGroupName/{name}",
+                account()
+            );
+            assert_eq!(
+                xml_unescape(&tag_value(&body, "Message")),
+                resource_refusal_message(&principal, &action, &resource, *expected),
+                "case {case:?}: expected IAM's refusal wording, got {body}"
+            );
+        }
+        // What the account holds is read back as a caller the policies allow: a refused
+        // create left no group behind.
+        let (status, described) = autoscaling_as(
+            &router,
+            ACCOUNT_KEY_ID,
+            "DescribeAutoScalingGroups",
+            &[("AutoScalingGroupNames.member.1", name.as_str())],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the read back must be served, got {status} {described}"
+        );
+        assert_eq!(
+            described.contains(name.as_str()),
+            *expected == Expect::Served,
+            "case {case:?}: expected the group to exist only when the create was served, got \
+             {described}"
+        );
+    }
 }

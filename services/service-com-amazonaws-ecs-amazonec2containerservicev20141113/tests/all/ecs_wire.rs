@@ -94,7 +94,7 @@ pub(crate) async fn create_auto_scaling_group_in(
         ("Action", "CreateAutoScalingGroup"),
         ("Version", AUTO_SCALING_API_VERSION),
         ("AutoScalingGroupName", name),
-        ("LaunchTemplate.LaunchTemplateName", "ecs-capacity"),
+        ("LaunchTemplate.LaunchTemplateName", CAPACITY_LAUNCH_TEMPLATE),
         ("MinSize", "0"),
         ("MaxSize", "0"),
         ("AvailabilityZones.member.1", zone.as_str()),
@@ -219,6 +219,10 @@ const AWSVPC_SUBNET_FAMILY_END: u64 = 0x200;
 /// their assertions name, which `CreateSubnet` — which mints its own — cannot give. A suite
 /// that drives the Amazon EC2 API itself builds its network through that API instead
 /// ([`crate::image_pull_placement`]).
+///
+/// It also puts the launch template the Auto Scaling groups of these suites launch from
+/// ([`seed_capacity_launch_template`]) in those same records, for the same reason: the
+/// records live in another service's store that no router here exposes an endpoint for.
 pub(crate) fn seed_awsvpc_subnets(engine: &engine::InMemoryEngine) {
     let ec2 = service_com_amazonaws_ec2_amazonec2::state::service_state(engine)
         .expect("the shared engine carries the Amazon EC2 store");
@@ -235,6 +239,38 @@ pub(crate) fn seed_awsvpc_subnets(engine: &engine::InMemoryEngine) {
             },
         );
     }
+    drop(store);
+    seed_capacity_launch_template(engine);
+}
+
+/// The launch template the Auto Scaling groups these suites create launch from
+/// ([`create_auto_scaling_group_in`]).
+pub(crate) const CAPACITY_LAUNCH_TEMPLATE: &str = "ecs-capacity";
+
+/// Put that launch template in the account's own Amazon EC2 records, through Amazon EC2's own
+/// writer.
+///
+/// An Auto Scaling group launches from a launch template THE ACCOUNT HOLDS — Amazon EC2 Auto
+/// Scaling resolves the specification when the group is created, and refuses a request naming
+/// a template Amazon EC2 does not have — so the group these suites create beneath a capacity
+/// provider needs its template written first.
+pub(crate) fn seed_capacity_launch_template(engine: &engine::InMemoryEngine) {
+    let ec2 = service_com_amazonaws_ec2_amazonec2::state::service_state(engine)
+        .expect("the shared engine carries the Amazon EC2 store");
+    let mut store = ec2.lock();
+    store.insert_launch_template(
+        service_com_amazonaws_ec2_amazonec2::state::LaunchTemplateSpec {
+            name: CAPACITY_LAUNCH_TEMPLATE.to_string(),
+            created_by: engine::emulator_arn("iam", "", "root"),
+            create_time: std::time::SystemTime::now(),
+            tags: Vec::new(),
+            operator: None,
+            version_description: None,
+            data:
+                service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData::default(
+                ),
+        },
+    );
 }
 
 /// One `awsJson1_1` call, returning the HTTP status and the parsed response body.

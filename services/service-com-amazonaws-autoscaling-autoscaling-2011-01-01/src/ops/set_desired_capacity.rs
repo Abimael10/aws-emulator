@@ -179,6 +179,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name = input.auto_scaling_group_name;
         let desired_capacity = input.desired_capacity;
+        // Whether IAM lets this caller change THIS group's capacity, decided against the
+        // group's own ARN before anything is read or written
+        // ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(
+                ctx.parts(),
+                "SetDesiredCapacity",
+                &name,
+                "refused: not authorized",
+            );
+            return Err(refusal);
+        }
         let honor_cooldown = input.honor_cooldown.unwrap_or(false);
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();

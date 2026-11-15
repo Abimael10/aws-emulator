@@ -32,23 +32,22 @@
 //! the ARN readings do — each comes from `services/common`, which is where the one copy of
 //! them lives.
 //!
-//! ## Which actions this decides, and why only those
+//! ## How each action is decided
 //!
 //! An Auto Scaling `Describe` action supports no resource-level permissions: the IAM
 //! Service Authorization Reference lists every `autoscaling:Describe*` action under
 //! "actions with no resource types", so IAM judges one against every resource
 //! ([`EVERY_RESOURCE`]) and a statement permits it only by covering every resource. That
 //! makes the decision for such an action a pure function of the caller's policies and the
-//! action name, which is exactly what this gate has: [`judged_over_every_resource`] is the
-//! test, and a refusal names no resource because there is none to name.
+//! action name: [`judged_over_every_resource`] is the test.
 //!
-//! Every OTHER Auto Scaling action is judged by IAM against the ARN of the group (or other
-//! resource) the request addresses, and that is not something this gate can resolve: the
-//! request carries a NAME, and which resource an action is authorized on differs per
-//! operation. Withholding a grant from such a request here would refuse calls AWS permits —
-//! a policy scoped to one group's ARN grants the action on that group — so this gate leaves
-//! them to the handler that knows which resources they address, and they continue to be
-//! served as before.
+//! Every OTHER Auto Scaling action is judged by IAM against the ARN of the GROUP (or other
+//! resource) the request addresses, which this gate does not resolve: the request carries a
+//! NAME, and which resource an action is authorized on differs per operation. So that
+//! decision belongs to the handler that knows which resource its operation addresses, and
+//! this module states it once for the group-scoped ones ([`group_action_refusal`]), which
+//! take it before they read or write anything: the refusal then names the group's ARN, as
+//! IAM's own sentence does.
 //!
 //! ## The callers this gate does not bound
 //!
@@ -110,14 +109,17 @@ pub fn judged_over_every_resource(operation: &str) -> bool {
     operation.starts_with(ACCOUNT_WIDE_READ_PREFIX)
 }
 
-/// An authorization refusal: who was refused, which action, and which of IAM's rules
-/// withheld the grant.
+/// An authorization refusal: who was refused, which action, on which resource when the
+/// decision was taken on one, and which of IAM's rules withheld the grant.
 #[derive(Debug, Clone)]
 pub struct Denied {
     /// The principal the request speaks for, as `sts:GetCallerIdentity` reports it.
     principal: String,
     /// The IAM action the request asked for.
     action: String,
+    /// The ARN of the resource the request was refused ON, when the decision was taken
+    /// against a resource the request addressed; `None` when there was none to name.
+    resource: Option<String>,
     /// Why the grant was withheld, as the refusal's closing clause words it — one of the
     /// four clauses `services/common` states.
     reason: String,
@@ -125,76 +127,176 @@ pub struct Denied {
 
 impl Denied {
     /// The refusal's message: the principal the credential speaks for, the action the
-    /// request asked for, and which of IAM's rules withheld the grant.
+    /// request asked for, the resource it was refused on where the decision was taken on
+    /// one, and which of IAM's rules withheld the grant.
     ///
-    /// No resource is named: this gate decides only the actions IAM judges over every
-    /// resource (see the module docs), so there is no resource the request was refused ON —
-    /// which is why the sentence is not
-    /// [`::service_common::iam_authorization::not_authorized_by_identity_policy`], whose
-    /// own documentation says a call addressing no single resource is outside it.
+    /// An action IAM judges over every resource has NO resource to name, which is why that
+    /// form of the sentence is not
+    /// [`::service_common::iam_authorization::not_authorized_by_identity_policy`], whose own
+    /// documentation says a call addressing no single resource is outside it; an action judged
+    /// against the resource the request addresses names that resource, and takes exactly that
+    /// shared sentence.
     #[must_use]
     pub fn message(&self) -> String {
-        format!(
-            "User: {} is not authorized to perform: {} {}",
-            self.principal, self.action, self.reason
-        )
+        match &self.resource {
+            Some(resource) => iam::not_authorized_by_identity_policy(
+                &self.principal,
+                &self.action,
+                resource,
+                &self.reason,
+            ),
+            None => format!(
+                "User: {} is not authorized to perform: {} {}",
+                self.principal, self.action, self.reason
+            ),
+        }
     }
+}
+
+/// This service's [`ACCESS_DENIED`] refusal of `operation` on the Auto Scaling group
+/// `group_name`, or `None` when the IAM policies in force permit it.
+///
+/// Every Auto Scaling action but the account-wide reads is judged by IAM against the ARN of
+/// the GROUP the request addresses, and a request names that group by NAME: the ARN it is
+/// judged on is the group's, with the resource-id segment left as the wildcard IAM itself
+/// writes for an id a request does not state (and which a group being CREATED does not have
+/// yet). So the decision is a handler's to take — only the handler knows which resource its
+/// operation addresses — and it is taken BEFORE the handler reads or writes anything, because
+/// a refused request must leave the account exactly as it was.
+///
+/// Carried as this service's own 403 `AccessDenied` error
+/// ([`crate::scaffolded::Scaffolded::access_denied`]), so it is rendered in the same envelope
+/// as every other error of this service.
+pub fn group_action_refusal<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    group_name: &str,
+) -> Option<crate::scaffolded::Scaffolded<E>> {
+    let region = crate::state::request_region(ctx.parts());
+    // The group's own ARN form, built by the one writer of it, with the wildcard in place of
+    // the resource id this service mints.
+    let resource = crate::state::group_arn(&region, EVERY_RESOURCE, group_name);
+    let refusal = authorize_on_resource(engine, ctx, operation, &resource).err()?;
+    Some(crate::scaffolded::Scaffolded::access_denied(
+        refusal.message(),
+    ))
+}
+
+/// Whether IAM lets this request perform the action of `operation` on `resource`.
+///
+/// The decision every caller of [`group_action_refusal`] takes, over the ARN that caller
+/// resolved: the same evaluation the account-wide reads take, against a resource instead of
+/// against every resource.
+fn authorize_on_resource<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    resource: &str,
+) -> Result<(), Denied> {
+    let action = format!("{ACTION_PREFIX}:{operation}");
+    let caller = caller(engine, ctx);
+    let documents = iam::prepare_documents(&caller.documents);
+    let boundary = caller
+        .boundary
+        .as_ref()
+        .map(|boundary| iam::prepare_documents(::std::slice::from_ref(boundary)));
+    decide(
+        &caller,
+        &documents,
+        boundary.as_deref(),
+        &action,
+        resource,
+        Some(resource),
+    )
 }
 
 /// Whether IAM lets this request perform the action of `operation` — the operation's own
 /// name, which is the routing key the request named.
 ///
-/// `Ok(())` for a request IAM permits, for an operation whose action this gate does not
-/// decide, and for every caller it does not bound (see the module docs); `Err` carries the
-/// refusal this service answers as [`ACCESS_DENIED`].
+/// `Ok(())` for a request IAM permits, for an operation whose action is judged against the
+/// ARN of a resource this gate does not read (those are decided by the handler that knows
+/// which resource they address — [`group_action_refusal`]), and for every caller this gate
+/// does not bound (see the module docs); `Err` carries the refusal this service answers as
+/// [`ACCESS_DENIED`].
 pub fn authorize<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     operation: &str,
 ) -> Result<(), Denied> {
+    // An action that supports no resource-level permissions is judged over EVERY resource,
+    // so a statement permits it only by covering every resource — which is the decision this
+    // gate can take from the caller's policies and the action name alone.
     if !judged_over_every_resource(operation) {
         return Ok(());
     }
     let action = format!("{ACTION_PREFIX}:{operation}");
     let caller = caller(engine, ctx);
+    let documents = iam::prepare_documents(&caller.documents);
+    let boundary = caller
+        .boundary
+        .as_ref()
+        .map(|boundary| iam::prepare_documents(::std::slice::from_ref(boundary)));
+    decide(
+        &caller,
+        &documents,
+        boundary.as_deref(),
+        &action,
+        EVERY_RESOURCE,
+        // There is no resource to name in the refusal of an action judged over every one.
+        None,
+    )
+}
+
+/// IAM's decision about `action` on `judged`, refused in the name of `named`.
+///
+/// `named` is what a refusal states the request was refused ON — the resource the request
+/// addressed, or `None` where the decision was taken over every resource and there is no
+/// resource to name.
+fn decide(
+    caller: &Caller,
+    documents: &[iam::PreparedDocument],
+    boundary: Option<&[iam::PreparedDocument]>,
+    action: &str,
+    judged: &str,
+    named: Option<&str>,
+) -> Result<(), Denied> {
     // The principal spellings travel with the request because that is what a statement's
     // `Principal` element would be matched against; an identity-based document states no
     // such element, so the decision below rests on the action and the resource.
-    let request = iam::Request::new(&action, EVERY_RESOURCE, &caller.principals);
-    let identity_said = iam::identity_decision(&caller.documents, &request);
+    let request = iam::Request::new(action, judged, &caller.principals);
+    let identity_said = iam::identity_decision_prepared(documents, &request);
     // The decision is taken FIRST, so an explicit `Deny` in a document that CAN be read
     // refuses the request whatever else the principal carries — including a grant this
     // emulator cannot read, which only lifts the DEFAULT deny of a request no readable
     // statement allows (see the module docs).
     if identity_said == Decision::Denied {
-        return Err(caller.refused(&action, iam::IDENTITY_POLICY_EXPLICIT_DENY));
+        return Err(caller.refused(action, named, iam::IDENTITY_POLICY_EXPLICIT_DENY));
     }
     let granted =
         iam::is_allowed(identity_said, Decision::NotStated) || caller.identity_is_unbounded();
     if !granted {
-        return Err(caller.refused(&action, &iam::no_identity_policy_allows(&action)));
+        return Err(caller.refused(action, named, &iam::no_identity_policy_allows(action)));
     }
     // "A permissions boundary sets the maximum permissions that an identity-based policy
     // can grant" (IAM, permissions boundaries): a grant the boundary does not also allow is
     // not a permission the principal has. The account's own credential carries none.
-    if let Some(boundary) = &caller.boundary {
-        let reason = match iam::identity_decision(::std::slice::from_ref(boundary), &request) {
+    if let Some(boundary) = boundary {
+        let reason = match iam::identity_decision_prepared(boundary, &request) {
             Decision::Allowed => return Ok(()),
             // An explicit deny is a fact about the boundary document, so the refusal names
             // it; a boundary that merely states nothing withheld the grant the
             // identity-based policies gave.
             Decision::Denied => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
-            Decision::NotStated => iam::no_permissions_boundary_allows(&action),
+            Decision::NotStated => iam::no_permissions_boundary_allows(action),
         };
-        return Err(caller.refused(&action, &reason));
+        return Err(caller.refused(action, named, &reason));
     }
     Ok(())
 }
 
 /// This service's [`ACCESS_DENIED`] response for a request whose caller the IAM policies in
-/// force do not permit to perform the action it named, or `None` when they do — and for
-/// every operation whose action this gate does not decide
-/// ([`judged_over_every_resource`]).
+/// force do not permit to perform the action it named, or `None` when they do.
 ///
 /// The action asked about is the operation's own name, taken from the request's routing key
 /// and only when the routing table SERVES that key: so it is always a modelled operation's
@@ -260,11 +362,12 @@ impl Caller {
         self.account_credential || self.unreadable_attachment
     }
 
-    /// This caller's refusal of `action`, closed by `reason`.
-    fn refused(&self, action: &str, reason: &str) -> Denied {
+    /// This caller's refusal of `action` on `named`, closed by `reason`.
+    fn refused(&self, action: &str, named: Option<&str>, reason: &str) -> Denied {
         Denied {
             principal: self.arn.clone(),
             action: action.to_string(),
+            resource: named.map(str::to_string),
             reason: reason.to_string(),
         }
     }
@@ -453,6 +556,7 @@ mod tests {
             let refusal = Denied {
                 principal: principal.to_string(),
                 action: action.clone(),
+                resource: None,
                 reason: reason.clone(),
             };
             let message = refusal.message();
@@ -469,10 +573,42 @@ mod tests {
         }
     }
 
-    /// RULE: the actions this gate decides are the ones IAM judges over every resource — the
-    /// `Describe` family — and no other operation is decided here.
+    /// RULE: an action IAM judges over every resource is decided over [`EVERY_RESOURCE`] and
+    /// names no resource; every other action is judged against the ARN of the resource the
+    /// request addresses and names it.
     #[test]
-    fn only_the_account_wide_reads_are_decided_here() {
+    fn a_refusal_names_the_resource_exactly_when_the_decision_was_taken_on_one() {
+        let principal = "arn:aws:sts::000000000000:assumed-role/restricted/session-1";
+        let action = format!("{ACTION_PREFIX}:CreateAutoScalingGroup");
+        let resource = crate::state::group_arn("us-west-2", EVERY_RESOURCE, "web");
+        let reason = iam::no_identity_policy_allows(&action);
+        let refusal = Denied {
+            principal: principal.to_string(),
+            action: action.clone(),
+            resource: Some(resource.clone()),
+            reason: reason.clone(),
+        };
+        let message = refusal.message();
+        assert_eq!(
+            message,
+            format!(
+                "User: {principal} is not authorized to perform: {action} on resource: \
+                 {resource} {reason}"
+            ),
+            "case \"an action judged against a group\": expected IAM's sentence naming the \
+             group's ARN, got {message:?}"
+        );
+        assert!(
+            resource.contains(":autoScalingGroup:*:autoScalingGroupName/web"),
+            "case \"the ARN a request names a group by\": the resource id a request does not \
+             state is the wildcard, got {resource:?}"
+        );
+    }
+
+    /// RULE: an action IAM judges over every resource is decided by the pre-dispatch gate;
+    /// every other action is decided by the handler that knows which resource it addresses.
+    #[test]
+    fn the_account_wide_reads_are_the_ones_judged_over_every_resource() {
         // (the operation, whether IAM judges its action over every resource)
         let rows: &[(&str, bool)] = &[
             ("DescribeTags", true),

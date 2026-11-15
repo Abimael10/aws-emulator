@@ -366,18 +366,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Reading an existing instance's configuration to build the group from it
-        // needs that instance's own state, which lives in EC2 and not here.
-        if input.instance_id.is_some() {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "CreateAutoScalingGroup with InstanceId needs the configuration of a \
-                              running EC2 instance, which this emulator does not hold"
-                        .to_string(),
-                },
-            ));
-        }
-
+        // needs that instance's own state, which lives in EC2 and not here. Asked AFTER the
+        // launch-source rule below, so a request naming `InstanceId` beside another launch
+        // source is refused for naming two of them rather than answered 501.
         let name = input.auto_scaling_group_name.clone();
+        // Whether IAM lets this caller create THIS group: the action is judged against the
+        // group's own ARN, so the decision is taken here — before anything is read or
+        // written — rather than by the gate that decides the account-wide reads.
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(
+                ctx.parts(),
+                "CreateAutoScalingGroup",
+                &name,
+                "refused: not authorized",
+            );
+            return Err(refusal);
+        }
         if !crate::state::is_valid_group_name(&name) {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 "The AutoScalingGroupName may contain only ASCII characters 33 to 126, and may \
@@ -451,14 +460,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             ));
         }
-        if input.launch_configuration_name.is_none()
-            && input.launch_template.is_none()
-            && input.mixed_instances_policy.is_none()
-        {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                "Valid requests must contain either LaunchTemplate, LaunchConfigurationName, \
-                 InstanceId or MixedInstancesPolicy parameter.",
+        // The launch source the group launches from: a request names exactly ONE of the four
+        // members that state it, which is a rule about the MEMBERS and is therefore decided
+        // before any of their values is resolved — so a request naming two launch sources is
+        // told to remove one rather than told to go and create the launch configuration it
+        // also named.
+        if let Some(refusal) = crate::state::group_configuration::launch_source_error(
+            input.instance_id.as_deref(),
+            input.launch_configuration_name.as_deref(),
+            input.launch_template.as_ref(),
+            input.mixed_instances_policy.as_ref(),
+        ) {
+            return Err(refusal);
+        }
+        if input.instance_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: "CreateAutoScalingGroup with InstanceId needs the configuration of a \
+                              running EC2 instance, which this emulator does not hold"
+                        .to_string(),
+                },
             ));
+        }
+        // The cross-member rules of the policies the group would carry, taken against the
+        // request the same way the update's are ([`crate::state::group_configuration`]).
+        if let Some(refusal) = crate::state::group_configuration::instance_maintenance_policy_error(
+            input.instance_maintenance_policy.as_ref(),
+            // A create states the pair outright: there is no stored threshold to clear.
+            crate::state::group_configuration::HealthyThresholds::Created,
+        ) {
+            return Err(refusal);
+        }
+        if let Some(refusal) = crate::state::group_configuration::duplicate_override_error(
+            input.mixed_instances_policy.as_ref(),
+        ) {
+            return Err(refusal);
         }
         // The checks above are all RELATIVE, so none of them bounds the absolute
         // size: every unit of capacity is a stored instance, and the service has a
@@ -539,6 +575,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+        // The Availability Zones the group would place instances in: a zone exists in exactly
+        // one Region, so a zone this Region does not have is a placement no instance could be
+        // launched into. Resolved against Amazon EC2's own catalog for the signed Region,
+        // before this service's store is locked, so a group that could never launch anything
+        // is refused instead of stored.
+        if let Some(refusal) = crate::state::group_configuration::unknown_availability_zone_error(
+            &region,
+            input.availability_zones.as_deref(),
+            input.availability_zone_ids.as_deref(),
+        ) {
+            return Err(refusal);
+        }
         // A group is associated with target groups of its OWN Region and account: a target
         // group is identified within one Region, so an ARN of anywhere else names nothing
         // the group could ever register an instance in. Refused on the input — as the
@@ -581,6 +629,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(crate::state::ec2_subnets::unknown_subnet_error(&subnet_id));
                 }
             }
+        }
+
+        // The launch template the group would launch from is Amazon EC2's resource, resolved
+        // against the account's own Amazon EC2 store before anything is stored: a
+        // specification naming a template nothing holds names one the group could never
+        // launch from. Asked BEFORE this service's store is locked, so only one store is ever
+        // held at a time, and before the instance profile below because a template that does
+        // not resolve carries no profile to resolve either.
+        if let Some(refusal) = crate::state::group_configuration::unresolvable_launch_template_error(
+            &*self.engine,
+            input.launch_template.as_ref(),
+            input.mixed_instances_policy.as_ref(),
+        ) {
+            return Err(refusal);
         }
 
         // The launch template a group launches from carries the IAM instance profile its

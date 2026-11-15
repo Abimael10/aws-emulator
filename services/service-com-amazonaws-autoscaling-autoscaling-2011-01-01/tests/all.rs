@@ -37,6 +37,8 @@ mod describe_policies_page_size;
 mod describe_tags;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/group_configuration_refusals.rs"]
+mod group_configuration_refusals;
 #[path = "all/group_tag_propagate_at_launch.rs"]
 mod group_tag_propagate_at_launch;
 #[path = "all/group_size_and_health_check_refusal_wording.rs"]

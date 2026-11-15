@@ -59,6 +59,9 @@ const LOOK_AGAIN: Duration = Duration::from_millis(20);
 /// makes the two views one account.
 fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    // A group launches from a launch template the account holds, so the one this suite's
+    // groups name is put in the account's own Amazon EC2 store first.
+    crate::support::seed_launch_templates(&engine, &[LAUNCH_TEMPLATE_NAME]);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));

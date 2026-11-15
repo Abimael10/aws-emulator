@@ -183,11 +183,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name = input.auto_scaling_group_name;
         let force_delete = input.force_delete.unwrap_or(false);
+        // Whether IAM lets this caller delete THIS group, decided against the group's own ARN
+        // before anything is read or written ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(
+                ctx.parts(),
+                "DeleteAutoScalingGroup",
+                &name,
+                "refused: not authorized",
+            );
+            return Err(refusal);
+        }
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
 
         let Some(group) = state.groups.get(&name) else {
+            // A delete of a group whose delete is already IN FLIGHT is the same delete: the
+            // group is gone from the store and the call that removed it has not completed
+            // yet, so this one is accepted and nothing further is done. That is what makes a
+            // racing or retrying client's parallel deletes all succeed.
+            if state.delete_in_flight(&name, now) {
+                crate::state::audit(
+                    ctx.parts(),
+                    "DeleteAutoScalingGroup",
+                    &name,
+                    "accepted: the delete is already in flight",
+                );
+                return Ok(DeleteAutoScalingGroupOutput);
+            }
             crate::state::audit(
                 ctx.parts(),
                 "DeleteAutoScalingGroup",
@@ -228,6 +257,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         let desired_capacity = group.desired_capacity;
         let protection = group.deletion_protection.clone().unwrap_or_default();
+        // Whether the group's own instance lifecycle policy keeps the instances an abandoned
+        // termination would otherwise take — the standing instruction a forced delete would
+        // have to disobey.
+        let retains_abandoned_terminations =
+            crate::state::group_configuration::retains_abandoned_terminations(
+                group.instance_lifecycle_policy.as_ref(),
+            );
         // The topics the group was configured to be told about a termination, read off its
         // own record for the same reason: a forced delete's terminations are the group's
         // terminations, and its configurations are gone once the group is.
@@ -259,6 +295,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // A forced delete terminates every instance the group holds, which is exactly what the
+        // group's `TerminateHookAbandon` retention trigger forbids while it is set to retain:
+        // the two instructions cannot both be honoured, so the call is refused and the group
+        // survives with its instances.
+        if force_delete && retains_abandoned_terminations {
+            crate::state::audit(
+                ctx.parts(),
+                "DeleteAutoScalingGroup",
+                &name,
+                "refused: the retention trigger retains instances",
+            );
+            return Err(crate::state::group_configuration::force_delete_retention_error());
+        }
+
         // A group that still has instances, or still asks for capacity, is in use:
         // only `ForceDelete` terminates what is left along with the group. The instances
         // of its warm pool count among them — they are instances of the group, in a state
@@ -286,6 +336,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         state.groups.remove(&name);
+        // The delete this call took runs to completion on the clock, and while it is in
+        // flight the same delete asked for again is accepted rather than refused as a name
+        // that answers to nothing — which is what a parallel or retrying client sends.
+        state.mark_group_deleting(&name, now);
         // A policy only exists against a group that exists, so the group's policies go
         // with it — and the CloudWatch alarms that would have executed them, which are
         // retired once this store's lock is released below.

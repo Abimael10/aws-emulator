@@ -18672,6 +18672,7 @@ dependencies = [
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-autoscaling-autoscaling-2011-01-01",
  "service-com-amazonaws-connecthealth-connecthealth",
+ "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-ecs-amazonec2containerservicev20141113",
  "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
  "service-com-amazonaws-eventbridge-awsevents",

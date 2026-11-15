@@ -17,6 +17,10 @@
 //! name the request states resolves at all, and whether the group was created with it or
 //! updated onto it.
 //!
+//! A specification that resolves to NOTHING names a template the group could never launch
+//! from, so the request is refused and no group is created: the resolution is what makes the
+//! group's launch source a launch source, not a decoration on it.
+//!
 //! Both services are mounted on ONE engine and driven over their own wire protocols —
 //! awsQuery for Auto Scaling, ec2Query for Amazon EC2 — the way the emulator serves them, so
 //! the templates these assertions resolve against are the ones a client created.
@@ -86,8 +90,9 @@ struct Row {
     group: &'static str,
     source: Source,
     named: Named,
-    /// Whether the group must report the OTHER half too: a template the account holds is
-    /// resolved, one it does not hold is left exactly as the request stated it.
+    /// Whether the account HOLDS the template the request names: one it holds is resolved
+    /// and the group reports both halves, and one it does not hold is refused, leaving no
+    /// group behind.
     resolved: bool,
 }
 
@@ -121,15 +126,14 @@ const ROWS: &[Row] = &[
         resolved: true,
     },
     Row {
-        case: "an id of the published form the account holds no template for is left as it \
-               was stated",
+        case: "an id of the published form the account holds no template for is refused",
         group: "fleet-absent-id",
         source: Source::Own,
         named: Named::AbsentId,
         resolved: false,
     },
     Row {
-        case: "a name the account holds no template under is left as it was stated",
+        case: "a name the account holds no template under is refused",
         group: "fleet-absent-name",
         source: Source::Own,
         named: Named::AbsentName,
@@ -221,6 +225,52 @@ async fn a_group_reports_both_halves_of_the_launch_template_it_resolves() {
             &borrowed(&params),
         )
         .await;
+        if !row.resolved {
+            // A template the account does not hold is no launch source at all: the create is
+            // refused and nothing is stored under the name it asked for.
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a launch template the account does not hold must be refused, \
+                 got {status}: {body}"
+            );
+            assert_eq!(
+                tag_value(&body, "Code"),
+                "ValidationError",
+                "case {case:?}: expected ValidationError, got {body}"
+            );
+            // The sentence is Amazon EC2's own for the half the request stated, surfaced by
+            // Auto Scaling: an id the account holds no template under is not an id of a
+            // launch template at all, and a NAME it holds none under is reported without the
+            // name being quoted back.
+            let expected = match row.named {
+                Named::AbsentId => format!("Malformed launch template Id: {value}"),
+                _ => "At least one of the launch templates specified in the request does not \
+                      exist."
+                    .to_string(),
+            };
+            assert_eq!(
+                tag_value(&body, "Message"),
+                expected,
+                "case {case:?}: expected the sentence AWS answers for the half the request \
+                 stated, got {body}"
+            );
+            let (status, described) = query(
+                &router,
+                "DescribeAutoScalingGroups",
+                &[("AutoScalingGroupNames.member.1", row.group)],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: DescribeAutoScalingGroups must answer 200, got {status}: \
+                 {described}"
+            );
+            assert!(
+                tag_values(&described, "AutoScalingGroupName").is_empty(),
+                "case {case:?}: the refused create must leave no group, got {described}"
+            );
+            continue;
+        }
         assert_eq!(
             status, 200,
             "case {case:?}: CreateAutoScalingGroup must succeed, got {status}: {body}"
@@ -237,27 +287,12 @@ async fn a_group_reports_both_halves_of_the_launch_template_it_resolves() {
             "case {case:?}: DescribeAutoScalingGroups must answer 200, got {status}: {described}"
         );
         let (reported_id, reported_name) = reported_specification(&described);
-        if row.resolved {
-            assert_eq!(
-                (reported_id.as_str(), reported_name.as_str()),
-                (held_id.as_str(), TEMPLATE_NAME),
-                "case {case:?}: the group must report both halves of the template it \
-                 resolved, got {described}"
-            );
-        } else {
-            // Nothing is invented for a template the account does not hold: the half the
-            // request stated is reported, and the other stays absent.
-            let expected = match row.named {
-                Named::AbsentId => (value.as_str(), ""),
-                _ => ("", value.as_str()),
-            };
-            assert_eq!(
-                (reported_id.as_str(), reported_name.as_str()),
-                expected,
-                "case {case:?}: a template the account does not hold must be reported exactly \
-                 as the request stated it, got {described}"
-            );
-        }
+        assert_eq!(
+            (reported_id.as_str(), reported_name.as_str()),
+            (held_id.as_str(), TEMPLATE_NAME),
+            "case {case:?}: the group must report both halves of the template it \
+             resolved, got {described}"
+        );
     }
 }
 

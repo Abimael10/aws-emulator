@@ -751,6 +751,9 @@ async fn a_rollback_in_progress_can_itself_be_cancelled() {
 /// same account's Amazon EC2 store, which is where the image it launches is read from.
 fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    // The refresh this suite starts names the desired configuration's launch template, which
+    // the account has to hold like any other launch source.
+    crate::support::seed_launch_templates(&engine, &[DESIRED_TEMPLATE]);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));

@@ -324,11 +324,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let name = input.auto_scaling_group_name.clone();
+        let region = crate::state::request_region(ctx.parts());
+        // Whether IAM lets this caller update THIS group, decided against the group's own ARN
+        // before anything is read or written ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(
+                ctx.parts(),
+                "UpdateAutoScalingGroup",
+                &name,
+                "refused: not authorized",
+            );
+            return Err(refusal);
+        }
         if input.availability_zones.is_some() && input.availability_zone_ids.is_some() {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 "You cannot specify both AvailabilityZones and AvailabilityZoneIds in the same \
                  request",
             ));
+        }
+        // The zones an update MOVES the group to are resolved against Amazon EC2's own
+        // catalog for the signed Region exactly as the create resolves the ones it is given:
+        // a zone the Region does not have is a placement no instance could be launched into.
+        if let Some(refusal) = crate::state::group_configuration::unknown_availability_zone_error(
+            &region,
+            input.availability_zones.as_deref(),
+            input.availability_zone_ids.as_deref(),
+        ) {
+            return Err(refusal);
+        }
+        // The cross-member rules of the policies this update would leave on the group, taken
+        // against the request the same way the create's are
+        // ([`crate::state::group_configuration`]): the two operations write one group, so a
+        // policy the create refuses is not one an update may store.
+        if let Some(refusal) = crate::state::group_configuration::instance_maintenance_policy_error(
+            input.instance_maintenance_policy.as_ref(),
+            // An update CHANGES the pair the group carries, where a threshold may be cleared.
+            crate::state::group_configuration::HealthyThresholds::Changed,
+        ) {
+            return Err(refusal);
+        }
+        if let Some(refusal) = crate::state::group_configuration::duplicate_override_error(
+            input.mixed_instances_policy.as_ref(),
+        ) {
+            return Err(refusal);
         }
         // A group always has somewhere to place an instance, so an update cannot leave it
         // with an EMPTY zone list: that names no zone at all, which is the same refusal a
@@ -349,7 +392,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut zones_from_subnets: Option<Vec<String>> = None;
         if input.availability_zones.is_none() {
             if let Some(subnets) = input.vpc_zone_identifier.as_deref() {
-                let region = crate::state::request_region(ctx.parts());
                 match crate::state::ec2_subnets::zones_of(&*self.engine, &region, subnets) {
                     crate::state::ec2_subnets::ZoneResolution::Zones(zones) => {
                         if !zones.is_empty() {
@@ -400,6 +442,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+        // A launch source the request REPLACES names a launch template of the account, resolved
+        // against Amazon EC2's own store exactly as the create resolves the one it is given: a
+        // specification naming a template nothing holds would leave the group unable to launch
+        // anything. Asked BEFORE this service's store is locked, so only one store is ever held
+        // at a time.
+        if let Some(refusal) = crate::state::group_configuration::unresolvable_launch_template_error(
+            &*self.engine,
+            input.launch_template.as_ref(),
+            input.mixed_instances_policy.as_ref(),
+        ) {
+            return Err(refusal);
+        }
         // A launch source the request REPLACES is resolved the way the create resolves
         // the one it is given: the launch template carries the IAM instance profile the
         // group's instances run under, and a template naming an instance profile the
@@ -426,6 +480,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let input = input;
 
         let now = ::std::time::SystemTime::now();
+        // The group's own launch source and subnets, as far as the cross-VPC question below
+        // needs them: read under a SHORT-LIVED lock of this service's store, which is
+        // released before Amazon EC2's is taken for that question. So this handler holds one
+        // store at a time throughout — the order every cross-service resolution above takes
+        // — and no pair of stores is ever acquired here in two different orders.
+        let held = {
+            let mut store = state.lock();
+            store.materialize_due(&*self.engine, now);
+            store.groups.get(&name).map(|group| {
+                (
+                    group.vpc_zone_identifier.clone(),
+                    group.launch_template.clone(),
+                    group.mixed_instances_policy.clone(),
+                )
+            })
+        };
+        let (held_subnets, held_template, held_policy) = held.unwrap_or_default();
+        // The group's subnets and the security groups its launch template names must sit in
+        // ONE VPC, exactly as they must when the group is created: an instance of the group
+        // is placed in one of those subnets, so a group of another VPC could never be
+        // applied to it. Asked of the configuration the update LEAVES the group with — a
+        // member the request omits keeps the value the group already has — so neither a new
+        // launch template nor new subnets can introduce a pairing whose instances could not
+        // exist, and the group is left exactly as it was when they would. The answer is held
+        // until the refusals the service states ahead of it have been taken.
+        let cross_vpc_refusal = crate::state::ec2_security_groups::cross_vpc_security_group_error(
+            &*self.engine,
+            input
+                .vpc_zone_identifier
+                .as_deref()
+                .or(held_subnets.as_deref()),
+            input.launch_template.as_ref().or(held_template.as_ref()),
+            input
+                .mixed_instances_policy
+                .as_ref()
+                .or(held_policy.as_ref()),
+        );
+
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
 
@@ -487,28 +579,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
-        // The group's subnets and the security groups its launch template names must sit in
-        // ONE VPC, exactly as they must when the group is created: an instance of the group
-        // is placed in one of those subnets, so a group of another VPC could never be
-        // applied to it. Asked of the configuration the update LEAVES the group with — a
-        // member the request omits keeps the value the group already has — so neither a new
-        // launch template nor new subnets can introduce a pairing whose instances could not
-        // exist, and the group is left exactly as it was when they would.
-        if let Some(refusal) = crate::state::ec2_security_groups::cross_vpc_security_group_error(
-            &*self.engine,
-            input
-                .vpc_zone_identifier
-                .as_deref()
-                .or(group.vpc_zone_identifier.as_deref()),
-            input
-                .launch_template
-                .as_ref()
-                .or(group.launch_template.as_ref()),
-            input
-                .mixed_instances_policy
-                .as_ref()
-                .or(group.mixed_instances_policy.as_ref()),
-        ) {
+        // The cross-VPC answer, taken before this store was locked, applied at the point the
+        // service states that refusal.
+        if let Some(refusal) = cross_vpc_refusal {
             return Err(refusal);
         }
 

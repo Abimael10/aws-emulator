@@ -42,6 +42,9 @@ const GROUP: &str = "asg-projection";
 /// service has to be mounted beside this one for the put to reach it.
 fn router() -> MultiServiceRouter {
     let engine = new_engine();
+    // A group launches from a launch template the account holds, so the one this suite's
+    // group names is put in the account's own Amazon EC2 store first.
+    crate::support::seed_launch_templates(&engine, &[LAUNCH_SOURCE.1]);
     let mut router = MultiServiceRouter::new();
     router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));
     router.register_service(cloudwatch_service::EmulatedService::new(engine));

@@ -46,7 +46,53 @@ pub fn new_engine() -> Arc<engine::InMemoryEngine> {
     Arc::new(engine::InMemoryEngine::new())
 }
 
+/// Every launch template name the suites in this crate create their groups from.
+///
+/// A group launches from a launch template THE ACCOUNT HOLDS — Amazon EC2 Auto Scaling
+/// resolves the specification when the group is configured, and refuses a request naming a
+/// template Amazon EC2 does not have — so the harness puts these templates in the account's
+/// own Amazon EC2 store before any suite creates a group. A suite that creates its own
+/// template over Amazon EC2's wire (through [`create_launch_template`]) names it itself and
+/// is not listed here.
+const SUITE_LAUNCH_TEMPLATES: &[&str] = &[
+    "lt-1",
+    "lt-activities",
+    "lt-cancel",
+    "lt-cancel-absent",
+    "lt-refresh",
+    "lt-refresh-next",
+    "lt-rollback",
+    "lt-rollback-next",
+    "lt-wording",
+    "tags-template",
+];
+
+/// Put the launch templates `names` in the account's own Amazon EC2 store, through EC2's
+/// own writer, so a group created from one launches from a template the account holds.
+///
+/// THE ONE COPY for every suite here that creates a group: the launch templates an Auto
+/// Scaling request names are Amazon EC2's resources, so they are written through EC2's own
+/// store rather than invented here. Each carries no launch parameters of its own: a suite
+/// that cares what an instance is launched WITH creates its template over EC2's wire with
+/// the parameters it means.
+pub fn seed_launch_templates(engine: &Arc<engine::InMemoryEngine>, names: &[&str]) {
+    let state = ec2::service_state(&**engine).expect("the EC2 store is mounted on this engine");
+    let mut store = state.lock();
+    for name in names {
+        store.insert_launch_template(ec2::LaunchTemplateSpec {
+            name: (*name).to_string(),
+            created_by: engine::emulator_arn("iam", "", "root"),
+            create_time: std::time::SystemTime::now(),
+            tags: Vec::new(),
+            operator: None,
+            version_description: None,
+            data: ec2_service::ops::types::RequestLaunchTemplateData::default(),
+        });
+    }
+}
+
 pub fn router_with(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+    seed_launch_templates(&engine, SUITE_LAUNCH_TEMPLATES);
     let mut router = MultiServiceRouter::new();
     router.register_service(autoscaling::EmulatedService::new(engine));
     router
@@ -102,6 +148,7 @@ const ELBV2_VERSION: &str = elbv2_service::service::shared_endpoint::API_VERSION
 /// makes the three views one account.
 pub fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    seed_launch_templates(&engine, SUITE_LAUNCH_TEMPLATES);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));
