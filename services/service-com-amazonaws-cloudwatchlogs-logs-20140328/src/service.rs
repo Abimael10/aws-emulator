@@ -144,19 +144,23 @@
 //! alone — `awsJson1_1` has no envelope element for the id) and wires it at the two layers
 //! every response of this service passes through:
 //!
-//! * [`RequestIdReportingOperation::header`], the outermost layer of each dispatch
+//! * [`stated_request_id::StatedRequestIdOperation`], the outermost layer of each dispatch
 //!   `override_operation` hands back, which covers a success, a modelled error, the
 //!   authorization refusal and a constraint refusal raised while an operation was being
 //!   served;
-//! * [`RequestIdEnvelopeDefinition::header_only`], the definition wrapper
+//! * [`RequestIdEnvelopeDefinition::reporting`] with that same report, the definition wrapper
 //!   [`Service::definition`] hands back, which covers a response NO operation produced: a
 //!   routing failure, a transport failure detected up front, and a pre-dispatch
 //!   authentication refusal.
+//!
+//! A refusal of this service also STATES that id in text — CloudWatch Logs words one as the
+//! sentence for its class followed by the SDK envelope clause, request id and all — and a
+//! response names ONE request, so the message states no id of its own: it is worded with
+//! [`crate::state::REQUEST_ID_PLACEHOLDER`] and the report above writes the id it reports in
+//! its place ([`stated_request_id`]).
 
 use service_common::event_stream::EventStreamRoute;
-use service_common::query_error_envelope::{
-    RequestIdEnvelopeDefinition, RequestIdReportingOperation,
-};
+use service_common::query_error_envelope::RequestIdEnvelopeDefinition;
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, Refusal, Refused,
     Service, Violation, ViolationKind,
@@ -170,6 +174,11 @@ use std::sync::Arc;
 /// Public: its catalog of the operations that take the decision themselves, and the resource
 /// a request is judged against, are checked by this crate's tests.
 pub mod identity_authorization;
+
+/// The ONE request id a response names its request by: the header this protocol reports it
+/// in, and the SDK envelope clause a refusal's message states it inside (see "Naming the
+/// request a response answers").
+pub mod stated_request_id;
 
 /// The operations the generated routing table cannot serve: each one's output member
 /// targets a `@streaming` union (`StartLiveTail$responseStream`,
@@ -656,9 +665,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
 /// One dispatch this service hands the router: whatever serves the request, behind the IAM
 /// decision taken in front of every operation
 /// ([`identity_authorization::IamAuthorized`]) and under the layer that names the request
-/// its response answers ([`RequestIdReportingOperation::header`]) — so neither can be
+/// its response answers ([`stated_request_id::StatedRequestIdOperation`]) — so neither can be
 /// forgotten for one route and taken for another.
-type Dispatch<Eng> = RequestIdReportingOperation<identity_authorization::IamAuthorized<Eng>>;
+type Dispatch<Eng> =
+    stated_request_id::StatedRequestIdOperation<identity_authorization::IamAuthorized<Eng>>;
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// Build this service from the shared engine. The engine is threaded into the
@@ -668,15 +678,15 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         // Each dispatch is built from the SAME shared engine, so the policies the decision
         // reads and the state the operation serves from are the one store.
         let authorized = |served: Box<dyn ErasedOperation>| {
-            RequestIdReportingOperation::header(identity_authorization::IamAuthorized::new(
-                Arc::clone(&engine),
-                served,
-            ))
+            stated_request_id::StatedRequestIdOperation::new(
+                identity_authorization::IamAuthorized::new(Arc::clone(&engine), served),
+            )
         };
         Self {
-            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(
-                Arc::clone(&engine),
-            )),
+            entry: RequestIdEnvelopeDefinition::reporting(
+                crate::ServiceDefinition::new(Arc::clone(&engine)),
+                stated_request_id::report,
+            ),
             refusal_scope: authorized(Box::new(OperationScopedRefusal)),
             start_live_tail: authorized(Box::new(EventStreamRoute(
                 crate::ops::start_live_tail::StartLiveTail::new(Arc::clone(&engine)),
@@ -694,8 +704,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry: what is
         // handed back is the shared `RequestIdEnvelopeDefinition`, which reads identity,
-        // protocol and the routing table straight off that entry and adds the request-id
-        // header to the three error renderers (see "Naming the request a response answers").
+        // protocol and the routing table straight off that entry and names the request each
+        // of the three error renderers answers (see "Naming the request a response answers").
         &self.entry
     }
 

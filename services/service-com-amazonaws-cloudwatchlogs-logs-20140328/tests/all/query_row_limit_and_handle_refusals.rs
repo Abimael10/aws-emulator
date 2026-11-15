@@ -685,7 +685,10 @@ async fn a_token_that_resumes_no_position_in_this_querys_results_is_refused() {
         ("a long run of text", "z".repeat(300)),
     ];
     let expected = query_results_invalid_token_message();
-    let sentence = without_sdk_envelope(
+    // The message as the service WORDS it states the marker where the response's own request
+    // id goes — the id is written in where the response is finished — so the sentence is read
+    // off it by taking that clause away.
+    let sentence = crate::harness::without_worded_sdk_envelope(
         "the expected wording",
         &expected,
         REFUSED_STATUS,

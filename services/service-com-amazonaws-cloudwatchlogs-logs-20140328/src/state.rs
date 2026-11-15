@@ -3328,24 +3328,32 @@ pub const ENVELOPE_RESOURCE_NOT_FOUND: SdkEnvelopeFacts = (400, "ResourceNotFoun
 /// model declares `MalformedQueryException` for the query operations (client error, HTTP 400).
 pub const ENVELOPE_MALFORMED_QUERY: SdkEnvelopeFacts = (400, "MalformedQueryException");
 
+/// What a refusal worded here writes where THIS RESPONSE's request id goes.
+///
+/// A refusal is worded where it is decided, and the id a response names its request by is
+/// reported where the response is finished ([`crate::service::stated_request_id`]). A
+/// response names ONE request, so the message cannot mint a second id of its own: it writes
+/// this marker inside its envelope clause, and that layer writes the id the response reports
+/// in its place — so the clause and the response's own header can never name two requests for
+/// one call, and nothing a request carries decides the value.
+pub const REQUEST_ID_PLACEHOLDER: &str = "{request-id}";
+
 /// `body` followed by the envelope the AWS SDK appends to a CloudWatch Logs refusal:
 /// ` (Service: AWSLogs; Status Code: <status>; Error Code: <code>; Request ID: <id>; Proxy: null)`.
 ///
 /// `facts` is the status-and-code pair of the refusal being worded (one of the
-/// `ENVELOPE_*` constants). The request id is the ONLY per-run field: a request id is
-/// minted by the service per call — nothing in the request carries one — so it comes from
-/// the emulator's one request-id mint
-/// ([`service_common::query_error_envelope::new_request_id`]), a fresh v4 UUID
-/// indistinguishable from the one the framework's own renderers report. Nothing of the
-/// request is interpolated.
+/// `ENVELOPE_*` constants). The request id is the ONLY per-run field, and it is the id THIS
+/// RESPONSE names its request by rather than one of this sentence's own: the clause is
+/// written with [`REQUEST_ID_PLACEHOLDER`] in its place and the layer that finishes the
+/// response substitutes the id it reports ([`crate::service::stated_request_id`]). Nothing of
+/// the request is interpolated.
 ///
 /// One function, so every refusal worded this way carries the envelope in the same shape.
 pub fn with_sdk_error_envelope(body: &str, facts: SdkEnvelopeFacts) -> String {
     let (status_code, error_code) = facts;
     format!(
         "{body} (Service: {SDK_ENVELOPE_SERVICE}; Status Code: {status_code}; \
-         Error Code: {error_code}; Request ID: {}; Proxy: null)",
-        ::service_common::query_error_envelope::new_request_id()
+         Error Code: {error_code}; Request ID: {REQUEST_ID_PLACEHOLDER}; Proxy: null)"
     )
 }
 

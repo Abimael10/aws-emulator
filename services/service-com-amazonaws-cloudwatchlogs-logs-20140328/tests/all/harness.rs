@@ -258,6 +258,25 @@ pub fn envelope_request_id(case: &str, said: &str) -> String {
     request_id
 }
 
+/// The marker a refusal message states where THIS RESPONSE's request id goes, written out
+/// here rather than read from the crate — so a response that leaves it unsubstituted fails
+/// the suites that assert a refusal's text.
+///
+/// A refusal is worded where it is decided and the id a response names its request by is
+/// reported where the response is finished, so a message read straight out of the crate
+/// states this marker and a message a CLIENT reads states the response's own id.
+pub const REQUEST_ID_PLACEHOLDER: &str = "{request-id}";
+
+/// The SDK error envelope this service states a refusal inside: the status and the error code
+/// the response answers with, and the request id it reports. ONE definition of its shape,
+/// shared by the two readers below.
+fn sdk_envelope(status: u16, code: &str, request_id: &str) -> String {
+    format!(
+        " (Service: AWSLogs; Status Code: {status}; Error Code: {code}; Request ID: \
+         {request_id}; Proxy: null)"
+    )
+}
+
 /// `said` with the SDK error envelope this service states a refusal inside stripped off,
 /// having asserted that the envelope reports `status` and `code` — the status and the error
 /// code the response itself answers with — and this response's own request id.
@@ -266,13 +285,23 @@ pub fn envelope_request_id(case: &str, said: &str) -> String {
 /// whose subject is the SENTENCE a refusal carries states only that sentence.
 pub fn without_sdk_envelope(case: &str, said: &str, status: u16, code: &str) -> String {
     let request_id = envelope_request_id(case, said);
-    let envelope = format!(
-        " (Service: AWSLogs; Status Code: {status}; Error Code: {code}; Request ID: \
-         {request_id}; Proxy: null)"
-    );
+    let envelope = sdk_envelope(status, code, &request_id);
     said.strip_suffix(&envelope)
         .unwrap_or_else(|| {
             panic!("case {case}: expected {envelope:?} after the sentence, got {said:?}")
+        })
+        .to_string()
+}
+
+/// [`without_sdk_envelope`] for a message as the service WORDS it — one read straight out of
+/// the crate rather than off the wire, which states [`REQUEST_ID_PLACEHOLDER`] where the id
+/// of the response carrying it goes.
+pub fn without_worded_sdk_envelope(case: &str, worded: &str, status: u16, code: &str) -> String {
+    let envelope = sdk_envelope(status, code, REQUEST_ID_PLACEHOLDER);
+    worded
+        .strip_suffix(&envelope)
+        .unwrap_or_else(|| {
+            panic!("case {case}: expected {envelope:?} after the sentence, got {worded:?}")
         })
         .to_string()
 }

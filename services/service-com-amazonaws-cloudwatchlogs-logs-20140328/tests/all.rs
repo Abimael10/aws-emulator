@@ -261,6 +261,8 @@ mod query_row_limit_and_handle_refusals;
 mod query_window_before_group_creation;
 #[path = "all/query_window_refusal.rs"]
 mod query_window_refusal;
+#[path = "all/refusal_envelope_request_id.rs"]
+mod refusal_envelope_request_id;
 #[path = "all/refusal_error_codes.rs"]
 mod refusal_error_codes;
 #[path = "all/refusal_message_fidelity.rs"]
