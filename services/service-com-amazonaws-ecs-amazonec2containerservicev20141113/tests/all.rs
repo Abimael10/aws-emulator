@@ -252,6 +252,10 @@ mod task_definition_rendering;
 mod task_definition_revision_requirement;
 #[path = "all/task_definition_role_references.rs"]
 mod task_definition_role_references;
+// Which rule an `ECS Task State Change` event reaches when the rules differ only in the
+// container exit status their pattern names, and what the event's detail reports about it.
+#[path = "all/task_exit_code_event_routing.rs"]
+mod task_exit_code_event_routing;
 #[path = "all/task_interface_allocation.rs"]
 mod task_interface_allocation;
 #[path = "all/task_interface_attach_and_connectivity.rs"]
