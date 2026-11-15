@@ -268,6 +268,95 @@ async fn every_provisioned_setting_takes_a_value_and_is_reset_to_the_provisioned
     }
 }
 
+/// A `SettingId` the model cannot carry is refused as an invalid REQUEST, while one it
+/// can carry is answered as the setting it names.
+///
+/// `SettingId` targets `ServiceSettingId`, a string of length 1..1000
+/// (`smithy_query(query="shape", shape="com.amazonaws.ssm#ServiceSettingId")`), so the
+/// rows are each published bound of that range and one character past it: at a bound the
+/// id is well-formed and names no provisioned setting, past it the request itself is
+/// invalid. Every operation of the slice reads the same member, so each row is asserted
+/// against all three.
+#[tokio::test]
+async fn a_setting_id_the_model_cannot_carry_is_refused_as_an_invalid_request() {
+    let router = router();
+    // The modelled length bounds of `ServiceSettingId`, as the shape states them.
+    const MIN_LENGTH: usize = 1;
+    const MAX_LENGTH: usize = 1000;
+    // A well-formed id of a chosen length that no service team provisions: the longest
+    // and the shortest spellings under the Systems Manager namespace.
+    let padded = |length: usize| format!("/ssm/{}", "a".repeat(length - "/ssm/".len()));
+
+    let cases: [(&str, String, &str); 4] = [
+        (
+            "the shortest id the model allows",
+            "/".repeat(MIN_LENGTH),
+            "ServiceSettingNotFound",
+        ),
+        (
+            "the longest id the model allows",
+            padded(MAX_LENGTH),
+            "ServiceSettingNotFound",
+        ),
+        (
+            "one character below the modelled minimum",
+            String::new(),
+            "ValidationException",
+        ),
+        (
+            "one character above the modelled maximum",
+            padded(MAX_LENGTH + 1),
+            "ValidationException",
+        ),
+    ];
+
+    for (case, id, expected) in cases {
+        for (operation, body) in [
+            ("GetServiceSetting", json!({ "SettingId": id })),
+            (
+                "UpdateServiceSetting",
+                json!({ "SettingId": id, "SettingValue": "true" }),
+            ),
+            ("ResetServiceSetting", json!({ "SettingId": id })),
+        ] {
+            let (status, response) = call(&router, operation, &body).await;
+            assert_eq!(
+                status, 400,
+                "case {case} / {operation}: an id of {} character(s) must be refused with HTTP \
+                 400, got {status} {response}",
+                id.len()
+            );
+            assert_eq!(
+                error_code(&response),
+                expected,
+                "case {case} / {operation}: expected {expected}, got {response}"
+            );
+            assert!(
+                !message(&response).is_empty(),
+                "case {case} / {operation}: the refusal must say why, got {response}"
+            );
+        }
+    }
+
+    // A refused read records nothing, so every provisioned setting is still reported at
+    // the value its service team provisioned.
+    for setting in SETTINGS {
+        let reading = get_ok(&router, setting.id, setting.id).await;
+        assert_eq!(
+            reading["Status"],
+            json!(STATUS_DEFAULT),
+            "case {:?}: a refused request must leave the setting provisioned, got {reading}",
+            setting.id
+        );
+        assert_eq!(
+            reading["SettingValue"],
+            json!(setting.default_value),
+            "case {:?}: expected the provisioned value, got {reading}",
+            setting.id
+        );
+    }
+}
+
 /// A setting whose value names a resource reports the unconfigured sentinel until the
 /// account names one — the catalogue's own value for a setting of that kind, asserted on
 /// every entry that carries it.
