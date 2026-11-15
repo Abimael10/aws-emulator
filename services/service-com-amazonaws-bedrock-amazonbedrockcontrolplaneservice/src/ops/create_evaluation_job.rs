@@ -232,9 +232,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal rather than a report about the request's contents — and it leaves no job
         // behind. The decision is the one every job-creating operation of this service
         // makes (`crate::state::job_pass_role_denial`), grounded in what this account's IAM
-        // answers about the role.
-        if let Some(denial) =
-            crate::state::job_pass_role_denial(ctx, &region, &input.role_arn, Some(&arn)).await
+        // answers about the calling principal's `iam:PassRole` and about the role.
+        if let Some(denial) = crate::state::job_pass_role_denial(
+            &*self.engine,
+            ctx,
+            &region,
+            &input.role_arn,
+            Some(&arn),
+        )
+        .await
         {
             return Err(CreateEvaluationJobErrorModeled::AccessDeniedException(
                 AccessDeniedException {

@@ -5,8 +5,9 @@
 //! to carry out and manage the inference under, so the request is decided by the
 //! `iam:PassRole` step for that role BEFORE anything it names is resolved
 //! ([`crate::state::job_pass_role_denial`], the one decision every job-creating operation
-//! of this service makes): a role the caller may not pass is the modelled
-//! `AccessDeniedException`, and such a refusal writes no job at all. The role is taken on
+//! of this service makes): a pass the calling principal's permissions do not carry, and a
+//! role the caller may not pass, are both the modelled `AccessDeniedException`, and such a
+//! refusal writes no job at all. The role is taken on
 //! FOR the job this submission mints, so that job's ARN is minted first and handed to the
 //! decision as the `aws:SourceArn` the assume carries — the batch-inference service role
 //! AWS documents narrows its trust to exactly that job family, and the clause is decided
@@ -253,9 +254,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than a report about a model — and it leaves no job behind. The decision is the
         // one every job-creating operation of this service makes
         // (`crate::state::job_pass_role_denial`), grounded in what this account's IAM
-        // answers about the role.
-        if let Some(denial) =
-            crate::state::job_pass_role_denial(ctx, &region, &input.role_arn, Some(&arn)).await
+        // answers about the calling principal's `iam:PassRole` and about the role.
+        if let Some(denial) = crate::state::job_pass_role_denial(
+            &*self.engine,
+            ctx,
+            &region,
+            &input.role_arn,
+            Some(&arn),
+        )
+        .await
         {
             return Err(CreateModelInvocationJobErrorModeled::AccessDeniedException(
                 AccessDeniedException {

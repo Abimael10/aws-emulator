@@ -716,53 +716,21 @@ pub fn base_model_id_of(model_identifier: &str) -> &str {
 /// `InferenceType` is `[ON_DEMAND, PROVISIONED]` and
 /// [`FoundationModel::inference_types_supported`] reports the ones that model is offered
 /// under, so this reads the catalog rather than any property of the request.
+///
+/// This is the WHOLE eligibility question a purchase asks of the model, with a commitment
+/// term and without one alike: the catalog this service publishes is what says which models
+/// Provisioned Throughput is offered over, so a model it returns for
+/// `ListFoundationModels(byInferenceType=PROVISIONED)` can back a purchase, and the
+/// not-supported refusal ([`MODEL_NOT_SUPPORTED_FOR_PROVISIONED_THROUGHPUT`]) is reserved
+/// for a model it offers on demand only and for one this service recognises and offers no
+/// longer. What a `commitmentDuration` decides is only WHICH granted model-unit quota the
+/// purchase draws on ([`granted_model_units`]) — whose no-commitment default is zero, so a
+/// no-commitment purchase is answered about the account's quota rather than about the model.
 #[must_use]
 pub fn supports_provisioned_throughput(model: &FoundationModel) -> bool {
     model
         .inference_types_supported
         .contains(&INFERENCE_TYPE_PROVISIONED)
-}
-
-/// The base models offered with Provisioned Throughput and NO commitment term.
-///
-/// Whether a purchase may omit `commitmentDuration` is a property of the MODEL, not of the
-/// account: that member's own documentation sends a caller to "Supported Regions and models
-/// for Provisioned Throughput" for "which base models support no commitment"
-/// (`smithy_query(query="doc",shape="CreateProvisionedModelThroughputRequest",member="commitmentDuration")`,
-/// which also states that custom models support every level of commitment). The base models
-/// that page lists a no-commitment purchase for are the earlier generations — the Amazon
-/// Titan family, the Cohere models, Mixtral and SDXL — so a later model is offered with
-/// Provisioned Throughput only under a term, and a no-commitment purchase over one of those
-/// is refused rather than drawn against the no-commitment model-unit quota
-/// ([`granted_model_units`]).
-///
-/// Kept as a list of ids rather than a column of [`FOUNDATION_MODELS`] because it is a
-/// different published table from the per-model attributes those rows carry. Every id here
-/// is a row of that catalog whose `inferenceTypesSupported` carries
-/// [`INFERENCE_TYPE_PROVISIONED`], which is what
-/// [`supports_no_commitment_provisioned_throughput`] holds it to.
-pub const NO_COMMITMENT_PROVISIONED_MODELS: &[&str] = &[
-    "amazon.titan-embed-image-v1",
-    "amazon.titan-embed-text-v2:0",
-    "amazon.titan-image-generator-v1",
-    "amazon.titan-text-lite-v1",
-    "cohere.command-light-text-v14",
-    "cohere.command-text-v14",
-    "cohere.embed-english-v3",
-    "mistral.mixtral-8x7b-instruct-v0:1",
-    "stability.stable-diffusion-xl-v1",
-];
-
-/// Whether a Provisioned Throughput over `model` can be bought with NO commitment term
-/// ([`NO_COMMITMENT_PROVISIONED_MODELS`]).
-///
-/// A model that is offered with no Provisioned Throughput at all is offered with none
-/// without a commitment either, so this answers for the catalog row as a whole rather than
-/// for the id alone.
-#[must_use]
-pub fn supports_no_commitment_provisioned_throughput(model: &FoundationModel) -> bool {
-    supports_provisioned_throughput(model)
-        && NO_COMMITMENT_PROVISIONED_MODELS.contains(&model.model_id)
 }
 
 /// The `ProvisionedModelSummary` a listing reports for a stored Provisioned Throughput.

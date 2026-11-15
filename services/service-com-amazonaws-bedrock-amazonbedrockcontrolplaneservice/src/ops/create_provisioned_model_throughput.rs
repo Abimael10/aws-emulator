@@ -12,12 +12,11 @@
 //! * model units come out of the quota the account has been GRANTED for them, and which
 //!   quota that is depends on whether the request carries a `commitmentDuration`
 //!   ([`crate::state::granted_model_units`]): a create asking for more model units than
-//!   are granted is refused with 400 `ServiceQuotaExceededException`. That quota is only
-//!   reached for a purchase the model can back at all: a request that omits
-//!   `commitmentDuration` asks for a no-commitment Provisioned Throughput, which AWS
-//!   offers only over the base models it publishes one for
-//!   ([`crate::state::supports_no_commitment_provisioned_throughput`]), so over any other
-//!   model that purchase is refused with 400 `ValidationException`.
+//!   are granted is refused with 400 `ServiceQuotaExceededException`. A request that omits
+//!   `commitmentDuration` asks for a no-commitment Provisioned Throughput, which draws on
+//!   the no-commitment quota — granted at zero until an account has an increase granted —
+//!   so such a purchase over a model the catalog offers Provisioned Throughput for is
+//!   answered about the account's model units rather than about the model.
 //! * `provisionedModelName` is the OTHER spelling of `ProvisionedModelId`
 //!   (`smithy_query(query="operation",operation="GetProvisionedModelThroughput")`), so two
 //!   live Provisioned Throughputs of one name in one region could not both be addressed by
@@ -304,22 +303,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         };
+        // Whether the catalog offers the model with Provisioned Throughput is the WHOLE
+        // eligibility question, for a purchase with a commitment term and for one without:
+        // the term the request names decides which granted model-unit quota the purchase
+        // draws on, not whether the model can back one. So a model this service's own
+        // catalogue returns for `byInferenceType=PROVISIONED` goes on to the quota gate
+        // below however the commitment reads, and the not-supported refusal stays reserved
+        // for a model offered on demand only and for one offered no longer.
         if !crate::state::supports_provisioned_throughput(&model) {
-            return Err(not_provisionable().into());
-        }
-        // A purchase that omits `commitmentDuration` asks for a no-commitment Provisioned
-        // Throughput, which only the base models AWS offers one for can back
-        // (`crate::state::supports_no_commitment_provisioned_throughput`): over any other
-        // model there is no such purchase to make, so the refusal is the same
-        // not-supported one rather than a report about the account's no-commitment quota.
-        if input.commitment_duration.is_none()
-            && !crate::state::supports_no_commitment_provisioned_throughput(&model)
-        {
             return Err(not_provisionable().into());
         }
 
         // Model units are bought out of the quota the account has been GRANTED for them,
-        // and which quota that is depends on whether this create carries a commitment.
+        // and which quota that is depends on whether this create carries a commitment: the
+        // no-commitment quota is granted at zero until AWS Support raises it, so a
+        // well-formed no-commitment purchase is refused for want of model units.
         let granted = crate::state::granted_model_units(input.commitment_duration.as_deref());
         if input.model_units > granted {
             let message = if input.commitment_duration.is_none() {

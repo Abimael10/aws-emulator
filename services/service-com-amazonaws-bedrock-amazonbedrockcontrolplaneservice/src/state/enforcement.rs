@@ -337,7 +337,23 @@ pub async fn pass_role_denial<Eng: Send + Sync + 'static>(
 /// `@httpError(403)`) — and each takes this one decision rather than a copy of it.
 ///
 /// The decision is the one every service that is handed a role to act under makes
-/// ([`::service_common::iam_role::role_pass_is_unauthorized`]), asked for THIS pass:
+/// ([`::service_common::iam_role::role_pass_is_unauthorized`]), asked for THIS pass, taken
+/// in two parts — the CALLER, then the ROLE:
+///
+/// * the ACCOUNT's PASS-ROLE BOUNDARY over the role being passed
+///   ([`crate::service::authorization::pass_role_is_withheld`]). Handing a service a role is
+///   a permission of the CALLING PRINCIPAL rather than a property of the role: IAM evaluates
+///   `iam:PassRole` on the role's own ARN against the policies in force on that principal
+///   ("Granting a user permissions to pass a role to an AWS service", IAM User Guide), and
+///   the account decides which of its roles each of its principals may hand out. So a
+///   session whose permissions do not carry that grant cannot submit such a job however
+///   well-formed the role it names is, and the pass of EVERY job-creating operation is
+///   judged by it — the same part [`pass_role_denial`] takes for the role a logging
+///   destination names. A caller this gate cannot ground — the account's own published
+///   credential, a principal holding a grant this emulator cannot read, an engine with no
+///   IAM store — is left admitted, because a refusal has to rest on a document that was
+///   READ;
+/// * and then the ROLE itself:
 ///
 /// * the value has to name a role of the CALLER's OWN account — `iam:PassRole` is granted by
 ///   the account that holds the role, so another account's role is one no principal of this
@@ -383,12 +399,16 @@ pub async fn pass_role_denial<Eng: Send + Sync + 'static>(
 /// A denied pass is the modelled `AccessDeniedException` (`@httpError(403)`) carrying
 /// [`CROSS_ACCOUNT_PASS_ROLE_DENIED`], with no job and nothing else written, which is
 /// what every recording of such a create shows.
-pub async fn job_pass_role_denial(
+pub async fn job_pass_role_denial<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     role_arn: &str,
     source_arn: Option<&str>,
 ) -> Option<String> {
+    if crate::service::authorization::pass_role_is_withheld(engine, ctx, role_arn) {
+        return Some(CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string());
+    }
     let mut context = vec![(
         SOURCE_ACCOUNT_CONDITION_KEY.to_string(),
         ::engine::emulator_account_id().to_string(),

@@ -53,6 +53,8 @@ mod automated_reasoning_policy_updates;
 mod automated_reasoning_policy_versions;
 #[path = "all/batch_delete_evaluation_jobs.rs"]
 mod batch_delete_evaluation_jobs;
+#[path = "all/batch_job_pass_role_caller_boundary.rs"]
+mod batch_job_pass_role_caller_boundary;
 #[path = "all/batch_submission_acceptance.rs"]
 mod batch_submission_acceptance;
 #[path = "all/control_plane_authorization.rs"]
@@ -163,6 +165,8 @@ mod model_invocation_log_destination_delivery;
 mod model_invocation_log_poller_view;
 #[path = "all/model_invocation_logging_pass_role_boundary.rs"]
 mod model_invocation_logging_pass_role_boundary;
+#[path = "all/no_commitment_provisioned_throughput_quota.rs"]
+mod no_commitment_provisioned_throughput_quota;
 #[path = "all/path_label_values_are_not_echoed.rs"]
 mod path_label_values_are_not_echoed;
 #[path = "all/prompt_routers.rs"]

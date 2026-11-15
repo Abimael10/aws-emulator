@@ -103,29 +103,34 @@ fn job_arn(family: &str, tail: &str) -> String {
 
 /// One job-creating operation: the create, the family of the job it mints, whether the pass
 /// it makes states a source ARN at all, and how the minted job is read back.
-struct JobCreate {
-    case: &'static str,
-    path: &'static str,
-    body: fn(&str, &str) -> Value,
+///
+/// `pub(crate)` because the OTHER half of the same decision — the account's pass-role
+/// boundary over the calling principal — is asserted over these very operations in
+/// `crate::batch_job_pass_role_caller_boundary`: one decision, one table of the operations
+/// that take it.
+pub(crate) struct JobCreate {
+    pub(crate) case: &'static str,
+    pub(crate) path: &'static str,
+    pub(crate) body: fn(&str, &str) -> Value,
     /// The success status the model declares for the create.
-    success: u16,
+    pub(crate) success: u16,
     /// The resource type of the job's own ARN.
-    family: &'static str,
+    pub(crate) family: &'static str,
     /// Whether the ARN of the job being created is fixed where the pass is decided, hence
     /// stated as `aws:SourceArn`. A customization job's ARN carries the resolved base model
     /// before its id, and that resolution happens after the decision.
     states_source_arn: bool,
     /// The read that reports the minted job, addressed by its ARN.
-    read: fn(&str) -> String,
+    pub(crate) read: fn(&str) -> String,
     /// The statuses the read may report for a job this create just minted.
-    non_terminal: &'static [&'static str],
+    pub(crate) non_terminal: &'static [&'static str],
     /// The operation's own listing filtered by `nameContains`, where one is implemented:
     /// what a refused create must leave empty.
     listing: Option<(&'static str, &'static str)>,
 }
 
 /// Every job-creating operation of this service that passes a role the job RUNS as.
-fn job_creates() -> Vec<JobCreate> {
+pub(crate) fn job_creates() -> Vec<JobCreate> {
     vec![
         JobCreate {
             case: "CreateModelInvocationJob",
@@ -291,7 +296,12 @@ fn is_minted_job_arn(arn: &str, family: &str) -> bool {
 
 /// Whether this account holds a job of `name` for `create`, read through the operation's own
 /// listing where one is implemented.
-async fn job_listed(emu: &Emulator, create: &JobCreate, case: &str, name: &str) -> bool {
+pub(crate) async fn job_listed(
+    emu: &Emulator,
+    create: &JobCreate,
+    case: &str,
+    name: &str,
+) -> bool {
     let Some((listing, member)) = create.listing else {
         return false;
     };
@@ -316,7 +326,7 @@ async fn job_listed(emu: &Emulator, create: &JobCreate, case: &str, name: &str) 
 }
 
 /// Assert `reply` is the modelled pass-role refusal, whole.
-fn assert_refused(case: &str, reply: &Reply) {
+pub(crate) fn assert_refused(case: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 403,
         "case {case}: a pass that cannot be shown to be granted must be refused 403, got {} {:?}",

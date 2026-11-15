@@ -91,11 +91,22 @@ fn collection(resource_type: &str) -> String {
 // ---------------------------------------------------------------------------------------
 
 /// A policy allowing every action of this service on `resource` ALONE — the shape a
-/// least-privilege policy scoped to one resource or to one family takes.
+/// least-privilege policy scoped to one resource or to one family takes — beside the
+/// `iam:PassRole` of the job role, which is an action of IAM on the ROLE's own ARN rather
+/// than one of this service on the resource a row addresses: the rows below turn on which
+/// Amazon Bedrock resource the action is judged against, so the pass the job creates make
+/// is allowed throughout and is never what a row's verdict rests on.
 fn allow_on(resource: &str) -> Value {
     json!({
         "Version": "2012-10-17",
-        "Statement": [{ "Effect": "Allow", "Action": "bedrock:*", "Resource": resource }]
+        "Statement": [
+            { "Effect": "Allow", "Action": "bedrock:*", "Resource": resource },
+            {
+                "Effect": "Allow",
+                "Action": "iam:PassRole",
+                "Resource": format!("arn:aws:iam::{ACCOUNT}:role/{JOB_ROLE}"),
+            },
+        ]
     })
 }
 
@@ -378,8 +389,12 @@ async fn every_control_plane_operation_is_authorized_against_the_callers_policie
             Verdict::DefaultDeny,
         ),
         (
+            // Beside this service's own actions, the `iam:PassRole` the job creates need:
+            // handing Amazon Bedrock a role is an action of IAM on that role, so a caller
+            // allowed every action of this service and nothing of IAM could not submit one,
+            // and these rows turn on the identity-based decision for the bedrock action.
             "an allow of this whole service",
-            Some(allow(json!("bedrock:*"))),
+            Some(allow(json!(["bedrock:*", "iam:PassRole"]))),
             Verdict::Served,
         ),
         (

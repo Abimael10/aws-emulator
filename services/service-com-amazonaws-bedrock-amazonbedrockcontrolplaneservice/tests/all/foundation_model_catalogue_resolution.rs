@@ -17,12 +17,12 @@
 //!    * an identifier naming no model at all is a missing ARN (404) when it is a
 //!      `foundation-model` ARN and an unreadable identifier (400 `ValidationException`
 //!      carrying the service's fixed sentence) when it is a bare model id.
-//! 2. **A no-commitment Provisioned Throughput purchase is offered only over the base
-//!    models AWS publishes one for** (`commitmentDuration`'s own documentation sends a
-//!    caller to "Supported Regions and models for Provisioned Throughput" for "which base
-//!    models support no commitment"), so over any other model that purchase is refused with
-//!    the not-supported sentence rather than drawn against the account's no-commitment
-//!    model-unit quota.
+//! 2. **A Provisioned Throughput purchase is offered over every base model the service's own
+//!    catalogue publishes PROVISIONED inference for**, with a commitment term and without
+//!    one alike: what `commitmentDuration` decides is only WHICH granted model-unit quota
+//!    the purchase draws on, and the no-commitment quota is granted at zero, so such a
+//!    purchase is answered about the account's model units rather than refused as a purchase
+//!    the model cannot back.
 //! 3. **A catalogued model's lifecycle is reported as the instants AWS publishes for it**:
 //!    its launch instant always, and both ends of the legacy window for a deprecated model
 //!    and for no other — each in the RFC 3339 wire form its `@timestampFormat("date-time")`
@@ -369,32 +369,25 @@ async fn a_provisioned_throughput_purchase_refuses_a_model_that_exists_as_not_su
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_no_commitment_purchase_is_offered_only_over_the_models_published_with_one() {
+async fn a_no_commitment_purchase_over_a_catalogued_model_reaches_the_model_unit_quota() {
     let emu = emulator();
 
-    // Every model the catalog offers with Provisioned Throughput, split by whether a
-    // no-commitment purchase is offered over it at all.
+    // Every model the catalog offers with Provisioned Throughput: the purchase the model
+    // can back, whether or not the request names a commitment term.
     let provisionable: Vec<&bedrock::state::FoundationModel> = CATALOG
         .iter()
         .filter(|model| bedrock::state::supports_provisioned_throughput(model))
         .collect();
-    let (with_no_commitment, term_only): (
-        Vec<&&bedrock::state::FoundationModel>,
-        Vec<&&bedrock::state::FoundationModel>,
-    ) = provisionable
-        .iter()
-        .partition(|model| bedrock::state::supports_no_commitment_provisioned_throughput(model));
     assert!(
-        !with_no_commitment.is_empty() && !term_only.is_empty(),
-        "both sides of the rule must have a model in the catalog, got {} with and {} without",
-        with_no_commitment.len(),
-        term_only.len()
+        !provisionable.is_empty(),
+        "the catalog must offer a model with Provisioned Throughput, or this table asserts \
+         nothing"
     );
 
-    // A model AWS publishes a no-commitment purchase for reaches the account's
-    // no-commitment model-unit quota, which is granted at zero.
-    for model in &with_no_commitment {
+    for model in &provisionable {
         let case = model.model_id;
+        // Omitting the term draws on the account's no-commitment model-unit quota, which is
+        // granted at zero, so the purchase is answered about those model units.
         let reply = buy(&emu, "pt-no-commitment", case, None).await;
         assert_eq!(
             (reply.status, code(&reply)),
@@ -411,29 +404,9 @@ async fn a_no_commitment_purchase_is_offered_only_over_the_models_published_with
             "case {case}: the refusal must name the model units the account lacks, got {:?}",
             reply.body
         );
-    }
-
-    // A model offered only UNDER a term has no such purchase to make.
-    for model in &term_only {
-        let case = model.model_id;
-        let reply = buy(&emu, "pt-term-only", case, None).await;
-        assert_eq!(
-            (reply.status, code(&reply)),
-            (400, "ValidationException"),
-            "case {case}: a model offered only with a commitment cannot back a no-commitment \
-             purchase, got {} {} {:?}",
-            reply.status,
-            code(&reply),
-            reply.body
-        );
-        assert_eq!(
-            message(case, &reply),
-            bedrock::state::MODEL_NOT_SUPPORTED_FOR_PROVISIONED_THROUGHPUT,
-            "case {case}: the refusal must be the not-supported sentence, got {:?}",
-            reply.body
-        );
-        // The same model, with a term, is bought: the refusal is about the purchase asked
-        // for and not about the model.
+        // The SAME model under a term draws on the commitment quota instead and is bought:
+        // the term decides which quota the purchase draws on, not whether the model can
+        // back one.
         let committed = buy(
             &emu,
             &format!("pt-term-{}", case.replace(['.', ':'], "-")),

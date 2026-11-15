@@ -66,13 +66,10 @@ const PROVISIONABLE_MODELS: &[&str] = &[
     "meta.llama3-70b-instruct-v1:0",
 ];
 
-/// Base models the same catalog offers with Provisioned Throughput and NO commitment term:
-/// the ids
-/// `service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::NO_COMMITMENT_PROVISIONED_MODELS`
-/// carries, which is where a no-commitment purchase reaches the account's no-commitment
-/// model-unit quota at all. Over a model offered only UNDER a term there is no such
-/// purchase to make, which is its own refusal (asserted in
-/// `tests/all/foundation_model_catalogue_resolution.rs`).
+/// Base models the same catalog offers with Provisioned Throughput, used by the rows that
+/// buy one with NO commitment term: such a purchase draws on the account's no-commitment
+/// model-unit quota, which is granted at zero, so it is refused for want of model units
+/// whichever of these models it names.
 const NO_COMMITMENT_MODELS: &[&str] = &[
     "amazon.titan-text-lite-v1",
     "cohere.command-text-v14",
