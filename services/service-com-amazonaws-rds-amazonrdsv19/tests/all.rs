@@ -315,6 +315,8 @@ mod pending_modified_values;
 mod postgres_rds_namespace_parameters;
 #[path = "all/published_catalog_creates.rs"]
 mod published_catalog_creates;
+#[path = "all/published_parameter_descriptions.rs"]
+mod published_parameter_descriptions;
 #[path = "all/query_catalog_reads.rs"]
 mod query_catalog_reads;
 #[path = "all/query_error_envelope.rs"]

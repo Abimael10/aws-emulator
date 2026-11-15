@@ -291,8 +291,10 @@ fn cluster_engine_default_parameters(
 /// Source: the cluster-level rows of the Amazon Aurora User Guide's Aurora MySQL parameter
 /// tables ("Cluster-level parameters"), which publish each parameter's apply type, data
 /// type, allowed values, default value and whether it is modifiable; `description` is the
-/// one-line description the engine's own documentation gives the parameter, which is the
-/// text the API reports.
+/// one-line description the published list gives the parameter, which is the text the API
+/// reports BYTE FOR BYTE — the published sentence as written, never a paraphrase of what the
+/// parameter does (see [`super::describe_engine_default_parameters::MYSQL_PARAMETERS`] for
+/// why a paraphrase is a defect).
 ///
 /// It is not AWS's whole list — a cluster parameter group publishes dozens of parameters per
 /// family, and that list moves with every engine release. What a caller can rely on is that
@@ -406,7 +408,7 @@ pub(crate) const POSTGRES_CLUSTER_PARAMETERS: &[crate::state::ClusterParameterSp
         "0",
         true,
         "",
-        "Enables logical decoding, which a logical replication slot needs.",
+        "Enables logical decoding.",
     ),
 ];
 

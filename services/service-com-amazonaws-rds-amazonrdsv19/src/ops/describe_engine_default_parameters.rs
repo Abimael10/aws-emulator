@@ -641,8 +641,12 @@ const MYSQL_CHARACTER_SETS: &str = "big5,dec8,cp850,hp8,koi8r,latin1,latin2,swe7
 /// Source: the engine parameter lists in the Amazon RDS and Amazon Aurora User Guides
 /// ("Parameters for MySQL" / the MariaDB and Aurora MySQL parameter tables), which publish
 /// each parameter's apply type, data type, allowed values, default value and whether it is
-/// modifiable; `description` is the one-line description the engine's own documentation
-/// gives the parameter, which is the text the API reports. A default the service computes
+/// modifiable; `description` is the one-line description the published list gives the
+/// parameter, which is the text the API reports BYTE FOR BYTE — the published sentence as
+/// written, its punctuation and its missing trailing period included, never a paraphrase of
+/// what the parameter does. A paraphrase would report a `Parameter$Description` the service
+/// never reports, which is what a console, a doc generator or a configuration-drift check
+/// surfaces to a human. A default the service computes
 /// from the instance class is published as the FORMULA AWS reports
 /// (`{DBInstanceClassMemory/12582880}`), not as a number, because the number depends on an
 /// instance that does not exist at the time of this call.
@@ -693,8 +697,12 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "0",
         true,
         "8.0.2",
-        "Whether the server activates all roles granted to an account when a client \
-         authenticates as that account.",
+        // The published text of this parameter, which the cluster-level table of the same
+        // engine already carries for it
+        // (`super::describe_engine_default_cluster_parameters::MYSQL_CLUSTER_PARAMETERS`):
+        // ONE parameter has ONE published description, whichever level reports it.
+        "Automatically set all granted roles as active after the user has authenticated \
+         successfully.",
     ),
     parameter(
         "allow-suspicious-udfs",
@@ -728,7 +736,8 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "1",
         true,
         "",
-        "Controls the increment between successive AUTO_INCREMENT values.",
+        "Intended for use with master-to-master replication, and can be used to control \
+         the operation of AUTO_INCREMENT columns",
     ),
     parameter(
         "auto_increment_offset",
@@ -738,7 +747,7 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "1",
         true,
         "",
-        "Determines the starting point for the AUTO_INCREMENT column value.",
+        "Determines the starting point for the AUTO_INCREMENT column value",
     ),
     parameter(
         "autocommit",
@@ -748,7 +757,7 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "1",
         true,
         "",
-        "Sets the autocommit mode.",
+        "Sets the autocommit mode",
     ),
     parameter(
         "automatic_sp_privileges",
@@ -758,8 +767,9 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "1",
         true,
         "",
-        "Whether the server automatically grants the EXECUTE and ALTER ROUTINE privileges \
-         to the creator of a stored routine.",
+        "When this variable has a value of 1 (the default), the server automatically \
+         grants the EXECUTE and ALTER ROUTINE privileges to the creator of a stored \
+         routine, if the user cannot already execute and alter or drop the routine.",
     ),
     parameter(
         "avoid_temporal_upgrade",
@@ -769,8 +779,8 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "0",
         true,
         "",
-        "Whether ALTER TABLE implicitly upgrades temporal columns found to be in pre-5.6.4 \
-         format.",
+        "This variable controls whether ALTER TABLE implicitly upgrades temporal columns \
+         found to be in pre-5.6.4 format.",
     ),
     parameter(
         "back_log",
@@ -782,7 +792,7 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "",
         true,
         "",
-        "The number of outstanding connection requests the server can have.",
+        "The number of outstanding connection requests MySQL can have",
     ),
     parameter(
         "basedir",
@@ -1413,8 +1423,10 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "-1",
         true,
         "",
-        "The minimum execution time in milliseconds above which a statement is logged; -1 \
-         disables the logging.",
+        // The engine's own catalog text, unit prefix included: PostgreSQL publishes the
+        // description of a millisecond-valued setting with the `(ms)` prefix, and the API
+        // reports that string byte for byte.
+        "(ms) Sets the minimum execution time above which statements will be logged.",
     ),
     parameter(
         "log_statement",
@@ -1424,7 +1436,7 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "none",
         true,
         "",
-        "Which SQL statements are logged.",
+        "Sets the type of statements logged.",
     ),
     parameter(
         "max_connections",
@@ -1474,7 +1486,7 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "0",
         true,
         "",
-        "Enables logical decoding, which a logical replication slot needs.",
+        "Enables logical decoding.",
     ),
     parameter(
         "shared_buffers",
