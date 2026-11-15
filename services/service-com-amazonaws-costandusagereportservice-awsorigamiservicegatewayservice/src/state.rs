@@ -250,7 +250,7 @@ impl TagLimitExceeded {
 /// in this service's modelled surface delivers a report — delivery is the billing
 /// pipeline's, not an API call's — so a report created through `PutReportDefinition`
 /// holds none until a delivery is recorded against it, and a read of such a report states
-/// no `ReportStatus` at all.
+/// the delivery-status dictionary with [`NO_DELIVERY`] in both of its keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportDelivery {
     /// The instant the report was delivered, reported through [`report_timestamp`].
@@ -259,6 +259,20 @@ pub struct ReportDelivery {
     /// (`smithy_query(shape="LastStatus")`).
     pub status: String,
 }
+
+/// What each key of a report's delivery status holds while no delivery has been recorded
+/// against the report: the empty string.
+///
+/// The delivery-status dictionary is unconditional on a read of a report definition, so a
+/// report with no delivery history still states both of its keys; the empty string is the
+/// value this service states in them, and it is the sentinel a client distinguishes "never
+/// delivered" by. It is an output-only value: the modelled constraints on the two members
+/// — `lastDelivery` length 16..20 with the pattern
+/// `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$`, `lastStatus` the `LastStatus` catalog
+/// (`smithy_query(shape="LastDelivery,LastStatus")`) — describe the values a DELIVERY has,
+/// and the boundary validator holds every request to them, as it does for every other
+/// constrained member.
+pub const NO_DELIVERY: &str = "";
 
 /// One persisted report definition: the definition exactly as the caller supplied it,
 /// its tags, when it was first created, and the last delivery recorded against it.
@@ -304,9 +318,9 @@ impl StoredReport {
     /// versioning preference is [`DEFAULT_REPORT_VERSIONING`], and an unstated billing view
     /// is the account's primary one ([`primary_billing_view_arn`]) — and the service's own
     /// facts about the report: the status of its last delivery
-    /// ([`Self::delivery_status`], stated only once a delivery has been recorded against
-    /// the report) and the date it was created, which is the STORED instant and so the
-    /// same on every read rather than the moment of the read.
+    /// ([`Self::delivery_status`], stated on every read whether or not a delivery has been
+    /// recorded against the report) and the date it was created, which is the STORED
+    /// instant and so the same on every read rather than the moment of the read.
     pub fn wire_definition(&self) -> ReportDefinition {
         ReportDefinition {
             additional_artifacts: Some(
@@ -332,30 +346,35 @@ impl StoredReport {
                     .clone()
                     .unwrap_or_else(primary_billing_view_arn),
             ),
-            report_status: self.delivery_status(),
+            report_status: Some(self.delivery_status()),
             report_creation_date: Some(report_timestamp(self.created_at)),
             ..self.definition.clone()
         }
     }
 
-    /// The modelled `ReportStatus` of this report: "the date and status of the last
-    /// delivered report for a particular report definition" (the modelled `ReportStatus`
-    /// doc).
+    /// The modelled `ReportStatus` of this report: "a two element dictionary with a
+    /// `lastDelivery` and `lastStatus` key whose values describe the date and status of the
+    /// last delivered report for a particular report definition" (the modelled
+    /// `ReportStatus` doc, `smithy_query(shape="ReportStatus")`).
     ///
-    /// `None` for a report no delivery has been recorded against: there is no delivery
-    /// date and no delivery outcome to state, and both members are constrained — the
-    /// `lastDelivery` to length 16..20 and the pattern
-    /// `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$`, the `lastStatus` to the `LastStatus`
-    /// catalog (`smithy_query(shape="LastDelivery,LastStatus")`) — so the optional member
-    /// is left out of the read-back rather than filled with a stand-in those constraints
-    /// reject. That is what keeps the definition this service reports a definition it also
-    /// accepts back, which is the read-modify-write `ModifyReportDefinition` is built on.
-    pub fn delivery_status(&self) -> Option<ReportStatus> {
-        let delivery = self.last_delivery.as_ref()?;
-        Some(ReportStatus {
-            last_delivery: Some(report_timestamp(delivery.at)),
-            last_status: Some(delivery.status.clone()),
-        })
+    /// The dictionary and BOTH of its keys are what a read of a report definition states,
+    /// whatever the report's delivery history: only the two VALUES depend on it. A report a
+    /// delivery has been recorded against states the instant of that delivery and the
+    /// outcome it ended with; a report no delivery has been recorded against states
+    /// [`NO_DELIVERY`] in each key, so a client that reads `lastStatus` to decide whether
+    /// its report has been delivered reads the sentinel for "not yet" rather than finding
+    /// the member it polls absent.
+    pub fn delivery_status(&self) -> ReportStatus {
+        match self.last_delivery.as_ref() {
+            Some(delivery) => ReportStatus {
+                last_delivery: Some(report_timestamp(delivery.at)),
+                last_status: Some(delivery.status.clone()),
+            },
+            None => ReportStatus {
+                last_delivery: Some(NO_DELIVERY.to_string()),
+                last_status: Some(NO_DELIVERY.to_string()),
+            },
+        }
     }
 
     /// Merge `tags` onto this report: a key already present takes the new value, a key

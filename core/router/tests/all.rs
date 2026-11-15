@@ -9,7 +9,6 @@
 // to one service crate's own, is stated in that suite's own module doc, and a note about
 // THIS file belongs in `all/appended_notes.rs`, which is declared below like any other
 // module and holds comments alone.
-//
 // A suite no `mod` names compiles nowhere and its tests never run; a suite declared twice
 // is `E0428`; and an inner doc comment (`//!`) is legal only before the first item, so one
 // written past the declarations is `E0753`. Each of those fails EVERY suite of this
@@ -19,9 +18,7 @@
 // `all/every_suite_file_is_declared.rs` pin the shape above. Every comment here is an
 // ordinary `//` one, this header included, so no merge of two landings can leave a doc
 // comment past the first item.
-//
 // Single integration-test target for the router.
-//
 // This file is a CANONICAL DECLARATION LIST: this header, then one
 // `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
 // line. Two branches landing at once then insert two lines in two places and have no prose
@@ -37,7 +34,6 @@
 // to a SIBLING (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what
 // points each declaration into `tests/all/`.
 // `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
 // check those rules, for this file and for every service crate's `tests/all.rs`, so check
 // there rather than leaving a note here. What a suite covers, and why it belongs to this
@@ -1663,7 +1659,6 @@ mod zz_probe_whole_emulator;
 //! than to one service crate's own belongs in that suite's module doc, beside the test it
 //! describes; `all/appended_notes.rs` keeps the notes this file had collected.
 // Four rules this file lives or dies by, each pinned by a suite of its own
-// `all/all_rs_is_a_canonical_declaration_list.rs` and
 // `all/every_suite_file_is_declared.rs`): one declaration per suite (a second is `E0428`),
 // every comment an ORDINARY `//` one (an inner `//!` past the first item is `E0753`),
 // nothing in the list but declaration pairs, and a pair for every suite file under
@@ -1842,3 +1837,17 @@ mod declaration_roots_are_canonical_and_complete;
 // test it explains. A note about this file itself belongs in `all/appended_notes.rs`.
 // Four suites check the rules above rather than restating them:
 // `all/every_suite_file_is_declared.rs`.
+// keep producing — is `E0753` and compiles no suite of this target. With no inner doc
+// Put a new suite at `tests/all/<name>.rs` and insert one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair below, in sorted position. The list
+// holds those pairs and no other line, so two branches landing at once insert two lines in
+// two places and have no prose to duplicate, re-word or mistype.
+// A suite no `mod` names compiles nowhere and its tests never run (this crate's build
+// script refuses it); a suite left at the top level of `tests/` fails the build; and a
+// suite declared twice is `E0428`. `tests/all.rs` is a test-target CRATE ROOT, so a bare
+// `mod` would resolve to a SIBLING of this file, which the layout check refuses: the
+// `#[path]` is what points each declaration into `tests/all/`.
+// Four suites pin those rules rather than restating them here:
+// `all/every_suite_file_is_declared.rs`. What a suite covers, and why it drives the
+// assembled router rather than one service crate, is stated in that suite's own module
+// header; a note about THIS file belongs in `all/appended_notes.rs`.

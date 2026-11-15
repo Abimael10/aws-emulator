@@ -13,15 +13,17 @@
 //! list sizes, which optional members are present, report count), not just one recorded
 //! request.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_costandusagereportservice_awsorigamiservicegatewayservice as cur;
 
-use cur::ops::types::ReportDefinition;
-use cur::state::{StoredReport, MAX_REPORTS};
+use cur::ops::types::{ReportDefinition, LAST_STATUS_VALUES};
+use cur::state::{ReportDelivery, StoredReport, MAX_REPORTS};
 use cur::ComAmazonawsCostandusagereportserviceAwsorigamiservicegatewayserviceState as ReportStore;
 
 /// One emulator: the shared engine plus a router carrying only this service.
@@ -190,8 +192,9 @@ pub(crate) fn primary_billing_view_arn() -> String {
 /// preference is on, an unstated versioning preference delivers a new version, and an
 /// unstated billing view is the account's primary one. The report's delivery status is the
 /// service's and not the caller's: nothing in this service delivers a report, so a report
-/// created through the API has never been delivered and its read-back states no
-/// `ReportStatus` at all — whatever the request put there.
+/// created through the API has never been delivered and its read-back states the
+/// delivery-status dictionary with both keys empty ([`never_delivered`]) — whatever the
+/// request put there.
 /// `ReportCreationDate` is a per-run instant, so [`read_back_of`] checks its form
 /// and drops it rather than this expectation carrying a value.
 pub(crate) fn expected_read_back(definition: &Value) -> Value {
@@ -211,8 +214,74 @@ pub(crate) fn expected_read_back(definition: &Value) -> Value {
     object
         .entry("BillingViewArn")
         .or_insert_with(|| json!(primary_billing_view_arn()));
-    object.remove("ReportStatus");
+    object.insert("ReportStatus".to_string(), never_delivered());
     expected
+}
+
+/// The delivery status a read states for a report no delivery has been recorded against:
+/// the modelled two-key dictionary with the empty string in each key.
+///
+/// The two empty strings are the RECORDED ground truth for a definition that has never
+/// had a delivery, written here as literals so this expectation stands on its own rather
+/// than on whatever value the projection happens to carry.
+pub(crate) fn never_delivered() -> Value {
+    json!({ "lastDelivery": "", "lastStatus": "" })
+}
+
+/// One instant, as a number of seconds after the epoch, for a test that pins what the
+/// service makes of a STORED instant rather than of this run's clock.
+pub(crate) fn at_epoch_seconds(seconds: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+}
+
+/// A stored report called `report_name`, created at `created_at`, carrying
+/// `last_delivery`, so a test can pin what the read-back projection makes of a record it
+/// could not reach through the API.
+///
+/// Seeding is how a DELIVERED report is set up at all: nothing in this service's modelled
+/// surface delivers a report, so no request can put a delivery on one. The definition is
+/// the required members alone, which is what every suite that seeds one needs.
+pub(crate) fn stored_report_at(
+    report_name: &str,
+    created_at: SystemTime,
+    last_delivery: Option<ReportDelivery>,
+) -> StoredReport {
+    StoredReport {
+        definition: ReportDefinition {
+            report_name: report_name.to_string(),
+            time_unit: "DAILY".to_string(),
+            format: "textORcsv".to_string(),
+            compression: "GZIP".to_string(),
+            additional_schema_elements: vec!["RESOURCES".to_string()],
+            s3_bucket: "seeded-bucket".to_string(),
+            s3_prefix: "cur/".to_string(),
+            s3_region: "us-east-1".to_string(),
+            ..Default::default()
+        },
+        tags: BTreeMap::new(),
+        created_at,
+        last_delivery,
+    }
+}
+
+/// The delivery histories a seeded report is built from, each with the case label naming
+/// it: no delivery recorded, and one per value of the modelled `LastStatus` catalog
+/// (`smithy_query(shape="LastStatus")`), each at a different instant — the epoch, a leap
+/// day and a mid-range instant — so a reported date is never pinned to one moment.
+pub(crate) fn recorded_deliveries() -> Vec<(String, Option<ReportDelivery>)> {
+    let instants = [0_u64, 1_709_210_096, 1_700_000_000];
+    let mut rows: Vec<(String, Option<ReportDelivery>)> =
+        vec![("no delivery recorded".to_string(), None)];
+    for (index, status) in LAST_STATUS_VALUES.iter().enumerate() {
+        rows.push((
+            format!("a delivery that ended {status}"),
+            Some(ReportDelivery {
+                at: at_epoch_seconds(instants[index % instants.len()]),
+                status: (*status).to_string(),
+            }),
+        ));
+    }
+    rows
 }
 
 /// One definition from a `DescribeReportDefinitions` page with its `ReportCreationDate`

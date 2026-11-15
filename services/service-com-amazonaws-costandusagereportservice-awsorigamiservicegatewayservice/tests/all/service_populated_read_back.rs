@@ -9,7 +9,8 @@
 //!    answers the stored definition PLUS every member the service itself populates: the
 //!    billing view the report is scoped to (the one the request named, or the account's
 //!    primary billing view when it named none), the status of the report's last delivery
-//!    (absent while nothing has delivered it) and the date the definition was
+//!    (stated on every read, with both of its keys empty while nothing has delivered the
+//!    report) and the date the definition was
 //!    created. Each comes from the stored record, so every read answers the same value and
 //!    none of them can be dictated by the caller.
 //! 2. **An optional output member the service does not populate is not serialized.**
@@ -28,50 +29,19 @@
 //! recorded against the report, the instant the report was created, which part of a
 //! Parquet preference the definition states, and which leg of the delete is called.
 
-use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime};
-
 use serde_json::{json, Value};
 
 use service_com_amazonaws_costandusagereportservice_awsorigamiservicegatewayservice as cur;
 
-use cur::ops::types::ReportDefinition;
-use cur::state::{ReportDelivery, StoredReport};
+use cur::state::ReportDelivery;
 
+// `stored_report_at` is the one seeded-report builder the suites of this target share; it
+// is the stored record a test pins the read-back projection against.
 use super::report_definition_lifecycle::{
-    expected_read_back, is_report_timestamp, minimal_definition, primary_billing_view_arn,
-    read_back_of, Cur,
+    at_epoch_seconds, expected_read_back, is_report_timestamp, minimal_definition,
+    never_delivered, primary_billing_view_arn, read_back_of, stored_report_at as stored_at,
+    Cur,
 };
-
-/// A stored report created at `created_at`, carrying `last_delivery`, so a test can pin
-/// what the projection makes of a record it could not reach through the API.
-fn stored_at(
-    report_name: &str,
-    created_at: SystemTime,
-    last_delivery: Option<ReportDelivery>,
-) -> StoredReport {
-    StoredReport {
-        definition: ReportDefinition {
-            report_name: report_name.to_string(),
-            time_unit: "DAILY".to_string(),
-            format: "textORcsv".to_string(),
-            compression: "GZIP".to_string(),
-            additional_schema_elements: vec!["RESOURCES".to_string()],
-            s3_bucket: "seeded-bucket".to_string(),
-            s3_prefix: "cur/".to_string(),
-            s3_region: "us-east-1".to_string(),
-            ..Default::default()
-        },
-        tags: BTreeMap::new(),
-        created_at,
-        last_delivery,
-    }
-}
-
-/// One instant, as a number of seconds after the epoch.
-fn at_epoch_seconds(seconds: u64) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
-}
 
 #[tokio::test]
 async fn a_read_back_carries_the_billing_view_the_report_is_scoped_to() {
@@ -133,11 +103,15 @@ async fn a_read_back_carries_the_status_of_the_report_last_delivery() {
     // Rows differ in whether a delivery has been recorded against the report and in how
     // that delivery ended: every value of the modelled `LastStatus` enum
     // (`smithy_query(shape="LastStatus")`) is covered, beside the report nothing has
-    // delivered, whose read-back states no `ReportStatus` at all — the member is optional
-    // and neither of its values has a form the model admits for "never delivered".
+    // delivered, whose read-back states the same two-key dictionary with the empty string
+    // in each key — the dictionary is unconditional on this read path and only its values
+    // depend on the report's delivery history.
     let delivered_at = at_epoch_seconds(1_700_000_000);
-    let mut table: Vec<(String, Option<ReportDelivery>, Option<Value>)> =
-        vec![("no delivery recorded".to_string(), None, None)];
+    let mut table: Vec<(String, Option<ReportDelivery>, Option<Value>)> = vec![(
+        "no delivery recorded".to_string(),
+        None,
+        Some(never_delivered()),
+    )];
     for status in cur::ops::types::LAST_STATUS_VALUES {
         table.push((
             format!("a delivery that ended {status}"),
@@ -290,10 +264,11 @@ async fn a_caller_cannot_dictate_the_members_the_service_populates() {
                 json!(claimed_name),
                 "case {case:?} via {operation}: expected the report to be listed, got {listed:?}"
             );
-            assert!(
-                subject.get("ReportStatus").is_none(),
+            assert_eq!(
+                subject.get("ReportStatus"),
+                Some(&never_delivered()),
                 "case {case:?} via {operation}: nothing delivered this report, so its read-back \
-                 must state no ReportStatus, got {subject:?}"
+                 must state the delivery status with both keys empty, got {subject:?}"
             );
             let created = subject["ReportCreationDate"].as_str().unwrap_or_default();
             assert!(
