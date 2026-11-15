@@ -31,6 +31,8 @@ mod run_groups;
 mod sequence_store_deletion;
 #[path = "all/sequence_stores.rs"]
 mod sequence_stores;
+#[path = "all/share_not_found_message.rs"]
+mod share_not_found_message;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/workflow_versions.rs"]
