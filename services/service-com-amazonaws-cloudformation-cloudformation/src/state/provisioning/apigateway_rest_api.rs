@@ -63,6 +63,10 @@
 //! A declared property no call here carries is REFUSED rather than dropped: an api reported
 //! created with less than its declaration asked for is the shallow success these arms exist
 //! to avoid.
+//!
+//! A CHANGED declaration is applied through the PATCH call API Gateway publishes for the
+//! record that already exists — `UpdateRestApi`, `UpdateResource`, `UpdateMethod`,
+//! `UpdateDeployment`, `UpdateStage` — which lives in [`in_place`].
 
 use std::collections::BTreeMap;
 
@@ -97,6 +101,12 @@ mod request_validation;
 /// same reason: it is the one type here whose create leaves the resource still coming up, so
 /// its arms are the only ones that read a status back. Reached through the same [`Kind`].
 mod vpc_link;
+
+/// Applying a CHANGED declaration to one of the five records a REST API is built out of, in
+/// a module of its own so that neither file grows past the length a change to this repository
+/// may touch: it is one concern — the patch call API Gateway publishes for a record that
+/// exists — across every type here, and it is reached through the same [`Kind`] every arm is.
+mod in_place;
 
 /// The ACCOUNT-level settings of this control plane, in a module of its own for the same
 /// reason: they are the one record here that is a SINGLETON rather than a resource either side
@@ -247,13 +257,17 @@ pub(super) async fn readiness(
 /// Apply a changed declaration to one of these records that already exists — see
 /// [`super::Owner::update`].
 ///
-/// A changed declaration of an api, a resource, a method, a deployment, a stage or one of the
-/// four types that govern access to a stage is applied by no arm here yet: API Gateway changes
-/// those through its own PATCH calls, which this module makes only for the settings a create
-/// could not carry — so such a change is reported as NOT applied (`Ok(None)`) rather than as a
-/// success that dropped the caller's change. The ACCOUNT settings are the one record here
-/// whose only call IS that patch, so a changed declaration of them is applied
-/// ([`account::update`]).
+/// A changed declaration of the api, of a resource of it, of a method on that resource, of a
+/// deployment of them or of the stage that serves one is applied through the PATCH call API
+/// Gateway publishes for that record ([`in_place`]), which is how that service changes one:
+/// only a change no pointer of that call can express — a property that is fixed when the
+/// resource is created — is reported as NOT applied (`Ok(None)`) rather than as a success that
+/// dropped the caller's change. The ACCOUNT settings are the record here whose only call IS
+/// that patch ([`account::update`]).
+///
+/// A changed declaration of a VPC link, or of one of the four types that govern access to a
+/// stage and the two that decide what a method validates against, is applied by no arm here
+/// yet, and is reported as not applied for the same reason.
 pub(super) async fn update(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -263,14 +277,10 @@ pub(super) async fn update(
 ) -> Result<Option<Created>, Refusal> {
     match kind {
         Kind::Account => account::update(ctx, region, resource, declared).await,
-        Kind::RestApi
-        | Kind::Resource
-        | Kind::Method
-        | Kind::Deployment
-        | Kind::Stage
-        | Kind::VpcLink
-        | Kind::AccessControl(_)
-        | Kind::RequestValidation(_) => Ok(None),
+        Kind::RestApi | Kind::Resource | Kind::Method | Kind::Deployment | Kind::Stage => {
+            in_place::update(ctx, region, kind, resource, declared).await
+        }
+        Kind::VpcLink | Kind::AccessControl(_) | Kind::RequestValidation(_) => Ok(None),
     }
 }
 

@@ -86,6 +86,16 @@ impl ProvisioningReach {
             identity: ctx.identity().clone(),
         }
     }
+
+    /// This service's identity, which a context built over this reach is for.
+    pub(crate) fn identity(&self) -> &ServiceIdentity {
+        &self.identity
+    }
+
+    /// The in-process transport the calls a task makes ride, exactly as a handler's do.
+    pub(crate) fn callback(&self) -> &::smithy_server_runtime::EmbeddedEmulator {
+        &self.callback
+    }
 }
 
 impl super::ComAmazonawsCloudformationCloudformationState {

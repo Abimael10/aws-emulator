@@ -718,12 +718,11 @@ impl Owner {
                 step_functions_state_machine::update(ctx, region, resource, declared, propagated)
                     .await
             }
-            // A CHANGED declaration of one of these is applied by no arm here yet: API Gateway
-            // changes an api, a method and a stage through its own PATCH calls, which that
-            // module makes only for the settings a create could not carry — so a changed
-            // declaration is reported as NOT applied rather than as a success that dropped the
-            // caller's change. The ACCOUNT settings are the exception, whose only call IS that
-            // patch ([`apigateway_rest_api::update`]).
+            // A CHANGED declaration of the api, of a resource of it, of a method, of a
+            // deployment or of a stage is applied through the PATCH call API Gateway publishes
+            // for that record, which is how that service changes one; a change no pointer of
+            // that call can express is reported as NOT applied rather than as a success that
+            // dropped the caller's change ([`apigateway_rest_api::update`]).
             Self::ApiGatewayRestApi(kind) => {
                 apigateway_rest_api::update(ctx, region, kind, resource, declared).await
             }

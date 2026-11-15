@@ -1181,3 +1181,26 @@ mod zz_opensearch_fgac_probe;
 mod zz_probe;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with a
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted: one pair per
+//! suite file and NOTHING else, so a landing has one place to insert and nothing to keep
+//! consistent.
+//! A suite that is not declared here compiles nowhere and its tests never run, and a suite
+//! left at the top level of `tests/` fails the build. Declare each suite exactly ONCE: this is
+//! one crate root, so a second `mod` for the same name is `E0428`. `tests/all.rs` is a
+//! test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of this file, which the
+//! layout check refuses: the `#[path]` is what points each module into `tests/all/`.
+//! THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past the
+//! first item one is `E0753` and compiles no suite of this target, so what goes below is a
+//! declaration, never a note about one. `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that, for
+//! this file and for every service crate's `tests/all.rs`, so check there rather than leaving
+//! a note here.
+//! WHY a suite lives in THIS target rather than in one service crate's own — it drives more
+//! than one service over the assembled router — is stated in that suite's own module doc,
+//! where it is read beside the test it describes and where it stays correct when the suite
+//! moves.
+#[path = "all/cloudformation_private_macro_change_sets.rs"]
+mod cloudformation_private_macro_change_sets;
+#[path = "all/cloudformation_rest_api_redeployment.rs"]
+mod cloudformation_rest_api_redeployment;

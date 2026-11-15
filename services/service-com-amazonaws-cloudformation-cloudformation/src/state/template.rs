@@ -4082,6 +4082,17 @@ fn transform_names(node: &Value, depth: usize) -> Vec<String> {
     }
 }
 
+/// Whether the transform `name` is one this service applies ITSELF rather than one a client
+/// registered: AWS's language-extensions transform and the SAM macro, whose expansions both
+/// live in this crate.
+///
+/// The one place that decides it, so the expansion below and the module that invokes a
+/// REGISTERED macro ([`super::private_macro`]) cannot disagree about which transform is
+/// whose.
+pub(crate) fn applied_by_this_service(name: &str) -> bool {
+    name == LANGUAGE_EXTENSIONS || name == super::sam::TRANSFORM
+}
+
 /// The `Processed` stage of a submitted template body.
 ///
 /// The transforms this service applies itself are AWS's own two: the SAM macro, whose
@@ -4119,7 +4130,7 @@ pub fn process_with_parameters(body: &str, supplied: &BTreeMap<String, String>) 
     let unsupported: Vec<&str> = declared
         .iter()
         .map(String::as_str)
-        .filter(|name| *name != LANGUAGE_EXTENSIONS && *name != super::sam::TRANSFORM)
+        .filter(|name| !applied_by_this_service(name))
         .collect();
     if !unsupported.is_empty() {
         return Processed::Unavailable(format!(

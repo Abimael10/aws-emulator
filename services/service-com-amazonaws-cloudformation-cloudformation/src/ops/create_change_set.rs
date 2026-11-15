@@ -836,6 +836,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     previous_processed.clone(),
                 ),
             };
+        // The MACROS that template invokes which a client has REGISTERED: performing one means
+        // invoking the function its `AWS::CloudFormation::Macro` resource names, which is the
+        // work creating this change set does — so the creation reports `CREATE_IN_PROGRESS`
+        // until that function answers and is settled by its answer
+        // ([`crate::state::private_macro`]). A template invoking a macro this account has no
+        // registration for is answered as it was: there is nothing to invoke for it.
+        let macro_parameters = {
+            let mut values = crate::state::declared_template(&template_body)
+                .map(|declared| declared.parameter_defaults())
+                .unwrap_or_default();
+            values.extend(supplied.clone());
+            values
+        };
+        let pending_macros = crate::state::private_macro::PendingMacros::declared(
+            &store,
+            &region,
+            &template_body,
+            macro_parameters,
+        );
+        // ...and a template invoking more macros than one creation performs
+        // ([`crate::state::private_macro::MAX_MACROS_PER_TEMPLATE`]) has NONE of them invoked:
+        // the change set settles FAILED with the transform failure that says so, so the work
+        // one request can set off is bounded before anything is called.
+        let too_many_macros = pending_macros
+            .as_ref()
+            .and_then(crate::state::private_macro::PendingMacros::over_the_bound);
+        let pending_macros = pending_macros.filter(|_| too_many_macros.is_none());
+        // While the macros have not answered there is no processed document to serve: "after
+        // CloudFormation finishes creating the change set, the Processed template becomes
+        // available".
+        let processed_template = if pending_macros.is_some() {
+            crate::state::template::Processed::Unavailable(
+                crate::state::private_macro::NOT_PROCESSED_YET.to_string(),
+            )
+        } else {
+            processed_template
+        };
         // "In some cases, you must explicitly acknowledge that your stack template contains
         // certain capabilities ... If you don't specify either of these capabilities,
         // CloudFormation returns an InsufficientCapabilities error": the template this
@@ -1280,6 +1317,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // says what could not be applied, so a plan nobody could compute is never offered
         // for execution.
         let settles_to = match &unprocessable {
+            // A template whose macros are still being performed is not a template this
+            // service could not process: the creation reaches `CREATE_IN_PROGRESS` and the
+            // macro's own answer settles it ([`crate::state::private_macro::conclude`]).
+            _ if pending_macros.is_some() => (
+                change_set_status::CREATE_IN_PROGRESS,
+                execution_status::UNAVAILABLE,
+                None,
+            ),
+            // ...and one invoking more macros than a creation performs is failed on that,
+            // with none of them invoked.
+            _ if too_many_macros.is_some() => (
+                change_set_status::FAILED,
+                execution_status::UNAVAILABLE,
+                too_many_macros.clone(),
+            ),
             Some(reason) => (
                 change_set_status::FAILED,
                 execution_status::UNAVAILABLE,
@@ -1391,6 +1443,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // stack operation, so its conclusion waits for nothing but its own clock.
                 awaits_the_stack: false,
             }),
+            // The macros this creation still owes, which its answer settles it on.
+            pending_macros: pending_macros.clone(),
             // Nothing has executed this plan, so there is nothing of it to discard yet.
             plan_discarded: false,
             changes,
@@ -1407,6 +1461,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ...and the change sets of the children below it, stored beside the parent's own so
         // `DescribeChangeSet` answers for every id the plan reports.
         store.change_sets.extend(nested_change_sets);
+        drop(store);
+
+        // The macros the template invokes are performed now: the function each one names is
+        // invoked with the fragment to process, in a task of its own, and what it answers is
+        // what settles this change set's creation ([`crate::state::private_macro`]). Nothing
+        // of it is waited for here — "after the CreateChangeSet call successfully completes,
+        // CloudFormation starts creating the change set".
+        if pending_macros.is_some() {
+            crate::state::private_macro::start(ctx, &self.engine, &region, &change_set_id);
+        }
 
         Ok(CreateChangeSetOutput {
             id: Some(change_set_id),

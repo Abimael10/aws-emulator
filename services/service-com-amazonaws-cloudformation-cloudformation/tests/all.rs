@@ -727,3 +727,7 @@ mod nested_stack_dynamodb_outputs;
 mod reference_read_authorization;
 #[path = "all/declared_bucket_policy_is_applied.rs"]
 mod declared_bucket_policy_is_applied;
+#[path = "all/private_macro_change_sets.rs"]
+mod private_macro_change_sets;
+#[path = "all/rest_api_redeployment.rs"]
+mod rest_api_redeployment;

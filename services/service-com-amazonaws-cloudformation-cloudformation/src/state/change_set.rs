@@ -101,6 +101,15 @@ pub struct StoredChangeSet {
     /// never re-read later.
     pub stack_drift_status: String,
     pub pending: Option<PendingChangeSetStatus>,
+    /// The MACROS this change set's creation still owes: the registered macros the submitted
+    /// template invokes, which CloudFormation performs before it can plan anything from that
+    /// template ([`private_macro`]). `None` for a change set whose template invokes none, and
+    /// for one whose macros have answered.
+    ///
+    /// A change set that owes one reports `CREATE_IN_PROGRESS` until the macro answers, and is
+    /// settled by the answer rather than by a clock ([`private_macro::conclude`]) — bar the
+    /// deadline below, which settles one whose macro never answers at all.
+    pub pending_macros: Option<private_macro::PendingMacros>,
     /// Whether `DeleteChangeSet` has DISCARDED this change set's plan after its execution
     /// had already been carried out.
     ///
@@ -158,7 +167,9 @@ impl StoredChangeSet {
     /// change set whose creation did not complete, which has no computed plan to report.
     pub fn hooks_status(&self) -> &'static str {
         match self.status.as_str() {
-            change_set_status::CREATE_PENDING => change_set_hooks::hooks_status::PLANNING,
+            change_set_status::CREATE_PENDING | change_set_status::CREATE_IN_PROGRESS => {
+                change_set_hooks::hooks_status::PLANNING
+            }
             change_set_status::CREATE_COMPLETE => change_set_hooks::hooks_status::PLANNED,
             _ => change_set_hooks::hooks_status::UNAVAILABLE,
         }
@@ -203,6 +214,29 @@ impl StoredChangeSet {
             } else {
                 execution_status
             };
+        }
+        // A creation that has reached `CREATE_IN_PROGRESS` is waiting for the MACROS the
+        // template invokes, which the macro's own answer concludes
+        // ([`private_macro::conclude`]). Only one thing is owed on a clock from here: the
+        // DEADLINE one creation's macros are given, so a macro whose function never answers
+        // settles the change set in a terminal status well inside a client's poll loop rather
+        // than leaving it polling.
+        if self.status == change_set_status::CREATE_IN_PROGRESS {
+            if let Some(macros) = &self.pending_macros {
+                self.pending = Some(PendingChangeSetStatus {
+                    status: Some(change_set_status::FAILED.to_string()),
+                    status_reason: Some(macros.unanswered_reason()),
+                    execution_status: Some(execution_status::UNAVAILABLE.to_string()),
+                    due_at: pending.due_at + private_macro::MACRO_ANSWER_DEADLINE,
+                    awaits_the_stack: false,
+                });
+            }
+        } else if self.creation_settled() {
+            // ...and a creation that deadline has SETTLED owes its expansion no longer: the
+            // macros may still be running, and what they answer must write nothing over the
+            // terminal record a client has already read, nor keep a chain going for it
+            // ([`private_macro::conclude`] and `private_macro::still_owed` both read this).
+            self.pending_macros = None;
         }
         Some(pending.due_at)
     }
@@ -272,9 +306,13 @@ impl StoredChangeSet {
     /// `GetTemplate`: "For change sets, the Original template is always available. After
     /// CloudFormation finishes creating the change set, the Processed template becomes
     /// available" — so the processed stage is serveable only once the creation this store
-    /// answered `CREATE_PENDING` has reached its terminal status.
+    /// answered `CREATE_PENDING` has reached its terminal status, which a creation still
+    /// processing the template's macros (`CREATE_IN_PROGRESS`) has not.
     pub fn creation_settled(&self) -> bool {
-        self.status != change_set_status::CREATE_PENDING
+        !matches!(
+            self.status.as_str(),
+            change_set_status::CREATE_PENDING | change_set_status::CREATE_IN_PROGRESS
+        )
     }
 
     /// The first attribute this stored change set states differently from a request that
