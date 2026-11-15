@@ -29,7 +29,7 @@ use smithy_server_runtime::http;
 /// The second label of every `execute-api` endpoint host: `{api-id}.execute-api.…`.
 ///
 /// Re-exported from [`crate::state::EXECUTE_API_LABEL`], which owns the label because the
-/// control plane ANNOUNCES it (see `crate::state::execute_api_endpoint`), so what
+/// control plane ANNOUNCES it (see `crate::state::emulator_served_api_endpoint`), so what
 /// a caller is given and what the data planes read are one constant.
 pub use crate::state::EXECUTE_API_LABEL;
 

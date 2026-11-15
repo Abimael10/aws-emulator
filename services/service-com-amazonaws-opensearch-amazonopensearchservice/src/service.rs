@@ -155,12 +155,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// borrowed from `&self`.
     credentialed_data_plane: CredentialedDataPlane<Eng>,
     /// An operation with that operation's OWN validation of its input run first
-    /// ([`StatedInputOperation`]): `StartMigration` and `AttachDataSource`, each of which
-    /// states a constraint report over members this model declares no constraint trait for.
-    /// Held in fields for the same reason as the data plane: `override_operation` hands back
-    /// a reference borrowed from `&self`.
+    /// ([`StatedInputOperation`]): `StartMigration`, which states a constraint report over
+    /// members this model declares no constraint trait for. Held in a field for the same
+    /// reason as the data plane: `override_operation` hands back a reference borrowed from
+    /// `&self`.
     stated_start_migration: StatedInputOperation,
-    stated_attach_data_source: StatedInputOperation,
     /// The request-DESERIALIZATION layer ([`request_layer`]): the answer to a request
     /// whose body carries a value the modelled member it is bound to cannot be read from.
     /// Held in a field for the same reason as the two above, and because it carries this
@@ -242,11 +241,6 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 routing_key: <crate::ops::start_migration::StartMigration<Eng> as Operation>::NAME,
                 violations: crate::ops::start_migration::stated_input_violations,
             },
-            stated_attach_data_source: StatedInputOperation {
-                routing_key:
-                    <crate::ops::attach_data_source::AttachDataSource<Eng> as Operation>::NAME,
-                violations: crate::ops::attach_data_source::stated_input_violations,
-            },
             unreadable_body: request_layer::UnreadableBody::new::<Eng>(),
             engine,
         }
@@ -261,10 +255,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// trait in this model at all — so the boundary, which reports only the traits and answers
 /// before any handler runs, can neither state those clauses nor let a handler state them.
 /// What the report SAYS is the operation's own rule
-/// ([`crate::ops::start_migration::stated_input_violations`],
-/// [`crate::ops::attach_data_source::stated_input_violations`]); this type only runs it
+/// ([`crate::ops::start_migration::stated_input_violations`]); this type only runs it
 /// first, and hands every request it refuses nothing in to the generated operation
 /// unchanged.
+///
+/// An operation whose own check is of a VALUE rather than of a constraint the live service
+/// declares states it from its handler instead, which the framework reaches only once the
+/// boundary has accepted the request — `crate::ops::attach_data_source` is the one that
+/// does — so such a check never speaks over the clause a member's declared constraint earns.
 struct StatedInputOperation {
     /// The routing key the generated operation is wired under.
     routing_key: &'static str,
@@ -390,13 +388,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         {
             return Some(&self.unreadable_body);
         }
-        // `StartMigration` and `AttachDataSource` are served through the seam that runs the
-        // operation's own validation of the input first (see [`StatedInputOperation`]).
-        // WHICH request that is comes from the model: the protocol resolves a request's
-        // routing key off the method and the URI pattern the model declares, so this names
-        // no path of its own.
+        // `StartMigration` is served through the seam that runs the operation's own
+        // validation of the input first (see [`StatedInputOperation`]). WHICH request that is
+        // comes from the model: the protocol resolves a request's routing key off the method
+        // and the URI pattern the model declares, so this names no path of its own.
         let routing_key = self.entry.protocol().routing_key(req).ok();
-        [&self.stated_start_migration, &self.stated_attach_data_source]
+        [&self.stated_start_migration]
             .into_iter()
             .find(|stated| routing_key == Some(stated.routing_key))
             .map(|stated| stated as &dyn ErasedOperation)

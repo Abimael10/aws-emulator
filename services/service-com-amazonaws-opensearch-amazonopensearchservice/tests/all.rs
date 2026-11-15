@@ -35,6 +35,8 @@ mod application_updates;
 mod applications;
 #[path = "all/authorized_principal_type.rs"]
 mod authorized_principal_type;
+#[path = "all/boundary_constraints_precede_stated_checks.rs"]
+mod boundary_constraints_precede_stated_checks;
 #[path = "all/bulk_loaded_snapshot_to_s3.rs"]
 mod bulk_loaded_snapshot_to_s3;
 #[path = "all/catalog_publication_order.rs"]

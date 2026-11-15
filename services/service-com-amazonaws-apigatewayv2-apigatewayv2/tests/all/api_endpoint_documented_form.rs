@@ -519,55 +519,47 @@ async fn a_websocket_api_still_reports_the_socket_its_data_plane_was_opened_on()
     }
 }
 
-/// The Region in the documented form is the one the request was SIGNED for, not the one the
-/// endpoint host it was addressed at names: apis created through the endpoint hosts of
-/// several Regions, all signed for one Region, differ only in their api id.
+/// Only the api id and the Region vary: every api announced to a client that resolves AWS's
+/// own hosts carries the same fixed labels after its own id, and the Region each carries is
+/// the one its create was SIGNED for.
 #[tokio::test]
-async fn the_announced_endpoint_carries_the_region_the_create_was_signed_for() {
-    let region = "eu-central-1";
+async fn the_documented_endpoint_varies_only_in_the_api_id_and_the_region() {
     let mut announced: Vec<(String, String)> = Vec::new();
-    for host in [
-        "apigateway.eu-central-1.amazonaws.com",
-        "apigateway.us-east-1.amazonaws.com",
-        "apigateway.ap-south-1.amazonaws.com",
-    ] {
+    for row in rows() {
         let emulator = emulator();
         let (status, created) = call_at_host(
             &emulator,
-            host,
-            region,
+            row.host,
+            row.region,
             "POST",
             "/v2/apis",
-            Some(json!({ "name": "documented-endpoint-independent", "protocolType": "HTTP" })),
+            Some(json!({ "name": "documented-endpoint-template", "protocolType": "HTTP" })),
         )
         .await;
         assert_eq!(
             status, 201,
-            "case {host:?}: CreateApi must answer 201, got {status} {created}"
+            "case {:?}: CreateApi must answer 201, got {status} {created}",
+            row.case
         );
         let api_id = as_str(&created, "apiId");
         let reported = as_str(&created, "apiEndpoint");
-        assert_eq!(
-            reported,
-            documented_endpoint(&api_id, region),
-            "case {host:?}: the endpoint must carry the Region the create was signed for, \
-             got {reported:?}"
-        );
-        announced.push((host.to_string(), reported));
+        assert_documented(&row, "CreateApi", &api_id, &reported);
+        announced.push((row.region.to_string(), reported));
     }
+    // What is left of each value once its own id and its own Region are taken out is the
+    // template: the scheme, the `execute-api` label and `amazonaws.com`.
     let forms: Vec<String> = announced
         .iter()
-        .map(|(_host, endpoint)| {
+        .map(|(region, endpoint)| {
             endpoint
                 .split_once('.')
-                .map(|(_id, rest)| rest.to_string())
+                .map(|(_id, rest)| rest.replace(region, "{region}"))
                 .unwrap_or_else(|| endpoint.clone())
         })
         .collect();
-    let first = forms.first().expect("one row per endpoint host");
+    let first = forms.first().expect("one row per Region");
     assert!(
         forms.iter().all(|form| form == first),
-        "every endpoint form must be the same whatever endpoint host the create reached, \
-         got {announced:?}"
+        "every endpoint must be the one documented template, got {announced:?}"
     );
 }

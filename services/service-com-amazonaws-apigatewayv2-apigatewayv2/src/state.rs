@@ -359,9 +359,9 @@ pub const DEFAULT_ROUTING_MODE: &str = "API_MAPPING_ONLY";
 /// of `ENDPOINT_TYPE_VALUES` (`EDGE | REGIONAL`).
 ///
 /// Every operation of this model is bound under `/v2/…` and every api it creates is
-/// reported on a REGIONAL `{api-id}.execute-api.{region}.amazonaws.com` host
-/// (`CreateApiResponse$ApiEndpoint`, see [`execute_api_endpoint`]), so `REGIONAL` is the
-/// endpoint type a domain name fronting one of them carries; `EDGE` is the
+/// documented on a REGIONAL `{api-id}.execute-api.{region}.amazonaws.com` host
+/// (`CreateApiResponse$ApiEndpoint`, the form [`execute_api_endpoint`] spells), so
+/// `REGIONAL` is the endpoint type a domain name fronting one of them carries; `EDGE` is the
 /// edge-optimized form the member's certificate wording belongs to.
 pub const DEFAULT_ENDPOINT_TYPE: &str = "REGIONAL";
 
@@ -4453,8 +4453,9 @@ pub const LOCAL_ENDPOINT_PREFIX: &str = "_aws";
 ///
 /// From `Api$ApiEndpoint`: "The URI of the API, of the form
 /// `{api-id}.execute-api.{region}.amazonaws.com`". It lives here, beside the marker,
-/// because the control plane ANNOUNCES it ([`execute_api_endpoint`]) and the data planes
-/// read it back (`crate::service::data_plane` re-exports it), so what a caller is given and
+/// because the control plane ANNOUNCES it ([`emulator_served_api_endpoint`], in the host
+/// of the documented form and in the path of the emulator's own) and the data planes read
+/// it back (`crate::service::data_plane` re-exports it), so what a caller is given and
 /// what is served are one constant.
 pub const EXECUTE_API_LABEL: &str = "execute-api";
 

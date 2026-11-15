@@ -17,6 +17,8 @@ mod absent_page_delete_idempotence;
 mod absent_portal_product_delete_idempotence;
 #[path = "all/access_log_settings_deletion.rs"]
 mod access_log_settings_deletion;
+#[path = "all/api_endpoint_announced_address.rs"]
+mod api_endpoint_announced_address;
 #[path = "all/api_endpoint_documented_form.rs"]
 mod api_endpoint_documented_form;
 #[path = "all/api_endpoint_scheme.rs"]

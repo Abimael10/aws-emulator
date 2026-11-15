@@ -186,6 +186,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
 
+        // This operation holds `dataSourceArn` to the ARN GRAMMAR a data source is named
+        // with, a requirement no trait of this model expresses, and states it the way the
+        // request boundary states a `@pattern` ([`stated_input_refusal`]). It runs HERE, in
+        // the handler, because a handler is reached only for a request whose modelled
+        // constraints all hold: a request that also breaks one of those — the `id` the URI
+        // label carries, say — is refused with that member's clause by the boundary, and a
+        // check of this service's own never speaks over it.
+        if let Some(refusal) = stated_input_refusal(&input.data_source_arn) {
+            return Err(AttachDataSourceErrorModeled::ValidationException(refusal).into());
+        }
+
         // `workspaceId` is "mutually exclusive with workspaceConfiguration" and
         // `workspaceConfiguration` "mutually exclusive with workspaceId": a request
         // carrying both names two different workspaces for one attachment, which is a
@@ -388,9 +399,14 @@ fn attached(
 // `dataSourceArn` is modelled as `ARN` with `@pattern(".*")`, which admits every string, so
 // the request boundary enforces only the member's length — while the service holds the value
 // to the ARN GRAMMAR a data source is named with, and reports a value outside it the way the
-// boundary reports a `@pattern`. The report has to be stated before the boundary answers,
-// which is what `crate::service` runs [`stated_input_violations`] from — the same seam
-// `StartMigration` states its own input report through.
+// boundary reports a `@pattern`.
+//
+// WHERE it runs is part of the rule: the report is stated from the HANDLER, which the
+// framework reaches only once the request boundary has accepted the request, so a check this
+// service makes on a VALUE never speaks over the clause a member's own declared constraint
+// earns. A request whose `id` label is outside the expression an application id satisfies
+// (`crate::service::validation`'s `STATED`) is therefore refused with that label's clause
+// alone, whatever its body carries.
 //
 // Nothing about the SENTENCE is written here: the clause, the member path and the envelope
 // come from the framework and from `crate::service::validation`'s one refusal path, exactly
@@ -401,7 +417,6 @@ fn attached(
 use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
 use ::aws_smithy_schema_server::constraints::{validate, PatternTrait};
-use ::aws_smithy_schema_server::Violation;
 use ::std::sync::LazyLock;
 
 /// This service's Smithy namespace, for the shadow member schema below.
@@ -458,8 +473,8 @@ static STATED_INPUT_SCHEMA: Schema = Schema::new_struct(
 );
 
 /// One request's validated member, written for the walk the way the codec writes a string
-/// member. A member the request did not carry is not written, so it is not reported:
-/// absence is the boundary's to refuse, against the model's `@required`.
+/// member. A member the input does not hold a value to report on is not written, so it is
+/// not reported: absence is the boundary's to refuse, against the model's `@required`.
 struct StatedInput<'a> {
     data_source_arn: Option<&'a str>,
 }
@@ -473,23 +488,25 @@ impl SerializableStruct for StatedInput<'_> {
     }
 }
 
-/// Everything this operation's own validation of `body` refuses — empty for a body it
+/// This operation's own refusal of the `dataSourceArn` it was handed — `None` for a value it
 /// refuses nothing in.
 ///
-/// `body` is the request's bytes, read as the JSON object `restJson1` carries this
-/// operation's input in; a body that is not one is left to the boundary's own codec
-/// refusal. A value this service DOES attach as a data source is passed over: which kinds
-/// those are is [`crate::state::data_source_arns::names_a_data_source`]'s, and a kind the
-/// service resolves is not a value the grammar above is quoted for — the ARN of an account's
-/// Data Catalog, which carries no resource id, is one.
-pub(crate) fn stated_input_violations(body: &[u8]) -> Vec<Violation> {
-    let Ok(request) = ::serde_json::from_slice::<::serde_json::Value>(body) else {
-        return Vec::new();
+/// A value this service DOES attach as a data source is passed over: which kinds those are
+/// is [`crate::state::data_source_arns::names_a_data_source`]'s, and a kind the service
+/// resolves is not a value the grammar above is quoted for — the ARN of an account's Data
+/// Catalog, which carries no resource id, is one.
+///
+/// The sentence is `crate::service::validation`'s, through the one path every refusal of
+/// this service is worded by, so a caller cannot tell this clause from one a member's own
+/// `@pattern` earned.
+fn stated_input_refusal(data_source_arn: &str) -> Option<ValidationException> {
+    let stated = StatedInput {
+        data_source_arn: Some(data_source_arn)
+            .filter(|arn| !crate::state::data_source_arns::names_a_data_source(arn)),
     };
-    let data_source_arn = request
-        .get(DATA_SOURCE_ARN_PATH)
-        .and_then(::serde_json::Value::as_str)
-        .filter(|arn| !crate::state::data_source_arns::names_a_data_source(arn));
-    validate(&StatedInput { data_source_arn }, &STATED_INPUT_SCHEMA)
+    let violations = validate(&stated, &STATED_INPUT_SCHEMA);
+    crate::service::validation::stated_report(&violations).map(|refused| ValidationException {
+        message: Some(refused.message),
+    })
 }
 
