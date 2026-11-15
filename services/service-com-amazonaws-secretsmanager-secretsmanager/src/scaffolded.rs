@@ -177,15 +177,28 @@ impl SerializableStruct for ValidationException {
     }
 }
 
-/// The `message` member of the synthetic `AccessDeniedException` error shape.
+/// The `Message` member of the synthetic `AccessDeniedException` error shape.
+///
+/// `Message`, not `message`: every error shape this service's model declares names its
+/// message member `Message` (`InvalidParameterException$Message`,
+/// `InvalidRequestException$Message`, … — this service's Smithy model), and the JSON
+/// envelope writes a member under the name the schema gives it. A refusal this service
+/// answers with a shape its model does NOT declare — the common `AccessDeniedException`,
+/// which no AWS service models — travels in that same envelope, so it has to word the
+/// member the same way; a client reading the message out of the member this service
+/// documents otherwise finds nothing there.
+///
+/// The two synthetic shapes above keep `message`: the framework answers those same two
+/// codes itself, ahead of any handler, out of its own envelope, so one code would
+/// otherwise travel under two member names depending on which layer refused the request.
 static ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
-        "smithy.framework#AccessDeniedException$message",
+        "smithy.framework#AccessDeniedException$Message",
         "smithy.framework",
-        "message",
+        "Message",
     ),
     ShapeType::String,
-    "message",
+    "Message",
     0,
 )
 .with_xml_name("Message");

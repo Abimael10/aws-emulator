@@ -51,8 +51,8 @@ pub const REPLICA_NAME_COLLISION_MESSAGE: &str =
 /// to do: make the call in the primary's Region. This is the mirror of the
 /// refusal [`NOT_A_REPLICA_MESSAGE`] states for the promotion call made on a
 /// secret that is not a replica: the same error class, and one fixed text naming
-/// the class of secret the call is not permitted on, carrying no secret name, ARN
-/// or Region of its own.
+/// the class of secret the call is not permitted on and the Region it has to be
+/// made in instead, carrying no secret name, ARN or Region of its own.
 pub const NOT_PERMITTED_ON_REPLICA_MESSAGE: &str =
     "Operation not permitted on a replica secret. Call must be made in primary secret's region.";
 

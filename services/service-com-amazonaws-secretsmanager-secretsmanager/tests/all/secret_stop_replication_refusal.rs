@@ -4,12 +4,13 @@
 //! a secret that is not a replica gets, driven over the multi-service router.
 //!
 //! The rule under test: `StopReplicationToReplica` is the replica-side promotion
-//! call, so a `SecretId` that in the signed Region names a secret which is NOT a
-//! replica — a replication primary, or a standalone secret that has no replicas
-//! at all — is refused with HTTP 400, `InvalidParameterException`, and ONE fixed
-//! sentence naming that class of secret: the message carries no secret name, ARN
-//! or Region from the request or from the store, and nothing else is appended to
-//! it.
+//! call — it must be made "from the Region in which you want to promote the
+//! replica to a primary secret" — so a `SecretId` that in the signed Region names
+//! a secret which is NOT a replica — a replication primary, or a standalone
+//! secret that has no replicas at all — is refused with HTTP 400,
+//! `InvalidParameterException`, and ONE fixed text stating that class of secret
+//! and the Region the call has to be made in instead: it carries no secret name,
+//! ARN or Region from the request or from the store.
 //!
 //! The test is a TABLE over the class the rule generalises: whether the secret
 //! has replicas and how many, the form of the `SecretId` (name, path-like name,
@@ -30,10 +31,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// it creates is homed in: the Region that holds the PRIMARY.
 const REGION: &str = "us-west-2";
 
-/// The one fixed sentence `StopReplicationToReplica` refuses a non-replica
-/// secret with. Asserted as a literal rather than read from the crate, so the
-/// test pins the text itself.
-const NOT_A_REPLICA: &str = "Operation not permitted on a primary/standalone secret.";
+/// The one fixed text `StopReplicationToReplica` refuses a non-replica secret
+/// with. Asserted as a literal rather than read from the crate, so the test pins
+/// the text itself.
+const NOT_A_REPLICA: &str =
+    "Operation not permitted on a primary secret. Call must be made in replica secret's region.";
 
 /// A SigV4 header naming `secretsmanager` in `region`; the router routes on the
 /// credential scope and the emulator verifies signatures only when an
@@ -122,9 +124,9 @@ fn secret_id(form: IdForm, name: &str, arn: &str) -> String {
 }
 
 /// Call `StopReplicationToReplica` and assert the whole refusal: status, wire
-/// error code and the fixed sentence. Asserting the message by EQUALITY is what
-/// pins the "no variable part" half of the rule: a sentence carrying any secret
-/// name, ARN or Region would not be equal to this one.
+/// error code and the fixed text. Asserting the message by EQUALITY is what pins
+/// the "no variable part" half of the rule: a message carrying any secret name,
+/// ARN or Region of the secret the request named would not be equal to this one.
 async fn assert_refused(router: &MultiServiceRouter, sent_id: &str, case: &str) {
     let (status, parsed) =
         call(router, "StopReplicationToReplica", &json!({"SecretId": sent_id})).await;
@@ -147,7 +149,7 @@ async fn assert_refused(router: &MultiServiceRouter, sent_id: &str, case: &str) 
         .unwrap_or_else(|| panic!("case {case:?}: no Message in error body {parsed}"));
     assert_eq!(
         message, NOT_A_REPLICA,
-        "case {case:?}: expected the fixed sentence {NOT_A_REPLICA:?}, got {message:?}"
+        "case {case:?}: expected the fixed text {NOT_A_REPLICA:?}, got {message:?}"
     );
 }
 

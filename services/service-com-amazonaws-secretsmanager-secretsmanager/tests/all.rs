@@ -63,6 +63,8 @@ mod secret_public_policy_message;
 mod secret_random_password;
 #[path = "all/secret_refusal_classes_and_sentences.rs"]
 mod secret_refusal_classes_and_sentences;
+#[path = "all/secret_refusal_message_member.rs"]
+mod secret_refusal_message_member;
 #[path = "all/secret_refused_write_staging_report.rs"]
 mod secret_refused_write_staging_report;
 #[path = "all/secret_regional_replication.rs"]

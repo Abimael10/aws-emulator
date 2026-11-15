@@ -369,14 +369,18 @@ pub const ROTATION_IN_PROGRESS_MESSAGE: &str =
 /// which is NOT a replica — a replication primary, or a standalone secret that
 /// has no replicas at all.
 ///
-/// Secrets Manager words this refusal as ONE fixed sentence naming the class of
-/// secret the call is not permitted on, and nothing else: no secret name, ARN or
-/// Region from the request or from the store is interpolated into it, and nothing
-/// is appended about where the call should instead have been made (a standalone
-/// secret has no replica Region to redirect a caller to). Every secret refused
-/// for not being a replica here — holding replicas or not — carries exactly this
-/// text.
-pub const NOT_A_REPLICA_MESSAGE: &str = "Operation not permitted on a primary/standalone secret.";
+/// The operation has to be called "from the Region in which you want to promote
+/// the replica to a primary secret" (`StopReplicationToReplica`, this service's
+/// Smithy model), so the refusal states both halves of that rule: the class of
+/// secret the call is not permitted on, and the Region the call has to be made in
+/// instead. It is the mirror of [`NOT_PERMITTED_ON_REPLICA_MESSAGE`], which says
+/// the same two things for a write made on a replica.
+///
+/// ONE fixed text: no secret name, ARN or Region from the request or from the
+/// store is interpolated into it, and every secret refused for not being a
+/// replica here — holding replicas or not — carries exactly this text.
+pub const NOT_A_REPLICA_MESSAGE: &str =
+    "Operation not permitted on a primary secret. Call must be made in replica secret's region.";
 
 /// The `InvalidParameterException` message for a `RecoveryWindowInDays` outside
 /// the documented range, stating that constraint: "The number of days from 7 to
