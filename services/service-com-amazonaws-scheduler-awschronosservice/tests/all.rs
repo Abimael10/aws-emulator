@@ -47,5 +47,7 @@ mod state_roundtrip;
 mod tagging_refusal_messages;
 #[path = "all/universal_target_invocation.rs"]
 mod universal_target_invocation;
+#[path = "all/universal_target_request_payload.rs"]
+mod universal_target_request_payload;
 #[path = "all/wire_harness.rs"]
 mod wire_harness;

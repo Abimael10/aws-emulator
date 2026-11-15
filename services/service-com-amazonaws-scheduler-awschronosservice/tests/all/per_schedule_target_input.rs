@@ -547,7 +547,7 @@ pub(crate) fn invoked_payloads(
 
 /// Those payloads once Lambda holds at least `wanted` of them, or whatever it holds
 /// once [`PATIENCE`] has passed.
-async fn invoked_payloads_once(
+pub(crate) async fn invoked_payloads_once(
     engine: &Arc<engine::InMemoryEngine>,
     function: &str,
     wanted: usize,

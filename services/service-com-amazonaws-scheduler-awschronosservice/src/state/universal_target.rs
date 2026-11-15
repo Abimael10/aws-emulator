@@ -211,7 +211,10 @@ pub(crate) fn universal_call(
     // A universal target's `Input` IS the operation's request, so it has to be the JSON
     // object that operation takes: "the input must be a well-formed JSON"
     // (`Target$Input`). Text that is not one names no request, and nothing is sent for
-    // it rather than a document guessed from the text.
+    // it rather than a document guessed from the text. It is the request a CLIENT wrote,
+    // in the form that operation's own API takes it: a member the operation carries as
+    // the request's BODY is written as the text of the bytes it carries, and those bytes
+    // are the body ([`integration::aws_sdk_call`]).
     let request: Value = ::serde_json::from_str(input).map_err(|error| {
         format!(
             "the Input of the universal target {} is not the well-formed JSON the \

@@ -1446,7 +1446,9 @@ pub struct Call {
     /// effective input IS that operation's request": what the state wrote for the
     /// payload member is a JSON value, and the bytes the member carries are that
     /// value's text. False for a dataset call, which is handed the object's own bytes
-    /// instead ([`dataset_call`]).
+    /// instead ([`dataset_call`]), and for a call whose request is an SDK request a
+    /// CLIENT wrote ([`aws_sdk_call`]), where a payload member is written as the text
+    /// of the bytes it carries.
     pub payload_document: bool,
     /// Whether the work is an HTTP REQUEST the state's own parameters describe rather
     /// than an API call to an operation of a service ([`super::http_task`]).
@@ -2905,13 +2907,20 @@ pub fn read(resource: &str) -> Result<Call, String> {
 /// same operation, and resolves it here rather than carrying a second copy of those
 /// facts. The `Err` says what was named and what about it is not called, for a caller
 /// that reports work nothing was run for.
+///
+/// The request such a caller hands the call is the invoked operation's OWN request as a
+/// client WROTE it, rather than a document a `Task` state's payload template built, so a
+/// member the operation binds as its `httpPayload` carries the BYTES of its text and the
+/// request body is those bytes as they stand ([`Call::payload_document`]).
 pub fn aws_sdk_call(service: &str, operation: &str) -> Result<Call, String> {
     // The family's own `Resource` form, which [`read`] is the one reading of; the
     // partition and the empty Region and account fields are the form's, and no field of
     // it is read as an address.
-    read(&format!(
+    let mut call = read(&format!(
         "arn:aws:{STATES_NAMESPACE}:::{AWS_SDK_SEGMENT}:{service}:{operation}"
-    ))
+    ))?;
+    call.payload_document = false;
+    Ok(call)
 }
 
 /// The HTTP Task `arn:aws:states:::http:invoke` names: one HTTP request to the endpoint

@@ -4900,3 +4900,10 @@ mod appended_notes;
 //! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks the notes, for this file
 //! and for every service crate's `tests/all.rs`, so add a declaration here and leave the
 //! rules to those suites.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with its
+//! compiles nowhere and its tests never run, and a suite left at the top level of
+//! `tests/` fails the build.
+//! same name is `E0428` and fails every suite in this target. An inner doc comment
+//! (`//!`) is legal only BEFORE the first item, so these lines are the only place one
+//! may stand — a note written with `//!` further down this file is `E0753` and compiles
+//! nothing, so keep what you have to say about a suite in that suite's own header.
