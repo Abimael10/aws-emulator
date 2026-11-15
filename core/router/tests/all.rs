@@ -1780,3 +1780,15 @@ mod lambda_sqs_event_source_attempt_reservation;
 // SIBLING of this file, which the layout check refuses: the `#[path]` is what points each
 // `all/all_rs_is_a_canonical_declaration_list.rs` check these rules, for this file and for
 // every service crate's `tests/all.rs`, so check there rather than leaving a note here.
+//! Put a new suite at `tests/all/<name>.rs` and insert its declaration into the sorted list
+//! below: one `#[path]` attribute naming `all/<name>.rs` and the `mod <name>;` under it, and
+//! no other line. A `#[path]` is what points a module into `tests/all/`, since this file is a
+//! test-target crate root and a bare declaration would resolve to a sibling of it.
+//! service crate's own, is stated in that suite's own module doc, where it is read beside the
+//! test it describes. The rules this root keeps are pinned by
+//! `all/all_rs_is_a_canonical_declaration_list.rs`,
+//! `all/every_suite_file_is_declared.rs` and
+//! `all/declaration_roots_are_canonical_and_complete.rs`, so they are checked there rather
+//! than restated here.
+#[path = "all/declaration_roots_are_canonical_and_complete.rs"]
+mod declaration_roots_are_canonical_and_complete;
