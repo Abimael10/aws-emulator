@@ -435,5 +435,7 @@ mod virtual_mfa_device_deletion;
 mod virtual_mfa_device_enablement;
 #[path = "all/virtual_mfa_device_resynchronization.rs"]
 mod virtual_mfa_device_resynchronization;
+#[path = "all/virtual_mfa_device_serial_reuse.rs"]
+mod virtual_mfa_device_serial_reuse;
 #[path = "all/virtual_mfa_devices.rs"]
 mod virtual_mfa_devices;

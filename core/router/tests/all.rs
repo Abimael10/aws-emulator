@@ -2503,3 +2503,13 @@ mod declaration_roots_keep_inner_attributes_ahead_of_the_first_item;
 // for every service crate's `tests/all.rs`.
 // `tests/all.rs` is a test-target CRATE ROOT, where a bare `mod` would resolve to a SIBLING
 // of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each
+// `mod <name>;` pair into the sorted list below. One pair per suite and no other line: two
+// branches landing at once then insert two lines in two places and have no prose to
+// rather than one service crate, belongs in that suite's own module header;
+// `all/appended_notes.rs` and `all/appended_notes_tail.rs` keep the notes earlier landings
+// had appended here.
+// two landings can leave one past the first item (`E0753`, which compiles no suite of this
+// target). A suite no `mod` names compiles nowhere and its tests never run; a suite left at
+// the top level of `tests/` fails the build; and a suite declared twice is `E0428`. This file
+// is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it, which the
+// `all/declaration_roots_are_canonical_and_complete.rs` check these rules, for this file and
