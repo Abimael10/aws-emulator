@@ -5,13 +5,14 @@
 //! call is deserialized, constraint-checked, handled and serialized exactly as a client's
 //! would be.
 //!
-//! The rule under test: a refusal of this service names its error SHAPE in exactly TWO
-//! places and no more — the `restJson1` error-type header (`x-amzn-errortype`), carried
-//! ONCE, and the body's `__type` discriminator — and the two always name the same shape, so
-//! a client that resolves the error class from the header and one that reads it off the body
-//! cannot disagree. A success names no shape in either place. A second occurrence of the
-//! header would fold, in any client that joins repeated header values, into a value naming
-//! no error shape at all, which is why the set is asserted and not just its first value.
+//! The rule under test: a refusal of this service names its error SHAPE in the `restJson1`
+//! error-type header (`x-amzn-errortype`) and in the body's `__type` discriminator, and the
+//! two always name the same shape, so a client that resolves the error class from the header
+//! and one that reads it off the body cannot disagree. A success names no shape in either
+//! place. The whole SET the header is carried as is asserted, not just its first value,
+//! because the multiplicity is part of the wire: the fail-closed refusal carries it twice
+//! (see [`super::fail_closed_refusal_repeats_its_error_type`], the suite that owns that
+//! rule) and every other class once.
 //!
 //! Asserted over a TABLE spanning the refusal classes this service can answer rather than
 //! one request. The rows differ along what the rule generalises over — WHICH class answered
@@ -152,23 +153,24 @@ async fn post(h: &Harness, path: &str, body: &Value) -> http::Response<bytes::By
     dispatch(h, "POST", path, Some(body)).await
 }
 
-/// A denial row: the request is answered HTTP 401 and names the front door's own code once
-/// in the header and once in the body.
+/// A denial row: the request is answered HTTP 401, names the front door's own code in the
+/// body, and carries it REPEATED in the error-type header — the multiplicity this service's
+/// wire carries for a fail-closed refusal.
 fn denied(case: &str, response: http::Response<bytes::Bytes>) -> Row {
     Row {
         case: case.to_string(),
         status: 401,
-        header_set: vec![UNAUTHORIZED],
+        header_set: vec![UNAUTHORIZED, UNAUTHORIZED],
         response,
     }
 }
 
-/// RULE: every refusal of this service names its error shape ONCE in the error-type header
-/// and once in the body's discriminator, the two agreeing — on every surface that can refuse,
-/// whichever way the request named what it acts on, and whichever refusal class answered;
-/// a served request names no shape in either place.
+/// RULE: every refusal of this service names its error shape in the error-type header and in
+/// the body's discriminator, the two agreeing — on every surface that can refuse, whichever
+/// way the request named what it acts on, and whichever refusal class answered; a served
+/// request names no shape in either place.
 #[tokio::test]
-async fn a_refusal_names_its_error_shape_once_in_the_header_and_once_in_the_body() {
+async fn a_refusal_names_the_same_error_shape_in_its_header_set_and_in_its_body() {
     let h = harness();
     // One real registration and one association, so the denials below are about what each
     // request names and not about an empty store.

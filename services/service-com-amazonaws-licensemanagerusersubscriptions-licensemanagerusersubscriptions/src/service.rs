@@ -53,8 +53,8 @@ use std::sync::Arc;
 /// EVERY operation of this service.
 mod authorization;
 
-/// The envelope a refusal of this service leaves under: its status, the ONE error-type
-/// header that names its shape, and its `message` body.
+/// The envelope a refusal of this service leaves under: its status, the error-type header
+/// set that names its shape, and its `message` body.
 mod refusal_headers;
 
 use refusal_headers::refusal_response;
@@ -384,54 +384,14 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizationGate<Eng> {
         req: &'r aws_smithy_runtime_api::http::Request,
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
-        let started = std::time::Instant::now();
+        // THE ONE EXIT every response of this service leaves through: this gate is picked
+        // for every request whose routing key resolves, and what it answers is either a
+        // refusal one of the gates decided or whatever the modelled operation answered. So
+        // the error-type header SET a refusal of this service leaves under is applied here,
+        // once, covering the refusals rendered by `refusal_response` and the ones a
+        // handler's own error channel rendered alike ([`refusal_headers`]).
         Box::pin(async move {
-            // The operation the request named, read exactly as dispatch reads it: the
-            // routing key this service's protocol resolves from the request line. It is the
-            // ACTION the IAM decision is about, and the key the modelled operation is wired
-            // under. Read and dropped inside this one statement, because
-            // `&dyn ErasedServiceDefinition` is not `Sync` and the awaits below would make
-            // this future non-`Send`; the key itself borrows the REQUEST.
-            let Ok(operation) = svc.definition().protocol().routing_key(req) else {
-                // `override_operation` picked this gate only for a request whose key
-                // resolves, so this is unreachable; answered as the request naming no
-                // modelled operation, which is what it would be.
-                return svc.definition().routing_error_response(req);
-            };
-            // THE IAM DECISION, ahead of every other answer this service could give: a
-            // caller whose permissions do not cover the action is told that and nothing
-            // about the resource it named, and the call performs nothing.
-            if let Err(refusal) = authorization::authorize(&*self.engine, ctx, operation) {
-                let code = refusal.code;
-                let response = refusal_response(svc, req, &refusal);
-                record_refusal(
-                    ctx,
-                    operation,
-                    code,
-                    response.status().as_u16(),
-                    started.elapsed(),
-                );
-                return response;
-            }
-            // The instance half, for the routes whose input names an EC2 instance.
-            if req.method() == GATED_METHOD {
-                // The path portion of the request URI, which is what an operation's `@http`
-                // `uri` pattern is written against. Read through
-                // `service_common::request_path`, the one shared reader for it in this tree,
-                // rather than a local copy of the split: the framework's own is
-                // `pub(crate)` in a read-only tree, and this crate depends on that crate
-                // anyway.
-                let path = ::service_common::request_path(req.uri());
-                if let Some(gate) = self.instances.iter().find(|gate| gate.route.uri == path) {
-                    return gate.run(svc, req, ctx).await;
-                }
-            }
-            // The modelled operation the key names, from this service's own model-derived
-            // routing table.
-            if let Some(modelled) = svc.definition().routing_table().get(operation) {
-                return modelled.run(svc, req, ctx).await;
-            }
-            svc.definition().routing_error_response(req)
+            refusal_headers::with_fail_closed_header_set(self.answer(svc, req, ctx).await)
         })
     }
 
@@ -439,6 +399,65 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizationGate<Eng> {
     // names. Answering `Some(&[])` here would serve every request of this service unsigned.
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
         None
+    }
+}
+
+impl<Eng: Send + Sync + 'static> AuthorizationGate<Eng> {
+    /// What this service answers `req` with, before the refusal envelope's header set is
+    /// applied to it: the IAM decision, then the instance one, then the modelled operation
+    /// the request named.
+    async fn answer<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> aws_smithy_runtime_api::http::Response {
+        let started = std::time::Instant::now();
+        // The operation the request named, read exactly as dispatch reads it: the routing
+        // key this service's protocol resolves from the request line. It is the ACTION the
+        // IAM decision is about, and the key the modelled operation is wired under. Read and
+        // dropped inside this one statement, because `&dyn ErasedServiceDefinition` is not
+        // `Sync` and the awaits below would make this future non-`Send`; the key itself
+        // borrows the REQUEST.
+        let Ok(operation) = svc.definition().protocol().routing_key(req) else {
+            // `override_operation` picked this gate only for a request whose key resolves,
+            // so this is unreachable; answered as the request naming no modelled operation,
+            // which is what it would be.
+            return svc.definition().routing_error_response(req);
+        };
+        // THE IAM DECISION, ahead of every other answer this service could give: a caller
+        // whose permissions do not cover the action is told that and nothing about the
+        // resource it named, and the call performs nothing.
+        if let Err(refusal) = authorization::authorize(&*self.engine, ctx, operation) {
+            let code = refusal.code;
+            let response = refusal_response(svc, req, &refusal);
+            record_refusal(
+                ctx,
+                operation,
+                code,
+                response.status().as_u16(),
+                started.elapsed(),
+            );
+            return response;
+        }
+        // The instance half, for the routes whose input names an EC2 instance.
+        if req.method() == GATED_METHOD {
+            // The path portion of the request URI, which is what an operation's `@http`
+            // `uri` pattern is written against. Read through
+            // `service_common::request_path`, the one shared reader for it in this tree,
+            // rather than a local copy of the split: the framework's own is `pub(crate)` in
+            // a read-only tree, and this crate depends on that crate anyway.
+            let path = ::service_common::request_path(req.uri());
+            if let Some(gate) = self.instances.iter().find(|gate| gate.route.uri == path) {
+                return gate.run(svc, req, ctx).await;
+            }
+        }
+        // The modelled operation the key names, from this service's own model-derived
+        // routing table.
+        if let Some(modelled) = svc.definition().routing_table().get(operation) {
+            return modelled.run(svc, req, ctx).await;
+        }
+        svc.definition().routing_error_response(req)
     }
 }
 
