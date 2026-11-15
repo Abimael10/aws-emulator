@@ -1213,3 +1213,6 @@ mod zz_probe_whole_emulator;
 //! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 //! `all/all_rs_is_a_canonical_declaration_list.rs` check all three halves of that, for this
 //! file and for every service crate's `tests/all.rs`.
+// EVERY comment in this file is an ordinary one, this header included, and that is
+// deliberate: with no inner doc comment anywhere, no merge of two landings can leave one
+// past the first item.
