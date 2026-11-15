@@ -239,7 +239,16 @@ async fn lambda(
 }
 
 /// One CloudWatch Logs call over its `awsJson1_1` wire, answering its status and parsed body.
-async fn logs(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+///
+/// `pub(crate)` because a sibling suite asks CloudWatch Logs a question this file has no
+/// helper for — which groups the account HOLDS, which is `DescribeLogGroups`
+/// ([`crate::stage_access_log_denied_destination`]) — and one wire helper is what keeps two
+/// suites from disagreeing about how that service is addressed.
+pub(crate) async fn logs(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let answered = dispatch(
         router,
         "POST",

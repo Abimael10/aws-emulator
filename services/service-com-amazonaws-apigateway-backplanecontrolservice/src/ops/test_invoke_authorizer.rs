@@ -327,9 +327,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(query) = query {
             log.line(format!("Method request query string: {query}"));
         }
-        log.line(format!(
-            "Method request headers: [{}]",
-            headers.names().join(", ")
+        log.line(crate::service::invoke::stage_logs::traced_header_names_line(
+            &headers.names(),
         ));
         // The body's SIZE, not the body: it is the caller's own text, and reporting its
         // length says what the simulation carried without copying a payload into a log.

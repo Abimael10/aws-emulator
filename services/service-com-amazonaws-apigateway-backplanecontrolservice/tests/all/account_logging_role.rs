@@ -59,19 +59,21 @@ pub(crate) fn trusting(principal: &str) -> String {
     .to_string()
 }
 
-/// `iam:CreateRole` for `name` under `path`, carrying `trust` as its
-/// `AssumeRolePolicyDocument`.
-pub(crate) async fn create_role(gateway: &Gateway, name: &str, path: &str, trust: &str) {
-    let encoded = |value: &str| {
-        ::percent_encoding::utf8_percent_encode(value, ::percent_encoding::NON_ALPHANUMERIC)
-            .to_string()
-    };
-    let body = format!(
-        "Action=CreateRole&Version=2010-05-08&RoleName={}&Path={}&AssumeRolePolicyDocument={}",
-        encoded(name),
-        encoded(path),
-        encoded(trust)
-    );
+/// Percent-encode `value` as a parameter of an `application/x-www-form-urlencoded` IAM query
+/// body.
+///
+/// `pub(crate)` for the reason [`iam_query`] gives.
+pub(crate) fn form_encoded(value: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(value, ::percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// One AWS IAM call over its `awsQuery` wire, asserting the HTTP 200 a served call answers.
+///
+/// `pub(crate)` because a sibling suite configures the account's CloudWatch role through IAM
+/// too — embedding an inline policy on the role it created
+/// ([`crate::stage_access_log_denied_destination`]) — and one helper is what keeps two suites
+/// from addressing that service two ways.
+pub(crate) async fn iam_query(gateway: &Gateway, case: &str, body: String) {
     let host = "iam.amazonaws.com";
     let request = http::Request::builder()
         .method("POST")
@@ -85,15 +87,31 @@ pub(crate) async fn create_role(gateway: &Gateway, name: &str, path: &str, trust
         )
         .header("content-type", "application/x-www-form-urlencoded")
         .body(bytes::Bytes::from(body))
-        .expect("the CreateRole request is well formed");
+        .expect("the IAM query request is well formed");
     let answer = gateway.send(request).await;
     assert_eq!(
         answer.status().as_u16(),
         200,
-        "case CreateRole({name:?}): expected 200, got {} with {:?}",
+        "case {case:?}: expected 200 from IAM, got {} with {:?}",
         answer.status(),
         String::from_utf8_lossy(answer.body())
     );
+}
+
+/// `iam:CreateRole` for `name` under `path`, carrying `trust` as its
+/// `AssumeRolePolicyDocument`.
+pub(crate) async fn create_role(gateway: &Gateway, name: &str, path: &str, trust: &str) {
+    iam_query(
+        gateway,
+        &format!("CreateRole({name:?})"),
+        format!(
+            "Action=CreateRole&Version=2010-05-08&RoleName={}&Path={}&AssumeRolePolicyDocument={}",
+            form_encoded(name),
+            form_encoded(path),
+            form_encoded(trust)
+        ),
+    )
+    .await;
 }
 
 /// `UpdateAccount` replacing the CloudWatch role with `value`.

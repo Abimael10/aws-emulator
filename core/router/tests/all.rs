@@ -2093,3 +2093,24 @@ mod zz_probe_whole_emulator;
 // `all/declaration_roots_are_canonical_and_complete.rs` pin all of it, for this file and
 // rather than a build failure. An inner attribute, like an inner doc comment, is legal only
 // before the first item, so it stands here rather than in the list below.
+// suite file, sorted by name, and NO other line — no prose between the pairs, no blank line,
+// nothing after the last pair. Two branches landing at once then insert two lines in one place
+// each and have nothing here to duplicate, re-word or mistype. Put a new suite at
+// and why it drives the assembled router rather than one service crate, belongs in that
+// suite's OWN module header, where it is read beside the test it explains.
+// comment documents the module it stands in, so the language accepts it only ahead of the
+// first item, and one left below the list compiles no suite of this target at all. With none
+// anywhere in the file there is no such line for a landing to copy. A suite no `mod` here
+// names is compiled nowhere (this crate's build script refuses it), a suite left at the top
+// level of `tests/` fails the build, and a second `mod` for one name is `E0428` — each of
+// those fails every suite of this target. `tests/all.rs` is a test-target CRATE ROOT, so a
+// bare `mod` would resolve to a SIBLING of this file: the `#[path]` above each `mod` is what
+// Suites of this target check all of that rather than restate it here:
+// `all/every_suite_file_is_declared.rs`, beside
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs`, which read the
+// same rules for every service crate's own root — so check there rather than leaving a note
+// here; `all/appended_notes.rs` records what the notes earlier landings had appended to this
+// file said.
+// The lint allowed below is for the suite files this root compiles, whose wrapped header
+// paragraphs are prose rather than doc list items. An inner attribute is legal only before the
+// first item, so it stands here rather than in the list.

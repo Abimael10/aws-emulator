@@ -45,7 +45,10 @@ const RESOURCE_PATH: &str = "/ping";
 
 /// The role the account writes its logs as, and the principal its trust policy has to admit
 /// for API Gateway to be able to write at all.
-const ROLE_NAME: &str = "apigw-absent-destination";
+/// The NAME is `pub(crate)` because the sibling suite that embeds an inline policy on this same
+/// role ([`crate::stage_access_log_denied_destination`]) has to name it; the path and the
+/// principal are read only by [`install_account_role`].
+pub(crate) const ROLE_NAME: &str = "apigw-absent-destination";
 const ROLE_PATH: &str = "/service-role/";
 const SERVICE_PRINCIPAL: &str = "apigateway.amazonaws.com";
 
@@ -120,7 +123,11 @@ fn rows() -> Vec<Row> {
 
 /// The ARN of the log group `name`, as a stage's `destinationArn` names one: the group itself,
 /// or — with `everything_under` — everything under it.
-fn destination_arn(name: &str, everything_under: bool) -> String {
+///
+/// `pub(crate)` because the sibling suite about the SAME destinations beside a delivering stage
+/// ([`crate::stage_access_log_denied_destination`]) names them the same way: one reading, so two
+/// suites cannot point a stage at two different ARN forms while believing they agree.
+pub(crate) fn destination_arn(name: &str, everything_under: bool) -> String {
     let account = engine::emulator_account_id();
     let everything = if everything_under { ":*" } else { "" };
     format!("arn:aws:logs:{REGION}:{account}:log-group:{name}{everything}")
@@ -129,7 +136,10 @@ fn destination_arn(name: &str, everything_under: bool) -> String {
 /// Install the account's CloudWatch role through AWS IAM's own `CreateRole` and API Gateway's
 /// own `UpdateAccount`, which is what API Gateway writes the account's logs as: with it in
 /// place, nothing but the destination decides whether a record lands.
-async fn install_account_role(gateway: &Gateway) {
+///
+/// `pub(crate)` for the reason [`destination_arn`] gives: it is the same prerequisite for every
+/// suite about what a stage DELIVERS, and one copy is what keeps them installing one role.
+pub(crate) async fn install_account_role(gateway: &Gateway) {
     create_role(gateway, ROLE_NAME, ROLE_PATH, &trusting(SERVICE_PRINCIPAL)).await;
     let installed = replace_role(gateway, &role_arn(ROLE_PATH, ROLE_NAME)).await;
     assert_eq!(

@@ -275,8 +275,10 @@ pub(crate) mod simulated_authorizer;
 /// What a SIMULATED request carries, read the one way for both `TestInvoke*` operations.
 pub(crate) mod simulated_request;
 /// What the stage LOGS about a request it served: its access-log record and the execution
-/// log its method settings turn on.
-mod stage_logs;
+/// log its method settings turn on. `pub(crate)` because the two `TestInvoke*` operations
+/// word — and bound — one line of that log through this module, so a trace of a served
+/// request and the log of a simulated one cannot say it two ways.
+pub(crate) mod stage_logs;
 /// The X-Ray trace context this stage propagates onto the call its integration makes.
 mod trace_context;
 /// What a deployed stage answers a call no deployed method serves — which is an

@@ -82,6 +82,20 @@ mod stage_access_log_record_rendering;
 // records: it spans API Gateway, AWS IAM and Amazon CloudWatch Logs at once.
 #[path = "all/stage_access_log_absent_destination.rs"]
 mod stage_access_log_absent_destination;
+// The NEGATIVE half of that, observed beside a correctly configured sibling: one stage of an api
+// pointed at a destination the account holds no group under delivers nothing and brings no group
+// into existence, while a second stage of the same api pointed at a group the account created
+// keeps receiving one record per request. Declared beside the suites above for the reason the
+// entry at the top of this file records: it spans API Gateway, AWS IAM and Amazon CloudWatch Logs
+// at once.
+#[path = "all/stage_access_log_denied_destination.rs"]
+mod stage_access_log_denied_destination;
+// How much of a request the stage's EXECUTION log carries about it: the header line is bounded
+// by the emulator, whatever the caller sends, and the request is served either way. Declared
+// beside the suites above for the reason the entry at the top of this file records: it spans API
+// Gateway, AWS IAM and Amazon CloudWatch Logs at once.
+#[path = "all/stage_execution_log_bounded_header_line.rs"]
+mod stage_execution_log_bounded_header_line;
 // WHICH PATH that record names for the request it answered: the stage-qualified path the
 // client asked for, carrying nothing of the endpoint it reached this emulator by, beside the
 // template the request matched. Declared beside the suites above for the reason the entry at

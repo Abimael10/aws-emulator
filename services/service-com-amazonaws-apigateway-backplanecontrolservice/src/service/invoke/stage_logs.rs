@@ -418,10 +418,7 @@ fn trace(
         format!("Execution log for request {request_id}"),
         format!("Starting execution for request: {request_id}"),
         format!("HTTP Method: {verb}, Resource Path: {resource_path}"),
-        format!(
-            "Method request headers: [{}]",
-            header_names(req).join(", ")
-        ),
+        traced_header_names_line(&header_names(req)),
         payload_line(
             "Method request body before transformations",
             request_body,
@@ -474,6 +471,36 @@ fn about_request(request_id: &str, line: &str) -> String {
 /// down with it. The figure is generous enough that no payload a method request carries in
 /// practice is reported by its size instead of its bytes.
 const MAX_TRACED_PAYLOAD_BYTES: usize = 8 * 1024;
+
+/// Emulator resource guard, NOT an AWS limit: the most header NAMES one traced line carries.
+///
+/// How many headers a request carries is the CALLER's choice, and a log event is itself
+/// bounded — CloudWatch Logs takes at most one megabyte per event — so the names past this are
+/// reported by their COUNT rather than growing one line with the request, which is the reading
+/// [`MAX_TRACED_PAYLOAD_BYTES`] takes of a payload. The figure is generous enough that no
+/// request a client sends in practice has a name of its left out.
+pub(crate) const MAX_TRACED_HEADER_NAMES: usize = 128;
+
+/// The `Method request headers` line of an execution log: the names the request carries, in
+/// the order they are given, within [`MAX_TRACED_HEADER_NAMES`], with any past that reported
+/// by their count.
+///
+/// One copy, shared with the two `TestInvoke*` operations: the trace of a request a STAGE
+/// served and the log of a simulated invocation word this line the same way, so they are also
+/// bounded the same way, and the bound is applied where the line is built rather than left to
+/// each caller.
+pub(crate) fn traced_header_names_line(names: &[String]) -> String {
+    let listed = names
+        .iter()
+        .take(MAX_TRACED_HEADER_NAMES)
+        .map(String::as_str)
+        .collect::<Vec<&str>>()
+        .join(", ");
+    match names.len().saturating_sub(MAX_TRACED_HEADER_NAMES) {
+        0 => format!("Method request headers: [{listed}]"),
+        past => format!("Method request headers: [{listed}] and {past} more"),
+    }
+}
 
 /// One payload line of the trace: the BYTES of the payload where data tracing is on and the
 /// payload is within [`MAX_TRACED_PAYLOAD_BYTES`], and its SIZE otherwise.
@@ -584,6 +611,58 @@ mod tests {
             ),
         ] {
             let got = payload_line(label, payload.as_bytes(), data_trace);
+            assert_eq!(
+                got, expected,
+                "case {case:?}: expected {expected:?}, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_traced_header_line_carries_the_names_within_the_guard_and_counts_the_rest() {
+        let names = |count: usize| -> Vec<String> {
+            (0..count).map(|index| format!("h{index}")).collect()
+        };
+        let joined = |count: usize| names(count).join(", ");
+        for (case, carried, expected) in [
+            ("no header at all", 0, "Method request headers: []".to_string()),
+            (
+                "one header",
+                1,
+                "Method request headers: [h0]".to_string(),
+            ),
+            (
+                "a handful of headers",
+                3,
+                format!("Method request headers: [{}]", joined(3)),
+            ),
+            (
+                "as many headers as the guard carries",
+                MAX_TRACED_HEADER_NAMES,
+                format!(
+                    "Method request headers: [{}]",
+                    joined(MAX_TRACED_HEADER_NAMES)
+                ),
+            ),
+            (
+                "one header past the guard",
+                MAX_TRACED_HEADER_NAMES + 1,
+                format!(
+                    "Method request headers: [{}] and 1 more",
+                    joined(MAX_TRACED_HEADER_NAMES)
+                ),
+            ),
+            (
+                "far more headers than the guard carries",
+                MAX_TRACED_HEADER_NAMES * 4,
+                format!(
+                    "Method request headers: [{}] and {} more",
+                    joined(MAX_TRACED_HEADER_NAMES),
+                    MAX_TRACED_HEADER_NAMES * 3
+                ),
+            ),
+        ] {
+            let got = traced_header_names_line(&names(carried));
             assert_eq!(
                 got, expected,
                 "case {case:?}: expected {expected:?}, got {got:?}"
