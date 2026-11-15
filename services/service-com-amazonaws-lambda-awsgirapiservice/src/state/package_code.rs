@@ -162,23 +162,38 @@ impl PackageCall {
 pub const ZIP_FILE_WITH_OTHER_MEMBERS_MESSAGE: &str =
     "Please do not provide other FunctionCode parameters when providing a ZipFile.";
 
-/// The refusal a request that configures a container image's ENTRY POINT on a function
-/// whose package is a .zip archive gets.
+/// The refusal a request that names a member the function's package type does not use
+/// gets: `The <Member> parameter is not supported for functions created with <packaging>.`
 ///
-/// `ImageConfig` is "configuration values that override the container image Dockerfile
-/// settings" — `Command`, `EntryPoint` and `WorkingDirectory` — so it configures the image a
-/// function runs FROM. A function deployed as a .zip archive runs on a managed runtime and
-/// has no image to override, so the member names nothing on one, whichever write named it.
+/// Fixed text around the MEMBER the request named, with the packaging the function's own
+/// `PackageType` is: a container-image function is "created with container images" and a
+/// .zip one "created with deployment packages". Nothing else of the request is carried.
 ///
-/// Recorded behaviour: corpus `simparity-wire-aws-v1`, fixture
+/// The members this stands for are the ones each packaging has no use for: the managed
+/// `Runtime` and `Handler` of a function that brings its own image ("You do not need to
+/// specify the handler and runtime properties" for a container image, and "Specifying a
+/// runtime results in an error if you're deploying a function using a container image"),
+/// and the `ImageConfig` overrides of one that has no image to override ("Configuration
+/// values that override the container image Dockerfile settings").
+///
+/// Recorded behaviour: corpus `simparity-wire-aws-v1`, fixtures
+/// `lambda-container-image-handler-and-runtime-rejected`, where a `CreateFunction` naming
+/// `Handler` on a container-image package is answered `400
+/// InvalidParameterValueException` with this sentence, and
 /// `lambda-create-function-imageconfig-on-zip-package-rejected`, step `task#4`, where a
-/// `CreateFunction` carrying `ImageConfig` with a .zip package is answered
-/// `400 InvalidParameterValueException` with `message` exactly this, and no function
-/// created. The sentence states what the FUNCTION is rather than what the call is, so both
-/// writes that accept the member state it.
-pub const IMAGE_CONFIG_UNSUPPORTED_FOR_ZIP_MESSAGE: &str =
-    "The ImageConfig parameter is not supported for functions created with deployment \
-     packages.";
+/// `CreateFunction` carrying `ImageConfig` with a .zip package is answered the same
+/// sentence for the other packaging, and no function created. The sentence states what the
+/// FUNCTION is rather than what the call is, so every write that accepts these members
+/// states it from here.
+#[must_use]
+pub fn unsupported_package_member_message(member: &str, package_type: &str) -> String {
+    let packaging = if package_type == PACKAGE_TYPE_IMAGE {
+        "container images"
+    } else {
+        "deployment packages"
+    };
+    format!("The {member} parameter is not supported for functions created with {packaging}.")
+}
 
 /// The refusal for a package member the function's package type does not use.
 ///

@@ -320,7 +320,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
 
-            function_configuration(record.configuration(&version, &config))
+            // The ARN this read reports keeps the qualifier the request named — the identity
+            // it asked about — and is the function's own unqualified ARN when the request
+            // named none (`FunctionRecord::addressed_configuration`). The qualifier may come
+            // from either half of the `FunctionName`/`Qualifier` pair, so both are read; see
+            // [`crate::state::named_qualifier`].
+            let named_qualifier =
+                crate::state::named_qualifier(&input.function_name, input.qualifier.as_deref());
+            function_configuration(record.addressed_configuration(
+                named_qualifier.as_deref(),
+                &version,
+                &config,
+            ))
         };
         // Reporting the environment variables reports their PLAINTEXT, which is a decrypt
         // under the function's own `KMSKeyArn`: so they are reported only while the key

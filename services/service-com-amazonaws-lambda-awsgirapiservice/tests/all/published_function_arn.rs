@@ -436,12 +436,23 @@ async fn a_call_addressed_to_a_qualifier_reports_the_qualified_arn() {
     }
 
     // And the unpublished configuration, which every one of those versions was taken
-    // from, still reports the function's own ARN.
+    // from, reports the `$LATEST`-qualified ARN for a read that named that qualifier: the
+    // ARN names the identity the request addressed, and this request addressed one.
     let latest = get_function(&router, function, Some(VERSION_LATEST)).await;
+    let qualified_latest = format!("{}:{VERSION_LATEST}", function_arn(function));
     assert_eq!(
         latest.string("/Configuration/FunctionArn"),
-        Some(function_arn(function)),
-        "the unpublished version must report the unqualified ARN, got {}",
+        Some(qualified_latest.clone()),
+        "a read qualified by {VERSION_LATEST} must report {qualified_latest:?}, got {}",
         latest.text()
+    );
+    // While a read that named no qualifier addressed the function itself, so it reports
+    // the function's own unqualified ARN.
+    let unqualified = get_function(&router, function, None).await;
+    assert_eq!(
+        unqualified.string("/Configuration/FunctionArn"),
+        Some(function_arn(function)),
+        "an unqualified read must report the unqualified ARN, got {}",
+        unqualified.text()
     );
 }

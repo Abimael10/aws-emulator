@@ -239,6 +239,8 @@ mod function_last_update_status_reason;
 mod function_layer_unzipped_size;
 #[path = "all/function_lifecycle.rs"]
 mod function_lifecycle;
+#[path = "all/function_read_identity_metadata.rs"]
+mod function_read_identity_metadata;
 #[path = "all/function_recursion_config.rs"]
 mod function_recursion_config;
 #[path = "all/function_scaling_config.rs"]

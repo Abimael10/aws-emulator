@@ -987,15 +987,21 @@ async fn every_function_name_form_resolves_to_the_same_record() {
     let router = router_on(&engine);
     create_active_function(&router, &engine, "resolve-me", &package_bytes(16)).await;
 
+    // The ARN a read reports keeps the qualifier the request named, so the two references
+    // that qualify the identity they ask about report the `:$LATEST` ARN and the rest the
+    // function's own; `FunctionName` names the one record either way.
     let references = [
-        "resolve-me",
-        "resolve-me:$LATEST",
-        "function:resolve-me",
-        "000000000000:function:resolve-me",
-        "arn:aws:lambda:us-east-1:000000000000:function:resolve-me",
-        "arn:aws:lambda:us-east-1:000000000000:function:resolve-me:$LATEST",
+        ("resolve-me", None),
+        ("resolve-me:$LATEST", Some("$LATEST")),
+        ("function:resolve-me", None),
+        ("000000000000:function:resolve-me", None),
+        ("arn:aws:lambda:us-east-1:000000000000:function:resolve-me", None),
+        (
+            "arn:aws:lambda:us-east-1:000000000000:function:resolve-me:$LATEST",
+            Some("$LATEST"),
+        ),
     ];
-    for reference in references {
+    for (reference, qualifier) in references {
         let answer = get_function(&router, reference).await;
         assert_eq!(
             answer.status,
@@ -1004,11 +1010,21 @@ async fn every_function_name_form_resolves_to_the_same_record() {
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
+        let expected = match qualifier {
+            Some(qualifier) => format!("{}:{qualifier}", function_arn("resolve-me")),
+            None => function_arn("resolve-me"),
+        };
         assert_eq!(
             answer.json()["Configuration"]["FunctionArn"],
-            serde_json::json!(function_arn("resolve-me")),
-            "case {reference}: expected the one record's ARN, got {:?}",
+            serde_json::json!(expected),
+            "case {reference}: expected the addressed identity's ARN {expected}, got {:?}",
             answer.json()["Configuration"]["FunctionArn"]
+        );
+        assert_eq!(
+            answer.json()["Configuration"]["FunctionName"],
+            serde_json::json!("resolve-me"),
+            "case {reference}: expected the one record's name, got {:?}",
+            answer.json()["Configuration"]["FunctionName"]
         );
     }
 

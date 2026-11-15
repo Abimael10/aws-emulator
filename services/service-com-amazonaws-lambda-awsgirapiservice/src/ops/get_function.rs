@@ -207,8 +207,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
 
+            // The ARN this read reports keeps the qualifier the request named — the
+            // identity it asked about — and is the function's own unqualified ARN when the
+            // request named none (`FunctionRecord::addressed_configuration`). The
+            // qualifier may come from either half of the `FunctionName`/`Qualifier` pair,
+            // so both are read; see [`crate::state::named_qualifier`].
+            let named_qualifier =
+                crate::state::named_qualifier(&input.function_name, input.qualifier.as_deref());
             GetFunctionOutput {
-                configuration: Some(record.configuration(&version, &config)),
+                configuration: Some(record.addressed_configuration(
+                    named_qualifier.as_deref(),
+                    &version,
+                    &config,
+                )),
                 code: Some(record.code_location(ctx, &version)),
                 // Tags are function-level rather than version-level, so every qualifier
                 // reports the same ones; an untagged function reports none at all.
@@ -225,13 +236,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // is a property of the UNQUALIFIED function: a read addressed to a qualified
                 // identity (a published version, an alias or `$LATEST` named explicitly)
                 // reports no `Concurrency` block at all, because that identity carries no
-                // limit of its own. The qualifier may come from either the name or the
-                // `Qualifier` parameter, so both are read — see
-                // [`crate::state::named_qualifier`].
-                concurrency: match crate::state::named_qualifier(
-                    &input.function_name,
-                    input.qualifier.as_deref(),
-                ) {
+                // limit of its own.
+                concurrency: match named_qualifier {
                     Some(_) => None,
                     None => record.concurrency(),
                 },

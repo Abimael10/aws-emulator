@@ -251,8 +251,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // unqualified read acted on the function). Recorded behaviour: corpus
             // `simparity-wire-aws-v1`, fixture
             // `lambda-listing-qualified-identifier-and-missing-function-errors`, step `task#7`.
+            //
+            // And every entry carries the LISTING's subset of the configuration: the live
+            // members (`State`, `LastUpdateStatus`, `RuntimeVersionConfig` and their
+            // reasons) are the ones the model says to read "for a function or version" with
+            // `GetFunction`, so a listing of versions reports none of them — see
+            // [`crate::state::listed_configuration`].
             let mut entries: Vec<(String, CreateFunctionOutput)> = Vec::new();
-            let mut latest = record.configuration(crate::state::VERSION_LATEST, &record.config);
+            let mut latest = crate::state::listed_configuration(
+                record.configuration(crate::state::VERSION_LATEST, &record.config),
+            );
             latest.function_arn = Some(crate::state::configured_function_arn(
                 &record.arn,
                 crate::state::VERSION_LATEST,
@@ -260,7 +268,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             entries.push((crate::state::VERSION_LATEST.to_string(), latest));
             for published in record.versions.values() {
                 let label = published.version.to_string();
-                let configuration = record.configuration(&label, &published.config);
+                let configuration = crate::state::listed_configuration(
+                    record.configuration(&label, &published.config),
+                );
                 entries.push((label, configuration));
             }
 

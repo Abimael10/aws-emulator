@@ -507,16 +507,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Configuration values that override the container image Dockerfile settings":
         // the member configures the IMAGE a function runs from, and a function deployed as
-        // a .zip archive has none, so the update is refused before anything is applied (see
-        // [`crate::state::IMAGE_CONFIG_UNSUPPORTED_FOR_ZIP_MESSAGE`]).
-        if input.image_config.is_some()
-            && store.functions.get(&reference.name).is_some_and(|record| {
-                record.config.package_type != crate::state::PACKAGE_TYPE_IMAGE
-            })
-        {
-            return Err(invalid_parameter(
-                crate::state::IMAGE_CONFIG_UNSUPPORTED_FOR_ZIP_MESSAGE.to_string(),
-            ));
+        // a .zip archive has none, so the update is refused before anything is applied, and
+        // the sentence names the packaging THIS function's own record carries (see
+        // [`crate::state::unsupported_package_member_message`]).
+        if input.image_config.is_some() {
+            let packaging = store
+                .functions
+                .get(&reference.name)
+                .map(|record| record.config.package_type.clone())
+                .filter(|package_type| package_type != crate::state::PACKAGE_TYPE_IMAGE);
+            if let Some(package_type) = packaging {
+                return Err(invalid_parameter(
+                    crate::state::unsupported_package_member_message(
+                        "ImageConfig",
+                        &package_type,
+                    ),
+                ));
+            }
         }
 
         let record = store
@@ -577,18 +584,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let is_image = record.config.package_type == crate::state::PACKAGE_TYPE_IMAGE;
         if is_image && input.runtime.is_some() {
             return Err(invalid_parameter(
-                "Runtime cannot be set for a function whose PackageType is Image".to_string(),
+                crate::state::unsupported_package_member_message(
+                    "Runtime",
+                    &record.config.package_type,
+                ),
             ));
         }
         if is_image && input.handler.is_some() {
             return Err(invalid_parameter(
-                "Handler cannot be set for a function whose PackageType is Image".to_string(),
+                crate::state::unsupported_package_member_message(
+                    "Handler",
+                    &record.config.package_type,
+                ),
             ));
         }
         if !is_image && input.image_config.is_some() {
             return Err(invalid_parameter(
-                "ImageConfig can only be set for a function whose PackageType is Image"
-                    .to_string(),
+                crate::state::unsupported_package_member_message(
+                    "ImageConfig",
+                    &record.config.package_type,
+                ),
             ));
         }
 

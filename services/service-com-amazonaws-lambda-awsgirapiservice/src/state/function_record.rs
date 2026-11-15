@@ -22,8 +22,8 @@ use crate::ops::types::{
 };
 
 use super::{
-    code_location_url, configured_capacity_provider, configured_log_group, event_payload,
-    iso8601,
+    code_location_url, configured_capacity_provider, configured_function_arn, configured_log_group,
+    event_payload, iso8601,
     mint_durable_execution_id, mint_revision_id, resolved_image_uri, runtime_version_arn,
     service_managed_function_scaling_config, AliasRecord, AsyncInvocationOutcome,
     AsyncInvocationRecord, CapacityProviderVersion, CodeRecord, DurableExecutionRecord,
@@ -963,6 +963,32 @@ impl FunctionRecord {
             tenancy_config: config.tenancy_config.clone(),
             ..CreateFunctionOutput::default()
         }
+    }
+
+    /// The `FunctionConfiguration` reported by a READ addressed by `named_qualifier` —
+    /// the version or alias the request itself named, through either half of the
+    /// `FunctionName`/`Qualifier` pair ([`crate::state::named_qualifier`]).
+    ///
+    /// It is [`Self::configuration`] with the one member that depends on how the resource
+    /// was ADDRESSED: `FunctionArn` targets `NameSpacedFunctionArn`, whose pattern admits a
+    /// trailing qualifier (`…:function:<name>(:($LATEST(.PUBLISHED)?|<alias-or-version>))?`),
+    /// and a read reports the qualified ARN exactly when the request qualified the
+    /// identity it asked about — `$LATEST` named explicitly included, which is the one
+    /// qualifier [`Self::versioned_arn`] cannot tell from an unqualified read, because
+    /// that is the version an unqualified read resolves to. A request that named no
+    /// qualifier addressed the function itself and reports its unqualified ARN.
+    #[must_use]
+    pub fn addressed_configuration(
+        &self,
+        named_qualifier: Option<&str>,
+        version: &str,
+        config: &FunctionConfig,
+    ) -> CreateFunctionOutput {
+        let mut reported = self.configuration(version, config);
+        if let Some(named) = named_qualifier {
+            reported.function_arn = Some(configured_function_arn(&self.arn, named));
+        }
+        reported
     }
 
     /// The `FunctionConfiguration` reported by a call whose SUBJECT is the FUNCTION — one

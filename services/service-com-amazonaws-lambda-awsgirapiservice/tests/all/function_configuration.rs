@@ -429,6 +429,18 @@ fn read_cases() -> Vec<ReadCase> {
     ]
 }
 
+/// The qualifier a read case's request NAMES, in either of the two places one can be
+/// named: the `Qualifier` parameter, or a `FunctionName` that appends the identity's own
+/// label to any of the documented forms. `None` is a request addressed to the function
+/// itself.
+fn named_qualifier(case: &ReadCase) -> Option<String> {
+    case.qualifier.map(str::to_string).or_else(|| {
+        case.reference
+            .strip_suffix(&format!(":{}", case.version))
+            .map(|_| case.version.to_string())
+    })
+}
+
 /// Assert one member of the answered configuration, naming the case and the value.
 fn assert_member(label: &str, body: &Value, pointer: &str, expected: &Value) {
     let actual = body.pointer(pointer).cloned().unwrap_or(Value::Null);
@@ -485,10 +497,13 @@ async fn get_function_configuration_reports_the_stored_configuration_of_the_reso
             case.label
         );
 
-        let expected_arn = if case.version == "$LATEST" {
-            function_arn(case.function)
-        } else {
-            format!("{}:{}", function_arn(case.function), case.version)
+        // `FunctionArn` targets `NameSpacedFunctionArn`, whose pattern admits a trailing
+        // qualifier, and a read reports the ARN of the identity the request ADDRESSED: the
+        // qualified one exactly when the request named a qualifier — `$LATEST` named
+        // explicitly included — and the function's own unqualified ARN when it named none.
+        let expected_arn = match named_qualifier(&case) {
+            Some(qualifier) => format!("{}:{qualifier}", function_arn(case.function)),
+            None => function_arn(case.function),
         };
         assert_member(case.label, &body, "/FunctionName", &json!(case.function));
         assert_member(case.label, &body, "/FunctionArn", &json!(expected_arn));

@@ -919,14 +919,18 @@ fn package_code(
 ) -> Result<crate::state::CodeRecord, CreateFunctionError> {
     let code = &input.code;
     if package_type == crate::state::PACKAGE_TYPE_IMAGE {
+        // A container image brings its own runtime and its own entry point, so neither
+        // managed member names anything on such a function: each is refused by naming the
+        // member and the packaging it does not belong to (see
+        // [`crate::state::unsupported_package_member_message`]).
         if input.runtime.is_some() {
             return Err(invalid_parameter(
-                "Runtime cannot be set for a function whose PackageType is Image".to_string(),
+                crate::state::unsupported_package_member_message("Runtime", package_type),
             ));
         }
         if input.handler.is_some() {
             return Err(invalid_parameter(
-                "Handler cannot be set for a function whose PackageType is Image".to_string(),
+                crate::state::unsupported_package_member_message("Handler", package_type),
             ));
         }
         // "A list of function layers to add to the function's EXECUTION ENVIRONMENT":
@@ -957,10 +961,10 @@ fn package_code(
         // "Configuration values that override the container image Dockerfile settings":
         // a .zip package runs on a managed runtime and has no image whose entry point
         // could be overridden, so the member names nothing on this function (see
-        // [`crate::state::IMAGE_CONFIG_UNSUPPORTED_FOR_ZIP_MESSAGE`]).
+        // [`crate::state::unsupported_package_member_message`]).
         if input.image_config.is_some() {
             return Err(invalid_parameter(
-                crate::state::IMAGE_CONFIG_UNSUPPORTED_FOR_ZIP_MESSAGE.to_string(),
+                crate::state::unsupported_package_member_message("ImageConfig", package_type),
             ));
         }
     }
