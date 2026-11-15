@@ -189,17 +189,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // set the `Force` parameter to `true`" — the StopApplication doc. The wider set a
         // forced stop accepts is the one the `Force` member documents: STARTING,
         // UPDATING, STOPPING, AUTOSCALING or RUNNING.
-        let stoppable = if forced {
-            FORCE_STOPPABLE_STATUSES.contains(&application.status.as_str())
-        } else {
-            application.status == crate::state::STATUS_RUNNING
-        };
-        if !stoppable {
+        //
+        // The two refusals are DIFFERENT sentences, because they refuse different things:
+        // an unforced stop is refused as a stop the application's status does not admit,
+        // while a forced one is refused as a force the status does not admit at all — the
+        // caller already asked for the widest form of the operation, so there is nothing
+        // left to reach for.
+        if forced {
+            if !FORCE_STOPPABLE_STATUSES.contains(&application.status.as_str()) {
+                return Err(StopApplicationErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(force_stop_refusal_message(&application.status)),
+                    },
+                )
+                .into());
+            }
+        } else if application.status != crate::state::STATUS_RUNNING {
             return Err(StopApplicationErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!(
-                        "Application {name} cannot be stopped while it is in the {} state",
-                        application.status
+                    message: Some(crate::state::ineligible_status_message(
+                        crate::state::TRANSITION_STOPPED,
+                        &application.status,
                     )),
                 },
             )
@@ -221,6 +231,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation_id: Some(operation_id),
         })
     }
+}
+
+/// How a FORCED stop is refused when the application's status is not one the force is
+/// accepted from: the fixed sentence for that class, with the status the application is
+/// currently in — read off the store — quoted as its only variable part. The application's
+/// name is not part of it; the sentence is about the status a force cannot be applied in.
+fn force_stop_refusal_message(status: &str) -> String {
+    format!("You can't force stop an application in '{status}' status.")
 }
 
 /// The statuses a forced stop is accepted from, from the `StopApplication$Force` doc:

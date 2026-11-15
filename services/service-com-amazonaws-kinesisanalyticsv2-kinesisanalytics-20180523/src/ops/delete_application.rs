@@ -175,9 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if application.status != crate::state::STATUS_READY {
             return Err(DeleteApplicationErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!(
-                        "Application {name} cannot be deleted while it is in the {} state",
-                        application.status
+                    message: Some(crate::state::ineligible_status_message(
+                        crate::state::TRANSITION_DELETED,
+                        &application.status,
                     )),
                 },
             )

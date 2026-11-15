@@ -23,6 +23,14 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// this wait must see the settled status.
 pub(crate) const SETTLE_WAIT: Duration = Duration::from_millis(1_200);
 
+/// How long a suite waits for a status the clock owes before giving up. Generous on
+/// purpose: [`await_status`] polls the condition, so the wait tracks the host rather than
+/// bounding it.
+pub(crate) const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long [`await_status`] waits before reading the stored status again.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// A router with this one service mounted on `engine`, so a test can inspect the same
 /// store the handlers write to.
 pub(crate) fn router_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
@@ -231,4 +239,44 @@ pub(crate) async fn describe(router: &MultiServiceRouter, name: &str) -> Value {
     .await;
     assert_eq!(status, 200, "case {name:?}: DescribeApplication got {body}");
     body["ApplicationDetail"].clone()
+}
+
+/// The `ApplicationStatus` `DescribeApplication` reports for `application` right now.
+///
+/// Shared plumbing, so no two suites that read one application's lifecycle status can drift
+/// on where the detail carries it.
+pub(crate) async fn reported_status(
+    router: &MultiServiceRouter,
+    case: &str,
+    application: &str,
+) -> String {
+    let detail = describe(router, application).await;
+    detail["ApplicationStatus"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: expected an ApplicationStatus, got {detail}"))
+        .to_string()
+}
+
+/// Look again until `application` reports `settled`, or [`SETTLE_DEADLINE`] passes.
+///
+/// A status the clock owes becomes due without any further call, so what a suite waits for
+/// is the CONDITION: a slow host waits longer rather than failing.
+pub(crate) async fn await_status(
+    router: &MultiServiceRouter,
+    case: &str,
+    application: &str,
+    settled: &str,
+) {
+    let give_up_at = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let observed = reported_status(router, case, application).await;
+        if observed == settled {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < give_up_at,
+            "case {case}: expected {application} to settle at {settled}, got {observed:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }

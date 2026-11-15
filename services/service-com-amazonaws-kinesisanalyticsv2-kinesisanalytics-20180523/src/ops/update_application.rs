@@ -268,16 +268,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An application in the middle of another lifecycle action is not available for
         // this one: the settled statuses this service drives an application through are
         // READY and RUNNING, and a transient one (STARTING, STOPPING, an update still
-        // settling) means a change is already outstanding. Worded as this crate already
-        // words the same refusal for the same class (`crate::ops::start_application`:
-        // "Application {name} cannot be started while it is in the {status} state"), so
-        // two operations refusing an application in use do not report it differently.
+        // settling) means a change is already outstanding. Worded through the shared
+        // sentence every operation of this service uses for an action refused on the
+        // status the application is in (`crate::state::ineligible_status_message`), so
+        // two operations refusing an ineligible application do not report it differently.
         if status != crate::state::STATUS_READY && status != crate::state::STATUS_RUNNING {
             return Err(UpdateApplicationErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!(
-                        "Application {name} cannot be updated while it is in the \
-                         {status} state"
+                    message: Some(crate::state::ineligible_status_message(
+                        crate::state::TRANSITION_UPDATED,
+                        &status,
                     )),
                 },
             )

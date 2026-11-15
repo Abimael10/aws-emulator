@@ -1874,6 +1874,35 @@ pub fn existing_application_message(name: &str) -> String {
     format!("Application '{name}' already exists.")
 }
 
+/// How this service words a lifecycle action refused because the application is not in a
+/// status that action is accepted from: the fixed sentence the API answers for that error
+/// class, naming the attempted transition and the application's CURRENT status, quoted.
+///
+/// `transition` is the past participle of the action as the API spells it
+/// ([`TRANSITION_STOPPED`] for `StopApplication`, [`TRANSITION_STARTED`] for
+/// `StartApplication`), and `status` is read off the STORED application, so one sentence
+/// answers every status a caller can catch an application in. The application's NAME is
+/// NOT part of it: the refusal states which status the action is not accepted from, not
+/// which application the caller named — the request already carries that. One wording for
+/// every operation that refuses a lifecycle action on a status, so two of them cannot
+/// report the same ineligible application differently.
+pub fn ineligible_status_message(transition: &str, status: &str) -> String {
+    format!("Application cannot be {transition} in '{status}' state")
+}
+
+/// The transition `StopApplication` names in [`ineligible_status_message`].
+pub const TRANSITION_STOPPED: &str = "Stopped";
+
+/// The transition `StartApplication` names in [`ineligible_status_message`].
+pub const TRANSITION_STARTED: &str = "Started";
+
+/// The transition `DeleteApplication` names in [`ineligible_status_message`].
+pub const TRANSITION_DELETED: &str = "Deleted";
+
+/// The transition the updates — `UpdateApplication` and
+/// `UpdateApplicationMaintenanceConfiguration` — name in [`ineligible_status_message`].
+pub const TRANSITION_UPDATED: &str = "Updated";
+
 /// How this service words a lookup miss on one VERSION of an application: the id the
 /// caller asked for and the application it was looked for in, in the sentence shape
 /// [`missing_application_message`] uses for the application itself.

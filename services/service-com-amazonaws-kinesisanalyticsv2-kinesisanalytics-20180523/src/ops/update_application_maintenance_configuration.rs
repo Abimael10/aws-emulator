@@ -229,15 +229,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // following states: READY or RUNNING. If you invoke it when the application is in
         // a state other than these two states, it throws a ResourceInUseException" (this
         // operation's doc). A transient status means a change is already outstanding, and
-        // the refusal is worded as this crate already words the same class for the same
-        // reason (`crate::ops::update_application`).
+        // the refusal is worded through the shared sentence this service answers for an
+        // action refused on the status the application is in
+        // (`crate::state::ineligible_status_message`).
         if status != crate::state::STATUS_READY && status != crate::state::STATUS_RUNNING {
             return Err(
                 UpdateApplicationMaintenanceConfigurationErrorModeled::ResourceInUseException(
                     ResourceInUseException {
-                        message: Some(format!(
-                            "Application {name} cannot be updated while it is in the \
-                             {status} state"
+                        message: Some(crate::state::ineligible_status_message(
+                            crate::state::TRANSITION_UPDATED,
+                            &status,
                         )),
                     },
                 )

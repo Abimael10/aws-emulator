@@ -16,22 +16,16 @@
 //! Every status this suite asserts on is read back from `DescribeApplication` and polled
 //! until the clock has made it due, so a slow host waits longer rather than failing.
 
-use std::time::Duration;
-
 use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, create_startable, describe, error_code, error_message, listed_snapshots, router};
+use crate::harness::{
+    await_status, call, create_startable, error_code, error_message, listed_snapshots,
+    reported_status, router,
+};
 
 /// The runtime the snapshot operations are served for.
 const FLINK_RUNTIME: &str = "FLINK-1_20";
-
-/// How long a case waits for a status the clock owes before giving up. Generous on
-/// purpose: the condition is polled, so the wait tracks the host rather than bounding it.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
-
-/// How long a poll waits before reading the status again.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Requests that identify no snapshot, spanning the modelled `SnapshotName` form (len
 /// 1..256, pattern `^[a-zA-Z0-9_.-]+$`) and the `SnapshotCreationTimestamp` the request
@@ -62,35 +56,10 @@ async fn served(router: &MultiServiceRouter, case: &str, operation: &str, applic
     );
 }
 
-/// The `ApplicationStatus` `DescribeApplication` reports for `application` right now.
-async fn reported_status(router: &MultiServiceRouter, case: &str, application: &str) -> String {
-    let detail = describe(router, application).await;
-    detail["ApplicationStatus"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case}: expected an ApplicationStatus, got {detail}"))
-        .to_string()
-}
-
-/// Look again until `application` reports `settled`, or [`SETTLE_DEADLINE`] passes.
-async fn await_status(
-    router: &MultiServiceRouter,
-    case: &str,
-    application: &str,
-    settled: &str,
-) {
-    let give_up_at = tokio::time::Instant::now() + SETTLE_DEADLINE;
-    loop {
-        let observed = reported_status(router, case, application).await;
-        if observed == settled {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < give_up_at,
-            "case {case}: expected {application} to settle at {settled}, got {observed:?}"
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-}
+// The `ApplicationStatus` `DescribeApplication` reports for `application` right now, and
+// the poll that waits for one the clock owes, both live in `crate::harness`
+// (`reported_status`, `await_status`): every suite in this crate that reads a lifecycle
+// status reads it the same way.
 
 /// A `DeleteApplicationSnapshot` naming a snapshot the application holds no record of is
 /// refused as the modelled `ResourceNotFoundException`, in the sentence that names the

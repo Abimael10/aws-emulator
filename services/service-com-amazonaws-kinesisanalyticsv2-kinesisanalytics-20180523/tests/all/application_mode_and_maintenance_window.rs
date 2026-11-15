@@ -13,8 +13,8 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    call, create, create_body, create_startable, describe, error_code, error_message, router,
-    SETTLE_WAIT,
+    await_status, call, create, create_body, create_startable, describe, error_code,
+    error_message, router,
 };
 
 /// Every `RuntimeEnvironment` an application can be created on, as the model spells them
@@ -320,12 +320,13 @@ async fn a_maintenance_update_of_an_application_in_use_is_refused() {
     );
     assert_eq!(
         error_message(&body),
-        format!("Application {name} cannot be updated while it is in the STARTING state"),
-        "case starting: expected the in-use sentence, got {body}"
+        "Application cannot be Updated in 'STARTING' state",
+        "case starting: expected the ineligible-status sentence, got {body}"
     );
 
     // Once the start has settled the application is RUNNING, which the operation accepts.
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The wait is for the CONDITION — the status the clock owes — not for a fixed time.
+    await_status(&router, "running", name, "RUNNING").await;
     let (status, answered) = call(
         &router,
         "UpdateApplicationMaintenanceConfiguration",
