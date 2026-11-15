@@ -185,6 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // The key the policy reports, resolved before this service's own store is locked:
+        // an alias is a question for AWS KMS, and one request holds one lock.
+        let kms_key_arn =
+            crate::state::kms_key_arn(&*self.engine, input.kms_key_id.as_deref(), &region);
 
         // `TagList` admits up to 200 entries, while one RESOURCE may carry at most
         // `MAX_TAGS_PER_RESOURCE` — the bound `TooManyTagsException` itself documents —
@@ -264,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             definition_hash: crate::state::policy_definition_hash(input.policy_definition.as_ref()),
             definition: input.policy_definition,
             description: input.description,
-            kms_key_arn: crate::state::kms_key_arn(input.kms_key_id.as_deref(), &region),
+            kms_key_arn,
             tags: input.tags.unwrap_or_default(),
             created_at: now,
             updated_at: now,

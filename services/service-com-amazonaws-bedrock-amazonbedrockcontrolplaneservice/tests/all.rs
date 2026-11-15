@@ -125,6 +125,8 @@ mod inference_profile_listing;
 mod inference_profiles;
 #[path = "all/job_pass_role_source_arn.rs"]
 mod job_pass_role_source_arn;
+#[path = "all/kms_key_resolution.rs"]
+mod kms_key_resolution;
 #[path = "all/marketplace_endpoint_deregistration.rs"]
 mod marketplace_endpoint_deregistration;
 #[path = "all/marketplace_endpoint_registration.rs"]

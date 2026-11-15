@@ -151,7 +151,9 @@ fn sent(body: &Value, name: &str) -> Value {
 /// `importedModelKmsKeyId` admits a key ARN, a bare 36-character key id or an alias, while
 /// `KmsKeyArn` (`^arn:aws(-[^:]+)?:kms:[a-zA-Z0-9-]*:[0-9]{12}:key/[a-zA-Z0-9-]{36}$`)
 /// admits only a key ARN: so a key ARN passes through, a bare id is completed into one,
-/// and an alias — which resolves to a key id only inside KMS — is reported by nothing.
+/// and an alias is resolved to the key it targets INSIDE AWS KMS, which this suite mounts
+/// no AWS KMS beside: an alias names no key here, so none is reported for it (the
+/// resolution itself is `kms_key_resolution.rs`).
 fn expected_kms_key_arn(body: &Value, region: &str) -> Value {
     let Some(key_id) = body.get("importedModelKmsKeyId").and_then(Value::as_str) else {
         return Value::Null;

@@ -6833,3 +6833,23 @@ mod appended_notes;
 //! What a suite covers, and why it belongs to this cross-service target rather than to one
 //! service crate's own, is stated in that suite's OWN module doc, where it is read beside
 //! the test it explains and stays correct when the suite moves.
+// EVERY note in this file is an ORDINARY `//` comment, this header included, and that is
+// deliberate: landings append their declaration to the end of this list, and a landing
+// that copies part of this header down with it would — had the header been written with
+// `//!` — leave an inner doc comment past the first item, which is `error[E0753]` and
+// fails EVERY suite of this target. A copy of an ordinary comment compiles wherever it
+// lands. `all/all_rs_inner_doc_comments_precede_the_first_item.rs` is what reports a
+// `//!` that did land past the first item, here and in every service crate's
+// `tests/all.rs`.
+// pair, keeping the list sorted, and declare each suite exactly ONCE: this is one crate
+// root, so a second `mod` for the same name is `E0428`, which fails every suite here too
+// (`all/all_rs_declares_each_suite_once.rs` reports that). What a suite covers, and why
+// it lives in this cross-service target rather than in one service crate's own, belongs
+// in that suite's own module header.
+// The notes below this paragraph, and the ones after the list, are what concurrent
+// landings appended to this file; `all/appended_notes.rs` is where such a note belongs.
+// (Copies of this header that concurrent landings had left above the list are pruned: one
+// statement of the rules, in the paragraphs above, is what stays current.)
+// (A run of notes about suites this file already declares once, and about why each lives in
+// this cross-service target, stood here. They are pruned: each suite's own module header
+// carries that, and this file has a 5,000-line ceiling.)

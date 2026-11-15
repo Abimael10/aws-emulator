@@ -192,6 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // `importedModelKmsKeyId` admits a key ARN, a bare key id or an alias, while the
+        // `importedModelKmsKeyArn` a read reports admits only a key ARN; the shared
+        // resolution is what decides which key is reported back, and it is asked before
+        // this service's own store is locked so one request holds one lock.
+        let imported_model_kms_key_arn = crate::state::kms_key_arn(
+            &*self.engine,
+            input.imported_model_kms_key_id.as_deref(),
+            &region,
+        );
 
         // `TooManyTagsException` documents the bound itself ("50 tags per resource"), and
         // this request carries tags for TWO resources — the job and the model it imports —
@@ -290,13 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             role_arn: input.role_arn,
             model_data_source: input.model_data_source,
             vpc_config: input.vpc_config,
-            // `importedModelKmsKeyId` admits a key ARN, a bare key id or an alias, while
-            // the `importedModelKmsKeyArn` a read reports admits only a key ARN; the
-            // shared conversion is what decides which of those can be reported back.
-            imported_model_kms_key_arn: crate::state::kms_key_arn(
-                input.imported_model_kms_key_id.as_deref(),
-                &region,
-            ),
+            imported_model_kms_key_arn,
             job_tags: input.job_tags.unwrap_or_default(),
             imported_model_tags: input.imported_model_tags.unwrap_or_default(),
             // The import runs after this call returns, so the job is reported running now

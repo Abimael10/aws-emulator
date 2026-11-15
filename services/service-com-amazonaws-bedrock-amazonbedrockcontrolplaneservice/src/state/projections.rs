@@ -1311,23 +1311,9 @@ pub fn caller_principal(parts: &http::request::Parts) -> String {
     }
 }
 
-/// The `kmsKeyArn` a response reports for a request's `kmsKeyId`.
-///
-/// `kmsKeyId` admits a key ARN, a bare key id, or an alias, while `KmsKeyArn`
-/// admits only `arn:aws:kms:<region>:<account>:key/<key id>`. A key ARN passes
-/// through and a bare key id is completed into one; an ALIAS resolves to a key id
-/// only inside KMS, so this reports no ARN for it rather than inventing one.
-pub fn kms_key_arn(kms_key_id: Option<&str>, region: &str) -> Option<String> {
-    let key_id = kms_key_id?;
-    if key_id.starts_with("arn:") {
-        return key_id.contains(":key/").then(|| key_id.to_string());
-    }
-    let is_key_id = key_id.len() == 36
-        && key_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
-    is_key_id.then(|| ::engine::emulator_arn("kms", region, &format!("key/{key_id}")))
-}
+// The `kmsKeyArn` a response reports for a request's `kmsKeyId` is built in
+// `super::kms_key`: an alias is resolved through the service that OWNS the alias-to-key
+// association, which is a question for AWS KMS rather than a rendering of this request.
 
 /// base-36 (`0-9a-z`) rendering of `value`, left-padded with `0` to `width`
 /// digits.

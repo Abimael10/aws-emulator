@@ -182,6 +182,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // `modelKmsKeyId` admits a key ARN, a bare key id or an alias, while the
+        // `targetModelKmsKeyArn` a read reports admits only a key ARN; the shared
+        // resolution is what decides which key is reported back, and it is asked before
+        // this service's own store is locked so one request holds one lock.
+        let target_model_kms_key_arn =
+            crate::state::kms_key_arn(&*self.engine, input.model_kms_key_id.as_deref(), &region);
 
         let tags = input.target_model_tags.unwrap_or_default();
         if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
@@ -290,7 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source_account_id: source_account_id(&input.source_model_arn),
             target_model_arn,
             target_model_name: input.target_model_name.clone(),
-            target_model_kms_key_arn: input.model_kms_key_id,
+            target_model_kms_key_arn,
             target_model_tags: tags,
             status: crate::state::MODEL_COPY_JOB_STATUS_IN_PROGRESS,
             completed_due_at: Some(now + crate::state::MODEL_COPY_JOB_COMPLETE_AFTER),

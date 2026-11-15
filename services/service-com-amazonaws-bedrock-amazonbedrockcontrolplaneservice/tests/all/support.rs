@@ -598,6 +598,23 @@ pub fn emulator_with_logs_and_iam() -> Emulator {
     Emulator { router, engine }
 }
 
+/// The same emulator with AWS KMS mounted beside this control plane on the one shared
+/// engine, exactly as `core/router` assembles them.
+///
+/// The form a suite drives when its rule is about the KMS key a request names: the key and
+/// the alias that names it are resources of THAT service, minted through its own API, so
+/// what this control plane resolves a `kmsKeyId` against is a key AWS KMS really holds.
+/// Requests to it go through [`Emulator::call_awsjson`].
+pub fn emulator_with_kms() -> Emulator {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = smithy_server_runtime::MultiServiceRouter::new();
+    router.register_service(bedrock::EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        ::service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
+    );
+    Emulator { router, engine }
+}
+
 impl Emulator {
     /// One request signed for [`REGION`], the region these suites address.
     pub async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {

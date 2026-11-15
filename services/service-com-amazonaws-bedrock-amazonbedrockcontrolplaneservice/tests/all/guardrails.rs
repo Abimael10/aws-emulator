@@ -157,8 +157,10 @@ async fn create_then_get_reports_the_stored_guardrail() {
                     "filters": [ { "type": "GROUNDING", "threshold": 0.75 } ],
                     "tier": { "tierName": "CLASSIC" },
                 },
-                // An alias resolves to a key id only inside KMS, so no key ARN is
-                // reported rather than one being invented.
+                // An alias is resolved to the key it targets inside AWS KMS, which this
+                // suite mounts none of: the alias names no key here, so no key ARN is
+                // reported rather than one being invented (`kms_key_resolution.rs` drives
+                // the resolution with AWS KMS mounted beside this service).
                 "kmsKeyArn": null,
             }),
         },

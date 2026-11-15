@@ -433,7 +433,10 @@ async fn the_kms_key_a_create_names_is_reported_as_a_key_arn() {
     // (case, kmsKeyId, the kmsKeyArn the read must report). A CATALOG of the spellings
     // `KmsKeyId`'s pattern admits — a key ARN, a bare 36-character key id, an alias — read
     // against `KmsKeyArn`, which admits only `arn:…:kms:<region>:<account>:key/<id>`: an
-    // alias resolves to a key id only inside KMS, so none is reported for it.
+    // alias is resolved to the key it targets inside AWS KMS, which this suite mounts none
+    // of, so the alias names no key here and none is reported for it
+    // (`kms_key_resolution.rs` drives the resolution with AWS KMS mounted beside this
+    // service).
     let key_id = "1234abcd-12ab-34cd-56ef-1234567890ab";
     let foreign_key_arn = format!("arn:aws:kms:{REGION}:111122223333:key/{key_id}");
     let rows: Vec<(&str, Option<String>, Value)> = vec![

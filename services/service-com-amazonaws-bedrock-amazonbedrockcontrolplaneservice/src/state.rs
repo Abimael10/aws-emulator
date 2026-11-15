@@ -332,6 +332,13 @@ pub use store::*;
 mod projections;
 pub use projections::*;
 
+/// The ARN a read reports for the KMS key a request named, with the alias resolution that
+/// takes. Beside this module for the reason [`model_source`] is: deciding which key an
+/// alias names means asking the service that OWNS keys, while the records the answer is
+/// stored on live here.
+mod kms_key;
+pub use kms_key::*;
+
 pub use automated_reasoning_policies::*;
 pub use foundation_models::*;
 pub use resource_records::*;

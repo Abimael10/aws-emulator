@@ -196,6 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let token = input.client_request_token;
+        // The key the guardrail reports, resolved before this service's own store is
+        // locked: an alias is a question for AWS KMS, and one request holds one lock.
+        let kms_key_arn =
+            crate::state::kms_key_arn(&*self.engine, input.kms_key_id.as_deref(), &region);
 
         let mut store = state.lock();
 
@@ -265,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             arn: crate::state::guardrail_arn(&region, &id),
             name: input.name.clone(),
-            kms_key_arn: crate::state::kms_key_arn(input.kms_key_id.as_deref(), &region),
+            kms_key_arn,
             tags: input.tags.unwrap_or_default(),
             created_at: now,
             draft,

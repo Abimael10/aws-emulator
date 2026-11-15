@@ -323,6 +323,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // `customModelKmsKeyId` admits a key ARN, a bare key id or an alias, while the
+        // `outputModelKmsKeyArn` a read reports admits only a key ARN; the shared
+        // resolution is what decides which key is reported back, and it is asked before
+        // this service's own store is locked so one request holds one lock.
+        let output_model_kms_key_arn = crate::state::kms_key_arn(
+            &*self.engine,
+            input.custom_model_kms_key_id.as_deref(),
+            &region,
+        );
+
         let mut store = state.lock();
 
         // `@idempotencyToken`: a replay answers with what the first request minted.
@@ -483,13 +493,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             base_model_arn: crate::state::foundation_model_arn(&region, base_model.model_id),
             customization_type,
-            // `customModelKmsKeyId` admits a key ARN, a bare key id or an alias, while the
-            // `outputModelKmsKeyArn` a read reports admits only a key ARN; the shared
-            // conversion is what decides which of those can be reported back.
-            output_model_kms_key_arn: crate::state::kms_key_arn(
-                input.custom_model_kms_key_id.as_deref(),
-                &region,
-            ),
+            output_model_kms_key_arn,
             hyper_parameters: input.hyper_parameters,
             training_data_config: input.training_data_config,
             // The read reports this member as required and its `validators` list admits
