@@ -21,6 +21,8 @@ mod body_validation_refusals;
 mod catalog_published_spellings;
 #[path = "all/console_identifier_namespace.rs"]
 mod console_identifier_namespace;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
 #[path = "all/list_setting_order.rs"]
 mod list_setting_order;
 #[path = "all/list_setting_reset.rs"]

@@ -3,7 +3,9 @@
 //! @op GetAccountCustomizations
 //!
 //! Implemented: reports the customization record persisted for the calling
-//! account, and writes nothing (`@readonly`).
+//! account, and writes nothing (`@readonly`). A caller whose IAM permissions do
+//! not allow this action is refused with the modelled `AccessDeniedException`
+//! (HTTP 403) before the record is read (`crate::service::authorization`).
 //!
 //! ## Shape of an operation
 //!
@@ -151,8 +153,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The input shape has no members, and this read needs no request metadata.
-        let _ = (&input, ctx);
+        // The input shape has no members, so nothing of the request is read for
+        // the answer; `ctx` carries the credentials the decision below is taken on.
+        let _ = &input;
+
+        // AWS takes the authorization decision at the IAM layer, ahead of the
+        // service reading anything, so a caller whose identity-based policies do
+        // not allow this action is refused without being told anything about the
+        // account's settings.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::account_customizations_resource(ctx),
+        )
+        .map_err(GetAccountCustomizationsErrorModeled::AccessDeniedException)?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetAccountCustomizationsErrorModeled::InternalServerException(

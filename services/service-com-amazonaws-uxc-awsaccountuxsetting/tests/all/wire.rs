@@ -14,10 +14,22 @@ use service_com_amazonaws_uxc_awsaccountuxsetting::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
-/// A SigV4 `Authorization` header whose credential scope names this service, which
-/// is the routing key `MultiServiceRouter` dispatches on. The signature itself is
-/// never checked here: request authentication is off below.
-const SIGV4_UXC: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/uxc/aws4_request, SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000";
+/// The access key id every helper that does not name one signs with: a key neither
+/// the IAM nor the STS store holds a record for, which is the account's own
+/// published credential.
+pub const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
+/// A SigV4 `Authorization` header for `access_key_id`, whose credential scope names
+/// this service — the routing key `MultiServiceRouter` dispatches on, and the key id
+/// the service resolves the CALLING PRINCIPAL from. The signature itself is never
+/// checked here: request authentication is off below.
+pub fn sigv4_header(access_key_id: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/us-east-1/uxc/aws4_request, \
+         SignedHeaders=host, \
+         Signature=0000000000000000000000000000000000000000000000000000000000000000"
+    )
+}
 
 /// A router mounting one freshly-stated copy of the service.
 pub fn build_router() -> MultiServiceRouter {
@@ -27,6 +39,31 @@ pub fn build_router() -> MultiServiceRouter {
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
     router
+}
+
+/// A router mounting one freshly-stated copy of the service BESIDE the IAM and STS
+/// services, over ONE shared engine, with that engine handed back.
+///
+/// What a suite needs to say who a request speaks for: the principal a request is
+/// judged as, its policies and its session live in the IAM and STS stores those
+/// services' own handlers write, so a suite seeds the same records those services
+/// hold rather than a copy of its own.
+pub fn build_router_with_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
+    router.register_service(
+        service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    (router, engine)
 }
 
 /// Percent-encode a query-parameter value: a page token is base64, whose `+`, `/`
@@ -57,6 +94,21 @@ pub async fn call(
     call_bytes(router, method, uri, &raw).await
 }
 
+/// As [`call`], signed with the access key id `access_key_id`: the request form a
+/// suite drives one PRINCIPAL's calls through.
+pub async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, String, Value) {
+    let raw = body
+        .map(|b| serde_json::to_vec(&b).expect("serialize the request body"))
+        .unwrap_or_default();
+    call_bytes_as(router, access_key_id, method, uri, &raw).await
+}
+
 /// As [`call`], with the request body given as RAW BYTES.
 ///
 /// The one way a suite sends a document `serde_json` cannot produce — a body that
@@ -69,12 +121,25 @@ pub async fn call_bytes(
     uri: &str,
     raw: &[u8],
 ) -> (u16, String, Value) {
+    call_bytes_as(router, DEFAULT_ACCESS_KEY_ID, method, uri, raw).await
+}
+
+/// As [`call_bytes`], signed with the access key id `access_key_id` rather than with
+/// [`DEFAULT_ACCESS_KEY_ID`]: the one way a suite says WHICH principal a request
+/// speaks for, which is what the service's authorization decision is taken on.
+pub async fn call_bytes_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    method: &str,
+    uri: &str,
+    raw: &[u8],
+) -> (u16, String, Value) {
     let raw = raw.to_vec();
     let request = http::Request::builder()
         .method(method)
         .uri(uri)
         .header("host", "uxc.us-east-1.amazonaws.com")
-        .header("authorization", SIGV4_UXC)
+        .header("authorization", sigv4_header(access_key_id))
         .header("content-type", "application/json")
         .body(bytes::Bytes::from(raw))
         .expect("build the request");

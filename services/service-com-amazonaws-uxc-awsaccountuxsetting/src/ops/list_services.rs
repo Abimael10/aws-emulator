@@ -4,7 +4,9 @@
 //!
 //! Implemented: pages over the service catalog held in this service's state,
 //! writing nothing (`@readonly`) — a page token carries its own resume offset, so
-//! a read never has to record one.
+//! a read never has to record one. A caller whose IAM permissions do not allow
+//! this action is refused with the modelled `AccessDeniedException` (HTTP 403)
+//! before the catalog is read (`crate::service::authorization`).
 //!
 //! ## Shape of an operation
 //!
@@ -234,8 +236,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Paging needs no request metadata: the resume position travels in the token.
-        let _ = ctx;
+        // Paging needs no request metadata: the resume position travels in the
+        // token. `ctx` carries the credentials the decision below is taken on.
+
+        // AWS takes the authorization decision at the IAM layer, ahead of the
+        // service reading anything, so a caller whose identity-based policies do
+        // not allow this action is refused without being told anything about the
+        // catalog. This listing enumerates the identifiers a setting may name —
+        // the same for every account — so it addresses no resource of its own and
+        // is judged against the resource IAM writes for such a request.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(ListServicesErrorModeled::AccessDeniedException)?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListServicesErrorModeled::InternalServerException(

@@ -118,6 +118,11 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether IAM lets a request perform the action it asks for — the decision every
+/// operation of this service takes before it reads or writes anything, held here beside
+/// the other refusals this service takes ahead of its own state.
+pub mod authorization;
+
 /// The error code AWS answers a constraint refusal with on the JSON protocols, and the
 /// one the framework's own default picks for this `restJson1` service — named here so
 /// the chosen message always travels with its matching code.

@@ -4,12 +4,15 @@
 //!
 //! Implemented: merges the supplied settings into the calling account's
 //! persisted customization record and answers with the record read back out of
-//! state. A body that breaks a modelled SHAPE constraint never reaches this
-//! handler at all — this service's front door (`crate::service`) refuses it with
-//! HTTP 400 `BadRequestException`. What this handler owns is the one admission
-//! rule the model states in prose: a `visibleServices` member the service
-//! catalog does not name is refused with the modelled `ValidationException`
-//! (HTTP 400), before anything is written.
+//! state. A caller whose IAM permissions do not allow `uxc:` this operation is
+//! refused with the modelled `AccessDeniedException` (HTTP 403) BEFORE anything
+//! is written (`crate::service::authorization`), so a denied update leaves the
+//! stored setting intact. A body that breaks a modelled SHAPE constraint never
+//! reaches this handler at all — this service's front door (`crate::service`)
+//! refuses it with HTTP 400 `BadRequestException`. What this handler owns is the
+//! one admission rule the model states in prose: a `visibleServices` member the
+//! service catalog does not name is refused with the modelled
+//! `ValidationException` (HTTP 400), before anything is written.
 //! A list setting is stored, echoed and read back in ONE canonical sequence —
 //! its members ascending — whatever sequence the request named them in
 //! (`crate::state::canonical_members`).
@@ -195,6 +198,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `BadRequestException` before any handler runs. The one admission rule
         // left to this handler is the one the model states in prose, and it is
         // enforced below, under the same guard as the write.
+
+        // AWS takes the authorization decision at the IAM layer, ahead of the
+        // service looking at the request's own input, so it is taken FIRST — and
+        // before the write, which is what leaves the setting this account already
+        // had exactly as it was when the caller may not change it.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::account_customizations_resource(ctx),
+        )
+        .map_err(UpdateAccountCustomizationsErrorModeled::AccessDeniedException)?;
 
         // "To reset a setting to its default behavior, set the value to null for
         // visible Regions and visible services": a list member the request
