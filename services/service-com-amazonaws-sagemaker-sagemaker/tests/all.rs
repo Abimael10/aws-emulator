@@ -193,6 +193,8 @@ mod model_package_group_lifecycle;
 mod model_package_group_policy;
 #[path = "all/model_package_group_policy_names.rs"]
 mod model_package_group_policy_names;
+#[path = "all/model_package_image_pull_admission.rs"]
+mod model_package_image_pull_admission;
 #[path = "all/model_package_pending_window.rs"]
 mod model_package_pending_window;
 #[path = "all/model_package_registration_status.rs"]

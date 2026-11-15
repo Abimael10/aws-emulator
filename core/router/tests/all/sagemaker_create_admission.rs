@@ -10,7 +10,9 @@
 //!   its trust policy admits the SageMaker service principal; a role that exists and does
 //!   trust SageMaker is accepted normally;
 //! * a model package is registered around the container image path the request names
-//!   whatever the registry holds, which is what the recorded service does.
+//!   whatever that registry holds, which is what the recorded service does — but only for a
+//!   path SageMaker can pull for the request, so one addressing another account's or another
+//!   Region's Amazon ECR registry is refused.
 //!
 //! The first rule reaches ANOTHER service through the in-process callback, so a
 //! single-service router has nothing to ask and this suite needs three services on one
@@ -22,7 +24,9 @@
 //! (three creates, each of a different resource kind), the trust policy's shape, where the
 //! role lives (the default path and a path), which account the ARN names, and whether the
 //! role was ever created; for the image, whether the registry holds the repository, whether
-//! the repository holds the tag, and the tag-versus-digest form of the path.
+//! the repository holds the tag, the tag-versus-digest form of the path, and which registry
+//! the path addresses (this account's in the request's Region, another account's, another
+//! Region's, and a host that is no Amazon ECR registry).
 //!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built — and the
 //! requests driven — on a sized thread.
@@ -475,20 +479,26 @@ fn a_sagemaker_create_is_accepted_only_for_a_role_iam_holds_and_sagemaker_may_as
         .expect("the suite thread");
 }
 
-/// One container image a model package is registered around.
+/// One container image a model package is registered around: the path, and the registry and
+/// repository a refusal must name when SageMaker cannot pull it for this request.
 struct ImageCase {
     case: &'static str,
     image: String,
+    /// `None` when the registration is admitted; otherwise the `(registry id, repository)`
+    /// pair the access-denied refusal reports.
+    unpullable: Option<(String, String)>,
 }
 
-/// RULE: a model package is registered around the container image path the request names,
-/// WHATEVER the registry holds — the recorded service registers a package naming an image in
-/// a registry of another account, and one naming a repository this account's registry does
-/// not hold, so registration resolves no image. What it does hold the path to is its FORM:
-/// one of the two the member documents, so a value naming no registry is refused (the rows
-/// for that live in the SageMaker crate's `model_package_admission` suite).
+/// RULE: a model package is registered around the container image path the request names
+/// whatever that registry HOLDS — the recorded service registers a package naming a
+/// repository this account's registry does not hold, and a tag nothing was pushed under —
+/// but only for an image SageMaker can pull for this request: Amazon ECR is per account and
+/// per Region, so a path addressing another account's registry, or another Region's, is
+/// refused 400 `ValidationException` naming that registry id and repository. The FORM of the
+/// path is a separate question, whose rows live in the SageMaker crate's
+/// `model_package_admission` suite.
 #[test]
-fn a_model_package_is_registered_around_whatever_image_the_request_names() {
+fn a_model_package_is_registered_around_whatever_image_this_request_can_pull() {
     std::thread::Builder::new()
         .name("sagemaker-create-admission-image".to_string())
         .stack_size(BOOT_STACK_SIZE)
@@ -500,8 +510,9 @@ fn a_model_package_is_registered_around_whatever_image_the_request_names() {
                 .build()
                 .expect("a current-thread runtime");
 
-            // The registry holds ONE repository with ONE tagged image; every other path
-            // below names something it does not hold, and is registered just the same.
+            // The registry holds ONE repository with ONE tagged image; the other paths into
+            // this account's registry below name something it does not hold, and are
+            // registered just the same.
             let (status, created) = ecr(
                 &router,
                 &runtime,
@@ -549,30 +560,42 @@ fn a_model_package_is_registered_around_whatever_image_the_request_names() {
                 ImageCase {
                     case: "the tag the repository holds",
                     image: image_uri("inference", "1"),
+                    unpullable: None,
                 },
                 ImageCase {
                     case: "the digest the repository holds",
                     image: format!("{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/inference@{digest}"),
+                    unpullable: None,
                 },
                 ImageCase {
                     case: "a tag the repository does not hold",
                     image: image_uri("inference", "99"),
+                    unpullable: None,
                 },
                 ImageCase {
                     case: "a repository the registry does not hold",
                     image: image_uri("absent-repository", "1"),
+                    unpullable: None,
                 },
                 ImageCase {
                     case: "a namespaced repository the registry does not hold",
                     image: image_uri("team/absent", "latest"),
+                    unpullable: None,
                 },
                 ImageCase {
                     case: "another account's registry",
                     image: format!("{OTHER_ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/inference:1"),
+                    unpullable: Some((OTHER_ACCOUNT.to_string(), "inference".to_string())),
+                },
+                ImageCase {
+                    case: "this account's registry in another Region",
+                    image: format!("{ACCOUNT}.dkr.ecr.eu-west-1.amazonaws.com/inference:1"),
+                    unpullable: Some((ACCOUNT.to_string(), "inference".to_string())),
                 },
                 ImageCase {
                     case: "another registry's host",
                     image: "registry.example.com/team/inference:1".to_string(),
+                    unpullable: None,
                 },
             ];
 
@@ -594,6 +617,35 @@ fn a_model_package_is_registered_around_whatever_image_the_request_names() {
                     "DescribeModelPackage",
                     &json!({ "ModelPackageName": name }),
                 );
+
+                if let Some((registry_id, repository_name)) = &case.unpullable {
+                    // The recorded refusal for an image SageMaker cannot pull for this
+                    // request: the registry and the repository the path addressed, then the
+                    // sentence telling the caller what to check.
+                    assert_eq!(
+                        (status, error_code(&answered).as_str()),
+                        (400, "ValidationException"),
+                        "case {:?}: an image this request cannot pull must be refused, got \
+                         {status} {answered}",
+                        case.case
+                    );
+                    assert_eq!(
+                        error_message(&answered),
+                        format!(
+                            "Access denied for registry ID: {registry_id}, repository name: \
+                             {repository_name}. Please check if your ECR image exists and has \
+                             proper pull permissions for SageMaker."
+                        ),
+                        "case {:?}: expected the pull refusal, got {answered}",
+                        case.case
+                    );
+                    assert_eq!(
+                        read.0, 400,
+                        "case {:?}: a refused registration must store nothing, got {} {}",
+                        case.case, read.0, read.1
+                    );
+                    continue;
+                }
 
                 assert_eq!(
                     status, 200,

@@ -172,6 +172,12 @@ pub use image_digest::{
     registry_image_digest, resolved_image_digest,
 };
 
+/// The IMAGE PULL slice: whether SageMaker can pull the container image a registration
+/// references out of Amazon ECR, and the sentence a reference it cannot pull is refused with.
+/// Re-exported below, so a handler names them as `crate::state::…` like every other slice.
+pub mod image_pull;
+pub use image_pull::{first_unpullable_image, image_pull_access_denied, UnpullableImage};
+
 /// The cluster-policy slice of this state: HyperPod clusters and the cluster policies
 /// on them, with their own records, quota, status span and id mint. Reached through the
 /// single [`ComAmazonawsSagemakerSagemakerState::cluster_policies`] field.

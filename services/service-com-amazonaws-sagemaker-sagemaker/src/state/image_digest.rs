@@ -75,7 +75,7 @@ pub fn derived_image_digest(image: &str) -> String {
 /// the AWS-hosted spelling and followed exactly like one that carries it already, rather
 /// than parsed a second time here. One endpoint serves every Region, so such a reference
 /// names no Region of its own and is resolved in the one the request was signed for.
-fn reference_into_this_registry<'image>(
+pub(super) fn reference_into_this_registry<'image>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     image: &'image str,
 ) -> ::std::borrow::Cow<'image, str> {

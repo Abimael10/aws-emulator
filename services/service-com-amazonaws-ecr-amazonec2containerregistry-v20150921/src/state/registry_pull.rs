@@ -208,8 +208,39 @@ pub fn serve_pull<Eng: Send + Sync + 'static>(
 /// tag and no digest asks for [`DEFAULT_IMAGE_TAG`].
 #[must_use]
 pub fn parse_reference(image: &str) -> Option<RegistryReference> {
+    let (addressed_registry, reference) = parse_registry_reference(image)?;
+    (addressed_registry == registry_id()).then_some(reference)
+}
+
+/// The registry a pull reference ADDRESSES — the account id its host names — and the
+/// reference into it, for a path addressing ANY account's Amazon ECR registry; `None` for a
+/// path that addresses no Amazon ECR registry at all (another registry altogether, or a bare
+/// name a container runtime resolves against a public registry).
+///
+/// The same reading [`parse_reference`] takes, with the account the host names REPORTED
+/// rather than held to the account this registry serves: a caller that has to tell a
+/// reference into another account's registry from one that addresses no registry — a compute
+/// service deciding whether the image a request names is one it can pull — reads the registry
+/// out of the path here rather than walking the host itself.
+///
+/// The form is the one the Amazon ECR User Guide gives for a pull:
+/// `<account>.dkr.ecr.<region>.amazonaws.com/<repository>[:<tag>|@<digest>]`, so the account,
+/// the Region and the repository are read out of the reference itself
+/// ([`ecr_registry_host_parts`] for the host). A reference naming no tag and no digest asks
+/// for [`DEFAULT_IMAGE_TAG`].
+#[must_use]
+pub fn parse_registry_reference(image: &str) -> Option<(String, RegistryReference)> {
     let (host, path) = image.trim().split_once('/')?;
-    let region = host_region(&host.to_ascii_lowercase())?;
+    let lowercased = host.to_ascii_lowercase();
+    let (addressed_registry, region) = ecr_registry_host_parts(&lowercased)
+        .map(|(account, region)| (account.to_string(), region.to_string()))?;
+    let reference = reference_into(region, path)?;
+    Some((addressed_registry, reference))
+}
+
+/// The repository and the tag or digest the PATH part of a pull reference names, in the
+/// Region its host named.
+fn reference_into(region: String, path: &str) -> Option<RegistryReference> {
     // A digest is written after `@`, a tag after the LAST `:` of the path — a repository
     // name carries neither character, so whichever is present decides which of the two the
     // reference asks for.

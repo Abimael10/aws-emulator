@@ -18,8 +18,8 @@
 //! with the maintained regex engine, against the grammar's own expression, rather than by a
 //! hand-rolled walk over the characters.
 //!
-//! Two questions are asked of a path, and which of them an operation asks is decided by what
-//! the recordings show that operation doing:
+//! Two questions are asked of a path here, and which of them an operation asks is decided by
+//! what the recordings show that operation doing:
 //!
 //! * is the value a reference AT ALL ([`malformed_container_image`]) — the question the
 //!   hosting creates ask, since their recordings show a model registered around the image
@@ -28,10 +28,13 @@
 //!   ([`first_image_outside_the_documented_formats`]) — the question the model-package
 //!   registration asks, which is recorded refusing a path without them.
 //!
-//! What neither of them decides: whether any registry HOLDS the image. The recorded service
-//! registers a resource around a path whose repository this account's registry does not hold,
-//! and around one in another account's registry, so existence is not part of admission — only
-//! the form is.
+//! What neither of them decides: which registry a path addresses, and whether SageMaker can
+//! pull from it. That is the model-package registration's own further question, asked after
+//! the form and answered in [`super::image_pull`] — its recordings show a registration
+//! refused for a path addressing an Amazon ECR registry this account cannot pull from — and
+//! the digest resolution's ([`super::image_digest`]). The hosting creates ask neither: their
+//! recordings show a resource registered around a path whose repository this account's
+//! registry does not hold.
 
 // This slice needs nothing from [`super`]'s records: a container image path is read out of
 // the request alone. The regex engine is the crate's, named in full below.

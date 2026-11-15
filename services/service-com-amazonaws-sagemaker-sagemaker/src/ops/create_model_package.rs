@@ -8,10 +8,12 @@
 //! and refusing a name already in use. This is the ONLY file to touch for this
 //! operation.
 //!
-//! Two refusals this operation settles before anything is registered: a container image path
-//! outside the two formats the member documents (see [`crate::state::container_image`]), and
-//! a `ClientToken` this account has already SPENT on another request or on a registration
-//! that is gone — neither of which has a first answer to replay.
+//! Three refusals this operation settles before anything is registered: a container image
+//! path outside the two formats the member documents (see
+//! [`crate::state::container_image`]), one addressing an Amazon ECR registry SageMaker cannot
+//! pull from for this request (see [`crate::state::image_pull`]), and a `ClientToken` this
+//! account has already SPENT on another request or on a registration that is gone — none of
+//! which has a first answer to replay.
 //!
 //! ## Shape of an operation
 //!
@@ -283,12 +285,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // registry/repository[@digest] image path formats"): a value that is no reference at
         // all, or one naming no registry, names nothing to pull, so the registration is
         // refused for it before anything is stored (see `crate::state::container_image`).
-        // What registry HOLDS the image is not part of admission.
         if crate::state::first_image_outside_the_documented_formats(container_images(&input))
             .is_some()
         {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::INVALID_IMAGE_PATH,
+            ));
+        }
+
+        // And the registry the path addresses has to be one SageMaker can pull from on this
+        // account's behalf — this account's own Amazon ECR registry, in the Region the
+        // request is made in. A path addressing another account's registry or another
+        // Region's names an image no pull of this request's can reach, which the recorded
+        // registration refuses naming that registry and repository (see
+        // `crate::state::image_pull`), rather than registering a package around an artifact
+        // nothing can deploy.
+        if let Some(unpullable) =
+            crate::state::first_unpullable_image(ctx, container_images(&input))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::image_pull_access_denied(&unpullable),
             ));
         }
 

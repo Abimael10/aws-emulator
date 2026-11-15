@@ -82,7 +82,7 @@ impl Emulator {
     }
 
     /// Call `target` with a SigV4 credential scope naming `region`.
-    async fn call_in(&self, region: &str, target: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call_in(&self, region: &str, target: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
