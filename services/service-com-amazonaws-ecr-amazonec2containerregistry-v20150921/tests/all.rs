@@ -135,6 +135,8 @@ mod resource_tag_mutations;
 mod resource_tags;
 #[path = "all/scan_on_push.rs"]
 mod scan_on_push;
+#[path = "all/scan_status_description.rs"]
+mod scan_status_description;
 #[path = "all/scanning_configuration.rs"]
 mod scanning_configuration;
 #[path = "all/signing_configuration.rs"]

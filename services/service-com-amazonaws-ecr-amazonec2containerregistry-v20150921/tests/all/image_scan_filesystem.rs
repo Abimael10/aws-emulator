@@ -41,8 +41,9 @@ pub(crate) const UNSUPPORTED_IMAGE_DESCRIPTION: &str =
     "UnsupportedImageError: The image is not supported.";
 
 /// The `description` of a run that read the image's filesystem and identified no operating
-/// system or no package manager in it, spelled out here for the same reason.
-const UNSUPPORTED_FILESYSTEM_DESCRIPTION: &str =
+/// system or no package manager in it, spelled out here for the same reason. Shared with
+/// `crate::scan_status_description`, so the suites cannot drift apart on it either.
+pub(crate) const UNSUPPORTED_FILESYSTEM_DESCRIPTION: &str =
     "UnsupportedImageError: The operating system and/or package manager are not supported.";
 
 /// The `description` of a run that examined the image and finished, spelled out here for

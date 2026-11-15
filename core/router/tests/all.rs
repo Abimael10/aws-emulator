@@ -1267,3 +1267,21 @@ mod lambda_in_function_assumed_role_session;
 //! and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` pin. What a suite covers,
 //! and why it drives the assembled router rather than one service crate, is in that suite's
 //! own module header.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted by name: the list
+//! holds those pairs and NOTHING else, so two branches landing at once each insert two lines
+//! in one place and have no prose to duplicate, re-word or mistype.
+//! Three rules bind this file, and breaking any of them fails EVERY suite of this target
+//! rather than one:
+//! * A suite no `mod` names compiles nowhere and its tests never run, and a suite left at the
+//!   top level of `tests/` fails the build. This file is a test-target CRATE ROOT, so a bare
+//!   `mod <name>;` would resolve to a sibling of it (`tests/<name>.rs`): the `#[path]` is what
+//!   points each declaration into `tests/all/`.
+//! * A suite declared twice is `E0428`, which compiles neither copy.
+//! * These header lines are the only place an inner doc comment (`//!`) may stand: the
+//!   language accepts one only before the first item, so past the first declaration it is
+//!   `E0753`.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the first two for this
+//! file and for every service crate's `tests/all.rs` — so a rule they already pin wants no
+//! restatement here, and what a suite covers belongs in that suite's own module doc, where it
+//! is read beside the test it describes. The notes earlier landings appended to this file live
+//! in `all/appended_notes.rs`.
