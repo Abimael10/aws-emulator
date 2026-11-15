@@ -409,6 +409,11 @@ async fn run_application(
                 // A Spark application reads its parameters off its command line, so the run
                 // is given no environment of its own.
                 environment: &BTreeMap::new(),
+                // The instruction set the environment the application runs in has, which
+                // the run reports as its own machine. A step names none, so it is the one
+                // the engine's own runtime reports when none is named.
+                architecture:
+                    ::service_com_amazonaws_lambda_awsgirapiservice::state::DEFAULT_ARCHITECTURE,
                 event: Some(&event),
                 request_id: &step_id,
                 invoked_function_arn: "",

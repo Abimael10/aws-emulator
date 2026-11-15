@@ -23,8 +23,9 @@
 //! host's own interpreter surface stays as small as a string in and a string out:
 //!
 //! * `__lambda_input` — a JSON document the host hands to the first call below: the
-//!   handler name, the package's modules, the modules the RUNTIME supplies beside them
-//!   (the AWS SDK), the event and the environment the invocation runs with.
+//!   handler name, the package's modules and its own data files, the modules the RUNTIME
+//!   supplies beside them (the AWS SDK), the event and the environment the invocation runs
+//!   with.
 //! * `__lambda_prepare` — the INIT phase: it installs this runtime, imports the handler's
 //!   module and resolves its entry point, answering the empty string when the environment
 //!   is ready and an error document for an initialization that failed. None of that is the
@@ -55,6 +56,7 @@ import sys
 import datetime
 import importlib
 import importlib.util
+import io
 import json
 import logging
 import time
@@ -213,6 +215,145 @@ class _PackageLoader:
 
     def is_package(self, name):
         return self._path.endswith("/__init__.py")
+
+    def get_resource_reader(self, name):
+        """What the standard library reads this module's own FILES through.
+
+        A package's data file is held beside its modules (`_RESOURCE_PREFIX`), so the
+        resources of a package are the held entries under its own directory, and those of
+        a module are the ones beside it — which is the directory each of them is at under
+        the task root.
+        """
+        directory = self._path.rpartition("/")[0]
+        return _PackageResources(self._sources, directory)
+
+
+# The prefix the host keys a DATA entry of the deployment package under, which is where the
+# files a package ships beside its modules are held. No module name resolves to one of
+# them: `_PackageFinder` resolves a name to `<name>.py` or `<name>/__init__.py`.
+_RESOURCE_PREFIX = "resource:"
+
+
+def _entry_path(held):
+    """The path inside the package of the held entry `held`.
+
+    A module is held under its own path and a data file under the prefix above, and both of
+    them are FILES of the package: a module's path is a file beside the others, which is
+    what a package shipping its modules and its data in one archive holds.
+    """
+    if held.startswith(_RESOURCE_PREFIX):
+        return held[len(_RESOURCE_PREFIX):]
+    return held
+
+
+class _PackageFile:
+    """One PATH inside the deployment package, as the standard library's own resource
+    reading traverses one.
+
+    The entries are the ones the host read out of the archive, so a file this answers for
+    is one the package really holds and one it does not hold reads as absent. Nothing here
+    opens a host file: a file's text is the text the archive carried.
+    """
+
+    def __init__(self, sources, path):
+        self._sources = sources
+        self._path = path
+
+    def __repr__(self):
+        return "<PackageFile %r>" % ("/var/task/" + self._path,)
+
+    @property
+    def name(self):
+        return self._path.rpartition("/")[2]
+
+    def _held(self):
+        """The key this path's own text is held under, or `None` when none is."""
+        for key in (_RESOURCE_PREFIX + self._path, self._path):
+            if key in self._sources:
+                return key
+        return None
+
+    def is_file(self):
+        return self._held() is not None
+
+    def is_dir(self):
+        under = self._path + "/" if self._path else ""
+        return not self.is_file() and any(
+            _entry_path(held).startswith(under) for held in self._sources
+        )
+
+    def iterdir(self):
+        under = self._path + "/" if self._path else ""
+        named = []
+        for held in self._sources:
+            path = _entry_path(held)
+            if not path.startswith(under):
+                continue
+            entry = path[len(under):].partition("/")[0]
+            if entry and entry not in named:
+                named.append(entry)
+        for entry in named:
+            yield self.joinpath(entry)
+
+    def joinpath(self, *names):
+        path = self._path
+        for name in names:
+            for part in str(name).split("/"):
+                if part:
+                    path = path + "/" + part if path else part
+        return _PackageFile(self._sources, path)
+
+    def __truediv__(self, name):
+        return self.joinpath(name)
+
+    def _bytes(self):
+        held = self._held()
+        if held is None:
+            raise FileNotFoundError("/var/task/" + self._path)
+        return self._sources[held].encode("utf-8")
+
+    def open(self, mode="r", encoding=None, errors=None, newline=None):
+        held = self._bytes()
+        if "b" in mode:
+            return io.BytesIO(held)
+        return io.TextIOWrapper(io.BytesIO(held), encoding, errors, newline)
+
+    def read_bytes(self):
+        return self._bytes()
+
+    def read_text(self, encoding=None, errors=None, newline=None):
+        with self.open("r", encoding, errors, newline) as reading:
+            return reading.read()
+
+
+class _PackageResources:
+    """The FILES of one module of the deployment package, as the import system asks the
+    loader for them.
+
+    It answers both ways the standard library asks: `files()` for the traversable the
+    current resource reading walks, and the older by-name calls beside it.
+    """
+
+    def __init__(self, sources, directory):
+        self._sources = sources
+        self._directory = directory
+
+    def files(self):
+        return _PackageFile(self._sources, self._directory)
+
+    def open_resource(self, resource):
+        return self.files().joinpath(resource).open("rb")
+
+    def resource_path(self, resource):
+        # A file of this runtime is held in memory, so it is at no path of the host a
+        # caller could open for itself.
+        raise FileNotFoundError("/var/task/" + self._directory)
+
+    def is_resource(self, path):
+        return self.files().joinpath(path).is_file()
+
+    def contents(self):
+        return [found.name for found in self.files().iterdir()]
 
 
 class _PackageFinder:

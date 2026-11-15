@@ -166,6 +166,11 @@ pub async fn run_python(
                 // The program sees no variable of this process and none of another
                 // session: a code interpreter session is given no environment of its own.
                 environment: &BTreeMap::new(),
+                // The instruction set the environment the program runs in has, which the
+                // run reports as its own machine. A session names none, so it is the one
+                // the engine's own runtime reports when none is named.
+                architecture:
+                    ::service_com_amazonaws_lambda_awsgirapiservice::state::DEFAULT_ARCHITECTURE,
                 event: Some(&event),
                 request_id: "",
                 invoked_function_arn: "",

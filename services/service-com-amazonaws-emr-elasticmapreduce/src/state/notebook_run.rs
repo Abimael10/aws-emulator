@@ -448,6 +448,11 @@ async fn run_notebook_cells(
                 modules: &modules,
                 handler: NOTEBOOK_KERNEL_HANDLER,
                 environment: &environment,
+                // The instruction set the environment the notebook runs in has, which the
+                // run reports as its own machine. An execution names none, so it is the one
+                // the engine's own runtime reports when none is named.
+                architecture:
+                    ::service_com_amazonaws_lambda_awsgirapiservice::state::DEFAULT_ARCHITECTURE,
                 event: Some(&event),
                 request_id: "",
                 invoked_function_arn: "",

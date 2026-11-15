@@ -120,6 +120,10 @@ pub mod runtime_api;
 /// the socket interface it is built on.
 pub mod guest_tls;
 
+/// The waiting interface of that same standard library — the `select` module a handler, or a
+/// client library it vendors, imports beside the socket interface.
+pub mod guest_select;
+
 /// The Amazon S3 half of that seam, whose own protocol binds a request per operation.
 mod aws_s3;
 
@@ -692,6 +696,24 @@ pub async fn run_invocation(mut invocation: Invocation) -> Result<Invoked, Unrun
             return Err(Unrunnable::PackageUnreadable(why))
         }
     };
+    // The package's own DATA entries, under the prefix a resource is keyed by: the files a
+    // package ships beside its modules and reads back rather than imports, which the
+    // standard library's own resource reading answers from ([`python::RESOURCE_ID_PREFIX`]).
+    // Read out of what is LEFT of the same budget, after the modules, so the modules of a
+    // package whose data is large are read in full. A read that answers a FAULT contributes
+    // nothing and is not the invocation's: the modules above are what decide whether this
+    // package can run at all, so a package whose data the budget had no room for still runs
+    // its handler, exactly as one that ships no data does.
+    if engine == Engine::Python {
+        if let Ok(entries) =
+            package::python_resources_within(invocation.zip_bytes.as_deref(), &mut read_budget)
+        {
+            modules.extend(entries.into_iter().map(|entry| package::PackageModule {
+                path: format!("{}{}", python::RESOURCE_ID_PREFIX, entry.path),
+                source: entry.source,
+            }));
+        }
+    }
     // The layers' own entries, under the prefix the runtime keys the layer root by, read
     // out of the SAME budget the deployment package was: what one invocation holds is
     // bounded across its mounts rather than per archive. A layer this emulator holds no
@@ -801,6 +823,7 @@ pub async fn run_invocation(mut invocation: Invocation) -> Result<Invoked, Unrun
                         modules: Arc::new(modules),
                         handler: handler.clone(),
                         environment,
+                        architecture: invocation.architecture.clone(),
                         event,
                         request_id: invocation.request_id.clone(),
                         invoked_function_arn: invocation.invoked_function_arn.clone(),
@@ -1951,6 +1974,7 @@ mod tests {
                     modules: &modules,
                     handler: "lambda_function.handler",
                     environment: &environment,
+                    architecture: crate::state::DEFAULT_ARCHITECTURE,
                     event: None,
                     request_id: "11111111-2222-3333-4444-555555555555",
                     invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe",

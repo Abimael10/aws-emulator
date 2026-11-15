@@ -152,6 +152,9 @@ pub struct Served {
     pub handler: String,
     /// The environment this invocation runs with.
     pub environment: BTreeMap<String, String>,
+    /// The `Architectures` entry the function is configured for, which the run reports as
+    /// the machine its execution environment has.
+    pub architecture: String,
     /// The event payload, as the caller sent it.
     pub event: Option<String>,
     /// This invocation's request id.
@@ -175,6 +178,7 @@ impl Served {
             modules: &self.modules,
             handler: &self.handler,
             environment: &self.environment,
+            architecture: &self.architecture,
             event: self.event.as_deref(),
             request_id: &self.request_id,
             invoked_function_arn: &self.invoked_function_arn,

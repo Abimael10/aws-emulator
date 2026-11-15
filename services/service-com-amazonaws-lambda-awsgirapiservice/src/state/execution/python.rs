@@ -111,6 +111,16 @@ use super::run_memory::{faulted_bytes, Held};
 /// The name of the module the host functions live on, as the runtime source imports it.
 const HOST_MODULE: &str = "_lambda_host";
 
+/// The prefix a DATA entry of the deployment package is keyed under among the entries the
+/// run is handed ([`super::package::python_resources_within`]).
+///
+/// A package's data file is not a module — nothing imports it — so it is keyed where no
+/// module name can resolve to it: the runtime's own finder resolves a module name to
+/// `<name>.py` or `<name>/__init__.py` ([`super::bootstrap`]), and no module name begins
+/// with this. What reads these entries is the resource reading of the standard library, which
+/// the runtime's loader answers from the same held entries.
+pub const RESOURCE_ID_PREFIX: &str = "resource:";
+
 /// Every native module this interpreter registers, out of the engine's own two pools.
 ///
 /// This list IS the containment of the native surface: a name absent from it is dropped
@@ -130,7 +140,10 @@ const HOST_MODULE: &str = "_lambda_host";
 /// `syslog`, `_signal`, `_interpreters`, `_interpchannels`, `_interpqueues`,
 /// `_testinternalcapi`, and every other module whose calls land on the host. `posix` and
 /// `_thread` are absent for the same reason, and this module supplies its OWN of each
-/// instead (see [`host_posix_module`], [`host_thread_module`]).
+/// instead (see [`host_posix_module`], [`host_thread_module`]). Where one of those names a
+/// module of the standard library a handler imports (`socket`, `ssl`, `select`), the module
+/// ITSELF is supplied on the import path in Python ([`runtime_stdlib`]), so the import
+/// succeeds and only the call needing the absent capability is refused.
 ///
 /// Two of the names here are registered but PATCHED before guest code runs, because the
 /// frozen standard library needs the rest of each: `_io`, whose host file-opening calls
@@ -223,6 +236,10 @@ pub struct Run<'a> {
     /// The environment the invocation runs with: the function's own variables plus the
     /// ones the runtime sets.
     pub environment: &'a BTreeMap<String, String>,
+    /// The `Architectures` entry the function is configured for, which is the instruction
+    /// set its execution environment has — what the run reports as its own machine
+    /// ([`super::host_posix::install_environment_identity`]).
+    pub architecture: &'a str,
     /// The event payload, as the caller sent it.
     pub event: Option<&'a str>,
     /// The invocation's request id.
@@ -709,7 +726,13 @@ fn initialize(
     bounds: &Arc<Bounds>,
     held: &TraceCell,
 ) -> PyResult<Initialized> {
-    let environ = prepare(vm, request.environment, request.budget.recursion_limit, session)?;
+    let environ = prepare(
+        vm,
+        request.environment,
+        request.architecture,
+        request.budget.recursion_limit,
+        session,
+    )?;
     let scope = vm.new_scope_with_builtins();
     let code = vm
         .compile(
@@ -905,6 +928,7 @@ fn interpreter(contained: &Arc<AtomicBool>) -> Interpreter {
 fn prepare(
     vm: &VirtualMachine,
     environment: &BTreeMap<String, String>,
+    architecture: &str,
     recursion_limit: usize,
     session: &Arc<Session>,
 ) -> PyResult<EnvironmentSinks> {
@@ -921,6 +945,11 @@ fn prepare(
     // the `open` flags — installed before any import of `os`, because that is where `os`
     // takes them from ([`super::host_posix::install_data_surface`]).
     super::host_posix::install_data_surface(vm)?;
+    // What the execution environment this run is in IS, which `os.uname` answers and the
+    // standard library's `platform` module is built on: the HOST states it, from the
+    // function's own configuration ([`super::host_posix::install_environment_identity`]),
+    // rather than anything of the machine this process is on.
+    super::host_posix::install_environment_identity(vm, environment, architecture)?;
     // The codec registry, AFTER the two installations above: whatever it imports then sees
     // the same patched `io` and the same complete `os` every later import sees, so it can
     // hold neither an unpatched way of opening a host file nor a half-built `os`.
@@ -1335,13 +1364,15 @@ fn runtime_modules() -> ::serde_json::Map<String, ::serde_json::Value> {
 }
 
 /// The modules of the STANDARD LIBRARY this runtime supplies in place of the frozen ones:
-/// the socket module a Python program expects of its operating system and the HTTP client
-/// built on one ([`super::guest_http`]). Resolved before the frozen standard library and
-/// after the deployment package's own entries, which is where a runtime's own standard
-/// library sits.
+/// the socket module a Python program expects of its operating system, the HTTP client
+/// built on one and the TLS layer beside it ([`super::guest_http`]), and the waiting
+/// interface the standard library's own `selectors` is built out of
+/// ([`super::guest_select`]). Resolved before the frozen standard library and after the
+/// deployment package's own entries, which is where a runtime's own standard library sits.
 fn runtime_stdlib() -> ::serde_json::Map<String, ::serde_json::Value> {
     super::guest_http::runtime_stdlib_modules()
         .into_iter()
+        .chain(super::guest_select::runtime_stdlib_modules())
         .map(|module| (module.path, ::serde_json::Value::String(module.source)))
         .collect()
 }
@@ -1809,7 +1840,7 @@ const REFUSED_POSIX_CALLS: &[&str] = &[
     "pathconf", "fpathconf", "process_cpu_count", "sched_getaffinity", "sched_setaffinity",
     "sysconf", "waitstatus_to_exitcode", "lockf", "getrandom",
     "stat", "statvfs", "symlink", "sync", "system", "tcgetpgrp", "tcsetpgrp", "times", "truncate",
-    "ttyname", "umask", "uname", "unlink", "utime", "wait", "wait3", "wait4", "waitpid", "write",
+    "ttyname", "umask", "unlink", "utime", "wait", "wait3", "wait4", "waitpid", "write",
     "writev",
 ];
 
@@ -2280,6 +2311,7 @@ mod tests {
                         modules: &modules,
                         handler: &handler,
                         environment: &environment,
+                        architecture: crate::state::DEFAULT_ARCHITECTURE,
                         event: event.as_deref(),
                         request_id: "11111111-2222-3333-4444-555555555555",
                         invoked_function_arn:

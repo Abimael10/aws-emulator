@@ -55,6 +55,7 @@ fn ran(source: &str, event: &str) -> Finished {
                 modules: &modules,
                 handler: HANDLER,
                 environment: &BTreeMap::new(),
+                architecture: crate::state::DEFAULT_ARCHITECTURE,
                 event: Some(event.as_str()),
                 request_id: "11111111-2222-3333-4444-555555555555",
                 invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe",

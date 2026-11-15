@@ -1195,3 +1195,21 @@ mod zz_probe;
 mod zz_probe_whole_emulator;
 //
 // of this target at all, so the list holds pairs only.
+//! Single integration-test target for the router.
+//!
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]` / `mod`
+//! pair, keeping the list sorted: one pair per suite and nothing else, so a landing has one
+//! place to insert and nothing to keep consistent.
+//! A suite that is not declared here compiles nowhere and its tests never run, and a suite
+//! left at the top level of `tests/` fails the build. Declare each suite exactly ONCE: this
+//! is one crate root, so a second `mod` for the same name is `E0428` and fails every suite
+//! in this target. An inner doc comment (`//!`) is legal only before the first item, so
+//! THESE lines are the only place one may stand — past the first item `//!` is `E0753` and
+//! compiles nothing, so leave no note below, not even an ordinary `//` one: this file is a
+//! declaration list, and the rules stand here. A note about a landing belongs in the suite
+//! it is about, where it is read with the test it explains (`all/appended_notes.rs` keeps
+//! the ones this file had collected).
+//! `all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check all three halves of that, for this
+//! file and for every service crate's `tests/all.rs`.

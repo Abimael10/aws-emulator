@@ -18,11 +18,16 @@
 //! * [`MAX_MODULE_BYTES`] of one entry, for the same reason at the level of a single file.
 //!
 //! Only entries that are SOURCE the engine running the package can compile — one of its
-//! suffixes ([`PYTHON_SUFFIXES`], [`JAVASCRIPT_SUFFIXES`]) and valid UTF-8 — are kept,
-//! because a source file is the only thing this emulator's in-process engines can import: a
-//! compiled artefact or a native extension shipped in the package is NOT loaded (nothing
-//! here loads a host library), so a handler that needs one fails to import exactly as it
-//! would if the file were absent, and nothing is reported as having run.
+//! suffixes ([`PYTHON_SUFFIXES`], [`JAVASCRIPT_SUFFIXES`]) and valid UTF-8 — are kept as
+//! MODULES, because a source file is the only thing this emulator's in-process engines can
+//! import: a compiled artefact or a native extension shipped in the package is NOT loaded
+//! (nothing here loads a host library), so a handler that needs one fails to import exactly
+//! as it would if the file were absent, and nothing is reported as having run.
+//!
+//! The other entries are the package's own DATA — the files a package ships beside its
+//! modules and reads back rather than imports — and are read as that ([`data_entries`]),
+//! under the same three bounds and out of what is LEFT of the budget once the modules have
+//! been read, so a package's modules are never crowded out by its data.
 
 /// One module of a deployment package: the archive-relative path it was stored under and
 /// its source text.
@@ -103,6 +108,22 @@ pub fn python_modules_within(
     source_modules(zip_bytes, PYTHON_SUFFIXES, budget)
 }
 
+/// Every DATA entry of a Python deployment package: the files it ships that are not modules
+/// the interpreter imports but files the package READS — the certificate bundle, the schema,
+/// the table a client library looks up — which the standard library's own resource reading
+/// (`importlib.resources`) answers from on a managed runtime.
+///
+/// Read out of what is LEFT of `budget` after the modules, so the modules of a package whose
+/// data is large are read in full. An entry whose bytes are not text is left out for the
+/// reason a module's are: nothing here holds the bytes of a file this emulator cannot
+/// present, and a package's own file that is absent reads as absent.
+pub fn python_resources_within(
+    zip_bytes: Option<&[u8]>,
+    budget: &mut ReadBudget,
+) -> Result<Vec<PackageModule>, PackageFault> {
+    data_entries(zip_bytes, PYTHON_SUFFIXES, budget)
+}
+
 /// Every JavaScript (and JSON) module `zip_bytes` holds, in the archive's own order.
 ///
 /// `Ok(vec![])` is a readable archive with no loadable module in it, which is a package
@@ -127,6 +148,31 @@ fn source_modules(
     suffixes: &[&str],
     budget: &mut ReadBudget,
 ) -> Result<Vec<PackageModule>, PackageFault> {
+    entries_within(zip_bytes, &|path| named_by(path, suffixes), budget)
+}
+
+/// Every entry of `zip_bytes` whose path ends in NONE of `suffixes` and whose bytes are
+/// text: the package's own data, read under the same bounds.
+fn data_entries(
+    zip_bytes: Option<&[u8]>,
+    suffixes: &[&str],
+    budget: &mut ReadBudget,
+) -> Result<Vec<PackageModule>, PackageFault> {
+    entries_within(zip_bytes, &|path| !named_by(path, suffixes), budget)
+}
+
+/// Whether `path` ends in one of `suffixes`.
+fn named_by(path: &str, suffixes: &[&str]) -> bool {
+    suffixes.iter().any(|suffix| path.ends_with(suffix))
+}
+
+/// Every entry of `zip_bytes` that `kept` names and whose bytes are text, read under this
+/// module's three bounds.
+fn entries_within(
+    zip_bytes: Option<&[u8]>,
+    kept: &dyn Fn(&str) -> bool,
+    budget: &mut ReadBudget,
+) -> Result<Vec<PackageModule>, PackageFault> {
     let Some(zip_bytes) = zip_bytes else {
         return Err(PackageFault::NotHeld);
     };
@@ -146,7 +192,7 @@ fn source_modules(
             continue;
         };
         let path = normalized_path(name.as_ref());
-        if !suffixes.iter().any(|suffix| path.ends_with(suffix)) {
+        if !kept(&path) {
             continue;
         }
         // The read is capped by what is LEFT of the whole-invocation budget and by the
@@ -220,6 +266,64 @@ mod tests {
                 "case {name:?}: expected the modules {wanted:?}, got {actual:?}"
             );
         }
+    }
+
+    /// The DATA entries of a Python package are exactly the ones that are not modules: one
+    /// row per kind of file a package ships beside its modules — at a package directory's
+    /// root, at the archive's root, one directory deeper, spelled with a leading `./` and
+    /// with `\` separators — and one per entry that is a module or is not text at all.
+    #[test]
+    fn the_data_entries_of_an_archive_are_the_ones_that_are_not_modules() {
+        let cases: &[(&str, &[u8], Option<&str>)] = &[
+            (
+                "vendored/cacert.pem",
+                b"-----BEGIN CERTIFICATE-----\n",
+                Some("vendored/cacert.pem"),
+            ),
+            ("data.json", b"{\"k\":1}", Some("data.json")),
+            ("./nested/table.csv", b"id\n1\n", Some("nested/table.csv")),
+            ("win\\notes.txt", b"note\n", Some("win/notes.txt")),
+            ("lambda_function.py", b"x = 1\n", None),
+            ("pkg/__init__.py", b"", None),
+            ("blob.bin", b"\xff\xfe\x00", None),
+        ];
+        for (name, bytes, expected) in cases {
+            let held = archive(&[(name, bytes)]);
+            let entries = python_resources_within(Some(&held), &mut ReadBudget::default())
+                .expect("a readable archive");
+            let actual: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+            let wanted: Vec<&str> = expected.iter().copied().collect();
+            assert_eq!(
+                actual, wanted,
+                "case {name:?}: expected the data entries {wanted:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// One archive holding both, read the way a run reads it: every module is read, and the
+    /// text of a data entry is the text the archive stored.
+    #[test]
+    fn an_archives_modules_and_data_are_both_read() {
+        let held = archive(&[
+            ("lambda_function.py", b"def handler(e, c):\n    return 1\n"),
+            ("vendored/cacert.pem", b"-----BEGIN CERTIFICATE-----\n"),
+            ("vendored/__init__.py", b""),
+        ]);
+        let mut budget = ReadBudget::default();
+        let modules = python_modules_within(Some(&held), &mut budget).expect("the modules");
+        let data = python_resources_within(Some(&held), &mut budget).expect("the data");
+        let module_paths: Vec<&str> = modules.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(
+            module_paths,
+            vec!["lambda_function.py", "vendored/__init__.py"],
+            "expected both modules to be read, got {module_paths:?}"
+        );
+        let read = data.first().map(|entry| entry.source.as_str());
+        assert_eq!(
+            read,
+            Some("-----BEGIN CERTIFICATE-----\n"),
+            "expected the stored text of the data entry back, got {read:?}"
+        );
     }
 
     /// The source read back is the source stored, for an entry of each size class up to

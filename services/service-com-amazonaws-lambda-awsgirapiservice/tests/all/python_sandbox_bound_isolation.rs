@@ -120,6 +120,7 @@ fn ran(source: &str, budget: Budget, clock: &Clock, case: &str) -> Finished {
                     modules: &modules,
                     handler: HANDLER,
                     environment: &environment,
+                    architecture: service_com_amazonaws_lambda_awsgirapiservice::state::DEFAULT_ARCHITECTURE,
                     event: None,
                     request_id: "11111111-2222-3333-4444-555555555555",
                     invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe",

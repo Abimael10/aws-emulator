@@ -487,14 +487,20 @@ mod provisioned_concurrency;
 mod provisioned_concurrency_resolution;
 #[path = "all/published_function_arn.rs"]
 mod published_function_arn;
+#[path = "all/python_environment_identity.rs"]
+mod python_environment_identity;
 #[path = "all/python_host_surface_isolation.rs"]
 mod python_host_surface_isolation;
+#[path = "all/python_package_resources.rs"]
+mod python_package_resources;
 #[path = "all/python_runtime_bundled_sdk.rs"]
 mod python_runtime_bundled_sdk;
 #[path = "all/python_runtime_os_surface.rs"]
 mod python_runtime_os_surface;
 #[path = "all/python_sandbox_bound_isolation.rs"]
 mod python_sandbox_bound_isolation;
+#[path = "all/python_select_surface.rs"]
+mod python_select_surface;
 #[path = "all/python_tls_surface.rs"]
 mod python_tls_surface;
 #[path = "all/queue_message_count_snapshot.rs"]

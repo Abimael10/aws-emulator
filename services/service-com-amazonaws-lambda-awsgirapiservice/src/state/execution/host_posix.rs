@@ -21,6 +21,10 @@
 //! * `urandom` answers bytes from the host's own generator, which is where a Python
 //!   program's randomness comes from; no host device is opened for it;
 //! * `getpid` answers the single process id a function sees;
+//! * `uname` answers what the function's own EXECUTION ENVIRONMENT is
+//!   ([`install_environment_identity`]) — the operating system a managed runtime runs on,
+//!   the environment's own name and the machine the function's `Architectures` names — and
+//!   reads nothing of the machine, kernel or host name THIS process runs on;
 //! * `register_at_fork` accepts a registration of the callables a caller wants run around a
 //!   `fork` and runs none of them, because nothing here ever forks.
 //!
@@ -31,13 +35,14 @@
 //! rather than a stub that pretends.
 //!
 //! What `os` re-exports as DATA is a different thing, and it is all here
-//! ([`install_data_surface`]): the `stat_result` type and the `open` flags are a type and a
-//! handful of numbers, not calls, and the standard library reads them off `os` WHILE BEING
-//! IMPORTED — `shutil` (and so `tempfile`, `zipfile` and `tarfile`) reads `os.stat_result`,
-//! `glob` (and so `pathlib`) reads `os.O_RDONLY` — so a module missing them is one those
-//! modules cannot be imported from at all, which is not what a managed runtime's complete
-//! standard library does. Holding them reaches nothing: there is no call here to pass a
-//! flag to, and the only `stat_result` a run ever sees is one guest code built itself.
+//! ([`install_data_surface`]): the `stat_result` and `uname_result` types and the `open`
+//! flags are types and a handful of numbers, not calls, and the standard library reads them
+//! off `os` WHILE BEING IMPORTED — `shutil` (and so `tempfile`, `zipfile` and `tarfile`)
+//! reads `os.stat_result`, `glob` (and so `pathlib`) reads `os.O_RDONLY` — so a module
+//! missing them is one those modules cannot be imported from at all, which is not what a
+//! managed runtime's complete standard library does. Holding them reaches nothing: there is
+//! no call here to pass a flag to, and the only `stat_result` a run ever sees is one guest
+//! code built itself.
 
 /// The module, as the engine's own module macro declares one. Registered under the name
 /// `posix`, which is the name Python's `os` and the import system look for.
@@ -92,6 +97,21 @@ pub(crate) mod module {
     #[pyfunction]
     fn getpid() -> i32 {
         1
+    }
+
+    /// What the EXECUTION ENVIRONMENT this run is in is, as a POSIX `uname` answers it.
+    ///
+    /// The five values are the HOST's, installed for this environment before any guest code
+    /// ran ([`super::install_environment_identity`]): nothing here reads this process's own
+    /// machine, kernel or host name, so what a run is told about the environment it is in is
+    /// what this emulator decided that environment is. The standard library's own `platform`
+    /// module is built on this call, which is how a function reads the architecture it is
+    /// configured for.
+    #[pyfunction]
+    fn uname(vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        let identity = attribute_of(vm, super::ENVIRONMENT_IDENTITY)?;
+        let result = attribute_of(vm, "uname_result")?;
+        result.call((identity,), vm)
     }
 
     /// `wanted` random bytes, from the host's own generator. No host device is opened: the
@@ -277,8 +297,77 @@ def _bind_fields():
 _bind_fields()
 "#;
 
+/// The TYPE a POSIX `uname` answers with, which `os` re-exports as `os.uname_result`.
+///
+/// The same shape as the type above, over the five values `uname` answers: the sequence a
+/// caller unpacks, with each value also reachable by its name — which is how the standard
+/// library's own `platform` module reads one.
+const UNAME_RESULT_SOURCE: &str = r#"
+class uname_result(tuple):
+    """What the system a POSIX uname answers for is."""
+
+    __module__ = "os"
+
+    _fields = ("sysname", "nodename", "release", "version", "machine")
+    n_fields = 5
+    n_sequence_fields = 5
+    n_unnamed_fields = 0
+
+    def __new__(cls, sequence):
+        values = tuple(sequence)
+        if len(values) != cls.n_sequence_fields:
+            raise TypeError(
+                "uname_result() takes a %d-sequence (%d-sequence given)"
+                % (cls.n_sequence_fields, len(values))
+            )
+        return tuple.__new__(cls, values)
+
+    def __repr__(self):
+        return "posix.uname_result(%s)" % ", ".join(
+            "%s=%r" % (name, value) for name, value in zip(self._fields, self)
+        )
+
+
+def _bind_fields():
+    for index, name in enumerate(uname_result._fields):
+        setattr(uname_result, name, property(lambda self, index=index: self[index]))
+
+
+_bind_fields()
+"#;
+
+/// The attribute of `posix` the five values of [`module::uname`] are held in, written by the
+/// HOST for the execution environment a run is in. Named with a leading underscore, so
+/// `os`'s own `from posix import *` does not re-export it.
+const ENVIRONMENT_IDENTITY: &str = "_environment_identity";
+
+/// The operating system a managed runtime runs on, which is what a run is told it is in.
+///
+/// The same reading the node runtime of this crate reports as that runtime's own `os.type()`
+/// (`super::node::core_modules`): a function's execution environment is Linux, whatever
+/// machine this emulator's process is on.
+const ENVIRONMENT_SYSTEM: &str = "Linux";
+
+/// Which environment variable names the EXECUTION ENVIRONMENT itself, which is the host name
+/// a run reports: the log stream one invocation's environment writes its log to is that
+/// environment's own, which is the same reading the node runtime reports as `os.hostname()`.
+const ENVIRONMENT_NAME_VARIABLE: &str = "AWS_LAMBDA_LOG_STREAM_NAME";
+
+/// The machine name a POSIX `uname` gives the instruction set an `Architectures` entry names.
+///
+/// The model's value set is `x86_64` and `arm64` (`smithy_query(query="shape",
+/// shape="Architecture")`); `uname` names the first of them by that same name and the second
+/// `aarch64`, which is the name the Linux kernel gives that instruction set.
+#[must_use]
+pub(crate) fn machine_of(architecture: &str) -> &str {
+    match architecture {
+        "arm64" => "aarch64",
+        other => other,
+    }
+}
+
 /// Install on the `posix` module above everything `os` re-exports from it as DATA: the
-/// [`STAT_RESULT_SOURCE`] type and the [`POSIX_FLAGS`].
+/// [`STAT_RESULT_SOURCE`] and [`UNAME_RESULT_SOURCE`] types and the [`POSIX_FLAGS`].
 ///
 /// Called before `os` is imported for the first time, because `os` builds itself out of the
 /// names it finds on this module (`from posix import *`). Nothing here is containment: the
@@ -291,19 +380,71 @@ pub(crate) fn install_data_surface(
     for (name, value) in POSIX_FLAGS {
         system.set_attr(*name, vm.ctx.new_int(*value), vm)?;
     }
+    for (name, source) in [
+        ("stat_result", STAT_RESULT_SOURCE),
+        ("uname_result", UNAME_RESULT_SOURCE),
+    ] {
+        let built = built_type(vm, name, source)?;
+        system.set_attr(name, built, vm)?;
+    }
+    Ok(())
+}
+
+/// The type `source` defines under the name `name`, built in a scope of its own.
+fn built_type(
+    vm: &::rustpython_vm::VirtualMachine,
+    name: &str,
+    source: &str,
+) -> ::rustpython_vm::PyResult<::rustpython_vm::PyObjectRef> {
     let scope = vm.new_scope_with_builtins();
     let code = vm
         .compile(
-            STAT_RESULT_SOURCE,
+            source,
             ::rustpython_vm::compiler::Mode::Exec,
             "<lambda-posix>".to_owned(),
         )
         .map_err(|error| {
-            vm.new_runtime_error(format!("the stat_result source does not compile: {error}"))
+            vm.new_runtime_error(format!("the {name} source does not compile: {error}"))
         })?;
     vm.run_code_obj(code, scope.clone())?;
-    let stat_result = scope.globals.get_item("stat_result", vm)?;
-    system.set_attr("stat_result", stat_result, vm)?;
+    scope.globals.get_item(name, vm)
+}
+
+/// Install the identity of the EXECUTION ENVIRONMENT a run is in, which [`module::uname`]
+/// answers from: the operating system a managed runtime runs on, the environment's own name
+/// as `environment` states it, no kernel release or version of its own, and the machine the
+/// function's `architecture` names.
+///
+/// Written by the HOST, before any guest code runs, for exactly the reason the environment
+/// mapping is: what a run is told about the environment it is in is this emulator's own
+/// decision rather than anything of the machine this process happens to be on. The kernel
+/// release and version are stated as the empty string every `uname` field no value is known
+/// for is stated as: the environment names no kernel of its own, and naming this process's
+/// would report the HOST rather than the function's environment. An embedder that hands this
+/// runtime no environment at all — a script run of another service, which is nobody's Lambda
+/// invocation — names no log stream either, so its run reports no name for the same reason:
+/// it has none.
+pub(crate) fn install_environment_identity(
+    vm: &::rustpython_vm::VirtualMachine,
+    environment: &::std::collections::BTreeMap<String, String>,
+    architecture: &str,
+) -> ::rustpython_vm::PyResult<()> {
+    let system = vm.import("posix", 0)?;
+    let named = environment
+        .get(ENVIRONMENT_NAME_VARIABLE)
+        .map(String::as_str)
+        .unwrap_or_default();
+    let identity: Vec<::rustpython_vm::PyObjectRef> = [
+        ENVIRONMENT_SYSTEM,
+        named,
+        "",
+        "",
+        machine_of(architecture),
+    ]
+    .into_iter()
+    .map(|value| vm.ctx.new_str(value).into())
+    .collect();
+    system.set_attr(ENVIRONMENT_IDENTITY, vm.ctx.new_tuple(identity), vm)?;
     Ok(())
 }
 

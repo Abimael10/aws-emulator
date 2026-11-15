@@ -141,6 +141,11 @@ pub async fn run(claimed: &ClaimedAction, access: Option<AwsAccess>) -> ActionOu
                         // An `aws:executeScript` step's script is given its values through
                         // its `InputPayload`, so the run carries no environment of its own.
                         environment: &::std::collections::BTreeMap::new(),
+                        // The instruction set the environment the script runs in has, which
+                        // the run reports as its own machine. A step names none, so it is
+                        // the one the engine's own runtime reports when none is named.
+                        architecture:
+                            ::service_com_amazonaws_lambda_awsgirapiservice::state::DEFAULT_ARCHITECTURE,
                         event: Some(&event),
                         request_id: &request_id,
                         invoked_function_arn: "",
