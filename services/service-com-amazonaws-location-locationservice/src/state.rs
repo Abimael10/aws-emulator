@@ -24,6 +24,15 @@ pub use resource_tags::{
     MAX_TAGS_PER_RESOURCE, RESERVED_TAG_KEY_PREFIX, RESOURCE_ARN_MEMBER, TAGS_MEMBER,
 };
 
+/// The geofence collection a `ConsumerArn` names and the cursor a tracker's
+/// consumers are paged with, kept beside this module because the three tracker
+/// consumer operations all reach the same per-tracker association set.
+mod tracker_consumers;
+pub use tracker_consumers::{
+    consumer_collection_name, not_a_geofence_collection_arn, CONSUMER_ARN_MEMBER,
+    TRACKER_CONSUMERS_CURSOR,
+};
+
 /// The sentence a value outside a member's documented set is refused with, kept
 /// beside this module because every such check in the crate words it the same way.
 mod value_sets;
@@ -315,13 +324,16 @@ pub const MAX_BATCH_PUT_GEOFENCE_ENTRIES: usize = 10;
 /// clock owes it no later transition out of `PENDING`.
 pub const GEOFENCE_STATUS_ACTIVE: &str = "ACTIVE";
 
-/// Emulator memory bound, NOT an AWS quota: consumer associations held per tracker.
-/// [`Tracker::associate_consumer`] reports no room past it rather than growing the
-/// store without limit, so a caller minting unbounded collection ARNs is refused
-/// instead of accumulating them. It is the contract an association write uses:
-/// `AssociateTrackerConsumer` is a scaffolded 501 today, so the only way into this
-/// set goes through that helper.
-pub const MAX_CONSUMERS_PER_TRACKER: usize = 100;
+/// Geofence collections one tracker may be associated with at once: the
+/// `AssociateTrackerConsumer` doc states "You can associate up to five geofence
+/// collections to each tracker resource."
+///
+/// `AssociateTrackerConsumer` refuses past it with the modelled
+/// `ServiceQuotaExceededException`, which also bounds what this set holds however
+/// many collection ARNs a caller mints. It is the contract an association write
+/// uses: every write into this set goes through [`Tracker::associate_consumer`],
+/// which reports no room past it.
+pub const MAX_CONSUMERS_PER_TRACKER: usize = 5;
 
 impl Tracker {
     /// Record `sample` in its device's history, keeping the history sorted ascending
@@ -438,8 +450,9 @@ impl Tracker {
     ///
     /// An ARN the tracker already holds stays held and is never refused (the set
     /// holds each one once). `false` is "no room": the tracker already holds
-    /// [`MAX_CONSUMERS_PER_TRACKER`] other consumers, so the association is not made
-    /// and the caller refuses it rather than growing the store without limit.
+    /// [`MAX_CONSUMERS_PER_TRACKER`] other consumers, which is the documented
+    /// per-tracker quota, so the association is not made and the caller refuses the
+    /// request with the modelled quota error.
     #[must_use]
     pub fn associate_consumer(&mut self, consumer_arn: String) -> bool {
         if self.consumer_arns.contains(&consumer_arn) {

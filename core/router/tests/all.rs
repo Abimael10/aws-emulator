@@ -2248,3 +2248,8 @@ mod zz_probe_whole_emulator;
 // ahead of the first item, and one a landing leaves below the list is `E0753` and compiles no
 // suite of this target. With none anywhere in the file, no appended, re-typed or merged copy
 // of a line of it can be one.
+// the file, no merge of two landings can leave one there. A name declared twice, and a
+// suite file no declaration names, each fail every suite here too.
+// points the declaration into `tests/all/`. What a suite covers, and why it drives the
+// where it is read beside the test it explains; `all/appended_notes.rs`,
+// keep the notes earlier landings had appended here.

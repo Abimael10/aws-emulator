@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The emulator memory bounds every request-growable container of this store carries.
+//! The bounds every request-growable container of this store carries.
 //!
 //! RULE: a container a caller can grow one entry per request is bounded, so repeated
 //! writes cannot grow the in-memory store without limit — the position history and the
 //! device map per tracker, the geofences per collection, and the consumer associations
-//! per tracker. Each bound is the emulator's own (not an AWS quota) and each is applied
-//! by the state helper that does the insert, which is the contract a write uses: a
-//! handler reaches these containers through that helper rather than inserting itself.
+//! per tracker. Each bound is applied by the state helper that does the insert, which
+//! is the contract a write uses: a handler reaches these containers through that
+//! helper rather than inserting itself. The first three bounds are the emulator's own
+//! (not an AWS quota); the consumer bound is the quota
+//! `AssociateTrackerConsumer` documents, and bounds the container as well.
 //!
 //! The device-position half is driven over HTTP by the other suites, and so is the
-//! geofence write path (`tests/all/geofences.rs` drives `BatchPutGeofence`); the
-//! BOUNDS themselves are asserted against the state helpers directly, because
-//! reaching one over the wire would take a thousand requests per bound. The consumer
-//! half has no implemented writer yet (`AssociateTrackerConsumer` is a scaffolded
-//! 501 owning its own stub issue), so it is asserted the same way.
+//! geofence write path (`tests/all/geofences.rs` drives `BatchPutGeofence`) and the
+//! consumer half (`tests/all/tracker_consumers.rs` drives `AssociateTrackerConsumer`);
+//! the BOUNDS themselves are asserted against the state helpers directly, because
+//! reaching one over the wire would take a thousand requests per bound.
 
 use service_com_amazonaws_location_locationservice::state::{
     Geofence, GeofenceCollection, Tracker, MAX_CONSUMERS_PER_TRACKER,

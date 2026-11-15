@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateTrackerConsumer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateTrackerConsumer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateTrackerConsumer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: associates one geofence collection with one tracker, by storing the
+//! collection's ARN in the tracker's own association set
+//! ([`crate::state::Tracker::consumer_arns`]) that `ListTrackerConsumers` reports and
+//! `DisassociateTrackerConsumer` removes from. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +118,24 @@ impl From<AssociateTrackerConsumerErrorModeled> for AssociateTrackerConsumerErro
     }
 }
 
+/// This operation's channel for a member the request got wrong: the shape comes from
+/// [`crate::state::field_validation_exception`], which every operation shares; only the
+/// lift into this operation's own error enum is local.
+fn field_validation_failed(member: &str, why: String) -> AssociateTrackerConsumerErrorModeled {
+    AssociateTrackerConsumerErrorModeled::ValidationException(
+        crate::state::field_validation_exception(member, why),
+    )
+}
+
+/// The `ResourceNotFoundException` this operation states for a tracker name this
+/// service holds no tracker under, worded by the sentence every refusal about a
+/// missing resource of this crate shares.
+fn tracker_not_found(tracker_name: &str) -> AssociateTrackerConsumerErrorModeled {
+    AssociateTrackerConsumerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::resource_not_found(crate::state::TRACKER_RESOURCE, tracker_name),
+    })
+}
+
 /// The `AssociateTrackerConsumer` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,18 +172,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateTrackerConsumer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateTrackerConsumerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateTrackerConsumer"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateTrackerConsumerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Amazon Location state store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // The modelled `Arn` pattern admits any well-formed ARN, so that the value
+        // names a geofence collection of this service is this service's own check, and
+        // it is a bad REQUEST rather than a missing resource.
+        let collection_name = crate::state::consumer_collection_name(&input.consumer_arn)
+            .map_err(|why| field_validation_failed(crate::state::CONSUMER_ARN_MEMBER, why))?;
+
+        let mut store = state.lock();
+
+        // The association is held on the tracker the request addresses, so a name no
+        // tracker is stored under is refused before the ARN is resolved.
+        if !store.trackers.contains_key(&input.tracker_name) {
+            return Err(tracker_not_found(&input.tracker_name).into());
+        }
+
+        // An association links two resources this service holds, so the ARN is stored
+        // only once the collection it names is one of them: what the list reports is a
+        // collection that exists, never a reference to nothing. The stored form is the
+        // collection's OWN ARN, so the list reports the resource rather than the text
+        // one request happened to address it by.
+        let consumer_arn = store
+            .geofence_collections
+            .get(&collection_name)
+            .map(|collection| collection.arn.clone())
+            .ok_or_else(|| {
+                AssociateTrackerConsumerErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::resource_not_found(
+                            crate::state::GEOFENCE_COLLECTION_RESOURCE,
+                            &collection_name,
+                        ),
+                    },
+                )
+            })?;
+
+        let tracker = store
+            .trackers
+            .get_mut(&input.tracker_name)
+            .ok_or_else(|| tracker_not_found(&input.tracker_name))?;
+
+        // Associating a collection the tracker already holds leaves it held and
+        // answers like the first call: the tracker holds each consumer once. Past the
+        // documented per-tracker quota the helper reports no room and the association
+        // is not made.
+        if !tracker.associate_consumer(consumer_arn) {
+            return Err(
+                AssociateTrackerConsumerErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The maximum number of geofence collections ({}) associated with tracker resource {} has been reached.",
+                            crate::state::MAX_CONSUMERS_PER_TRACKER,
+                            input.tracker_name,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(AssociateTrackerConsumerOutput {})
     }
 }

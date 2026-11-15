@@ -41,6 +41,8 @@ mod route_calculators;
 mod state_memory_bounds;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tracker_consumers.rs"]
+mod tracker_consumers;
 #[path = "all/trackers.rs"]
 mod trackers;
 #[path = "all/value_set_refusals.rs"]

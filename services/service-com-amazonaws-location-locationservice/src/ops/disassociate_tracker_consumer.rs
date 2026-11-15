@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateTrackerConsumer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateTrackerConsumer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateTrackerConsumer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes one geofence collection from the tracker's own association
+//! set ([`crate::state::Tracker::consumer_arns`]), the set `AssociateTrackerConsumer`
+//! fills and `ListTrackerConsumers` reports. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +110,15 @@ impl From<DisassociateTrackerConsumerErrorModeled> for DisassociateTrackerConsum
     }
 }
 
+/// This operation's channel for a member the request got wrong: the shape comes from
+/// [`crate::state::field_validation_exception`], which every operation shares; only the
+/// lift into this operation's own error enum is local.
+fn field_validation_failed(member: &str, why: String) -> DisassociateTrackerConsumerErrorModeled {
+    DisassociateTrackerConsumerErrorModeled::ValidationException(
+        crate::state::field_validation_exception(member, why),
+    )
+}
+
 /// The `DisassociateTrackerConsumer` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,18 +155,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateTrackerConsumer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateTrackerConsumerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateTrackerConsumer"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateTrackerConsumerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Amazon Location state store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // The modelled `Arn` pattern admits any well-formed ARN, so that the value
+        // names a geofence collection of this service is this service's own check, and
+        // it is a bad REQUEST rather than a missing resource.
+        let collection_name = crate::state::consumer_collection_name(&input.consumer_arn)
+            .map_err(|why| field_validation_failed(crate::state::CONSUMER_ARN_MEMBER, why))?;
+
+        let mut store = state.lock();
+        let tracker = store.trackers.get_mut(&input.tracker_name).ok_or_else(|| {
+            DisassociateTrackerConsumerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::resource_not_found(
+                        crate::state::TRACKER_RESOURCE,
+                        &input.tracker_name,
+                    ),
+                },
+            )
+        })?;
+
+        // Unlinking a collection the tracker is not linked to is done by doing
+        // nothing: the association the request asks to be gone is gone either way, so
+        // the second identical call answers exactly like the first. Only the link is
+        // removed — the collection itself is untouched, and the unlink asks nothing
+        // about it, so an association can always be undone.
+        let _ = tracker.disassociate_consumer(&collection_name);
+
+        Ok(DisassociateTrackerConsumerOutput {})
     }
 }
