@@ -174,6 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The identifier is judged on its syntax before anything is resolved: one
+        // that breaks the grammar could never name a cluster, so it is a request
+        // fault rather than a missing resource.
+        if let Err(message) = st::check_identifier_syntax(
+            st::ClusterIdentifierParameter::AsNamed,
+            &input.cluster_identifier,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+        }
+
         let mut store = state.lock();
         // The only write a read makes: every transition the clock already owed at
         // this instant, which a later caller would have seen anyway.

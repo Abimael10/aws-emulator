@@ -626,8 +626,9 @@ async fn parameters_are_paged_over_the_documented_window() {
         }
     }
 
-    // A cursor this service did not hand out is refused rather than served as a
-    // mid-page offset.
+    // A cursor this service did not hand out names a position past the end of
+    // the sequence rather than a mid-page offset: the read is SERVED with that
+    // empty last page.
     for (case, cursor) in [
         ("not a cursor at all", "bogus"),
         ("a bare offset", "0"),
@@ -644,12 +645,13 @@ async fn parameters_are_paged_over_the_documented_window() {
             )
             .await;
         assert_eq!(
-            (answer.status, answer.error_code()),
-            (400, Some("InvalidParameterValue".to_string())),
-            "case {case}: expected the cursor {cursor:?} to be refused with 400 \
-             InvalidParameterValue, got {} / {:?}",
+            (answer.status, answer.text("Marker")),
+            (200, None),
+            "case {case}: expected the cursor {cursor:?} served with an empty last page, got {} \
+             / {:?} with body {}",
             answer.status,
-            answer.error_code()
+            answer.error_code(),
+            answer.body
         );
     }
 }

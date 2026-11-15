@@ -971,7 +971,8 @@ async fn the_read_pages_under_the_services_maxrecords_window() {
         "case the walked pages: expected the unpaged sequence in order, got {walked:?}"
     );
 
-    // A cursor no page handed out resumes nothing.
+    // A cursor no page handed out resumes nothing: it names a position past the
+    // end of the sequence, so the read is served with that empty last page.
     for (case, cursor) in [
         ("an invented cursor", "nonsense"),
         ("a bare offset", "20"),
@@ -980,7 +981,15 @@ async fn the_read_pages_under_the_services_maxrecords_window() {
         let bogus = emulator
             .call("DescribeRedshiftIdcApplications", &[("Marker", cursor)])
             .await;
-        assert_refused(case, &bogus, 400, "InvalidParameterValue");
+        assert_eq!(
+            (bogus.status, bogus.text("Marker")),
+            (200, None),
+            "case {case}: expected the cursor {cursor:?} served with an empty last page, got {} \
+             / {:?} with body {}",
+            bogus.status,
+            bogus.error_code(),
+            bogus.body
+        );
     }
 }
 

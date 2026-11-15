@@ -478,6 +478,20 @@ pub fn published_cluster_versions() -> Vec<ClusterVersion> {
         .collect()
 }
 
+/// Why a read whose `ClusterVersion` filter names no engine version this service
+/// offers is refused.
+///
+/// The constraint is the member's own: `smithy_query(query="doc",
+/// shape="DescribeOrderableClusterOptionsMessage", member="ClusterVersion")` —
+/// "Must be one of the version returned from DescribeClusterVersions" — so a
+/// value outside that catalog cannot select anything and is refused instead of
+/// selecting nothing. Amazon Redshift's own wording for the refusal: the fixed
+/// prefix "Cannot find Cluster version " and the requested version as its one
+/// variable part, with no trailing period.
+pub fn cluster_version_not_found_message(cluster_version: &str) -> String {
+    format!("Cannot find Cluster version {cluster_version}")
+}
+
 /// The DEFAULT cluster parameter group of every published engine version: the
 /// groups a fresh account already has, before it creates one of its own.
 ///
@@ -1261,6 +1275,19 @@ pub const SNAPSHOT_TYPE_MANUAL: &str = "manual";
 /// Source: `smithy_query(query="doc", shape="DescribeClusterSnapshotsMessage",
 /// member="SnapshotType")` — "Valid Values: automated | manual".
 pub const SNAPSHOT_TYPE_AUTOMATED: &str = "automated";
+
+/// Why a `SnapshotType` outside the domain the read admits is refused.
+///
+/// Amazon Redshift's own wording for this error class: fixed text whose one
+/// variable part is the value the request named, and which states the whole of
+/// the domain — the two types, and that naming NO type is legal too. The two
+/// spaces after the first sentence are the service's own.
+pub fn invalid_snapshot_type_message(snapshot_type: &str) -> String {
+    format!(
+        "Invalid snapshot type '{snapshot_type}'.  Must be blank or one of: \
+         {SNAPSHOT_TYPE_MANUAL}, {SNAPSHOT_TYPE_AUTOMATED}."
+    )
+}
 
 /// How many snapshot identifiers ONE batch snapshot operation accepts before it
 /// refuses the whole call with its own modelled limit fault.
@@ -3187,16 +3214,18 @@ pub const IDENTITY_CENTER_ENHANCED_CREDENTIALS_REQUIRED: &str =
 /// The opaque `Marker` cursor the paginated `Describe*` operations hand out for
 /// the record at `offset` in the stable insertion order.
 ///
-/// The offset is paired with a tag derived from it, so a cursor this service did
-/// not produce is refused rather than served as a mid-page offset: the
-/// representation is this module's business alone and a caller can only echo
-/// back one it was given.
+/// The offset is paired with a tag derived from it, so the representation is this
+/// module's business alone and a caller can only echo back one it was given: a
+/// cursor this service did not produce names no position in the sequence, which
+/// [`page_bounds_within`] resumes as the sequence's empty end rather than
+/// refusing.
 fn marker_for(offset: usize) -> String {
     format!("{offset}.{}", short_digest(&format!("marker/{offset}"), 8))
 }
 
 /// The offset a `Marker` names, or `None` when the cursor is not one
-/// [`marker_for`] produced.
+/// [`marker_for`] produced — which is a position past the end of the sequence,
+/// not a refusal. See [`page_bounds_within`].
 fn marker_offset(cursor: &str) -> Option<usize> {
     let (offset, tag) = cursor.rsplit_once('.')?;
     let offset: usize = offset.parse().ok()?;
@@ -3251,6 +3280,19 @@ pub const TAG_MAX_RECORDS_WINDOW: MaxRecordsWindow = MaxRecordsWindow {
     max: 50,
 };
 
+/// Why a `MaxRecords` outside the window the operation publishes is refused.
+///
+/// Amazon Redshift's own wording for this error class: entirely fixed text
+/// carrying the window's two published bounds, with no trailing period and no
+/// echo of the value the request named — so a caller matching the sentence sees
+/// the same one whatever it sent.
+pub fn max_records_out_of_window_message(window: MaxRecordsWindow) -> String {
+    format!(
+        "Invalid value for max records. Must be between {} and {}",
+        window.min, window.max
+    )
+}
+
 /// Resolve one page of `total` records from the request's `Marker` / `MaxRecords`,
 /// under the `MaxRecords` window of the operation serving it.
 ///
@@ -3267,6 +3309,13 @@ pub const TAG_MAX_RECORDS_WINDOW: MaxRecordsWindow = MaxRecordsWindow {
 /// whole collection, which is what each caller's page is copied and serialised
 /// from.
 ///
+/// A `Marker` is a POSITION in the sequence rather than a token the service has
+/// to have issued, so one it cannot place — a cursor nothing handed out, or one
+/// whose position the sequence no longer holds — is not a refusal either: it
+/// names a position PAST the end of the sequence, so the page it resumes carries
+/// no records and no cursor follows it. A read is not turned away for it, which
+/// is what keeps a pagination loop from aborting on a call the service serves.
+///
 /// Returns the half-open range of the page and the `Marker` to hand back, which
 /// is `Some` only when records remain after it.
 pub fn page_bounds_within(
@@ -3278,23 +3327,13 @@ pub fn page_bounds_within(
     let page_size = match max_records {
         None => window.default,
         Some(value) if value >= window.min => value.min(window.max),
-        Some(value) => {
-            return Err(format!(
-                "Invalid value for MaxRecords: {value}. MaxRecords must be at least {}.",
-                window.min
-            ))
-        }
+        Some(_) => return Err(max_records_out_of_window_message(window)),
     };
     let start = match marker {
         None => 0usize,
-        Some(cursor) => match marker_offset(cursor) {
-            Some(offset) if offset <= total => offset,
-            _ => {
-                return Err(format!(
-                    "Invalid value for Marker: '{cursor}'. The marker must be one returned by a previous call."
-                ))
-            }
-        },
+        Some(cursor) => marker_offset(cursor)
+            .filter(|offset| *offset <= total)
+            .unwrap_or(total),
     };
     let end = (start + page_size as usize).min(total);
     let next = (end < total).then(|| marker_for(end));

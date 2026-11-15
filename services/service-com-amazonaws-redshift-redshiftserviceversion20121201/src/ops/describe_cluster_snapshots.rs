@@ -222,14 +222,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // "Valid Values: automated | manual".
-        if let Some(kind) = input.snapshot_type.as_deref() {
+        // "Must be blank or one of: manual, automated" — a value outside that
+        // domain is refused, while a BLANK one names no type at all and so
+        // selects everything, exactly as an omitted member does.
+        let snapshot_type_filter = input
+            .snapshot_type
+            .as_deref()
+            .filter(|kind| !kind.trim().is_empty());
+        if let Some(kind) = snapshot_type_filter {
             if kind != st::SNAPSHOT_TYPE_AUTOMATED && kind != st::SNAPSHOT_TYPE_MANUAL {
-                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value for SnapshotType: '{kind}'. Valid Values: {} | {}",
-                    st::SNAPSHOT_TYPE_AUTOMATED,
-                    st::SNAPSHOT_TYPE_MANUAL
-                )));
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::invalid_snapshot_type_message(kind),
+                ));
             }
         }
 
@@ -293,27 +297,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         }
-        // A cluster identifier that names neither a live cluster nor any snapshot
-        // this service holds refers to nothing at all.
-        if let Some(wanted) = input.cluster_identifier.as_deref() {
-            let known = store.cluster(wanted).is_some()
-                || store
-                    .snapshots
-                    .iter()
-                    .any(|s| s.snapshot.cluster_identifier.as_deref() == Some(wanted));
-            if !known {
-                return Err(DescribeClusterSnapshotsErrorModeled::ClusterNotFoundFault(
-                    ClusterNotFoundFault {
-                        message: Some(st::cluster_not_found_message(
-                            st::ClusterNotFoundWording::IdentifierThenNotFound,
-                            wanted,
-                        )),
-                    },
-                )
-                .into());
-            }
-        }
-
+        // `ClusterIdentifier` is "the identifier of the cluster which generated
+        // the requested snapshots": a PREDICATE over the snapshots this service
+        // holds, not a cluster this operation resolves. One that matches no
+        // snapshot selects none of them, so the read is served with an empty
+        // collection rather than refused — an inventory client enumerating the
+        // snapshots of a cluster it has not created yet is asking a question with
+        // the answer "none".
+        //
         // Select by REFERENCE, then clone only the page: the work done under the
         // state lock is proportional to the page, not to the whole store.
         let mut matched: Vec<&Snapshot> = Vec::new();
@@ -334,7 +325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     continue;
                 }
             }
-            if let Some(wanted) = input.snapshot_type.as_deref() {
+            if let Some(wanted) = snapshot_type_filter {
                 if snapshot.snapshot_type.as_deref() != Some(wanted) {
                     continue;
                 }

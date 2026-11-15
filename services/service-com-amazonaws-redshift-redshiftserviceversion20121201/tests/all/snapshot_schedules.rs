@@ -1206,8 +1206,8 @@ async fn snapshot_schedules_are_paginated_over_the_documented_window() {
         "case the walked pages: expected the creation order, got {walked:?}"
     );
 
-    // A cursor no page handed out is refused rather than served as some other
-    // offset.
+    // A cursor no page handed out names a position past the end of the sequence:
+    // the read is SERVED with that empty last page rather than refused.
     for (case, cursor) in [
         ("a cursor of the wrong shape", "not-a-cursor"),
         ("an offset past the collection", "99.deadbeef"),
@@ -1215,6 +1215,14 @@ async fn snapshot_schedules_are_paginated_over_the_documented_window() {
         let answer = emulator
             .call("DescribeSnapshotSchedules", &[("Marker", cursor)])
             .await;
-        assert_refused(case, &answer, 400, "InvalidParameterValue");
+        assert_eq!(
+            (answer.status, answer.text("Marker")),
+            (200, None),
+            "case {case}: expected the cursor {cursor:?} served with an empty last page, got {} \
+             / {:?} with body {}",
+            answer.status,
+            answer.error_code(),
+            answer.body
+        );
     }
 }

@@ -1074,19 +1074,22 @@ async fn the_read_pages_filters_and_refuses_what_it_cannot_serve() {
         }
     }
 
-    // A cursor this service did not produce is refused rather than served as a
-    // mid-page offset.
+    // A cursor this service did not produce names a position past the end of the
+    // sequence rather than a mid-page offset: the read is SERVED with that empty
+    // last page.
     let answer = call_with(
         &emulator,
         "DescribeEventSubscriptions",
         &[("Marker".to_string(), "5.deadbeef".to_string())],
     )
     .await;
-    assert_refused(
-        "a cursor nothing produced",
-        &answer,
-        400,
-        "InvalidParameterValue",
+    assert_eq!(
+        (answer.status, answer.text("Marker")),
+        (200, None),
+        "case a cursor nothing produced: expected an empty last page, got {} / {:?} with body {}",
+        answer.status,
+        answer.error_code(),
+        answer.body
     );
 
     // The tag filter selects subscriptions: one matching tag reports the whole

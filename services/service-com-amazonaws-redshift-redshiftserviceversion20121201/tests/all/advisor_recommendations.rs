@@ -506,7 +506,15 @@ async fn the_page_follows_the_published_max_records_window() {
                 answer.status, answer.body
             );
         } else {
-            assert_refused(case, &answer, 400, "InvalidParameterValue", "MaxRecords");
+            // AWS's own sentence for this error class names the window's two
+            // published bounds and does not echo the value sent.
+            assert_refused(
+                case,
+                &answer,
+                400,
+                "InvalidParameterValue",
+                "Invalid value for max records. Must be between 20 and 100",
+            );
         }
     }
 
@@ -559,16 +567,23 @@ async fn the_page_follows_the_published_max_records_window() {
         second_page.text("Marker")
     );
 
-    // A cursor this service never handed out is refused, not silently served as
-    // the first page.
+    // A cursor this service never handed out names a position past the end of
+    // the sequence: the read is SERVED with that empty last page, never with the
+    // first page again and never refused.
     let forged = emulator
         .call("ListRecommendations", &[("Marker", "not-a-cursor")])
         .await;
-    assert_refused(
-        "a cursor nothing produced",
-        &forged,
-        400,
-        "InvalidParameterValue",
-        "Marker",
+    assert_eq!(
+        (forged.status, forged.text("Marker")),
+        (200, None),
+        "case a cursor nothing produced: expected an empty last page, got {} / {:?} with body {}",
+        forged.status,
+        forged.error_code(),
+        forged.body
+    );
+    assert!(
+        listed(&forged.body).is_empty(),
+        "case a cursor nothing produced: expected no recommendation, got {:?}",
+        listed(&forged.body)
     );
 }

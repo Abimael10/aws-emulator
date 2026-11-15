@@ -1497,10 +1497,23 @@ async fn a_read_pages_under_the_documented_max_records_window() {
         "case the cursor walk: expected every seeded endpoint exactly once in order"
     );
 
-    // A cursor this service did not hand out is refused rather than served as a
-    // mid-page offset.
+    // A cursor this service did not hand out names a position past the end of
+    // the sequence rather than a mid-page offset: the read is SERVED with that
+    // empty last page.
     let forged = emulator
         .call("DescribeEndpointAccess", &[("Marker", "7.deadbeef")])
         .await;
-    assert_refused("a forged Marker", &forged, 400, "InvalidParameterValue");
+    assert_eq!(
+        (forged.status, forged.text("Marker")),
+        (200, None),
+        "case a forged Marker: expected an empty last page, got {} / {:?} with body {}",
+        forged.status,
+        forged.error_code(),
+        forged.body
+    );
+    assert!(
+        listed_endpoints(&forged).is_empty(),
+        "case a forged Marker: expected no endpoint in the page, got {:?}",
+        listed_endpoints(&forged)
+    );
 }

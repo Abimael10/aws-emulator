@@ -667,8 +667,9 @@ async fn grants_are_paginated_over_the_documented_window() {
         "case the walked pages: expected the unpaged sequence, got {walked:?}"
     );
 
-    // A cursor this service did not hand out is refused rather than served as a
-    // mid-page offset.
+    // A cursor this service did not hand out names a position past the end of
+    // the sequence rather than a mid-page offset: the read is SERVED with that
+    // empty last page.
     for (case, cursor) in [
         ("not a cursor at all", "nonsense"),
         ("a bare offset", "20"),
@@ -677,7 +678,15 @@ async fn grants_are_paginated_over_the_documented_window() {
         let bogus = emulator
             .call("DescribeSnapshotCopyGrants", &[("Marker", cursor)])
             .await;
-        assert_refused(case, &bogus, 400, "InvalidParameterValue");
+        assert_eq!(
+            (bogus.status, bogus.text("Marker")),
+            (200, None),
+            "case {case}: expected the cursor {cursor:?} served with an empty last page, got {} \
+             / {:?} with body {}",
+            bogus.status,
+            bogus.error_code(),
+            bogus.body
+        );
     }
 }
 

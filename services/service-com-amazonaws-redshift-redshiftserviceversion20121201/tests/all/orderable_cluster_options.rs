@@ -12,11 +12,15 @@
 //! `DescribeClusterVersions` reports) with the node types the service still
 //! offers a new cluster of and the cluster types each of those can be ordered as,
 //! each option carrying the Availability Zones of the Region the request was
-//! signed for; `ClusterVersion` and `NodeType` SELECT from that catalog; the
+//! signed for; `ClusterVersion` is RESOLVED against the offered versions while
+//! `NodeType` SELECTS from that catalog; the
 //! shared `MaxRecords` window and `Marker` cursor paginate it; and reading it
 //! changes nothing. The node-type, cluster-type and zone lists are written out
 //! here, quoting the source they come from, so the suite pins the catalog
 //! independently of the constants the handler reads.
+//!
+//! The refusal a `ClusterVersion` outside the offered catalog is answered with is
+//! pinned in [`crate::describe_filter_validation`].
 
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
@@ -283,22 +287,10 @@ async fn every_filter_selects_from_the_catalog() {
             Some("zz.enormous"),
         ),
         (
-            "an engine version nobody offers",
-            vec![("ClusterVersion", "2.0")],
-            Some("2.0"),
-            None,
-        ),
-        (
             "a node type differing only in case",
             vec![("NodeType", "RA3.XLPLUS")],
             None,
             Some("RA3.XLPLUS"),
-        ),
-        (
-            "filters that agree on nothing",
-            vec![("ClusterVersion", "2.0"), ("NodeType", "ra3.large")],
-            Some("2.0"),
-            Some("ra3.large"),
         ),
     ];
 
@@ -448,7 +440,8 @@ async fn the_documented_max_records_window_and_marker_cursor_govern_the_page() {
         answer.text("Marker")
     );
 
-    // A cursor nobody handed out is refused rather than served as an offset.
+    // A cursor nobody handed out names a position past the end of the sequence:
+    // the read is SERVED with that empty last page.
     for (case, cursor) in [
         ("not a number", "not-a-cursor"),
         ("an invented offset", "7"),
@@ -458,11 +451,18 @@ async fn the_documented_max_records_window_and_marker_cursor_govern_the_page() {
             .call("DescribeOrderableClusterOptions", &[("Marker", cursor)])
             .await;
         assert_eq!(
-            (bogus.status, bogus.error_code()),
-            (400, Some("InvalidParameterValue".to_string())),
-            "case marker {case} ({cursor:?}): expected a 400 refusal, got {} / {:?}",
+            (bogus.status, bogus.text("Marker")),
+            (200, None),
+            "case marker {case} ({cursor:?}): expected an empty last page, got {} / {:?} with \
+             body {}",
             bogus.status,
-            bogus.error_code()
+            bogus.error_code(),
+            bogus.body
+        );
+        assert!(
+            listed_options(&bogus).is_empty(),
+            "case marker {case} ({cursor:?}): expected no option in the page, got {:?}",
+            listed_options(&bogus)
         );
     }
 }

@@ -1112,17 +1112,19 @@ async fn describe_tags_pages_inside_its_documented_max_records_window() {
         "case the walked pages: expected every tag once, in order, got {walked:?}"
     );
 
-    // A cursor this service did not hand out is refused rather than served as a
-    // mid-page offset.
+    // A cursor this service did not hand out names a position past the end of
+    // the sequence rather than a mid-page offset: the read is SERVED with that
+    // empty last page.
     let bogus = emulator
         .call("DescribeTags", &[("Marker", "7.not-a-marker")])
         .await;
     assert_eq!(
-        (bogus.status, bogus.error_code()),
-        (400, Some("InvalidParameterValue".to_string())),
-        "case a forged cursor: expected 400 InvalidParameterValue, got {} / {:?}",
+        (bogus.status, bogus.text("Marker")),
+        (200, None),
+        "case a forged cursor: expected an empty last page, got {} / {:?} with body {}",
         bogus.status,
-        bogus.error_code()
+        bogus.error_code(),
+        bogus.body
     );
 
     // A request that names NO MaxRecords is served the window's maximum — the

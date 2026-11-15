@@ -144,20 +144,13 @@ pub fn check_identifier(rule: IdentifierRule, member: &str, value: &str) -> Resu
     if value.chars().count() > rule.max_len {
         return refuse("The identifier is longer than allowed.");
     }
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
+    if !holds_only_the_identifier_alphabet(value) {
         return refuse("The identifier contains a character that is neither alphanumeric nor a hyphen.");
     }
     if rule.lowercase_only && value.chars().any(|c| c.is_ascii_uppercase()) {
         return refuse("Alphabetic characters must be lowercase.");
     }
-    if !value
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic())
-    {
+    if !begins_with_a_letter(value) {
         return refuse("The first character must be a letter.");
     }
     if value.ends_with('-') {
@@ -165,6 +158,121 @@ pub fn check_identifier(rule: IdentifierRule, member: &str, value: &str) -> Resu
     }
     if value.contains("--") {
         return refuse("The identifier cannot contain two consecutive hyphens.");
+    }
+    Ok(())
+}
+
+/// Whether `value` opens with an ASCII letter, as every identifier of this
+/// service must.
+///
+/// One of the constraints the identifier grammar is made of that carries a rule
+/// of its own rather than reading off `str`, written ONCE here: the two refusals
+/// that judge an identifier — the create path's per-constraint
+/// [`check_identifier`] and the read path's [`check_identifier_syntax`] — word
+/// their sentences differently but must decide the same values.
+fn begins_with_a_letter(value: &str) -> bool {
+    value.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
+/// Whether every character of `value` is in the identifier alphabet: ASCII
+/// letters, digits and the hyphen. See [`begins_with_a_letter`].
+fn holds_only_the_identifier_alphabet(value: &str) -> bool {
+    value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Which NAME the identifier validator reports for the cluster identifier an
+/// operation was given.
+///
+/// Recorded behaviour: the grammar check that runs before a cluster lookup is a
+/// validator shared with the rest of the RDS family, and the name it reports the
+/// offending parameter under differs by the path that judged it — the member's
+/// own name on the cluster-scoped reads, and the RDS-family name on
+/// `DescribeClusters`. The message is what a caller matches on, so the name is a
+/// per-operation attribute rather than one the member decides, which is why each
+/// call site names the one its own recording carries.
+#[derive(Debug, Clone, Copy)]
+pub enum ClusterIdentifierParameter {
+    /// The input member's own name, `ClusterIdentifier`.
+    AsNamed,
+    /// `DBInstanceIdentifier`, the name the shared RDS-family validator carries
+    /// a cluster identifier under.
+    RdsFamily,
+}
+
+impl ClusterIdentifierParameter {
+    /// The name the refusal reports.
+    pub fn reported(self) -> &'static str {
+        match self {
+            Self::AsNamed => CLUSTER_IDENTIFIER_RULE.member,
+            Self::RdsFamily => "DBInstanceIdentifier",
+        }
+    }
+}
+
+/// Why `parameter` does not hold an identifier this service can resolve.
+///
+/// Amazon Redshift's own wording for this error class, and entirely fixed text
+/// apart from the parameter the validator names: the offending value is NOT
+/// echoed, so a caller matching the sentence sees the same one whatever it sent.
+pub fn invalid_identifier_message(parameter: &str) -> String {
+    format!(
+        "The parameter {parameter} is not a valid identifier. Identifiers must begin with a \
+         letter; must contain only ASCII letters, digits, and hyphens; and must not end with a \
+         hyphen or contain two consecutive hyphens."
+    )
+}
+
+/// Why `parameter` holds more characters than an identifier may.
+///
+/// The validator judges the LENGTH before the alphabet, so a value that breaks
+/// both is refused with this sentence rather than
+/// [`invalid_identifier_message`]'s. Fixed text apart from the parameter named
+/// and the documented maximum, both of which the request did not supply.
+pub fn identifier_too_long_message(parameter: &str, max_len: usize) -> String {
+    format!(
+        "The parameter {parameter} is not a valid identifier because it is longer than {max_len} \
+         characters."
+    )
+}
+
+/// Whether `value` satisfies the identifier GRAMMAR an operation that resolves an
+/// identifier checks before it looks anything up: it must begin with a letter,
+/// hold only ASCII letters, digits and hyphens, and neither end with a hyphen nor
+/// carry two consecutive ones.
+///
+/// Those four constraints are the whole of the grammar
+/// [`invalid_identifier_message`] states, so nothing else — the length, which
+/// [`check_identifier_syntax`] judges first, or the case of a letter, which the
+/// sentence does not mention — is judged here: a name that satisfies the grammar
+/// and names nothing is a LOOKUP failure, answered with the operation's own
+/// not-found fault, while one that breaks it could never name anything and is a
+/// request failure.
+pub fn identifier_syntax_holds(value: &str) -> bool {
+    begins_with_a_letter(value)
+        && holds_only_the_identifier_alphabet(value)
+        && !value.ends_with('-')
+        && !value.contains("--")
+}
+
+/// Refuse `value` under the cluster-identifier syntax, naming the parameter the
+/// way the validator of the operation that judged it does.
+///
+/// Reached by an operation that RESOLVES the cluster identifier it is given,
+/// ahead of the lookup. Two refusals, in the order the validator reaches them:
+/// the documented maximum length of a cluster identifier
+/// ([`CLUSTER_IDENTIFIER_RULE`]) first, then the grammar
+/// ([`identifier_syntax_holds`]) — so a value that breaks both is refused for
+/// being too long.
+pub fn check_identifier_syntax(
+    parameter: ClusterIdentifierParameter,
+    value: &str,
+) -> Result<(), String> {
+    let max_len = CLUSTER_IDENTIFIER_RULE.max_len;
+    if value.chars().count() > max_len {
+        return Err(identifier_too_long_message(parameter.reported(), max_len));
+    }
+    if !identifier_syntax_holds(value) {
+        return Err(invalid_identifier_message(parameter.reported()));
     }
     Ok(())
 }

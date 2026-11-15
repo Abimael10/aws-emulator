@@ -1849,3 +1849,18 @@ mod zz_probe_whole_emulator;
 // Five suites pin the rules above rather than restating them here:
 // `all/declaration_roots_are_canonical_and_complete.rs`, each for this file and for every
 // service crate's own `tests/all.rs`. `tests/all.rs` is a test-target CRATE ROOT, so a bare
+// `tests/all/<name>.rs` and insert its pair in the one place its name sorts to, so two
+// the declarations compiles no suite of this target at all — and with none anywhere in the
+// file, no merge of two landings can leave one there.
+// A suite file no `mod` here names is compiled nowhere and its tests never run; a suite left
+// at the top level of `tests/` fails the build; and a suite declared twice is `E0428`. Each
+// of those fails every suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so
+// a bare `mod <name>;` would resolve to a SIBLING of this file, which the layout check
+// refuses: the `#[path]` above each declaration is what points it into `tests/all/`.
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin the rules
+// above, for this file and for every service crate's `tests/all.rs`, so check there rather
+// than leaving a note here.
+// `all/appended_notes.rs`, `all/appended_notes_tail.rs`, `all/appended_header_notes.rs` and
+// `all/appended_prose.rs` keep the notes earlier landings had appended to this file.
+// The lint allowed below is for the suite files this root compiles: a wrapped paragraph in a
+// module header is then a note rather than a build failure. An inner attribute, like an inner

@@ -1618,7 +1618,8 @@ async fn pagination_walks_the_whole_collection_through_the_marker() {
         "case walk every page: expected creation order with no gap or repeat, got {walked:?}"
     );
 
-    // A marker nobody handed out is refused rather than silently reset — a
+    // A marker nobody handed out names a position past the end of the sequence:
+    // the read is SERVED with that empty last page rather than refused — a
     // decimal offset the caller invented included, since the cursor is not just
     // a number.
     for (case, cursor) in [
@@ -1628,11 +1629,17 @@ async fn pagination_walks_the_whole_collection_through_the_marker() {
     ] {
         let bogus = emulator.call("DescribeClusters", &[("Marker", cursor)]).await;
         assert_eq!(
-            (bogus.status, bogus.error_code()),
-            (400, Some("InvalidParameterValue".to_string())),
-            "case marker {case} ({cursor:?}): expected a 400 refusal, got {} / {:?}",
+            (bogus.status, bogus.text("Marker")),
+            (200, None),
+            "case marker {case} ({cursor:?}): expected an empty last page, got {} / {:?} with body {}",
             bogus.status,
-            bogus.error_code()
+            bogus.error_code(),
+            bogus.body
+        );
+        assert!(
+            listed_clusters(&bogus.body).is_empty(),
+            "case marker {case} ({cursor:?}): expected no cluster in the page, got {:?}",
+            listed_clusters(&bogus.body)
         );
     }
 

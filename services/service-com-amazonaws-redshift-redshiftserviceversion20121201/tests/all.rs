@@ -79,6 +79,8 @@ mod data_shares;
 mod default_cluster_parameters;
 #[path = "all/delete_cluster_snapshot.rs"]
 mod delete_cluster_snapshot;
+#[path = "all/describe_filter_validation.rs"]
+mod describe_filter_validation;
 #[path = "all/endpoint_access.rs"]
 mod endpoint_access;
 #[path = "all/endpoint_and_usage_limit_refusal_wording.rs"]

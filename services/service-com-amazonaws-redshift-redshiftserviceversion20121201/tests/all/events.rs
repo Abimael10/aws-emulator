@@ -444,13 +444,18 @@ async fn the_retention_window_bounds_what_a_read_reports() {
     let readable = [true, true, true, false, false];
     let identifiers = seed_events(&emulator, "retention", &ages);
 
-    // An interval wide enough to hold every seeded event, so what a read
-    // reports is decided by the retention window alone.
+    // An interval wide enough to hold every event still inside the retention
+    // window, so what a read reports is decided by that window alone. The reach
+    // back is the window itself: a read may not ask for a period beginning before
+    // it (pinned in [`crate::describe_filter_validation`]), whether it names that
+    // beginning as a `StartTime` or as a `Duration` of minutes before the
+    // request.
     let now = SystemTime::now();
+    let retention_minutes = retention.as_secs() / 60;
     let answer = read(
         &emulator,
         &[
-            ("StartTime", &iso8601(now - 30 * DAY)),
+            ("Duration", &retention_minutes.to_string()),
             ("EndTime", &iso8601(now + minute)),
         ],
     )

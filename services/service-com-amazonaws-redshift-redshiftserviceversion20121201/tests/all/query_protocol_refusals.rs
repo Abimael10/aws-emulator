@@ -135,22 +135,35 @@ async fn max_records_is_enforced_only_below_the_published_minimum() {
             }
             assert_refused(&case, &answer, 400, "InvalidParameterValue");
             let message = answer.text("Message").unwrap_or_default();
-            assert!(
-                message.contains("MaxRecords")
-                    && message.contains(&state::MAX_RECORDS_MIN.to_string()),
-                "case {case}: expected the refusal to name MaxRecords and the minimum \
-                 {}, got {message:?}",
-                state::MAX_RECORDS_MIN
+            // AWS's own sentence for this error class is fixed text carrying the
+            // window's two published bounds, and echoes neither the member nor
+            // the value the request sent.
+            let expected = format!(
+                "Invalid value for max records. Must be between {} and {}",
+                state::MAX_RECORDS_MIN,
+                state::MAX_RECORDS_MAX
+            );
+            assert_eq!(
+                message, expected,
+                "case {case}: expected the message {expected:?}, got {message:?}"
             );
         }
     }
 
-    // A `Marker` the service never handed out is the same class of refusal: a
-    // pagination value it will not serve.
+    // A `Marker` the service never handed out is NOT a refusal: it names a
+    // position past the end of the sequence, so the read is served with the empty
+    // page that position holds.
     for cursor in ["not-a-cursor", "7", "20.deadbeef"] {
         let case = format!("a forged Marker {cursor:?}");
         let answer = emulator.call("DescribeClusters", &[("Marker", cursor)]).await;
-        assert_refused(&case, &answer, 400, "InvalidParameterValue");
+        assert_served(&case, &answer);
+        assert_eq!(
+            answer.text("Marker"),
+            None,
+            "case {case}: nothing follows the end of the sequence, so expected no cursor, got \
+             {:?}",
+            answer.text("Marker")
+        );
     }
 }
 

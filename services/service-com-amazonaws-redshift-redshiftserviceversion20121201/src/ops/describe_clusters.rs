@@ -199,6 +199,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // An identifier this operation RESOLVES is judged on its syntax first:
+        // one that breaks the grammar could never name a cluster, so it is a
+        // request fault rather than a missing resource, and it is decided before
+        // the store is reached at all.
+        if let Some(wanted) = input.cluster_identifier.as_deref() {
+            if let Err(message) =
+                st::check_identifier_syntax(st::ClusterIdentifierParameter::RdsFamily, wanted)
+            {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+            }
+        }
+
         let mut store = state.lock();
         // The clock already owed these transitions at this instant, so applying
         // them here shows nothing a later caller could not already have seen.

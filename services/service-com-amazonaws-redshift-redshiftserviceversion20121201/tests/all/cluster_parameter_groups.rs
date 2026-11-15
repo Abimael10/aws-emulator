@@ -730,7 +730,9 @@ async fn parameter_groups_are_paginated_over_the_documented_window() {
         "case the walked pages: expected the unpaged sequence, got {walked:?}"
     );
 
-    // A cursor this service did not hand out is refused rather than served.
+    // A cursor this service did not hand out names a position past the end of
+    // the sequence: the read is SERVED, with the empty page that position holds
+    // and no cursor after it, rather than refused.
     for (case, cursor) in [
         ("not a cursor at all", "nonsense"),
         ("a bare offset", "20"),
@@ -740,11 +742,17 @@ async fn parameter_groups_are_paginated_over_the_documented_window() {
             .call("DescribeClusterParameterGroups", &[("Marker", cursor)])
             .await;
         assert_eq!(
-            (bogus.status, bogus.error_code()),
-            (400, Some("InvalidParameterValue".to_string())),
-            "case {case}: expected the cursor {cursor:?} to be refused with 400 InvalidParameterValue, got {} / {:?}",
+            (bogus.status, bogus.text("Marker")),
+            (200, None),
+            "case {case}: expected the cursor {cursor:?} served with an empty last page, got {} / {:?} with body {}",
             bogus.status,
-            bogus.error_code()
+            bogus.error_code(),
+            bogus.body
+        );
+        assert!(
+            listed_groups(&bogus.body).is_empty(),
+            "case {case}: expected no group in the page, got {:?}",
+            listed_groups(&bogus.body)
         );
     }
 }

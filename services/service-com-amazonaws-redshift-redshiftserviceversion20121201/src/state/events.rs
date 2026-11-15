@@ -423,6 +423,31 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
 /// not a span this emulator chose.
 pub const EVENT_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
+/// The earliest instant, in whole seconds since the epoch, an event read served
+/// at `now` may be asked to reach back to: the far edge of the published
+/// retention window ([`EVENT_RETENTION`]).
+///
+/// An event older than this has left the log, so a read that asks for a period
+/// beginning before it is asking for a period the service keeps nothing from.
+pub fn event_retention_floor(now: SystemTime) -> i64 {
+    ::aws_smithy_types::DateTime::from(now)
+        .secs()
+        .saturating_sub(EVENT_RETENTION.as_secs() as i64)
+}
+
+/// Why a read whose requested period begins before the retention window is
+/// refused.
+///
+/// Amazon Redshift's own wording for this error class: entirely fixed text, the
+/// one number in it being the published retention window itself
+/// ([`EVENT_RETENTION`]) rather than anything the request carried.
+pub fn event_retention_exceeded_message() -> String {
+    format!(
+        "Events occurring more than {} days in the past are not available.",
+        EVENT_RETENTION.as_secs() as i64 / SECONDS_PER_DAY
+    )
+}
+
 /// How many minutes before the request an event read reaches back when the
 /// request names neither a `StartTime` nor a `Duration`.
 ///

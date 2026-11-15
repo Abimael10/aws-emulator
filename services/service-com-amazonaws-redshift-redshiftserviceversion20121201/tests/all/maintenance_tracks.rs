@@ -332,8 +332,9 @@ async fn the_track_window_and_cursor_follow_the_documented_rules() {
         }
     }
 
-    // A cursor nobody handed out is refused rather than served as an offset,
-    // exactly as on the other paginated reads.
+    // A cursor nobody handed out names a position past the end of the sequence:
+    // the read is SERVED with that empty last page, exactly as on the other
+    // paginated reads.
     for (case, cursor) in [
         ("not a number", "not-a-cursor"),
         ("an invented offset", "1"),
@@ -343,11 +344,13 @@ async fn the_track_window_and_cursor_follow_the_documented_rules() {
             .call("DescribeClusterTracks", &[("Marker", cursor)])
             .await;
         assert_eq!(
-            (bogus.status, bogus.error_code()),
-            (400, Some("InvalidParameterValue".to_string())),
-            "case marker {case} ({cursor:?}): expected a 400 refusal, got {} / {:?}",
+            (bogus.status, bogus.text("Marker")),
+            (200, None),
+            "case marker {case} ({cursor:?}): expected an empty last page, got {} / {:?} with \
+             body {}",
             bogus.status,
-            bogus.error_code()
+            bogus.error_code(),
+            bogus.body
         );
     }
 }

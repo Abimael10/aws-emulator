@@ -191,6 +191,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owed on it, so this operation settles nothing and writes nothing.
         let store = state.lock();
 
+        // "Constraints: Must be one of the version returned from
+        // DescribeClusterVersions": the `ClusterVersion` filter is RESOLVED
+        // against the catalog the store offers, so a version this service does
+        // not publish is refused rather than selecting nothing — a client
+        // probing which versions exist must not be handed a catalog for one that
+        // cannot be ordered. `NodeType` carries no such constraint and stays a
+        // filter.
+        if let Some(wanted) = input.cluster_version.as_deref() {
+            let offered = store
+                .cluster_versions
+                .iter()
+                .any(|offered| offered.cluster_version.as_deref() == Some(wanted));
+            if !offered {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                    st::cluster_version_not_found_message(wanted),
+                ));
+            }
+        }
+
         // The catalog, in a stable order: engine version (as the store offers
         // them, so `DescribeClusterVersions` and this operation cannot disagree
         // about which versions exist), then node type, then cluster type, each
@@ -198,10 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // be ORDERED, so the pairs come from the one orderable rule
         // (`orderable_cluster_types`): the current-generation node types, each as
         // `multi-node` and — where the service offers a one-node cluster of that
-        // shape — as `single-node` too. The request's `ClusterVersion` /
-        // `NodeType` filters SELECT from that catalog rather than refusing
-        // ("Default: All versions"): a filter that matches nothing selects
-        // nothing.
+        // shape — as `single-node` too. The request's `NodeType` filter SELECTS
+        // from that catalog rather than refusing: a filter that matches nothing
+        // selects nothing. Its `ClusterVersion` was resolved above, so only a
+        // version the catalog holds reaches this loop.
         let mut options: Vec<OrderableClusterOption> = Vec::new();
         for offered in &store.cluster_versions {
             let Some(cluster_version) = offered.cluster_version.as_deref() else {

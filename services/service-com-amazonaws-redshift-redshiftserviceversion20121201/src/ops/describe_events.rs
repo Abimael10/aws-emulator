@@ -187,12 +187,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             (Some(_), None) => {
                 return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
-                    "SourceType must also be provided when SourceIdentifier is supplied.",
+                    "Cannot specify source identifier without source type",
                 ))
             }
             (None, Some(_)) => {
                 return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
-                    "SourceIdentifier must also be provided when SourceType is supplied.",
+                    "Cannot specify source type without source identifier",
                 ))
             }
             _ => {}
@@ -212,12 +212,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The interval this request reports over, from its own three time
         // members, read before the store is locked so the `now` the default
         // window is measured from is the instant the request was served at.
-        let (window_start, window_end) = st::event_window(
-            input.start_time,
-            input.end_time,
-            input.duration,
-            ::std::time::SystemTime::now(),
-        );
+        let served_at = ::std::time::SystemTime::now();
+        let (window_start, window_end) =
+            st::event_window(input.start_time, input.end_time, input.duration, served_at);
+
+        // The log keeps nothing from before the published retention window, so a
+        // read that names an instant before it is asking for a period the service
+        // has no events from at all, and is refused on the request alone. Both
+        // ends of the interval are judged against the same floor — whether the
+        // request named one as a `StartTime`, as an `EndTime` or as the
+        // `Duration` of minutes before the request to reach back.
+        if window_start.min(window_end) < st::event_retention_floor(served_at) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                st::event_retention_exceeded_message(),
+            ));
+        }
 
         // A reporting operation: the ONE write it makes is materialising what the
         // clock already owed — here, an event whose retention window has passed,
