@@ -52,10 +52,12 @@
 //!   the offending value was found, only on whether the service read it. The
 //!   wording of a member-level refusal is split between its two statements: the
 //!   summary envelope names the member and the requirement it failed, the member's
-//!   own `fieldList` entry adds the value the request sent, and a requirement over
-//!   an enumerated value set lists that enum's members in the order this service
-//!   states that set in (`crate::state::FilterName::VALUE_SET_ORDER`), which is not
-//!   the model's declaration order.
+//!   own `fieldList` entry adds the value the request sent (a member the request
+//!   left out sent none, so both statements say it arrived with no value), and a
+//!   requirement over an enumerated value set lists that enum's members in the
+//!   order this service states that set in
+//!   (`crate::state::FilterName::VALUE_SET_ORDER`), which is not the model's
+//!   declaration order.
 //! * **Pagination.** Records are reported in store (insertion) order, so a page
 //!   boundary is stable. `nextToken` is opaque: a 128-bit fingerprint of the
 //!   SELECTION the token was issued over (the filter) followed by the offset to
@@ -312,10 +314,19 @@ fn stated_value_set(allowed: &[String]) -> Option<Vec<String>> {
 /// The same violation with the rejected value WITHHELD, so the clause it renders
 /// names the member and the requirement alone — the form the SUMMARY states.
 ///
-/// The framework already renders a clause both ways and chooses by whether the
-/// violation carries a value to show, so withholding the value here keeps the
-/// summary's wording the framework's rather than respelling it in this crate.
+/// The framework already renders a clause three ways and chooses by what the
+/// violation carries, so withholding the value here keeps the summary's wording
+/// the framework's rather than respelling it in this crate.
+///
+/// What is withheld is the value the request SENT. A violation that carries none —
+/// a member the request left out — has nothing to withhold and is handed on
+/// untouched, so its clause keeps saying that the member arrived with no value at
+/// all, which is the fact that violation states and is not a value this refusal
+/// could echo.
 fn without_echoed_value(violation: &Violation) -> Violation {
+    if violation.value.is_none() {
+        return violation.clone();
+    }
     Violation {
         value: None,
         sensitive: true,

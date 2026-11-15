@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/boot_inventory_timestamp.rs"]
 mod boot_inventory_timestamp;
+#[path = "all/constraint_refusal_wording.rs"]
+mod constraint_refusal_wording;
 #[path = "all/context_map_order.rs"]
 mod context_map_order;
 #[path = "all/list_recommended_actions.rs"]

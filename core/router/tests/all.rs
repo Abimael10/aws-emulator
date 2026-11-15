@@ -1750,3 +1750,12 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // service crate's own, belongs in that suite's own module header, where it is read
 // beside the test it explains; the notes landings had appended to this file live in
 // under `tests/` — which the layout check refuses. The `#[path]` is what points each
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, in its sorted position. A suite no
+//! `mod` names compiles nowhere and its tests never run, and a suite left at the top level
+//! of `tests/` fails the build. `#[path]` is what points a declaration into `tests/all/`:
+//! this file is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it.
+//! The three rules this root lives by — each suite declared exactly once, nothing between
+//! the pairs, and no inner doc comment past this header — are pinned by
+//! `all/all_rs_is_a_canonical_declaration_list.rs`, so they are stated there rather than
+//! restated here. What a suite covers, and why it belongs in this target, is in that
+//! suite's own module doc, where it is read beside the test it explains.
