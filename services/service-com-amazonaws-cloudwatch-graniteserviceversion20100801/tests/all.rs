@@ -151,6 +151,8 @@ mod insight_rules;
 mod just_published_datapoint_grading;
 #[path = "all/lambda_alarm_actions.rs"]
 mod lambda_alarm_actions;
+#[path = "all/lambda_errors_alarm_notification.rs"]
+mod lambda_errors_alarm_notification;
 #[path = "all/list_metric_streams.rs"]
 mod list_metric_streams;
 #[path = "all/list_tags_for_resource_reads.rs"]

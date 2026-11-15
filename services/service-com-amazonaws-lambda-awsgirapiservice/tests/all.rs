@@ -365,6 +365,8 @@ mod invocation_count_series;
 mod invocation_duration_report_agreement;
 #[path = "all/invocation_duration_statistics_reads.rs"]
 mod invocation_duration_statistics_reads;
+#[path = "all/invocation_error_indicator.rs"]
+mod invocation_error_indicator;
 #[path = "all/invocation_init_phase.rs"]
 mod invocation_init_phase;
 #[path = "all/invocation_log_after_a_role_change.rs"]

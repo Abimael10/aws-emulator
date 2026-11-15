@@ -11,8 +11,9 @@
 //!
 //! * `Duration`, in `Milliseconds`, carrying the time THAT run took, once per invocation that
 //!   ran, whichever surface started it and whether or not the handler failed;
-//! * `Errors`, in `Count`, one per invocation that came to a function error — the handler's
-//!   own exception and the runtime's alike — and none for an invocation that returned;
+//! * `Errors`, in `Count`, once per invocation that ran — a binary indicator of that
+//!   invocation's outcome, carrying 1 for one that came to a function error (the handler's own
+//!   exception and the runtime's alike) and 0 for one that returned;
 //! * `Throttles`, in `Count`, one per invocation request refused because the function's
 //!   concurrency pool had no room for it, which is a request that never reached the function
 //!   and is therefore counted in `Throttles` instead of `Invocations`.
@@ -422,7 +423,7 @@ struct Row {
     duration_samples: f64,
     /// The floor every `Duration` datapoint must clear, in milliseconds.
     least_duration_ms: f64,
-    /// What `Errors` must sum to; 0 means the series must hold no datapoint at all.
+    /// What `Errors` must sum to: the runs of the row that failed.
     error_sum: f64,
 }
 
@@ -597,26 +598,30 @@ async fn every_run_publishes_its_duration_and_every_failure_publishes_an_error()
                  {MILLISECONDS_UNIT:?}, got {durations:?}"
             );
 
+            // `Errors` is the binary indicator of what one invocation came to, so every run
+            // of the row reports on it — 1 for a run that failed and 0 for one that returned.
+            // The SUM is therefore the failures of the row and the SAMPLE COUNT is its runs,
+            // which is what tells a function that failed nothing from one nobody invoked.
             let errors = datapoints(&router, case, ERRORS_SERIES, COUNT_UNIT, &dimensions).await;
-            if row.error_sum == 0.0 {
-                assert!(
-                    errors.is_empty(),
-                    "case {case:?}: nothing failed, so {ERRORS_SERIES} of {dimensions} must \
-                     hold no datapoint at all, got {errors:?}"
-                );
-            } else {
-                let sum = total(&errors, "Sum");
-                assert_eq!(
-                    sum, row.error_sum,
-                    "case {case:?}: {ERRORS_SERIES} of {dimensions} must sum to {}, got {sum} \
-                     over {errors:?}",
-                    row.error_sum
-                );
-            }
+            let sum = total(&errors, "Sum");
+            assert_eq!(
+                sum, row.error_sum,
+                "case {case:?}: {ERRORS_SERIES} of {dimensions} must sum to {}, got {sum} \
+                 over {errors:?}",
+                row.error_sum
+            );
+            let reported_runs = total(&errors, "SampleCount");
+            assert_eq!(
+                reported_runs, row.duration_samples,
+                "case {case:?}: {ERRORS_SERIES} of {dimensions} must report on each of the {} \
+                 run(s), got {reported_runs} over {errors:?}",
+                row.duration_samples
+            );
         }
 
         // The series are DISCOVERABLE, which is the read a client makes before it alarms on
-        // them, and a row in which nothing failed registers no error series.
+        // them, and a function that was invoked at all registers its error indicator whether or
+        // not any of those invocations failed.
         let listed = listed_series(&router, case).await;
         let duration_series = (
             DURATION_SERIES.to_string(),
@@ -627,11 +632,10 @@ async fn every_run_publishes_its_duration_and_every_failure_publishes_an_error()
             "case {case:?}: ListMetrics must discover {duration_series:?}, got {listed:?}"
         );
         let has_errors = listed.iter().any(|series| series.0 == ERRORS_SERIES);
-        assert_eq!(
+        assert!(
             has_errors,
-            row.error_sum > 0.0,
-            "case {case:?}: an {ERRORS_SERIES} series must be discoverable only when an \
-             invocation failed, got {listed:?}"
+            "case {case:?}: the {ERRORS_SERIES} series of an invoked function must be \
+             discoverable, got {listed:?}"
         );
 
         // Reading the series changes nothing a later reader sees.
@@ -880,9 +884,16 @@ async fn an_asynchronous_invocation_publishes_its_run_once_it_has_been_delivered
         &function_dimensions(),
     )
     .await;
-    assert!(
-        errors.is_empty(),
-        "case {case:?}: the delivered handler returned, so {ERRORS_SERIES} must hold no \
-         datapoint, got {errors:?}"
+    assert_eq!(
+        total(&errors, "Sum"),
+        0.0,
+        "case {case:?}: the delivered handler returned, so the {ERRORS_SERIES} indicator it \
+         published must sum to zero, got {errors:?}"
+    );
+    assert_eq!(
+        total(&errors, "SampleCount"),
+        1.0,
+        "case {case:?}: the delivered invocation must report its outcome on {ERRORS_SERIES} \
+         exactly once, got {errors:?}"
     );
 }

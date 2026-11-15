@@ -1701,3 +1701,19 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 //! lines are the only place an inner doc comment may stand in this file;
 //! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, here and in every
 //! service crate's `tests/all.rs`. What a suite covers belongs in its own module doc.
+// Single integration-test target for the router: the canonical declaration list.
+// Put a new suite at `tests/all/<name>.rs` and declare it below with a
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted into the sorted list — one pair
+// per suite and NO other line, so two branches landing at once insert two lines in two
+// places and have no prose to duplicate, re-word or mistype.
+// level of `tests/` fails the build. Declare each suite exactly ONCE: this is one crate root,
+// so a second `mod` for the same name is `E0428` and fails every suite in this target.
+// an inner doc comment (`//!`) is legal only before the first item, so a copy of this header
+// that a landing appends past the declarations is `E0753` and compiles no suite of this
+// target. With no `//!` anywhere, no merge of two landings can put one past the first item.
+// `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the first two for this
+// file and for every service crate's `tests/all.rs` — so a note about any of them belongs
+// there rather than below.
+// WHAT a suite covers, and why it lives in this target rather than in one service crate's
+// own, is stated in that suite's own module header, where it is read beside the test it
+// explains; `all/appended_notes.rs` holds the notes landings had appended here.

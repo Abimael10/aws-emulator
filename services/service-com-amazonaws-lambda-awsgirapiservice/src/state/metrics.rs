@@ -232,10 +232,20 @@ pub const DURATION_METRIC: &str = "Duration";
 ///
 /// The name is the one Lambda's own series carries in [`METRIC_NAMESPACE`]: `Errors`, "the
 /// number of invocations that result in a function error", which are "exceptions thrown by
-/// your code and exceptions thrown by the Lambda runtime" — so one observation of 1 is
-/// published per invocation whose run reported a `FunctionError`, in [`COUNT_UNIT`], and an
-/// invocation that returned normally publishes none. A request Lambda refused before the
-/// function was reached is no invocation of it and is counted here no more than it is in
+/// your code and exceptions thrown by the Lambda runtime".
+///
+/// It is a BINARY INDICATOR of what one invocation came to, which is what the AWS Lambda
+/// metric reference calls an invocation metric: one observation is published per invocation
+/// that RAN, in [`COUNT_UNIT`], carrying 1 when that run reported a `FunctionError` and 0
+/// when it returned. So `Sum` over a window counts the failures of that window — a window
+/// with none sums to zero — while the window itself exists as soon as the function was
+/// invoked at all, which is what tells a client "this function ran and failed nothing" from
+/// "this function was never invoked": the first reads an explicit zero, the second has no
+/// datapoint to read. It is also why `Average` over the series is the error RATE of the
+/// window, a figure that needs every invocation of it represented.
+///
+/// A request Lambda refused before the function was reached ran nothing, so it reports no
+/// outcome here at all — neither a failure nor a zero — and is counted no more than it is in
 /// [`INVOCATIONS_METRIC`].
 pub const ERRORS_METRIC: &str = "Errors";
 
@@ -542,22 +552,20 @@ impl InvocationMetrics {
     }
 
     /// Publish what this invocation's finished run came to: the time it took
-    /// ([`DURATION_METRIC`]), and — for a run that reported a `FunctionError` — the one
-    /// failure it came to ([`ERRORS_METRIC`]).
+    /// ([`DURATION_METRIC`]), and whether it came to a function error ([`ERRORS_METRIC`]).
     ///
     /// Both are published per invocation rather than accumulated here, so a reader laying
-    /// periods over either series gets the runs of each period and a period in which the
-    /// function failed nothing holds no error datapoint at all.
+    /// periods over either series gets the runs of each period — and the error indicator is
+    /// published for a run that RETURNED as much as for one that failed, carrying 0 for it, so
+    /// a period of healthy traffic reads an explicit zero rather than nothing at all.
     pub fn publish_outcome(&self, duration: ::std::time::Duration, errored: bool) {
         self.publisher.publish_duration(
             &self.function_name,
             &self.resource,
             duration.as_secs_f64() * 1000.0,
         );
-        if errored {
-            self.publisher
-                .publish_error(&self.function_name, &self.resource);
-        }
+        self.publisher
+            .publish_error(&self.function_name, &self.resource, errored);
     }
 
     /// Publish that this invocation request was THROTTLED ([`THROTTLES_METRIC`]).
@@ -703,10 +711,16 @@ impl FunctionMetrics {
         );
     }
 
-    /// Publish that ONE invocation of `function_name`, addressed as `resource`, came to a
-    /// function error: a single observation of [`ERRORS_METRIC`].
-    pub fn publish_error(&self, function_name: &str, resource: &str) {
-        self.publish_both(ERRORS_METRIC, function_name, resource, 1.0, COUNT_UNIT);
+    /// Publish WHAT one invocation of `function_name`, addressed as `resource`, came to: a
+    /// single observation of [`ERRORS_METRIC`], carrying 1 for a run that reported a function
+    /// error and 0 for one that returned.
+    ///
+    /// The indicator is published either way because the series is a binary indicator of one
+    /// invocation's outcome ([`ERRORS_METRIC`]): the zero is what an invocation that failed
+    /// nothing contributes, so a window of healthy traffic reads 0 instead of reading nothing.
+    pub fn publish_error(&self, function_name: &str, resource: &str, errored: bool) {
+        let value = if errored { 1.0 } else { 0.0 };
+        self.publish_both(ERRORS_METRIC, function_name, resource, value, COUNT_UNIT);
     }
 
     /// Publish that ONE invocation request for `function_name`, addressed at `resource`, was
