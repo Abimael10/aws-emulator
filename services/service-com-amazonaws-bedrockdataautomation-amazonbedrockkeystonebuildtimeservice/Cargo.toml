@@ -40,6 +40,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The Bedrock control plane, mounted beside this service on one engine — the way the
+# assembled emulator runs them. It binds this service's three tagging paths identically,
+# so the family's claim rule gives that segment to it and a tagging call about one of THIS
+# service's resources only reaches these handlers with both services mounted.
+service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice = { workspace = true }
 # Amazon S3 is mounted beside this service on one engine — the way the assembled emulator
 # runs them — so the locations a submission names are staged in, and resolved against, the
 # store that really owns them.

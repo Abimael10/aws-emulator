@@ -1,5 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
+//! Single integration-test target for the router: the declaration list for every
+//! cross-service suite under `tests/all/`.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with one
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted in its sorted position, and
+//! nothing else. Three rules bind this crate root, each pinned by a suite of its own
+//! (`all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
+//! `all/all_rs_is_a_canonical_declaration_list.rs`), for this file and for every service
+//! crate's `tests/all.rs`. One, a suite declared twice is `E0428`, which compiles no suite
+//! of this target. Two, an inner doc comment is legal only before the first item, so this
+//! header is the only place one may stand: written past the first declaration it is
+//! `E0753`, which again compiles no suite of this target, and this header carries no
+//! markdown list, so a line appended to it is prose rather than a lint. Three, this file is
+//! a test-target crate root, where a bare `mod` would resolve to a sibling of it and the
+//! layout check refuses that, so the `#[path]` above each declaration is what points it
+//! into `tests/all/`. The list below therefore holds declaration pairs and no prose: what a
+//! suite covers, and why it belongs to this cross-service target rather than to one service
+//! crate's own, is stated in that suite's own module header, where it is read beside the
+//! test it explains. `all/appended_notes.rs` is an intentionally empty placeholder, declared
+//! below like any other file because the layout check wants a declaration for every file
+//! under `tests/all/`.
 //! Single integration-test target for the router: a canonical declaration list.
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below with one
