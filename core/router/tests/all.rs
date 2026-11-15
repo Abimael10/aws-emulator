@@ -1632,3 +1632,18 @@ mod cloudtrail_iam_credential_write_audit;
 // all. With none in the file, no merge of two landings can produce one.
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of this
 // file, which the layout check refuses: the `#[path]` is what points each module into
+// This file is the license line, this header, and then one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair per suite file under `tests/all/`, sorted by name, and NO other line —
+// so two branches landing at once insert their two lines in one place each and have no prose
+// to duplicate, re-word or mistype.
+// EVERY comment here is an ORDINARY one, this header included, and that is deliberate: an
+// inner doc comment (`//!`) is legal only before the first item, so one appended past the
+// declarations is `E0753` and compiles no suite of this target. With no `//!` anywhere in the
+// file, no merge of two landings can leave one past the first item.
+// A suite no `mod` names compiles nowhere and its tests never run (this crate's `build.rs`
+// refuses it); a suite left at the top level of `tests/` fails the build; and a second `mod`
+// for one name is `E0428`. Each of those fails EVERY suite of this target. `tests/all.rs` is
+// a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING (`tests/<name>.rs`),
+// which the layout check refuses: the `#[path]` is what points each declaration into
+// `all/appended_notes.rs`, and four suites check the rules above rather than restating them:
+// `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`.
