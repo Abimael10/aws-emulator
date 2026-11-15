@@ -45,6 +45,8 @@ mod blueprint_deletion;
 mod blueprint_lifecycle_miss;
 #[path = "all/blueprint_listing.rs"]
 mod blueprint_listing;
+#[path = "all/blueprint_registration_terminal_status.rs"]
+mod blueprint_registration_terminal_status;
 #[path = "all/blueprint_run_listing.rs"]
 mod blueprint_run_listing;
 #[path = "all/blueprint_runs.rs"]

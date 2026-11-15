@@ -45,7 +45,10 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/sim2real-glue-blueprint-r
 
 /// Stage `key` in the suite's bucket as a published blueprint archive, and answer the
 /// `s3://` location that names it.
-async fn stage_archive(router: &MultiServiceRouter, key: &str) -> String {
+///
+/// Shared with [`crate::blueprint_registration_terminal_status`], so both suites publish an
+/// archive the same way.
+pub(crate) async fn stage_archive(router: &MultiServiceRouter, key: &str) -> String {
     s3_client(router)
         .put_object()
         .bucket(BUCKET)
@@ -59,8 +62,9 @@ async fn stage_archive(router: &MultiServiceRouter, key: &str) -> String {
     format!("s3://{BUCKET}/{key}")
 }
 
-/// The `Blueprint` the `GetBlueprint` answer for `name` reports.
-async fn read(router: &MultiServiceRouter, name: &str) -> Value {
+/// The `Blueprint` the `GetBlueprint` answer for `name` reports. Shared with
+/// [`crate::blueprint_registration_terminal_status`].
+pub(crate) async fn read(router: &MultiServiceRouter, name: &str) -> Value {
     let body = ok(router, "GetBlueprint", &json!({ "Name": name })).await;
     body.get("Blueprint")
         .cloned()
@@ -68,8 +72,9 @@ async fn read(router: &MultiServiceRouter, name: &str) -> Value {
 }
 
 /// Put the instant the clock owes `name`'s registration its terminal status in the past, so
-/// the next read reports the status the clock had already reached.
-fn make_settlement_due(engine: &Arc<engine::InMemoryEngine>, name: &str) {
+/// the next read reports the status the clock had already reached. Shared with
+/// [`crate::blueprint_registration_terminal_status`].
+pub(crate) fn make_settlement_due(engine: &Arc<engine::InMemoryEngine>, name: &str) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     let entry = store
