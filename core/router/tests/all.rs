@@ -1966,3 +1966,4 @@ mod cloudtrail_iam_credential_write_audit;
 // rather than here. What a suite covers, and why it drives the assembled router rather than
 // one service crate, belongs in that suite's own module header; the notes earlier landings
 // appended to the end of this file live in `all/appended_notes.rs`.
+// explains; a note about this file itself belongs in `all/appended_notes.rs`.

@@ -10,7 +10,10 @@
 //! account whose payment instrument has not been vetted
 //! ([`crate::state::ComAmazonawsFreetierAwsfreetierserviceState::payment_instrument_vetted`])
 //! is refused with the modelled `ValidationException` and its plan record is
-//! left exactly as it was — not even established.
+//! left exactly as it was — not even established. The vetting is a property of
+//! the ACCOUNT that no operation of this API establishes, so which of the two
+//! states the emulated account is in is settled when the store is created
+//! ([`crate::state::PAYMENT_INSTRUMENT_VETTED_ENV`]) and no request changes it.
 //!
 //! Before any of that, the request is AUTHORIZED
 //! ([`crate::service::authorization`]): this operation's model declares
@@ -208,7 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account with none is refused and nothing of its plan record is read
         // or written, so the refusal answers the same way however often it is
         // made. Free Tier models no operation that establishes an instrument,
-        // so the vetting is state this service only reads.
+        // so the vetting is state this service only reads — which of the two
+        // states the account is in is settled before any request arrives
+        // (`crate::state::PAYMENT_INSTRUMENT_VETTED_ENV`).
         if target == crate::state::PLAN_TYPE_PAID && !store.payment_instrument_vetted(account_id) {
             return Err(stated_verbatim(
                 crate::state::PAYMENT_INSTRUMENT_VET_FAILURE,

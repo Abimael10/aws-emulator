@@ -23,7 +23,15 @@
 //!   been vetted, which is the precondition `UpgradeAccountPlan` checks before
 //!   it moves an account onto the paid plan
 //!   ([`ComAmazonawsFreetierAwsfreetierserviceState::payment_instrument_vetted`]).
-//!   It starts EMPTY, like `plans`.
+//!   Unlike `plans`, which this service's own plan-writing operation fills, no
+//!   operation of this API — and none of any other service this emulator serves
+//!   — establishes a payment instrument: the vetting happens where AWS makes it
+//!   happen, outside this API, so it is a START-UP property of the emulated
+//!   account that whoever runs the emulator sets
+//!   ([`PAYMENT_INSTRUMENT_VETTED_ENV`]). It starts empty unless that setting
+//!   says the account's instrument has been vetted, because the recorded
+//!   response to a paid upgrade asked for by an account with none is the
+//!   refusal [`PAYMENT_INSTRUMENT_VET_FAILURE`] states.
 //!
 //! `activities` and `usages` are part of the store's initial value
 //! ([`Default`]), so a reporting operation serves a read without writing
@@ -399,8 +407,12 @@ pub struct ComAmazonawsFreetierAwsfreetierserviceState {
     ///
     /// A payment instrument is established outside this service — Free Tier
     /// models no operation that adds one, and none of its three other
-    /// operations reads this — so an account is in here only once something put
-    /// it here, and the emulator's own account is not.
+    /// operations reads this — so this is a property of the ACCOUNT rather than
+    /// something a request brings about: a field rather than a constant, seeded
+    /// from [`PAYMENT_INSTRUMENT_VETTED_ENV`] when this store is created
+    /// ([`vetted_payment_instruments`]), which is how whoever runs the
+    /// emulator says the account it presents is one whose instrument AWS has
+    /// vetted.
     pub vetted_payment_instruments: HashSet<String>,
 }
 
@@ -416,14 +428,21 @@ impl Default for ComAmazonawsFreetierAwsfreetierserviceState {
     /// Seeding the two catalogs here rather than on first read is what lets both
     /// reporting operations answer without writing: a read never changes what a
     /// later caller sees.
+    ///
+    /// The account's payment instrument is whatever
+    /// [`PAYMENT_INSTRUMENT_VETTED_ENV`] says it is when the store is created:
+    /// unvetted unless that setting says otherwise.
     fn default() -> Self {
         let account_id = caller_account_id().to_string();
         let now = now();
         Self {
             plans: HashMap::new(),
             activities: HashMap::from([(account_id.clone(), seed_activities(now))]),
-            usages: HashMap::from([(account_id, seed_usages())]),
-            vetted_payment_instruments: HashSet::new(),
+            usages: HashMap::from([(account_id.clone(), seed_usages())]),
+            vetted_payment_instruments: vetted_payment_instruments(
+                &account_id,
+                ::std::env::var(PAYMENT_INSTRUMENT_VETTED_ENV).ok().as_deref(),
+            ),
         }
     }
 }
@@ -469,7 +488,10 @@ impl ComAmazonawsFreetierAwsfreetierserviceState {
     /// move onto the paid plan is open to it.
     ///
     /// This is what a vetting outside this service leaves behind; nothing in
-    /// Free Tier's own surface establishes a payment instrument.
+    /// Free Tier's own surface establishes a payment instrument. At start-up
+    /// that is what [`PAYMENT_INSTRUMENT_VETTED_ENV`] reaches through
+    /// ([`vetted_payment_instruments`]), and it is the same state a suite
+    /// puts the account in when it drives the vetted branch over the wire.
     pub fn vet_payment_instrument(&mut self, account_id: &str) {
         self.vetted_payment_instruments
             .insert(account_id.to_string());
@@ -717,6 +739,52 @@ pub fn stated_validation(sentence: &str) -> String {
 /// the same words whichever account asked and however often, which is what makes
 /// the refusal idempotent.
 pub const PAYMENT_INSTRUMENT_VET_FAILURE: &str = "Account plan upgrade failed PI vet failure";
+
+/// The setting whoever runs the emulator uses to say that the account it presents
+/// holds a payment instrument that has been vetted
+/// (`FREETIER_PAYMENT_INSTRUMENT_VETTED=1`), read once when this service's store
+/// is created and turned into state by [`vetted_payment_instruments`].
+///
+/// A payment instrument is established where AWS establishes one: outside this
+/// API. Free Tier models no operation that adds one and no other service of this
+/// emulator does either, so the vetting is not a condition a REQUEST can bring
+/// about — it is a property of the account, and a property no operation
+/// establishes is a start-up setting rather than a constant.
+///
+/// Unset means NOT vetted, which is the state the recorded response to a paid
+/// upgrade was answered for: such an account is refused with
+/// [`PAYMENT_INSTRUMENT_VET_FAILURE`], and its plan record is left as it was.
+/// Set, it puts the emulated account in the other state AWS serves, so the move
+/// onto the paid plan — and the plan state a client reads after it — is reachable
+/// over the wire.
+pub const PAYMENT_INSTRUMENT_VETTED_ENV: &str = "FREETIER_PAYMENT_INSTRUMENT_VETTED";
+
+/// Whether `setting` says the account's payment instrument has been vetted: `1`,
+/// `true`, `yes` or `on` in any case says so, and anything else — an absent
+/// setting, an empty value, `0`, `no`, or a typo — leaves the account unvetted
+/// rather than being guessed at.
+fn vetted_setting_says_yes(setting: Option<&str>) -> bool {
+    setting.is_some_and(|setting| {
+        matches!(
+            setting.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// The accounts whose payment instrument is vetted in a store created while
+/// [`PAYMENT_INSTRUMENT_VETTED_ENV`] holds `setting` (`None` when the environment
+/// does not carry it): `account_id` when the setting says the account this
+/// emulator presents holds a vetted instrument, and no account otherwise.
+///
+/// The one place the setting is turned into state, so what a store starts with
+/// and what the setting means cannot disagree.
+pub fn vetted_payment_instruments(account_id: &str, setting: Option<&str>) -> HashSet<String> {
+    if vetted_setting_says_yes(setting) {
+        return HashSet::from([account_id.to_string()]);
+    }
+    HashSet::new()
+}
 
 /// The order this service STATES the `LanguageCode` value set in when it refuses
 /// a value outside it.

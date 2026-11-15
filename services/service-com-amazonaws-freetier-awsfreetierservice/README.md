@@ -26,6 +26,29 @@ service-com-amazonaws-freetier-awsfreetierservice/
     └── ops/              # ONE FILE PER OPERATION
 ```
 
+## The account's payment instrument (`FREETIER_PAYMENT_INSTRUMENT_VETTED`)
+
+`UpgradeAccountPlan` moves the account onto the paid plan only when the account
+holds a payment instrument that has been vetted; from an account with none AWS
+answers HTTP 400 `ValidationException` with `Account plan upgrade failed PI vet
+failure` and leaves the account's plan record untouched. Nothing in this API — and
+nothing in any other service this emulator serves — adds a payment instrument, so
+the emulated account starts with none, which is the state the recorded refusal was
+answered for. An operator says otherwise out of band:
+
+```bash
+FREETIER_PAYMENT_INSTRUMENT_VETTED=1 cargo run -p aws-emulator-router
+```
+
+The setting is read once into
+`state::ComAmazonawsFreetierAwsfreetierserviceState::vetted_payment_instruments`
+when this service's store is created (`1`, `true`, `yes` or `on` in any case says
+the instrument has been vetted; anything else leaves it unvetted), and
+`src/ops/upgrade_account_plan.rs` reads it before it writes any plan state. With it
+set, the paid plan and everything a client does after reaching it — a plan state
+reporting `PAID` with no expiration instant, and the closed free-plan window — are
+reachable with nothing but the modelled requests.
+
 ## Implementing an operation
 
 Each file in `src/ops/` owns exactly one operation and declares which one
