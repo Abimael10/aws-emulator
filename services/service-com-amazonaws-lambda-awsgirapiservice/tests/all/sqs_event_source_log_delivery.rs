@@ -147,7 +147,15 @@ fn emulator() -> MultiServiceRouter {
 ///
 /// A group no delivery has created yet holds none, which is what this answers while the chain
 /// is still in flight.
-async fn logged_lines(router: &MultiServiceRouter, case: &str, group: &str) -> Vec<String> {
+///
+/// `pub(crate)` because the suite that reads a handler's own line for another rule
+/// (`tests/all/sqs_event_source_revoked_downstream_grant.rs`) reads the group through this one
+/// reader rather than a second copy of it.
+pub(crate) async fn logged_lines(
+    router: &MultiServiceRouter,
+    case: &str,
+    group: &str,
+) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for stream in streams(router, case, group).await {
         for (_, message) in events(router, case, group, &stream).await {

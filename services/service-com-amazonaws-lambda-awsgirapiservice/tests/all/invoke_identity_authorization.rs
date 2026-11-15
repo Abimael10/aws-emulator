@@ -491,14 +491,20 @@ fn function_arn(name: &str) -> String {
 }
 
 /// The sentence AWS refuses an unauthorized request with.
-fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -> String {
+///
+/// `pub(crate)` because every suite that asserts this error class reads it from here
+/// (`tests/all/sqs_event_source_revoked_downstream_grant.rs`), so the two tables cannot
+/// drift apart.
+pub(crate) fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -> String {
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} {reason}"
     )
 }
 
 /// The clause a refusal carries when nothing the principal holds allows `action`.
-fn no_allow(action: &str) -> String {
+///
+/// `pub(crate)` for the reason [`not_authorized`] is.
+pub(crate) fn no_allow(action: &str) -> String {
     format!("because no identity-based policy allows the {action} action")
 }
 

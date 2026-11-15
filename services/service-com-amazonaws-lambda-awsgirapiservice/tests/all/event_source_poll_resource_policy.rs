@@ -170,7 +170,11 @@ impl SourcePolicy {
 
 /// The root-user ARN of the account `arn` belongs to, which is one of the two spellings a
 /// statement names that whole ACCOUNT by.
-fn account_root_of(arn: &str) -> String {
+///
+/// `pub(crate)` because the suite that reads the same rule at the END of the chain
+/// (`tests/all/sqs_event_source_revoked_downstream_grant.rs`) names an account the same way
+/// rather than carrying a second copy of this.
+pub(crate) fn account_root_of(arn: &str) -> String {
     let account = arn
         .split(':')
         .nth(4)
@@ -235,7 +239,10 @@ fn rows() -> Vec<Row> {
 
 /// Attach `document` to the queue `url` addresses as its `Policy` attribute, through Amazon
 /// SQS's own API — or, for a row that attaches none, leave the queue as it was.
-async fn set_queue_policy(
+///
+/// `pub(crate)` for the reason [`account_root_of`] is: THE ONE writer of that attribute in
+/// these suites.
+pub(crate) async fn set_queue_policy(
     router: &MultiServiceRouter,
     case: &str,
     url: &str,

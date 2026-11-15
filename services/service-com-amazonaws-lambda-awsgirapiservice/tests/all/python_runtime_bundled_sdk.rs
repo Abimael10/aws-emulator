@@ -119,7 +119,11 @@ async fn dynamodb_ok(
 
 /// The table `name`, created and waited out to `ACTIVE` by the shared fixture, answered as the
 /// ARN DynamoDB persisted — which is the resource a grant for it names.
-async fn given_table_arn(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+///
+/// `pub(crate)` because the suites that grant a role one table and then read the refusal naming
+/// it (`tests/all/sqs_event_source_revoked_downstream_grant.rs`) need the very ARN DynamoDB
+/// persisted, read this one way.
+pub(crate) async fn given_table_arn(router: &MultiServiceRouter, case: &str, name: &str) -> String {
     given_table(router, case, name, None).await;
     let described = dynamodb_ok(router, case, "DescribeTable", &json!({"TableName": name})).await;
     described["Table"]["TableArn"]
