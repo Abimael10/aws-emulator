@@ -1731,3 +1731,16 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // The `all/all_rs_*.rs` suites, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` pin all of that, for this file and for
 // every service crate's `tests/all.rs`, so a note about those rules belongs there rather than
+// cross-service suites, and nothing else. Below this header the file holds one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under `tests/all/`, sorted
+// by name, and no other line, so two branches landing at once insert two lines in two places
+// and have no prose to duplicate, re-word or mistype. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair in order; what that suite covers belongs in its
+// own module header, and a note about THIS file belongs in `all/appended_notes.rs`.
+// compiles no suite of this target. A suite no `mod` here names is compiled nowhere; a second
+// `mod` for one name is `E0428`; and `tests/all.rs` is a test-target CRATE ROOT, so a bare
+// `mod` would resolve to a sibling of this file, which the layout check refuses — the
+// `#[path]` above each `mod` is what points it into `tests/all/`. The `all_rs_*`,
+// `declaration_roots_*` and `all/every_suite_file_is_declared.rs` suites pin every rule above.
+// An inner attribute, like an inner doc comment, is legal only before the first item, so the
+// lint allowance below stands here rather than in the list.

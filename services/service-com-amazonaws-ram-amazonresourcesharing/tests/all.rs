@@ -25,8 +25,12 @@ mod managed_permissions;
 mod mutation_reports;
 #[path = "all/pending_invitation_resources.rs"]
 mod pending_invitation_resources;
+#[path = "all/permission_deletion.rs"]
+mod permission_deletion;
 #[path = "all/permission_listing.rs"]
 mod permission_listing;
+#[path = "all/permission_refusal_wording.rs"]
+mod permission_refusal_wording;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_shares.rs"]
@@ -43,5 +47,3 @@ mod share_tags_and_configuration;
 mod shareable_resource_arn_classification;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
-#[path = "all/permission_refusal_wording.rs"]
-mod permission_refusal_wording;

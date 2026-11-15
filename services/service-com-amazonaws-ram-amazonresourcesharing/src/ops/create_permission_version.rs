@@ -233,6 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let now = store.tick();
+        store.settle_due_permissions(now);
 
         if let Some(token) = input.client_token.clone() {
             if let Some(record) = store.client_token_record(Self::NAME, &token) {
@@ -250,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A repeat writes no further version: the one the first call wrote is
                 // the permission's default version, and that is the answer.
                 let arn = record.resource_arn.clone();
-                if let Some(detail) = store.permission(&arn).and_then(|permission| {
+                if let Some(detail) = store.live_permission(&arn).and_then(|permission| {
                     permission
                         .version(None)
                         .map(|version| permission.detail(version))
@@ -263,8 +264,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A permission `DeletePermission` has deleted, or is deleting, is no longer a
+        // permission there is a version to add to, so [`live_permission`] reports it as
+        // the unknown resource it now is.
         let permission = store
-            .permission(&input.permission_arn)
+            .live_permission(&input.permission_arn)
             .cloned()
             .ok_or_else(|| {
                 CreatePermissionVersionErrorModeled::UnknownResourceException(

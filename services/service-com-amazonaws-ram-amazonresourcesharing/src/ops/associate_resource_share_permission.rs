@@ -251,6 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let now = store.tick();
         store.settle_due_associations(now);
+        store.settle_due_permissions(now);
 
         // Every parameter other than the token itself, so a retry of this request is
         // told apart from a different request that reuses the token.
@@ -287,7 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // unknown resource it now is by the checks below, so a token cannot
                 // answer for a resource that is gone.
                 if store.live_share(&input.resource_share_arn).is_some()
-                    && store.permission(&input.permission_arn).is_some()
+                    && store.live_permission(&input.permission_arn).is_some()
                 {
                     return Ok(AssociateResourceSharePermissionOutput {
                         return_value: Some(true),
@@ -307,8 +308,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // A permission that is ATTACHABLE is one that "can be associated with resource
+        // shares" (`ResourceSharePermissionDetail$status`); one `DeletePermission` has
+        // deleted, or is deleting, is not, so [`live_permission`] reports it as the
+        // unknown resource it now is.
         let permission = store
-            .permission(&input.permission_arn)
+            .live_permission(&input.permission_arn)
             .cloned()
             .ok_or_else(|| {
                 AssociateResourceSharePermissionErrorModeled::UnknownResourceException(

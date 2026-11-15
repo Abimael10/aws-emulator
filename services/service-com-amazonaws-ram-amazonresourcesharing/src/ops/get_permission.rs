@@ -8,7 +8,10 @@
 //! ARNs name no Region and no account (`arn:aws:ram::aws:permission/<PermissionName>`),
 //! so either resolves through the same lookup.
 //!
-//! A pure read: it writes nothing, so what a create stored is what this reports.
+//! A reporting operation: the only state it writes is the move the clock already owed
+//! — a permission whose delete has fallen due is `DELETED` from that instant on,
+//! whether or not anybody asks — so what a create or a version write stored is what
+//! this reports.
 //!
 //! ## Shape of an operation
 //!
@@ -190,7 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // A permission whose delete has fallen due is DELETED whether or not anybody
+        // asked, so this read materialises that owed move before reporting — the only
+        // write it performs.
+        let now = store.tick();
+        store.settle_due_permissions(now);
         let permission = store.permission(&input.permission_arn).ok_or_else(|| {
             GetPermissionErrorModeled::UnknownResourceException(UnknownResourceException {
                 message: crate::state::unknown_permission_message(&input.permission_arn),

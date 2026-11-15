@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the customer managed permission [`crate::state`] holds under the ARN the
+//! request names, with every version written for it, and reports the status the delete
+//! has reached.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The delete "is performed asynchronously": the permission leaves the attachable
+//! statuses for `DELETING` at once and reaches `DELETED` once the move the clock owes
+//! falls due, so a caller polling [`crate::ops::get_permission`] sees the deletion
+//! complete ([`crate::state::permission_deletion`]). The permission a delete has
+//! deleted is no longer one a resource share can be associated with, and only a
+//! CUSTOMER managed permission that no live share is associated with can be deleted at
+//! all.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +177,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePermission"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeletePermissionErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the managed permission store is unavailable".to_string(),
+            })
+        })?;
+
+        // The model constrains neither member, so both rules below are applied here,
+        // each rendered as the modelled error RAM words that refusal with.
+        if let Some(why) =
+            crate::state::permission_arn_rejection("permissionArn", &input.permission_arn)
+        {
+            return Err(DeletePermissionErrorModeled::MalformedArnException(
+                MalformedArnException { message: why },
+            )
+            .into());
+        }
+        if let Some(why) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_rejection)
+        {
+            return Err(DeletePermissionErrorModeled::InvalidClientTokenException(
+                InvalidClientTokenException { message: why },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let now = store.tick();
+        store.settle_due_permissions(now);
+
+        // Every parameter other than the token itself, so a retry of this request is
+        // told apart from a different request that reuses the token.
+        let fingerprint = crate::state::fingerprint(&[&input.permission_arn]);
+
+        if let Some(token) = input.client_token.clone() {
+            if let Some(record) = store.client_token_record(Self::NAME, &token) {
+                if record.fingerprint != fingerprint {
+                    return Err(
+                        DeletePermissionErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE
+                                    .to_string(),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // A repeat of the delete that already happened deletes nothing further
+                // and reports the same success, with the status the permission has
+                // reached since — the delete the first call started goes on falling due
+                // on its own. A permission created again under the freed name is a
+                // DIFFERENT permission, which this token's call never deleted, so the
+                // repeat answers for the delete that did happen rather than deleting it.
+                let arn = record.resource_arn.clone();
+                let status = store
+                    .permission(&arn)
+                    .and_then(|permission| permission.deletion.as_ref())
+                    .map_or_else(
+                        || crate::state::PERMISSION_STATUS_DELETED.to_string(),
+                        |deletion| deletion.status.clone(),
+                    );
+                return Ok(DeletePermissionOutput {
+                    return_value: Some(true),
+                    permission_status: Some(status),
+                    client_token: Some(token),
+                });
+            }
+        }
+
+        let permission = store
+            .permission(&input.permission_arn)
+            .cloned()
+            .ok_or_else(|| {
+                DeletePermissionErrorModeled::UnknownResourceException(UnknownResourceException {
+                    message: crate::state::unknown_permission_message(&input.permission_arn),
+                })
+            })?;
+        // This operation "deletes the specified CUSTOMER MANAGED permission", and an
+        // AWS managed one is a permission "Amazon Web Services created and manages"
+        // that "you can't modify" (`ResourceSharePermissionDetail$permissionType`), so
+        // asking for one to be deleted is asking for an operation that is not
+        // permitted.
+        if permission.permission_type != crate::state::PERMISSION_TYPE_CUSTOMER_MANAGED {
+            return Err(
+                DeletePermissionErrorModeled::OperationNotPermittedException(
+                    OperationNotPermittedException {
+                        message: crate::state::aws_managed_permission_not_deletable_message(
+                            &input.permission_arn,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "You can delete a customer managed permission only if it isn't attached to
+        // any resource share." A permission still governing a live share is therefore
+        // refused rather than deleted — so a share never loses the permission it is
+        // governed by under a caller's feet.
+        if !permission.is_deleting_or_deleted() {
+            let attached = store.shares_attaching_permission(&input.permission_arn);
+            if !attached.is_empty() {
+                return Err(
+                    DeletePermissionErrorModeled::OperationNotPermittedException(
+                        OperationNotPermittedException {
+                            message: crate::state::permission_attached_to_share_message(
+                                &input.permission_arn,
+                                &attached,
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Deleting a permission is idempotent for as long as its record exists: one
+        // already DELETING or DELETED is deleted, so a repeat reports the status that
+        // delete has reached instead of a client error, and neither restarts the move
+        // nor moves the stamps.
+        let permission_status = store
+            .delete_permission(&input.permission_arn, now)
+            .ok_or_else(|| {
+                DeletePermissionErrorModeled::UnknownResourceException(UnknownResourceException {
+                    message: crate::state::unknown_permission_message(&input.permission_arn),
+                })
+            })?;
+
+        // RAM generates a token when the request omits one and reports it either way,
+        // so a caller can repeat the call idempotently.
+        let client_token = match input.client_token {
+            Some(token) => token,
+            None => store.fresh_uuid(),
+        };
+        store.remember_client_token(
+            Self::NAME,
+            &client_token,
+            fingerprint,
+            input.permission_arn,
+        );
+
+        Ok(DeletePermissionOutput {
+            // "A boolean that indicates whether the delete operations succeeded": the
+            // permission is on the delete path.
+            return_value: Some(true),
+            permission_status: Some(permission_status),
+            client_token: Some(client_token),
+        })
     }
 }

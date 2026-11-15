@@ -25,9 +25,11 @@
 
 mod aws_managed_permissions;
 mod permission_attachments;
+mod permission_deletion;
 
 pub use aws_managed_permissions::*;
 pub use permission_attachments::*;
+pub use permission_deletion::*;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -771,6 +773,9 @@ pub struct PermissionRecord {
     /// Every version written for this permission, keyed by version number: the key
     /// order is total and stable, so a paginated read over versions has a page order.
     pub versions: BTreeMap<i32, PermissionVersionRecord>,
+    /// Where the delete of this whole permission has got to, or `None` for a
+    /// permission nobody has deleted ([`permission_deletion`]).
+    pub deletion: Option<PermissionDeletion>,
 }
 
 impl PermissionRecord {
@@ -793,7 +798,7 @@ impl PermissionRecord {
             default_version: Some(version.version == self.default_version),
             name: Some(self.name.clone()),
             resource_type: Some(self.resource_type.clone()),
-            status: Some(version.status.clone()),
+            status: Some(self.version_status(version)),
             // The times are the version's own: what a summary describes is one
             // version of the permission.
             creation_time: Some(to_date_time(version.creation_time)),
@@ -822,7 +827,7 @@ impl PermissionRecord {
             is_resource_type_default: Some(self.is_resource_type_default),
             permission_type: Some(self.permission_type.clone()),
             feature_set: Some(self.feature_set.clone()),
-            status: Some(version.status.clone()),
+            status: Some(self.version_status(version)),
             tags: Some(tag_list(&self.tags)),
         }
     }
@@ -1049,6 +1054,11 @@ impl ComAmazonawsRamAmazonresourcesharingState {
     /// create cap counts: the AWS managed catalog the store is seeded with was created
     /// by Amazon Web Services, not by a caller, so it does not count against what a
     /// caller may create.
+    ///
+    /// A permission a delete has removed still counts: its record survives the delete
+    /// so a caller can read the deletion back, and nothing reclaims it, so it is a
+    /// record this account's creates put in the store like any other. That is what
+    /// keeps the store finite under a create-and-delete loop.
     pub fn customer_managed_permission_count(&self) -> usize {
         self.permissions
             .values()

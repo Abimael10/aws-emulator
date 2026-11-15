@@ -279,6 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let now = store.tick();
+        store.settle_due_permissions(now);
 
         if let Some(token) = input.client_token.clone() {
             if let Some(record) = store.client_token_record(Self::NAME, &token) {
@@ -310,9 +311,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A permission's name is unique within the Region, and its ARN carries that
         // name, so a second permission of the same name in the same Region is the
         // name clash RAM refuses rather than a second record. The refusal names the
-        // permission already holding the name by the ARN it is stored under.
+        // permission already holding the name by the ARN it is stored under. A
+        // permission whose delete has COMPLETED is deleted, so it holds its name no
+        // longer and this create takes it over.
         let arn = crate::state::permission_arn(&region, &input.name);
-        if let Some(existing) = store.permission(&arn) {
+        if let Some(existing) = store
+            .permission(&arn)
+            .filter(|permission| !permission.is_deleted())
+        {
             let existing_arn = existing.arn.clone();
             return Err(
                 CreatePermissionErrorModeled::PermissionAlreadyExistsException(
@@ -367,6 +373,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )]
             .into_iter()
             .collect(),
+            // Nothing has deleted a permission this call is minting.
+            deletion: None,
         });
 
         // RAM generates a token when the request omits one and reports it either

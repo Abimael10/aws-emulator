@@ -354,6 +354,9 @@ impl AwsManagedPermission {
             )]
             .into_iter()
             .collect(),
+            // A permission Amazon Web Services manages is one no caller can delete, so
+            // no catalog entry is ever on the delete path.
+            deletion: None,
         }
     }
 }
