@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair per file under `tests/all/`, sorted by name, and no other line.
+// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
+// pin that shape; `all/appended_prose.rs` keeps what landings had appended here.
+// Single integration-test target for the router: the declaration list, and nothing else.
+//
+// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // Single integration-test target for the router: the canonical DECLARATION LIST of every
 // cross-service suite under `tests/all/`, and nothing else.
-//
 // Single integration-test target for the router: a declaration list, and nothing else.
 // Past this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // file under `tests/all/`, sorted by name, and no other line — no prose between the pairs, no
@@ -63,7 +71,6 @@
 // test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of it, which the layout
 // check refuses: the `#[path]` above each `mod` is what points it into `tests/all/`.
 // Suites of this target pin all of that rather than restate it:
-// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // suite file, sorted by name, and no other line — no prose between the pairs, no blank line,
 // and nothing after the last pair. Two branches landing at once then insert two lines in two
 // places and have no prose to duplicate, re-word or mistype, which is what had gone wrong
@@ -83,8 +90,6 @@
 // this header that kept arriving in its tail had done. With none anywhere below this block, no
 // merge of two landings can leave one there.
 // note about THIS file belongs in `all/appended_notes.rs`. The suites
-// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
 // The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`

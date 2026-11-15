@@ -23,6 +23,8 @@ mod cancel_resource_request;
 mod compound_identifiers;
 #[path = "all/deleted_resource_refusal.rs"]
 mod deleted_resource_refusal;
+#[path = "all/dynamodb_table_read_through.rs"]
+mod dynamodb_table_read_through;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/full_resource_model.rs"]

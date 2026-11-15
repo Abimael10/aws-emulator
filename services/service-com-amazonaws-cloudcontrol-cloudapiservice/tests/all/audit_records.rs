@@ -15,8 +15,9 @@ use serde_json::json;
 use super::emulator::{progress, text, Emulator};
 
 /// A resource type whose primary identifier the caller supplies and whose resources live
-/// in this service's own store.
-const TABLE: &str = "AWS::DynamoDB::Table";
+/// in this service's own store — one no provider of this emulator stands behind, so the
+/// records here are about the CALL rather than about an owning service.
+const TABLE: &str = "AWS::Timestream::Table";
 
 /// One captured `tracing` event: its target and its fields as text.
 #[derive(Clone, Debug)]
@@ -185,7 +186,7 @@ async fn every_state_changing_call_leaves_one_record_and_no_resource_model() {
         for record in matching {
             assert_eq!(
                 record.field("resource"),
-                "AWS::DynamoDB::Table/audited-table",
+                format!("{TABLE}/audited-table"),
                 "case {case:?}: the record must name the resource the call acted on, got \
                  {record:?}"
             );

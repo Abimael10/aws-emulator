@@ -42,6 +42,7 @@ mod managed_policies;
 mod parameters;
 mod queues;
 mod state_machines;
+mod tables;
 mod topics;
 
 use ::serde_json::Value;
@@ -219,6 +220,9 @@ impl NativeResources {
         if let Some(provider) = parameters::ParameterProvider::for_engine(engine) {
             providers.push(Box::new(provider));
         }
+        if let Some(provider) = tables::TableProvider::for_engine(engine) {
+            providers.push(Box::new(provider));
+        }
         Self { providers }
     }
 
@@ -277,6 +281,17 @@ pub type IamState =
 pub type SfnState =
     ::service_com_amazonaws_sfn_awsstepfunctions::state::ComAmazonawsSfnAwsstepfunctionsState;
 
+/// The Amazon DynamoDB store the resources of the `AWS::DynamoDB::Table` type live in — that
+/// service's OWN state struct, reached through the shared engine, so a table
+/// `dynamodb:CreateTable` created is the table Cloud Control API resolves, and a table
+/// `dynamodb:DeleteTable` removed is one it reports as not found.
+///
+/// The DynamoDB Streams store a table's stream lives in is reached through that service's own
+/// seam (`ddb::streams_state`), so the stream half of a table's lifecycle stays its
+/// knowledge rather than being reassembled here.
+pub type DynamodbState =
+    ::service_com_amazonaws_dynamodb_dynamodb_20120810::state::ComAmazonawsDynamodbDynamodb20120810State;
+
 /// The Systems Manager store the resources of the `AWS::SSM::Parameter` type live in — that
 /// service's OWN state struct, reached through the shared engine, so a parameter
 /// `ssm:PutParameter` wrote is the parameter Cloud Control API resolves, and one
@@ -333,6 +348,30 @@ fn require_held(
 ) -> Result<(), NativeRefusal> {
     match held {
         Some(held) => require_value(property, value, held),
+        None => Err(unsupported(type_name, property)),
+    }
+}
+
+/// Check that `property` carries exactly what a read of the resource REPORTS for it — the
+/// rule a property of the type's schema whose value is not text is held to, where this
+/// emulator's provider does not APPLY that property.
+///
+/// The text-valued rule ([`require_held`]) stated over a whole property VALUE, for a schema
+/// whose properties are structures and lists: a read reports such a property, so a model a
+/// client round-trips carries it, and carrying it unchanged asks for nothing; any other
+/// value — and any value at all where the read reports none — asks for work no handler here
+/// performs, which is refused rather than accepted and dropped.
+fn require_reported(
+    type_name: &str,
+    property: &str,
+    value: &Value,
+    reported: Option<&Value>,
+) -> Result<(), NativeRefusal> {
+    match reported {
+        Some(reported) if reported == value => Ok(()),
+        Some(_) => Err(NativeRefusal::Invalid(format!(
+            "{property} of this resource is what a read of it reports"
+        ))),
         None => Err(unsupported(type_name, property)),
     }
 }
@@ -497,7 +536,11 @@ mod tests {
             native.provider("AWS::SSM::Parameter").is_some(),
             "expected the parameter provider, got {native:?}"
         );
-        for unbacked in ["AWS::Kinesis::Stream", "AWS::DynamoDB::Table", "AWS::Logs"] {
+        assert!(
+            native.provider("AWS::DynamoDB::Table").is_some(),
+            "expected the table provider, got {native:?}"
+        );
+        for unbacked in ["AWS::Kinesis::Stream", "AWS::DynamoDB::GlobalTable", "AWS::Logs"] {
             assert!(
                 native.provider(unbacked).is_none(),
                 "type {unbacked:?}: expected no provider, got one"

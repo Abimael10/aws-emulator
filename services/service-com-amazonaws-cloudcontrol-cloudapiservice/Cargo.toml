@@ -40,6 +40,11 @@ service-com-amazonaws-ssm-amazonssm = { workspace = true }
 # store, so an alarm provisioned through this service is one that service's own
 # `DescribeAlarms` reports and its own evaluation then grades.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# And for `AWS::DynamoDB::Table`: a table lives in the Amazon DynamoDB service's store,
+# whichever API created it, so this crate reads and writes it THERE — including the stream a
+# deleted table hands back, which that crate's own streams seam applies
+# (`state::native::tables`).
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

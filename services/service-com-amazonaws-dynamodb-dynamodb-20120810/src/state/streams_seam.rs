@@ -433,8 +433,57 @@ pub fn disable_table_stream<Eng: Send + Sync + 'static>(
     stream_arn: &str,
     at: SystemTime,
 ) -> bool {
-    use ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810 as streams;
+    disable_stream_in(streams_state(engine).as_ref(), stream_arn, at)
+}
 
-    streams::state::service_state(engine)
-        .is_some_and(|store| store.lock().disable_stream(stream_arn, at))
+/// The DynamoDB Streams store a table's stream lives in — that service's OWN state struct,
+/// named here because a table's stream is reached through this seam and nowhere else.
+pub type StreamsState =
+    ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::state::ComAmazonawsDynamodbstreamsDynamodbstreams20120810State;
+
+/// The handle to that store THIS engine carries, or `None` for a deployment whose engine
+/// carries none.
+///
+/// For a caller that holds the handle rather than the engine — a control plane acting on a
+/// table of this account from outside this service's own wire — so the stream half of a
+/// table's lifecycle stays one piece of knowledge.
+pub fn streams_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<StreamsState>> {
+    ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::state::service_state(engine)
+}
+
+/// [`disable_table_stream`] for a caller that already holds the streams store's handle, and
+/// the one place the disable itself is performed.
+pub fn disable_stream_in(
+    streams: Option<&::engine::ServiceState<StreamsState>>,
+    stream_arn: &str,
+    at: SystemTime,
+) -> bool {
+    streams.is_some_and(|store| store.lock().disable_stream(stream_arn, at))
+}
+
+/// Hand the stream of the deleted table `table_name` back to the DynamoDB Streams service:
+/// "If you have DynamoDB Streams enabled on the table, then the corresponding stream on that
+/// table goes into the DISABLED state" (the `DeleteTable` doc).
+///
+/// The ONE place that rule lives, so a table removed over this service's own wire and one
+/// removed by a control plane acting on this account do the same thing. A delete itself
+/// cannot fail on the stream — the table is going away either way — but a registry that does
+/// not hold the table's enabled stream is a broken invariant, so it is reported rather than
+/// swallowed, which is also what a streams store this process cannot reach looks like from
+/// here.
+pub fn hand_back_table_stream(
+    streams: Option<&::engine::ServiceState<StreamsState>>,
+    table_name: &str,
+    stream_arn: &str,
+    at: SystemTime,
+) {
+    if !disable_stream_in(streams, stream_arn, at) {
+        ::tracing::warn!(
+            stream_arn = %stream_arn,
+            table_name = %table_name,
+            "the deleted table's enabled stream was not in the DynamoDB Streams registry"
+        );
+    }
 }

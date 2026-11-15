@@ -27,8 +27,10 @@ use super::emulator::{code, message, text, Emulator, STATUS_SUCCESS};
 /// A queue type, created with nothing but its name so the model carries few properties.
 const QUEUE: &str = "AWS::SQS::Queue";
 
-/// A table type, whose model carries nested objects and a list to point into.
-const TABLE: &str = "AWS::DynamoDB::Table";
+/// A table type, whose model carries nested objects and a list to point into. One no
+/// provider of this emulator stands behind, so its model is exactly what the desired state
+/// below spells.
+const TABLE: &str = "AWS::Timestream::Table";
 
 /// A log group type, whose schema's `RetentionInDays` is a property the owning service
 /// reports only once something has set it.

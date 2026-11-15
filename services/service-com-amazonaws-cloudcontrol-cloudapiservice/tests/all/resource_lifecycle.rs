@@ -13,12 +13,16 @@ use super::emulator::{
     code, descriptions, message, progress, text, Emulator, STATUS_FAILED, STATUS_IN_PROGRESS,
     STATUS_SUCCESS,
 };
-use super::refusal_wording::{assert_handler_not_found, generic_already_exists};
+use super::refusal_wording::{assert_handler_not_found, generic_already_exists, generic_not_found};
 
 /// A resource type whose primary identifier the caller supplies and whose resources live
 /// in THIS service's own store, so every row here is about the operation rather than about
 /// one owning service.
-const TABLE: &str = "AWS::DynamoDB::Table";
+///
+/// A type no provider of this emulator stands behind, which is what keeps that true: the
+/// resources of a type whose owning service this emulator holds the store of live THERE
+/// (`state::native`), so such a type's rows would be about that service as well.
+const TABLE: &str = "AWS::Timestream::Table";
 
 /// A second resource type, so a case can tell one type's resources from another's. Its
 /// resources live in the OWNING service's store (`AWS::Logs::LogGroup` is a CloudWatch
@@ -46,11 +50,11 @@ fn inert_patch() -> Value {
     json!([{ "op": "add", "path": "/Tags", "value": [] }])
 }
 
-/// The not-found diagnostic the service that OWNS this type states for one of its
-/// resources, which every refusal about an absent one of them carries: Amazon DynamoDB
-/// names the table it holds none of.
+/// The not-found diagnostic the handler of this type states for one of its resources,
+/// which every refusal about an absent one of them carries: a handler built on the generic
+/// resource-provider base class names nothing but the type and the identifier.
 fn table_not_found(identifier: &str) -> String {
-    format!("Table: {identifier} does not exist.")
+    generic_not_found(TABLE, identifier)
 }
 
 #[tokio::test]

@@ -80,6 +80,15 @@ pub(crate) const SFN_SIGNING_NAME: &str = "states";
 /// parameters `AWS::SSM::Parameter` names.
 pub(crate) const SSM_SIGNING_NAME: &str = "ssm";
 
+/// The sigv4 signing name of the Amazon DynamoDB service, whose own store holds the tables
+/// `AWS::DynamoDB::Table` names.
+pub(crate) const DYNAMODB_SIGNING_NAME: &str = "dynamodb";
+
+/// The `X-Amz-Target` prefix a client writes for that service: the local name of its Smithy
+/// service shape. DynamoDB and DynamoDB Streams share one signing name, so this prefix is
+/// what tells the two apart.
+pub(crate) const DYNAMODB_TARGET_PREFIX: &str = "DynamoDB_20120810";
+
 /// The `X-Amz-Target` prefix a client writes for that service: the local name of its
 /// Smithy service shape.
 pub(crate) const SSM_TARGET_PREFIX: &str = "AmazonSSM";
@@ -331,6 +340,42 @@ impl Emulator {
     /// One operation of the Systems Manager service, required to succeed.
     pub(crate) async fn ssm_ok(&self, operation: &str, body: Value) -> Value {
         let (status, decoded) = self.ssm(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
+        );
+        decoded
+    }
+
+    /// One emulator with the service that OWNS `AWS::DynamoDB::Table` mounted beside this
+    /// one.
+    ///
+    /// The DynamoDB Streams store a table's stream lives in is part of the same shared
+    /// engine, so the stream a table carries is registered and handed back whether or not
+    /// that service's own wire is mounted — no suite here calls it.
+    pub(crate) fn with_dynamodb() -> Self {
+        Self::mounted(|router, engine| {
+            router.register_service(
+                service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService::new(engine),
+            );
+        })
+    }
+
+    /// One operation of the Amazon DynamoDB service — the OWNING service's own API, the one
+    /// a client uses when it is not going through Cloud Control API.
+    pub(crate) async fn dynamodb(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.post(
+            DYNAMODB_SIGNING_NAME,
+            "application/x-amz-json-1.0",
+            &format!("{DYNAMODB_TARGET_PREFIX}.{operation}"),
+            body,
+        )
+        .await
+    }
+
+    /// One operation of the Amazon DynamoDB service, required to succeed.
+    pub(crate) async fn dynamodb_ok(&self, operation: &str, body: Value) -> Value {
+        let (status, decoded) = self.dynamodb(operation, body).await;
         assert_eq!(
             status, 200,
             "{operation}: expected HTTP 200, got {status} with body {decoded:?}"

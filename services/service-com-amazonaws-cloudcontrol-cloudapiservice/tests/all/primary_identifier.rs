@@ -95,13 +95,13 @@ async fn the_primary_identifier_is_the_value_of_the_types_own_identifier_propert
         },
         Case {
             name: "the most specific property wins over the fallbacks",
-            type_name: "AWS::DynamoDB::Table",
+            type_name: "AWS::Timestream::Table",
             desired: json!({ "TableName": "primary", "Name": "secondary", "Id": "tertiary" }),
             expected: Some("primary"),
         },
         Case {
             name: "a numeric identifier",
-            type_name: "AWS::DynamoDB::Table",
+            type_name: "AWS::Timestream::Table",
             desired: json!({ "TableId": 42, "Partition": "a" }),
             expected: Some("42"),
         },
@@ -197,7 +197,7 @@ async fn two_creates_naming_no_identifier_are_two_resources() {
 #[tokio::test]
 async fn the_same_identifier_under_two_types_is_two_resources() {
     let emulator = Emulator::new();
-    const TABLE: &str = "AWS::DynamoDB::Table";
+    const TABLE: &str = "AWS::Timestream::Table";
     const LOG_GROUP: &str = "AWS::Logs::LogGroup";
     let table = json!({ "TableName": "shared", "Tags": [] });
     let log_group = json!({ "LogGroupName": "shared", "RetentionInDays": 7 });

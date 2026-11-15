@@ -274,6 +274,17 @@ pub const MAX_TAGS_PER_TABLE: usize = 50;
 /// cannot assign" (the `Tag` doc).
 pub const RESERVED_TAG_PREFIX: &str = "aws:";
 
+/// AWS's fixed text for a delete of a table whose deletion protection is on: "The table
+/// cannot be deleted" while the flag is set (`CreateTable$DeletionProtectionEnabled`), and
+/// the sentence names the setting standing in the way rather than the table.
+///
+/// Stated once because a table is deleted from more than one plane — this service's own
+/// `DeleteTable`, and a generic control plane that removes a resource of this account — and
+/// the flag turns every one of them down with the same words.
+pub const DELETION_PROTECTED_MESSAGE: &str =
+    "Resource cannot be deleted as it is currently protected against deletion. Disable \
+     deletion protection first.";
+
 /// The most global secondary indexes one table may carry: "One or more global
 /// secondary indexes (the maximum is 20) to be created on the table" (the
 /// `CreateTable$GlobalSecondaryIndexes` doc).
@@ -3659,9 +3670,17 @@ pub fn index_arn(region: &str, table: &str, index: &str) -> String {
 // =============================================================================
 pub mod streams_seam;
 
+/// Minting a stored table from what its creator decided about it lives in
+/// `state/table_minting.rs`: the record is one piece of knowledge, and more than one plane
+/// creates a table. Re-exported below, so every caller still names it `crate::state::…`.
+pub mod table_minting;
+
+pub use table_minting::{mint_table, MintedTable, BILLING_MODE_PAY_PER_REQUEST};
+
 pub use streams_seam::{
-    disable_table_stream, publish_item_changes, register_table_stream, stream_view_type,
-    StreamFault, STREAM_VIEW_TYPE_FORBIDDEN_ON_CREATE, STREAM_VIEW_TYPE_FORBIDDEN_ON_UPDATE,
+    disable_stream_in, disable_table_stream, hand_back_table_stream, publish_item_changes,
+    register_table_stream, stream_view_type, streams_state, StreamFault, StreamsState,
+    STREAM_VIEW_TYPE_FORBIDDEN_ON_CREATE, STREAM_VIEW_TYPE_FORBIDDEN_ON_UPDATE,
     STREAM_VIEW_TYPE_REQUIRED, STREAM_VIEW_TYPE_REQUIRED_ON_ENABLE,
 };
 
