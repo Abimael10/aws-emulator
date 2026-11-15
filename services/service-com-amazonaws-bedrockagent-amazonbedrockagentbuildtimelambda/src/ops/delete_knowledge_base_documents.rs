@@ -268,19 +268,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The index the knowledge base's own `storageConfiguration` binds it to,
         // read while this store is still held.
-        let binding = state
+        let bound = state
             .live_knowledge_base(&input.knowledge_base_id)
-            .and_then(|knowledge_base| {
-                crate::state::s3_vectors_binding(knowledge_base.storage_configuration.as_ref())
-            });
+            .and_then(crate::state::BoundVectorIndex::of);
         // A document whose deletion this call accepted is no longer part of what
         // the knowledge base holds, so the chunk its ingestion recorded leaves
         // the bound index with it and no retrieval keeps reporting it. Written
         // with NO guard of this service's store held, the lock order every
         // cross-plane path of these services keeps.
         drop(state);
-        if let Some(binding) = binding.filter(|_| !deleted.is_empty()) {
-            crate::state::remove_document_vectors(&*self.engine, &binding, &deleted);
+        if let Some(bound) = bound.filter(|_| !deleted.is_empty()) {
+            crate::state::remove_document_vectors(&*self.engine, &bound, &deleted);
         }
 
         Ok(DeleteKnowledgeBaseDocumentsOutput {

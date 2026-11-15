@@ -393,12 +393,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The index the knowledge base's own `storageConfiguration` binds it to,
         // and the dimension its chunks carry, read while this store is still
         // held.
-        let (binding, record_dimension) =
+        let (bound, record_dimension) =
             match state.live_knowledge_base(&input.knowledge_base_id) {
                 Some(knowledge_base) => (
-                    crate::state::s3_vectors_binding(
-                        knowledge_base.storage_configuration.as_ref(),
-                    ),
+                    crate::state::BoundVectorIndex::of(knowledge_base),
                     Some(crate::state::record_dimension(knowledge_base)),
                 ),
                 None => (None, None),
@@ -424,16 +422,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 document_details: Some(document_details),
             });
         };
-        let dimension = binding
+        let dimension = bound
             .as_ref()
-            .and_then(|binding| crate::state::bound_index_dimension(&*self.engine, binding))
+            .and_then(|bound| bound.dimension(&*self.engine))
             .unwrap_or(record_dimension);
         let chunks =
             crate::state::pushed_document_chunks(&*self.engine, &ingested, dimension);
-        if let Some(binding) = binding {
+        if let Some(bound) = bound {
             crate::state::index_pushed_chunks(
                 &*self.engine,
-                &binding,
+                &bound,
                 &input.data_source_id,
                 &chunks,
             );

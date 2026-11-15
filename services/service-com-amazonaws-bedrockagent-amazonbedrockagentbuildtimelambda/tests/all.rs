@@ -67,6 +67,8 @@ mod ingestion_job_lifecycle;
 mod ingestion_job_listing;
 #[path = "all/ingestion_statistics_measure_their_own_run.rs"]
 mod ingestion_statistics_measure_their_own_run;
+#[path = "all/ingestion_writes_the_bound_collection_index.rs"]
+mod ingestion_writes_the_bound_collection_index;
 #[path = "all/knowledge_base_document_kinds_and_deletion.rs"]
 mod knowledge_base_document_kinds_and_deletion;
 #[path = "all/knowledge_base_document_listing.rs"]

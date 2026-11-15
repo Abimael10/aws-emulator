@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
             let already_deleting = record.is_deleting();
-            let binding = crate::state::s3_vectors_binding(record.storage_configuration.as_ref());
+            let bound = crate::state::BoundVectorIndex::of(record);
 
             // Deleting a knowledge base deletes the data sources inside it, so
             // each one's own `dataDeletionPolicy` decides what becomes of the
@@ -229,15 +229,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !already_deleting {
                 state.begin_knowledge_base_deletion(&input.knowledge_base_id, now);
             }
-            binding
+            bound
                 .filter(|_| !keys.is_empty())
-                .map(|binding| (binding, keys))
+                .map(|bound| (bound, keys))
         };
 
-        // The vectors leave the store that OWNS them, with no guard of this
+        // The chunks leave the store that OWNS them, with no guard of this
         // service's store held.
-        if let Some((binding, keys)) = removal {
-            crate::state::remove_vectors(&*self.engine, &binding, &keys);
+        if let Some((bound, keys)) = removal {
+            bound.remove(&*self.engine, &keys);
         }
 
         Ok(DeleteKnowledgeBaseOutput {

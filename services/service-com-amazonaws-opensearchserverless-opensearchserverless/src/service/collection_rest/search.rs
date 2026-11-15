@@ -27,21 +27,36 @@ const MAX_RESULT_WINDOW: i64 = 10_000;
 /// overflow aborts the process rather than failing one request.
 const MAX_QUERY_DEPTH: usize = 20;
 
-/// The most values one `terms` or `ids` clause may name, and the most dimensions a `knn`
-/// query vector may carry — each a caller-chosen factor in the cost of evaluating one
-/// clause against every document.
+/// The most values one `terms` or `ids` clause may name — a caller-chosen factor in the
+/// cost of evaluating one clause against every document.
 const MAX_CLAUSE_VALUES: usize = 1_024;
+
+/// The most values one `knn` query vector may carry.
+///
+/// A k-NN query names one value per dimension of the field it searches, so the bound has to
+/// admit the vector a `knn_vector` field holds: the k-NN plugin maps such a field with up to
+/// 16 000 dimensions, and the ordinary embedding a vector knowledge base writes is 1 024 or
+/// 1 536 values long. What bounds the WORK such a query performs is not this count but the
+/// product of it and the documents scanned ([`MAX_SEARCH_WORK`]), which is spent down during
+/// the scan.
+const MAX_KNN_VECTOR_VALUES: usize = 16_000;
 
 /// The most leaf clauses one query body may carry, counted across a `bool`'s BREADTH as
 /// well as its depth — the engine's own `indices.query.bool.max_clause_count`.
 const MAX_QUERY_CLAUSES: usize = 1_024;
+
+/// The most object levels a dotted field name may address — the engine's own
+/// `index.mapping.depth.limit`, whose default is 20, so a field nested deeper than that
+/// cannot be mapped in an index at all. See [`field_name`].
+const MAX_FIELD_SEGMENTS: usize = 20;
 
 /// The most value comparisons one search or count may perform: the documents it scans
 /// times the values it compares in each of them.
 ///
 /// EMULATOR RESOURCE GUARD, not an AWS limit, and the bound that matters here: each factor
 /// being bounded on its own ([`MAX_QUERY_CLAUSES`], [`MAX_CLAUSE_VALUES`],
-/// [`state::MAX_DOCUMENTS_PER_INDEX`], [`state::MAX_DOCUMENT_SOURCE_NODES`]) still leaves
+/// [`MAX_KNN_VECTOR_VALUES`], [`state::MAX_DOCUMENTS_PER_INDEX`],
+/// [`state::MAX_DOCUMENT_SOURCE_NODES`]) still leaves
 /// their product to the caller, so the product is what is bounded. It is the same standard
 /// this crate's own [`state::MAX_RESOURCE_FILTER_WORK`] holds a caller-written filter to.
 ///
@@ -56,8 +71,13 @@ const MAX_QUERY_CLAUSES: usize = 1_024;
 /// short.
 const MAX_SEARCH_WORK: usize = 10_000_000;
 
-/// The engine's error type for a query carrying more clauses than it will evaluate.
+/// The error type the engine answers for a query carrying more clauses than it will evaluate.
 const TOO_MANY_CLAUSES: &str = "too_many_clauses";
+
+/// The score a pair of vectors earns when the space's own conversion produces no number at
+/// all: the score of the furthest hit, which is what a pair carrying values too large to
+/// measure a distance between is ranked as. See [`Space::score`].
+const NO_SCORE: f64 = 0.0;
 
 /// What one search or count may still spend on comparing values, counted DOWN as the scan
 /// performs them. See [`MAX_SEARCH_WORK`] for why the budget is spent during the scan and
@@ -249,11 +269,15 @@ fn evaluated(
         }
         selected.extend(selected_in(index_name, index, &selector, &mut budget)?);
     }
+    // Ordered by score, and by the hit's own identity at equal scores, so two reads of one
+    // index report one order. `total_cmp` is a TOTAL order over every `f64`, which
+    // `partial_cmp` is not: a comparator that is not a total order is one `slice::sort_by`
+    // may panic on, and a panic inside this critical section would cost every later caller
+    // the store rather than this one its answer.
     selected.sort_by(|left, right| {
         right
             .score
-            .partial_cmp(&left.score)
-            .unwrap_or(::std::cmp::Ordering::Equal)
+            .total_cmp(&left.score)
             .then_with(|| left.index.cmp(&right.index))
             .then_with(|| left.id.cmp(&right.id))
     });
@@ -423,7 +447,23 @@ impl Space {
     /// "supported spaces" table converts a distance into a score: `1 / (1 + distance)`
     /// for every distance-shaped space, and the two-branch conversion for the inner
     /// product, whose value grows with similarity rather than with distance.
+    ///
+    /// Always FINITE. Both vectors are values a request or a stored document carried, and a
+    /// JSON number may be large enough that a product or a sum of them overflows to an
+    /// infinity — out of which the conversions below produce a `NaN`, which is not a score
+    /// and orders against nothing. Such a pair earns [`NO_SCORE`] instead, so what the scan
+    /// hands the ordering is always a number that ranks.
     fn score(self, stored: &[f64], queried: &[f64]) -> f64 {
+        let score = self.converted(stored, queried);
+        if score.is_finite() {
+            score
+        } else {
+            NO_SCORE
+        }
+    }
+
+    /// The space's own conversion, before [`score`](Self::score) holds it to a finite value.
+    fn converted(self, stored: &[f64], queried: &[f64]) -> f64 {
         let pairs = || stored.iter().zip(queried.iter());
         match self {
             Self::L1 => 1.0 / (1.0 + pairs().map(|(held, asked)| (held - asked).abs()).sum::<f64>()),
@@ -513,7 +553,7 @@ impl Selector {
                 named.iter().any(|named| named == id).then_some(1.0)
             }
             Self::Term { field, value } => {
-                let held = field_values(source, field);
+                let held = field_values(source, field, budget)?;
                 if !budget.spend(held.len()) {
                     return Option::None;
                 }
@@ -522,7 +562,7 @@ impl Selector {
                     .then_some(1.0)
             }
             Self::Terms { field, values } => {
-                let held = field_values(source, field);
+                let held = field_values(source, field, budget)?;
                 if !budget.spend(held.len().saturating_mul(values.len())) {
                     return Option::None;
                 }
@@ -537,8 +577,12 @@ impl Selector {
                 phrase,
                 all,
             } => {
-                let values = field_values(source, field);
-                if !budget.spend(values.len()) {
+                let values = field_values(source, field, budget)?;
+                // The BYTES of the values, charged before they are copied and tokenised:
+                // what tokenising costs is the length of the text, not the number of values
+                // it is spread over.
+                let bytes: usize = values.iter().map(|value| scalar_text_bytes(value)).sum();
+                if !budget.spend(bytes.max(values.len())) {
                     return Option::None;
                 }
                 let held: Vec<String> = values
@@ -573,7 +617,7 @@ impl Selector {
                 Some(matched / carried)
             }
             Self::Exists { field } => {
-                let held = field_values(source, field);
+                let held = field_values(source, field, budget)?;
                 if !budget.spend(held.len()) {
                     return Option::None;
                 }
@@ -588,11 +632,20 @@ impl Selector {
                 if !budget.spend(vector.len()) {
                     return Option::None;
                 }
-                let held = field_at(source, field)
-                    .into_iter()
-                    .find_map(numbers)
-                    .filter(|held| held.len() == vector.len())?;
-                Some(space.score(&held, vector))
+                // Every candidate value is charged for the values IT holds before it is read
+                // as a vector, so a field carrying many long lists cannot be walked for free.
+                for candidate in field_at(source, field, budget)? {
+                    let carried = candidate.as_array().map_or(0, Vec::len);
+                    if !budget.spend(carried.max(1)) {
+                        return Option::None;
+                    }
+                    if let Some(held) =
+                        numbers(candidate).filter(|held| held.len() == vector.len())
+                    {
+                        return Some(space.score(&held, vector));
+                    }
+                }
+                Option::None
             }
             Self::Bool {
                 must,
@@ -707,7 +760,7 @@ fn selector(
                 .and_then(Value::as_array)
                 .ok_or_else(|| unparsed("ids", "an [ids] query names its [values]"))?;
             if values.len() > MAX_CLAUSE_VALUES {
-                return Err(too_many_values("ids"));
+                return Err(too_many_values("ids", MAX_CLAUSE_VALUES));
             }
             Ok(Selector::Ids(
                 values.iter().map(scalar_text).collect::<Vec<String>>(),
@@ -722,7 +775,7 @@ fn selector(
                 .and_then(Value::as_str)
                 .ok_or_else(|| unparsed("exists", "an [exists] query names its [field]"))?;
             Ok(Selector::Exists {
-                field: field.to_string(),
+                field: field_name(field, "exists")?,
             })
         }
         "term" => {
@@ -742,7 +795,7 @@ fn selector(
                 .as_array()
                 .ok_or_else(|| unparsed("terms", "a [terms] query names a list of values"))?;
             if values.len() > MAX_CLAUSE_VALUES {
-                return Err(too_many_values("terms"));
+                return Err(too_many_values("terms", MAX_CLAUSE_VALUES));
             }
             Ok(Selector::Terms {
                 field,
@@ -913,8 +966,8 @@ fn knn_selector(
         .get("vector")
         .and_then(numbers)
         .ok_or_else(|| unparsed("knn", "a [knn] query names its [vector]"))?;
-    if vector.is_empty() || vector.len() > MAX_CLAUSE_VALUES {
-        return Err(too_many_values("knn"));
+    if vector.is_empty() || vector.len() > MAX_KNN_VECTOR_VALUES {
+        return Err(too_many_values("knn", MAX_KNN_VECTOR_VALUES));
     }
     let mapped = knn_field(index, &field);
     let mapped = mapped.as_ref();
@@ -975,17 +1028,12 @@ fn knn_selector(
 
 /// The mapping the index declares for one field, when that field is mapped at all —
 /// where a `knn_vector` field's dimension and space type are read from.
+///
+/// WHERE that mapping lives in a stored index schema is decided once, beside the record
+/// that holds it ([`state::index_documents::index_field_mapping`]), so this plane and the
+/// service bound to the same index read one field's mapping the same way.
 fn knn_field(index: &state::IndexRecord, field: &str) -> Option<Value> {
-    let mappings = super::indexes::mappings(index);
-    let mut held = mappings.get("properties")?.clone();
-    let mut segments = field.split('.').peekable();
-    while let Some(segment) = segments.next() {
-        held = held.get(segment)?.clone();
-        if segments.peek().is_some() {
-            held = held.get("properties")?.clone();
-        }
-    }
-    Some(held)
+    state::index_documents::index_field_mapping(index, field).map(json_from_document)
 }
 
 /// The clauses a `bool` member holds: a list of clauses, or the one clause written where
@@ -1014,7 +1062,27 @@ fn single_field(clause: &Value, name: &str) -> Result<(String, Value), Box<RtRes
             &format!("[{name}] query doesn't support multiple fields"),
         )));
     }
-    Ok((field.clone(), value.clone()))
+    Ok((field_name(field, name)?, value.clone()))
+}
+
+/// The field name a clause addresses, refused when it addresses more object levels than an
+/// index maps.
+///
+/// Each level a dotted name carries is a WALK over the stored document
+/// ([`field_at`]), so how many of them one clause may ask for is settled where the query is
+/// parsed rather than paid for once per document scanned.
+fn field_name(named: &str, clause: &str) -> Result<String, Box<RtResponse>> {
+    if named.split('.').count() > MAX_FIELD_SEGMENTS {
+        return Err(Box::new(error(
+            400,
+            ILLEGAL_ARGUMENT_EXCEPTION,
+            &format!(
+                "[{clause}] names a field nested deeper than the [{MAX_FIELD_SEGMENTS}] object \
+                 levels an index maps"
+            ),
+        )));
+    }
+    Ok(named.to_string())
 }
 
 /// The refusal for a clause this plane could not read.
@@ -1026,12 +1094,12 @@ fn unparsed(name: &str, reason: &str) -> Box<RtResponse> {
     ))
 }
 
-/// The refusal for a clause naming more values than one clause may carry.
-fn too_many_values(name: &str) -> Box<RtResponse> {
+/// The refusal for a clause naming more values than one clause of its kind may carry.
+fn too_many_values(name: &str, most: usize) -> Box<RtResponse> {
     Box::new(error(
         400,
         ILLEGAL_ARGUMENT_EXCEPTION,
-        &format!("a [{name}] query must name between 1 and {MAX_CLAUSE_VALUES} values"),
+        &format!("a [{name}] query must name between 1 and {most} values"),
     ))
 }
 
@@ -1039,49 +1107,86 @@ fn too_many_values(name: &str) -> Box<RtResponse> {
 /// objects — each member AS STORED, so a list-valued member is one value (a vector, which
 /// a `knn` clause reads whole).
 ///
+/// The walk is CHARGED to `budget` as it goes, one unit per node it inspects — every member
+/// lookup and every item of a list it looks into — and answers `None` the moment the budget
+/// runs out, which aborts the scan ([`selected_in`]). What the walk costs is decided by the
+/// STORED document's shape, which no pre-scan estimate of a query can know, so charging it
+/// here is what keeps one request's work inside [`MAX_SEARCH_WORK`].
+///
 /// The members are BORROWED from the document: a clause is evaluated against every
 /// document of the index, so nothing here may copy one.
-fn field_at<'v>(source: &'v Value, field: &str) -> Vec<&'v Value> {
+fn field_at<'v>(
+    source: &'v Value,
+    field: &str,
+    budget: &mut Budget,
+) -> Option<Vec<&'v Value>> {
     let mut held = vec![source];
     for segment in field.split('.') {
         let mut next: Vec<&'v Value> = Vec::new();
         for value in held {
             match value {
                 Value::Object(members) => {
+                    if !budget.spend(1) {
+                        return Option::None;
+                    }
                     if let Some(found) = members.get(segment) {
                         next.push(found);
                     }
                 }
                 Value::Array(items) => {
+                    if !budget.spend(items.len()) {
+                        return Option::None;
+                    }
                     for item in items {
                         if let Some(found) = item.get(segment) {
                             next.push(found);
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    if !budget.spend(1) {
+                        return Option::None;
+                    }
+                }
             }
         }
         held = next;
         if held.is_empty() {
-            return Vec::new();
+            return Some(Vec::new());
         }
     }
-    held
+    Some(held)
 }
 
 /// The values a document carries at `field`, with a list-valued member contributing each
 /// of its ELEMENTS — which is what makes a `term` over a list of keywords match any one of
-/// them, and what a `match` tokenises. Borrowed, for the reason [`field_at`] gives.
-fn field_values<'v>(source: &'v Value, field: &str) -> Vec<&'v Value> {
-    field_at(source, field)
-        .into_iter()
-        .flat_map(|value| match value {
-            Value::Array(items) => items.iter().collect::<Vec<&'v Value>>(),
-            single => vec![single],
-        })
-        .filter(|value| !value.is_null())
-        .collect()
+/// them, and what a `match` tokenises. Borrowed and charged, for the reasons [`field_at`]
+/// gives.
+fn field_values<'v>(
+    source: &'v Value,
+    field: &str,
+    budget: &mut Budget,
+) -> Option<Vec<&'v Value>> {
+    let mut values: Vec<&'v Value> = Vec::new();
+    for value in field_at(source, field, budget)? {
+        match value {
+            Value::Array(items) => {
+                if !budget.spend(items.len()) {
+                    return Option::None;
+                }
+                values.extend(items.iter().filter(|item| !item.is_null()));
+            }
+            single => {
+                if !budget.spend(1) {
+                    return Option::None;
+                }
+                if !single.is_null() {
+                    values.push(single);
+                }
+            }
+        }
+    }
+    Some(values)
 }
 
 /// Whether a stored value is the one a `term` names. A term is compared as the engine
@@ -1107,6 +1212,19 @@ fn text_tokens(text: &str) -> Vec<String> {
         .filter(|token| !token.is_empty())
         .map(str::to_lowercase)
         .collect()
+}
+
+/// How many bytes of text a stored value carries, which is what reading and tokenising it
+/// costs — charged BEFORE [`scalar_text`] copies it and [`text_tokens`] walks it, because a
+/// single long stored string costs its own length however few values the field holds.
+///
+/// A scalar that is not text renders to a handful of characters, so it counts as one.
+fn scalar_text_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.len(),
+        Value::Number(_) | Value::Bool(_) => 1,
+        _ => 0,
+    }
 }
 
 /// The numbers a value carries, when it is a list of them — a vector, stored or queried.

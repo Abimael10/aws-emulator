@@ -140,36 +140,35 @@ pub fn pushed_document_chunks<Eng: Send + Sync + 'static>(
         .collect()
 }
 
-/// Write the chunk of each of `chunks` into the index `binding` names, answering
+/// Write the chunk of each of `chunks` into the index `bound` names, answering
 /// the documents whose chunk the vector store really took.
 ///
-/// Every vector is checked against the index by the owning service's own rule
-/// before it is written, exactly as an ingestion job's is
-/// ([`index_source_vectors`]) — so what comes back is what the store holds: an
-/// index this emulator does not hold takes nothing, an index that cannot take
-/// the vector takes none of it, and an index that is full takes what it has room
-/// for.
+/// Every chunk is checked by the owning store's own rules before it is held,
+/// exactly as an ingestion job's is ([`index_source_vectors`]) — so what comes
+/// back is what the store holds: an index this emulator does not hold takes
+/// nothing, an index that cannot take the vector takes none of it, and an index
+/// that is full takes what it has room for.
 ///
 /// LOCK ORDER: as the module doc says.
 pub fn index_pushed_chunks<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    binding: &S3VectorsBinding,
+    bound: &BoundVectorIndex,
     data_source_id: &str,
     chunks: &[(DocumentKey, Option<IngestedChunk>)],
 ) -> Vec<DocumentKey> {
-    use ::service_com_amazonaws_s3vectors_s3vectors::state as vectors;
-
-    // What goes into the store is assembled with no guard held, so the vector
-    // store is held for the writes alone.
-    let pending: Vec<(DocumentKey, vectors::StoredVector)> = chunks
+    // What goes into the store is assembled with no guard held, so the store is
+    // held for the writes alone. A document whose bytes live nowhere this
+    // emulator holds carries no chunk, so there is nothing to write for it.
+    let pending: Vec<(DocumentKey, WrittenChunk)> = chunks
         .iter()
         .filter_map(|(key, chunk)| {
             let chunk = chunk.as_ref()?;
             Some((
                 key.clone(),
-                vectors::StoredVector {
+                WrittenChunk {
                     key: document_vector_key(key),
-                    data: chunk.vector.clone(),
+                    text: chunk.text.clone(),
+                    vector: chunk.vector.clone(),
                     metadata: chunk_metadata_of(data_source_id, key, &chunk.text),
                 },
             ))
@@ -179,28 +178,18 @@ pub fn index_pushed_chunks<Eng: Send + Sync + 'static>(
         return Vec::new();
     }
 
-    let Some(state) = vectors::service_state(engine) else {
+    let written: Vec<WrittenChunk> = pending.iter().map(|(_, chunk)| chunk.clone()).collect();
+    let Some(taken) = bound.write(engine, &written) else {
         return Vec::new();
     };
-    let mut store = state.lock();
-    let Ok(index) = store.index_mut(&binding.vector_bucket, &binding.index) else {
-        return Vec::new();
-    };
-    let mut taken: Vec<DocumentKey> = Vec::new();
-    for (document, vector) in pending {
-        if vectors::vector_data_defect(index, &vector.data).is_some() {
-            continue;
-        }
-        if vectors::vector_quota_exceeded(index, ::std::slice::from_ref(&vector)).is_some() {
-            break;
-        }
-        // An upsert, as a put of the same key is: re-ingesting a document
-        // replaces its one chunk rather than adding a second.
-        index.clear_tombstone(&vector.key);
-        index.vectors.insert(vector.key.clone(), vector);
-        taken.push(document);
-    }
-    taken
+    // As an ingestion job reconciles its own documents ([`index_source_vectors`]): a set, so
+    // one request's reconciliation is linear in the documents it carried.
+    let taken: ::std::collections::HashSet<String> = taken.into_iter().collect();
+    pending
+        .into_iter()
+        .filter(|(_, chunk)| taken.contains(&chunk.key))
+        .map(|(document, _)| document)
+        .collect()
 }
 
 /// The metadata the index records with one document's chunk: the fields an
@@ -222,17 +211,17 @@ pub(super) fn chunk_metadata_of(
     ingestion_index::chunk_metadata(data_source_id, key.identity(), chunk, provenance)
 }
 
-/// Take the chunks of `documents` out of the index `binding` names, answering
+/// Take the chunks of `documents` out of the index `bound` names, answering
 /// how many were there to take.
 ///
 /// LOCK ORDER: as the module doc says.
 pub fn remove_document_vectors<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    binding: &S3VectorsBinding,
+    bound: &BoundVectorIndex,
     documents: &[DocumentKey],
 ) -> usize {
     let keys: Vec<String> = documents.iter().map(document_vector_key).collect();
-    remove_vectors(engine, binding, &keys)
+    bound.remove(engine, &keys)
 }
 
 impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {

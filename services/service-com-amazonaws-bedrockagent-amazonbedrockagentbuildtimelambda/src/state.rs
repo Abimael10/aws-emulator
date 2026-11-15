@@ -131,6 +131,11 @@
 //! [`agents_classic_usage`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::agents_classic_usage)
 //! record holds and the `agents_classic` module beside this one states.
 
+/// The vector index a knowledge base is BOUND to, whichever store holds it: one
+/// ingested chunk, and the read, the write and the removal every plane here performs
+/// on that index.
+mod bound_vector_index;
+
 /// The flow-alias slice of this state: its records, their projections, and the
 /// resolution of an alias identifier and of an alias's routing target.
 mod flow_aliases;
@@ -175,6 +180,7 @@ mod ingestion_job_listing;
 /// refusal a second knowledge base under it gets.
 mod knowledge_base_names;
 
+pub use bound_vector_index::*;
 pub use data_source_listing::*;
 pub use flow_aliases::*;
 pub use ingestion::*;

@@ -2520,3 +2520,13 @@ mod declaration_roots_keep_inner_attributes_ahead_of_the_first_item;
 // it here: `all/all_rs_carries_no_inner_doc_comment.rs`,
 // the test it explains; `all/appended_notes.rs` keeps the notes earlier landings had
 // appended here.
+// `mod <name>;` pair per suite file under `tests/all/`, sorted by name, and no other line.
+// `E0753` and compiles no suite of this target — which is how the tail of this file, grown by
+// concurrent landings into re-typed copies of a header, came to compile nothing at all. With
+// no `//!` line in the file there is none for a landing to copy. What a suite covers, and why
+// it drives the assembled router rather than one service crate, belongs in that suite's own
+// module doc, where it is read beside the test it explains.
+// `all/declaration_roots_are_canonical_and_complete.rs` pin that shape, for this file and for
+// every service crate's `tests/all.rs`, so a note about any of those rules belongs there.
+#[path = "all/bedrock_agent_ingestion_populates_its_aoss_index.rs"]
+mod bedrock_agent_ingestion_populates_its_aoss_index;

@@ -311,11 +311,11 @@ pub fn s3_vectors_binding_problem<Eng: Send + Sync + 'static>(
     (effective != dimension).then_some(VectorBindingProblem::IndexCannotTakeTheVector)
 }
 
-/// How many values the vectors of the index `binding` names carry, or `None`
-/// when the S3 Vectors store holds no such index.
+/// How many values the vectors of the Amazon S3 Vectors index `binding` names
+/// carry, or `None` when that store holds no such index.
 ///
 /// LOCK ORDER: as the module doc says.
-pub fn bound_index_dimension<Eng: Send + Sync + 'static>(
+pub fn s3_vectors_index_dimension<Eng: Send + Sync + 'static>(
     engine: &Eng,
     binding: &S3VectorsBinding,
 ) -> Option<i32> {

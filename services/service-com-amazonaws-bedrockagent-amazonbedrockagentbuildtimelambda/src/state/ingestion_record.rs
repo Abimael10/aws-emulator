@@ -7,10 +7,10 @@
 //!
 //! A knowledge base keeps its vectors in the store its `storageConfiguration`
 //! names, and the modelled `KnowledgeBaseStorageType` admits several. This
-//! emulator serves the data plane of exactly one of them — the S3 Vectors index
-//! an ingestion writes through to ([`crate::state::ingestion`],
-//! [`crate::state::pushed_documents`]) — and no API here can write a vector into
-//! any of the others. So every ingestion records the chunk it read ON the
+//! emulator serves the data plane of two of them — the S3 Vectors index and the
+//! OpenSearch Serverless collection index an ingestion writes through to
+//! ([`crate::state::bound_vector_index`]) — and no API here can write a vector
+//! into any of the others. So every ingestion records the chunk it read ON the
 //! document it read it from ([`IngestedChunk`]), and what a knowledge base
 //! backed by one of those other stores HOLDS is that record: real work, written
 //! by the ingestion that did it, read back here:

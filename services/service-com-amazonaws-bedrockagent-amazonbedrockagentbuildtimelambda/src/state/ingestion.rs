@@ -301,37 +301,28 @@ impl IndexedVectors {
     }
 }
 
-/// Write the vector of each source document into the index `binding` names,
-/// answering which of them the store really took.
+/// Write the chunk of each source document into the index `bound` names, answering
+/// which of them the store really took.
 ///
-/// Every vector is checked against the index by the owning service's OWN rule
-/// ([`::service_com_amazonaws_s3vectors_s3vectors::state::vector_data_defect`])
-/// and against its ceiling before it is written, so what comes back is what the
-/// store holds and nothing else: an index the store no longer holds takes
-/// nothing, and an index that is full takes what it has room for. The job's
-/// accounting then reports the rest as failed.
+/// Every chunk is checked by the OWNING store's own rules before it is held, so
+/// what comes back is what that store holds and nothing else: an index it no longer
+/// holds takes nothing, one that is full takes what it has room for, and one whose
+/// policies no longer grant the knowledge base's role the write takes none. The
+/// job's accounting then reports the rest as failed.
 ///
 /// LOCK ORDER: as the module doc says.
 pub fn index_source_vectors<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    binding: &S3VectorsBinding,
+    bound: &BoundVectorIndex,
     data_source_id: &str,
     documents: &[SourceDocument],
 ) -> IndexedVectors {
-    use ::service_com_amazonaws_s3vectors_s3vectors::state as vectors;
-
-    let Some(state) = vectors::service_state(engine) else {
-        return IndexedVectors::NotReconciled;
-    };
-    let mut store = state.lock();
-    let Ok(index) = store.index_mut(&binding.vector_bucket, &binding.index) else {
-        return IndexedVectors::Taken(Vec::new());
-    };
-    let mut taken: Vec<String> = Vec::new();
-    for document in documents {
-        let vector = vectors::StoredVector {
+    let chunks: Vec<WrittenChunk> = documents
+        .iter()
+        .map(|document| WrittenChunk {
             key: source_vector_key(&document.uri),
-            data: document.vector.clone(),
+            text: document.chunk.clone(),
+            vector: document.vector.clone(),
             // What the knowledge base records with the chunk: its text, its id, the
             // data source it came from and its source file's modality, beside the
             // source URI this plane keys its own bookkeeping by. One place decides
@@ -343,6 +334,52 @@ pub fn index_source_vectors<Eng: Send + Sync + 'static>(
                 &document.chunk,
                 SOURCE_URI_METADATA_KEY,
             ),
+        })
+        .collect();
+    let Some(taken) = bound.write(engine, &chunks) else {
+        return IndexedVectors::NotReconciled;
+    };
+    // Read as a SET, so reconciling one job's documents against what the store took is
+    // linear in the documents it crawled rather than quadratic.
+    let taken: HashSet<String> = taken.into_iter().collect();
+    IndexedVectors::Taken(
+        documents
+            .iter()
+            .filter(|document| taken.contains(&source_vector_key(&document.uri)))
+            .map(|document| document.uri.clone())
+            .collect(),
+    )
+}
+
+/// Write `chunks` into the Amazon S3 Vectors index `binding` names, answering the
+/// keys that index really took — or `None` when this emulator holds no S3 Vectors
+/// store at all, so there is nothing to reconcile an ingestion against.
+///
+/// Every vector is checked against the index by that service's OWN rule
+/// ([`::service_com_amazonaws_s3vectors_s3vectors::state::vector_data_defect`]) and
+/// against its ceiling before it is written, so what comes back is what the store
+/// holds and nothing else: an index it no longer holds takes nothing, and one that
+/// is full takes what it has room for.
+///
+/// LOCK ORDER: as the module doc says.
+pub fn write_s3_vectors_chunks<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    binding: &S3VectorsBinding,
+    chunks: &[WrittenChunk],
+) -> Option<Vec<String>> {
+    use ::service_com_amazonaws_s3vectors_s3vectors::state as vectors;
+
+    let state = vectors::service_state(engine)?;
+    let mut store = state.lock();
+    let Ok(index) = store.index_mut(&binding.vector_bucket, &binding.index) else {
+        return Some(Vec::new());
+    };
+    let mut taken: Vec<String> = Vec::new();
+    for chunk in chunks {
+        let vector = vectors::StoredVector {
+            key: chunk.key.clone(),
+            data: chunk.vector.clone(),
+            metadata: chunk.metadata.clone(),
         };
         if vectors::vector_data_defect(index, &vector.data).is_some() {
             continue;
@@ -353,34 +390,34 @@ pub fn index_source_vectors<Eng: Send + Sync + 'static>(
         // An upsert, as a put of the same key is: the document's one vector is
         // replaced rather than joined by a second.
         index.clear_tombstone(&vector.key);
-        taken.push(document.uri.clone());
+        taken.push(vector.key.clone());
         index.vectors.insert(vector.key.clone(), vector);
     }
-    IndexedVectors::Taken(taken)
+    Some(taken)
 }
 
-/// Take the vectors of `uris` out of the index `binding` names, answering how
-/// many were there to take.
+/// Take the chunks of `uris` out of the index `bound` names, answering how many
+/// were there to take.
 ///
 /// LOCK ORDER: as the module doc says.
 pub fn remove_source_vectors<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    binding: &S3VectorsBinding,
+    bound: &BoundVectorIndex,
     uris: &[String],
 ) -> usize {
     let keys: Vec<String> = uris.iter().map(|uri| source_vector_key(uri)).collect();
-    remove_vectors(engine, binding, &keys)
+    bound.remove(engine, &keys)
 }
 
-/// Take the vectors held under `keys` out of the index `binding` names,
-/// answering how many were there to take.
+/// Take the vectors held under `keys` out of the Amazon S3 Vectors index `binding`
+/// names, answering how many were there to take.
 ///
 /// The keys are the ones this plane holds a chunk under, whichever path wrote
 /// it: a crawled document's is where its source object lives, and a pushed
 /// document's is [`crate::state::document_vector_key`].
 ///
 /// LOCK ORDER: as the module doc says.
-pub fn remove_vectors<Eng: Send + Sync + 'static>(
+pub fn remove_s3_vectors<Eng: Send + Sync + 'static>(
     engine: &Eng,
     binding: &S3VectorsBinding,
     keys: &[String],

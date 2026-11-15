@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ingestion_job_id,
             ingestion_job,
             data_source_configuration,
-            storage_configuration,
+            bound,
             record_dimension,
             ingested,
         ) = {
@@ -206,7 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            let storage_configuration = knowledge_base.storage_configuration.clone();
+            // The index the knowledge base's own `storageConfiguration` binds it
+            // to, in the store that holds it, read while this store is still
+            // held.
+            let bound = crate::state::BoundVectorIndex::of(knowledge_base);
             // The dimension this job's chunks carry when the knowledge base
             // binds to no index this emulator holds: the one its embedding model
             // produces ([`crate::state::record_dimension`]).
@@ -343,7 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ingestion_job_id,
                 ingestion_job,
                 data_source_configuration,
-                storage_configuration,
+                bound,
                 record_dimension,
                 state.ingested_source_uris(&input.knowledge_base_id, &input.data_source_id),
             )
@@ -351,7 +354,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The job's work, with NO guard of this service's store held: the bound
         // index's dimension, then the data source's source documents in the
-        // service that owns them, then the vectors for them written into that
+        // service that owns them, then the chunks for them written into that
         // index. Each store is reached on its own, which is what keeps a lock
         // cycle between them unreachable.
         //
@@ -359,10 +362,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a chunk per document, in the dimension its own embedding model
         // produces: that chunk is what a retrieval of such a knowledge base
         // reads ([`crate::state::ingestion_record`]).
-        let binding = crate::state::s3_vectors_binding(storage_configuration.as_ref());
-        let dimension = binding
+        let dimension = bound
             .as_ref()
-            .and_then(|binding| crate::state::bound_index_dimension(&*self.engine, binding))
+            .and_then(|bound| bound.dimension(&*self.engine))
             .unwrap_or(record_dimension);
         let crawled = crate::state::crawl_data_source(
             &*self.engine,
@@ -370,18 +372,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(dimension),
         );
         let mut indexed = crate::state::IndexedVectors::NotReconciled;
-        if let (Some(crawled), Some(binding)) = (crawled.as_ref(), binding.as_ref()) {
+        if let (Some(crawled), Some(bound)) = (crawled.as_ref(), bound.as_ref()) {
             // A document the source no longer offers is gone from the knowledge
-            // base too, so the vector it was held under leaves the bound store
+            // base too, so the chunk it was held under leaves the bound store
             // with it.
             let gone: Vec<String> = ingested
                 .into_iter()
                 .filter(|uri| !crawled.documents.iter().any(|document| &document.uri == uri))
                 .collect();
-            crate::state::remove_source_vectors(&*self.engine, binding, &gone);
+            crate::state::remove_source_vectors(&*self.engine, bound, &gone);
             indexed = crate::state::index_source_vectors(
                 &*self.engine,
-                binding,
+                bound,
                 &input.data_source_id,
                 &crawled.documents,
             );

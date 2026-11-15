@@ -48,6 +48,9 @@ pub mod data_access;
 /// The account's VPCs and subnets, which a managed VPC endpoint is placed in: facts this
 /// service RESOLVES against Amazon EC2 rather than holds.
 pub mod ec2_network;
+/// The documents of one index of a collection as the plane of another service bound to that
+/// index writes them, and the field mapping that index declares.
+pub mod index_documents;
 /// Whether a collection's endpoints are reachable at all: the `network` security policies
 /// that admit traffic to them.
 pub mod network_access;
@@ -865,7 +868,20 @@ pub const MAX_DOCUMENTS_PER_INDEX: usize = 1_000;
 /// The most values ONE stored document source may carry; see [`MAX_DOCUMENTS_PER_INDEX`]
 /// for why the size of one document is bounded, and [`document_within_bounds`] for the
 /// walk that enforces it.
-pub const MAX_DOCUMENT_SOURCE_NODES: usize = 1_000;
+///
+/// It has to admit the document a VECTOR collection exists for: a document of a vector
+/// index carries one value per dimension of the `knn_vector` field it is written into, and
+/// the k-NN plugin maps such a field with up to 16 000 dimensions — so a bound below that
+/// would refuse the ordinary document of this service's own `VECTORSEARCH` collections.
+///
+/// What it bounds is ONE write: the values a single document's source may carry, checked
+/// before that document is stored, so no request allocates or holds more than a few tens of
+/// thousands of scalars however large a body it sends. How much the STORE can come to hold
+/// is bounded beside it, by how many documents one index keeps
+/// ([`MAX_DOCUMENTS_PER_INDEX`]), how many indexes one collection holds
+/// ([`MAX_INDEXES_PER_COLLECTION`]) and how many collections one store holds
+/// ([`MAX_COLLECTIONS`]) — each of them a count a caller cannot exceed.
+pub const MAX_DOCUMENT_SOURCE_NODES: usize = 20_000;
 
 /// One document an index holds, as its data plane stores and reports it.
 #[derive(Debug, Clone)]

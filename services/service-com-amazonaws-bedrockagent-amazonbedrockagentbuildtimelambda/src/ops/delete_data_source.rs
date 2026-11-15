@@ -215,12 +215,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .document_vector_keys(&input.knowledge_base_id, &input.data_source_id);
                     state
                         .live_knowledge_base(&input.knowledge_base_id)
-                        .and_then(|knowledge_base| {
-                            crate::state::s3_vectors_binding(
-                                knowledge_base.storage_configuration.as_ref(),
-                            )
-                        })
-                        .map(|binding| (binding, keys))
+                        .and_then(crate::state::BoundVectorIndex::of)
+                        .map(|bound| (bound, keys))
                 })
                 .flatten();
 
@@ -244,10 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             removal
         };
 
-        // The vectors leave the store that OWNS them, with no guard of this
+        // The chunks leave the store that OWNS them, with no guard of this
         // service's store held.
-        if let Some((binding, keys)) = removal {
-            crate::state::remove_vectors(&*self.engine, &binding, &keys);
+        if let Some((bound, keys)) = removal {
+            bound.remove(&*self.engine, &keys);
         }
 
         Ok(DeleteDataSourceOutput {
