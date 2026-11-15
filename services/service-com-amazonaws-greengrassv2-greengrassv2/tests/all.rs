@@ -19,6 +19,8 @@ mod component_publish_and_deploy;
 mod component_state_recipe_and_deployment_reads;
 #[path = "all/component_versions_and_resolution.rs"]
 mod component_versions_and_resolution;
+#[path = "all/connectivity_info_publication.rs"]
+mod connectivity_info_publication;
 #[path = "all/core_device_data_plane_authorization.rs"]
 mod core_device_data_plane_authorization;
 #[path = "all/core_device_fleet.rs"]

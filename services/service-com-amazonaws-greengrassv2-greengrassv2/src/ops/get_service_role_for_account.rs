@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetServiceRoleForAccount
-//! Reports the one Greengrass service role association this account holds, or a success
-//! naming neither a role nor an instant while it holds none.
+//! Reports the one Greengrass service role association this account holds, or the legacy
+//! surface's 404 while it holds none.
 //!
 //! ## Shape of an operation
 //!
@@ -83,7 +83,14 @@ pub enum GetServiceRoleForAccountErrorModeled {
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::get_service_role_for_account::GetServiceRoleForAccountError`). Wrapping the modeled enum is what
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type GetServiceRoleForAccountError = crate::scaffolded::Scaffolded<GetServiceRoleForAccountErrorModeled>;
+///
+/// The operation's own modelled channel, widened by the refusals the LEGACY Greengrass
+/// surface words itself ([`crate::state::LegacyRefusal`]): this route is one both API
+/// versions publish, and AWS reports an account with no service role associated at 404
+/// with its sentence in a `Message` body member — a status no shape of either Greengrass
+/// model carries, so it cannot be a variant of the enum above.
+pub type GetServiceRoleForAccountError =
+    crate::state::LegacyRefusable<GetServiceRoleForAccountErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -91,7 +98,7 @@ pub type GetServiceRoleForAccountError = crate::scaffolded::Scaffolded<GetServic
 /// this operation is implemented.
 impl From<GetServiceRoleForAccountErrorModeled> for GetServiceRoleForAccountError {
     fn from(modeled: GetServiceRoleForAccountErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Channel(crate::scaffolded::Scaffolded::Modeled(modeled))
     }
 }
 
@@ -145,14 +152,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A pure REPORT of the one association the account holds, so it writes nothing:
-        // an account with no service role associated — the state it starts in, and the
-        // one a disassociation returns it to — is reported by a success that carries
-        // neither member, since there is no role to name and no instant it was
-        // associated at.
+        // A pure REPORT of the one association the account holds, so it writes nothing.
+        // An account with no service role associated — the state it starts in, and the
+        // one a disassociation returns it to — is not reported as a success with nothing
+        // in it: the endpoint reports that state at 404, telling the caller to attach a
+        // role, so a client can branch on it instead of reading an empty success as an
+        // association to nothing.
         let association = state.lock().service_role.clone();
         let Some(association) = association else {
-            return Ok(GetServiceRoleForAccountOutput::default());
+            return Err(st::LegacyRefusal::not_found(st::NO_SERVICE_ROLE_MESSAGE).into());
         };
 
         Ok(GetServiceRoleForAccountOutput {

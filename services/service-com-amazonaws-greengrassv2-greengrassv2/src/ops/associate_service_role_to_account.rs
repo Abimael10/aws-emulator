@@ -2,7 +2,8 @@
 
 //! @op AssociateServiceRoleToAccount
 //! Associates a Greengrass service role with this account, REPLACING the one association
-//! the account holds and stamping it with the instant of the call.
+//! the account holds and stamping it with the instant of the call. A value that is not the
+//! ARN of an IAM role is refused and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -90,17 +91,22 @@ pub enum AssociateServiceRoleToAccountErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::associate_service_role_to_account::AssociateServiceRoleToAccountError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type AssociateServiceRoleToAccountError = crate::scaffolded::Scaffolded<AssociateServiceRoleToAccountErrorModeled>;
+/// (`crate::ops::associate_service_role_to_account::AssociateServiceRoleToAccountError`).
+///
+/// The operation's own modelled channel, widened by the refusals the LEGACY Greengrass
+/// surface words itself ([`crate::state::LegacyRefusal`]): this route is one both API
+/// versions publish, and AWS answers a client error on it in the elder envelope, whose
+/// sentence travels in a `Message` body member rather than in the lowercase `message` this
+/// model's `ValidationException` declares.
+pub type AssociateServiceRoleToAccountError =
+    crate::state::LegacyRefusable<AssociateServiceRoleToAccountErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// wrapper variant.
 impl From<AssociateServiceRoleToAccountErrorModeled> for AssociateServiceRoleToAccountError {
     fn from(modeled: AssociateServiceRoleToAccountErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Channel(crate::scaffolded::Scaffolded::Modeled(modeled))
     }
 }
 
@@ -153,6 +159,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // The role this request names has to BE a role: `roleArn` is modelled as a plain
+        // string with no pattern, so the form is the service's own rule — the value must
+        // be the ARN of an IAM role (vendor `iam`, resource type `role`), which
+        // `service_common::arn` states once for every service that takes one. Whether that
+        // role EXISTS is not checked: the Greengrass API documents the role association as
+        // not validating the role's existence, only its ARN.
+        if !::service_common::arn::IAM_ROLE.admits(&input.role_arn) {
+            return Err(st::LegacyRefusal::bad_request(st::INVALID_ROLE_ARN_MESSAGE).into());
+        }
 
         // The service role is ONE association per account, so associating a role
         // REPLACES whatever was associated before — including the same role, which

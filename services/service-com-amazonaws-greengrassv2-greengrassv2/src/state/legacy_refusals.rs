@@ -1,0 +1,331 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The refusals the LEGACY Greengrass surface answers with, and the error channel that
+//! carries them.
+//!
+//! Four of this service's operations are bound to routes the 2017-06-07 Greengrass model
+//! binds too — `GET`/`PUT`/`DELETE /greengrass/servicerole` and
+//! `GET`/`PUT /greengrass/things/{thingName}/connectivityInfo`
+//! (`smithy_query(query="digest")` on both models; `service_common::greengrass` names this
+//! service as the one claimant). AWS co-hosts the two API versions on one endpoint and
+//! answers those routes in the ELDER envelope: a client error carries its sentence in a
+//! `Message` body member, not in the lowercase `message` the 2020-11-30 shapes declare,
+//! and the account service role reports "nothing associated" as a 404 rather than as an
+//! empty success. Neither is expressible as a variant of an operation's
+//! `#[operation_error]` enum: the body member's wire name belongs to the shape, and no
+//! shape of this model carries a 404 at all.
+//!
+//! So the two refusal classes live here, once, rather than in each operation's file: what
+//! a refusal looks like on the wire is a property of the SERVICE, and two operations that
+//! reach the same decision must not word it two ways. An operation carries them by
+//! declaring its error channel [`LegacyRefusable`], which widens that operation's own
+//! modelled channel without changing how any modelled error is rendered.
+//!
+//! The sibling class [`super::TaggingNotFound`] is the OTHER recorded 404 of this service
+//! and keeps its own lowercase `message`: it answers the 2020-11-30 tagging route, whose
+//! recorded envelope is this model's own. The two differ because the recorded responses
+//! differ, not because two authors chose differently.
+
+use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType};
+use ::smithy_server_runtime::OperationError;
+
+/// The `__type` a client-input refusal of the legacy surface is named by: the client-error
+/// shape the 2017-06-07 model declares for both mutating operations of that surface
+/// (`smithy_query(query="operation",operation="AssociateServiceRoleToAccount")` on
+/// `com-amazonaws-greengrass-greengrass` lists `BadRequestException`, `httpError` 400,
+/// whose one documented member is `Message`).
+pub const LEGACY_BAD_REQUEST_CODE: &str = "BadRequestException";
+
+/// The status that refusal carries, from the same `httpError`.
+pub const LEGACY_BAD_REQUEST_STATUS: u16 = 400;
+
+/// The `__type` a "nothing is associated" report of the legacy surface is named by.
+///
+/// RECORDED behaviour, not modelled: neither Greengrass model declares a 404 shape for the
+/// account service role, yet the endpoint answers the un-associated account at that status
+/// with a sentence telling the caller to attach a role. The code is the one this service
+/// already answers its other recorded, unmodelled 404 under
+/// ([`super::TAGGING_NOT_FOUND_CODE`]), so one not-found class is named one way across the
+/// service.
+pub const LEGACY_NOT_FOUND_CODE: &str = super::TAGGING_NOT_FOUND_CODE;
+
+/// The status that report carries.
+pub const LEGACY_NOT_FOUND_STATUS: u16 = 404;
+
+/// What `AssociateServiceRoleToAccount` answers a `RoleArn` that is no IAM role ARN.
+///
+/// Fixed text: the refusal is about the FORM of the value, so it quotes nothing back.
+pub const INVALID_ROLE_ARN_MESSAGE: &str = "That role ARN is invalid.";
+
+/// What `GetServiceRoleForAccount` answers while the account has no service role.
+///
+/// Fixed text: it states the action the caller has to take, and names no value of the
+/// request (there is none to name — the operation takes no input).
+pub const NO_SERVICE_ROLE_MESSAGE: &str = "You need to attach an IAM role to this AWS account.";
+
+/// What `UpdateConnectivityInfo` answers a `ConnectivityInfo` list it cannot read as
+/// connectivity information.
+///
+/// The sentence names the request MEMBER that could not be read, under the wire name the
+/// legacy API publishes it as (`connectivityInfoList`), which is the form AWS words an
+/// unparsable parameter in.
+pub const UNPARSABLE_CONNECTIVITY_INFO_MESSAGE: &str =
+    "The following required parameter(s) are unparsable: connectivityInfoList.";
+
+/// The `Message` member of the legacy client-error shape.
+///
+/// Spelled `Message` on the wire (`with_json_name`): the recorded legacy envelope carries
+/// its sentence under that capitalized key, and a client reading it finds nothing under
+/// any other name. `with_xml_name` matches, so the shape renders the same on a protocol
+/// this service does not speak.
+static LEGACY_BAD_REQUEST_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#GreengrassLegacyBadRequest$Message",
+        "smithy.framework",
+        "Message",
+    ),
+    ShapeType::String,
+    "Message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("Message");
+
+/// Schema for the legacy client-error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the scaffold's synthetic
+/// shapes (`crate::scaffolded`): the shape is in no model, so it must not collide with a
+/// modelled one, and its own id never reaches the wire — the `__type` and the
+/// `x-amzn-errortype` header come from [`OperationError::shape_name`], which answers
+/// [`LEGACY_BAD_REQUEST_CODE`].
+static LEGACY_BAD_REQUEST_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#GreengrassLegacyBadRequest",
+        "smithy.framework",
+        "GreengrassLegacyBadRequest",
+    ),
+    ShapeType::Structure,
+    &[&LEGACY_BAD_REQUEST_MESSAGE],
+);
+
+/// The `Message` member of the legacy not-found shape. The same wire name as
+/// [`LEGACY_BAD_REQUEST_MESSAGE`], on its own shape so the two refusals stay distinct
+/// shapes with distinct statuses.
+static LEGACY_NOT_FOUND_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#GreengrassLegacyNotFound$Message",
+        "smithy.framework",
+        "Message",
+    ),
+    ShapeType::String,
+    "Message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("Message");
+
+/// Schema for the legacy not-found shape. Synthetic for the same reason as
+/// [`LEGACY_BAD_REQUEST_SCHEMA`].
+static LEGACY_NOT_FOUND_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#GreengrassLegacyNotFound",
+        "smithy.framework",
+        "GreengrassLegacyNotFound",
+    ),
+    ShapeType::Structure,
+    &[&LEGACY_NOT_FOUND_MESSAGE],
+);
+
+/// The body of a legacy client-error refusal: the one sentence it states.
+#[derive(Debug, Clone)]
+pub struct LegacyBadRequest {
+    pub message: String,
+}
+
+impl SerializableStruct for LegacyBadRequest {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&LEGACY_BAD_REQUEST_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
+/// The body of a legacy not-found report: the one sentence it states.
+#[derive(Debug, Clone)]
+pub struct LegacyNotFound {
+    pub message: String,
+}
+
+impl SerializableStruct for LegacyNotFound {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&LEGACY_NOT_FOUND_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
+/// A refusal of the legacy surface, carrying the ONE mapping from the refusal class to the
+/// wire code, the HTTP status and the body it answers with.
+#[derive(Debug)]
+pub enum LegacyRefusal {
+    /// A request this surface cannot read: the value it carries is not of the form the
+    /// operation takes.
+    BadRequest(LegacyBadRequest),
+    /// The account-level fact the request asked for is not established.
+    NotFound(LegacyNotFound),
+}
+
+impl LegacyRefusal {
+    /// A client-input refusal carrying `message`.
+    #[must_use]
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::BadRequest(LegacyBadRequest {
+            message: message.into(),
+        })
+    }
+
+    /// A not-found report carrying `message`.
+    #[must_use]
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound(LegacyNotFound {
+            message: message.into(),
+        })
+    }
+
+    /// The body this refusal serializes.
+    fn as_serializable(&self) -> &dyn SerializableStruct {
+        match self {
+            Self::BadRequest(body) => body,
+            Self::NotFound(body) => body,
+        }
+    }
+
+    /// The schema the answer is written against.
+    fn variant_schema(&self) -> &'static Schema {
+        match self {
+            Self::BadRequest(_) => &LEGACY_BAD_REQUEST_SCHEMA,
+            Self::NotFound(_) => &LEGACY_NOT_FOUND_SCHEMA,
+        }
+    }
+
+    /// The code on the wire, which the framework reads from an operation's `shape_name`
+    /// rather than from the schema.
+    fn error_code(&self) -> &'static str {
+        match self {
+            Self::BadRequest(_) => LEGACY_BAD_REQUEST_CODE,
+            Self::NotFound(_) => LEGACY_NOT_FOUND_CODE,
+        }
+    }
+
+    /// The HTTP status this refusal answers with.
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::BadRequest(_) => LEGACY_BAD_REQUEST_STATUS,
+            Self::NotFound(_) => LEGACY_NOT_FOUND_STATUS,
+        }
+    }
+
+    /// The sentence the body states, for the [`std::fmt::Display`] rendering below.
+    fn message(&self) -> &str {
+        match self {
+            Self::BadRequest(body) => &body.message,
+            Self::NotFound(body) => &body.message,
+        }
+    }
+}
+
+impl ::std::fmt::Display for LegacyRefusal {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(f, "{}: {}", self.error_code(), self.message())
+    }
+}
+
+impl ::std::error::Error for LegacyRefusal {}
+
+/// One legacy operation's error channel, widened by the refusals above.
+///
+/// `Channel` is the operation's own channel — its modelled errors, the scaffold's 501 and
+/// the framework's synthetic `ValidationException` — rendered exactly as it is rendered
+/// without this wrapper. `Refused` is a refusal this surface words itself. An operation
+/// declares `type Error = LegacyRefusable<{Op}ErrorModeled>` and keeps writing
+/// `Err(SomeModeledError.into())`.
+#[derive(Debug)]
+pub enum LegacyRefusable<E> {
+    /// The operation's own error channel.
+    Channel(crate::scaffolded::Scaffolded<E>),
+    /// A refusal the legacy surface words itself.
+    Refused(LegacyRefusal),
+}
+
+impl<E> From<crate::scaffolded::Scaffolded<E>> for LegacyRefusable<E> {
+    fn from(channel: crate::scaffolded::Scaffolded<E>) -> Self {
+        Self::Channel(channel)
+    }
+}
+
+impl<E> From<LegacyRefusal> for LegacyRefusable<E> {
+    fn from(refusal: LegacyRefusal) -> Self {
+        Self::Refused(refusal)
+    }
+}
+
+impl<E: ::std::fmt::Display> ::std::fmt::Display for LegacyRefusable<E> {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Channel(error) => write!(f, "{error}"),
+            Self::Refused(refusal) => write!(f, "{refusal}"),
+        }
+    }
+}
+
+/// `source()` forwards to the wrapped failure rather than taking the default `None`.
+impl<E: ::std::error::Error + 'static> ::std::error::Error for LegacyRefusable<E> {
+    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
+        match self {
+            Self::Channel(error) => error.source(),
+            Self::Refused(refusal) => refusal.source(),
+        }
+    }
+}
+
+/// Every method delegates: the operation's own channel renders a modelled error exactly as
+/// it would without this wrapper, and a refusal renders as [`LegacyRefusal`] states it — so
+/// an operation that carries this channel answers either condition exactly as its siblings
+/// do.
+impl<E: OperationError> OperationError for LegacyRefusable<E> {
+    fn as_serializable(&self) -> &dyn SerializableStruct {
+        match self {
+            Self::Channel(error) => error.as_serializable(),
+            Self::Refused(refusal) => refusal.as_serializable(),
+        }
+    }
+
+    fn variant_schema(&self) -> &'static Schema {
+        match self {
+            Self::Channel(error) => error.variant_schema(),
+            Self::Refused(refusal) => refusal.variant_schema(),
+        }
+    }
+
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Channel(error) => error.shape_name(),
+            Self::Refused(refusal) => refusal.error_code(),
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Channel(error) => error.http_status(),
+            Self::Refused(refusal) => refusal.http_status(),
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Channel(error) => error.query_error_code(),
+            // The refusal's shape is in no model, so it carries no `awsQueryError` trait
+            // to honour — and this service speaks only `restJson1`.
+            Self::Refused(_) => None,
+        }
+    }
+}

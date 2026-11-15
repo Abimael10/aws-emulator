@@ -5,9 +5,10 @@
 //!
 //! The rule under test: the service role is ONE association per account — associating a
 //! role replaces whatever was associated before and stamps the association with the
-//! instant of that call, reading reports the association that is stored (and nothing when
-//! none is), and disassociating removes it; every instant reported is the RFC 3339 UTC
-//! form, and the instant a read reports is the one the write answered.
+//! instant of that call, a value that is not the ARN of an IAM role is refused and stored
+//! nowhere, reading reports the association that is stored (and the surface's own
+//! not-found while none is), and disassociating removes it; every instant reported is the
+//! RFC 3339 UTC form, and the instant a read reports is the one the write answered.
 //!
 //! Every assertion drives the real `restJson1` front door: the request is built the way
 //! an SDK builds it, dispatched through [`MultiServiceRouter`], and judged on the HTTP
@@ -104,6 +105,38 @@ fn member(body: &Value, key: &str) -> Value {
     body.get(key).cloned().unwrap_or(Value::Null)
 }
 
+/// The status the endpoint reports an account that holds NO service role at, and the
+/// sentence that report carries — written here as the literals AWS answers rather than
+/// read from the implementation's constants, so a status or wording that drifts away from
+/// AWS fails this suite. "Nothing associated" is not an empty success on this surface: it
+/// is a 404 telling the caller to attach a role, which is what lets a client branch on it.
+pub(crate) const NO_ROLE_STATUS: u16 = 404;
+pub(crate) const NO_ROLE_MESSAGE: &str = "You need to attach an IAM role to this AWS account.";
+
+/// Assert that `status` and `body` are the endpoint's report of an account holding no
+/// service role: the status above, that one sentence, and neither of the two members a
+/// held association would be reported in.
+pub(crate) fn assert_no_role_reported(case: &str, status: u16, body: &Value) {
+    assert_eq!(
+        (status, text(body, "Message").as_str()),
+        (NO_ROLE_STATUS, NO_ROLE_MESSAGE),
+        "case {case:?}: expected the no-service-role report, got {status} {body}"
+    );
+    for absent in ["RoleArn", "AssociatedAt"] {
+        assert_eq!(
+            member(body, absent),
+            Value::Null,
+            "case {case:?}: a report naming no association must carry no {absent}, got \
+             {body}"
+        );
+    }
+}
+
+/// The status and sentence `AssociateServiceRoleToAccount` refuses a value that is not the
+/// ARN of an IAM role with — again the literals AWS answers.
+pub(crate) const INVALID_ROLE_ARN_STATUS: u16 = 400;
+pub(crate) const INVALID_ROLE_ARN_MESSAGE: &str = "That role ARN is invalid.";
+
 /// A string member of a JSON object, or the empty string when absent.
 pub(crate) fn text(body: &Value, key: &str) -> String {
     body.get(key)
@@ -186,6 +219,93 @@ pub(crate) fn role_arn_rows() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Values `RoleArn` can carry that are NOT the ARN of an IAM role, each with what makes it
+/// one.
+///
+/// The requirement is the vendor `iam` and the resource type `role`
+/// (`service_common::arn::IAM_ROLE`, which states once for the whole workspace what "the
+/// ARN of an IAM role" is), so the rows span the ways a value misses it: it is no ARN at
+/// all, it carries no resource, it names another IAM entity, it names another service's
+/// resource, or its vendor is spelled in another case — an ARN namespace is a fixed
+/// lowercase token.
+fn invalid_role_arn_rows() -> Vec<(&'static str, String)> {
+    vec![
+        ("a bare role name", "GreengrassServiceRole".to_string()),
+        ("the empty string", String::new()),
+        (
+            "an ARN with no resource field",
+            format!("arn:aws:iam::{ACCOUNT}:"),
+        ),
+        (
+            "an IAM user, which is not a role",
+            format!("arn:aws:iam::{ACCOUNT}:user/greengrass-operator"),
+        ),
+        (
+            "an IAM policy, which is not a role",
+            format!("arn:aws:iam::{ACCOUNT}:policy/AWSGreengrassResourceAccessRolePolicy"),
+        ),
+        (
+            "another service's resource",
+            format!("arn:aws:greengrass:{REGION}:{ACCOUNT}:coreDevices:laser-1"),
+        ),
+        (
+            "the vendor spelled in another case",
+            format!("arn:aws:IAM::{ACCOUNT}:role/GreengrassServiceRole"),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn associating_a_value_that_is_no_role_arn_is_refused_and_writes_nothing() {
+    let router = emulator();
+
+    // Nothing is associated yet, so a refused write must leave the account holding none:
+    // the refusal is decided on the request, before anything is stored.
+    for (case, value) in invalid_role_arn_rows() {
+        let (status, refused) = associate(&router, &value).await;
+        assert_eq!(
+            (status, text(&refused, "Message").as_str()),
+            (INVALID_ROLE_ARN_STATUS, INVALID_ROLE_ARN_MESSAGE),
+            "case {case:?}: expected the invalid-role-ARN refusal, got {status} {refused}"
+        );
+        let (status, got) = get_role(&router).await;
+        assert_no_role_reported(&format!("{case} after the refusal"), status, &got);
+    }
+
+    // With a role associated, a refused write leaves THAT association exactly as it was:
+    // the refusal replaces nothing and re-stamps nothing.
+    let (held_case, held) = role_arn_rows()
+        .pop()
+        .expect("the role-ARN catalog is not empty");
+    let (status, written) = associate(&router, &held).await;
+    assert_eq!(
+        status, 200,
+        "case {held_case:?}: expected 200 from AssociateServiceRoleToAccount, got {status} \
+         {written}"
+    );
+    let associated_at = text(&written, "AssociatedAt");
+
+    for (case, value) in invalid_role_arn_rows() {
+        let (status, refused) = associate(&router, &value).await;
+        assert_eq!(
+            (status, text(&refused, "Message").as_str()),
+            (INVALID_ROLE_ARN_STATUS, INVALID_ROLE_ARN_MESSAGE),
+            "case {case:?} over a held association: expected the invalid-role-ARN \
+             refusal, got {status} {refused}"
+        );
+        let (status, got) = get_role(&router).await;
+        assert_eq!(
+            (
+                status,
+                text(&got, "RoleArn"),
+                text(&got, "AssociatedAt")
+            ),
+            (200, held.clone(), associated_at.clone()),
+            "case {case:?}: expected the held association untouched, got {status} {got}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn associating_a_service_role_replaces_the_one_the_account_holds() {
     let router = emulator();
@@ -264,32 +384,18 @@ async fn associating_a_service_role_replaces_the_one_the_account_holds() {
         "disassociating must answer 200, got {status} {removed}"
     );
     let (status, got) = get_role(&router).await;
-    assert_eq!(
-        (status, member(&got, "RoleArn")),
-        (200, Value::Null),
-        "after disassociating, the account must hold no service role, got {status} {got}"
-    );
+    assert_no_role_reported("after disassociating", status, &got);
 }
 
 #[tokio::test]
 async fn an_account_with_no_service_role_reports_none_and_disassociating_is_no_failure() {
     let router = emulator();
 
-    // An account starts with no service role associated: the read succeeds and names
-    // neither a role nor an instant, because there is no association to report.
+    // An account starts with no service role associated: the read reports that state
+    // rather than an association, so there is nothing for it to name.
     for read in 1..=2 {
         let (status, got) = get_role(&router).await;
-        assert_eq!(
-            status, 200,
-            "case read {read} with nothing associated: expected 200, got {status} {got}"
-        );
-        for absent in ["RoleArn", "AssociatedAt"] {
-            assert_eq!(
-                member(&got, absent),
-                Value::Null,
-                "case read {read} with nothing associated: expected no {absent}, got {got}"
-            );
-        }
+        assert_no_role_reported(&format!("read {read} with nothing associated"), status, &got);
     }
 
     // Disassociating when there is nothing associated asks for the state the account is
@@ -331,17 +437,7 @@ async fn an_account_with_no_service_role_reports_none_and_disassociating_is_no_f
         instant_within(case, &text(&removed, "DisassociatedAt"), opened, closed);
 
         let (status, got) = get_role(&router).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?} after disassociating: expected 200, got {status} {got}"
-        );
-        for absent in ["RoleArn", "AssociatedAt"] {
-            assert_eq!(
-                member(&got, absent),
-                Value::Null,
-                "case {case:?} after disassociating: expected no {absent}, got {got}"
-            );
-        }
+        assert_no_role_reported(&format!("{case} after disassociating"), status, &got);
 
         // Asking again changes nothing and still succeeds: the association is gone, so
         // this call disassociated nothing.

@@ -663,9 +663,9 @@ async fn the_claiming_version_serves_the_request_from_its_own_state() {
     );
 
     // A URI shape both models bind reaches its declared owner, so it is answered by a
-    // service rather than refused as ambiguous. Those operations are not implemented in
-    // either version yet, so what is asserted here is only that the router no longer
-    // refuses them.
+    // service rather than refused as ambiguous. What is asserted here is only that the
+    // router no longer refuses them; what each operation then answers is pinned by its own
+    // service's suite.
     for (case, method, uri) in [
         ("the service role", "GET", "/greengrass/servicerole"),
         (

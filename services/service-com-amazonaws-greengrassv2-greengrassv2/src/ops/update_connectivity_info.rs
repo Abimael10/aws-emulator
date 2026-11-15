@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConnectivityInfo
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConnectivityInfo`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConnectivityInfo::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Publishes a core device's connectivity information: the endpoint list the request
+//! carries REPLACES whatever that core device had published, and the response names the
+//! version token minted for the stored list.
 //!
 //! ## Shape of an operation
 //!
@@ -98,17 +92,22 @@ pub enum UpdateConnectivityInfoErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::update_connectivity_info::UpdateConnectivityInfoError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type UpdateConnectivityInfoError = crate::scaffolded::Scaffolded<UpdateConnectivityInfoErrorModeled>;
+/// (`crate::ops::update_connectivity_info::UpdateConnectivityInfoError`).
+///
+/// The operation's own modelled channel, widened by the refusals the LEGACY Greengrass
+/// surface words itself ([`crate::state::LegacyRefusal`]): this route is one both API
+/// versions publish, and AWS answers a client error on it in the elder envelope, whose
+/// sentence travels in a `Message` body member rather than in the lowercase `message` this
+/// model's `ValidationException` declares.
+pub type UpdateConnectivityInfoError =
+    crate::state::LegacyRefusable<UpdateConnectivityInfoErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// wrapper variant.
 impl From<UpdateConnectivityInfoErrorModeled> for UpdateConnectivityInfoError {
     fn from(modeled: UpdateConnectivityInfoErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Channel(crate::scaffolded::Scaffolded::Modeled(modeled))
     }
 }
 
@@ -148,18 +147,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConnectivityInfo` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConnectivityInfoErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConnectivityInfo"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(UpdateConnectivityInfoErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the greengrassv2 state store is unavailable".to_string(),
+                    retry_after_seconds: 1,
+                },
+            )
+            .into());
+        };
+
+        // The list the request carries is the core device's connectivity information, so
+        // storing it REPLACES what that device had published and mints the version token
+        // this response names — the token a client compares to detect a concurrent
+        // overwrite. A list this surface cannot read as connectivity information is
+        // refused in the legacy envelope, naming the member that could not be read, and
+        // nothing is written.
+        let endpoints = input.connectivity_info.len();
+        let version = match state
+            .lock()
+            .publish_connectivity_info(&input.thing_name, input.connectivity_info)
+        {
+            Ok(version) => version,
+            Err(st::ConnectivityInfoRefusal::Unparsable) => {
+                return Err(st::LegacyRefusal::bad_request(
+                    st::UNPARSABLE_CONNECTIVITY_INFO_MESSAGE,
+                )
+                .into())
+            }
+            Err(st::ConnectivityInfoRefusal::StoreFull) => {
+                return Err(UpdateConnectivityInfoErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "this emulator holds connectivity information for the maximum \
+                             of {} core devices",
+                            st::MAX_CONNECTIVITY_INFO_THINGS
+                        ),
+                        retry_after_seconds: 1,
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Audit record for a state-changing call: who asked, what changed, and how it
+        // ended. The presented access-key id is an identifier, never a secret.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = "published",
+            principal = %::engine::extract_akid(&ctx.parts().headers),
+            resource = %input.thing_name,
+            endpoints,
+            "published a core device's connectivity information"
+        );
+
+        // Only the version: the `message` member reports a remark about the request, and
+        // this write has no remark to make beyond the version it stored the list under.
+        Ok(UpdateConnectivityInfoOutput {
+            version: Some(version),
+            message: None,
+        })
     }
 }

@@ -18,7 +18,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod core_devices;
 /// What every paginated reader of this service shares.
 pub mod paging;
+/// The connectivity information a core device publishes for its client devices.
+pub mod connectivity_info;
+/// The refusals the legacy Greengrass surface answers in the elder envelope.
+pub mod legacy_refusals;
+pub use connectivity_info::*;
 pub use core_devices::*;
+pub use legacy_refusals::*;
 pub use paging::*;
 
 use crate::ops::types::{
@@ -451,6 +457,11 @@ pub struct ComAmazonawsGreengrassv2Greengrassv2State {
     /// itself under it. Bounded by [`MAX_CORE_DEVICES_WITH_ASSOCIATIONS`] names, each by
     /// [`MAX_CLIENT_DEVICES_PER_CORE_DEVICE`].
     pub client_device_associations: BTreeMap<String, BTreeMap<String, SystemTime>>,
+    /// The connectivity information each core device has published, keyed by its thing
+    /// name — what `UpdateConnectivityInfo` writes and `GetConnectivityInfo` reads back.
+    /// Bounded by [`MAX_CONNECTIVITY_INFO_THINGS`] names, each record by
+    /// [`MAX_CONNECTIVITY_INFO_ENTRIES`] endpoints.
+    pub connectivity_info: BTreeMap<String, ConnectivityInfoRecord>,
 }
 
 impl ComAmazonawsGreengrassv2Greengrassv2State {

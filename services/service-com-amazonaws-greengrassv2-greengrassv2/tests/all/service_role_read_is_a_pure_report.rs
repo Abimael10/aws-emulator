@@ -4,8 +4,9 @@
 //! Greengrass service-role association an account holds.
 //!
 //! The rule under test: `GetServiceRoleForAccount` answers 200 with the role ARN and the
-//! instant of the write that established the association the account currently holds, or
-//! with neither member while it holds none — and reading NEVER changes what a later
+//! instant of the write that established the association the account currently holds, and
+//! reports the account that holds none as the not-found that surface answers — and reading
+//! NEVER changes what a later
 //! caller sees, however many reads are made and wherever in the lifecycle they fall: a
 //! read neither creates, re-stamps nor consumes the association, so the role and the
 //! instant every read reports are the ones the write answered and a later disassociation
@@ -32,7 +33,8 @@ use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::service_role_association::{
-    associate, disassociate, emulator, get_role, instant_within, now_seconds, role_arn_rows, text,
+    assert_no_role_reported, associate, disassociate, emulator, get_role, instant_within,
+    now_seconds, role_arn_rows, text,
 };
 
 /// The output members `GetServiceRoleForAccount` reports, by the wire names the model
@@ -64,13 +66,13 @@ async fn reads_report(
 ) {
     for read in 1..=reads {
         let (status, got) = get_role(router).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?} {stage} read {read}: expected 200 from \
-             GetServiceRoleForAccount, got {status} {got}"
-        );
         match expected {
             Some((role_arn, associated_at)) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?} {stage} read {read}: expected 200 from \
+                     GetServiceRoleForAccount, got {status} {got}"
+                );
                 assert_eq!(
                     (text(&got, "RoleArn"), text(&got, "AssociatedAt")),
                     (role_arn.to_string(), associated_at.to_string()),
@@ -84,12 +86,7 @@ async fn reads_report(
                      members, got {got}"
                 );
             }
-            None => assert_eq!(
-                members(&got),
-                Vec::<String>::new(),
-                "case {case:?} {stage} read {read}: expected a success naming no \
-                 association, got {got}"
-            ),
+            None => assert_no_role_reported(&format!("{case} {stage} read {read}"), status, &got),
         }
     }
 }
