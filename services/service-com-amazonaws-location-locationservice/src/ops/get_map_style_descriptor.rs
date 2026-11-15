@@ -3,12 +3,14 @@
 //! @op GetMapStyleDescriptor
 //! Serves the style descriptor a stored map resource publishes.
 //!
-//! The document is derived from the map resource's OWN stored configuration: the
-//! style it was created with decides the provider its tiles are credited to, the
-//! zoom range they exist for and the layers they carry.
-//! [`crate::state::style_document`] builds it from the same catalog entry and the
-//! same layer table `GetMapTile` serves tiles from, so what this document
-//! declares and what a tile read answers cannot drift apart.
+//! The document is derived from the map resource's OWN stored record: the style
+//! it was created with decides the provider its tiles are credited to and the
+//! source they are declared under, the zoom range they exist for and the layers
+//! they carry, and the resource's own create and update instants are the
+//! instants the style reports. [`crate::state::style_document`] builds it from
+//! the same catalog entry and the same layer table `GetMapTile` serves tiles
+//! from, so what this document declares and what a tile read answers cannot
+//! drift apart.
 //!
 //!
 //! ## Shape of an operation
@@ -169,10 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // Read the style the map was created with and release the store:
-        // building the document reads nothing else, so a style read holds no
-        // lock while it renders and writes nothing at all.
-        let style = {
+        // Read the map resource's own record — the style it was created with,
+        // the provider that style's tiles are sourced from, and the instants it
+        // was created and last written — and release the store: building the
+        // document reads nothing else, so a style read holds no lock while it
+        // renders and writes nothing at all.
+        let (style, data_source, created, modified) = {
             let store = state.lock();
             let map = store.maps.get(&input.map_name).ok_or_else(|| {
                 GetMapStyleDescriptorErrorModeled::ResourceNotFoundException(
@@ -184,7 +188,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             })?;
-            map.configuration.style.clone()
+            (
+                map.configuration.style.clone(),
+                map.data_source.clone(),
+                map.create_time,
+                map.update_time,
+            )
         };
 
         // The create resolved the style against this service's catalog, so a
@@ -205,10 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // they are rooted at the endpoint this emulator is served at rather than
         // at any provider's own host.
         let endpoint = ctx.endpoint();
+        let map = crate::state::style_document::StyledMap {
+            name: &input.map_name,
+            style: entry,
+            data_source: &data_source,
+            created,
+            modified,
+        };
         Ok(GetMapStyleDescriptorOutput {
             blob: Some(crate::state::style_document::style_descriptor(
-                &input.map_name,
-                &entry,
+                &map,
                 endpoint.as_str(),
             )),
             content_type: Some(crate::state::style_document::STYLE_CONTENT_TYPE.to_string()),

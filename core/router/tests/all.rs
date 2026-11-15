@@ -1588,3 +1588,9 @@ mod zz_probe_whole_emulator;
 // `all/every_suite_file_is_declared.rs`,
 // `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` pin every rule above, for this file
+// Declaration list for the router's cross-service test target: one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file directly under `tests/all/`,
+// sorted by name, declared exactly once, and nothing else below this header. The
+// `all_rs_*` suites and `all/every_suite_file_is_declared.rs` pin that shape; what a suite
+// covers belongs in its own module header, and a note about this file in
+// `all/appended_notes.rs` or its siblings, declared below like any other suite.

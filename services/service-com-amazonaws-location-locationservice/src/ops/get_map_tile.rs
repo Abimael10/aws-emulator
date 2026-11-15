@@ -254,14 +254,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             x: u32::try_from(x).unwrap_or(u32::MAX),
             y: u32::try_from(y).unwrap_or(u32::MAX),
         };
-        let format = map_tiles::tile_format(entry.style);
         Ok(GetMapTileOutput {
             blob: Some(map_tiles::tile_bytes(
                 entry.style,
                 &data_source,
                 address,
             )),
-            content_type: Some(map_tiles::content_type(format).to_string()),
+            // The media type this plane labels a tile with follows the
+            // OPERATION, not the format of the bytes inside it: see
+            // [`map_tiles::TILE_CONTENT_TYPE`].
+            content_type: Some(map_tiles::TILE_CONTENT_TYPE.to_string()),
             cache_control: Some(map_tiles::TILE_CACHE_CONTROL.to_string()),
         })
     }

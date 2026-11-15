@@ -47,17 +47,19 @@ pub const TILE_LABEL_PATTERN: &str = r"\d+";
 /// entire world at (0/0/0)" the operation's own doc describes.
 pub const MIN_ZOOM: u32 = 0;
 
-/// The media type a vector tile is served with. The
-/// `GetMapTileResponse$ContentType` doc: "The map tile's content type. For
-/// example, application/vnd.mapbox-vector-tile."
-pub const VECTOR_TILE_CONTENT_TYPE: &str = "application/vnd.mapbox-vector-tile";
-
-/// The media type a raster tile is served with.
+/// The media type EVERY tile of this plane is served with, whatever the bytes
+/// inside it encode.
 ///
-/// A raster basemap's tile is an image rather than vector data; this emulator
-/// encodes it losslessly as PNG and reports that in `ContentType`, so a client
-/// reads the format off the response rather than assuming one.
-pub const RASTER_TILE_CONTENT_TYPE: &str = "image/png";
+/// The `GetMapTileResponse$ContentType` doc names a media type only "for
+/// example" and the model fixes no value, so what this operation really labels
+/// a tile with is recorded behaviour: a v1 map tile is handed back as the
+/// provider's own opaque bytes and labelled as the binary payload it is — the
+/// same media type the `GetMapGlyphsResponse$ContentType` doc names for the
+/// other binary asset of this plane ("For example, application/octet-stream").
+/// The label is therefore a property of the OPERATION rather than of the
+/// style's tile format: a raster basemap's tile carries it exactly as a vector
+/// basemap's does.
+pub const TILE_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// The `Cache-Control` directive every tile is served with.
 ///
@@ -186,14 +188,6 @@ pub fn tile_format(style: &str) -> TileFormat {
     }
 }
 
-/// The media type a tile of `format` is served with.
-pub fn content_type(format: TileFormat) -> &'static str {
-    match format {
-        TileFormat::Vector => VECTOR_TILE_CONTENT_TYPE,
-        TileFormat::Raster => RASTER_TILE_CONTENT_TYPE,
-    }
-}
-
 /// The bytes of the tile at `address` of a map whose style is `style`, sourced
 /// from `data_source`: vector data for a vector basemap, an image for a raster
 /// one.
@@ -226,13 +220,28 @@ pub enum Ground {
     Water,
 }
 
+/// Which of the provider's three colours a layer's features are drawn in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tint {
+    /// The provider's water colour.
+    Water,
+    /// The provider's ground colour: the land every other feature is drawn on
+    /// top of.
+    Ground,
+    /// The provider's relief colour, which land detail is drawn in so it reads
+    /// against the ground.
+    Detail,
+}
+
 /// One layer a vector tile carries: its name, what its features are drawn as,
-/// the ground they are drawn over, and the lowest zoom they are drawn at.
+/// the ground they are drawn over, the colour a style paints them in, and the
+/// lowest zoom they are drawn at.
 #[derive(Debug, Clone, Copy)]
 pub struct TileLayer {
     pub name: &'static str,
     pub geometry: LayerGeometry,
     pub ground: Ground,
+    pub tint: Tint,
     pub min_zoom: u32,
 }
 
@@ -245,53 +254,73 @@ pub struct TileLayer {
 /// comes in at is this emulator's schema: a basemap draws its coarse features
 /// (water, boundaries, cities) at every zoom and its fine ones only once the
 /// tiles are small enough to hold them.
-const TILE_LAYERS: [TileLayer; 8] = [
+///
+/// The ground comes FIRST because it is a layer of the tile data like any
+/// other: a renderer paints the land from the `land` polygon the tile carries,
+/// which is what lets every layer of the style document be bound to the source
+/// the document declares rather than to a background of the style's own.
+const TILE_LAYERS: [TileLayer; 9] = [
+    TileLayer {
+        name: "land",
+        geometry: LayerGeometry::Area,
+        ground: Ground::Land,
+        tint: Tint::Ground,
+        min_zoom: 0,
+    },
     TileLayer {
         name: "water",
         geometry: LayerGeometry::Area,
         ground: Ground::Water,
+        tint: Tint::Water,
         min_zoom: 0,
     },
     TileLayer {
         name: "boundaries",
         geometry: LayerGeometry::Way,
         ground: Ground::Any,
+        tint: Tint::Detail,
         min_zoom: 0,
     },
     TileLayer {
         name: "places",
         geometry: LayerGeometry::Point,
         ground: Ground::Land,
+        tint: Tint::Detail,
         min_zoom: 0,
     },
     TileLayer {
         name: "roads",
         geometry: LayerGeometry::Way,
         ground: Ground::Land,
+        tint: Tint::Detail,
         min_zoom: 5,
     },
     TileLayer {
         name: "railways",
         geometry: LayerGeometry::Way,
         ground: Ground::Land,
+        tint: Tint::Detail,
         min_zoom: 7,
     },
     TileLayer {
         name: "parks",
         geometry: LayerGeometry::Area,
         ground: Ground::Land,
+        tint: Tint::Detail,
         min_zoom: 10,
     },
     TileLayer {
         name: "landmarks",
         geometry: LayerGeometry::Point,
         ground: Ground::Land,
+        tint: Tint::Detail,
         min_zoom: 12,
     },
     TileLayer {
         name: "buildings",
         geometry: LayerGeometry::Area,
         ground: Ground::Land,
+        tint: Tint::Detail,
         min_zoom: 14,
     },
 ];
@@ -447,6 +476,19 @@ pub struct TilePalette {
 /// That colour as the `#rrggbb` a style document paints with.
 pub fn hex(colour: Rgba) -> String {
     format!("#{:02x}{:02x}{:02x}", colour[0], colour[1], colour[2])
+}
+
+/// The colour of `palette` a layer tinted `tint` is painted in.
+///
+/// The ONE place a tile layer's colour is decided, so the style document that
+/// paints a layer and the raster imagery drawn from the same palette cannot
+/// disagree about what the provider's map looks like.
+pub fn tint_colour(palette: &TilePalette, tint: Tint) -> Rgba {
+    match tint {
+        Tint::Water => palette.water,
+        Tint::Ground => palette.land,
+        Tint::Detail => palette.relief,
+    }
 }
 
 /// The palette a map whose style is sourced from `data_source` draws its raster

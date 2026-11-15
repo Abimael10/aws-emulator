@@ -214,6 +214,89 @@ pub fn iso_millis(iso: &str) -> i64 {
         .expect("epoch millis")
 }
 
+/// The media type EVERY tile of the map plane is labelled with, whatever the
+/// bytes inside it encode.
+///
+/// Source: recorded behaviour of `GetMapTile` — the model fixes no value for
+/// `GetMapTileResponse$ContentType` (its doc names one only "for example"), and
+/// the recorded 200 of a vector tile carries `application/octet-stream`, the
+/// media type this plane labels its binary assets with (the
+/// `GetMapGlyphsResponse$ContentType` doc names the same one). Stated here once,
+/// so the suites that read a tile and the suites that read the document
+/// declaring it cannot disagree about it.
+pub const TILE_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// The media type a style descriptor is served as. The
+/// `GetMapStyleDescriptorResponse$ContentType` doc: "The style descriptor's
+/// content type. For example, application/json."
+pub const STYLE_CONTENT_TYPE: &str = "application/json";
+
+/// Every style the service publishes, with the provider it is sourced from and
+/// the deepest zoom its tiles exist for, read from the crate's own catalog: a
+/// suite spans the whole catalog rather than a sample of it, and a style added
+/// to the catalog is covered without a suite being edited.
+pub fn published_styles() -> Vec<(&'static str, &'static str, u32)> {
+    service_com_amazonaws_location_locationservice::state::MAP_STYLES
+        .iter()
+        .map(|entry| (entry.style, entry.data_source, entry.max_zoom))
+        .collect()
+}
+
+/// Whether a style's basemap is drawn from images rather than vector data, which
+/// is what the tile BODY has to decode as.
+///
+/// Source: the `MapConfiguration$Style` doc, which describes `RasterEsriImagery`
+/// as "A raster basemap" and `HybridHereExploreSatellite` as a map "over
+/// satellite imagery", against the `Vector…` styles' "vector basemap".
+pub fn raster_basemap(style: &str) -> bool {
+    style.starts_with("Raster") || style.starts_with("Hybrid")
+}
+
+/// Create the map resource `name` carrying `style`, asserting the create was
+/// served — the step every map-plane suite starts from.
+pub async fn create_map(router: &MultiServiceRouter, name: &str, style: &str) {
+    let created = call(
+        router,
+        "POST",
+        "/maps/v0/maps",
+        Some(json!({ "MapName": name, "Configuration": { "Style": style } })),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case {name:?}/{style:?}: the map must be created, got {} {:?}",
+        created.status, created.body
+    );
+}
+
+/// The style descriptor of `map`, decoded as the JSON document it is served as.
+pub async fn style_descriptor(router: &MultiServiceRouter, map: &str) -> Value {
+    let served = call_bytes(
+        router,
+        "GET",
+        &format!("/maps/v0/maps/{map}/style-descriptor"),
+    )
+    .await;
+    assert_eq!(
+        served.status, 200,
+        "case {map:?}: the style descriptor must be served, got {} {:?}",
+        served.status,
+        String::from_utf8_lossy(&served.body)
+    );
+    assert_eq!(
+        served.header("content-type").as_deref(),
+        Some(STYLE_CONTENT_TYPE),
+        "case {map:?}: the descriptor is served as JSON, got {:?}",
+        served.header("content-type")
+    );
+    serde_json::from_slice(&served.body).unwrap_or_else(|error| {
+        panic!(
+            "case {map:?}: the descriptor must be JSON, got {error}: {:?}",
+            String::from_utf8_lossy(&served.body)
+        )
+    })
+}
+
 /// The wire form of a timestamp inside a JSON body.
 ///
 /// Every timestamp member of this model targets one shape and that shape carries

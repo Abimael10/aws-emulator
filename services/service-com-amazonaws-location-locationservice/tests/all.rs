@@ -27,6 +27,8 @@ mod harness;
 mod listing_entry_members;
 #[path = "all/map_sprites.rs"]
 mod map_sprites;
+#[path = "all/map_style_document.rs"]
+mod map_style_document;
 #[path = "all/map_tiles.rs"]
 mod map_tiles;
 #[path = "all/maps.rs"]

@@ -24,54 +24,19 @@
 //! the `maxzoom` it publishes is the deepest zoom a tile read of the same map
 //! serves, which is proved here by fetching that tile and the one past it.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_location_locationservice::state;
 
-use crate::harness::{call, call_bytes, emulator, millis_of, RawAnswer};
-
-/// Every style the service publishes, with the provider it is sourced from and
-/// the deepest zoom its tiles exist for, read from the crate's own catalog: the
-/// suites below span the whole catalog rather than a sample of it, and a style
-/// added to it is covered without this file being edited.
-fn published_styles() -> Vec<(&'static str, &'static str, u32)> {
-    state::MAP_STYLES
-        .iter()
-        .map(|entry| (entry.style, entry.data_source, entry.max_zoom))
-        .collect()
-}
-
-/// The media type a style's tiles are served with: vector data for a vector
-/// basemap, an image for a raster one.
-///
-/// Source: the `MapConfiguration$Style` doc, which describes `RasterEsriImagery`
-/// as "A raster basemap" and `HybridHereExploreSatellite` as a map "over
-/// satellite imagery", against the `Vector…` styles' "vector basemap"; and the
-/// `GetMapTileResponse$ContentType` doc, which names the vector media type
-/// ("For example, application/vnd.mapbox-vector-tile").
-fn expected_content_type(style: &str) -> &'static str {
-    if style.starts_with("Raster") || style.starts_with("Hybrid") {
-        "image/png"
-    } else {
-        "application/vnd.mapbox-vector-tile"
-    }
-}
-
-async fn create_map(router: &MultiServiceRouter, name: &str, style: &str) {
-    let created = call(
-        router,
-        "POST",
-        "/maps/v0/maps",
-        Some(json!({ "MapName": name, "Configuration": { "Style": style } })),
-    )
-    .await;
-    assert_eq!(
-        created.status, 200,
-        "case {name:?}/{style:?}: the map must be created, got {} {:?}",
-        created.status, created.body
-    );
-}
+// The map-plane helpers every suite of this crate shares — the published style
+// catalog, the tile media type, the raster test, the create step and the
+// descriptor read — live in the harness, so this suite and the style-document
+// suite beside it cannot drift apart about any of them.
+use crate::harness::{
+    call, call_bytes, create_map, emulator, millis_of, published_styles, raster_basemap,
+    style_descriptor, RawAnswer, TILE_CONTENT_TYPE,
+};
 
 async fn get_tile(
     router: &MultiServiceRouter,
@@ -81,34 +46,6 @@ async fn get_tile(
     y: &str,
 ) -> RawAnswer {
     call_bytes(router, "GET", &format!("/maps/v0/maps/{map}/tiles/{z}/{x}/{y}")).await
-}
-
-/// The style descriptor of `map`, decoded as the JSON document it is served as.
-async fn style_descriptor(router: &MultiServiceRouter, map: &str) -> Value {
-    let served = call_bytes(
-        router,
-        "GET",
-        &format!("/maps/v0/maps/{map}/style-descriptor"),
-    )
-    .await;
-    assert_eq!(
-        served.status, 200,
-        "case {map:?}: the style descriptor must be served, got {} {:?}",
-        served.status,
-        String::from_utf8_lossy(&served.body)
-    );
-    assert_eq!(
-        served.header("content-type").as_deref(),
-        Some("application/json"),
-        "case {map:?}: the descriptor is served as JSON, got {:?}",
-        served.header("content-type")
-    );
-    serde_json::from_slice(&served.body).unwrap_or_else(|error| {
-        panic!(
-            "case {map:?}: the descriptor must be JSON, got {error}: {:?}",
-            String::from_utf8_lossy(&served.body)
-        )
-    })
 }
 
 /// The `maxzoom` every source of a style document declares.
@@ -203,9 +140,8 @@ async fn every_published_style_serves_its_own_tiles_in_its_own_format() {
             );
             assert_eq!(
                 served.header("content-type").as_deref(),
-                Some(expected_content_type(style)),
-                "case {case:?}: expected Content-Type {:?}, got {:?}",
-                expected_content_type(style),
+                Some(TILE_CONTENT_TYPE),
+                "case {case:?}: expected Content-Type {TILE_CONTENT_TYPE:?}, got {:?}",
                 served.header("content-type")
             );
             assert!(
@@ -222,7 +158,7 @@ async fn every_published_style_serves_its_own_tiles_in_its_own_format() {
             );
 
             // The body really is the format its media type claims.
-            if expected_content_type(style) == "image/png" {
+            if raster_basemap(style) {
                 let decoder = png::Decoder::new(served.body.as_slice());
                 let reader = decoder.read_info().unwrap_or_else(|error| {
                     panic!("case {case:?}: a raster tile must be a PNG, got {error}")
@@ -418,8 +354,16 @@ async fn the_layers_a_style_paints_are_the_layers_its_tiles_carry() {
             layer.name
         );
     }
-    let deep = get_tile(&router, "LayeredMap", "16", "0", "0").await;
-    for carried in tile_layers("VectorEsriStreets at zoom 16", &deep.body) {
+    // The deepest zoom this style's own pyramid publishes, read from the
+    // catalog, so the row follows the style rather than a zoom written here.
+    let deepest = published_styles()
+        .into_iter()
+        .find(|(style, _, _)| *style == "VectorEsriStreets")
+        .map(|(_, _, max_zoom)| max_zoom)
+        .expect("the catalog publishes VectorEsriStreets");
+    let case = format!("VectorEsriStreets at zoom {deepest}");
+    let deep = get_tile(&router, "LayeredMap", &deepest.to_string(), "0", "0").await;
+    for carried in tile_layers(&case, &deep.body) {
         assert!(
             painted.contains(&carried),
             "tile layer {carried:?} is painted by no style layer, got {painted:?}"
@@ -460,13 +404,17 @@ async fn a_tiles_content_follows_its_own_address() {
     /// which names each layer and the lowest zoom it is drawn at; the rows are
     /// those thresholds, so each one adds exactly the layer that zoom brings in.
     const LAND_LAYERS: [(u32, &[&str]); 6] = [
-        (0, &["boundaries", "places"]),
-        (5, &["boundaries", "places", "roads"]),
-        (7, &["boundaries", "places", "roads", "railways"]),
-        (10, &["boundaries", "places", "roads", "railways", "parks"]),
+        (0, &["land", "boundaries", "places"]),
+        (5, &["land", "boundaries", "places", "roads"]),
+        (7, &["land", "boundaries", "places", "roads", "railways"]),
+        (
+            10,
+            &["land", "boundaries", "places", "roads", "railways", "parks"],
+        ),
         (
             12,
             &[
+                "land",
                 "boundaries",
                 "places",
                 "roads",
@@ -478,6 +426,7 @@ async fn a_tiles_content_follows_its_own_address() {
         (
             14,
             &[
+                "land",
                 "boundaries",
                 "places",
                 "roads",

@@ -46,12 +46,14 @@ pub struct MapStyle {
     /// [`super::map_tiles::MIN_ZOOM`], the single world tile.
     ///
     /// The model publishes no zoom table — the `MapConfiguration$Style` doc links
-    /// each provider's own page for what its tiles cover — so the depths here are
-    /// this emulator's catalog: a street-level vector basemap is published deeper
-    /// than the canvas styles beside it, and a raster basemap one level shallower
-    /// than the vector tiles of the same provider. They live on the catalog entry
-    /// because a tile read bounds `Z` by the style the MAP was created with, so
-    /// the depth has to be reachable from the stored resource.
+    /// each provider's own page for what its tiles cover — so a depth here is
+    /// this emulator's catalog unless a recorded style descriptor publishes the
+    /// provider's own, as [`ESRI_MAX_ZOOM`] is: a street-level vector basemap is
+    /// published deeper than the canvas styles beside it, and a raster basemap
+    /// one level shallower than the vector tiles of the same provider. They live
+    /// on the catalog entry because a tile read bounds `Z` by the style the MAP
+    /// was created with, so the depth has to be reachable from the stored
+    /// resource.
     pub max_zoom: u32,
 }
 
@@ -67,17 +69,17 @@ pub const MAP_STYLES: [MapStyle; 18] = [
     MapStyle {
         style: "VectorEsriDarkGrayCanvas",
         data_source: PROVIDER_ESRI,
-        max_zoom: CANVAS_MAX_ZOOM,
+        max_zoom: ESRI_MAX_ZOOM,
     },
     MapStyle {
         style: "RasterEsriImagery",
         data_source: PROVIDER_ESRI,
-        max_zoom: ESRI_MAX_ZOOM - 1,
+        max_zoom: ESRI_IMAGERY_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorEsriLightGrayCanvas",
         data_source: PROVIDER_ESRI,
-        max_zoom: CANVAS_MAX_ZOOM,
+        max_zoom: ESRI_MAX_ZOOM,
     },
     MapStyle {
         style: "VectorEsriTopographic",
@@ -156,15 +158,21 @@ pub const MAP_STYLES: [MapStyle; 18] = [
     },
 ];
 
-/// How deep Esri's street-level vector basemaps are published, and so the
-/// deepest zoom a tile read of one of them serves. See
-/// [`MapStyle::max_zoom`] for why the depth is this emulator's own.
-const ESRI_MAX_ZOOM: u32 = 22;
+/// How deep Esri publishes its vector basemaps, and so both the deepest zoom a
+/// tile read of one of them serves and the `maxzoom` its style descriptor
+/// declares.
+///
+/// Recorded behaviour rather than a depth of this emulator's choosing: the style
+/// descriptor AWS serves for an Esri-backed vector map declares `maxzoom` 15 on
+/// its provider source. The canvas styles are tiles of the same vector basemap
+/// family, so they are published to the same depth.
+const ESRI_MAX_ZOOM: u32 = 15;
 
-/// How deep the two Esri canvas styles are published: a neutral background style
-/// the `MapConfiguration$Style` doc describes as carrying "minimal colors,
-/// labels, and features" is published shallower than the street map beside it.
-const CANVAS_MAX_ZOOM: u32 = 16;
+/// How deep Esri's imagery basemap is published. No recording covers it and the
+/// model publishes no depth, so this one is this emulator's catalog (see
+/// [`MapStyle::max_zoom`]): photographic imagery is published deeper than the
+/// vector basemaps drawn over the same ground.
+const ESRI_IMAGERY_MAX_ZOOM: u32 = 19;
 
 /// How deep the HERE Technologies basemaps are published.
 const HERE_MAX_ZOOM: u32 = 20;
