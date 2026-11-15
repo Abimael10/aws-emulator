@@ -819,6 +819,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|stack_id| store.resolve(&region, stack_id))
             .map(|stack| stack.notification_arns.clone())
             .unwrap_or_default();
+        // The tags in force on the stack, which the tags this change set would put in force
+        // are compared with: the stack's tags are the tags of its resources, so a revision
+        // that states them differently changes every one of them
+        // ([`crate::state::change_plan::tag_changes`]).
+        let previous_tags = target_stack_id
+            .as_deref()
+            .and_then(|stack_id| store.resolve(&region, stack_id))
+            .map(|stack| stack.tags.clone())
+            .unwrap_or_default();
         // "Whether to reuse the template that's associated with the stack to create the
         // change set." Either way the body and its processed stage travel together, which
         // `zip` is what expresses: a submitted body ALWAYS has the stage computed for it
@@ -898,7 +907,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // change set is the very thing the acknowledgement stands in for.
         // "If the list of resource types doesn't include a resource that you're creating,
         // the stack creation fails": the bound this request put on the operation it plans is
-        // weighed against the template that plan would deploy, before the plan is written
+        // weighed against the template that plan would deploy, before the plan is written —
+        // the same rule, in the same wording and under the same `ValidationError`, that
+        // `CreateStack` and `UpdateStack` hold their own requests to
         // (`crate::state::resource_type_allow_list`).
         crate::state::validate_allowed_resource_types(
             &template_body,
@@ -1025,6 +1036,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 changes.push(crate::state::change_plan::drift_change(drifted));
             }
         }
+        // "If you don't specify this parameter, CloudFormation doesn't modify the stack's
+        // tags. If you specify an empty value, CloudFormation removes all associated tags":
+        // the tags the change set would put in force are the ones it STATES, and the ones
+        // already in force where it states none — the same reading `UpdateStack` gives the
+        // member, since what a change set carries is the update it plans.
+        let tags = match input.tags.as_deref() {
+            Some(stated) => crate::state::stored_tags(stated),
+            None => previous_tags.clone(),
+        };
+        // What a change to the STACK's own tags adds to that plan: the stack's tags are the
+        // tags of the resources it manages, so a revision stating them differently changes
+        // every resource the stack holds under the `Tags` attribute
+        // ([`crate::state::change_plan::tag_changes`]). An IMPORT change set adopts exactly
+        // the resources it names and plans nothing else.
+        if !imports_resources {
+            crate::state::change_plan::tag_changes(
+                &mut changes,
+                &previous_tags,
+                &tags,
+                &deployed,
+            );
+        }
 
         // The configuration the change set would carry, resolved once: it is what the
         // comparison below holds a re-created name to AND what the record stores.
@@ -1038,7 +1071,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(stated) => stated,
             None => previous_notification_arns.clone(),
         };
-        let tags = crate::state::stored_tags(input.tags.as_deref().unwrap_or_default());
         let rollback_configuration =
             crate::state::stored_rollback_configuration(input.rollback_configuration.as_ref());
         let deployment_config =

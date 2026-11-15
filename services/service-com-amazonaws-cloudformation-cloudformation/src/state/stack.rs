@@ -1598,11 +1598,11 @@ impl StoredStack {
         let pending = self.pending.take().expect("checked just above");
         let completing_deletion = pending.status == status::DELETE_COMPLETE;
         let deployed = self.pending_deployment.take();
-        // A ROLLBACK that is completing went through the phase that removes what the
-        // operation it reverted had created, between putting the previous configuration back
-        // and its own terminal status: that phase is an event of the stack's, recorded ahead
-        // of the terminal one it leads to.
-        self.record_rollback_cleanup(
+        // An UPDATE that is completing, and a ROLLBACK of one, go through the phase that
+        // removes the resources the operation replaced between applying the change and their
+        // own terminal status: that phase is an event of the stack's, recorded ahead of the
+        // terminal one it leads to ([`Self::record_cleanup_phase`]).
+        self.record_cleanup_phase(
             due_at,
             &pending.status,
             pending.operation_id.clone(),
@@ -1698,45 +1698,51 @@ impl StoredStack {
         );
     }
 
-    /// Record the CLEANUP phase of a ROLLBACK that is completing at `at`.
+    /// Record the CLEANUP phase of an UPDATE or of a ROLLBACK of one that is completing at
+    /// `at`.
     ///
-    /// "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS — CloudFormation is cleaning up the
-    /// resources after the rollback": a rollback does not go straight from putting the
-    /// previous configuration back to its terminal status — it then removes what the
-    /// operation it reverted had created, and that phase is a status of its own in the
-    /// stack's event stream, which is what a client auditing the documented rollback phases
-    /// reads. It belongs to every rollback alike: the one a failed update owed, the one
-    /// `RollbackStack` asked for and the one `ContinueUpdateRollback` resumed, all of which
-    /// reach their terminal status through here.
+    /// Both documented phases, in one place, because they are one rule: an update does not go
+    /// straight from applying its changes to its terminal status — "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS
+    /// — the stack update was successful, and CloudFormation is deleting the old resources" —
+    /// and neither does the rollback of one: "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS —
+    /// CloudFormation is cleaning up the resources after the rollback". Each phase is a status
+    /// of its own in the stack's event stream, which is what a client auditing the documented
+    /// phases of an update reads, and it belongs to EVERY such operation: the phase is the
+    /// update's own last step, so it is reported whether or not that particular revision left
+    /// a replaced resource to take down. For the rollback it belongs to every rollback alike:
+    /// the one a failed update owed, the one `RollbackStack` asked for and the one
+    /// `ContinueUpdateRollback` resumed, all of which reach their terminal status through here.
     ///
-    /// The phase falls due at the instant the rollback's terminal status does, because by
-    /// then the revert itself is through: [`Self::settle`] holds that status back until the
-    /// work the rollback owed the owning services has been carried out
-    /// ([`Self::owed_rollback`]), and what is left is the removal this phase reports.
+    /// The phase falls due at the instant the operation's terminal status does, because by
+    /// then the change itself is through: [`Self::settle`] holds that status back until the
+    /// resources the operation acted on are settled ([`Self::owed_rollback`] for the work a
+    /// rollback owed the owning services), and what is left is the removal this phase reports.
     ///
     /// `terminal` is the status the operation is settling into, so nothing is recorded for an
-    /// operation that is not a rollback of an update.
+    /// operation that is neither an update nor the rollback of one. A stack ALREADY reporting
+    /// the phase has had the event recorded as that cleanup began
+    /// ([`Self::report_update_cleanup`], which a replaced resource's own removal drives), and
+    /// one phase is reported once.
     ///
-    /// The phase is an EVENT of the rollback and not a status the stack rests in: the
+    /// The phase is an EVENT of the operation and not a status the stack rests in: the
     /// terminal status falls due at the same instant, and it is what a client reading the
     /// stack sees, so nothing here writes [`Self::status`].
-    fn record_rollback_cleanup(
+    fn record_cleanup_phase(
         &mut self,
         at: SystemTime,
         terminal: &str,
         operation_id: Option<String>,
         client_request_token: Option<String>,
     ) {
-        if terminal != status::UPDATE_ROLLBACK_COMPLETE {
+        let phase = match terminal {
+            status::UPDATE_ROLLBACK_COMPLETE => status::UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS,
+            status::UPDATE_COMPLETE => status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS,
+            _ => return,
+        };
+        if self.status == phase {
             return;
         }
-        self.record_event(
-            at,
-            status::UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS,
-            None,
-            operation_id,
-            client_request_token,
-        );
+        self.record_event(at, phase, None, operation_id, client_request_token);
     }
 
     /// The instant the LAST resource the walk in flight acted on finished, if it has one.

@@ -415,7 +415,9 @@ fn preview_cases() -> Vec<PreviewCase> {
             }],
         },
         // An addition and a removal change the whole resource rather than an attribute of
-        // it, so neither carries a detail, a scope or a replacement.
+        // it, so neither carries a detail, a scope or a replacement. A removal does report
+        // what the execution would do to the physical resource, which is that resource's own
+        // `DeletionPolicy` — `Delete` for a declaration that states none.
         PreviewCase {
             case: "a resource added and a resource removed",
             stack: "preview-add-remove",
@@ -444,7 +446,7 @@ fn preview_cases() -> Vec<PreviewCase> {
                     logical_resource_id: "Reader",
                     resource_type: "AWS::CloudWatch::Alarm",
                     replacement: None,
-                    policy_action: None,
+                    policy_action: Some(policy_action::DELETE),
                     scope: Vec::new(),
                     details: Vec::new(),
                 },
@@ -465,7 +467,7 @@ fn preview_cases() -> Vec<PreviewCase> {
                     logical_resource_id: "Reader",
                     resource_type: "AWS::CloudWatch::Alarm",
                     replacement: None,
-                    policy_action: None,
+                    policy_action: Some(policy_action::DELETE),
                     scope: Vec::new(),
                     details: Vec::new(),
                 },

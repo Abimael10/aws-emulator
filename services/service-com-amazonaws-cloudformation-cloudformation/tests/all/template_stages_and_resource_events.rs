@@ -49,6 +49,9 @@ const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
 const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 const UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
 const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
+/// The phase every successful update goes through on its way to its terminal status: "the
+/// stack update was successful, and CloudFormation is deleting the old resources".
+const UPDATE_COMPLETE_CLEANUP_IN_PROGRESS: &str = "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS";
 const DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
 const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
 
@@ -1465,6 +1468,10 @@ async fn an_update_and_a_delete_report_events_only_for_the_resources_they_act_on
                 (CREATE_COMPLETE.to_string(), "Added".to_string()),
                 (CREATE_IN_PROGRESS.to_string(), "Added".to_string()),
                 (CREATE_IN_PROGRESS.to_string(), "Added".to_string()),
+                (
+                    UPDATE_COMPLETE_CLEANUP_IN_PROGRESS.to_string(),
+                    "churn".to_string(),
+                ),
             ],
         ),
         (
@@ -1476,6 +1483,10 @@ async fn an_update_and_a_delete_report_events_only_for_the_resources_they_act_on
             vec![
                 (DELETE_COMPLETE.to_string(), "Changed".to_string()),
                 (DELETE_IN_PROGRESS.to_string(), "Changed".to_string()),
+                (
+                    UPDATE_COMPLETE_CLEANUP_IN_PROGRESS.to_string(),
+                    "churn".to_string(),
+                ),
             ],
         ),
     ] {
@@ -1781,6 +1792,10 @@ async fn an_update_whose_template_cannot_be_deployed_fails_and_acts_on_no_resour
         status_and_logical_id(&one_operation(&events)),
         vec![
             (UPDATE_COMPLETE.to_string(), "unknowable".to_string()),
+            (
+                UPDATE_COMPLETE_CLEANUP_IN_PROGRESS.to_string(),
+                "unknowable".to_string(),
+            ),
             (UPDATE_IN_PROGRESS.to_string(), "unknowable".to_string()),
         ],
         "case \"an update back to the deployed template\": the resource was kept, so \
@@ -1811,6 +1826,10 @@ async fn an_update_whose_template_cannot_be_deployed_fails_and_acts_on_no_resour
         status_and_logical_id(&one_operation(&events)),
         vec![
             (UPDATE_COMPLETE.to_string(), "unknowable".to_string()),
+            (
+                UPDATE_COMPLETE_CLEANUP_IN_PROGRESS.to_string(),
+                "unknowable".to_string(),
+            ),
             (UPDATE_IN_PROGRESS.to_string(), "unknowable".to_string()),
         ],
         "case \"an update to a yaml template\": the same resources, differently spelled, \

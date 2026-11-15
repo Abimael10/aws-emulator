@@ -97,9 +97,22 @@ pub mod change_source {
 /// `PolicyAction` values this service reports for what a change set does to the EXISTING
 /// physical resource (from the model's `PolicyAction` enum).
 pub mod policy_action {
+    pub const DELETE: &str = "Delete";
+    pub const RETAIN: &str = "Retain";
+    pub const SNAPSHOT: &str = "Snapshot";
     pub const REPLACE_AND_DELETE: &str = "ReplaceAndDelete";
     pub const REPLACE_AND_RETAIN: &str = "ReplaceAndRetain";
     pub const REPLACE_AND_SNAPSHOT: &str = "ReplaceAndSnapshot";
+}
+
+/// The `DeletionPolicy` values the resource attribute takes: "with the `DeletionPolicy`
+/// attribute you can preserve, and in some cases, backup a resource when its stack is
+/// deleted… `Delete`, `Retain`, `RetainExceptOnCreate`, `Snapshot`", `Delete` being the
+/// default for a resource that declares none.
+mod deletion_policy {
+    pub const RETAIN: &str = "Retain";
+    pub const RETAIN_EXCEPT_ON_CREATE: &str = "RetainExceptOnCreate";
+    pub const SNAPSHOT: &str = "Snapshot";
 }
 
 /// The `UpdateReplacePolicy` values the resource attribute takes: "With the
@@ -128,7 +141,11 @@ pub struct StoredChangeDetail {
     /// `ResourceChangeDetail$Evaluation`.
     pub evaluation: String,
     /// `ResourceChangeDetail$ChangeSource`: the group the causing entity belongs to.
-    pub change_source: String,
+    ///
+    /// `None` where the change has no such group: a change to the stack's own TAGS is made
+    /// by the stack operation itself rather than by anything the template states, so no
+    /// source is reported for it.
+    pub change_source: Option<String>,
     /// `ResourceChangeDetail$CausingEntity`: "the identity of the entity that triggered
     /// this change… If the `ChangeSource` value is `DirectModification`, no value is given
     /// for `CausingEntity`."
@@ -138,6 +155,74 @@ pub struct StoredChangeDetail {
     /// the templates alone, where the members are "only present for drift-aware change
     /// sets".
     pub drifted: Option<DriftedValues>,
+    /// What this detail reports about the TARGET's own value: its path, the value each
+    /// revision would deploy and what the change does to it ([`TargetValues`]).
+    ///
+    /// `DescribeChangeSet` reports these only for a request that asked for the property
+    /// values, which is what they are. `None` for a change nothing computed them for.
+    pub values: Option<TargetValues>,
+}
+
+/// The property VALUES one detail reports: `ResourceTargetDefinition$Path`,
+/// `$BeforeValue`/`$AfterValue` and `$AttributeChangeType`.
+///
+/// "The property path of the property", "the value of the property before the change is
+/// executed", "the value of the property after the change is executed" and "the type of
+/// change to be made to the property if the change is executed" — the detailed changes in the
+/// property values a `DescribeChangeSet(IncludePropertyValues=true)` asks for, computed from
+/// the same two revisions the comparison itself is made over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetValues {
+    /// `ResourceTargetDefinition$Path`: where in the resource's declaration the target sits
+    /// — `/Properties/<name>` for one of its properties, and `/<Attribute>` for a resource
+    /// attribute declared beside them.
+    pub path: String,
+    /// The value the revision IN FORCE would deploy for it, absent where that revision
+    /// states none (the target is being added).
+    pub before_value: Option<String>,
+    /// The value the SUBMITTED revision would deploy for it, absent where that revision
+    /// states none (the target is being removed).
+    pub after_value: Option<String>,
+    /// `AttributeChangeType`: `Add` for a target only the submitted revision states,
+    /// `Remove` for one only the revision in force states, and `Modify` for one both state
+    /// differently.
+    pub change_type: String,
+}
+
+/// `AttributeChangeType` values this comparison reports (from the model's enum).
+pub mod attribute_change_type {
+    pub const ADD: &str = "Add";
+    pub const REMOVE: &str = "Remove";
+    pub const MODIFY: &str = "Modify";
+}
+
+impl TargetValues {
+    /// The values one target of a comparison reports: `path` is where it sits in the
+    /// declaration, and `before`/`after` are what each revision would deploy for it — a
+    /// value each side states, and `None` where that side states none at all.
+    ///
+    /// The text of a value is the value itself where it IS text, and its JSON otherwise:
+    /// `BeforeValue` and `AfterValue` are strings, and a property whose value is a number, a
+    /// list or an object is reported as the document that property carries.
+    fn of(path: String, before: Option<&Value>, after: Option<&Value>) -> Self {
+        fn text(value: &Value) -> String {
+            match value {
+                Value::String(text) => text.clone(),
+                value => value.to_string(),
+            }
+        }
+        let change_type = match (before, after) {
+            (None, _) => attribute_change_type::ADD,
+            (_, None) => attribute_change_type::REMOVE,
+            _ => attribute_change_type::MODIFY,
+        };
+        Self {
+            path,
+            before_value: before.map(text),
+            after_value: after.map(text),
+            change_type: change_type.to_string(),
+        }
+    }
 }
 
 /// The before and after values a DRIFT-AWARE change reports for one property, and where
@@ -202,6 +287,21 @@ pub struct StoredResourceChange {
     /// no hierarchy below it, and one on a child stack that does not exist yet has no stack
     /// to hold a change set of its own.
     pub nested_change_set_id: Option<String>,
+    /// `ResourceChange$BeforeContext`: "an encoded JSON string that contains the context of
+    /// the resource before the change is executed" — the `Properties` document the revision
+    /// IN FORCE would deploy for this resource, evaluated.
+    ///
+    /// `None` for an `Add`, whose resource is not there to have a context yet, and for a
+    /// change computed without a revision to read one from. `DescribeChangeSet` reports it
+    /// only for a request that asked for the property values ([`IncludePropertyValues`]).
+    ///
+    /// [`IncludePropertyValues`]: crate::ops::describe_change_set
+    pub before_context: Option<String>,
+    /// `ResourceChange$AfterContext`: the same document for the revision the change set
+    /// would put in force — "the context of the resource after the change is executed".
+    ///
+    /// `None` for a `Remove`, whose resource is not there afterwards.
+    pub after_context: Option<String>,
 }
 
 /// The revision of a stack a change set is computed AGAINST: the template in force on it,
@@ -351,7 +451,17 @@ pub fn computed_changes(
     submitted_parameters: &[StoredParameter],
 ) -> Vec<StoredResourceChange> {
     let Some(current) = current else {
-        return submitted.resources.iter().map(addition).collect();
+        // No stack to compare against and none to resolve against either, so each addition
+        // reports the document the submitted template states for it
+        // ([`property_context`]).
+        let mut budget = template::Budget::new();
+        let mut changes: Vec<StoredResourceChange> =
+            submitted.resources.iter().map(addition).collect();
+        for (change, resource) in changes.iter_mut().zip(&submitted.resources) {
+            change.after_context =
+                Some(property_context(&resource.properties, None, &mut budget));
+        }
+        return changes;
     };
     // ONE budget for the whole comparison, as a deployment evaluates a whole template out
     // of one: the total work a caller's two templates can ask for is bounded.
@@ -537,7 +647,72 @@ pub fn computed_changes(
             changes.push(removal(resource, physical_id(&resource.logical_id)));
         }
     }
+    // What each change would deploy, on each side it HAS a side on: the resource's evaluated
+    // `Properties` as the revision in force states them and as the submitted revision states
+    // them ([`property_context`]). Filled here, from the two declaration sets the comparison
+    // above already read, so a change carries the same document the comparison was made over
+    // — and a `Remove` reports only the before and an `Add` only the after, since a change
+    // that takes a resource away leaves no resource to have an after context and one that
+    // brings it into being had none before.
+    let declared_before: BTreeMap<&str, &template::DeclaredResource> = current
+        .template
+        .resources
+        .iter()
+        .map(|resource| (resource.logical_id.as_str(), resource))
+        .collect();
+    let declared_after: BTreeMap<&str, &template::DeclaredResource> = submitted
+        .resources
+        .iter()
+        .map(|resource| (resource.logical_id.as_str(), resource))
+        .collect();
+    for change in &mut changes {
+        let logical_id = change.logical_resource_id.as_str();
+        if change.action != change_action::ADD {
+            change.before_context = declared_before.get(logical_id).map(|resource| {
+                // The configuration the resource CARRIES where the template in force no
+                // longer declares it is the before side for that resource, exactly as it is
+                // for the property comparison above ([`carried_configurations`]).
+                match carried.get(logical_id) {
+                    Some(carried) => property_context(carried, None, &mut budget),
+                    None => property_context(&resource.properties, Some(&before), &mut budget),
+                }
+            });
+        }
+        if change.action != change_action::REMOVE {
+            change.after_context = declared_after.get(logical_id).map(|resource| {
+                property_context(&resource.properties, Some(&after), &mut budget)
+            });
+        }
+    }
     changes
+}
+
+/// The `BeforeContext`/`AfterContext` of one resource: "an encoded JSON string that contains
+/// the context of the resource" — its `Properties` document, under that one key, with every
+/// intrinsic function evaluated in `scope`.
+///
+/// It is the document the deployment would carry out, so it is EVALUATED: a property reading
+/// `!Ref Size` is reported as the value that revision would really deploy, which is the whole
+/// point of asking for the property values. A value this reader cannot evaluate at all is
+/// reported as the template states it — that declaration is what is known about it — and so
+/// is every property of a resource there is no scope to resolve against (a change set over a
+/// stack that does not exist yet).
+///
+/// A declaration stating no properties reports an empty document rather than a null one: the
+/// context is the resource's properties, and it has none.
+fn property_context(
+    properties: &Value,
+    scope: Option<&template::Scope<'_>>,
+    budget: &mut template::Budget,
+) -> String {
+    let resolved = scope.and_then(|scope| template::resolve(properties, scope, budget));
+    let properties = match resolved.unwrap_or_else(|| properties.clone()) {
+        Value::Null => Value::Object(::serde_json::Map::new()),
+        resolved => resolved,
+    };
+    let mut context = ::serde_json::Map::new();
+    context.insert(PROPERTIES_ATTRIBUTE.to_string(), properties);
+    Value::Object(context).to_string()
 }
 
 /// What the comparison says about one resource the submitted template declares, before the
@@ -625,9 +800,13 @@ fn propagate_recreations(
             // plan already decided: determined, and determined to change, which is what
             // `Static` reports.
             evaluation: evaluation::STATIC.to_string(),
-            change_source: source.to_string(),
+            change_source: Some(source.to_string()),
             causing_entity: Some(causing_entity),
             drifted: None,
+            // The value this property will carry is a physical id the recreated resource
+            // does not have yet, so neither side of it is a value this comparison read: the
+            // target is reported, and what it will become is not something to state.
+            values: None,
         });
     }
     details.extend(propagated);
@@ -740,9 +919,16 @@ fn change_details(
                 // resource.
                 requires_recreation: requires_recreation::NEVER.to_string(),
                 evaluation: evaluation::STATIC.to_string(),
-                change_source: change_source::DIRECT_MODIFICATION.to_string(),
+                change_source: Some(change_source::DIRECT_MODIFICATION.to_string()),
                 causing_entity: None,
                 drifted: None,
+                // The attribute itself is the target, so its path is the attribute and the
+                // values are the documents the two declarations state for it.
+                values: Some(TargetValues::of(
+                    format!("/{attribute}"),
+                    previous.declaration.get(attribute),
+                    submitted.declaration.get(attribute),
+                )),
             });
         }
     }
@@ -839,9 +1025,17 @@ fn property_details(
                 // updatable ones is `Conditionally` ([`recreation_of`]).
                 requires_recreation: recreates.to_string(),
                 evaluation: evaluation.to_string(),
-                change_source: source.to_string(),
+                change_source: Some(source.to_string()),
                 causing_entity,
                 drifted: None,
+                // The target is this property, and the values are the ones each revision
+                // would really DEPLOY for it — the resolved pair the comparison above was
+                // made over, which is what the detailed property values are.
+                values: Some(TargetValues::of(
+                    format!("/{PROPERTIES_ATTRIBUTE}/{property}"),
+                    resolved_before.as_ref().or(declared_before),
+                    resolved_after.as_ref().or(declared_after),
+                )),
             }
         };
         // What the change is attributed to is the ENTITY the property's new value is built
@@ -990,10 +1184,17 @@ fn addition(resource: &template::DeclaredResource) -> StoredResourceChange {
         policy_action: None,
         resource_drift_status: None,
         nested_change_set_id: None,
+        before_context: None,
+        after_context: None,
     }
 }
 
 /// The `Remove` of a resource the submitted template no longer declares.
+///
+/// "The action that will be taken on the physical resource when the change set is executed"
+/// is what the resource's own `DeletionPolicy` says ([`delete_action`]): the resource the
+/// change takes out of the stack is deleted, retained or snapshotted, and the change reports
+/// which.
 fn removal(
     resource: &template::DeclaredResource,
     physical_resource_id: Option<String>,
@@ -1006,9 +1207,11 @@ fn removal(
         scope: Vec::new(),
         replacement: None,
         details: Vec::new(),
-        policy_action: None,
+        policy_action: Some(delete_action(resource).to_string()),
         resource_drift_status: None,
         nested_change_set_id: None,
+        before_context: None,
+        after_context: None,
     }
 }
 
@@ -1035,6 +1238,8 @@ fn modification(
             .then(|| replace_action(resource).to_string()),
         resource_drift_status: None,
         nested_change_set_id: None,
+        before_context: None,
+        after_context: None,
     }
 }
 
@@ -1067,11 +1272,23 @@ pub fn drift_change(drifted: &super::drift::DriftedResource) -> StoredResourceCh
             // template — so the change and its value are determined, which is what `Static`
             // reports.
             evaluation: evaluation::STATIC.to_string(),
-            change_source: change_source::DIRECT_MODIFICATION.to_string(),
+            change_source: Some(change_source::DIRECT_MODIFICATION.to_string()),
             causing_entity: None,
             drifted: Some(DriftedValues {
                 before_value: difference.actual_value.clone(),
                 after_value: difference.expected_value.clone(),
+            }),
+            // The target's path and its two values are the drift comparison's own, reported
+            // beside where each of them came from: the property path it found the difference
+            // under, the value the resource really carries and the one the template declares.
+            values: Some(TargetValues {
+                path: format!(
+                    "/{PROPERTIES_ATTRIBUTE}/{}",
+                    difference.property_path.trim_start_matches('/')
+                ),
+                before_value: Some(difference.actual_value.clone()),
+                after_value: Some(difference.expected_value.clone()),
+                change_type: attribute_change_type::MODIFY.to_string(),
             }),
         })
         .collect();
@@ -1088,6 +1305,11 @@ pub fn drift_change(drifted: &super::drift::DriftedResource) -> StoredResourceCh
         // `MODIFIED` states.
         resource_drift_status: Some(super::resource_drift_status::MODIFIED.to_string()),
         nested_change_set_id: None,
+        // The two values this change carries are the DETAIL's own ([`DriftedValues`]): what
+        // a drift-aware comparison read off the live resource and off the template, not the
+        // whole document either side would deploy.
+        before_context: None,
+        after_context: None,
     }
 }
 
@@ -1104,4 +1326,150 @@ fn replace_action(resource: &template::DeclaredResource) -> &'static str {
         Some(update_replace_policy::SNAPSHOT) => policy_action::REPLACE_AND_SNAPSHOT,
         _ => policy_action::REPLACE_AND_DELETE,
     }
+}
+
+/// What taking a resource OUT of the stack does to the physical resource: its
+/// `DeletionPolicy`, which "specif[ies] how CloudFormation handles the resource" when the
+/// stack stops managing it and defaults to deleting it.
+///
+/// `RetainExceptOnCreate` keeps the resource exactly as `Retain` does for everything but a
+/// create that fails — "retain the resource only if the resource creation fails" — and a
+/// change that removes a resource the stack HAS is not that case, so it is reported as the
+/// retention it is.
+fn delete_action(resource: &template::DeclaredResource) -> &'static str {
+    match resource
+        .declaration
+        .get("DeletionPolicy")
+        .and_then(Value::as_str)
+    {
+        Some(deletion_policy::RETAIN | deletion_policy::RETAIN_EXCEPT_ON_CREATE) => {
+            policy_action::RETAIN
+        }
+        Some(deletion_policy::SNAPSHOT) => policy_action::SNAPSHOT,
+        _ => policy_action::DELETE,
+    }
+}
+
+/// The `ResourceAttribute` a change to the STACK's own tags triggers on each of its
+/// resources: `Scope` "indicates which resource attribute is triggering this update, such as
+/// a change in the resource attribute's `Metadata`, `Properties`, or `Tags`".
+const TAGS_ATTRIBUTE: &str = "Tags";
+
+/// Add what a change to the stack's own TAG SET does to a plan: the stack's tags are the
+/// tags of the resources it manages — "key-value pairs to associate with this stack.
+/// CloudFormation also propagates these tags to resources in the stack" — so a revision that
+/// states them differently changes every resource the stack holds, under the `Tags` attribute
+/// rather than under `Properties`.
+///
+/// One `Modify` per resource the stack has DEPLOYED whose tags CloudFormation really holds
+/// and the plan does not already take away or bring into being: a resource the plan removes
+/// is gone (nothing re-tags it) and one it adds is created with the new set, so neither
+/// carries a tag change, while a resource the plan already reports a change for gains the
+/// `Tags` attribute beside the ones it carries — its `Scope` is read off its details, so the
+/// two can never disagree ([`scope_of`]).
+///
+/// Which resources those are is which of them a service TAGS: CloudFormation propagates a
+/// stack's tags to the resources in it through each type's own tagging, so a resource of a
+/// type no service here holds — one this emulator leaves declared-only
+/// ([`super::provisioning::owner_for`]) — holds no tags for a tag change to change, and the
+/// execution of the change set would ask nobody anything about it.
+///
+/// Re-tagging never recreates a resource (`RequiresRecreation` `Never`), the two tag sets are
+/// both read so the change and its value are determined (`Static`), and it is the revision
+/// itself that states them, which is what `DirectModification` is.
+///
+/// `in_force` is the stack's tag set and `submitted` the one the revision would put in force;
+/// a revision that states the same set changes nothing here ([`super::same_tags`]).
+pub fn tag_changes(
+    changes: &mut Vec<StoredResourceChange>,
+    in_force: &[super::StoredTag],
+    submitted: &[super::StoredTag],
+    deployed: &[DeployedResource],
+) {
+    if super::same_tags(in_force, submitted) {
+        return;
+    }
+    let detail = StoredChangeDetail {
+        attribute: TAGS_ATTRIBUTE.to_string(),
+        // "For all other attributes, the value is null": `Tags` is not `Properties`, so the
+        // detail names no property.
+        name: None,
+        requires_recreation: requires_recreation::NEVER.to_string(),
+        evaluation: evaluation::STATIC.to_string(),
+        // "If the `ChangeSource` value is `DirectModification`, no value is given for
+        // `CausingEntity`" — and a tag change names no source at all: it is not something
+        // the template states, so there is no entity and no group one could belong to.
+        change_source: None,
+        causing_entity: None,
+        drifted: None,
+        // The target is the resource's tag set, and the two values are the sets the stack
+        // carries and the revision would put in force ([`tag_set_text`]).
+        values: Some(TargetValues::of(
+            format!("/{TAGS_ATTRIBUTE}"),
+            Some(&tag_set_text(in_force)),
+            Some(&tag_set_text(submitted)),
+        )),
+    };
+    for held in deployed {
+        // A record the stack kept at `DELETE_COMPLETE` is not a resource the stack holds:
+        // the operation that disposed of it took it away, so there is nothing to re-tag.
+        if held.status == super::resource_status::DELETE_COMPLETE {
+            continue;
+        }
+        // ...and neither is a resource no service of this emulator holds: nothing tags it.
+        if super::provisioning::owner_for(&held.resource.resource_type).is_none() {
+            continue;
+        }
+        let logical_id = held.resource.logical_id.as_str();
+        match changes
+            .iter_mut()
+            .find(|change| change.logical_resource_id == logical_id)
+        {
+            Some(change) if change.action == change_action::MODIFY => {
+                if change
+                    .details
+                    .iter()
+                    .any(|detail| detail.attribute == TAGS_ATTRIBUTE)
+                {
+                    continue;
+                }
+                change.details.push(detail.clone());
+                change.details.sort_by(detail_order);
+                change.scope = scope_of(&change.details);
+            }
+            // The resource is being created or taken away by this plan: the tags it ends up
+            // with are the ones that create carries, and a resource that is gone has none.
+            Some(_) => {}
+            None => {
+                let mut tagged = StoredResourceChange {
+                    action: change_action::MODIFY.to_string(),
+                    logical_resource_id: held.resource.logical_id.clone(),
+                    resource_type: held.resource.resource_type.clone(),
+                    physical_resource_id: Some(held.resource.physical_resource_id.clone()),
+                    scope: Vec::new(),
+                    replacement: Some(replacement::FALSE.to_string()),
+                    details: vec![detail.clone()],
+                    policy_action: None,
+                    resource_drift_status: None,
+                    nested_change_set_id: None,
+                    before_context: None,
+                    after_context: None,
+                };
+                tagged.scope = scope_of(&tagged.details);
+                changes.push(tagged);
+            }
+        }
+    }
+}
+
+/// The text one tag set is reported as on the target of a tag change: its pairs as JSON,
+/// keyed and ordered by tag key, which is how two sets are compared ([`super::same_tags`]).
+fn tag_set_text(tags: &[super::StoredTag]) -> Value {
+    let set: BTreeMap<&str, &str> = tags
+        .iter()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    Value::String(
+        ::serde_json::to_string(&set).unwrap_or_else(|_| String::from("{}")),
+    )
 }

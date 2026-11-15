@@ -137,6 +137,19 @@ const ON_STACK_FAILURE_DO_NOTHING: &str = "DO_NOTHING";
 /// `CreateStack` spells `OnFailure=DELETE`.
 const ON_STACK_FAILURE_DELETE: &str = "DELETE";
 
+/// The refusal a request that states BOTH dispositions earns: "this parameter can't be
+/// specified when the `OnStackFailure` parameter to the `CreateChangeSet` API operation was
+/// specified" — the two members state the same thing, and CloudFormation answers the
+/// `ValidationError` below for a call that states one of them against a change set that
+/// already carries the other.
+///
+/// Entirely FIXED text: neither the change set, the stack nor any value of the request
+/// reaches it, so it is the sentence and nothing else. Recorded behaviour — the model
+/// documents the rule and not its wording.
+pub const BOTH_DISABLE_ROLLBACK_AND_ON_STACK_FAILURE: &str =
+    "Either DisableRollback or OnStackFailure can be specified, but not both. Validation \
+     error as OnStackFailure parameter was specified during CreateChangeSet.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -383,8 +396,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // a request that states both is refused rather than one of them being dropped.
             if input.disable_rollback.is_some() && change_set.on_stack_failure.is_some() {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    "DisableRollback cannot be specified when the change set was created \
-                     with OnStackFailure",
+                    BOTH_DISABLE_ROLLBACK_AND_ON_STACK_FAILURE,
                 ));
             }
             // "The specified change set can't be used to update the stack. For example,

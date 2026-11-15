@@ -69,6 +69,8 @@ mod cdk_asset_function_writes_its_granted_table;
 mod cdk_deployed_table_estate;
 #[path = "all/cdk_metadata_resource_type.rs"]
 mod cdk_metadata_resource_type;
+#[path = "all/change_set_bounds_and_property_values.rs"]
+mod change_set_bounds_and_property_values;
 #[path = "all/change_set_created_stack_template_reads.rs"]
 mod change_set_created_stack_template_reads;
 #[path = "all/change_set_early_validation.rs"]

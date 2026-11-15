@@ -1494,6 +1494,10 @@ async fn describe_stack_events_reports_the_recorded_events_newest_first() {
             "DELETE_COMPLETE".to_string(),
             "DELETE_IN_PROGRESS".to_string(),
             "UPDATE_COMPLETE".to_string(),
+            // "the stack update was successful, and CloudFormation is deleting the old
+            // resources": the phase every update goes through on its way to its terminal
+            // status, recorded as an event of the stack's.
+            "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS".to_string(),
             "UPDATE_IN_PROGRESS".to_string(),
             "CREATE_COMPLETE".to_string(),
             "CREATE_IN_PROGRESS".to_string(),

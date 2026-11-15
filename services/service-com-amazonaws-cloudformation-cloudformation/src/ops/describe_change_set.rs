@@ -165,7 +165,13 @@ use crate::state::{StoredChangeDetail, StoredResourceChange};
 /// `ChangeSetId` is "the change set ID of the nested change set" for a change on a child
 /// stack the change set was expanded into ([`crate::state::nested_change_set`]), and absent
 /// for every other change.
-fn change_view(stored: &StoredResourceChange) -> Change {
+///
+/// `with_property_values` is what the request asked for: "if `true`, the returned changes
+/// include detailed changes in the property values", which is what
+/// `BeforeContext`/`AfterContext` carry — the document each side of the change would deploy,
+/// computed when the change set was created. A request that did not ask for them is answered
+/// without them, so the flag decides what the response carries rather than what was stored.
+fn change_view(stored: &StoredResourceChange, with_property_values: bool) -> Change {
     Change {
         r#type: Some(crate::state::CHANGE_TYPE_RESOURCE.to_string()),
         hook_invocation_count: None,
@@ -179,11 +185,21 @@ fn change_view(stored: &StoredResourceChange) -> Change {
             scope: Some(stored.scope.clone()),
             resource_drift_status: stored.resource_drift_status.clone(),
             resource_drift_ignored_attributes: None,
-            details: Some(stored.details.iter().map(detail_view).collect()),
+            details: Some(
+                stored
+                    .details
+                    .iter()
+                    .map(|detail| detail_view(detail, with_property_values))
+                    .collect(),
+            ),
             change_set_id: stored.nested_change_set_id.clone(),
             module_info: None,
-            before_context: None,
-            after_context: None,
+            before_context: with_property_values
+                .then(|| stored.before_context.clone())
+                .flatten(),
+            after_context: with_property_values
+                .then(|| stored.after_context.clone())
+                .flatten(),
             previous_deployment_context: None,
         }),
     }
@@ -195,24 +211,32 @@ fn change_view(stored: &StoredResourceChange) -> Change {
 /// state and absent for every other change, which is what "only present for drift-aware
 /// change sets" states: the before value is the one the owning service reported and the
 /// after value the one the template declares, each beside where it came from
-/// ([`crate::state::change_plan::DriftedValues`]). `Path` and `Drift` are left absent: the
-/// detail reports the DECLARED property, and the per-property drift timestamps are not
-/// something this comparison read.
-fn detail_view(stored: &StoredChangeDetail) -> ResourceChangeDetail {
+/// ([`crate::state::change_plan::DriftedValues`]). `Drift` is left absent: the per-property
+/// drift timestamps are not something this comparison read.
+///
+/// `with_property_values` is what the request asked for: `Path`, `BeforeValue`, `AfterValue`
+/// and `AttributeChangeType` are "detailed changes in the property values" — where the target
+/// sits, what each revision would deploy for it and what the change does to it
+/// ([`crate::state::change_plan::TargetValues`]) — so they are reported for a request that
+/// asked for them and left off one that did not.
+fn detail_view(stored: &StoredChangeDetail, with_property_values: bool) -> ResourceChangeDetail {
+    let values = stored.values.as_ref().filter(|_| with_property_values);
     ResourceChangeDetail {
         target: Some(ResourceTargetDefinition {
             attribute: Some(stored.attribute.clone()),
             name: stored.name.clone(),
             requires_recreation: Some(stored.requires_recreation.clone()),
-            path: None,
+            path: values.map(|values| values.path.clone()),
             before_value: stored
                 .drifted
                 .as_ref()
-                .map(|drifted| drifted.before_value.clone()),
+                .map(|drifted| drifted.before_value.clone())
+                .or_else(|| values.and_then(|values| values.before_value.clone())),
             after_value: stored
                 .drifted
                 .as_ref()
-                .map(|drifted| drifted.after_value.clone()),
+                .map(|drifted| drifted.after_value.clone())
+                .or_else(|| values.and_then(|values| values.after_value.clone())),
             before_value_from: stored.drifted.as_ref().map(|_| {
                 crate::state::change_plan::BEFORE_VALUE_FROM_ACTUAL_STATE.to_string()
             }),
@@ -221,10 +245,10 @@ fn detail_view(stored: &StoredChangeDetail) -> ResourceChangeDetail {
                 .as_ref()
                 .map(|_| crate::state::change_plan::AFTER_VALUE_FROM_TEMPLATE.to_string()),
             drift: None,
-            attribute_change_type: None,
+            attribute_change_type: values.map(|values| values.change_type.clone()),
         }),
         evaluation: Some(stored.evaluation.clone()),
-        change_source: Some(stored.change_source.clone()),
+        change_source: stored.change_source.clone(),
         causing_entity: stored.causing_entity.clone(),
     }
 }
@@ -345,10 +369,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token is SCOPED to this change set — the changes are the change set's own
         // ([`crate::state::PageScope`]).
         let change_set_id = change_set.change_set_id.clone();
+        let with_property_values = input.include_property_values == Some(true);
         let (changes, next_token) = crate::state::paginate_in(
             crate::state::PageOf::Changes,
             crate::state::PageScope(&change_set_id),
-            change_set.changes.iter().map(change_view).collect(),
+            change_set
+                .changes
+                .iter()
+                .map(|stored| change_view(stored, with_property_values))
+                .collect(),
             input.next_token.as_deref(),
         )
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;

@@ -6,12 +6,16 @@ Issue-Shape-Id: com.amazonaws.cloudformation#CloudFormation
 Issue-Key: cloudformation.change-set-client-token-retry-same-id-other-token-rejected|_error#13|AssertionError|raise AssertionError(f"expected a refusal, the call succeeded: {result!r}")
 Issue-Key: cloudformation.change-set-on-stack-failure-delete-on-update-type-rejected|_error#7|AssertionError|raise AssertionError(f"expected a refusal, the call succeeded: {result!r}")
 Issue-Key: cloudformation.change-set-on-stack-failure-with-disable-rollback-rejected|run#11|AssertionError|assert got == (
-Issue-Key: cloudformation.change-set-resource-types-excluding-a-template-type-rejected|_error#16|AssertionError|raise AssertionError(f"expected a refusal, the call succeeded: {result!r}")
 Issue-Key: cloudformation.change-set-stack-tag-change-scopes-tags-not-properties|run#11|AssertionError|assert cs["Status"] == "CREATE_COMPLETE", f"change set: {cs.get('StatusReason')!r}"
 Issue-Key: cloudformation.change-set-include-property-values-add-modify-remove-contexts|run#18|KeyError|assert json.loads(mod["BeforeContext"]) == props(keep, "k1"), mod.get("BeforeContext")
 Issue-Key: cloudformation.change-set-execute-client-request-token-marks-only-its-events|run#20|AssertionError|assert [(lid, st) for lid, st, _ in new] == [
-Issue-Key: cloudformation.cdk-deploy-method-direct-creates-and-updates-without-a-change-set|_err#18|AssertionError|raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
 Issue-Commit: 765add48a71cdb59193040bf215c1324536972c5
+
+> _RESOLVED for the six causes whose keys this header still carries — 1, 2, 3, 5, 6 and 7 — each
+> replayed green. Causes 4 (the `ResourceTypes` allow-list on `CreateChangeSet`) and 8 (a direct
+> deploy's change-set record) are NOT resolved: their two keys moved to
+> `issues/things-that-do-not-work/20261115T060000Z-cloudformation-two-change-set-divergences-remain-resource-types-and-the-direct-deploy.md`,
+> which carries them as its own blocking evidence together with what was established about each._
 
 # cloudformation: 8 net-new root causes in the change-set surface — unenforced guards, missing property contexts and wrong refusal messages
 

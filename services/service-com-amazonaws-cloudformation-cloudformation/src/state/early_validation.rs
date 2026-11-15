@@ -439,6 +439,8 @@ mod tests {
             policy_action: None,
             resource_drift_status: None,
             nested_change_set_id: None,
+            before_context: None,
+            after_context: None,
         };
         let rows: &[(&str, Vec<StoredResourceChange>, Option<&str>)] = &[
             (

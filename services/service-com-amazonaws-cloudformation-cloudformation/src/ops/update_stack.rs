@@ -352,29 +352,27 @@ fn submitted_logical_ids(
         .unwrap_or_default()
 }
 
-/// The resource actions an update PLANS, as the stack policy in force is asked about them.
+/// The resource-level plan this update would carry out: the comparison of the revision in
+/// force on the stack with the one this update would deploy, which is the same comparison
+/// `CreateChangeSet` reviews an update through ([`crate::state::changes_against`]).
 ///
-/// Computed from the resource-level plan [`crate::state::computed_changes`] answers for the
-/// two revisions — the one the stack is in force with and the one this update would deploy —
-/// which is the same comparison `CreateChangeSet` reviews an update through, so the policy
-/// is evaluated against the actions the deployment really performs.
-fn planned_actions(
+/// Read off the stage the update would DEPLOY, over the body that stage was computed over, so
+/// a stack whose template spliced in an `AWS::Include` snippet is compared with the document
+/// it really deployed. A template this service could not process has no plan at all: the
+/// deployment's own failure is what reports that.
+fn planned_changes(
     previous: &PreviousValues,
     submitted_body: &str,
     submitted_stage: &crate::state::template::Processed,
     parameters: &[StoredParameter],
-) -> Vec<crate::state::stack_policy::PlannedAction> {
+) -> Vec<crate::state::StoredResourceChange> {
     let Some(submitted) = submitted_stage
         .body(submitted_body)
         .and_then(crate::state::declared_template)
     else {
         return Vec::new();
     };
-    // The stack's own side of the comparison, read at its PROCESSED stage by the shared
-    // reader `CreateChangeSet` plans through ([`crate::state::changes_against`]) — over the
-    // body that stage was computed over, so a stack whose template spliced in an
-    // `AWS::Include` snippet is compared with the document it really deployed.
-    let changes = crate::state::changes_against(
+    crate::state::changes_against(
         Some(crate::state::DeployedStack {
             region: &previous.region,
             stack_name: &previous.stack_name,
@@ -389,8 +387,26 @@ fn planned_actions(
         }),
         &submitted,
         parameters,
-    );
-    crate::state::stack_policy::planned_actions(&changes)
+    )
+}
+
+/// The resource actions an update PLANS, as the stack policy in force is asked about them.
+///
+/// Computed from the resource-level plan [`planned_changes`] answers for the two revisions —
+/// the one the stack is in force with and the one this update would deploy — so the policy is
+/// evaluated against the actions the deployment really performs.
+fn planned_actions(
+    previous: &PreviousValues,
+    submitted_body: &str,
+    submitted_stage: &crate::state::template::Processed,
+    parameters: &[StoredParameter],
+) -> Vec<crate::state::stack_policy::PlannedAction> {
+    crate::state::stack_policy::planned_actions(&planned_changes(
+        previous,
+        submitted_body,
+        submitted_stage,
+        parameters,
+    ))
 }
 
 // The request's `Parameters` are resolved against the stack's stored values by the shared

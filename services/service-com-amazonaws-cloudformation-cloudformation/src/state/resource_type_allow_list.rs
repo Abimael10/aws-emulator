@@ -7,10 +7,15 @@
 //!
 //! A request that states `ResourceTypes` bounds the deploy it opens to those types, and
 //! "if the list of resource types doesn't include a resource that you're creating, the
-//! stack creation fails" — so the list is weighed against the template BEFORE anything is
-//! provisioned, and a template declaring a type the list does not cover is refused with
-//! nothing created. A stated list is the caller's own ceiling on what the operation may
-//! bring into the account; a list nothing is held to is no ceiling at all.
+//! stack creation fails" — so the list is weighed against the template the operation would
+//! DEPLOY before anything is provisioned, and a template declaring a type the list does not
+//! cover is refused with nothing created. A stated list is the caller's own ceiling on what
+//! the operation may bring into the account; a list nothing is held to is no ceiling at all.
+//!
+//! Which REFUSAL that is belongs to the operation: the create, the update and the change set
+//! that plans one all answer the `ValidationError` their own requests earn, in the one
+//! sentence this module words ([`not_allowed_message`]), since it is the same bound being
+//! weighed.
 //!
 //! The syntax a list entry may take is the documented one: `AWS::*` for every resource
 //! Amazon Web Services publishes, `Custom::*` for every custom resource,

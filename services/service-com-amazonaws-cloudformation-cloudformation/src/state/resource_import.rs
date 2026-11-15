@@ -182,6 +182,10 @@ pub fn import_change(
         policy_action: None,
         resource_drift_status: None,
         nested_change_set_id: None,
+        // Adopting a resource changes nothing about it, so neither side of the change states
+        // a document of its own.
+        before_context: None,
+        after_context: None,
     }
 }
 
@@ -434,6 +438,8 @@ mod tests {
             policy_action: None,
             resource_drift_status: None,
             nested_change_set_id: None,
+            before_context: None,
+            after_context: None,
         };
         let taken = vec![NamedResource {
             logical_id: "Adopted".to_string(),
@@ -635,6 +641,8 @@ mod tests {
                 policy_action: None,
                 resource_drift_status: None,
                 nested_change_set_id: None,
+                before_context: None,
+                after_context: None,
             }
         };
         /// `(case, the plan's changes, the identifiers its imports report)`.
