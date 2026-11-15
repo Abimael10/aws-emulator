@@ -1684,3 +1684,15 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // service crate's own, is stated in that suite's own module header, where it is read
 // beside the test it explains. `all/all_rs_declares_each_suite_once.rs`,
 // every service crate's `tests/all.rs`, so a note about any of them belongs there.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted in the sorted list — this file
+//! holds those pairs and no other line, so two branches landing at once insert two lines in
+//! What a suite covers, and why it lives in THIS target rather than in a service crate's own,
+//! belongs in that suite's own module header, where it is read beside the test it explains
+//! (`all/appended_notes.rs` keeps the notes this file had collected).
+//! * Declare each suite EXACTLY ONCE: this is one crate root, so a second `mod` for the same
+//!   name is `E0428` and takes every suite in the target down with it.
+//!   only place one may stand: past the first item it is `E0753` and compiles nothing.
+//! * `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod <name>;` would resolve to a
+//!   sibling of this file, which the layout check refuses: the `#[path]` above each `mod` is
+//!   what points it into `tests/all/`.
+//! top level of `tests/` is a test target of its own, which fails the build.

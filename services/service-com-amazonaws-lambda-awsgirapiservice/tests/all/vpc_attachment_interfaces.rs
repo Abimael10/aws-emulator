@@ -46,7 +46,10 @@ const UNKNOWN_SUBNET: &str = "subnet-0000000000bad0bad";
 
 /// The `NetworkInterfaceType` a function's own interfaces are of, from the modelled EC2
 /// enum's `lambda` member (`smithy_query(query="shape",shape="NetworkInterfaceType")`).
-const LAMBDA_INTERFACE_TYPE: &str = "lambda";
+///
+/// `pub(crate)` because the suite over the grant a VPC attachment takes
+/// (`tests/all/vpc_attachment_role_grant.rs`) selects the same interfaces by it.
+pub(crate) const LAMBDA_INTERFACE_TYPE: &str = "lambda";
 
 /// The principal that creates those interfaces: the Lambda service principal, which
 /// `NetworkInterface$RequesterId` names. Written out here rather than taken from the crate, so
@@ -85,7 +88,10 @@ struct Emulator {
 
 /// An EC2 client for [`REGION`] over `callback`, the in-process seam this emulator routes on:
 /// no socket is opened and the endpoint URL is only the address that transport routes by.
-fn ec2_client(callback: &EmbeddedEmulator) -> aws_sdk_ec2::Client {
+///
+/// `pub(crate)` because every suite that reads the account's EC2 inventory back reaches it
+/// this one way (`tests/all/vpc_attachment_role_grant.rs`).
+pub(crate) fn ec2_client(callback: &EmbeddedEmulator) -> aws_sdk_ec2::Client {
     let config = aws_sdk_ec2::Config::builder()
         .behavior_version(aws_sdk_ec2::config::BehaviorVersion::latest())
         .region(aws_sdk_ec2::config::Region::new(REGION.to_string()))
@@ -122,13 +128,22 @@ fn emulator() -> Emulator {
 
 /// One VPC with one subnet per entry of `subnet_cidrs` and one security group, created
 /// through EC2's own API; the ids are the ones EC2 MINTED.
-struct Network {
-    vpc_id: String,
-    subnet_ids: Vec<String>,
-    group_id: String,
+///
+/// `pub(crate)` because the suite over the grant a VPC attachment takes
+/// (`tests/all/vpc_attachment_role_grant.rs`) stands its networks up the same way, rather
+/// than passing off ids of its own as ones the account holds.
+pub(crate) struct Network {
+    pub(crate) vpc_id: String,
+    pub(crate) subnet_ids: Vec<String>,
+    pub(crate) group_id: String,
 }
 
-async fn network(ec2: &aws_sdk_ec2::Client, case: &str, prefix: u8, subnets: usize) -> Network {
+pub(crate) async fn network(
+    ec2: &aws_sdk_ec2::Client,
+    case: &str,
+    prefix: u8,
+    subnets: usize,
+) -> Network {
     let created = ec2
         .create_vpc()
         .cidr_block(format!("10.{prefix}.0.0/16"))
@@ -219,7 +234,7 @@ async fn default_subnet(ec2: &aws_sdk_ec2::Client) -> (String, String) {
 /// Every interface of the account's inventory that belongs to the function `function_name`,
 /// read through EC2's own `DescribeNetworkInterfaces` and selected by the interface type the
 /// model gives a function's interfaces and the description that names the function.
-async fn function_interfaces(
+pub(crate) async fn function_interfaces(
     ec2: &aws_sdk_ec2::Client,
     function_name: &str,
 ) -> Vec<NetworkInterface> {

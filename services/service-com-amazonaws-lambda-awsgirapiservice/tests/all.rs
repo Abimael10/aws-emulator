@@ -557,6 +557,8 @@ mod version_delete_alias_reference;
 mod version_publishing;
 #[path = "all/vpc_attachment_interfaces.rs"]
 mod vpc_attachment_interfaces;
+#[path = "all/vpc_attachment_role_grant.rs"]
+mod vpc_attachment_role_grant;
 #[path = "all/vpc_config_execution_role_permissions.rs"]
 mod vpc_config_execution_role_permissions;
 #[path = "all/async_invocation_delivery.rs"]
