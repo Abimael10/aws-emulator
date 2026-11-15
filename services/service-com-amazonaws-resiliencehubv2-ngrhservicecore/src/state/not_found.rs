@@ -17,6 +17,9 @@ pub const POLICY_RESOURCE_TYPE: &str = "Policy";
 /// `resourceType` for a service, as [`POLICY_RESOURCE_TYPE`] is for a policy.
 pub const SERVICE_RESOURCE_TYPE: &str = "Service";
 
+/// `resourceType` for a system, as [`POLICY_RESOURCE_TYPE`] is for a policy.
+pub const SYSTEM_RESOURCE_TYPE: &str = "System";
+
 /// `resourceType` for a service function, as [`POLICY_RESOURCE_TYPE`] is for a policy.
 ///
 /// A function is addressed by its `serviceFunctionId` rather than by an ARN of its own, so

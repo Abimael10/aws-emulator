@@ -17,11 +17,11 @@
 //! [`ServiceRecord::to_summary`] for the `ServiceSummary` `ListServices` emits — so the
 //! two readers cannot drift from one another or from what was stored.
 //!
-//! The store's other resource lives in its own module beside this one:
-//! [`policies`] holds the `Policy` lifecycle's records and projection. The state STRUCT
-//! stays single ([`ComAmazonawsResiliencehubv2NgrhservicecoreState`]), so one lock
-//! covers the whole store and a policy can be counted against the services that
-//! reference it.
+//! The store's other resources live in their own modules beside this one:
+//! [`policies`] holds the `Policy` lifecycle's records and projection, and [`systems`]
+//! the `System` lifecycle's. The state STRUCT stays single
+//! ([`ComAmazonawsResiliencehubv2NgrhservicecoreState`]), so one lock covers the whole
+//! store and a policy can be counted against the services that reference it.
 //!
 //! One reading beside them reaches OUTSIDE this store: [`invoker_role`] resolves the IAM
 //! role a `permissionModel` names against the account's IAM records in the same shared
@@ -29,19 +29,27 @@
 //! write.
 //!
 //! [`not_found`] holds the refusal every operation that resolves an ARN answers with when
-//! the ARN names nothing stored, so the whole crate words it once, and [`tagging`] holds
+//! the ARN names nothing stored, so the whole crate words it once, [`conflicts`] holds the
+//! `ConflictException` wordings a create answers with, and [`tagging`] holds
 //! the one tag map projection and the write path `TagResource` reaches a tagged resource
 //! through, whichever of this store's resources an ARN names.
 
+mod conflicts;
 mod invoker_role;
 mod not_found;
 mod policies;
+mod systems;
 mod tagging;
 
+pub use conflicts::{name_already_exists_message, two_requests_one_token_message};
 pub use invoker_role::{invoker_role_rejection, unassumable_message, SERVICE_PRINCIPAL};
 pub use not_found::{
     arn_resource_id, resource_not_found, service_function_not_found, POLICY_RESOURCE_TYPE,
-    SERVICE_FUNCTION_RESOURCE_TYPE, SERVICE_RESOURCE_TYPE,
+    SERVICE_FUNCTION_RESOURCE_TYPE, SERVICE_RESOURCE_TYPE, SYSTEM_RESOURCE_TYPE,
+};
+pub use systems::{
+    mint_system_arn, SystemCreateRequest, SystemIdempotencyRecord, SystemRecord, MAX_SYSTEMS,
+    SYSTEM_RESOURCE,
 };
 pub use tagging::{tagged_resource_type, MAX_TAGS_PER_RESOURCE};
 pub(crate) use tagging::tag_map_view;
@@ -457,6 +465,15 @@ pub struct ComAmazonawsResiliencehubv2NgrhservicecoreState {
     /// `@idempotencyToken` returns the policy the first call created instead of
     /// creating a second one.
     pub policy_idempotency: BTreeMap<String, String>,
+    /// Every created system, keyed by its ARN. See [`systems`].
+    pub systems: BTreeMap<String, SystemRecord>,
+    /// `name` -> `systemArn`, so `CreateSystem` can refuse a duplicate name with
+    /// `ConflictException` without scanning every record.
+    pub system_names: BTreeMap<String, String>,
+    /// `clientToken` -> what that token created, so a repeat of the `CreateSystem` call
+    /// it was first used for answers the system that call created, and the same token
+    /// carrying DIFFERENT creation parameters is refused rather than served.
+    pub system_idempotency: BTreeMap<String, SystemIdempotencyRecord>,
     /// Monotonic creation counter handed out by [`Self::next_sequence`].
     next_sequence: u64,
 }

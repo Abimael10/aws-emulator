@@ -31,7 +31,7 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_resiliencehubv2_ngrhservicecore::state::{
     DEPENDENCY_DISCOVERY_DISABLED_MESSAGE, MAX_TAGS_PER_RESOURCE, POLICY_RESOURCE_TYPE,
-    SERVICE_FUNCTION_RESOURCE_TYPE, SERVICE_RESOURCE_TYPE,
+    SERVICE_FUNCTION_RESOURCE_TYPE, SERVICE_RESOURCE_TYPE, SYSTEM_RESOURCE_TYPE,
 };
 use service_com_amazonaws_resiliencehubv2_ngrhservicecore::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -732,8 +732,8 @@ async fn a_tag_written_onto_a_resource_is_what_the_next_read_reports() {
 async fn tagging_a_resource_that_is_not_there_is_refused() {
     let router = emulator();
 
-    // Rows: an ARN of each kind this store holds that names nothing, one whose resource was
-    // created and then deleted, and one naming a kind this store does not hold at all.
+    // Rows: an ARN of each kind this store holds that names nothing, and one whose resource
+    // was created and then deleted.
     let deleted_service = service_arn(&router, "Doomed").await;
     let deleted = call(
         &router,
@@ -765,7 +765,7 @@ async fn tagging_a_resource_that_is_not_there_is_refused() {
         format!("arn:aws:resiliencehub:{REGION}:{ACCOUNT}:service/00000000-0000-8000-8000-000000000000");
     let absent_policy =
         format!("arn:aws:resiliencehub:{REGION}:{ACCOUNT}:policy/00000000-0000-8000-8000-000000000000");
-    let other_kind =
+    let absent_system =
         format!("arn:aws:resiliencehub:{REGION}:{ACCOUNT}:system/00000000-0000-8000-8000-000000000000");
 
     let rows: Vec<(&str, &str, &str)> = vec![
@@ -773,9 +773,10 @@ async fn tagging_a_resource_that_is_not_there_is_refused() {
         ("a service deleted", &deleted_service, SERVICE_RESOURCE_TYPE),
         ("a policy never created", &absent_policy, POLICY_RESOURCE_TYPE),
         ("a policy deleted", &deleted_policy, POLICY_RESOURCE_TYPE),
-        // An ARN naming a kind this store holds nothing of is reported under the kind it
-        // names, not under one of the two it does hold.
-        ("a kind this store does not hold", &other_kind, "system"),
+        // A system is a resource this store holds too, so an ARN naming one that is not
+        // there is reported under the model's own shape name for it, the way a service's
+        // and a policy's are.
+        ("a system never created", &absent_system, SYSTEM_RESOURCE_TYPE),
     ];
 
     for (case, arn, resource_type) in rows {

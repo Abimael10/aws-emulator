@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSystem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSystem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a system and STORES it, so every later `GetSystem` reads what this call wrote.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSystem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `clientToken` is an `@idempotencyToken`, so the token decides whether a repeat of this
+//! call is the SAME create: a repeat carrying the parameters the token was first used with
+//! answers the system that call created, and the same token carrying different parameters
+//! is refused `ConflictException` rather than served — see
+//! [`crate::state::SystemCreateRequest`].
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +152,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSystem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSystemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSystem"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSystemErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        // The creation parameters of THIS request, which are what a `clientToken` compares
+        // a repeat against.
+        let requested = crate::state::SystemCreateRequest::new(
+            input.name.clone(),
+            input.description.clone(),
+            input.sharing_enabled,
+            input.kms_key_id.clone(),
+            input.tags.clone(),
+        );
+        let mut store = state.lock();
+
+        // `clientToken` is an @idempotencyToken: it makes a RETRY of this create safe, so a
+        // repeat of the same call answers the system the first one created rather than
+        // creating a second one. A token already used for a DIFFERENT create is not a
+        // retry — the caller would be asking one token to stand for two distinct systems —
+        // so it is refused with the conflict this operation models instead of silently
+        // answering a system that is not the one asked for.
+        if let Some(consumed) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.system_idempotency.get(token))
+            .cloned()
+        {
+            if consumed.request != requested {
+                return Err(CreateSystemErrorModeled::ConflictException(ConflictException {
+                    message: crate::state::two_requests_one_token_message(
+                        input.client_token.as_deref().unwrap_or_default(),
+                    ),
+                })
+                .into());
+            }
+            if let Some(system) = store.system_view(&consumed.system_arn) {
+                return Ok(CreateSystemOutput { system });
+            }
+        }
+
+        // A system name identifies one system within the account — `EntityName` is
+        // "Resource name (used in ARN — no spaces allowed)" — so a second system under a
+        // name already taken is a conflict, not a second system.
+        if store.system_named(&input.name).is_some() {
+            return Err(CreateSystemErrorModeled::ConflictException(ConflictException {
+                message: crate::state::name_already_exists_message(
+                    crate::state::SYSTEM_RESOURCE_TYPE,
+                    &input.name,
+                ),
+            })
+            .into());
+        }
+
+        // The store is BOUNDED before it is written: every create grows `systems` by one
+        // entry carrying caller-supplied payload, so a caller that repeats this call would
+        // otherwise grow the process's memory without limit. At the ceiling the create is
+        // refused with the quota error this operation models. The two secondary indexes are
+        // bounded by the same ceiling — `system_names` holds exactly one entry per stored
+        // system and `system_idempotency` at most one (a token already in it returns above
+        // instead of inserting).
+        if store.systems.len() >= crate::state::MAX_SYSTEMS {
+            return Err(CreateSystemErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of systems for this account has been reached: {}. \
+                         Delete a system before creating another.",
+                        crate::state::MAX_SYSTEMS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The call is a create: mint the ARN and the id it carries, and take the next
+        // creation-order position.
+        let (system_arn, system_id) = crate::state::mint_system_arn(&region);
+        let sequence = store.next_sequence();
+        let record = crate::state::SystemRecord {
+            system_arn: system_arn.clone(),
+            system_id,
+            name: requested.name.clone(),
+            description: requested.description.clone(),
+            // Omitted means cross-account sharing is off for the new system.
+            sharing_enabled: requested.sharing_enabled.unwrap_or(false),
+            kms_key_id: requested.kms_key_id.clone(),
+            tags: requested.tags.clone(),
+            created_at: now,
+            updated_at: now,
+            sequence,
+        };
+
+        store
+            .system_names
+            .insert(record.name.clone(), system_arn.clone());
+        if let Some(token) = input.client_token {
+            store.system_idempotency.insert(
+                token,
+                crate::state::SystemIdempotencyRecord {
+                    system_arn: system_arn.clone(),
+                    request: requested,
+                },
+            );
+        }
+        // The response is projected through the same path every later read answers from.
+        let system = record.to_system();
+        store.systems.insert(system_arn, record);
+        Ok(CreateSystemOutput { system })
     }
 }

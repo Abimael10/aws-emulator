@@ -5,7 +5,8 @@
 //!
 //! Tags are not a resource of their own — they are a map carried BY a resource (a policy's
 //! [`PolicyRecord::tags`](super::PolicyRecord), a service's
-//! [`ServiceRecord::tags`](super::ServiceRecord)) — so `TagResource` addresses one by ARN
+//! [`ServiceRecord::tags`](super::ServiceRecord), a system's
+//! [`SystemRecord::tags`](super::SystemRecord)) — so `TagResource` addresses one by ARN
 //! and writes into the record that holds it ([`ComAmazonawsResiliencehubv2NgrhservicecoreState::resource_tags_mut`]).
 //! Every reader of that resource projects the SAME stored map through [`tag_map_view`], so
 //! a tag write is visible to the next read of the resource and the two cannot drift.
@@ -14,7 +15,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::{
     arn_resource_id, ComAmazonawsResiliencehubv2NgrhservicecoreState, POLICY_RESOURCE,
-    POLICY_RESOURCE_TYPE, SERVICE_RESOURCE, SERVICE_RESOURCE_TYPE,
+    POLICY_RESOURCE_TYPE, SERVICE_RESOURCE, SERVICE_RESOURCE_TYPE, SYSTEM_RESOURCE,
+    SYSTEM_RESOURCE_TYPE,
 };
 
 /// How many tags one resource in this store may hold.
@@ -43,13 +45,14 @@ pub(crate) fn tag_map_view(tags: &BTreeMap<String, String>) -> Option<HashMap<St
 /// carries — `Policy` for a `policy/…` ARN, `Service` for a `service/…` one.
 ///
 /// An ARN naming any other kind is reported under the kind it names, so the refusal says
-/// what the caller addressed rather than claiming it addressed one of the two resources
-/// this store holds.
+/// what the caller addressed rather than claiming it addressed one of the resources this
+/// store holds.
 pub fn tagged_resource_type(arn: &str) -> &str {
     let resource_id = arn_resource_id(arn);
     match resource_id.split('/').next() {
         Some(POLICY_RESOURCE) => POLICY_RESOURCE_TYPE,
         Some(SERVICE_RESOURCE) => SERVICE_RESOURCE_TYPE,
+        Some(SYSTEM_RESOURCE) => SYSTEM_RESOURCE_TYPE,
         Some(other) => other,
         None => resource_id,
     }
@@ -65,6 +68,9 @@ impl ComAmazonawsResiliencehubv2NgrhservicecoreState {
     pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
         if let Some(service) = self.services.get_mut(arn) {
             return Some(&mut service.tags);
+        }
+        if let Some(system) = self.systems.get_mut(arn) {
+            return Some(&mut system.tags);
         }
         self.policies.get_mut(arn).map(|policy| &mut policy.tags)
     }
