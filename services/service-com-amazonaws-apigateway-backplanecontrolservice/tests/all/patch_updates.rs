@@ -863,6 +863,16 @@ async fn a_patched_method_member_is_stored_and_read_back() {
 
     let gateway = Gateway::new();
     let (api, root) = create_api(&gateway, "patch-methods").await;
+    // A `requestModels` value names a `Model` OF THIS API, so the model the rows below map
+    // a content type to is created first: the mapping is not storable otherwise, by the
+    // same rule `PutMethod` applies to the member.
+    crate::stage_request_validation::create_model(
+        &gateway,
+        &api,
+        "Pet",
+        json!({ "type": "object" }),
+    )
+    .await;
     let resource = create_resource(&gateway, &api, &root, "pets").await;
     let resource_id = string_member(&resource, "id", "pets");
     let put = gateway

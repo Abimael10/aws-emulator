@@ -114,7 +114,8 @@ use super::types::*;
 
 use crate::state::{
     patch_bool, patch_bool_map, patch_optional_string, patch_required_string, patch_string_map,
-    patch_string_set, MethodEntry, Patch, PatchFailure, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+    patch_string_set, MethodEntry, Patch, PatchFailure, PatchOpKind, MAX_COLLECTION_ENTRIES,
+    MAX_STRING_CHARS,
 };
 
 // The `path` values `UpdateMethod` accepts are the ones `apply_patch` below has an arm
@@ -124,7 +125,14 @@ use crate::state::{
 // here.
 
 /// Apply one patch to a COPY of a stored method.
-fn apply_patch(entry: &mut MethodEntry, patch: &Patch) -> Result<(), PatchFailure> {
+///
+/// `api_model_names` is the set of `Model` names the api holds, which is what a
+/// `requestModels` entry's value has to name ([`crate::state::unknown_model_name`]).
+fn apply_patch(
+    entry: &mut MethodEntry,
+    patch: &Patch,
+    api_model_names: &::std::collections::BTreeSet<String>,
+) -> Result<(), PatchFailure> {
     match patch.member() {
         // `authorizationType` is how a method is authorized and `Method` always reports
         // one, so it can be replaced but not removed.
@@ -171,6 +179,15 @@ fn apply_patch(entry: &mut MethodEntry, patch: &Patch) -> Result<(), PatchFailur
             let content_type = patch.map_key(1)?;
             crate::state::bound_chars(&patch.path, &content_type, MAX_STRING_CHARS)
                 .map_err(PatchFailure::BadRequest)?;
+            // The value names a `Model` of this api, the same rule `PutMethod` enforces
+            // for the member: a patch cannot store a reference a create would refuse.
+            if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+                if let Some(message) =
+                    crate::state::unknown_model_name(api_model_names, patch.require_value()?)
+                {
+                    return Err(PatchFailure::BadRequest(message));
+                }
+            }
             patch_string_map(
                 &mut entry.request_models,
                 patch,
@@ -272,6 +289,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
             })
         })?;
+        let api_model_names: ::std::collections::BTreeSet<String> =
+            api.models.keys().cloned().collect();
         let resource = api.resources.get_mut(&input.resource_id).ok_or_else(|| {
             UpdateMethodErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
@@ -290,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone();
 
         for patch in &patches {
-            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+            apply_patch(&mut updated, patch, &api_model_names).map_err(patch_failure)?;
         }
 
         resource.methods.insert(verb.clone(), updated);

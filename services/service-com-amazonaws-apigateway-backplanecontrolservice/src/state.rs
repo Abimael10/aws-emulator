@@ -677,7 +677,17 @@ pub struct StageEntry {
     /// the authorizer cache, so a flush of it leaves every member `GetStage` reports —
     /// `cacheClusterStatus` included — exactly as it was.
     pub authorizers_cache_flushed_at: Option<::std::time::Instant>,
-    pub variables: BTreeMap<String, String>,
+    /// The stage variables this stage was CONFIGURED with: the `variables` map a request
+    /// supplied, and `None` for a stage no request ever supplied the member for.
+    ///
+    /// `Option` rather than a bare map because `Stage$variables` distinguishes the two: a
+    /// stage created with `variables={}` HAS the map (every read reports it, empty) while
+    /// one created with the member omitted has none (no read reports it at all), so a
+    /// client that reads a stage to decide whether variables were ever configured is
+    /// answered from what was actually set. Every reader goes through
+    /// [`crate::ops::create_stage::stage_body`], and the data plane resolves a
+    /// `$stageVariables` reference against the map a stage that has one carries.
+    pub variables: Option<BTreeMap<String, String>>,
     pub documentation_version: Option<String>,
     /// The canary release configured on this stage: `CreateStage`'s or
     /// `CreateDeployment`'s `canarySettings`, and what an `UpdateStage` patch of
@@ -1878,6 +1888,41 @@ pub fn defaulted_endpoint_configuration(
     configuration.types = Some(types);
     configuration
 }
+
+/// Whether `api`'s endpoint configuration makes it a PRIVATE api — one reached only
+/// through an interface VPC endpoint ([`PRIVATE_ENDPOINT_TYPE`]).
+///
+/// Read off the stored configuration, which every create completes
+/// ([`defaulted_endpoint_configuration`]), so a record can never be half-defaulted here.
+pub fn is_private_api(api: &RestApiEntry) -> bool {
+    api.endpoint_configuration
+        .as_ref()
+        .and_then(|configuration| configuration.types.as_ref())
+        .is_some_and(|types| types.iter().any(|kind| kind == PRIVATE_ENDPOINT_TYPE))
+}
+
+/// Whether `api` carries a RESOURCE POLICY: "a stringified JSON policy document that
+/// applies to this RestApi regardless of the caller and Method configuration"
+/// (`RestApi$policy`). A document that is only whitespace states nothing, so it is no
+/// policy.
+pub fn carries_resource_policy(api: &RestApiEntry) -> bool {
+    api.policy
+        .as_deref()
+        .is_some_and(|document| !document.trim().is_empty())
+}
+
+/// The `BadRequestException` message for deploying a PRIVATE api that carries no resource
+/// policy.
+///
+/// A private api is reachable ONLY through an interface VPC endpoint, and what admits a
+/// request arriving at one is the api's own resource policy — so until a document is
+/// attached there is nothing that could admit a caller, and API Gateway refuses the
+/// deployment rather than publishing a stage no request can reach. ONE sentence of
+/// entirely fixed text, naming the condition and the document that is missing; it quotes
+/// back neither the api id (which the request's URI already carries) nor the endpoint
+/// type.
+pub const PRIVATE_API_WITHOUT_RESOURCE_POLICY: &str =
+    "Private REST API doesn't have a resource policy attached to it";
 
 // ---------------------------------------------------------------------------
 // Gateway responses
@@ -3490,6 +3535,29 @@ pub fn invalid_tag() -> String {
     )
 }
 
+/// The punctuation a tag key or value may carry beside letters, digits and whitespace —
+/// the set [`invalid_tag`] names ("the following: _ . : / = + - @"), which is AWS's own
+/// tag character class.
+const TAG_PUNCTUATION: &str = "_.:/=+-@";
+
+/// Whether `text` is spelled from the character class a tag key and a tag value are drawn
+/// from: UNICODE LETTERS AND DIGITS, whitespace, and [`TAG_PUNCTUATION`].
+///
+/// AWS's tag character class is wider than the ASCII set the `tags` member's
+/// documentation lists — it admits a letter or a digit of any script, which is why the
+/// recorded units `apigateway.tag-resource-unicode-key-value-round-trip` and
+/// `apigateway.tag-value-unicode-round-trip` round-trip non-ASCII tags — and narrower
+/// than "any text": a character that is neither a letter, a digit, whitespace nor one of
+/// the listed punctuation marks (a symbol, an emoji) is outside it and is refused, which
+/// is what [`invalid_tag`] states.
+fn is_tag_text(text: &str) -> bool {
+    text.chars().all(|character| {
+        character.is_alphanumeric()
+            || character.is_whitespace()
+            || TAG_PUNCTUATION.contains(character)
+    })
+}
+
 /// Refuse one caller-supplied tag this service will not store.
 ///
 /// Every bound comes from the `tags` member's own documentation — "The tag key can be
@@ -3497,12 +3565,9 @@ pub fn invalid_tag() -> String {
 /// characters." — so the one check serves every operation that takes tags, whether the
 /// tags ride on a create (`CreateRestApi`, `CreateStage`, `CreateApiKey`) or on
 /// `TagResource`. A key or a value outside the contract — an empty key as much as a key or
-/// a value past its bound — earns the one tag-contract sentence
-/// [`invalid_tag`] states, whichever rule it broke. The member's documented "valid
-/// character set is [a-zA-Z+-=._:/]" is NOT enforced: AWS accepts a key and a value
-/// outside it (the recorded units `apigateway.tag-resource-unicode-key-value-round-trip`
-/// and `apigateway.tag-value-unicode-round-trip` round-trip non-ASCII tags), so refusing
-/// them would be stricter than the service.
+/// a value past its bound, and one carrying a character outside the tag character class
+/// ([`is_tag_text`]) — earns the one tag-contract sentence [`invalid_tag`] states,
+/// whichever rule it broke.
 pub fn bound_tag(key: &str, value: &str) -> Result<(), String> {
     // A key is what names a tag, so a tag has to carry one: an EMPTY key names nothing and
     // is outside the contract exactly as a key past its bound is, which is why it earns the
@@ -3510,6 +3575,8 @@ pub fn bound_tag(key: &str, value: &str) -> Result<(), String> {
     if key.is_empty()
         || key.chars().count() > MAX_TAG_KEY_CHARS
         || value.chars().count() > MAX_TAG_VALUE_CHARS
+        || !is_tag_text(key)
+        || !is_tag_text(value)
     {
         return Err(invalid_tag());
     }
@@ -3687,6 +3754,53 @@ pub fn invalid_percent_traffic() -> String {
     )
 }
 
+/// The characters a STAGE VARIABLE's value is spelled from, from the member's own
+/// documentation: "Variable names can have alphanumeric and underscore characters, and
+/// the values must match `[A-Za-z0-9-._~:/?#&=,]+`"
+/// (`smithy_query(query="doc", shape="Stage", member="variables")`).
+const STAGE_VARIABLE_VALUE_PUNCTUATION: &str = "-._~:/?#&=,";
+
+/// Refuse one stage variable this service will not store.
+///
+/// Both halves come from the `variables` member's own documentation: a NAME carries
+/// "alphanumeric and underscore characters" and a VALUE "must match
+/// `[A-Za-z0-9-._~:/?#&=,]+`". Each published pattern is a `+`, so neither an empty name
+/// nor an empty value is one — a variable the stage could resolve to nothing is refused
+/// rather than stored.
+///
+/// One check for every place a stage variable rides on a request — `CreateStage`, the
+/// stage `CreateDeployment` creates, a patch of `/variables/{name}` and a canary's
+/// `stageVariableOverrides` — so one value is refused the same way wherever it was set.
+pub fn bound_stage_variable(name: &str, value: &str) -> Result<(), String> {
+    let named = !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_');
+    let valued = !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || STAGE_VARIABLE_VALUE_PUNCTUATION.contains(character)
+        });
+    if !named || !valued {
+        return Err(INVALID_STAGE_VARIABLE.to_string());
+    }
+    Ok(())
+}
+
+/// The `BadRequestException` message for a stage variable outside the sets the member
+/// publishes — a name, a value, or both.
+///
+/// It STATES THE RULE AWS DOCUMENTS for the member, quoted: "Variable names can have
+/// alphanumeric and underscore characters, and the values must match
+/// `[A-Za-z0-9-._~:/?#&=,]+`" (`smithy_query(query="doc", shape="CreateStageRequest",
+/// member="variables")`). ONE sentence for the whole contract, the way this service states
+/// its sibling contracts ([`invalid_tag`] covers every tag rule at once), and entirely
+/// fixed text: neither the name nor the value is quoted back, so nothing of one request is
+/// in it.
+pub const INVALID_STAGE_VARIABLE: &str =
+    "Variable names can have alphanumeric and underscore characters, and the values must \
+     match [A-Za-z0-9-._~:/?#&=,]+";
+
 /// The `NotFoundException` message for a `restApiId` that names no stored API.
 ///
 /// API Gateway does not state a fixed sentence here: it names the identifier it could
@@ -3750,12 +3864,24 @@ pub const NO_SUCH_STAGE: &str = "Invalid stage identifier specified";
 /// words it the same way.
 pub const STAGE_ALREADY_EXISTS: &str = "Stage already exists";
 
-/// The `NotFoundException` message for a `deploymentId` that names no stored deployment.
+/// The `NotFoundException` message for a `deploymentId` that names no stored deployment,
+/// where that id is the IDENTIFIER IN THE URI — the resource the call addresses.
 /// The resource type is CAPITALISED here, as it is in the `Resource` / `Method` /
 /// `Integration` siblings above and unlike the `stage` one below: that is the spelling the
 /// service answers for a deployment, and one sentence serves every operation that resolves
 /// one, so all of them say the same thing about the same failure.
 pub const NO_SUCH_DEPLOYMENT: &str = "Invalid Deployment identifier specified";
+
+/// The `BadRequestException` message for a `deploymentId` the request CARRIES — a stage's
+/// own pointer, its canary's, or the value a patch of either sets — that resolves to no
+/// deployment of the api.
+///
+/// A DIFFERENT sentence from [`NO_SUCH_DEPLOYMENT`], because it is a different fact: the
+/// resource the call addresses exists and it is the VALUE that names nothing, so the
+/// sentence states the value's own condition rather than an identifier the service could
+/// not resolve. Entirely fixed text, quoting the rejected id back nowhere; one copy for
+/// every operation that takes such a value.
+pub const DEPLOYMENT_ID_DOES_NOT_EXIST: &str = "Deployment id does not exist";
 
 /// The `BadRequestException` message for a `CreateDeployment` of an API that carries no
 /// method on any of its resources.
@@ -4114,7 +4240,60 @@ pub fn no_such_model(model_name: &str) -> String {
     format!("Invalid model name specified: {model_name}")
 }
 
-/// The `ConflictException` message for a model name this API already holds a model under:
+/// The refusal for a MODEL REFERENCE — a `requestModels` or `responseModels` entry whose
+/// value names no `Model` of `api` — or `None` when every value the request carried names
+/// one.
+///
+/// Both members map a content type to "a Model name" (`Method$requestModels`,
+/// `MethodResponse$responseModels`), and a `Model` lives inside one REST API
+/// ([`RestApiEntry::models`] is keyed by that name), so a value is resolved against the
+/// api the method belongs to. A value naming no model of it configures nothing — a request
+/// payload or a response body would be validated against a schema that does not exist — so
+/// it is refused rather than stored, with the sentence this service states for a model
+/// REFERENCE that resolves to nothing ([`invalid_model_reference`]).
+///
+/// One check for every place such a reference rides on a request: `PutMethod`,
+/// `PutMethodResponse` and the `UpdateMethod` / `UpdateMethodResponse` patches of the same
+/// members, so a reference this service refuses on one path cannot be stored through
+/// another.
+pub fn unresolved_model_reference(
+    api: &RestApiEntry,
+    models: Option<&::std::collections::HashMap<String, String>>,
+) -> Option<String> {
+    // Read in CONTENT-TYPE order, so a request carrying several unresolvable references is
+    // refused with the same one of them every time: the member arrives as an unordered map.
+    let mut entries: Vec<(&String, &String)> = models.into_iter().flatten().collect();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    entries
+        .into_iter()
+        .map(|(_, model_name)| model_name)
+        .find(|model_name| !api.models.contains_key(*model_name))
+        .map(|model_name| invalid_model_reference(model_name))
+}
+
+/// The `BadRequestException` message for a model REFERENCE that resolves to no `Model` of
+/// the api ([`unresolved_model_reference`]).
+///
+/// A reference names a model by IDENTIFIER rather than addressing one in the URI, so API
+/// Gateway states it as an invalid model IDENTIFIER — a different sentence from the
+/// [`no_such_model`] one a `modelName` path label earns. BUILT FROM THE REQUEST: the
+/// variable part is the value the caller has to change.
+pub fn invalid_model_reference(model_name: &str) -> String {
+    format!("Invalid model identifier specified: {model_name}")
+}
+
+/// The refusal for ONE model reference — the value of a single `requestModels` /
+/// `responseModels` entry a PATCH sets — or `None` when it names a model the api has.
+///
+/// The same rule [`unresolved_model_reference`] applies to a whole map, for the caller
+/// that holds the api's model names rather than the api itself: an `UpdateMethod` /
+/// `UpdateMethodResponse` patch is applied to a COPY of the record with the store's api
+/// borrow already given up, so the names are read once per request and the one rule is
+/// stated in one place.
+pub fn unknown_model_name(api_model_names: &BTreeSet<String>, model_name: &str) -> Option<String> {
+    (!api_model_names.contains(model_name)).then(|| invalid_model_reference(model_name))
+}
+
 /// a model is keyed by its name, so the second create under one name is refused rather
 /// than replacing the model the first one stored (replacing it is `UpdateModel`'s own
 /// call).

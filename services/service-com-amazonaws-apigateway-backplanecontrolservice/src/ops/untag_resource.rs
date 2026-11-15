@@ -198,28 +198,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(message),
             })
         })?;
-        // Every key must name a tag the resource carries: the recorded unit
-        // `apigateway.untag-resource-unknown-key-fails` has AWS REFUSE a `tagKeys` entry
-        // the resource does not carry rather than silently ignore it, so the removal is
-        // all-or-nothing — the unknown keys are collected and the request refused before
-        // a single tag is dropped, and the message names them so the caller can fix it.
-        let unknown: Vec<&str> = input
-            .tag_keys
-            .iter()
-            .filter(|key| !stored.contains_key(*key))
-            .map(String::as_str)
-            .collect();
-        if !unknown.is_empty() {
-            return Err(UntagResourceErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "Invalid tag key(s) specified: {}",
-                        unknown.join(", ")
-                    )),
-                },
-            )
-            .into());
-        }
+        // Removing a tag is stated as the RESULT it asks for — "the resource carries no
+        // tag under this key" — so a key the resource does not carry is already in that
+        // state and the request succeeds, leaving every other tag as it was. The
+        // modelled `NotFoundException` is about the RESOURCE the ARN names (resolved
+        // above), never about a key within it, which is what makes a repeated teardown,
+        // and one issued without first reading the tag set, idempotent.
         for key in &input.tag_keys {
             stored.remove(key);
         }

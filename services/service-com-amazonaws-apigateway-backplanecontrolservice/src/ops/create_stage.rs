@@ -180,9 +180,12 @@ pub fn stage_body(entry: &StageEntry, web_acl_arn: Option<String>) -> CreateStag
                 .map(|(key, setting)| (key.clone(), setting.clone()))
                 .collect::<HashMap<String, MethodSetting>>(),
         ),
-        variables: (!entry.variables.is_empty()).then(|| {
-            entry
-                .variables
+        // `variables` is reported exactly as the stage was CONFIGURED: a stage that HAS
+        // the map reports it — empty when that is what was set — and a stage no request
+        // ever set it on reports no member at all, which is the distinction
+        // `Stage$variables` draws (see [`StageEntry::variables`]).
+        variables: entry.variables.as_ref().map(|variables| {
+            variables
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect()
@@ -241,6 +244,9 @@ fn bound_input(input: &CreateStageInput) -> Result<(), String> {
         for (key, value) in variables {
             bound_chars("a variables key", key, MAX_STRING_CHARS)?;
             bound_chars("a variables value", value, MAX_STRING_CHARS)?;
+            // The name and the value go through the SAME check every other operation
+            // that sets a stage variable applies.
+            crate::state::bound_stage_variable(key, value)?;
         }
     }
     if let Some(canary) = &input.canary_settings {
@@ -257,6 +263,9 @@ fn bound_input(input: &CreateStageInput) -> Result<(), String> {
             for (key, value) in overrides {
                 bound_chars("a stageVariableOverrides key", key, MAX_STRING_CHARS)?;
                 bound_chars("a stageVariableOverrides value", value, MAX_STRING_CHARS)?;
+                // A canary's override IS a stage variable — the value the canary's share
+                // of the traffic resolves that name to — so it is held to the same rule.
+                crate::state::bound_stage_variable(key, value)?;
             }
         }
     }
@@ -372,6 +381,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deployment id the request carries is resolved against that API's deployments
         // before the stage is stored — `canarySettings.deploymentId`, the deployment a
         // canary serves, included.
+        //
+        // An id that resolves to no deployment of this API is a refusal of the REQUEST
+        // (`BadRequestException`), not of the resource the URI addresses: the API this
+        // call was sent to exists, so the caller has to fix the VALUE it sent rather
+        // than conclude the API is gone. That is the same class `UpdateStage` states for
+        // the same value (`crate::ops::update_stage`'s `require_deployment`); the
+        // not-found class stays for the identifiers in the URI.
         let canary_deployment = input
             .canary_settings
             .as_ref()
@@ -381,10 +397,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .flatten()
         {
             if !api.deployments.contains_key(&deployment_id) {
-                return Err(CreateStageErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::NO_SUCH_DEPLOYMENT.to_string()),
-                })
-                .into());
+                return Err(bad_request(
+                    crate::state::DEPLOYMENT_ID_DOES_NOT_EXIST.to_string(),
+                ));
             }
         }
         // A stage name names one stage of an API: re-creating it is a conflict, not an
@@ -425,9 +440,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             authorizers_cache_flushed_at: None,
             variables: input
                 .variables
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<BTreeMap<String, String>>(),
+                .map(|variables| variables.into_iter().collect::<BTreeMap<String, String>>()),
             documentation_version: input.documentation_version,
             canary_settings: input.canary_settings,
             // Access logging and a client certificate are configured by `UpdateStage`,

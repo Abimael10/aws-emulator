@@ -36,8 +36,8 @@ use crate::rest_api_lifecycle::{assert_failure, create_api, Gateway};
 use crate::stage_lifecycle::{create_deployment, get_stage};
 
 /// One row: the case name, the variables the stage carries BEFORE the patch, the ops the
-/// row sends, and the whole `variables` map the stage must report afterwards (`Null` when
-/// no variable is left, which is how this service reports an empty map).
+/// row sends, and the whole `variables` map the stage must report afterwards (the EMPTY
+/// map when a patch left no variable: the stage HAS the map once one was configured).
 type Row = (
     &'static str,
     Vec<(&'static str, &'static str)>,
@@ -185,13 +185,16 @@ async fn a_variables_patch_sets_the_named_entry_and_the_stage_reads_back() {
                 json!({ "op": "add", "path": "/variables/temp", "value": "x" }),
                 json!({ "op": "remove", "path": "/variables/temp" }),
             ],
-            Value::Null,
+            // The stage HAS the map once a patch named it, so it reports the map it now
+            // holds — empty — rather than none at all: `Stage$variables` distinguishes
+            // the two, and a stage whose variables were configured is a stage with a map.
+            json!({}),
         ),
         (
             "the stage's only variable removed",
             vec![("table", "pets")],
             vec![json!({ "op": "remove", "path": "/variables/table" })],
-            Value::Null,
+            json!({}),
         ),
         (
             "a remove of a name the stage has no variable for leaves the map alone",

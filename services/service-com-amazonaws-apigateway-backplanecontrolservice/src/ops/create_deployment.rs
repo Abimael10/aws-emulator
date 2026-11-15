@@ -182,6 +182,10 @@ fn bound_input(input: &CreateDeploymentInput) -> Result<(), String> {
         for (key, value) in variables {
             bound_chars("a variables key", key, MAX_STRING_CHARS)?;
             bound_chars("a variables value", value, MAX_STRING_CHARS)?;
+            // The variables of the stage this call creates go through the SAME check
+            // `CreateStage` applies, so one value is refused the same way whichever
+            // call set it.
+            crate::state::bound_stage_variable(key, value)?;
         }
     }
     if let Some(canary) = &input.canary_settings {
@@ -198,6 +202,8 @@ fn bound_input(input: &CreateDeploymentInput) -> Result<(), String> {
             for (key, value) in overrides {
                 bound_chars("a stageVariableOverrides key", key, MAX_STRING_CHARS)?;
                 bound_chars("a stageVariableOverrides value", value, MAX_STRING_CHARS)?;
+                // A canary's override IS a stage variable, held to the same rule.
+                crate::state::bound_stage_variable(key, value)?;
             }
         }
     }
@@ -311,6 +317,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if api.resources.values().all(|resource| resource.methods.is_empty()) {
                 return Err(bad_request(crate::state::NO_METHODS_TO_DEPLOY.to_string()));
             }
+            // A PRIVATE api is reached only through an interface VPC endpoint, and what
+            // admits a request arriving at one is the api's own resource policy
+            // ("a stringified JSON policy document that applies to this RestApi
+            // regardless of the caller and Method configuration", `RestApi$policy`): with
+            // no document attached there is nothing that could admit a caller, so the
+            // deployment is refused rather than publishing a stage no request can reach.
+            // Attaching a policy (`UpdateRestApi` of `/policy`, or `CreateRestApi`'s own
+            // `policy`) is what makes the same call succeed.
+            if crate::state::is_private_api(api) && !crate::state::carries_resource_policy(api) {
+                return Err(bad_request(
+                    crate::state::PRIVATE_API_WITHOUT_RESOURCE_POLICY.to_string(),
+                ));
+            }
             // Bound the growth a caller drives. A deployment is kept until it is
             // deleted, and API Gateway publishes no quota for them, so the cap is this
             // emulator's.
@@ -377,11 +396,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(stage_name) = input.stage_name {
             let cache_cluster_enabled = input.cache_cluster_enabled.unwrap_or(false);
             let canary_settings = input.canary_settings;
+            // The stage this call may CREATE is configured with the `variables` the
+            // request carried, and with none where it carried the member not at all —
+            // the distinction every reader of a stage reports (see
+            // [`crate::state::StageEntry::variables`]).
             let variables = input
                 .variables
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<BTreeMap<String, String>>();
+                .map(|variables| variables.into_iter().collect::<BTreeMap<String, String>>());
             match api.stages.get_mut(&stage_name) {
                 Some(stage) => {
                     match canary_settings {

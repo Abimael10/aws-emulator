@@ -489,7 +489,8 @@ fn default_method_setting() -> MethodSetting {
 /// A patch VALUE that names no record is a refusal of the REQUEST
 /// (`BadRequestException`), not of the resource the URI addresses: the stage and the API
 /// this patch was sent to both exist, so the caller has to fix the value rather than
-/// abandon the stage. The not-found class stays for the identifiers in the URI.
+/// abandon the stage. The not-found class, and the identifier sentence
+/// ([`crate::state::NO_SUCH_DEPLOYMENT`]), stay for the identifiers in the URI.
 fn require_deployment(
     deployments: &BTreeSet<String>,
     deployment_id: &str,
@@ -498,7 +499,7 @@ fn require_deployment(
         return Ok(());
     }
     Err(PatchFailure::BadRequest(
-        crate::state::NO_SUCH_DEPLOYMENT.to_string(),
+        crate::state::DEPLOYMENT_ID_DOES_NOT_EXIST.to_string(),
     ))
 }
 
@@ -620,9 +621,19 @@ fn apply_stage_patch(
         "cacheClusterSize" => apply_cache_cluster_size(entry, patch),
         "variables" => {
             let name = patch.map_key(1)?;
-            // The value bound is the one `CreateStage` enforces for a stage variable.
+            // The name and the value go through the one check `CreateStage` enforces for
+            // a stage variable, so a variable this service refuses on a create cannot be
+            // written through a patch.
+            if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+                crate::state::bound_stage_variable(&name, patch.require_value()?)
+                    .map_err(PatchFailure::BadRequest)?;
+            }
+            // The member the patch addresses exists once a request names it: a stage
+            // whose variables were never set carries NO map at all, and setting (or
+            // dropping) an entry is what gives it one — which is what keeps a stage
+            // configured with an empty map distinct from one configured with none.
             patch_string_map(
-                &mut entry.variables,
+                entry.variables.get_or_insert_with(BTreeMap::new),
                 patch,
                 name,
                 MAX_COLLECTION_ENTRIES,
@@ -681,7 +692,7 @@ fn apply_canary_promotion(
     // variables — an overridden name takes the canary's value and a name the canary did
     // not override keeps the stage's — so a canary that overrode nothing promotes nothing.
     // The result is bounded like every other caller-driven collection.
-    let mut variables = entry.variables.clone();
+    let mut variables = entry.variables.clone().unwrap_or_default();
     variables.extend(
         canary
             .and_then(|canary| canary.stage_variable_overrides)
@@ -689,7 +700,12 @@ fn apply_canary_promotion(
     );
     crate::state::bound_entries("variables", variables.len(), MAX_COLLECTION_ENTRIES)
         .map_err(PatchFailure::BadRequest)?;
-    entry.variables = variables;
+    // A promotion that merges nothing onto a stage whose variables were never set leaves
+    // it with none: the member is reported for a stage that HAS a map, and this copy
+    // gives it one only where the canary or the stage itself carried entries.
+    if entry.variables.is_some() || !variables.is_empty() {
+        entry.variables = Some(variables);
+    }
     Ok(())
 }
 
@@ -808,6 +824,12 @@ fn apply_canary_patch(
         }
         "stageVariableOverrides" => {
             let name = nested.map_key(1)?;
+            // A canary's override IS a stage variable, held to the same rule as the
+            // stage's own map.
+            if matches!(nested.op, PatchOpKind::Add | PatchOpKind::Replace) {
+                crate::state::bound_stage_variable(&name, nested.require_value()?)
+                    .map_err(PatchFailure::BadRequest)?;
+            }
             let mut overrides: BTreeMap<String, String> = canary
                 .stage_variable_overrides
                 .clone()

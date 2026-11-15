@@ -302,7 +302,7 @@ async fn a_copy_outside_the_stages_copy_grammar_is_refused_with_both_legal_sets(
             op("replace", "/canarySettings/deploymentId", Some(&second)),
             op("replace", "/canarySettings/stageVariableOverrides/table", Some("pets")),
             op("replace", "/variables/table", Some("kittens")),
-            op("replace", "/variables/kept", Some("as it was")),
+            op("replace", "/variables/kept", Some("as-it-was")),
         ],
     )
     .await;
@@ -334,7 +334,7 @@ async fn a_copy_outside_the_stages_copy_grammar_is_refused_with_both_legal_sets(
     );
     for (member, expected) in [
         ("deploymentId", json!(second)),
-        ("variables", json!({ "table": "pets", "kept": "as it was" })),
+        ("variables", json!({ "table": "pets", "kept": "as-it-was" })),
     ] {
         assert_eq!(
             read.body[member], expected,

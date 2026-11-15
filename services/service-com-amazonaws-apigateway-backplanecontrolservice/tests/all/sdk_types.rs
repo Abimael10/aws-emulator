@@ -18,9 +18,10 @@
 //! * every published entry reads back member for member through the single reader, and an
 //!   id the catalog does not publish — including the retired generators an older model
 //!   sentence still names — is the modelled 404;
-//! * a page is the slice `position` and `limit` name, over page sizes across the
-//!   documented `1..=500` range, each published bound and one past each, and over every
-//!   cursor the sequence holds; a cursor the sequence does not hold is the modelled 400;
+//! * a page is cut by `limit` alone: the modelled output carries no cursor member, so the
+//!   `position` a request sends names nothing and is ignored — the rows span the
+//!   documented `1..=500` range, each published bound and one past each, every cursor the
+//!   sequence holds and several it never held;
 //! * both reads are reporting operations: repeating them changes nothing a later caller
 //!   sees.
 
@@ -292,29 +293,35 @@ async fn every_sdk_type_of_the_catalog_is_listed_and_reads_back_through_get_sdk_
 }
 
 #[tokio::test]
-async fn a_page_of_sdk_types_is_the_slice_the_position_and_limit_name() {
+async fn the_catalog_issues_no_cursor_so_a_position_names_nothing_and_a_limit_still_cuts() {
     let gateway = Gateway::new();
     let ids = catalog_ids();
 
-    // Rows span the documented page-size range (default 25, maximum 500), each published
-    // bound and one past each — a size below 1 and a size above 500 are clamped into the
-    // range rather than refused — crossed with every cursor the sequence holds, which
-    // includes no cursor at all and the last id.
-    let limits = [0, 1, 2, 3, 6, 7, 25, 500, 501, 10_000];
+    // The modelled `SdkTypes` output declares `items` alone and no `position`
+    // (`smithy_query(query="shape", shape="SdkTypes")`), so the service issues no cursor
+    // for this collection: a `position` a request sends names nothing and is ignored,
+    // while the `limit` it asks for still cuts the page from the start of the catalog's
+    // own order. Rows span the `limit` across the documented 1..=500 range, each published
+    // bound and one past each — a size outside the range is clamped into it — crossed with
+    // every `position` a caller could send: an id of the catalog, a cursor the sequence
+    // never held, and no cursor at all.
+    let limits = [None, Some(0), Some(1), Some(2), Some(25), Some(500), Some(501)];
+    let cursors: Vec<Option<&str>> = std::iter::once(None)
+        .chain(ids.iter().map(|id| Some(*id)))
+        .chain([Some("nosuchcursor"), Some("JAVA"), Some("java-"), Some("javascript")])
+        .collect();
     for limit in limits {
-        let effective =
-            usize::try_from(limit.clamp(1, 500)).expect("the clamped limit is positive");
-        for (index, cursor) in std::iter::once(None)
-            .chain(ids.iter().map(|id| Some(*id)))
-            .enumerate()
-        {
-            // No cursor starts at the first id; a cursor is the id of the first entry
-            // the previous page did NOT hand out, so its page resumes AT that entry.
-            let start = index.saturating_sub(1);
-            let expected: Vec<&str> = ids.iter().skip(start).take(effective).copied().collect();
-            let query = match cursor {
-                None => format!("limit={limit}"),
-                Some(id) => format!("limit={limit}&position={id}"),
+        // The page size the service APPLIES: the documented default is 25 and the
+        // documented maximum 500, and a size outside `1..=500` is held inside it.
+        let applied = usize::try_from(limit.unwrap_or(25).clamp(1, 500))
+            .expect("the clamped limit is positive");
+        let expected: Vec<&str> = ids.iter().take(applied).copied().collect();
+        for cursor in &cursors {
+            let query = match (limit, cursor) {
+                (None, None) => String::new(),
+                (Some(limit), None) => format!("limit={limit}"),
+                (None, Some(id)) => format!("position={id}"),
+                (Some(limit), Some(id)) => format!("limit={limit}&position={id}"),
             };
             let case = format!("GetSdkTypes({query})");
             let answer = get_sdk_types(&gateway, &query).await;
@@ -326,50 +333,23 @@ async fn a_page_of_sdk_types_is_the_slice_the_position_and_limit_name() {
             assert_eq!(
                 listed_ids(&answer.body, &case),
                 expected,
-                "case {case}: expected the page {expected:?}, got {:?}",
+                "case {case}: expected the catalog's first {applied} entries in its own \
+                 order, whatever position was sent, got {:?}",
                 answer.body
+            );
+            // The collection carries no cursor member of its own, so no answer reports
+            // one whatever was asked for.
+            assert!(
+                answer.body["position"].is_null(),
+                "case {case}: this collection reports no position, got {:?}",
+                answer.body["position"]
             );
         }
     }
-
-    // The collection carries no cursor member of its own: the modelled `SdkTypes` output
-    // declares `items` alone, so a page reports no `position` even when more types follow
-    // it.
-    let first = get_sdk_types(&gateway, "limit=1").await;
-    assert!(
-        first.body["position"].is_null(),
-        "case GetSdkTypes(limit=1): this collection reports no position, got {:?}",
-        first.body["position"]
-    );
-
-    // Walking the catalog one page at a time with the caller's own cursor reassembles the
-    // catalog's order from each cursor on, with no entry listed twice: a page resumes AT
-    // the cursor it is given.
-    let mut seen: Vec<String> = Vec::new();
-    for chunk in ids.chunks(2) {
-        let query = format!("limit=2&position={}", chunk[0]);
-        let case = format!("GetSdkTypes({query})");
-        let answer = get_sdk_types(&gateway, &query).await;
-        seen.extend(listed_ids(&answer.body, &case));
-    }
-    let expected: Vec<String> = ids
-        .chunks(2)
-        .flat_map(|chunk| {
-            let at = ids
-                .iter()
-                .position(|id| *id == chunk[0])
-                .expect("the chunk's first id is the catalog's");
-            ids.iter().skip(at).take(2).map(|id| (*id).to_string())
-        })
-        .collect();
-    assert_eq!(
-        seen, expected,
-        "case GetSdkTypes paged in twos: expected {expected:?}, got {seen:?}"
-    );
 }
 
 #[tokio::test]
-async fn an_id_the_catalog_does_not_hold_is_a_not_found_and_an_unknown_cursor_is_a_bad_request() {
+async fn an_id_the_catalog_does_not_hold_is_a_not_found() {
     let gateway = Gateway::new();
 
     // The ways an id can miss the catalog: a generator the service no longer publishes
@@ -415,16 +395,24 @@ async fn an_id_the_catalog_does_not_hold_is_a_not_found_and_an_unknown_cursor_is
         );
     }
 
-    // A cursor naming nothing in the sequence is a bad request, not an empty page — in
-    // the ways a cursor can miss: an unknown word, a published id in the wrong case, a
+    // A cursor naming nothing in the sequence is not a refusal and not an empty page: this
+    // collection issues no cursor, so the token names nothing and the catalog is served —
+    // in the ways a cursor can miss: an unknown word, a published id in the wrong case, a
     // published id with a trailing character, and a retired generator's id.
     for cursor in ["nosuchcursor", "JAVA", "java-", "javascript"] {
         let query = format!("position={cursor}");
-        assert_failure(
-            &get_sdk_types(&gateway, &query).await,
-            400,
-            "BadRequestException",
-            &format!("GetSdkTypes({query})"),
+        let case = format!("GetSdkTypes({query})");
+        let answer = get_sdk_types(&gateway, &query).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            listed_ids(&answer.body, &case),
+            catalog_ids(),
+            "case {case}: expected the whole catalog, got {:?}",
+            answer.body
         );
     }
 

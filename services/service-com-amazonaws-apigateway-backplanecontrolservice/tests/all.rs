@@ -760,6 +760,15 @@ mod domain_name_delete_cascade;
 // REFUSES leaves behind — nothing, in any collection of the account.
 #[path = "all/refused_control_plane_writes.rs"]
 mod refused_control_plane_writes;
+// Appended for the reason the note above gives: ten control-plane rules at once — the
+// sources a response-parameter mapping may name and what each resolves to, the keyed PUT
+// of an integration response, the idempotent untag, the tag character class, a stage's
+// `variables` as the request configured it, the caller's own IAM policies deciding a
+// control-plane call, a `deploymentId` as a VALUE, the unpaginated SDK-type catalog, a
+// model reference resolved against the api, and the resource policy a PRIVATE api's
+// deployment is gated on.
+#[path = "all/control_plane_fidelity_rules.rs"]
+mod control_plane_fidelity_rules;
 // WHICH method setting gates the execution log of a request the stage served: the entry keyed
 // by the method it reached, and only then the stage-wide one. Declared beside the suites above
 // for the reason the entry at the top of this file records: it spans API Gateway, AWS Lambda

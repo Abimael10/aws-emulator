@@ -7,10 +7,10 @@
 //! regardless of the caller and Method configuration", so the rule under test is: a document
 //! the developer attached decides EVERY request the endpoint answers — a request it allows
 //! is served by the method's integration, and one it does not is refused `403` with the
-//! `execute-api:Invoke` authorization sentence, with the integration never reached. A
-//! PRIVATE api pinned to one of its interface VPC endpoints with a `StringEquals`
-//! `aws:SourceVpce` condition is the case that rule exists for: the request that arrived
-//! through the named endpoint is served and the one that arrived through another is not.
+//! `execute-api:Invoke` authorization sentence, with the integration never reached. An api
+//! pinned to one interface VPC endpoint with a `StringEquals` `aws:SourceVpce` condition is
+//! the case that rule exists for: the request that arrived through the named endpoint is
+//! served and the one that arrived through another is not.
 //!
 //! Every case drives the real wire path — an HTTP request through the multi-service router
 //! into the mounted service, on the api's own
@@ -106,7 +106,7 @@ enum Address {
     ZonalEndpoint(&'static str),
 }
 
-/// One PRIVATE api with a deployed `MOCK` GET method, as the control plane writes it.
+/// One REGIONAL api with a deployed `MOCK` GET method, as the control plane writes it.
 struct Deployed {
     /// The api id.
     api: String,
@@ -115,13 +115,17 @@ struct Deployed {
 }
 
 impl Deployed {
-    /// A PRIVATE api carrying `GET /whoami`, answered by a `MOCK` integration with
+    /// A REGIONAL api carrying `GET /whoami`, answered by a `MOCK` integration with
     /// [`served_body`], deployed to [`STAGE`].
     ///
-    /// Created PRIVATE because that is the endpoint type this rule exists for — a private
-    /// api is reached through an interface VPC endpoint — though the gate itself is the
-    /// document, which "applies to this RestApi regardless of the caller and Method
-    /// configuration" whatever the endpoint type is.
+    /// The gate under test is the DOCUMENT, which "applies to this RestApi regardless of
+    /// the caller and Method configuration" whatever the endpoint type is — which is why
+    /// the table below can carry a row for an api with NO document at all. A PRIVATE api
+    /// cannot: its deployment is itself gated on a document being attached
+    /// (`crate::control_plane_fidelity_rules`), so a private endpoint
+    /// type would make that row unreachable. The endpoint a request arrives THROUGH is
+    /// what the `aws:SourceVpce` rows vary, and that is the request's own addressing
+    /// rather than the api's type.
     async fn stand_up(gateway: &Gateway, name: &str) -> Self {
         let created = gateway
             .call(
@@ -129,7 +133,7 @@ impl Deployed {
                 "/restapis",
                 Some(json!({
                     "name": name,
-                    "endpointConfiguration": { "types": ["PRIVATE"] },
+                    "endpointConfiguration": { "types": ["REGIONAL"] },
                 })),
             )
             .await;

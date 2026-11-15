@@ -1600,6 +1600,16 @@ async fn serving<Eng: Send + Sync + 'static>(
                 // nothing.
                 break 'planned Planned::answered(refusal_response(Some(api), FORBIDDEN));
             }
+            // A PRIVATE api is reachable ONLY through an interface VPC endpoint: its
+            // `endpointConfiguration.types` say it has no public endpoint at all, so a
+            // request that arrived through no endpoint this service can name — a call on
+            // the api's own `execute-api` host, or any addressing that names no endpoint —
+            // is `403 Forbidden`, with nothing of the api served. A request that DID
+            // arrive through one carries it ([`Resolved::source_vpce`]) and is decided by
+            // the api's own resource policy like any other.
+            if crate::state::is_private_api(api) && resolved.source_vpce.is_none() {
+                break 'planned Planned::answered(refusal_response(Some(api), FORBIDDEN));
+            }
             let Some((stage_name, resource_path)) = split_stage(resolved.invoke_path) else {
                 break 'planned Planned::answered(refusal_response(Some(api), FORBIDDEN));
             };
@@ -1761,6 +1771,12 @@ async fn serving<Eng: Send + Sync + 'static>(
                 },
             };
             let method_arn = call_of.method_arn();
+            // The stage's own variables, read ONCE for this request: the integration's
+            // configuration is resolved against them ([`with_stage_variables`]) and a
+            // mapping template of the call renders `$stageVariables` from them, so the map
+            // is cloned out of the stored record a single time. A stage the member was
+            // never set on carries none, which is the empty map to resolve against.
+            let stage_variables = stage.variables.clone().unwrap_or_default();
 
             let mut call = MethodRequest::of_request(
                 req,
@@ -1772,7 +1788,7 @@ async fn serving<Eng: Send + Sync + 'static>(
                     path: matched_path_parameters(matched_path, &resource_path),
                     querystring: sent_query_parameters(query_of(req.uri())),
                     header: sent_headers(req),
-                    stage_variables: stage.variables.clone(),
+                    stage_variables: stage_variables.clone(),
                     context: call_context(
                         &api.id,
                         &stage.stage_name,
@@ -1982,7 +1998,7 @@ async fn serving<Eng: Send + Sync + 'static>(
             // arrived at, so one deployment reached through two stages addresses each stage's
             // own backend ([`with_stage_variables`]).
             let performed_method = match deployed_method {
-                Some(method) => match with_stage_variables(method, &stage.variables) {
+                Some(method) => match with_stage_variables(method, &stage_variables) {
                     Ok(resolved) => Some(resolved),
                     Err(unserved) => {
                         tracing::warn!(
@@ -3583,17 +3599,28 @@ fn passed_through(
 /// The response headers the call answers with: API Gateway returns only the headers the
 /// METHOD response declares, mapped as the INTEGRATION response says.
 ///
-/// A `MOCK` has no backend response to map from, so the one mapping it can resolve is the
-/// documented static value in single quotes ([`static_mapping_literal`]): the literal
-/// between the quotes is the header's value.
+/// Each mapping is resolved from the SOURCE it names ([`mapped_response_value`]): the
+/// literal of a static value, a header or a JSON value of what the integration answered,
+/// one `$context` value of this call, or one variable of the invoked stage. A mapping
+/// whose source carries nothing maps nothing, and the header is then not sent at all —
+/// there is no value for it to carry.
+///
+/// The answer's payload is read as a JSON document AT MOST ONCE per response, however many
+/// mappings name a JSON expression over it: the work is then the payload's size plus one
+/// lookup per mapping, rather than the PRODUCT of how large a backend's answer is and how
+/// many mappings a developer stored.
 fn mapped_response_headers(
     method: Option<&MethodEntry>,
     selected: &GetIntegrationResponseOutput,
     status: u16,
+    inputs: &TemplateInputs,
+    answer: &IntegrationAnswer,
 ) -> BTreeMap<String, Vec<String>> {
     let declared = method
         .and_then(|method| method.method_responses.get(&status.to_string()))
         .and_then(|response| response.response_parameters.as_ref());
+    let mut document: Option<::serde_json::Value> = None;
+    let mut read_body = false;
     let mut mapped = BTreeMap::new();
     for (key, value) in selected.response_parameters.iter().flatten() {
         let Some(name) = key.strip_prefix(METHOD_RESPONSE_HEADER_PREFIX) else {
@@ -3602,12 +3629,105 @@ fn mapped_response_headers(
         if declared.is_none_or(|declared| !declared.contains_key(key)) {
             continue;
         }
-        if let Some(literal) = static_mapping_literal(value) {
+        if !read_body
+            && value.starts_with(crate::ops::put_integration_response::INTEGRATION_RESPONSE_BODY_PREFIX)
+        {
+            read_body = true;
+            document = answer
+                .payload
+                .as_deref()
+                .and_then(|payload| ::serde_json::from_slice(payload).ok());
+        }
+        if let Some(resolved) = mapped_response_value(value, inputs, answer, document.as_ref()) {
             // A mapping declares ONE value for the header, so the name carries exactly it.
-            mapped.insert(name.to_string(), vec![literal.to_string()]);
+            mapped.insert(name.to_string(), vec![resolved]);
+        } else {
+            // The source the mapping names carries no value for this call, so the header
+            // is not sent — which is what AWS does, and is also what a mapping naming
+            // something this emulator does not resolve looks like. Said once per such
+            // mapping, so the two are told apart from the trace rather than from a
+            // missing header.
+            tracing::warn!(
+                header = %name,
+                mapping = %value,
+                "the response parameter mapping resolves nothing for this call, so the \
+                 header is not sent"
+            );
         }
     }
     mapped
+}
+
+/// What one `responseParameters` mapping expression resolves to for this call, or `None`
+/// when the source it names carries no value here (and when it is written in a form this
+/// emulator does not read).
+///
+/// The forms are the ones the control plane accepts for the member
+/// ([`crate::ops::put_integration_response::is_integration_response_mapping_value`]), so a
+/// mapping a developer could store is a mapping this resolves: the one grammar is read in
+/// one place on both sides.
+///
+/// `document` is what the integration answered, read as JSON once by the caller, or `None`
+/// for an answer that is no JSON document (and for one nothing asked to read).
+fn mapped_response_value(
+    value: &str,
+    inputs: &TemplateInputs,
+    answer: &IntegrationAnswer,
+    document: Option<&::serde_json::Value>,
+) -> Option<String> {
+    use crate::ops::put_integration_response::{
+        CONTEXT_MAPPING_PREFIX, INTEGRATION_RESPONSE_BODY_PREFIX,
+        INTEGRATION_RESPONSE_HEADER_PREFIX, STAGE_VARIABLE_MAPPING_PREFIX,
+    };
+
+    if let Some(literal) = static_mapping_literal(value) {
+        return Some(literal.to_string());
+    }
+    if let Some(name) = value.strip_prefix(INTEGRATION_RESPONSE_HEADER_PREFIX) {
+        // A header name is compared case-insensitively, as the wire compares one, and the
+        // FIRST value under it is what a single-valued mapping expression names.
+        return answer
+            .headers
+            .iter()
+            .find(|(held, _)| held.eq_ignore_ascii_case(name))
+            .and_then(|(_, values)| values.first().cloned());
+    }
+    if let Some(expression) = value.strip_prefix(INTEGRATION_RESPONSE_BODY_PREFIX) {
+        return integration_body_value(expression, document?);
+    }
+    if let Some(variable) = value.strip_prefix(CONTEXT_MAPPING_PREFIX) {
+        return inputs.context.get(variable).cloned();
+    }
+    if let Some(name) = value.strip_prefix(STAGE_VARIABLE_MAPPING_PREFIX) {
+        return inputs.stage_variables.get(name).cloned();
+    }
+    None
+}
+
+/// The value the JSON expression `expression` names in `document` — what the integration
+/// answered — as the header carries it, or `None` when it names no single value there.
+///
+/// `expression` is the member's own form, "a valid JSON expression without the `$`
+/// prefix", so the `$` root is put back and the path is read through the shared bounded
+/// reader of a JSON reference path — the same one a mapping template's `$input.json`
+/// reference is applied through, so one caller-stored path is read one way. A string value
+/// is the text itself; any other JSON value is its JSON rendering, which is what a header
+/// can carry.
+fn integration_body_value(
+    expression: &str,
+    document: &::serde_json::Value,
+) -> Option<String> {
+    // A path naming an element of the root array opens with the index itself, so the root
+    // is written without the member separator for it.
+    let path = if expression.starts_with('[') {
+        format!("${expression}")
+    } else {
+        format!("$.{expression}")
+    };
+    match ::service_common::json_reference_path::select(&path, document)? {
+        ::serde_json::Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    }
 }
 
 /// The wire response a performed integration answers with.
@@ -4261,6 +4381,10 @@ fn call_context(
         ("extendedRequestId", request_id.to_string()),
         ("requestTimeEpoch", epoch_millis(now).to_string()),
         ("identity.sourceIp", source_address_of(req)),
+        // "The request protocol, for example, HTTP/1.1" (`$context.protocol`): every
+        // request this data plane is handed arrives over the emulator's own HTTP/1.1
+        // front door, which is the protocol version a client sends it with.
+        ("protocol", HTTP_PROTOCOL.to_string()),
     ]
     .into_iter()
     .map(|(member, value)| (member.to_string(), value))
@@ -4308,6 +4432,10 @@ pub(super) fn stage_qualified_path(stage: &str, request_path: &str) -> String {
 /// The request header the caller's user agent travels in, which `$context.identity.userAgent`
 /// reports.
 const USER_AGENT_HEADER: &str = "user-agent";
+
+/// The protocol version `$context.protocol` reports: "the request protocol, for example,
+/// HTTP/1.1", which is the version the emulator's own front door serves a request over.
+const HTTP_PROTOCOL: &str = "HTTP/1.1";
 
 /// The request header the address the request came from is recorded in where it reached the
 /// emulator through a forwarder.

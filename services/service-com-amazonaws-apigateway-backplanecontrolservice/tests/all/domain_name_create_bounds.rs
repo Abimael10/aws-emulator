@@ -86,8 +86,16 @@ fn tag_cases() -> Vec<TagCase> {
         },
         TagCase {
             case: "a non-ASCII key and value, which AWS round-trips",
-            tags: pair("équipe", "plate-forme ✓"),
+            tags: pair("équipe", "plate-forme"),
             stored: true,
+        },
+        TagCase {
+            // AWS's tag character class admits unicode LETTERS, DIGITS and whitespace
+            // beside the punctuation the member's own documentation lists, and nothing
+            // else: a SYMBOL — a check mark as much as an emoji — is outside it.
+            case: "a value carrying a symbol, which AWS refuses",
+            tags: pair("marque", "plate-forme ✓"),
+            stored: false,
         },
         TagCase {
             case: "entries AT the per-request bound",

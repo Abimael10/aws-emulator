@@ -127,7 +127,7 @@ fn rendered(
                 .to_string(),
         });
     };
-    let mut headers = mapped_response_headers(method, selected, status);
+    let mut headers = mapped_response_headers(method, selected, status, &call.inputs, answer);
     // The media type is the method response's own `Content-Type` mapping where it declares
     // one; see [`super::taken_content_type`].
     let mapped_type = taken_content_type(&mut headers);

@@ -148,6 +148,22 @@ pub const INTEGRATION_RESPONSE_HEADER_PREFIX: &str = "integration.response.heade
 /// [`INTEGRATION_RESPONSE_HEADER_PREFIX`].
 pub const INTEGRATION_RESPONSE_BODY_PREFIX: &str = "integration.response.body.";
 
+/// The prefix a mapping expression that reads one value of the CALL'S CONTEXT carries:
+/// `context.<variable>` — the request id, the api id, the account id, the stage, the
+/// verb, the caller's address, every `$context` variable API Gateway documents for a
+/// mapping (`crate::service::invoke`'s `call_context` is where this emulator fills them).
+///
+/// Hand-written for the reason [`INTEGRATION_RESPONSE_HEADER_PREFIX`] is: the model types
+/// the map value as a bare `String` and declares no pattern for it. API Gateway accepts
+/// this source wherever it accepts a mapping expression, which is why it is a source of a
+/// RESPONSE parameter as much as of a request one.
+pub const CONTEXT_MAPPING_PREFIX: &str = "context.";
+
+/// The prefix a mapping expression that reads one STAGE VARIABLE carries:
+/// `stageVariables.<name>`, whose `<name>` is a key of the invoked stage's own
+/// `variables` map; see [`CONTEXT_MAPPING_PREFIX`].
+pub const STAGE_VARIABLE_MAPPING_PREFIX: &str = "stageVariables.";
+
 /// Whether `value` is the static form a mapped value may take: "a static value enclosed
 /// within a pair of single quotes" (`responseParameters`). A pair of quotes is two
 /// characters, so the shortest static value is the empty string between them.
@@ -170,12 +186,21 @@ pub fn static_mapping_literal(value: &str) -> Option<&str> {
 
 /// Whether `value` is one of the forms a `responseParameters` value may take: a static
 /// value in single quotes, an `integration.response.header.{name}` expression naming a
-/// valid header, or an `integration.response.body.{JSON-expression}` expression carrying
-/// a JSON expression "without the `$` prefix".
+/// valid header, an `integration.response.body.{JSON-expression}` expression carrying
+/// a JSON expression "without the `$` prefix", a `context.<variable>` expression naming
+/// one value of the call's context, or a `stageVariables.<name>` expression naming one
+/// variable of the invoked stage.
 ///
 /// The header name's character set is the HTTP field-name token of RFC 9110 §5.1, which
 /// is what "a valid and unique response header name" means on the wire — the same token
 /// [`is_method_response_header`] holds the mapping KEY to.
+///
+/// `context.` and `stageVariables.` are the two sources a mapping expression may name
+/// BESIDE the integration response itself: API Gateway's parameter-mapping grammar
+/// accepts them wherever it accepts a mapping expression, and the value is resolved from
+/// the call when the response is served (`crate::service::invoke`). The member's own
+/// documentation names the integration-response forms only, so the two are listed here
+/// rather than quoted from it.
 pub fn is_integration_response_mapping_value(value: &str) -> bool {
     if is_static_mapping_value(value) {
         return true;
@@ -185,6 +210,14 @@ pub fn is_integration_response_mapping_value(value: &str) -> bool {
     }
     if let Some(expression) = value.strip_prefix(INTEGRATION_RESPONSE_BODY_PREFIX) {
         return !expression.is_empty() && !expression.starts_with('$');
+    }
+    // A context variable is addressed by its member path (`requestId`,
+    // `identity.sourceIp`, `authorizer.claims.sub`) and a stage variable by its name, so
+    // the only rule either spelling carries is that it names something at all.
+    for prefix in [CONTEXT_MAPPING_PREFIX, STAGE_VARIABLE_MAPPING_PREFIX] {
+        if let Some(name) = value.strip_prefix(prefix) {
+            return !name.is_empty();
+        }
     }
     false
 }
@@ -199,8 +232,9 @@ pub fn invalid_integration_response_mapping(value: &str) -> String {
     format!(
         "Invalid mapping expression specified: {value}; an integration response parameter \
          value must be a static value enclosed in single quotes, \
-         {INTEGRATION_RESPONSE_HEADER_PREFIX}{{name}} or \
-         {INTEGRATION_RESPONSE_BODY_PREFIX}{{JSON-expression}}"
+         {INTEGRATION_RESPONSE_HEADER_PREFIX}{{name}}, \
+         {INTEGRATION_RESPONSE_BODY_PREFIX}{{JSON-expression}}, \
+         {CONTEXT_MAPPING_PREFIX}{{variable}} or {STAGE_VARIABLE_MAPPING_PREFIX}{{name}}"
     )
 }
 

@@ -177,9 +177,11 @@ fn bound_input(input: &PutMethodResponseInput) -> Result<(), String> {
 /// this call creates the response for, plus the two caller-supplied maps.
 ///
 /// `Err` carries the `BadRequestException` message for a `responseParameters` key that is
-/// not a `method.response.header.{name}` mapping expression — the one rule these members
-/// publish. The `responseModels` values name `Model` resources, which no operation of this
-/// emulator creates yet, so a value is stored as given rather than resolved.
+/// not a `method.response.header.{name}` mapping expression — the one rule that member
+/// publishes.
+///
+/// A `responseModels` value is resolved against the API's own models by the caller, which
+/// holds the store: see [`unresolved_model_reference`].
 ///
 /// Validation happens here, before anything is written, so a refused request leaves the
 /// method's responses as they were.
@@ -306,6 +308,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .rest_apis
             .get_mut(&input.rest_api_id)
             .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        // A `responseModels` value "specifies the Model resources used for the response's
+        // content type" (`MethodResponse$responseModels`), so it has to name a `Model` of
+        // THIS api: a value no model of the api answers to configures nothing and is
+        // refused before the response is stored.
+        if let Some(message) =
+            crate::state::unresolved_model_reference(api, input.response_models.as_ref())
+        {
+            return Err(bad_request(message));
+        }
         let resource = api
             .resources
             .get_mut(&input.resource_id)
@@ -316,7 +327,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .methods
             .get_mut(&method_key(&input.http_method))
             .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
-
         // A status code names at most one response of a method: adding one that is already
         // there is a conflict, not an overwrite — `UpdateMethodResponse` is the call that
         // changes a stored response.

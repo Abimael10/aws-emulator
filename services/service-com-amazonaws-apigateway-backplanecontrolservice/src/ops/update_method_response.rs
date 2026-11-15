@@ -109,12 +109,19 @@ use crate::state::{
 
 /// Apply one patch to a COPY of a stored method response.
 ///
+/// `api_model_names` is the set of `Model` names the api holds, which is what a
+/// `responseModels` entry's value has to name ([`crate::state::unknown_model_name`]).
+///
 /// Both patchable members are MAPS, so a path names ONE entry of one of them
 /// (`/responseModels/application~1json`), exactly as `UpdateMethod` addresses a method's
 /// `requestModels`. The edit itself is the service's shared map-patch semantics
 /// ([`patch_string_map`], [`patch_bool_map`]): `add` and `replace` set the entry, `remove`
 /// drops it, and `move`/`copy`/`test` name nothing on such a member.
-fn apply_patch(entry: &mut GetMethodResponseOutput, patch: &Patch) -> Result<(), PatchFailure> {
+fn apply_patch(
+    entry: &mut GetMethodResponseOutput,
+    patch: &Patch,
+    api_model_names: &::std::collections::BTreeSet<String>,
+) -> Result<(), PatchFailure> {
     match patch.member() {
         // "A key defines a method response header" whose expression "must match the
         // pattern method.response.header.{name}" (`MethodResponse$responseParameters`), and
@@ -136,10 +143,17 @@ fn apply_patch(entry: &mut GetMethodResponseOutput, patch: &Patch) -> Result<(),
         // "Response models are represented as a key/value map, with a content-type as the
         // key and a Model name as the value" (`MethodResponse$responseModels`); a `/` in the
         // content type is escaped `~1` the way a JSON Pointer requires. The value names a
-        // `Model` resource, which no operation of this emulator creates yet, so it is stored
-        // as given rather than resolved — as `PutMethodResponse` stores it.
+        // `Model` of this api, the same rule `PutMethodResponse` enforces for the member:
+        // a patch cannot store a reference a create would refuse.
         "responseModels" => {
             let content_type = crate::state::bounded_map_key(patch, 1)?;
+            if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+                if let Some(message) =
+                    crate::state::unknown_model_name(api_model_names, patch.require_value()?)
+                {
+                    return Err(PatchFailure::BadRequest(message));
+                }
+            }
             let mut models = crate::state::ordered_map(entry.response_models.take());
             patch_string_map(
                 &mut models,
@@ -275,6 +289,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .rest_apis
             .get_mut(&input.rest_api_id)
             .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        let api_model_names: ::std::collections::BTreeSet<String> =
+            api.models.keys().cloned().collect();
         let resource = api
             .resources
             .get_mut(&input.resource_id)
@@ -292,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone();
 
         for patch in &patches {
-            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+            apply_patch(&mut updated, patch, &api_model_names).map_err(patch_failure)?;
         }
 
         method

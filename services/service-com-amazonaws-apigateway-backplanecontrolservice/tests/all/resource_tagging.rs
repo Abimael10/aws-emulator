@@ -25,8 +25,8 @@
 //!   does not tag, and a well-formed path whose record does not exist (including every
 //!   taggable kind this emulator keeps no records of) — applied to all three
 //!   operations;
-//! * the tag bounds over each published bound and one past it, plus the reserved `aws:`
-//!   prefix in several spellings;
+//! * the tag bounds over each published bound and one past it, the character class a key
+//!   and a value are drawn from, plus the reserved `aws:` prefix in several spellings;
 //! * `UntagResource` over tables of named and unnamed keys.
 
 use std::collections::BTreeMap;
@@ -190,7 +190,6 @@ async fn a_tag_written_on_any_taggable_resource_reads_back_through_get_tags_and_
         ("an empty value", vec![("unset", "")]),
         ("a non-ASCII key and value", vec![("クラウド", "東京")]),
         ("a non-ASCII value only", vec![("city", "münchen")]),
-        ("an emoji value", vec![("mood", "🚀")]),
         (
             "a key and a value at their published length bound",
             vec![(long_key.as_str(), long_value.as_str())],
@@ -520,6 +519,17 @@ async fn a_tag_outside_the_published_rules_is_refused_and_changes_nothing() {
             vec![("team-aws:api", "yes")],
             true,
         ),
+        // AWS's tag character class is unicode LETTERS, DIGITS and whitespace beside the
+        // punctuation the member's own documentation lists (`_ . : / = + - @`): a
+        // SYMBOL-category character is outside it, wherever it rides.
+        ("an emoji value", vec![("mood", "🎉🔥")], false),
+        ("an emoji key", vec![("🚀", "launch")], false),
+        ("a symbol in a value", vec![("check", "done ✓")], false),
+        (
+            "a letter, a digit and a space, which the class admits",
+            vec![("Cost Center", "équipe 42")],
+            true,
+        ),
     ];
 
     let gateway = Gateway::new();
@@ -615,7 +625,7 @@ async fn the_tag_quota_is_on_the_resulting_collection() {
 }
 
 #[tokio::test]
-async fn untagging_removes_the_keys_it_names_and_refuses_a_key_the_resource_does_not_carry() {
+async fn untagging_removes_the_keys_it_names_and_ignores_a_key_the_resource_does_not_carry() {
     let gateway = Gateway::new();
     for (kind, resource_arn, _) in taggables(&gateway, "untag").await {
         let stored: Vec<(&str, &str)> = vec![
@@ -635,24 +645,29 @@ async fn untagging_removes_the_keys_it_names_and_refuses_a_key_the_resource_does
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
 
-        // A key the resource does not carry is REFUSED, and the removal is
-        // all-or-nothing: a request naming one unknown key beside known ones drops
-        // nothing. Rows span an unknown key alone, mixed with a known one, an empty key
-        // and a key that was already removed.
+        // Removal is stated as the RESULT it asks for, so a key the resource does not
+        // carry is already in that state: the request SUCCEEDS and leaves every other tag
+        // alone, which is what makes a repeated teardown idempotent. Rows span an unknown
+        // key alone, mixed with a known one (whose tag is still dropped), an empty key and
+        // a reserved key, which can never have been stored.
         let unknown: Vec<(&str, Vec<&str>)> = vec![
             ("one key the resource never carried", vec!["absent"]),
             ("an unknown key beside a known one", vec!["team", "absent"]),
             ("an empty key", vec![""]),
             ("a reserved key, which can never be stored", vec!["aws:region"]),
+            ("a key already removed", vec!["team"]),
         ];
         for (row, keys) in &unknown {
             let case = format!("{kind} / {row}");
-            assert_failure(
-                &untag(&gateway, &resource_arn, keys).await,
-                404,
-                "NotFoundException",
-                &case,
+            let answer = untag(&gateway, &resource_arn, keys).await;
+            assert_eq!(
+                answer.status, 204,
+                "case {case}: expected the modelled 204 from UntagResource, got {} with {:?}",
+                answer.status, answer.body
             );
+            for key in keys {
+                expected.remove(*key);
+            }
             assert_tags(&get_tags(&gateway, &resource_arn).await, &expected, &case);
         }
 

@@ -111,6 +111,7 @@
 //! is [`invoke`]'s own documentation; the api's own resource policy, which every invoke is
 //! decided against, is [`resource_policy`]'s.
 
+pub mod control_plane_authorization;
 pub mod custom_domain_socket;
 pub mod invoke;
 pub mod mapping_template;
@@ -194,6 +195,7 @@ macro_rules! wrap_operations {
                 stringify!($operation),
                 ::std::boxed::Box::new(StatedPerOperation::new(
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                    ::std::sync::Arc::clone(&$engine),
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
         )+
@@ -442,7 +444,8 @@ fn with_rendered_templates(mut resp: RtResponse) -> RtResponse {
 }
 
 /// One modelled operation, served so that a refused request is stated the way this
-/// service states it: every validation path rooted at THIS operation's input shape.
+/// service states it: every validation path rooted at THIS operation's input shape, and
+/// only for a caller IAM lets perform it.
 ///
 /// Nothing else is re-implemented. A request this wrapper does not refuse is handed to
 /// the generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle
@@ -452,14 +455,22 @@ fn with_rendered_templates(mut resp: RtResponse) -> RtResponse {
 /// a request this wrapper does not refuse is read twice, once here and once in the
 /// operation's own sequence, because the framework hands no already-built input to an
 /// operation.
-struct StatedPerOperation<O> {
+///
+/// It carries the SAME shared engine the wrapped operation was built from, which is what
+/// the authorization decision reads the caller's identity and its policies through
+/// ([`control_plane_authorization`]): the gate belongs to the SERVICE rather than to one
+/// operation — IAM decides every control-plane call ahead of API Gateway — so it is taken
+/// here once rather than in each of the modelled operations.
+struct StatedPerOperation<O, Eng> {
     operation: O,
+    engine: Arc<Eng>,
 }
 
-impl<O> StatedPerOperation<O> {
-    /// Wrap one operation, already constructed from the shared engine.
-    fn new(operation: O) -> Self {
-        Self { operation }
+impl<O, Eng> StatedPerOperation<O, Eng> {
+    /// Wrap one operation, already constructed from the shared engine, and keep a handle
+    /// on that same engine for the authorization decision.
+    fn new(operation: O, engine: Arc<Eng>) -> Self {
+        Self { operation, engine }
     }
 }
 
@@ -507,9 +518,10 @@ fn violations_of<O: Operation>(
     }
 }
 
-impl<O> ErasedOperation for StatedPerOperation<O>
+impl<O, Eng> ErasedOperation for StatedPerOperation<O, Eng>
 where
     O: Operation + ErasedOperation,
+    Eng: Send + Sync + 'static,
 {
     fn run<'r>(
         &'r self,
@@ -518,6 +530,21 @@ where
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            // IAM's decision, taken before anything of the request is read or written: a
+            // caller whose policies allow none of this service's actions on the resource
+            // the request names is told it is not authorized, and the answer says nothing
+            // about whether that resource exists here.
+            if let Some(denial) =
+                control_plane_authorization::denial(&*self.engine, ctx, req)
+            {
+                // The protocol is read, used and dropped inside this one statement:
+                // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across an
+                // await would make this future non-`Send`.
+                return control_plane_authorization::refusal_response(
+                    svc.definition().protocol(),
+                    &denial,
+                );
+            }
             // The definition is read, used and dropped inside each statement:
             // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the
             // await below would make this future non-`Send`.

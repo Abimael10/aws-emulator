@@ -317,6 +317,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A `requestModels` value "specifies the Model resources used for the request's
+        // content type" (`Method$requestModels`), so it has to name a `Model` of THIS
+        // api: a value no model of the api answers to configures nothing and is refused
+        // before the method is stored. Resolved against the api BEFORE the resource is
+        // borrowed out of it, so one lookup answers for the whole map.
+        if let Some(message) = store
+            .rest_apis
+            .get(&input.rest_api_id)
+            .and_then(|api| {
+                crate::state::unresolved_model_reference(api, input.request_models.as_ref())
+            })
+        {
+            return Err(PutMethodErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into());
+        }
         // A method is put ON a resource, so the `(restApiId, resourceId)` pair is resolved
         // as ONE lookup for that resource: an identifier no stored API answers to leaves
         // the addressed resource unresolvable too, and the refusal names the resource the

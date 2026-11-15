@@ -102,7 +102,11 @@ pub(crate) const SESSION_KEY_ID: &str = "ASIAEXAMPLEVENDED001";
 const USER: &str = "stage-client";
 
 /// That key's id.
-const USER_KEY_ID: &str = "AKIAEXAMPLELONGTERM1";
+///
+/// `pub(crate)` with [`given_user`] for the sibling `control_plane_fidelity_rules` suite,
+/// which judges the CONTROL plane's own gate about the same principal: one seeding of an
+/// IAM user and its long-term key in this crate rather than two.
+pub(crate) const USER_KEY_ID: &str = "AKIAEXAMPLELONGTERM1";
 
 /// An access key id neither store holds a record for: the position the account's own
 /// published credential is in.
@@ -274,7 +278,7 @@ pub(crate) fn given_scoped_session(
 
 /// Record the IAM user [`USER_KEY_ID`] belongs to, as `iam:CreateUser` and
 /// `iam:CreateAccessKey` record them.
-fn given_user(gateway: &Gateway) {
+pub(crate) fn given_user(gateway: &Gateway) {
     let store = iam::service_state(gateway.engine()).expect("the IAM store");
     let mut store = store.lock();
     store.users.insert(

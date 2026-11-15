@@ -572,20 +572,6 @@ async fn an_unknown_identifier_is_a_not_found_on_every_stage_operation() {
             format!("/restapis/{missing}/stages"),
             Some(json!({ "stageName": "prod", "deploymentId": deployment })),
         ),
-        (
-            "POST",
-            format!("/restapis/{api}/stages"),
-            Some(json!({ "stageName": "prod", "deploymentId": missing })),
-        ),
-        (
-            "POST",
-            format!("/restapis/{api}/stages"),
-            Some(json!({
-                "stageName": "canaryprobe",
-                "deploymentId": deployment,
-                "canarySettings": { "percentTraffic": 5.0, "deploymentId": missing }
-            })),
-        ),
         ("GET", format!("/restapis/{missing}/stages/prod"), None),
         ("GET", format!("/restapis/{api}/stages/prod"), None),
     ];
@@ -597,6 +583,35 @@ async fn an_unknown_identifier_is_a_not_found_on_every_stage_operation() {
             404,
             "NotFoundException",
             &case,
+        );
+    }
+
+    // A `deploymentId` the request CARRIES is a VALUE rather than an identifier in the
+    // URI: the api it was sent to exists, so an id that resolves to no deployment of it is
+    // the bad request it is — the same class `UpdateStage` states for the same value —
+    // whether the stage's own pointer or its canary's carried it.
+    let values: Vec<(&str, Value)> = vec![
+        (
+            "the stage's own deploymentId",
+            json!({ "stageName": "prod", "deploymentId": missing }),
+        ),
+        (
+            "the canary's deploymentId",
+            json!({
+                "stageName": "canaryprobe",
+                "deploymentId": deployment,
+                "canarySettings": { "percentTraffic": 5.0, "deploymentId": missing }
+            }),
+        ),
+    ];
+    for (case, body) in values {
+        assert_failure(
+            &gateway
+                .call("POST", &format!("/restapis/{api}/stages"), Some(body))
+                .await,
+            400,
+            "BadRequestException",
+            &format!("CreateStage({case} naming no deployment of this api)"),
         );
     }
 

@@ -2,8 +2,10 @@
 
 //! @op GetSdkTypes
 //! IMPLEMENTED: lists the SDK types API Gateway can generate a client SDK for — the
-//! service's published catalog ([`crate::state::sdk_type_ids`]) — one `position`/`limit`
-//! page at a time. Reads only.
+//! service's published catalog ([`crate::state::sdk_type_ids`]), cut to the `limit` the
+//! request asks for. The modelled `SdkTypes` output carries no `position`, so this
+//! collection issues no cursor and the `position` a request may send names nothing.
+//! Reads only.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +150,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is on every sibling operation rather than answered.
         crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
 
-        // One page of the catalog's own order, the sequence a `position` cursor walks.
-        // An unresolvable cursor is a bad request, not an empty page.
+        // The SDK-type catalog is NOT a paginated collection: the modelled `SdkTypes`
+        // output declares `items` alone and no `position`
+        // (`smithy_query(query="shape", shape="SdkTypes")`), so this service issues no
+        // cursor for it and there is no page for a cursor to resume at. The `position` a
+        // request carries therefore names nothing here and is IGNORED rather than refused
+        // — a caller that replayed or persisted one is still served the catalog — while
+        // the `limit` it asks for is applied as it is on every other collection, from the
+        // start of the catalog's own order.
         let ordered = crate::state::sdk_type_ids();
-        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
-            .map_err(|message| {
-                GetSdkTypesErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(message),
-                })
-            })?;
-        // `page.next_position` is not reported: the modelled `SdkTypes` output declares
-        // `items` alone (`smithy_query(query="shape", shape="SdkTypes")`), so this
-        // collection has no cursor member to carry one, unlike `RestApis`.
+        let page = crate::state::Page::cut(&ordered, 0, input.limit);
+        // `page.next_position` is not reported: this collection has no cursor member to
+        // carry one, unlike `RestApis`.
         let items = page
             .ids
             .iter()

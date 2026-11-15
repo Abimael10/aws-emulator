@@ -162,6 +162,19 @@ impl SigningCaller {
         self.account_credential || self.unreadable_attachment
     }
 
+    /// Whether the credential this request presented is a session the clock has already run
+    /// out on, which speaks for nobody at all.
+    ///
+    /// `pub` because the CONTROL plane's gate
+    /// ([`crate::service::control_plane_authorization`]) states its own sentence for such a
+    /// credential, over the same caller this module resolves: there is one resolution of who
+    /// a request speaks for in this crate, and one evaluation ORDER
+    /// ([`refusing_reason`]), with each plane wording its own refusal.
+    #[must_use]
+    pub fn expired(&self) -> bool {
+        self.expired
+    }
+
     /// Read what the IAM identity `identity_arn` names may do, through IAM's own accessors.
     fn read_policies_of(
         &mut self,
@@ -318,29 +331,53 @@ pub fn refusal(
     // DECISION is taken about the method's own ARN — which is what a statement names it by.
     let reported = call.reported_resource();
     let request = iam::Request::new(INVOKE_ACTION, &method_arn, &caller.spellings);
-    // The explicit DENIES first, each naming its own document class: an explicit deny refuses
-    // the invoke whatever else allows it — including a grant this emulator cannot read, which
-    // only lifts the DEFAULT deny of a call no readable statement allows. The api's own
-    // document is asked before the caller's, because its deny is a fact about the api and
-    // applies "regardless of the caller and Method configuration".
+    let reason = refusing_reason(caller, &request, INVOKE_ACTION, resource_policy_said)?;
+    Some(not_authorized(&caller.arn, &reported, &reason))
+}
+
+/// The CLAUSE naming which document class refuses `request` and why, in IAM's own
+/// evaluation order, or `None` when nothing consulted refuses it.
+///
+/// The ONE place that order lives, for both planes of this service: the `execute-api` data
+/// plane asks it about `execute-api:Invoke` on a method ARN with the api's own resource
+/// policy's decision in hand ([`refusal`]), and the control plane asks it about
+/// `apigateway:<method>` on the ARN of the path a request addressed
+/// ([`crate::service::control_plane_authorization`]), which publishes no resource-based
+/// policy and therefore passes [`Decision::NotStated`]. Each plane states the sentence its
+/// own caller reads; the PRECEDENCE is this function's, so the two cannot drift.
+///
+/// The order, as IAM reads it:
+///
+/// * an EXPLICIT deny wins over everything, whichever document class carries it — the api's
+///   own document first, because its deny is a fact about the api and applies "regardless of
+///   the caller and Method configuration", then the caller's identity-based policies, then
+///   the session policies its credential was minted with;
+/// * then a GRANT is needed: an identity-based allow, a caller this gate does not bound
+///   ([`SigningCaller::identity_is_unbounded`]), or a resource-based allow, since for a
+///   caller in the api's own account either grant suffices;
+/// * then each CAP applies — the session policies ("the resulting session's permissions are
+///   the intersection of the role's identity-based policy and the session policies",
+///   `AssumeRoleRequest$PolicyArns`) and the permissions boundary ("a permissions boundary
+///   sets the maximum permissions that an identity-based policy can grant") — each taking
+///   permissions away and granting none of its own. A grant the RESOURCE policy made is not
+///   an identity-based one, so no boundary caps it.
+#[must_use]
+pub fn refusing_reason(
+    caller: &SigningCaller,
+    request: &iam::Request<'_>,
+    action: &str,
+    resource_policy_said: Decision,
+) -> Option<String> {
     if resource_policy_said == Decision::Denied {
-        return Some(not_authorized(
-            &caller.arn,
-            &reported,
-            RESOURCE_POLICY_EXPLICIT_DENY,
-        ));
+        return Some(RESOURCE_POLICY_EXPLICIT_DENY.to_string());
     }
-    let identity_said = iam::identity_decision(&caller.documents, &request);
+    let identity_said = iam::identity_decision(&caller.documents, request);
     if identity_said == Decision::Denied {
-        return Some(not_authorized(
-            &caller.arn,
-            &reported,
-            IDENTITY_EXPLICIT_DENY,
-        ));
+        return Some(IDENTITY_EXPLICIT_DENY.to_string());
     }
-    let scope_said = caller.scope.decision(&request);
+    let scope_said = caller.scope.decision(request);
     if scope_said == Decision::Denied {
-        return Some(not_authorized(&caller.arn, &reported, SESSION_EXPLICIT_DENY));
+        return Some(SESSION_EXPLICIT_DENY.to_string());
     }
     let granted = iam::is_allowed(identity_said, Decision::NotStated)
         || caller.identity_is_unbounded()
@@ -349,42 +386,23 @@ pub fn refusal(
         // IAM's DEFAULT deny: no document the decision could read allows the call, so a grant
         // is what would lift it — which is what the clause naming the identity-based class
         // tells whoever reads the refusal.
-        return Some(not_authorized(
-            &caller.arn,
-            &reported,
-            &iam::no_identity_policy_allows(INVOKE_ACTION),
-        ));
+        return Some(iam::no_identity_policy_allows(action));
     }
-    // "The resulting session's permissions are the intersection of the role's identity-based
-    // policy and the session policies" (`AssumeRoleRequest$PolicyArns`): a grant the scope the
-    // credential was minted with does not also allow is not a permission this request has,
-    // whichever document granted it. A credential no mint scoped caps nothing, which the
-    // resolved scope answers as an allow.
     if scope_said != Decision::Allowed {
-        return Some(not_authorized(
-            &caller.arn,
-            &reported,
-            &iam::no_session_policy_allows(INVOKE_ACTION),
-        ));
+        return Some(iam::no_session_policy_allows(action));
     }
-    // "A permissions boundary sets the maximum permissions that an identity-based policy can
-    // grant": a grant the boundary does not also allow is not a permission the principal has. A
-    // grant the RESOURCE policy made is not an identity-based one, so no boundary caps it.
     if resource_policy_said == Decision::Allowed || caller.identity_is_unbounded() {
         return None;
     }
-    if let Some(boundary) = &caller.boundary {
-        let reason = match iam::identity_decision(::std::slice::from_ref(boundary), &request) {
-            Decision::Allowed => return None,
-            // An explicit deny is a fact about the boundary document, so the refusal names it;
-            // a boundary that merely states nothing withheld the grant the identity-based
-            // policies gave.
-            Decision::Denied => BOUNDARY_EXPLICIT_DENY.to_string(),
-            Decision::NotStated => iam::no_permissions_boundary_allows(INVOKE_ACTION),
-        };
-        return Some(not_authorized(&caller.arn, &reported, &reason));
+    let boundary = caller.boundary.as_ref()?;
+    match iam::identity_decision(::std::slice::from_ref(boundary), request) {
+        Decision::Allowed => None,
+        // An explicit deny is a fact about the boundary document, so the refusal names it;
+        // a boundary that merely states nothing withheld the grant the identity-based
+        // policies gave.
+        Decision::Denied => Some(BOUNDARY_EXPLICIT_DENY.to_string()),
+        Decision::NotStated => Some(iam::no_permissions_boundary_allows(action)),
     }
-    None
 }
 
 /// The sentence the `execute-api` endpoint refuses an unauthorized invoke with: the principal

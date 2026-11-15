@@ -36,6 +36,20 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::ops::put_method_re
 use crate::method_integration::{get_method, resource_with_a_method};
 use crate::method_response::{get_method_response, put_method_response, response_header};
 use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
+use crate::stage_request_validation::create_model;
+
+/// The name of the `Model` the rows below map a content type to, created on the api they
+/// run against: a `responseModels` value names a model OF THAT API, so the model has to
+/// exist for the mapping to be storable at all (`PutMethodResponse` and this operation
+/// both resolve it).
+const MODEL: &str = "Pet";
+
+/// `CreateRestApi` plus the [`MODEL`] a `responseModels` row maps to.
+async fn api_with_the_model(gateway: &Gateway, name: &str) -> (String, String) {
+    let (api, root) = create_api(gateway, name).await;
+    create_model(gateway, &api, MODEL, json!({ "type": "object" })).await;
+    (api, root)
+}
 
 /// One `patchOperations` entry, as a client spells it on the wire.
 fn op(kind: &str, path: &str, value: Option<&str>) -> Value {
@@ -292,7 +306,7 @@ async fn a_patched_method_response_member_is_stored_and_read_back() {
     ];
 
     let gateway = Gateway::new();
-    let (api, root) = create_api(&gateway, "update-method-response-round-trip").await;
+    let (api, root) = api_with_the_model(&gateway, "update-method-response-round-trip").await;
     let resource = resource_with_a_method(&gateway, &api, &root, "pets", "GET", json!({})).await;
     seed(&gateway, &api, &resource, "GET", "200", json!({})).await;
 
@@ -331,7 +345,7 @@ async fn the_patch_rule_holds_for_every_status_code_and_verb() {
     ];
 
     let gateway = Gateway::new();
-    let (api, root) = create_api(&gateway, "update-method-response-codes").await;
+    let (api, root) = api_with_the_model(&gateway, "update-method-response-codes").await;
 
     for (status, verb, probe_other_spelling) in &rows {
         let resource = resource_with_a_method(
@@ -515,7 +529,7 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
     ];
 
     let gateway = Gateway::new();
-    let (api, root) = create_api(&gateway, "update-method-response-refusals").await;
+    let (api, root) = api_with_the_model(&gateway, "update-method-response-refusals").await;
     let resource = resource_with_a_method(&gateway, &api, &root, "pets", "GET", json!({})).await;
     seed(
         &gateway,
@@ -598,7 +612,7 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
 #[tokio::test]
 async fn an_unknown_identifier_is_a_not_found_and_patches_nothing() {
     let gateway = Gateway::new();
-    let (api, root) = create_api(&gateway, "update-method-response-notfound").await;
+    let (api, root) = api_with_the_model(&gateway, "update-method-response-notfound").await;
     let resource = resource_with_a_method(&gateway, &api, &root, "pets", "GET", json!({})).await;
     seed(&gateway, &api, &resource, "GET", "200", json!({})).await;
     let missing = "zzzzzzzzzz";
@@ -676,8 +690,10 @@ async fn an_unknown_identifier_is_a_not_found_and_patches_nothing() {
 #[tokio::test]
 async fn a_patch_changes_only_the_response_its_four_identifiers_name() {
     let gateway = Gateway::new();
-    let (first_api, first_root) = create_api(&gateway, "update-method-response-scope-a").await;
-    let (second_api, second_root) = create_api(&gateway, "update-method-response-scope-b").await;
+    let (first_api, first_root) =
+        api_with_the_model(&gateway, "update-method-response-scope-a").await;
+    let (second_api, second_root) =
+        api_with_the_model(&gateway, "update-method-response-scope-b").await;
     let first_resource =
         resource_with_a_method(&gateway, &first_api, &first_root, "pets", "GET", json!({})).await;
     let second_resource = resource_with_a_method(

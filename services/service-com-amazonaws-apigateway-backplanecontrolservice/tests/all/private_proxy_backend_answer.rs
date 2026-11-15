@@ -132,6 +132,11 @@ async fn backend(gateway: &Gateway) -> String {
             Some(json!({
                 "name": "private-proxy-backend",
                 "endpointConfiguration": { "types": ["PRIVATE"] },
+                // A PRIVATE api is deployable only once a resource policy is attached —
+                // the document is what admits a request arriving at its endpoint — so the
+                // api is created carrying one, pinned to the endpoint the first rows
+                // invoke through. Each row re-pins it ([`repin_policy`]).
+                "policy": pinned_policy(ENDPOINT),
             })),
         )
         .await;

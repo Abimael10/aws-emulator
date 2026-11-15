@@ -32,7 +32,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::ops::delete_deployment::DEPLOYMENT_IN_USE;
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    MAX_STRING_CHARS, NO_SUCH_DEPLOYMENT,
+    DEPLOYMENT_ID_DOES_NOT_EXIST, MAX_STRING_CHARS, NO_SUCH_DEPLOYMENT,
 };
 
 use crate::deployment_collection::{get_deployment, get_deployments, reported_ids};
@@ -235,7 +235,7 @@ async fn deleting_a_deployment_removes_it_and_leaves_every_other_record() {
         );
 
         // The record is gone for every reader that resolves a deployment: the read, the
-        // delete again, the patch, and a stage asked to point at it.
+        // delete again and the patch, each of which names it in the URI.
         for (reader, answer) in [
             ("GetDeployment", get_deployment(&gateway, &api, &target).await),
             (
@@ -251,15 +251,6 @@ async fn deleting_a_deployment_removes_it_and_leaves_every_other_record() {
                 )
                 .await,
             ),
-            (
-                "CreateStage pointing at it",
-                create_stage(
-                    &gateway,
-                    &api,
-                    json!({ "stageName": "prod", "deploymentId": target }),
-                )
-                .await,
-            ),
         ] {
             let case = format!("{case} / {reader}({target})");
             assert_failure(&answer, 404, "NotFoundException", &case);
@@ -272,6 +263,25 @@ async fn deleting_a_deployment_removes_it_and_leaves_every_other_record() {
                 answer.body["message"]
             );
         }
+
+        // A stage asked to point at it is refused too — but as the BAD REQUEST it is, with
+        // the sentence this service states for a deployment id a request CARRIES: the id is
+        // a value, and the api it was sent to is still there, so the caller has to fix the
+        // value rather than conclude the api is gone.
+        let pointed = create_stage(
+            &gateway,
+            &api,
+            json!({ "stageName": "prod", "deploymentId": target }),
+        )
+        .await;
+        let pointed_case = format!("{case} / CreateStage pointing at {target}");
+        assert_failure(&pointed, 400, "BadRequestException", &pointed_case);
+        assert_eq!(
+            pointed.body["message"].as_str(),
+            Some(DEPLOYMENT_ID_DOES_NOT_EXIST),
+            "case {pointed_case}: expected {DEPLOYMENT_ID_DOES_NOT_EXIST:?}, got {:?}",
+            pointed.body["message"]
+        );
 
         // Every record the delete did not name is exactly as it was: this API's other
         // deployments, the collection that lists them, the live resources the snapshot was
