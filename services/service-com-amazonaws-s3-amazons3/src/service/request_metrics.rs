@@ -628,52 +628,61 @@ fn epoch_secs(at: SystemTime) -> f64 {
 pub fn serve_metered<Eng: Send + Sync + 'static>(
     table: &mut OperationRoutingTable,
     engine: &Arc<Eng>,
+    data_events: &Arc<super::data_events::ObjectDataEvents<Eng>>,
 ) {
     meter(
         table,
         engine,
+        data_events,
         crate::ops::get_object::GetObject::new(Arc::clone(engine)),
         RequestKind::Get,
     );
     meter(
         table,
         engine,
+        data_events,
         crate::ops::head_object::HeadObject::new(Arc::clone(engine)),
         RequestKind::Head,
     );
     meter(
         table,
         engine,
+        data_events,
         crate::ops::put_object::PutObject::new(Arc::clone(engine)),
         RequestKind::Put,
     );
     meter(
         table,
         engine,
+        data_events,
         crate::ops::delete_object::DeleteObject::new(Arc::clone(engine)),
         RequestKind::Delete,
     );
     meter(
         table,
         engine,
+        data_events,
         crate::ops::upload_part::UploadPart::new(Arc::clone(engine)),
         RequestKind::Put,
     );
     meter(
         table,
         engine,
+        data_events,
         crate::ops::create_multipart_upload::CreateMultipartUpload::new(Arc::clone(engine)),
         RequestKind::Post,
     );
     meter(
         table,
         engine,
+        data_events,
         crate::ops::complete_multipart_upload::CompleteMultipartUpload::new(Arc::clone(engine)),
         RequestKind::Post,
     );
     meter(
         table,
         engine,
+        data_events,
         crate::ops::abort_multipart_upload::AbortMultipartUpload::new(Arc::clone(engine)),
         RequestKind::Delete,
     );
@@ -685,24 +694,28 @@ pub fn serve_metered<Eng: Send + Sync + 'static>(
     meter_behind_door(
         table,
         engine,
+        data_events,
         crate::ops::list_objects_v2::ListObjectsV2::new(Arc::clone(engine)),
         RequestKind::List,
     );
     meter_behind_door(
         table,
         engine,
+        data_events,
         crate::ops::list_objects::ListObjects::new(Arc::clone(engine)),
         RequestKind::List,
     );
     meter_behind_door(
         table,
         engine,
+        data_events,
         crate::ops::list_object_versions::ListObjectVersions::new(Arc::clone(engine)),
         RequestKind::List,
     );
     meter_behind_door(
         table,
         engine,
+        data_events,
         crate::ops::list_multipart_uploads::ListMultipartUploads::new(Arc::clone(engine)),
         RequestKind::List,
     );
@@ -718,24 +731,48 @@ pub fn serve_metered<Eng: Send + Sync + 'static>(
 /// ids every other answer of this service is named by. Behind the door that refusal is worded
 /// by [`super::uri_value_wording`] and rendered by this service
 /// (`super::EmulatedService::detailed_refusal`).
-fn meter_behind_door<Eng, O>(
+pub(super) fn meter_behind_door<Eng, O>(
     table: &mut OperationRoutingTable,
     engine: &Arc<Eng>,
+    data_events: &Arc<super::data_events::ObjectDataEvents<Eng>>,
     operation: O,
     kind: RequestKind,
 ) where
     Eng: Send + Sync + 'static,
     O: Operation + ErasedOperation + 'static,
 {
-    table.add_operation(
-        O::NAME,
-        Box::new(Metered::new(
-            FrontDoor::worded(operation, super::submitted_value_wording)
-                .wording_uri(super::uri_value_wording),
-            Arc::clone(engine),
-            kind,
-        )),
-    );
+    // The same split [`meter`] makes, for the same reason: a call on one object's contents is
+    // a DATA event of the account, recorded inside this wrapper and delivered outside it.
+    let entry: Box<dyn ErasedOperation> = match super::data_events::recorded_class(O::NAME) {
+        Some(class) => super::data_events::served_as_data_event(
+            data_events,
+            operation,
+            class,
+            |audited| counted_behind_door(audited, engine, kind),
+        ),
+        None => Box::new(counted_behind_door(operation, engine, kind)),
+    };
+    table.add_operation(O::NAME, entry);
+}
+
+/// `operation` behind this service's front door, with its answers counted — the pair
+/// [`meter_behind_door`] serves, as a FUNCTION so the two arms above can wrap values of two
+/// different types (a closure is monomorphic in its argument).
+fn counted_behind_door<Eng, O>(
+    operation: O,
+    engine: &Arc<Eng>,
+    kind: RequestKind,
+) -> Metered<Eng, FrontDoor<O>>
+where
+    Eng: Send + Sync + 'static,
+    O: Operation + ErasedOperation,
+{
+    Metered::new(
+        FrontDoor::worded(operation, super::submitted_value_wording)
+            .wording_uri(super::uri_value_wording),
+        Arc::clone(engine),
+        kind,
+    )
 }
 
 /// Add one metered operation to `table`, keyed by its own modelled name — the key the
@@ -744,16 +781,27 @@ fn meter_behind_door<Eng, O>(
 fn meter<Eng, O>(
     table: &mut OperationRoutingTable,
     engine: &Arc<Eng>,
+    data_events: &Arc<super::data_events::ObjectDataEvents<Eng>>,
     operation: O,
     kind: RequestKind,
 ) where
     Eng: Send + Sync + 'static,
     O: Operation + ErasedOperation + 'static,
 {
-    table.add_operation(
-        O::NAME,
-        Box::new(Metered::new(operation, Arc::clone(engine), kind)),
-    );
+    // A call on the CONTENTS of one object is also a DATA event of the account, which the
+    // catalog states once ([`super::data_events::DATA_EVENT_OPERATIONS`]): such an operation
+    // is served with its record built inside this wrapper and delivered outside it, and every
+    // other one is served counted and nothing more.
+    let entry: Box<dyn ErasedOperation> = match super::data_events::recorded_class(O::NAME) {
+        Some(class) => super::data_events::served_as_data_event(
+            data_events,
+            operation,
+            class,
+            |audited| Metered::new(audited, Arc::clone(engine), kind),
+        ),
+        None => Box::new(Metered::new(operation, Arc::clone(engine), kind)),
+    };
+    table.add_operation(O::NAME, entry);
 }
 
 #[cfg(test)]

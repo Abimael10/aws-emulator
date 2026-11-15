@@ -221,6 +221,12 @@ mod trail_log_file_delivery_of_data_events;
 // under the trail's own key prefix, named by the id the caller was answered under.
 #[path = "all/trail_log_file_delivery_of_other_services.rs"]
 mod trail_log_file_delivery_of_other_services;
+// `trail_log_file_delivery_of_s3_object_data_events` pins the same delivery for the calls on
+// the CONTENTS of an S3 OBJECT: a trail delivers the object calls its advanced ARN-scoped
+// selector or its basic `DataResource` admits, withholds the rest, and records none of its own
+// log-file writes.
+#[path = "all/trail_log_file_delivery_of_s3_object_data_events.rs"]
+mod trail_log_file_delivery_of_s3_object_data_events;
 // `trail_not_found_identifier_echo` pins WHICH identifier a `TrailNotFoundException`
 // names — the one the request supplied, in the form it supplied it — over every
 // operation that addresses a trail by `Name` / `TrailName`.

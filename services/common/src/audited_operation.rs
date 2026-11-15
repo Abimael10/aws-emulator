@@ -350,7 +350,9 @@ enum RecordedAs {
 
 /// One modelled operation served audited.
 ///
-/// Built by [`AuditedTable::serve`]; there is no reason to name this type elsewhere.
+/// Built by [`AuditedTable::serve`], or — for a service whose DATA-plane operations alone
+/// are audited, each already served behind wrappers of that service's own — by
+/// [`AuditedOperation::data_event`].
 pub struct AuditedOperation<O, S> {
     /// The operation that serves the call.
     operation: O,
@@ -364,6 +366,34 @@ pub struct AuditedOperation<O, S> {
     /// The protocol envelope the framework renders a pre-dispatch failure of this
     /// operation in — the same value the generated shim passes.
     pre_dispatch: PreDispatchProtocol<'static>,
+}
+
+impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
+    /// `operation` served as a DATA event of the resource it acts on, as a call of `kind`,
+    /// recording into `service` and rendering a pre-dispatch failure in `pre_dispatch` —
+    /// the service's own protocol envelope, the same value its generated per-operation shim
+    /// passes.
+    ///
+    /// What [`AuditedTable::serves_data_event`] files, handed over as a VALUE instead: a
+    /// service whose data-plane operations are already served behind wrappers of its own
+    /// composes them around this one and files the result itself, so one operation is served
+    /// once rather than twice. The record this builds is still DELIVERED by the layer that
+    /// takes it ([`crate::data_events::DeliveringDataEvents`]), which such a service wraps
+    /// outermost for the reason that module gives.
+    pub fn data_event(
+        operation: O,
+        service: Arc<S>,
+        kind: CallKind,
+        pre_dispatch: PreDispatchProtocol<'static>,
+    ) -> Self {
+        Self {
+            operation,
+            service,
+            kind,
+            recorded_as: RecordedAs::Data,
+            pre_dispatch,
+        }
+    }
 }
 
 impl<O: Operation, S: AuditedService> Operation for AuditedOperation<O, S> {

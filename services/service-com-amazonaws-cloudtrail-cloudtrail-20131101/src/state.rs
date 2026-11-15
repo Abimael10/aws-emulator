@@ -4177,41 +4177,130 @@ fn delivering_trail(trail: &TrailRecord) -> DeliveringTrail {
 }
 
 /// The selectors of `trail` a DATA event is matched against: one per ADVANCED event selector
-/// the trail carries.
+/// the trail carries, and one per DATA RESOURCE of each basic one.
 ///
 /// Data events are logged only where a selector says so — "trails created without specific
 /// event selectors will be configured to log all read and write management events, and no
-/// data events" (`EventSelector`) — and a data-event class is named by the
-/// `resources.type` field of an ADVANCED selector, which is why a trail carrying none, or
-/// carrying BASIC selectors (whose `DataResources` name the three legacy resource types,
-/// served by the data planes that own them), contributes nothing here.
+/// data events" (`EventSelector`) — so a trail carrying no selector at all contributes
+/// nothing here. Both kinds of selector state which data events a trail logs, and they state
+/// it in the same three facts, so both are projected onto the one match the delivery makes
+/// ([`service_common::data_events::DataEventSelector`]): an ADVANCED selector states them as
+/// field selectors, and a BASIC one as a `DataResource` ([`basic_data_event_selectors`]).
 ///
-/// Every field selector is carried through as the client wrote it, so the match is made
-/// against the record ([`service_common::data_events::DataEventSelector`]) rather than
-/// against a projection that might admit an event the selector excludes.
+/// Every field selector of an advanced one is carried through as the client wrote it, so the
+/// match is made against the record rather than against a projection that might admit an
+/// event the selector excludes.
 fn logged_data_event_selectors(trail: &TrailRecord) -> Vec<DataEventSelector> {
-    let Some(EventSelectorConfig::Advanced(selectors)) = &trail.event_selectors else {
-        return Vec::new();
-    };
-    selectors
-        .iter()
-        .filter(|selector| !selects_management_category(selector))
-        .map(|selector| DataEventSelector {
-            field_selectors: selector
-                .field_selectors
+    match &trail.event_selectors {
+        None => Vec::new(),
+        Some(EventSelectorConfig::Basic(selectors)) => basic_data_event_selectors(selectors),
+        Some(EventSelectorConfig::Advanced(selectors)) => selectors
+            .iter()
+            .filter(|selector| !selects_management_category(selector))
+            .map(|selector| DataEventSelector {
+                field_selectors: selector
+                    .field_selectors
+                    .iter()
+                    .map(|field| DataEventFieldSelector {
+                        field: field.field.clone(),
+                        equals: field.equals.clone().unwrap_or_default(),
+                        starts_with: field.starts_with.clone().unwrap_or_default(),
+                        ends_with: field.ends_with.clone().unwrap_or_default(),
+                        not_equals: field.not_equals.clone().unwrap_or_default(),
+                        not_starts_with: field.not_starts_with.clone().unwrap_or_default(),
+                        not_ends_with: field.not_ends_with.clone().unwrap_or_default(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// The data events the BASIC selectors `selectors` log, as the one match the delivery makes:
+/// one projected selector per `DataResource` any of them carries.
+///
+/// A basic selector states a class of data events in exactly the facts an advanced one states
+/// as field selectors, so it is projected onto them rather than matched by a second rule:
+///
+/// * the `Data` category, which is what a `DataResource` is about at all;
+/// * the resource TYPE it names (`DataResource$Type`: "the resource type in which you want to
+///   log data events", one of the three basic types), as the record's `resources.type`;
+/// * the ARN PREFIXES it names (`DataResource$Values`: "an array of Amazon Resource Name (ARN)
+///   strings or partial ARN strings for the specified resource type" — "to log data events for
+///   all objects in an S3 bucket, specify the bucket and an empty object prefix such as
+///   `arn:aws:s3:::amzn-s3-demo-bucket1/`"), as `StartsWith` on the record's `resources.ARN`.
+///   A resource that names no value at all narrows by no ARN, which is the configuration of
+///   "resource logging for all data events" the member's own limits note sets apart;
+/// * and the READ/WRITE class the selector's `ReadWriteType` names ("specify if you want your
+///   trail to log read-only events, write-only events, or all"), as `Equals` on the record's
+///   `readOnly` — the one value that field takes. `All` pins nothing, so both classes are
+///   logged, which is the member's documented default.
+///
+/// A resource naming no TYPE is projected to nothing: the type is what names the class of data
+/// events, and a selector this emulator cannot read admits nothing rather than everything.
+fn basic_data_event_selectors(selectors: &[EventSelector]) -> Vec<DataEventSelector> {
+    let mut projected: Vec<DataEventSelector> = Vec::new();
+    for selector in selectors {
+        // `ReadWriteType` is one member spelling one set of three values, whichever class of
+        // event it narrows, so it is read by the one reader of that member.
+        let read_only = match ManagementEventClass::from_read_write_type(
+            selector.read_write_type.as_deref(),
+        ) {
+            ManagementEventClass::ReadOnly => Some("true"),
+            ManagementEventClass::WriteOnly => Some("false"),
+            ManagementEventClass::All => None,
+        };
+        for resource in selector.data_resources.iter().flatten() {
+            let Some(resource_type) = resource
+                .r#type
+                .as_deref()
+                .filter(|resource_type| !resource_type.is_empty())
+            else {
+                continue;
+            };
+            let mut field_selectors = vec![
+                selects(
+                    ::service_common::data_events::EVENT_CATEGORY_FIELD,
+                    &[::service_common::management_events::EVENT_CATEGORY_DATA],
+                ),
+                selects(
+                    ::service_common::data_events::RESOURCES_TYPE_FIELD,
+                    &[resource_type],
+                ),
+            ];
+            let values: Vec<&str> = resource
+                .values
                 .iter()
-                .map(|field| DataEventFieldSelector {
-                    field: field.field.clone(),
-                    equals: field.equals.clone().unwrap_or_default(),
-                    starts_with: field.starts_with.clone().unwrap_or_default(),
-                    ends_with: field.ends_with.clone().unwrap_or_default(),
-                    not_equals: field.not_equals.clone().unwrap_or_default(),
-                    not_starts_with: field.not_starts_with.clone().unwrap_or_default(),
-                    not_ends_with: field.not_ends_with.clone().unwrap_or_default(),
-                })
-                .collect(),
-        })
-        .collect()
+                .flatten()
+                .map(String::as_str)
+                .filter(|value| !value.is_empty())
+                .collect();
+            if !values.is_empty() {
+                field_selectors.push(DataEventFieldSelector {
+                    field: ::service_common::data_events::RESOURCES_ARN_FIELD.to_string(),
+                    starts_with: values.iter().map(ToString::to_string).collect(),
+                    ..DataEventFieldSelector::default()
+                });
+            }
+            if let Some(read_only) = read_only {
+                field_selectors.push(selects(
+                    ::service_common::data_events::READ_ONLY_FIELD,
+                    &[read_only],
+                ));
+            }
+            projected.push(DataEventSelector { field_selectors });
+        }
+    }
+    projected
+}
+
+/// One projected field selector stating `Equals` over `values`.
+fn selects(field: &str, values: &[&str]) -> DataEventFieldSelector {
+    DataEventFieldSelector {
+        field: field.to_string(),
+        equals: values.iter().map(ToString::to_string).collect(),
+        ..DataEventFieldSelector::default()
+    }
 }
 
 /// Whether `trail`'s selectors log management events at all, and which read/write class of

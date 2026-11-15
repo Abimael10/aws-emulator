@@ -2628,7 +2628,7 @@ fn with_date_time_timestamp_headers(mut response: Response) -> Response {
 /// Response Headers*), which every S3 response carries — it is what a client's
 /// `ResponseMetadata.RequestId` reports and what an event notification names the call it
 /// came of by.
-const REQUEST_ID_HEADER: &str = "x-amz-request-id";
+pub(crate) const REQUEST_ID_HEADER: &str = "x-amz-request-id";
 
 /// The second correlation header of that same list: "`x-amz-id-2`: A special token that
 /// helps Amazon Web Services troubleshoot problems", reported as

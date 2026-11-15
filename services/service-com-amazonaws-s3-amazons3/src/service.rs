@@ -69,6 +69,9 @@ pub mod announced_url;
 // the request carries, and the account the request says owns the bucket — see
 // `service/authorization.rs`.
 pub mod authorization;
+// The calls on the CONTENTS of an object, which CloudTrail delivers as DATA events into the
+// bucket of every trail whose event selectors admit them — see `service/data_events.rs`.
+pub mod data_events;
 // The S3 Express session token a Zonal endpoint request presents, and what it authorizes —
 // see `service/express_session.rs`.
 pub mod express_session;
@@ -1247,6 +1250,10 @@ fn front_door<Eng: Send + Sync + 'static>(
         Arc::clone(engine),
     ));
     let mut table = door.finish();
+    // What the account's CloudTrail delivers for the calls on an object's CONTENTS: one
+    // recorder for every data-event row below and in [`request_metrics::serve_metered`], so
+    // two of them cannot report one call differently ([`data_events`]).
+    let data_events = Arc::new(data_events::ObjectDataEvents::new(Arc::clone(engine)));
     table.add_operation(
         crate::ops::put_bucket_metrics_configuration::PutBucketMetricsConfiguration::<Eng>::NAME,
         Box::new(
@@ -1290,34 +1297,29 @@ fn front_door<Eng: Send + Sync + 'static>(
     // their answers counted into the addressed bucket's request metrics: a copy writes the
     // destination object, so it is a `PUT` request of that object's bucket
     // ([`request_metrics`]). One entry per operation, so the door and the counting are the
-    // same served operation rather than two.
-    table.add_operation(
-        crate::ops::copy_object::CopyObject::<Eng>::NAME,
-        Box::new(request_metrics::Metered::new(
-            FrontDoor::worded(
-                crate::ops::copy_object::CopyObject::new(Arc::clone(engine)),
-                submitted_value_wording,
-            )
-            .wording_uri(uri_value_wording),
-            Arc::clone(engine),
-            request_metrics::RequestKind::Put,
-        )),
+    // same served operation rather than two — and each is a DATA event of the object it
+    // writes, which that same entry records inside both wrappers and delivers outside them
+    // ([`data_events`]).
+    request_metrics::meter_behind_door(
+        &mut table,
+        engine,
+        &data_events,
+        crate::ops::copy_object::CopyObject::new(Arc::clone(engine)),
+        request_metrics::RequestKind::Put,
     );
-    table.add_operation(
-        crate::ops::upload_part_copy::UploadPartCopy::<Eng>::NAME,
-        Box::new(request_metrics::Metered::new(
-            FrontDoor::worded(
-                crate::ops::upload_part_copy::UploadPartCopy::new(Arc::clone(engine)),
-                submitted_value_wording,
-            )
-            .wording_uri(uri_value_wording),
-            Arc::clone(engine),
-            request_metrics::RequestKind::Put,
-        )),
+    request_metrics::meter_behind_door(
+        &mut table,
+        engine,
+        &data_events,
+        crate::ops::upload_part_copy::UploadPartCopy::new(Arc::clone(engine)),
+        request_metrics::RequestKind::Put,
     );
     // And the operations whose answers are counted and nothing else: the object data plane
     // and the listings of what a bucket holds.
-    request_metrics::serve_metered(&mut table, engine);
+    request_metrics::serve_metered(&mut table, engine, &data_events);
+    // And the object operations this service wraps in nothing else, each the data event of
+    // the object it acts on ([`data_events::serve_object_data_events`]).
+    data_events::serve_object_data_events(&mut table, engine, &data_events);
     // The BROWSER-FORM upload, which is not a modelled operation at all: no routing-table
     // entry is bound to `POST /{Bucket}`, so such a request resolved to nothing and the
     // framework answered it as unwritten. It is held in this table because that is where

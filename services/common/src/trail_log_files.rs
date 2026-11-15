@@ -25,7 +25,9 @@
 //! an emulator with no object store mounted, or a bucket a client has since deleted, has
 //! nowhere to deliver, and a caller is never failed because a log file could not be written.
 
+use std::collections::BTreeSet;
 use std::io::Write;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use smithy_server_runtime::EmbeddedEmulator;
@@ -50,6 +52,62 @@ const GZIP_MEDIA_TYPE: &str = "application/x-gzip";
 /// How many characters of the unique field a log file's name ends with — the field that
 /// tells two files of the same minute apart.
 const UNIQUE_FIELD_LEN: usize = 16;
+
+/// The objects this process is writing RIGHT NOW to deliver a trail's log files, each as the
+/// `(bucket, key)` pair the write addresses.
+///
+/// Read by the object store that serves those writes ([`is_delivering`]), which is why the set
+/// lives beside the delivery rather than in a service's state: the write is CloudTrail's own,
+/// made while it delivers the record of another call, and a service that classed it as one
+/// more call on a bucket's contents would ask the account's trails to deliver a record of
+/// it — which, for a trail whose selectors admit its own log bucket, is a delivery that
+/// delivers itself without end.
+///
+/// A pair is entered before the write is made and removed when the write's own guard is
+/// dropped ([`Delivering`]) — on every path out of it, a cancelled delivery included — so the
+/// set holds exactly the deliveries in flight and is bounded by how many of them this process
+/// is making at once. A key carries a field drawn fresh per file ([`unique_field`]), so no
+/// pair can answer for a write a client made.
+static DELIVERING_NOW: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
+
+/// The set, with a poisoned lock recovered from rather than unwrapped: nothing but the two
+/// statements below ever runs under this lock, so a poisoned one means a panic elsewhere left
+/// the set readable and correct.
+fn delivering_now() -> MutexGuard<'static, BTreeSet<(String, String)>> {
+    DELIVERING_NOW.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether the write of `key` into `bucket` is one of the log-file deliveries this process is
+/// making right now ([`DELIVERING_NOW`]).
+#[must_use]
+pub fn is_delivering(bucket: &str, key: &str) -> bool {
+    delivering_now().contains(&(bucket.to_string(), key.to_string()))
+}
+
+/// One log-file write in flight, entered in [`DELIVERING_NOW`] for as long as this value
+/// lives.
+///
+/// A GUARD rather than a pair of calls, so the entry is released on every path out of the
+/// write — the error path and a dropped (cancelled) delivery included — and the set cannot
+/// grow past the deliveries actually in flight.
+struct Delivering {
+    addressed: (String, String),
+}
+
+impl Delivering {
+    /// Enter the write of `key` into `bucket`.
+    fn write_of(bucket: &str, key: &str) -> Self {
+        let addressed = (bucket.to_string(), key.to_string());
+        delivering_now().insert(addressed.clone());
+        Self { addressed }
+    }
+}
+
+impl Drop for Delivering {
+    fn drop(&mut self) {
+        delivering_now().remove(&self.addressed);
+    }
+}
 
 /// One log file CloudTrail delivers for a call: the records it carries, and the object they
 /// are written as.
@@ -94,6 +152,10 @@ impl DeliveredLogFile {
     ///
     /// Nothing about the call that produced it changes: a failure is traced and the
     /// operation's own answer stands, for the reason the module docs give.
+    ///
+    /// The object is entered in [`DELIVERING_NOW`] for as long as the write is in flight, so
+    /// the object store serving it can tell CloudTrail's own delivery from a call a client
+    /// made on the same bucket.
     pub async fn deliver(self, callback: &EmbeddedEmulator) {
         let Some(body) = self.body() else {
             ::tracing::warn!(
@@ -103,6 +165,9 @@ impl DeliveredLogFile {
             );
             return;
         };
+        // Held across the write alone, and released by its own `Drop` whichever way that
+        // write ends.
+        let delivering = Delivering::write_of(&self.bucket, &self.key);
         let client = crate::s3_client::s3_client(callback, &self.region);
         let answered = client
             .put_object()
@@ -112,6 +177,7 @@ impl DeliveredLogFile {
             .body(::aws_sdk_s3::primitives::ByteStream::from(body))
             .send()
             .await;
+        drop(delivering);
         if let Err(error) = answered {
             ::tracing::warn!(
                 bucket = %self.bucket,
@@ -288,6 +354,39 @@ mod tests {
                 "case {count} records: expected them under {RECORDS_MEMBER}, got {actual}"
             );
         }
+    }
+
+    /// RULE: a log-file write is entered as in flight for exactly as long as its guard lives,
+    /// and is released whichever way that write ends — so the set names the deliveries in
+    /// flight and nothing else.
+    ///
+    /// The rows differ along which write is asked about: the one in flight, another key of the
+    /// same bucket, the same key of another bucket, and the write once its guard is gone.
+    #[test]
+    fn a_log_file_write_is_in_flight_only_while_its_guard_lives() {
+        let (bucket, key) = ("trail-logs", "AWSLogs/000000000000/CloudTrail/file.json.gz");
+        assert!(
+            !is_delivering(bucket, key),
+            "case \"before the write\": no delivery is in flight yet"
+        );
+        {
+            let _delivering = Delivering::write_of(bucket, key);
+            for (case, asked_bucket, asked_key, expected) in [
+                ("the write in flight", bucket, key, true),
+                ("another key of the same bucket", bucket, "client/object", false),
+                ("the same key in another bucket", "data-bucket", key, false),
+            ] {
+                let actual = is_delivering(asked_bucket, asked_key);
+                assert_eq!(
+                    actual, expected,
+                    "case {case:?}: expected in flight == {expected}, got {actual}"
+                );
+            }
+        }
+        assert!(
+            !is_delivering(bucket, key),
+            "case \"after the write\": the guard releases the entry on every path out"
+        );
     }
 
     /// RULE: a unique field is drawn fresh, so two files of one minute do not collide.

@@ -678,7 +678,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
 /// Published by this operation's own documentation: "The request can contain a list of up
 /// to 1,000 keys that you want to delete." The model constrains the list not at all, so
 /// nothing refuses a longer one before the handler.
-const MAX_KEYS_PER_DELETE: usize = 1_000;
+///
+/// `pub`, because the one other reader of a `Delete` document bounds its own walk by the same
+/// published number ([`crate::service::data_events::data_event_resources`], which names the
+/// objects a delete's record reports and runs before this handler refuses an over-long list).
+pub const MAX_KEYS_PER_DELETE: usize = 1_000;
 
 /// The `Code` an `Errors` entry carries when the delete marker an identifier needs could
 /// not be recorded because this emulator is at its own ceiling on stored versions.
