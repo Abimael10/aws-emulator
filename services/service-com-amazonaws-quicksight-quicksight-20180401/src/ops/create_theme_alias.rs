@@ -199,11 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let key = (input.aws_account_id.clone(), input.theme_id.clone());
         let Some(theme) = store.themes.get_mut(&key) else {
-            let theme_arn =
-                crate::state::theme_arn(&region, &input.aws_account_id, &input.theme_id);
             return Err(CreateThemeAliasErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Theme {theme_arn} is not found")),
+                    message: Some(crate::state::theme_not_found_message(
+                        &region,
+                        &input.aws_account_id,
+                        &input.theme_id,
+                    )),
                     // `ExceptionResourceType` declares no member for a theme, so this
                     // refusal reports none rather than an unmodelled value.
                     resource_type: None,

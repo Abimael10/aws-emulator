@@ -53,6 +53,8 @@ mod state_roundtrip;
 mod theme_alias_lifecycle;
 #[path = "all/theme_lifecycle.rs"]
 mod theme_lifecycle;
+#[path = "all/theme_permissions.rs"]
+mod theme_permissions;
 #[path = "all/topic_lifecycle.rs"]
 mod topic_lifecycle;
 #[path = "all/user_lifecycle.rs"]

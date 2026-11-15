@@ -1763,6 +1763,13 @@ pub fn page_of<'a, T>(
 /// its list can carry is refused rather than stored.
 pub const MAX_RESOURCE_PERMISSIONS: usize = 64;
 
+/// How many grants a resource whose `Permissions` member targets
+/// `UpdateResourcePermissionList` may hold: that shape's own ceiling (`length 0..100`),
+/// so an update that would leave the resource holding more grants than the list a read
+/// reports can carry is refused rather than stored. A theme is such a resource.
+/// Source: smithy_query(query="shape", shape="UpdateResourcePermissionList").
+pub const MAX_UPDATE_RESOURCE_PERMISSIONS: usize = 100;
+
 /// One resource's permission list after granting `grant` and revoking `revoke`.
 ///
 /// A permission list holds one entry per principal, so an update is applied per

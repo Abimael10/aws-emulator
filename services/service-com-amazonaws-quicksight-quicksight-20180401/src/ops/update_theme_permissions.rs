@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateThemePermissions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateThemePermissions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateThemePermissions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Grants and revokes resource permissions on the theme the request identifies by
+//! `(AwsAccountId, ThemeId)`, per principal, and reports the list the theme is left
+//! holding — the same list [`crate::ops::describe_theme_permissions`] then reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +173,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateThemePermissions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateThemePermissionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateThemePermissions"))
+        // The update changes only the theme's permission list, so the ARN it reports is
+        // the one minted when the theme was created; `ctx` carries the region a
+        // refusal's ARN is scoped to.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateThemePermissionsErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the QuickSight store is unavailable".to_string()),
+                        request_id: Some(crate::state::next_request_id()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let request_id = crate::state::next_request_id();
+        let key = (input.aws_account_id, input.theme_id);
+        let mut store = state.lock();
+        let Some(record) = store.themes.get_mut(&key) else {
+            return Err(
+                UpdateThemePermissionsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::theme_not_found_message(
+                            &region, &key.0, &key.1,
+                        )),
+                        // `ExceptionResourceType` declares no member for a theme, so
+                        // this refusal reports none rather than an unmodelled value.
+                        resource_type: None,
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let updated = crate::state::apply_permission_updates(
+            &record.permissions,
+            input.grant_permissions.as_deref().unwrap_or_default(),
+            input.revoke_permissions.as_deref().unwrap_or_default(),
+        );
+        // Each submitted list is within the modelled bound on its own, but their union
+        // with what the theme already holds need not be: a permission list the read
+        // could not report is refused rather than stored, so what a later read reports
+        // is always a list the model admits.
+        if updated.len() > crate::state::MAX_UPDATE_RESOURCE_PERMISSIONS {
+            return Err(
+                UpdateThemePermissionsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "A theme holds permissions for at most {} principals; this update would leave {}.",
+                            crate::state::MAX_UPDATE_RESOURCE_PERMISSIONS,
+                            updated.len()
+                        )),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        }
+        record.permissions = updated;
+
+        Ok(UpdateThemePermissionsOutput {
+            theme_arn: Some(record.arn.clone()),
+            theme_id: Some(record.theme_id.clone()),
+            // The resulting list, which is what the read of this theme's permissions
+            // reports from here on.
+            permissions: Some(record.permissions.clone()),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

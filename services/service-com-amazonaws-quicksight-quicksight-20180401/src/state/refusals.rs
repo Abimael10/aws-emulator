@@ -28,10 +28,14 @@
 
 use std::fmt::Write as _;
 
-use super::{data_set_arn, data_source_arn, folder_arn};
+use super::{data_set_arn, data_source_arn, folder_arn, theme_arn};
 
 /// The resource kind a folder refusal names.
 const FOLDER: &str = "Folder";
+
+/// The resource kind a theme refusal names, as the service's own `Theme` shape spells
+/// it.
+const THEME: &str = "Theme";
 
 /// The resource kind a data-source refusal names — one word, as the service's own
 /// `DataSource` shape spells it, not the two words its documentation prose uses.
@@ -75,6 +79,13 @@ pub fn data_source_not_found_message(
         DATA_SOURCE,
         &data_source_arn(region, aws_account_id, data_source_id),
     )
+}
+
+/// The miss a theme operation reports for a `ThemeId` the account holds no theme
+/// under — the same text whether the call reads the theme, addresses one of its
+/// aliases, or reads or writes its permissions.
+pub fn theme_not_found_message(region: &str, aws_account_id: &str, theme_id: &str) -> String {
+    arn_not_found_message(THEME, &theme_arn(region, aws_account_id, theme_id))
 }
 
 /// The miss a data-set operation reports for a `DataSetId` the account holds no data
