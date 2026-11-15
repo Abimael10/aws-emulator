@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The EventBridge events this service publishes as a JOB moves: one event per state
-//! change of a backup job, one per state change of a copy job and one per state change of
-//! a restore job.
+//! The EventBridge events this service publishes as a JOB or a RECOVERY POINT moves: one
+//! event per state change of a backup job, one per state change of a copy job, one per
+//! state change of a restore job and one per state change of a recovery point.
 //!
 //! # The rule this module implements
 //!
 //! AWS Backup does not only record a job's progress for a reader to poll: every state a
 //! job MOVES INTO after the call that started it is PUBLISHED onto the account's default
 //! EventBridge bus, under the `source` this service owns ([`EVENT_SOURCE`]) and the
-//! `detail-type` of the KIND of job that moved ([`BACKUP_JOB_STATE_CHANGE`],
-//! [`COPY_JOB_STATE_CHANGE`], [`RESTORE_JOB_STATE_CHANGE`]), carrying that job's own stored
-//! members — the state it moved
-//! into among them — as the event's `detail` and the recovery point the job is about in
-//! `resources`. A rule on that bus whose `EventPattern` matches then delivers the envelope
+//! `detail-type` of the KIND of thing that moved ([`BACKUP_JOB_STATE_CHANGE`],
+//! [`COPY_JOB_STATE_CHANGE`], [`RESTORE_JOB_STATE_CHANGE`],
+//! [`RECOVERY_POINT_STATE_CHANGE`]), carrying that record's own stored members — the state
+//! it moved into among them — as the event's `detail` and the recovery point the event is
+//! about in `resources`. The same holds for the RECOVERY POINT a backup or a copy writes:
+//! it is a resource of its own with a status of its own, so each state it moves into is
+//! published too, which is what a client watching for a backup to become available reacts
+//! to. A rule on that bus whose `EventPattern` matches then delivers the envelope
 //! unchanged to every one of that rule's targets, so a client that reacts to a backup, a
-//! copy or a restore through EventBridge observes the job without calling AWS Backup again
-//! — and ONE rule whose pattern lists several detail-types receives every kind of envelope
-//! it names.
+//! copy, a restore or a recovery point through EventBridge observes it without calling AWS
+//! Backup again — and ONE rule whose pattern lists several detail-types receives every
+//! kind of envelope it names.
 //!
 //! The state a START call stored is not a move: it is what that call's own response
 //! reports, so the snapshot is seeded with it and the events published are the transitions
@@ -28,7 +31,9 @@
 //! Nothing here decides WHEN anything moves: the stored job and the clock do
 //! ([`super::ComAmazonawsBackupCryocontrollerusermanagerState::settle_job`],
 //! [`super::ComAmazonawsBackupCryocontrollerusermanagerState::settle_copy_job`],
-//! [`super::ComAmazonawsBackupCryocontrollerusermanagerState::settle_restore_job`]), and a
+//! [`super::ComAmazonawsBackupCryocontrollerusermanagerState::settle_restore_job`],
+//! [`super::ComAmazonawsBackupCryocontrollerusermanagerState::settle_recovery_points`]),
+//! and a
 //! state they write is the fact an event reports. So this module is a DIFF rather than a
 //! second state machine:
 //! [`super::ComAmazonawsBackupCryocontrollerusermanagerState::record_job_state_changes`]
@@ -56,7 +61,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::SystemTime;
 
 use super::{
-    BackupJob, ComAmazonawsBackupCryocontrollerusermanagerState, CopyJobRecord, RestoreJobRecord,
+    BackupJob, ComAmazonawsBackupCryocontrollerusermanagerState, CopyJobRecord, RecoveryPoint,
+    RestoreJobRecord,
 };
 
 /// The `source` of every event AWS Backup publishes.
@@ -73,6 +79,16 @@ pub const COPY_JOB_STATE_CHANGE: &str = "Copy Job State Change";
 
 /// The `detail-type` of the event published when a RESTORE job changes state.
 pub const RESTORE_JOB_STATE_CHANGE: &str = "Restore Job State Change";
+
+/// The `detail-type` of the event published when a RECOVERY POINT changes state.
+///
+/// A recovery point is a resource of its own, not a job: it is what a backup or a copy
+/// WROTE, and it moves through the statuses `RecoveryPointStatus` declares
+/// (`smithy_query(query="shape", shape="com.amazonaws.backup#RecoveryPointStatus")`:
+/// `CREATING`/`COMPLETED`/`AVAILABLE`/`PARTIAL`/`STOPPED`/`DELETING`/`EXPIRED`) on a clock
+/// of its own, so its moves are announced under their own detail-type rather than folded
+/// into the job's.
+pub const RECOVERY_POINT_STATE_CHANGE: &str = "Recovery Point State Change";
 
 /// The event bus this service publishes onto.
 ///
@@ -140,6 +156,9 @@ pub struct JobEventLog {
     copy_jobs: BTreeMap<String, String>,
     /// The `RestoreJobStatus` last published for each restore job, by `RestoreJobId`.
     restore_jobs: BTreeMap<String, String>,
+    /// The `RecoveryPointStatus` last published for each stored recovery point, by
+    /// `RecoveryPointArn`.
+    recovery_points: BTreeMap<String, String>,
     /// The changes queued for the next drain, oldest first.
     pending: VecDeque<JobStateChange>,
 }
@@ -159,15 +178,16 @@ pub struct JobClock {
 }
 
 impl ComAmazonawsBackupCryocontrollerusermanagerState {
-    /// Queue one event for every stored job state that differs from the state last
-    /// published for it, and take that state to be the published one.
+    /// Queue one event for every stored job state — and every stored recovery point
+    /// status — that differs from the state last published for it, and take that state to
+    /// be the published one.
     ///
     /// This is the whole of the "which transitions owe an event" rule: a state the stored
-    /// job carries is compared against the last one published, so every move — the settle
-    /// the clock owed, and any later transition — owes exactly one event, and a state that
-    /// has not changed owes none however many times this runs. A job seen for the FIRST
-    /// time only seeds the snapshot: the state its start call stored is what that call's
-    /// own response reports, not a move (see the module docs).
+    /// record carries is compared against the last one published, so every move — the
+    /// settle the clock owed, and any later transition — owes exactly one event, and a
+    /// state that has not changed owes none however many times this runs. A record seen for
+    /// the FIRST time only seeds the snapshot: the state its start call stored is what that
+    /// call's own response reports, not a move (see the module docs).
     ///
     /// Call it under the store lock, after whatever the operation materialised, and then
     /// [`publish_job_state_changes`] with the lock released.
@@ -178,6 +198,7 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
             backup_jobs,
             copy_jobs,
             restore_jobs,
+            recovery_points,
             job_events,
             ..
         } = self;
@@ -217,11 +238,32 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
                 enqueue(&mut job_events.pending, restore_job_change(job));
             }
         }
+        // A recovery point moves on a clock of its own — the `CREATING` -> `COMPLETED` the
+        // backup that wrote it owes, and whatever a later call makes of it — and each of
+        // those moves is announced the same way a job's is, under the detail-type of the
+        // KIND of thing that moved ([`RECOVERY_POINT_STATE_CHANGE`]). The point a start
+        // call stored is seen here for the first time and only seeds the snapshot, for the
+        // same reason a job's stored state does: it is what that call wrote, not a move.
+        for (arn, point) in recovery_points.iter() {
+            let published = job_events.recovery_points.get(arn).cloned();
+            if published.as_deref() == Some(point.status.as_str()) {
+                continue;
+            }
+            job_events
+                .recovery_points
+                .insert(arn.clone(), point.status.clone());
+            if published.is_some() {
+                enqueue(&mut job_events.pending, recovery_point_change(point));
+            }
+        }
         // A snapshot belongs to a job: one the store no longer holds can never differ
         // again, so the snapshots do not grow past the jobs they are about.
         job_events
             .backup_jobs
             .retain(|job_id, _| backup_jobs.contains_key(job_id));
+        job_events
+            .recovery_points
+            .retain(|arn, _| recovery_points.contains_key(arn));
         job_events
             .copy_jobs
             .retain(|job_id, _| copy_jobs.contains_key(job_id));
@@ -264,7 +306,15 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
                     && job.created_resource_arn.is_some()
             })
             .map(|job| job.settles_at);
-        backups.chain(copies).chain(restores).min()
+        // A recovery point still being written owes its own `CREATING` -> `COMPLETED`
+        // transition at the instant the point itself records, which is what makes that
+        // move due with no call to read it.
+        let points = self
+            .recovery_points
+            .values()
+            .filter(|point| point.status == super::RECOVERY_POINT_STATUS_CREATING)
+            .map(|point| point.settles_at);
+        backups.chain(copies).chain(restores).chain(points).min()
     }
 
     /// Materialise every job transition the clock has already made due, and queue the
@@ -277,6 +327,11 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         self.settle_jobs(now);
         self.settle_copy_jobs(now);
         self.settle_restore_jobs(now);
+        // The recovery points a backup or a copy wrote settle on the same clock, and a
+        // read of one materialises exactly this step
+        // ([`super::ComAmazonawsBackupCryocontrollerusermanagerState::settle_recovery_points`]),
+        // so a point's state does not depend on whether anybody looked at it.
+        self.settle_recovery_points(now);
         self.record_job_state_changes();
     }
 
@@ -630,6 +685,61 @@ fn restore_job_change(job: &RestoreJobRecord) -> JobStateChange {
         // created.
         resource: job.recovery_point_arn.clone(),
         at: epoch_millis(moved_at(job.completion_date, job.creation_date)),
+        detail: ::serde_json::Value::Object(detail),
+    }
+}
+
+/// The change a RECOVERY POINT's move owes: the point's own stored members as the event
+/// `detail`, and the point ITSELF as the resource the event is about.
+///
+/// Every member is the one a read of the same point reports for it
+/// (`DescribeRecoveryPoint`, `ListRecoveryPointsByBackupVault`), under that member's name
+/// with a lower-case first letter as an event detail spells it — so the point a client
+/// reacts to on the bus and the point it then reads back cannot disagree. A member the
+/// stored point does not carry is absent from the detail rather than reported as null,
+/// exactly as it is absent from that read.
+fn recovery_point_change(point: &RecoveryPoint) -> JobStateChange {
+    let mut detail = ::serde_json::Map::new();
+    detail.insert("recoveryPointArn".to_string(), point.arn.clone().into());
+    detail.insert("state".to_string(), point.status.clone().into());
+    detail.insert(
+        "backupVaultName".to_string(),
+        point.backup_vault_name.clone().into(),
+    );
+    detail.insert(
+        "backupVaultArn".to_string(),
+        point.backup_vault_arn.clone().into(),
+    );
+    detail.insert("resourceArn".to_string(), point.resource_arn.clone().into());
+    detail.insert("iamRoleArn".to_string(), point.iam_role_arn.clone().into());
+    detail.insert(
+        "backupSizeInBytes".to_string(),
+        point.backup_size_in_bytes.into(),
+    );
+    detail.insert("isEncrypted".to_string(), point.is_encrypted.into());
+    detail.insert("isParent".to_string(), point.is_parent.into());
+    insert_instant(&mut detail, "creationDate", Some(point.creation_date));
+    insert_instant(&mut detail, "completionDate", point.completion_date);
+    if let Some(resource_type) = point.resource_type.as_ref() {
+        detail.insert("resourceType".to_string(), resource_type.clone().into());
+    }
+    if let Some(encryption_key_arn) = point.encryption_key_arn.as_ref() {
+        detail.insert(
+            "encryptionKeyArn".to_string(),
+            encryption_key_arn.clone().into(),
+        );
+    }
+    if let Some(index_status) = point.index_status.as_ref() {
+        detail.insert("indexStatus".to_string(), index_status.clone().into());
+    }
+    JobStateChange {
+        detail_type: RECOVERY_POINT_STATE_CHANGE,
+        // A recovery point belongs to the vault that HOLDS it, so that vault's Region is
+        // the one its events are published in — the destination vault's own Region for a
+        // point a cross-Region copy wrote.
+        region: vault_region(&point.backup_vault_arn),
+        resource: point.arn.clone(),
+        at: epoch_millis(moved_at(point.completion_date, point.creation_date)),
         detail: ::serde_json::Value::Object(detail),
     }
 }

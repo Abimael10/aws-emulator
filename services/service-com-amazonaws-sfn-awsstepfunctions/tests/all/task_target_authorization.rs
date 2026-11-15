@@ -86,6 +86,9 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
     let queue_arn = format!("arn:aws:sqs:{REGION}:{ACCOUNT}:intake");
     let function_arn = format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:handler");
     let topic_arn = format!("arn:aws:sns:{REGION}:{ACCOUNT}:orders");
+    let vault_arn = format!("arn:aws:backup:{REGION}:{ACCOUNT}:backup-vault:nightly");
+    let table_arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/orders");
+    let backup_role_arn = format!("arn:aws:iam::{ACCOUNT}:role/service-role/AWSBackupDefaultServiceRole");
     let role_arn = chain
         .role(
             "TargetActionsRole",
@@ -184,6 +187,23 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             action: "lambda:InvokeFunction",
             resource_arn: function_arn,
             refusal_error: "Lambda.AWSLambdaException",
+            refusal_code: REFUSAL_CODE,
+        },
+        Row {
+            // A backup is taken INTO the vault the request names by name, so the access
+            // request is over that vault's own ARN, minted in the Region the call is made
+            // in. `StartBackupJob` models no access-denied error, so the refusal is
+            // reported under AWS Backup's base SDK exception.
+            case: "a backup job, the vault named by its bare name",
+            resource: "arn:aws:states:::aws-sdk:backup:startBackupJob",
+            parameters: json!({
+                "BackupVaultName": "nightly",
+                "ResourceArn": table_arn.clone(),
+                "IamRoleArn": backup_role_arn.clone(),
+            }),
+            action: "backup:StartBackupJob",
+            resource_arn: vault_arn,
+            refusal_error: "Backup.AWSBackupException",
             refusal_code: REFUSAL_CODE,
         },
     ];

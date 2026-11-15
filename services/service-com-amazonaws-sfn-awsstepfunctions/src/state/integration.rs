@@ -2085,6 +2085,34 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
         named: GLUE_JOB,
         denied: None,
     },
+    // `arn:aws:states:::aws-sdk:backup:startBackupJob` backs a resource up INTO the
+    // vault its `BackupVaultName` parameter names — "the name of a logical container
+    // where backups are stored"
+    // (`smithy_query(query="operation",operation="StartBackupJob",model_path="services/
+    // service-com-amazonaws-backup-cryocontrollerusermanager/smithy-model/
+    // com-amazonaws-backup-cryocontrollerusermanager.json")`) — which is the resource
+    // `backup:StartBackupJob` is taken on ("Actions defined by AWS Backup", IAM Service
+    // Authorization Reference, whose resource type for it is the backup vault). The
+    // member is the vault's NAME rather than its ARN, and a vault's ARN writes that name
+    // under the `backup-vault` resource type — "for example,
+    // arn:aws:backup:us-east-1:123456789012:backup-vault:aBackupVault"
+    // (`CreateBackupVaultOutput$BackupVaultArn` of the same model) — so the resource the
+    // access request is over is minted from it. `StartBackupJob` models no
+    // access-denied error (that model declares none at all), so a refusal of it is
+    // reported under AWS Backup's base SDK exception. The other AWS Backup integrations
+    // this emulator calls carry no entry: which resource each of THEM is taken on is not
+    // a fact this entry's sources state — the actions AWS publishes for a copy, a
+    // restore and the reads name their own resource types — and an access request formed
+    // over a guessed one would refuse calls AWS serves, so each is left to the change
+    // that grounds it.
+    TargetResource {
+        integration: "backup:startBackupJob",
+        action: None,
+        member: "BackupVaultName",
+        default: None,
+        named: BACKUP_VAULT,
+        denied: None,
+    },
 ];
 
 /// An Athena workgroup, named by the `WorkGroup` one of that service's query
@@ -2110,6 +2138,13 @@ const GLUE_JOB: TargetNaming = TargetNaming::Named {
 const DYNAMODB_TABLE: TargetNaming = TargetNaming::Named {
     service: "dynamodb",
     prefix: "table/",
+};
+
+/// An AWS Backup vault, named by the `BackupVaultName` one of that service's job
+/// operations takes.
+const BACKUP_VAULT: TargetNaming = TargetNaming::Named {
+    service: "backup",
+    prefix: "backup-vault:",
 };
 
 impl TargetResource {

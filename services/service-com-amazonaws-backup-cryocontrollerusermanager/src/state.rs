@@ -140,6 +140,11 @@ pub use tagging::*;
 mod authorization;
 pub use authorization::*;
 
+/// Whether the CALLER's own IAM policies allow the call that starts a job, decided
+/// before anything is stored. Re-exported for the reason given on `events`.
+mod caller_authorization;
+pub use caller_authorization::*;
+
 /// Which KMS key a vault created with no `EncryptionKeyArn` is encrypted under:
 /// the Amazon Web Services managed key of this service, resolved against the
 /// shared KMS store. Re-exported for the reason given on `events`.

@@ -51,6 +51,14 @@ aws-sdk-dynamodb = { version = "1", default-features = false }
 # engine, so the ARN a vault publishes is one `kms:DescribeKey` resolves
 # (`state::vault_encryption_key`).
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# The STS store, for the identity an access key id speaks for: the principal
+# `sts:GetCallerIdentity` answers for the credentials a request signed with, which is
+# the caller a call that starts a job is authorized as
+# (`state::caller_authorization`).
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, for the identity-based policy documents in force on that principal,
+# and for what a backup job's own role is allowed to create.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # `eventbridge_client`: the tree's ONE construction of that in-process EventBridge
 # client, so this service configures the publication hop exactly as every other
 # publisher does. `iam_role`: the shared reading of a caller-supplied IAM role ARN
@@ -71,10 +79,10 @@ sha2 = { workspace = true }
 # mounted there is nothing for the publication to reach.
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
-# The role-resolution suite mounts IAM beside this service on one engine and
-# creates the roles it resolves through IAM's own wire, so the records read are
-# the ones `CreateRole` wrote.
-service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# Amazon SNS is mounted beside them for the fan-out leg: a rule's target may be an SNS
+# topic, which hands what it is published to its own SQS subscriber, so the envelope a
+# client reads arrives through that topic.
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 # DynamoDB is mounted beside Backup in the restore suite: a restore re-creates
 # the protected resource in the service that owns it, so the table a restore
 # creates is read back through DynamoDB's own wire.

@@ -220,6 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lack of privileges rather than reported as a value that names no
         // stored point (`crate::state::authorized_recovery_point`).
         crate::state::authorized_recovery_point(&input.recovery_point_arn)?;
+        // And the CALLER's own policies on that same point, read at the IAM layer
+        // ahead of the request's own input, so a caller they do not allow starts
+        // no restore at all (`crate::state::caller_authorization`).
+        crate::state::authorized_call(&*self.engine, ctx, Self::NAME, &input.recovery_point_arn)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartRestoreJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {

@@ -213,6 +213,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // absent one is refused before this handler runs; `crate::service` words
         // that refusal as `MissingParameterValueException`.
         let region = crate::state::request_region(ctx);
+        // WHETHER THE CALLER MAY ASK FOR THIS JOB AT ALL, decided at the IAM layer
+        // ahead of the request's own input: the policies in force on the principal
+        // this request signed as are read against this action on the vault the
+        // request names, and a caller they do not allow is refused with nothing
+        // stored (`crate::state::caller_authorization`). Distinct from the question
+        // below, which is about the ROLE the backup would be performed under.
+        crate::state::authorized_call(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::backup_vault_arn(&region, &input.backup_vault_name),
+        )?;
         // WHAT THE JOB WILL COME TO, decided BEFORE it is stored: the backup is
         // performed under the role the request named and against the resource it
         // named, so a backup that role may not perform, or that has no such

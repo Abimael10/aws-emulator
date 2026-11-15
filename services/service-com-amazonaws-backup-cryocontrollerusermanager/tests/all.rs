@@ -25,8 +25,12 @@ mod backup_plan_listing;
 mod backup_plan_update;
 #[path = "all/backup_selection.rs"]
 mod backup_selection;
+#[path = "all/caller_authorization.rs"]
+mod caller_authorization;
 #[path = "all/copy_job.rs"]
 mod copy_job;
+#[path = "all/copy_job_listing.rs"]
+mod copy_job_listing;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
 #[path = "all/framework.rs"]
@@ -73,6 +77,8 @@ mod recovery_point_deletion;
 mod recovery_point_denial_sentence;
 #[path = "all/recovery_point_read.rs"]
 mod recovery_point_read;
+#[path = "all/recovery_point_state_change_events.rs"]
+mod recovery_point_state_change_events;
 #[path = "all/refusal_error_codes.rs"]
 mod refusal_error_codes;
 #[path = "all/refused_job_start_publishes_no_event.rs"]

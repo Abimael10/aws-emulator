@@ -199,6 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Starting the copy holds this store's lock; the publication below does
         // not, so no lock is held across an await.
         let region = crate::state::request_region(ctx);
+        // WHETHER THE CALLER MAY ASK FOR THIS COPY AT ALL, decided at the IAM layer
+        // ahead of the request's own input, on the recovery point this call
+        // addresses — the same resource the cross-account decision below is taken
+        // on (`crate::state::caller_authorization`).
+        crate::state::authorized_call(&*self.engine, ctx, Self::NAME, &input.recovery_point_arn)?;
         let output = self.started_copy_job(input, &region)?;
         crate::state::publish_job_state_changes(ctx, &*self.engine).await;
         // The transition this copy job is owed falls due on the clock, not on the

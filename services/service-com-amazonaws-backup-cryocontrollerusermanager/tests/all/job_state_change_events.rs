@@ -57,6 +57,11 @@ pub(crate) const EVENT_SOURCE: &str = "aws.backup";
 pub(crate) const BACKUP_JOB_STATE_CHANGE: &str = "Backup Job State Change";
 const COPY_JOB_STATE_CHANGE: &str = "Copy Job State Change";
 
+/// The `detail-type` the move of a RECOVERY POINT is published under, which a pattern
+/// matching the source alone is owed too. What those envelopes carry is pinned by the
+/// sibling suite `recovery_point_state_change_events.rs`.
+const RECOVERY_POINT_STATE_CHANGE: &str = "Recovery Point State Change";
+
 /// The terminal state both job kinds reach, as the model's `BackupJobState` and
 /// `CopyJobState` spell it.
 pub(crate) const COMPLETED: &str = "COMPLETED";
@@ -378,6 +383,42 @@ pub(crate) async fn delivered_at_least(
     delivered_at_least_in(router, REGION, case, url, wanted).await
 }
 
+/// Poll the queue at `url` until it has handed over at least `wanted` envelopes of
+/// `detail_type`, or until [`POLL_DEADLINE`] passes.
+///
+/// [`delivered_at_least`] waits for a COUNT, which one start of several kinds of record
+/// reaches as soon as the first envelope of any kind arrives; a case that is about one KIND
+/// of envelope waits for that kind instead, so an envelope published a moment later is
+/// looked for again rather than missed. Envelopes of other detail-types are kept too, so an
+/// assertion can see them.
+///
+/// `pub(crate)` for the sibling suite covering the RECOVERY POINT envelopes
+/// (`recovery_point_state_change_events.rs`), which waits the same way.
+pub(crate) async fn delivered_of_type(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    detail_type: &str,
+    wanted: usize,
+) -> Vec<Value> {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    let mut bodies = Vec::new();
+    loop {
+        bodies.extend(delivered_in(router, REGION, case, url).await);
+        if of_type(&bodies, detail_type).len() >= wanted {
+            return bodies;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected at least {wanted} {detail_type:?} envelope(s) on \
+             {url:?} within {POLL_DEADLINE:?}, got {bodies:?}"
+        );
+        // Hand the runtime back, so the in-process clock pump is polled between attempts
+        // rather than only when this task happens to block.
+        ::tokio::task::yield_now().await;
+    }
+}
+
 /// The backup job `job_id` once it has reached its terminal state, looked for again until
 /// it has or until [`POLL_DEADLINE`] passes: the transition falls due on the emulator's
 /// clock, so the case waits for the STATE rather than for a span.
@@ -511,7 +552,16 @@ fn rows() -> Vec<Row> {
         Row {
             case: "a source-only pattern, destination vault in this Region",
             pattern: json!({ "source": [EVENT_SOURCE] }),
-            expected: &[BACKUP_JOB_STATE_CHANGE, COPY_JOB_STATE_CHANGE],
+            // Such a pattern is owed every envelope these two jobs produce: each job's
+            // own move, and the move of the recovery point each of them WROTE, which is a
+            // record of its own with a status of its own
+            // (`recovery_point_state_change_events.rs` is the suite for those).
+            expected: &[
+                BACKUP_JOB_STATE_CHANGE,
+                COPY_JOB_STATE_CHANGE,
+                RECOVERY_POINT_STATE_CHANGE,
+                RECOVERY_POINT_STATE_CHANGE,
+            ],
             destination_region: REGION,
         },
         Row {
@@ -925,7 +975,7 @@ async fn the_clock_publishes_a_transition_with_no_call_to_read_it() {
     // Waited for by LOOKING AGAIN at the queue, never by reading the job: the drain is
     // what this case is allowed to call, and it is repeated until the envelope the clock
     // owes is there.
-    let delivered = delivered_at_least(&router, case, &url, 1).await;
+    let delivered = delivered_of_type(&router, case, &url, BACKUP_JOB_STATE_CHANGE, 1).await;
     let envelopes = of_type(&delivered, BACKUP_JOB_STATE_CHANGE);
     assert_eq!(
         envelopes.len(),
@@ -963,7 +1013,7 @@ async fn the_clock_publishes_a_transition_with_no_call_to_read_it() {
         "case {case:?}: StartCopyJob answered {status} {copy_started}"
     );
     let copy_job_id = string_at(&copy_started, "CopyJobId");
-    let delivered = delivered_at_least(&router, case, &url, 1).await;
+    let delivered = delivered_of_type(&router, case, &url, COPY_JOB_STATE_CHANGE, 1).await;
     let envelopes = of_type(&delivered, COPY_JOB_STATE_CHANGE);
     assert_eq!(
         envelopes.len(),
