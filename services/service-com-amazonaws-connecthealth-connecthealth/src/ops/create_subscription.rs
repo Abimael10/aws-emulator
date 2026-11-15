@@ -60,7 +60,8 @@
 //! * `createdAt` (Timestamp) **required**
 //! * `deactivatedAt` (Timestamp)
 //! * `domainId` (DomainId, len 20..25, pattern ^(hai-|dom-)[a-z0-9]+$) **required**
-//! * `lastUpdatedAt` (Timestamp) **required**
+//! * `lastUpdatedAt` (Timestamp) **required** — answered only once the subscription has
+//!   been updated; see `types::CreateSubscriptionOutput`.
 //! * `status` (SubscriptionStatus, one of: ACTIVE | DELETED | INACTIVE) **required**
 //! * `subscriptionId` (SubscriptionId, len 25..25, pattern ^sub-[a-zA-Z0-9]{21}$)
 //!   **required**
@@ -144,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     const NAME: &'static str = "CreateSubscription";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_SUBSCRIPTION_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_SUBSCRIPTION_OUTPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_SUBSCRIPTION_RECORD_SCHEMA;
     const SUCCESS_STATUS: u16 = 201u16;
 
     async fn handle(
@@ -210,7 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // to re-enable one a `DeactivateSubscription` turned off.
             status: crate::state::SubscriptionStatus::Active,
             created_at: now,
-            last_updated_at: now,
+            // `lastUpdatedAt` records an UPDATE of the record; creation is not one, so a
+            // freshly created subscription carries no update instant and the create's
+            // 201 leaves the member off (see `types::CreateSubscriptionOutput`).
+            last_updated_at: None,
             // `activatedAt` / `deactivatedAt` record the explicit transition calls, so a
             // subscription that has never been activated or deactivated carries neither;
             // the initial status is not one of those transitions.

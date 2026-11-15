@@ -379,7 +379,7 @@ async fn an_arn_that_names_no_resource_is_refused_and_removes_nothing() {
         // The detail text is built from the REQUEST: it names the ARN the caller asked
         // for, which is what tells one 404 from another.
         let message = body
-            .get("Message")
+            .get("message")
             .and_then(Value::as_str)
             .unwrap_or_else(|| panic!("case {case:?}: the 404 must carry a Message, got {body}"));
         assert!(
@@ -518,7 +518,7 @@ async fn a_key_this_service_does_not_accept_is_refused_and_removes_nothing() {
         .await;
     assert_eq!(status, 400, "an over-long key: got {status} with {body}");
     let message = body
-        .get("Message")
+        .get("message")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("the 400 must carry a Message, got {body}"));
     assert_eq!(
@@ -541,7 +541,7 @@ async fn a_key_this_service_does_not_accept_is_refused_and_removes_nothing() {
         .await;
     assert_eq!(status, 400, "a reserved key: got {status} with {body}");
     let message = body
-        .get("Message")
+        .get("message")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("the 400 must carry a Message, got {body}"));
     assert!(

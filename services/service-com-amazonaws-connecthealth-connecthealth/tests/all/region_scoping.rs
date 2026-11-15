@@ -420,7 +420,7 @@ async fn every_operation_that_resolves_a_domain_refuses_one_of_another_region() 
                  got {status} {answered}"
             );
             assert_eq!(
-                answered.get("Message").and_then(Value::as_str),
+                answered.get("message").and_then(Value::as_str),
                 Some(detail.as_str()),
                 "case {case:?}: expected the detail text {detail:?}, got {answered}"
             );
@@ -527,7 +527,7 @@ async fn the_domain_cap_is_counted_per_region() {
              {status} {refused}"
         );
         assert_eq!(
-            refused.get("Message").and_then(Value::as_str),
+            refused.get("message").and_then(Value::as_str),
             Some(refusal.as_str()),
             "case {region:?}: the refusal must name the account and the cap, got {refused}"
         );

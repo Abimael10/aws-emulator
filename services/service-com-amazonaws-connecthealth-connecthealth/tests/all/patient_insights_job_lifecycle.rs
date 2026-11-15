@@ -459,7 +459,7 @@ async fn a_job_is_readable_only_under_its_own_domain() {
             "ResourceNotFoundException",
             "case {case:?}: got {body}"
         );
-        let detail = string_at(&body, "Message");
+        let detail = string_at(&body, "message");
         assert!(
             detail.contains(expected_in_message),
             "case {case:?}: the detail must name the identifier that did not resolve \
@@ -759,7 +759,7 @@ async fn a_domain_at_the_job_ceiling_refuses_a_further_start() {
         "ValidationException",
         "a start past the ceiling got {refused}"
     );
-    let detail = string_at(&refused, "Message");
+    let detail = string_at(&refused, "message");
     assert!(
         detail.contains(&MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN.to_string()),
         "the refusal must name the ceiling it enforced, got {detail:?}"

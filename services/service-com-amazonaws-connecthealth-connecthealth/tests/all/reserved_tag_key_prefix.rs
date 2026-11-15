@@ -80,7 +80,7 @@ fn assert_refused(case: &str, reserved_key: &str, status: u16, body: &Value) -> 
         "case {case:?}: got {body}"
     );
     let message = body
-        .get("Message")
+        .get("message")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: a refusal must carry a Message, got {body}"))
         .to_string();

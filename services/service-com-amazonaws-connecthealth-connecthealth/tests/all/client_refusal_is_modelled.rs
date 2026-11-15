@@ -76,8 +76,9 @@ const MODELLED_VALIDATION_SHAPE: &str = "com.amazonaws.connecthealth#ValidationE
 /// The wire error code that shape renders with on this service's restJson1 protocol.
 const VALIDATION_CODE: &str = "ValidationException";
 
-/// The body member this service reports an exception's detail text in.
-const DETAIL_MEMBER: &str = "Message";
+/// The body member this service reports an exception's detail text in: the Smithy member
+/// name every exception shape of this model declares (`message`, no `@jsonName`).
+const DETAIL_MEMBER: &str = "message";
 
 /// One emulator: the shared engine, this service mounted on a router (for the callback a
 /// handler is given, and for the wire leg of each row) and the request metadata a handler

@@ -28,8 +28,9 @@ use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
 /// The Region every request of this suite is signed for.
 const REGION: &str = "us-west-2";
 
-/// The body member a refused ConnectHealth call reports its detail text in.
-const DETAIL_MEMBER: &str = "Message";
+/// The body member a refused ConnectHealth call reports its detail text in: the Smithy
+/// member name every exception shape of this model declares (`message`, no `@jsonName`).
+const DETAIL_MEMBER: &str = "message";
 
 /// The refusal both listings answer for a `nextToken` that is not a cursor this service
 /// issued for the collection being listed.

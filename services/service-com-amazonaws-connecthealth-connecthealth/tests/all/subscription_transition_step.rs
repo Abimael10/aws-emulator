@@ -44,6 +44,16 @@ use service_com_amazonaws_connecthealth_connecthealth::state::{self, Subscriptio
 use crate::arn_resolution_during_domain_deletion::web_app_setup;
 use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
 
+/// One stored subscription as it stands when a call arrives: its id, the stamp `ACTIVE`
+/// owns, the stamp `INACTIVE` owns, and the instant it was last updated — each of the
+/// three absent until the event it records has happened.
+type Snapshot = (
+    String,
+    Option<SystemTime>,
+    Option<SystemTime>,
+    Option<SystemTime>,
+);
+
 /// ONE transition operation a client addresses, and what the step it takes must leave on
 /// the record.
 struct Step {
@@ -346,7 +356,7 @@ async fn deleting_a_domain_takes_the_same_step_for_every_subscription() {
         }
 
         // The stamps and the instant each record carries when the delete arrives.
-        let snapshots: Vec<(String, Option<SystemTime>, Option<SystemTime>, SystemTime)> = {
+        let snapshots: Vec<Snapshot> = {
             let store =
                 state::service_state(&**emulator.engine()).expect("this service's own store");
             let store = store.lock();
@@ -399,8 +409,11 @@ async fn deleting_a_domain_takes_the_same_step_for_every_subscription() {
                      {:?}",
                     subscription.status
                 );
+                let stamped = subscription
+                    .last_updated_at
+                    .unwrap_or_else(|| panic!("case {case:?}: the step must stamp {id}"));
                 assert!(
-                    (before..=after).contains(&subscription.last_updated_at),
+                    (before..=after).contains(&stamped),
                     "case {case:?}: the step must move {id}'s lastUpdatedAt to the instant \
                      the delete was served, in [{before:?}, {after:?}], got {:?} (it stood \
                      at {previous_updated:?})",

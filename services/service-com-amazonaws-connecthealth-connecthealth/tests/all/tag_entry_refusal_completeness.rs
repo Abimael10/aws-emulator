@@ -350,7 +350,7 @@ fn tags_object(entries: &[(String, String)]) -> Value {
 
 /// The detail text of a refusal, in the member this service reports it in.
 fn detail(case: &str, body: &Value) -> String {
-    body.get("Message")
+    body.get("message")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: a refusal must carry a Message, got {body}"))
         .to_string()

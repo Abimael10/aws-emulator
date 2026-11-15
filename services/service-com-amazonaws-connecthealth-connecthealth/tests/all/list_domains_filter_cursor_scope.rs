@@ -52,8 +52,9 @@ const OTHER_REGION: &str = "ap-south-1";
 /// is about the narrowing, not about how many records it selects.
 const FILTERS: [Option<&str>; 4] = [None, Some("ACTIVE"), Some("DELETING"), Some("DELETED")];
 
-/// The body member a refused ConnectHealth call reports its detail text in.
-const DETAIL_MEMBER: &str = "Message";
+/// The body member a refused ConnectHealth call reports its detail text in: the Smithy
+/// member name every exception shape of this model declares (`message`, no `@jsonName`).
+const DETAIL_MEMBER: &str = "message";
 
 /// This service's refusal of a `nextToken` it did not issue for the collection being
 /// listed, as its one cursor refusal words it.

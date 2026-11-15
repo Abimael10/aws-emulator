@@ -50,8 +50,9 @@ const PAGE_SIZE_RANGE: (i64, i64) = (1, 100);
 /// page can be a partial one.
 const COLLECTION_SIZE: usize = 3;
 
-/// The body member a refused ConnectHealth call reports its detail text in.
-const DETAIL_MEMBER: &str = "Message";
+/// The body member a refused ConnectHealth call reports its detail text in: the Smithy
+/// member name every exception shape of this model declares (`message`, no `@jsonName`).
+const DETAIL_MEMBER: &str = "message";
 
 /// One paginated listing, as a case drives it.
 struct Listing {

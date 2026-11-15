@@ -101,7 +101,7 @@ async fn listed_domain_ids(emulator: &Emulator) -> Vec<String> {
 /// `pub(crate)` so a sibling suite reads a refusal's text the same way rather than growing
 /// a second copy of the reader.
 pub(crate) fn detail(case: &str, body: &Value) -> String {
-    body.get("Message")
+    body.get("message")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: a refusal must carry a Message, got {body}"))
         .to_string()

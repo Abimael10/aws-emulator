@@ -342,7 +342,7 @@ async fn an_arn_that_names_no_resource_is_refused_and_writes_nothing() {
              got {status} with {body}"
         );
         let message = body
-            .get("Message")
+            .get("message")
             .and_then(Value::as_str)
             .unwrap_or_else(|| panic!("case {case:?}: the 404 must carry a Message, got {body}"));
         assert!(

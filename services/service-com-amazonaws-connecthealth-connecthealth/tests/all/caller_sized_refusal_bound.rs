@@ -50,7 +50,7 @@ fn elision(value: &str) -> String {
 
 /// The `Message` member of a refusal body, which every refusal of this service carries.
 fn message(case: &str, body: &Value) -> String {
-    body.get("Message")
+    body.get("message")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: the refusal must carry a Message, got {body}"))
         .to_string()

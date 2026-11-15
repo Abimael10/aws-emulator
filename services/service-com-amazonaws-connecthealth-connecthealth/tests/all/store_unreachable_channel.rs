@@ -198,7 +198,7 @@ fn every_operation() -> Vec<(&'static str, &'static str, String, Option<Value>)>
 
 /// The detail text of a failure, in the member this service reports it in.
 fn detail(case: &str, body: &Value) -> String {
-    body.get("Message")
+    body.get("message")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: the failure must carry a Message, got {body}"))
         .to_string()

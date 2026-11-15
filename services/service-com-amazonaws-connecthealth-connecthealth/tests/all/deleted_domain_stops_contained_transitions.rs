@@ -89,7 +89,7 @@ struct JobRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SubscriptionRecord {
     status: SubscriptionStatus,
-    last_updated_at: SystemTime,
+    last_updated_at: Option<SystemTime>,
 }
 
 /// `StartPatientInsightsJob` under `domain_id`, asserting the modelled success, and the

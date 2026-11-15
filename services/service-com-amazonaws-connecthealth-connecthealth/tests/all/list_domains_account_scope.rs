@@ -282,7 +282,7 @@ async fn a_domain_handed_to_another_account_leaves_the_listing_and_the_cap_toget
         "a create past the account's cap must be refused, got {status} {refused}"
     );
     assert_eq!(
-        refused.get("Message").and_then(Value::as_str),
+        refused.get("message").and_then(Value::as_str),
         Some(refusal.as_str()),
         "the refusal must name the account and the cap, got {refused}"
     );
@@ -336,7 +336,7 @@ async fn a_domain_handed_to_another_account_leaves_the_listing_and_the_cap_toget
         "the create past the refilled cap must be refused, got {status} {refused}"
     );
     assert_eq!(
-        refused.get("Message").and_then(Value::as_str),
+        refused.get("message").and_then(Value::as_str),
         Some(refusal.as_str()),
         "the refusal must name the account and the cap, got {refused}"
     );

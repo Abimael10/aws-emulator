@@ -49,8 +49,9 @@ const REGION: &str = "us-west-2";
 /// The wire error code a refused domain id carries.
 const VALIDATION_CODE: &str = "ValidationException";
 
-/// The body member this service reports an exception's detail text in.
-const DETAIL_MEMBER: &str = "Message";
+/// The body member this service reports an exception's detail text in: the Smithy member
+/// name every exception shape of this model declares (`message`, no `@jsonName`).
+const DETAIL_MEMBER: &str = "message";
 
 /// The FIXED text of this service's domain-id refusal, after the value the request
 /// supplied.

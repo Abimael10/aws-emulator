@@ -14,11 +14,10 @@
 //!    succeeds with status `ACTIVE`. (That the count is per Region rather than
 //!    cross-Region is asserted in `tests/all/region_scoping.rs`; every row here is signed
 //!    for one Region.)
-//! 2. `DeleteDomain` separates an id this service ALLOCATED — whose Domain is simply
-//!    gone, the modelled 404 `ResourceNotFoundException` — from a well-formed id with no
-//!    allocation history at all, which the front door answers with
-//!    `AuthorizerConfigurationException` whose detail member is present and EMPTY (an
-//!    explicit null), carrying no text.
+//! 2. `DeleteDomain` answers a `domainId` it resolves no domain for with the modelled
+//!    404 `ResourceNotFoundException`, whose detail member names the requested id —
+//!    whether the id names a domain this service already purged or one it never minted;
+//!    the operation models no other error.
 //! 3. A Domain-not-found answer reports `Domain not found: <domainId>`, the requested id
 //!    verbatim, from whichever operation resolved the Domain.
 //! 4. `GetMedicalScribeListeningSession` resolves a session only under the exact
@@ -48,21 +47,14 @@ use service_com_amazonaws_connecthealth_connecthealth::state::{
 
 use super::domain_subscription_lifecycle::{error_code, string_at, Emulator};
 
-/// The body member ConnectHealth reports an exception's detail text in.
-const DETAIL_MEMBER: &str = "Message";
+/// The body member ConnectHealth reports an exception's detail text in: the Smithy member
+/// name every exception shape of this model declares (`message`, no `@jsonName`).
+const DETAIL_MEMBER: &str = "message";
 
-/// The member the framework's renderers would otherwise write that text under. No error
-/// body may carry the text here.
-const RENDERED_DETAIL_MEMBER: &str = "message";
-
-/// The status a front door answers an authorizer-configuration failure with — the
-/// default status of API Gateway's `AUTHORIZER_CONFIGURATION_ERROR` gateway response,
-/// which is what `DeleteDomain` of an id with no allocation history surfaces.
-const AUTHORIZER_CONFIGURATION_STATUS: u16 = 500;
-
-/// Long enough for the `DELETING` -> purged transition `state::DOMAIN_DELETION_SPAN`
-/// owes to have fallen due.
-const PAST_THE_DELETION_SPAN: Duration = Duration::from_millis(900);
+/// How long the poll below keeps looking for the purge the clock owes: many times over
+/// the span `state::DOMAIN_DELETION_SPAN` owes, so a loaded host has room while a fast
+/// one never waits at all.
+const PURGE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// A `CreateWebAppConfiguration`: what a create names to ask for a web application, the
 /// one resource a Domain owns OUTSIDE this service — and so the one whose deletion
@@ -77,10 +69,6 @@ fn web_app_setup() -> Value {
 
 /// The detail text of an error body, failing with the whole body when it carries none.
 fn detail_text(case: &str, body: &Value) -> String {
-    assert!(
-        body.get(RENDERED_DETAIL_MEMBER).is_none(),
-        "case {case:?}: the detail text must be reported under {DETAIL_MEMBER} only, got {body}"
-    );
     body.get(DETAIL_MEMBER)
         .and_then(Value::as_str)
         .unwrap_or_else(|| {
@@ -296,10 +284,24 @@ async fn a_domain_whose_deletion_is_still_in_flight_keeps_its_slot_until_the_pur
         "a deletion still in flight keeps its slot, got {status} {body:?}"
     );
 
-    // Real elapsed time is required (the handlers read `SystemTime::now()`) and the
-    // workspace `tokio` dependency does not enable the `time` feature, so this is a
-    // plain blocking sleep.
-    std::thread::sleep(PAST_THE_DELETION_SPAN);
+    // The purge the clock owes is observed by LOOKING again, not by waiting a fixed
+    // interval: it falls due at an instant, and a fixed wait would make the outcome
+    // depend on how fast the host runs.
+    let deadline = std::time::Instant::now() + PURGE_DEADLINE;
+    loop {
+        let (status, body) = emulator
+            .send("GET", &format!("/domain/{web}"), None)
+            .await;
+        if status == 404 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the record under {web} was still held after {PURGE_DEADLINE:?}, last read \
+             {status} with {body:?}"
+        );
+        ::tokio::task::yield_now().await;
+    }
     let (status, created) = emulator
         .send("POST", "/domain", Some(&json!({ "name": "after-the-purge" })))
         .await;
@@ -311,7 +313,7 @@ async fn a_domain_whose_deletion_is_still_in_flight_keeps_its_slot_until_the_pur
 }
 
 #[tokio::test]
-async fn delete_domain_separates_an_unallocated_id_from_a_domain_that_is_gone() {
+async fn delete_domain_answers_the_modelled_not_found_for_every_unresolvable_id() {
     let emulator = Emulator::new("us-east-1");
 
     // Well-formed ids this service never allocated: both modelled prefixes, both ends of
@@ -329,30 +331,27 @@ async fn delete_domain_separates_an_unallocated_id_from_a_domain_that_is_gone() 
     ];
 
     for (case, domain_id) in &unallocated {
-        // DeleteDomain: the front door cannot resolve an ARN for an id with no
-        // allocation history, so its own authorizer failure is the answer — with no
-        // detail text at all.
+        // DeleteDomain of an id this service holds no domain for: the ONE error the
+        // operation models, naming the id the request addressed. Never a 5xx — an SDK
+        // retries a server fault, and deleting a domain that is already gone is the
+        // normal idempotent-cleanup path.
         let (status, body) = emulator
             .send("DELETE", &format!("/domain/{domain_id}"), None)
             .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (
-                AUTHORIZER_CONFIGURATION_STATUS,
-                "AuthorizerConfigurationException"
-            ),
-            "case {case:?} ({domain_id}): expected the front door's refusal, got {status} \
+            (404, "ResourceNotFoundException"),
+            "case {case:?} ({domain_id}): expected the modelled not-found, got {status} \
              {body:?}"
         );
-        assert!(
-            body.get(DETAIL_MEMBER) == Some(&Value::Null)
-                && body.get(RENDERED_DETAIL_MEMBER).is_none(),
-            "case {case:?}: the refusal carries an EMPTY detail member, not text and not \
-             an absent one, got {body:?}"
+        assert_eq!(
+            detail_text(case, &body),
+            format!("Domain not found: {domain_id}"),
+            "case {case:?}: the not-found must name the requested id, got {body:?}"
         );
 
-        // A READ of the same id is the ordinary modelled not-found: the front-door
-        // distinction is the delete's alone.
+        // A READ of the same id answers the identical refusal: one sentence for one
+        // unresolvable domain, whichever operation resolved it.
         let (status, read) = emulator
             .send("GET", &format!("/domain/{domain_id}"), None)
             .await;

@@ -36,9 +36,10 @@ const SUBSCRIPTION_ARN_PATTERN: &str = r"^arn:aws:health-agent:[a-z0-9-]+:[0-9]{
 /// which the generated contract header does not restate). Asserted below at each end
 /// and one past each.
 const MAX_RESULTS_RANGE: (i64, i64) = (1, 100);
-/// Long enough for the `DELETING` -> purged transition `state::DOMAIN_DELETION_SPAN`
-/// owes to have fallen due.
-const PAST_THE_DELETION_SPAN: Duration = Duration::from_millis(900);
+/// How long a poll for the `DELETING` -> purged transition `state::DOMAIN_DELETION_SPAN`
+/// owes keeps looking: many times over that span, so a loaded host has room while a fast
+/// one never waits at all.
+const PURGE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// One emulator: the shared engine, this service mounted on it, and the region every
 /// request is signed for.
@@ -240,6 +241,24 @@ pub(crate) fn string_at(body: &Value, member: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("member {member} must be a string in {body:?}"))
         .to_string()
+}
+
+/// The member a reported subscription carries the instant of its last UPDATE in.
+pub(crate) const UPDATE_INSTANT_MEMBER: &str = "lastUpdatedAt";
+
+/// A reported subscription WITHOUT that member — what a create's 201 and a read of the
+/// record it created have in common.
+///
+/// The create reports the subscription as creation established it, so it carries no
+/// update instant for a record no call has updated, while a reader of the record reports
+/// the instant it was last written. Comparing the two on everything else is what pins
+/// that this is the ONE member they differ on.
+pub(crate) fn without_update_instant(reported: &Value) -> Value {
+    let mut stripped = reported.clone();
+    if let Some(object) = stripped.as_object_mut() {
+        object.remove(UPDATE_INSTANT_MEMBER);
+    }
+    stripped
 }
 
 fn matches(pattern: &str, value: &str) -> bool {
@@ -614,17 +633,12 @@ async fn minted_ids_and_arns_match_the_model_patterns_in_every_signed_region() {
             Some("ACTIVE"),
             "case {signed_region:?}: a new subscription is ACTIVE, got {subscription:?}"
         );
-        assert_eq!(
-            subscription.get("createdAt"),
-            subscription.get("lastUpdatedAt"),
-            "case {signed_region:?}: an untouched subscription was last updated when it was \
-             created, got {subscription:?}"
-        );
         assert!(
-            subscription.get("activatedAt").is_none()
+            subscription.get("lastUpdatedAt").is_none()
+                && subscription.get("activatedAt").is_none()
                 && subscription.get("deactivatedAt").is_none(),
-            "case {signed_region:?}: a subscription that was never activated carries neither \
-             stamp, got {subscription:?}"
+            "case {signed_region:?}: a subscription that has taken no transition carries \
+             none of the instants one records, got {subscription:?}"
         );
     }
 }
@@ -749,10 +763,21 @@ async fn subscription_status_transitions_are_persisted_and_idempotent() {
         // A read observes exactly what the transitions wrote.
         let (status, fetched) = emulator.send("GET", &path, None).await;
         assert_eq!(status, 200, "case {case:?}: GetSubscription got {fetched:?}");
+        let reported = fetched
+            .get("subscription")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: subscription in {fetched:?}"));
         assert_eq!(
-            fetched.get("subscription"),
-            Some(&last),
+            without_update_instant(&reported),
+            without_update_instant(&last),
             "case {case:?}: GetSubscription must report the stored subscription"
+        );
+        // A READ of the record reports the instant it was last written, whether or not a
+        // transition has stamped one; the create is the one response that leaves the
+        // member out until an update has happened.
+        assert!(
+            reported.get(UPDATE_INSTANT_MEMBER).is_some(),
+            "case {case:?}: a read must report {UPDATE_INSTANT_MEMBER}, got {reported:?}"
         );
 
         // And so does the list of the domain's subscriptions.
@@ -772,9 +797,15 @@ async fn subscription_status_transitions_are_persisted_and_idempotent() {
             .find(|entry| string_at(entry, "subscriptionId") == subscription_id)
             .cloned();
         assert_eq!(
-            found.as_ref(),
-            Some(&last),
+            found.as_ref().map(without_update_instant),
+            Some(without_update_instant(&last)),
             "case {case:?}: ListSubscriptions must report the stored subscription"
+        );
+        assert_eq!(
+            found.as_ref().and_then(|entry| entry.get(UPDATE_INSTANT_MEMBER)),
+            reported.get(UPDATE_INSTANT_MEMBER),
+            "case {case:?}: both readers of the record must report one \
+             {UPDATE_INSTANT_MEMBER}, got {found:?}"
         );
     }
 }
@@ -1257,12 +1288,25 @@ async fn delete_domain_moves_the_domain_to_deleting_then_purges_it() {
         );
     }
 
-    // Once the span the clock owes has elapsed, the domain is purged: it is gone from
-    // the list and every read of it is a 404.
-    // Real elapsed time is required (the handlers read `SystemTime::now()`), and the
-    // workspace `tokio` dependency does not enable the `time` feature, so this is a
-    // plain blocking sleep rather than `tokio::time::sleep(..).await`.
-    std::thread::sleep(PAST_THE_DELETION_SPAN);
+    // Once the span the clock owes has fallen due, the domain is purged: it is gone from
+    // the list and every read of it is a 404. The purge is observed by LOOKING again, not
+    // by waiting a fixed interval: it falls due at an instant, and a fixed wait would make
+    // the outcome depend on how fast the host runs.
+    let deadline = std::time::Instant::now() + PURGE_DEADLINE;
+    loop {
+        let (status, body) = emulator
+            .send("GET", &format!("/domain/{domain_id}"), None)
+            .await;
+        if status == 404 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the record under {domain_id} was still held after {PURGE_DEADLINE:?}, last \
+             read {status} with {body:?}"
+        );
+        ::tokio::task::yield_now().await;
+    }
     let (status, fetched) = emulator
         .send("GET", &format!("/domain/{domain_id}"), None)
         .await;

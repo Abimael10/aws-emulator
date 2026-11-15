@@ -61,6 +61,8 @@ mod patient_insights_output_uri_character_bound;
 mod patient_insights_runtime_refusals;
 #[path = "all/recorded_domain_identity_projection.rs"]
 mod recorded_domain_identity_projection;
+#[path = "all/recorded_refusal_and_create_members.rs"]
+mod recorded_refusal_and_create_members;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 #[path = "all/reserved_tag_key_prefix.rs"]

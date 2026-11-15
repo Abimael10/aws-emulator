@@ -90,11 +90,11 @@ async fn poll_until_unheld(emulator: &Emulator, domain_id: &str) {
     }
 }
 
-/// The `Message` member of a response body, which an error body must carry.
+/// The `message` member of a response body, which an error body must carry.
 fn detail(case: &str, body: &Value) -> String {
-    body.get("Message")
+    body.get("message")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("case {case:?}: the error body must carry a Message, got {body}"))
+        .unwrap_or_else(|| panic!("case {case:?}: the error body must carry a message, got {body}"))
         .to_string()
 }
 

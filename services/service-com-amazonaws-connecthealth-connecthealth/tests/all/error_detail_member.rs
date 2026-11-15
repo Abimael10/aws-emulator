@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Where a ConnectHealth failure reports its detail text: the `Message` member of the
+//! Where a ConnectHealth failure reports its detail text: the `message` member of the
 //! error body.
 //!
 //! The RULE under test, asserted over a table rather than one recorded response: every
 //! error this service answers carries the exception's detail text in a body member spelled
-//! `Message` — the spelling ConnectHealth uses on the wire — whichever layer produced the
-//! failure (a handler's modelled exception, or the boundary validator's refusal), and the
-//! body carries that text under no other key. The text itself is
+//! `message` — the Smithy member name every exception shape of this model declares, and
+//! so the key on the restJson1 wire — whichever layer produced the failure (a handler's
+//! modelled exception, or the boundary validator's refusal). The text itself is
 //! built from the REQUEST:
 //!
 //! * a not-found names the identifiers the request asked for — the subscription and its
@@ -40,13 +40,10 @@ use serde_json::{json, Value};
 
 use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
 
-/// The body member ConnectHealth reports an exception's detail text in.
-const DETAIL_MEMBER: &str = "Message";
-
-/// The member name the framework's restJson1 renderers would otherwise write it under —
-/// the Smithy member name of every exception shape in this model. No error body may carry
-/// the text here: a client reading one key must not find the text under the other.
-const RENDERED_DETAIL_MEMBER: &str = "message";
+/// The body member ConnectHealth reports an exception's detail text in: the Smithy member
+/// name every exception shape of this model declares (`message`, with no `@jsonName`), so
+/// it is the key the restJson1 renderers write and an SDK reads back.
+const DETAIL_MEMBER: &str = "message";
 
 /// The modelled `@range` of `maxResults` on both list operations, asserted at each bound
 /// and one past each (`smithy_query(query="operation",operation="ListSubscriptions")`
@@ -54,13 +51,8 @@ const RENDERED_DETAIL_MEMBER: &str = "message";
 const MAX_RESULTS_RANGE: (i64, i64) = (1, 100);
 
 /// The detail text an error body carries, failing with the whole body when it carries
-/// none — or carries it under the key this service does not use.
+/// none.
 fn detail_text(case: &str, body: &Value) -> String {
-    assert!(
-        body.get(RENDERED_DETAIL_MEMBER).is_none(),
-        "case {case:?}: the detail text must be reported under {DETAIL_MEMBER} only, \
-         but the body also carries {RENDERED_DETAIL_MEMBER}: {body}"
-    );
     let text = body
         .get(DETAIL_MEMBER)
         .and_then(Value::as_str)
@@ -138,7 +130,7 @@ async fn every_not_found_names_the_requested_identifiers_in_the_message_member()
         .await;
     assert_eq!(status, 200, "GetSubscription of a live subscription: {found}");
     assert!(
-        found.get(DETAIL_MEMBER).is_none() && found.get(RENDERED_DETAIL_MEMBER).is_none(),
+        found.get(DETAIL_MEMBER).is_none(),
         "a success carries no detail member, got {found}"
     );
 
@@ -162,8 +154,8 @@ async fn every_not_found_names_the_requested_identifiers_in_the_message_member()
 
     // A domain this service allocated and has since deleted: its id names a domain that
     // is GONE, so every reader of it — including the repeated delete — names it in the
-    // modelled not-found. (`DeleteDomain` of an id with NO allocation history is not a
-    // not-found at all; see `domain_account_cap_and_lookup_semantics`.)
+    // modelled not-found. (`DeleteDomain` answers that same 404 for an id this service
+    // never minted; see `domain_account_cap_and_lookup_semantics`.)
     let deleted_domain = string_at(
         &emulator
             .create_domain(&json!({ "name": "clinic-deleted" }))
@@ -347,11 +339,9 @@ async fn an_error_the_framework_renders_reports_its_text_in_the_message_member_t
         );
     }
 
-    // Every operation at the ARN-addressed tagging URI renders its refusal through the
-    // same wrapper, whichever method the request used: this service has no scaffolded
-    // operation left, so the framework's own 501 body is unreachable over HTTP here and
-    // the rename of that body is pinned by the unit test beside the wrapper
-    // (`src/service/error_detail.rs`).
+    // Every operation at the ARN-addressed tagging URI states its refusal through the
+    // same renderer, whichever method the request used: this service has no scaffolded
+    // operation left, so the framework's own 501 body is unreachable over HTTP here.
     let arn = "arn:aws:health-agent:us-west-2:000000000000:domain/dom-zzzzzzzzzzzzzzzz";
     let encoded = arn.replace(':', "%3A").replace('/', "%2F");
     // `tagKeys` is a required `@httpQuery` list of 1..50 keys

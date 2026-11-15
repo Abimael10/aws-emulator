@@ -327,7 +327,7 @@ async fn an_arn_that_names_no_resource_is_refused() {
         // The detail text is built from the REQUEST: it names the ARN the caller asked
         // for, which is what tells one 404 from another.
         let message = body
-            .get("Message")
+            .get("message")
             .and_then(Value::as_str)
             .unwrap_or_else(|| panic!("case {case:?}: the 404 must carry a Message, got {body}"));
         assert!(

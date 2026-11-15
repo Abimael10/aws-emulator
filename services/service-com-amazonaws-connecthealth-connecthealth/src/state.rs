@@ -22,8 +22,9 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    CreateSubscriptionOutput, CreateWebAppConfiguration, EncryptionContext, InputDataConfig,
-    InsightsContext, InsightsOutput, InternalServerException, MedicalScribeChannelDefinition,
+    CreateSubscriptionOutput, CreateSubscriptionRecord, CreateWebAppConfiguration,
+    EncryptionContext, InputDataConfig, InsightsContext, InsightsOutput,
+    InternalServerException, MedicalScribeChannelDefinition,
     MedicalScribeListeningSessionDetails, MedicalScribePostStreamActionSettingsResponse,
     MedicalScribePostStreamActionsResult, OutputDataConfig, PatientInsightsEncounterContext,
     PatientInsightsPatientContext, SubscriptionDescription, UserContext, ValidationException,
@@ -734,7 +735,13 @@ pub struct Subscription {
     pub arn: String,
     pub status: SubscriptionStatus,
     pub created_at: SystemTime,
-    pub last_updated_at: SystemTime,
+    /// When this record was last UPDATED, and `None` on one that still stands as its
+    /// create left it: an update instant is stamped by a transition
+    /// ([`Self::transition_to`]), and creation is not one. Every reader of the record
+    /// reports the instant it was last written, which for a never-updated record is its
+    /// own `created_at`; the CREATE response reports no `lastUpdatedAt` at all while this
+    /// is `None` (see [`CreateSubscriptionOutput`]).
+    pub last_updated_at: Option<SystemTime>,
     pub activated_at: Option<SystemTime>,
     pub deactivated_at: Option<SystemTime>,
     /// The Medical Scribe listening sessions started on this subscription, by
@@ -866,7 +873,7 @@ impl Subscription {
             SubscriptionStatus::Inactive => self.deactivated_at = Some(now),
             SubscriptionStatus::Deleted => {}
         }
-        self.last_updated_at = now;
+        self.last_updated_at = Some(now);
     }
 
     /// Start a Medical Scribe listening session on this subscription, under the
@@ -906,7 +913,7 @@ impl Subscription {
             arn: self.arn.clone(),
             status: self.status.as_wire().to_string(),
             created_at: to_timestamp(self.created_at),
-            last_updated_at: to_timestamp(self.last_updated_at),
+            last_updated_at: to_timestamp(self.last_updated_at.unwrap_or(self.created_at)),
             activated_at: self.activated_at.map(to_timestamp),
             deactivated_at: self.deactivated_at.map(to_timestamp),
         }
@@ -914,13 +921,17 @@ impl Subscription {
 
     /// This record as the `CreateSubscriptionOutput` `CreateSubscription` answers with.
     ///
-    /// `CreateSubscriptionOutput` is a distinct generated type from
-    /// `SubscriptionDescription`, but it carries the identical member set, so it is the
-    /// SAME projection re-typed rather than a second one: this re-types
-    /// [`Self::description`] member for member instead of reading the record again.
-    /// Destructuring is deliberate — if either shape gains or loses a member, this stops
-    /// compiling instead of letting the create's view of a subscription drift from the
-    /// view every other responder reports.
+    /// `CreateSubscriptionOutput` carries the same member set as
+    /// `SubscriptionDescription`, so it is the SAME projection re-typed rather than a
+    /// second one: this re-types [`Self::description`] member for member instead of
+    /// reading the record again. Destructuring is deliberate — if either shape gains or
+    /// loses a member, this stops compiling instead of letting the create's view of a
+    /// subscription drift from the view every other responder reports.
+    ///
+    /// The ONE member it does not take from that projection is `lastUpdatedAt`: a create
+    /// reports no update instant for a record no call has updated, so it is read off the
+    /// record itself (`None` until a transition stamps one) and written only when there
+    /// is one, while a READER of the record reports the instant it was last written.
     pub fn create_output(&self) -> CreateSubscriptionOutput {
         let SubscriptionDescription {
             domain_id,
@@ -928,19 +939,21 @@ impl Subscription {
             arn,
             status,
             created_at,
-            last_updated_at,
+            last_updated_at: _,
             activated_at,
             deactivated_at,
         } = self.description();
         CreateSubscriptionOutput {
-            domain_id,
-            subscription_id,
-            arn,
-            status,
-            created_at,
-            last_updated_at,
-            activated_at,
-            deactivated_at,
+            record: CreateSubscriptionRecord {
+                domain_id,
+                subscription_id,
+                arn,
+                status,
+                created_at,
+                activated_at,
+                deactivated_at,
+            },
+            last_updated_at: self.last_updated_at.map(to_timestamp),
         }
     }
 }
@@ -962,8 +975,8 @@ pub struct ComAmazonawsConnecthealthConnecthealthState {
     /// [`Self::set_tags`]; `UntagResource`/`ListTagsForResource` share it.
     pub tags_by_arn: BTreeMap<String, BTreeMap<String, String>>,
     /// Every `domainId` this service has allocated and still remembers, whether or not
-    /// the domain itself is still held — the ALLOCATION HISTORY a delete consults to
-    /// tell "this domain is gone" from "this id was never valid anywhere".
+    /// the domain itself is still held — the ALLOCATION HISTORY a mint consults, so one
+    /// id never names two domains over the life of the store.
     pub allocated_domain_ids: BTreeSet<String>,
     /// The same ids in allocation order, so the bound in
     /// [`MAX_DOMAIN_ALLOCATION_HISTORY`] drops the oldest first.
@@ -991,9 +1004,7 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         loop {
             let seq = self.next_seq();
             let candidate = mint_id("dom-", 16, seq);
-            if !self.domains.contains_key(&candidate)
-                && !self.allocated_domain_ids.contains(&candidate)
-            {
+            if !self.domains.contains_key(&candidate) && !self.has_allocated_domain(&candidate) {
                 return candidate;
             }
         }
@@ -1084,7 +1095,10 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     }
 
     /// Whether `domain_id` was ever allocated to a domain this service created.
-    pub fn has_allocated_domain(&self, domain_id: &str) -> bool {
+    ///
+    /// Read by [`Self::mint_domain_id`], so an id it hands out names no domain this
+    /// service ever created, not even one already purged.
+    fn has_allocated_domain(&self, domain_id: &str) -> bool {
         self.allocated_domain_ids.contains(domain_id)
     }
 

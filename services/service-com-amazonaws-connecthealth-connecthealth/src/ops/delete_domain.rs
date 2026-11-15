@@ -3,9 +3,8 @@
 //! @op DeleteDomain
 //! IMPLEMENTED: moves the PERSISTED domain into `DELETING` and records when the purge
 //! the clock then owes falls due; the stored record is what the response reports.
-//! Repeating the call is harmless (`@idempotent`). An id this service allocated but no
-//! longer holds is a 404 `ResourceNotFoundException`; an id it never allocated is the
-//! front door's `AuthorizerConfigurationException`.
+//! Repeating the call is harmless (`@idempotent`). A `domainId` this service resolves no
+//! domain for is the modelled 404 `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -71,11 +70,6 @@
 //!   name it, and it is the channel for the one server-side failure this handler can
 //!   meet — a store it cannot reach ([`crate::state::store_unreachable`]).
 //!
-//! Beside it, this operation answers the front door's own
-//! `AuthorizerConfigurationException` for a `domainId` that was never allocated — whose
-//! body carries an EMPTY `message` member (an explicit JSON null), see
-//! [`AuthorizerConfigurationException`].
-//!
 //! ## Beside the model
 //!
 //! The recorded 200 carries one further top-level member the model declares on no
@@ -136,170 +130,11 @@ pub enum DeleteDomainErrorModeled {
     InternalServerException(InternalServerException),
 }
 
-/// The `message` member of the `AuthorizerConfigurationException` body.
-///
-/// RECORDED behaviour: the body carries this member with an explicit JSON `null` — there
-/// is no detail text, and the requirement is that the member is PRESENT and EMPTY rather
-/// than absent, because a client branching on whether a failure carries a diagnosis reads
-/// "no message" from a null and "unknown" from an omitted member. The name is the one
-/// every exception member of this service's model carries (`message`), which
-/// [`crate::service::error_detail`] then reports under the `Message` member ConnectHealth
-/// clients read, exactly as it does for every other error body of this service. Index 0:
-/// it is this synthetic shape's only member.
-static AUTHORIZER_CONFIGURATION_MESSAGE: ::aws_smithy_schema::Schema =
-    ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "smithy.framework#AuthorizerConfigurationException$message",
-            "smithy.framework",
-            "message",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "message",
-        0,
-    )
-    .with_xml_name("Message");
-
-/// Schema for the `AuthorizerConfigurationException` this operation answers for a
-/// `domainId` with no allocation history.
-///
-/// RECORDED behaviour, not modelled: no shape of this name is in the model
-/// (`smithy_query(query="shape", shape="AuthorizerConfigurationException")` finds
-/// none), because it is not the SERVICE's error at all — it is the front door's, raised
-/// before the service resolves a resource. The shape carries ONE member, the empty
-/// `message` the recorded body spells as JSON `null` (see
-/// [`AUTHORIZER_CONFIGURATION_MESSAGE`]). Deliberately in the `smithy.framework`
-/// namespace, as `crate::scaffolded`'s synthetic shapes are, so it cannot collide with a
-/// modelled shape; the wire `__type` and the `x-amzn-errortype` header come from
-/// [`DeleteDomainError::shape_name`], not from here.
-pub static AUTHORIZER_CONFIGURATION_EXCEPTION_SCHEMA: ::aws_smithy_schema::Schema =
-    ::aws_smithy_schema::Schema::new_struct(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "smithy.framework#AuthorizerConfigurationException",
-            "smithy.framework",
-            "AuthorizerConfigurationException",
-        ),
-        ::aws_smithy_schema::ShapeType::Structure,
-        &[&AUTHORIZER_CONFIGURATION_MESSAGE],
-    );
-
-/// The front door's refusal of a `domainId` it can resolve no allocation for.
-///
-/// RECORDED behaviour: a well-formed `domainId` that was never allocated to any account
-/// is answered with the error code `AuthorizerConfigurationException` and an EMPTY
-/// message — the body's `message` member is an explicit JSON `null`, so a client reads
-/// "this failure carries no diagnosis" rather than an empty string or an absent member —
-/// rather than with the `ResourceNotFoundException` the model declares: the front door
-/// cannot resolve an ARN for an id with no allocation history, so its own authorizer
-/// failure surfaces before the service ever looks a resource up. The status is the one
-/// an API Gateway front door answers an authorizer-configuration failure with (its
-/// `AUTHORIZER_CONFIGURATION_ERROR` gateway response, default status 500).
-///
-/// A unit struct: the response body carries the discriminator and that one empty member.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AuthorizerConfigurationException;
-
-/// The HTTP status the front door answers an authorizer-configuration failure with.
-const AUTHORIZER_CONFIGURATION_STATUS: u16 = 500;
-
-impl ::std::fmt::Display for AuthorizerConfigurationException {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        write!(f, "AuthorizerConfigurationException")
-    }
-}
-
-impl ::std::error::Error for AuthorizerConfigurationException {}
-
-impl ::aws_smithy_schema::serde::SerializableStruct for AuthorizerConfigurationException {
-    fn serialize_members(
-        &self,
-        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
-    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
-        // The one member, written EMPTY: the recorded response carries no detail text,
-        // and writing text here would invent prose the real response does not have —
-        // while omitting the member entirely would make the body say nothing about
-        // whether a diagnosis exists, which is the difference a client branches on.
-        serializer.write_null(&AUTHORIZER_CONFIGURATION_MESSAGE)?;
-        Ok(())
-    }
-}
-
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::delete_domain::DeleteDomainError`).
-///
-/// Two channels, not one: the scaffold wrapper (this operation's modelled errors, plus
-/// the 501 and the `ValidationException` a handler needs for a refusal its model cannot
-/// express), and the front door's [`AuthorizerConfigurationException`], which is
-/// neither a modelled error of this operation nor a framework signal.
-#[derive(Debug)]
-pub enum DeleteDomainError {
-    /// A modelled error, the scaffold 501, or a handler refusal.
-    Scaffolded(crate::scaffolded::Scaffolded<DeleteDomainErrorModeled>),
-    /// The front door's refusal of an id with no allocation history.
-    AuthorizerConfiguration(AuthorizerConfigurationException),
-}
-
-impl ::std::fmt::Display for DeleteDomainError {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        match self {
-            Self::Scaffolded(error) => write!(f, "{error}"),
-            Self::AuthorizerConfiguration(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl ::std::error::Error for DeleteDomainError {
-    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
-        match self {
-            Self::Scaffolded(error) => error.source(),
-            Self::AuthorizerConfiguration(error) => error.source(),
-        }
-    }
-}
-
-/// Every method delegates to the channel the active variant belongs to, so the
-/// scaffold wrapper keeps rendering exactly as it does for every other operation and
-/// only the front-door variant answers its own code and status.
-impl smithy_server_runtime::OperationError for DeleteDomainError {
-    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
-        match self {
-            Self::Scaffolded(error) => error.as_serializable(),
-            Self::AuthorizerConfiguration(error) => error,
-        }
-    }
-
-    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
-        match self {
-            Self::Scaffolded(error) => error.variant_schema(),
-            Self::AuthorizerConfiguration(_) => &AUTHORIZER_CONFIGURATION_EXCEPTION_SCHEMA,
-        }
-    }
-
-    /// The wire error code (`__type`, and the `x-amzn-errortype` header restJson1
-    /// resolves an error shape from). Keep the literal as it is: it is what a client
-    /// branches on.
-    fn shape_name(&self) -> &'static str {
-        match self {
-            Self::Scaffolded(error) => error.shape_name(),
-            Self::AuthorizerConfiguration(_) => "AuthorizerConfigurationException",
-        }
-    }
-
-    fn http_status(&self) -> u16 {
-        match self {
-            Self::Scaffolded(error) => error.http_status(),
-            Self::AuthorizerConfiguration(_) => AUTHORIZER_CONFIGURATION_STATUS,
-        }
-    }
-
-    fn query_error_code(&self) -> Option<&'static str> {
-        match self {
-            Self::Scaffolded(error) => error.query_error_code(),
-            // No `awsQueryError` trait to honour: the shape is in no model, and this
-            // service speaks restJson1 in any case.
-            Self::AuthorizerConfiguration(_) => None,
-        }
-    }
-}
+/// (`crate::ops::delete_domain::DeleteDomainError`): this operation's modelled errors,
+/// plus the 501 and the `ValidationException` a handler needs for a refusal its model
+/// cannot express.
+pub type DeleteDomainError = crate::scaffolded::Scaffolded<DeleteDomainErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -307,14 +142,7 @@ impl smithy_server_runtime::OperationError for DeleteDomainError {
 /// this operation is implemented.
 impl From<DeleteDomainErrorModeled> for DeleteDomainError {
     fn from(modeled: DeleteDomainErrorModeled) -> Self {
-        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
-    }
-}
-
-/// The same for a refusal the scaffold channel words (`Scaffolded::validation`).
-impl From<crate::scaffolded::Scaffolded<DeleteDomainErrorModeled>> for DeleteDomainError {
-    fn from(scaffolded: crate::scaffolded::Scaffolded<DeleteDomainErrorModeled>) -> Self {
-        Self::Scaffolded(scaffolded)
+        crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
 
@@ -374,25 +202,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialise_due(now);
 
         let Some(domain) = store.held_domain_mut(&region, &input.domain_id) else {
-            // Which failure this is depends on whether the id was ever ALLOCATED, and
-            // BOTH halves are recorded. An id this service once minted names a domain
-            // that is gone, which is the modelled 404 — the recording for a domain that
-            // was created and then deleted answers `ResourceNotFoundException` to
-            // `GetDomain` AND to the second, double-delete `DeleteDomain`
-            // (`connecthealth.delete-domain-then-get-returns-not-found`). An id with no
-            // allocation history names nothing anywhere, so the front door cannot
-            // resolve an ARN for it and its own authorizer failure is what the caller
-            // sees (`connecthealth.delete-domain-not-found`) — a configuration fault,
-            // not a resource that was deleted. Keeping the two apart is what lets a
-            // client tell a benign idempotent delete from a request that was never valid.
-            // An id this service minted for a domain of ANOTHER Region does have an
-            // allocation history, so it takes the 404 branch: the id is one this service
-            // issued, and THIS Region simply holds no domain under it.
-            if !store.has_allocated_domain(&input.domain_id) {
-                return Err(DeleteDomainError::AuthorizerConfiguration(
-                    AuthorizerConfigurationException,
-                ));
-            }
+            // `DeleteDomain` models ONE error, `ResourceNotFoundException` at 404
+            // (`smithy_query(query="operation", operation="DeleteDomain")`), and that is
+            // what a `domainId` this Region resolves no domain for is answered with —
+            // whether the id names a domain this service already purged, one that lives
+            // in another Region, or nothing it ever minted. The id the request addressed
+            // is what tells one 404 from another, so the sentence names it through the
+            // shared constructor. A permanent client-side condition is never a 5xx: an
+            // SDK retries a server fault, so the normal idempotent-cleanup path — delete
+            // a domain that is already gone — has to terminate in "already gone".
             return Err(DeleteDomainErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::service::error_detail::domain_not_found_message(

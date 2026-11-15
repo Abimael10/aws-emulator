@@ -586,11 +586,9 @@ impl<Eng: Send + Sync + 'static> EventStreamOperation for StartMedicalScribeList
             let protocol = svc.definition().protocol();
             let response = match self.respond(protocol, req, ctx) {
                 Ok(response) => response,
-                // A failure is reported in this service's own `Message` member, the same
-                // way every other operation of this service reports one.
-                Err(error) => crate::service::error_detail::with_service_detail_member(
-                    error_response(protocol, &error),
-                ),
+                // A failure is rendered by the framework, in the modelled `message`
+                // member, the same way every other operation of this service reports one.
+                Err(error) => error_response(protocol, &error),
             };
             // One access record per request, so a refused stream is diagnosable. No
             // request payload and no credential reaches it.

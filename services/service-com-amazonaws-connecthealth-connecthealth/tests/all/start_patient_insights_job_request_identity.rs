@@ -171,7 +171,7 @@ async fn a_token_bound_to_one_parameter_set_refuses_every_other_one() {
                 "ConflictException",
                 "case {case:?}: got {refused}"
             );
-            let detail = string_at(&refused, "Message");
+            let detail = string_at(&refused, "message");
             assert!(
                 detail.contains(&token) && detail.contains(&job_id),
                 "case {case:?}: the detail must name the token and the job it is bound to \

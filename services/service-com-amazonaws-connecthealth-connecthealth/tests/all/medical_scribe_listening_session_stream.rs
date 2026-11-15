@@ -729,7 +729,7 @@ async fn a_start_outside_the_model_or_outside_a_live_scope_is_refused() {
         // This service reports an exception's detail text in its `Message` member, and a
         // refused stream is no exception to that.
         assert!(
-            body.get("Message").and_then(Value::as_str).is_some(),
+            body.get("message").and_then(Value::as_str).is_some(),
             "case {case:?}: the refusal states why, got {body:?}"
         );
         // A refused start writes nothing: the session it named is readable nowhere.

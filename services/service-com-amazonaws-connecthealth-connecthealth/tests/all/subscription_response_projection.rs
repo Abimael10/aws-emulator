@@ -4,7 +4,7 @@
 //! reports one — the create and the four readers/transitions.
 //!
 //! The rule: a stored subscription is reported by projecting the record held in state,
-//! so every operation that answers with one answers the same eight members with the same
+//! so every operation that answers with one answers the same members with the same
 //! values for the same record — `CreateSubscription`'s output and the
 //! `SubscriptionDescription` the other four return carry the identical member set
 //! (`smithy_query(query="shape", shape="CreateSubscriptionOutput,SubscriptionDescription",
@@ -12,6 +12,12 @@
 //! `domainId`, `subscriptionId`, `arn`, `status`, `createdAt`, `lastUpdatedAt`, with the
 //! optional `activatedAt` / `deactivatedAt`), so a create response and a read of the
 //! record it created cannot disagree about any of them.
+//!
+//! `lastUpdatedAt` is the ONE member the two answer differently, and that difference is
+//! itself the rule: a response reports an instant only for an event that has happened, so
+//! the create — which has updated nothing — leaves it out exactly as it leaves out
+//! `activatedAt` / `deactivatedAt`, while a READ of the record reports the instant it was
+//! last written. Every other member is compared whole.
 //!
 //! `CreateSubscription` used to write that projection out by hand while the other four
 //! went through the single-homed one in `crate::state`; both now compute it in one place,
@@ -32,22 +38,26 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::arn_resolution_during_domain_deletion::web_app_setup;
-use crate::domain_subscription_lifecycle::{string_at, Emulator};
+use crate::domain_subscription_lifecycle::{
+    string_at, without_update_instant, Emulator, UPDATE_INSTANT_MEMBER,
+};
 
-/// Every member `CreateSubscriptionOutput` and `SubscriptionDescription` declare — the
-/// two shapes the one projection fills, member for member
+/// Every member `CreateSubscriptionOutput` and `SubscriptionDescription` declare that
+/// EVERY responder reports — the identity of the record and the instant creation
+/// established
 /// (`smithy_query(query="shape", shape="CreateSubscriptionOutput,SubscriptionDescription")`).
-/// `activatedAt` and `deactivatedAt` are the two optional ones, absent until the
-/// transition each records has run.
-const REQUIRED_MEMBERS: [&str; 6] = [
+const ALWAYS_REPORTED_MEMBERS: [&str; 5] = [
     "domainId",
     "subscriptionId",
     "arn",
     "status",
     "createdAt",
-    "lastUpdatedAt",
 ];
-const OPTIONAL_MEMBERS: [&str; 2] = ["activatedAt", "deactivatedAt"];
+
+/// The members reported only once the event each one records has happened:
+/// `lastUpdatedAt` from the first update of the record (a READ of the record reports the
+/// instant it was last written), and the two transition stamps from their own transition.
+const EVENT_MEMBERS: [&str; 3] = [UPDATE_INSTANT_MEMBER, "activatedAt", "deactivatedAt"];
 
 /// One transition a row may take, as its URI segment and the status it moves the record
 /// to (`smithy_query(query="operation", operation="ActivateSubscription,DeactivateSubscription")`
@@ -64,19 +74,19 @@ fn members(body: &Value) -> BTreeSet<String> {
         .collect()
 }
 
-/// Assert `reported` carries exactly the projection's member set: every required member,
-/// and no member outside the modelled eight.
+/// Assert `reported` carries exactly the projection's member set: every member every
+/// responder reports, and no member outside the modelled eight.
 fn assert_member_set(case: &str, what: &str, reported: &Value) {
     let present = members(reported);
-    for member in REQUIRED_MEMBERS {
+    for member in ALWAYS_REPORTED_MEMBERS {
         assert!(
             present.contains(member),
             "case {case:?}: {what} must report {member}, got {present:?} in {reported:?}"
         );
     }
-    let modelled: BTreeSet<&str> = REQUIRED_MEMBERS
+    let modelled: BTreeSet<&str> = ALWAYS_REPORTED_MEMBERS
         .into_iter()
-        .chain(OPTIONAL_MEMBERS)
+        .chain(EVENT_MEMBERS)
         .collect();
     for member in &present {
         assert!(
@@ -254,27 +264,41 @@ async fn every_subscription_responder_reports_one_projection_of_the_record() {
                 "case {case:?}: CreateSubscription #{position} got {status} with {body:?}"
             );
             assert_member_set(case, "CreateSubscription", &body);
+            // The create has updated nothing, so it reports no update instant — the same
+            // reason it reports neither transition stamp.
+            assert!(
+                body.get(UPDATE_INSTANT_MEMBER).is_none(),
+                "case {case:?}: a create that has updated nothing must report no \
+                 {UPDATE_INSTANT_MEMBER}, got {body:?}"
+            );
             created.push(body);
         }
 
         // The create's projection and each reader's are one computation: for EVERY
-        // subscription in the domain, the create response is byte-for-byte the record
-        // `GetSubscription` and `ListSubscriptions` report.
+        // subscription in the domain, the create response is the record
+        // `GetSubscription` and `ListSubscriptions` report, beside the update instant a
+        // read of the record adds.
         for (position, create_response) in created.iter().enumerate() {
             let subscription_id = string_at(create_response, "subscriptionId");
             let fetched = get_subscription(&emulator, case, &domain_id, &subscription_id).await;
             assert_member_set(case, "GetSubscription", &fetched);
             assert_eq!(
-                &fetched, create_response,
+                without_update_instant(&fetched),
+                without_update_instant(create_response),
                 "case {case:?}: GetSubscription of subscription #{position} must report the \
                  record the create projected, expected {create_response:?}, got {fetched:?}"
+            );
+            assert!(
+                fetched.get(UPDATE_INSTANT_MEMBER).is_some(),
+                "case {case:?}: a read of subscription #{position} must report the instant \
+                 the record was last written, got {fetched:?}"
             );
             let listed = listed_subscription(&emulator, case, &domain_id, &subscription_id).await;
             assert_member_set(case, "ListSubscriptions", &listed);
             assert_eq!(
-                &listed, create_response,
+                &listed, &fetched,
                 "case {case:?}: the ListSubscriptions entry for subscription #{position} must \
-                 report the record the create projected, expected {create_response:?}, got \
+                 report the record GetSubscription reports, expected {fetched:?}, got \
                  {listed:?}"
             );
         }
@@ -365,9 +389,16 @@ async fn a_create_response_projects_its_own_record_and_no_neighbours() {
             )
             .await;
             assert_eq!(
-                &fetched, response,
+                without_update_instant(&fetched),
+                without_update_instant(response),
                 "case {case:?}: the reader must report this subscription's own record, \
                  expected {response:?}, got {fetched:?}"
+            );
+            assert_eq!(
+                fetched.get(UPDATE_INSTANT_MEMBER),
+                response.get("createdAt"),
+                "case {case:?}: a record no call has updated was last written when it was \
+                 created, got {fetched:?}"
             );
         }
         // Each create minted a distinct record, so the projections are distinct too.
