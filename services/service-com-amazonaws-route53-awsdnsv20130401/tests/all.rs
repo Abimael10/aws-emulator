@@ -85,6 +85,11 @@ mod health_check_monitored_alarm;
 mod health_check_not_found_message;
 #[path = "all/health_check_refusal_messages.rs"]
 mod health_check_refusal_messages;
+// Declared beside the probe suite: this one is the plain request types' STATUS
+// criterion against an endpoint this emulator serves, and a live check REPOINTED
+// at another path of it.
+#[path = "all/health_check_repointed_endpoint.rs"]
+mod health_check_repointed_endpoint;
 #[path = "all/health_check_status.rs"]
 mod health_check_status;
 #[path = "all/health_check_update_contention.rs"]

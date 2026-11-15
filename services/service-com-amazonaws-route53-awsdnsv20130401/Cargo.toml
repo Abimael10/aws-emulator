@@ -73,5 +73,12 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# Amazon S3 is mounted beside Route 53 in the repointed-endpoint suite: a health checker's
+# probe can only observe an endpoint this emulator SERVES, and a bucket serving a static
+# website is one — without it there is no endpoint for a probe to be answered 2xx from, so
+# that suite could only ever see the unreachable half of the rule.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+
 [lints]
 workspace = true

@@ -194,7 +194,10 @@ async fn settled_assessments(router: &MultiServiceRouter, case: &str, id: &str) 
 }
 
 /// The observations `GetHealthCheckLastFailureReason` reports for `id`.
-async fn last_failure_observations(
+///
+/// `pub(crate)` so a sibling suite reads the other reader of a health check's
+/// observations through the SAME request rather than growing a second copy of it.
+pub(crate) async fn last_failure_observations(
     router: &MultiServiceRouter,
     id: &str,
     case: &str,
@@ -215,7 +218,9 @@ async fn last_failure_observations(
 }
 
 /// The observations `GetHealthCheckStatus` reports for `id`.
-async fn status_observations(
+///
+/// `pub(crate)` for the same reason [`last_failure_observations`] is.
+pub(crate) async fn status_observations(
     router: &MultiServiceRouter,
     id: &str,
     case: &str,

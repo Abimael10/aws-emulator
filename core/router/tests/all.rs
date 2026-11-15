@@ -1,5 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
+//! Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
+//! `mod <name>;` pair per suite, sorted by name, and no other line.
+//!
+//! A suite no `mod` here names compiles nowhere and its tests never run; a suite left at the
+//! top level of `tests/` fails the build; and a suite declared twice is `E0428`, which fails
+//! every suite in this target. An inner doc comment (`//!`) is legal only BEFORE the first
+//! item, so these lines are the only place one may stand: past the first item one is `E0753`,
+//! which compiles no suite of this target. So add a DECLARATION below — never a note about
+//! one, in either comment form. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod`
+//! would resolve to a sibling of this file (`tests/<name>.rs`), which the layout check
+//! refuses: the `#[path]` above each `mod` is what points it into `tests/all/`.
+//! What a suite covers, and why it belongs to this cross-service target rather than to one
+//! service crate's own, belongs in that suite's own module header, where it is read beside the
+//! test it explains — not here, where one note per suite buries the list this file exists to
+//! be. `all/all_rs_is_a_canonical_declaration_list.rs`, `all/all_rs_declares_each_suite_once.rs`
+//! and `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check all three rules, for
+//! this file and for every service crate's `tests/all.rs`.
 // Single integration-test target for the router: the DECLARATION LIST, and nothing else.
 // Put a new suite at `tests/all/<name>.rs` and declare it below with one
 // `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted so the list stays sorted by
