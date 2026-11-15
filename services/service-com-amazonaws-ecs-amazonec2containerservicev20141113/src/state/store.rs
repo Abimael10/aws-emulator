@@ -2422,6 +2422,18 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         if service.status == SERVICE_INACTIVE {
             return Some(RUN_STATUS_TOMBSTONE.to_string());
         }
+        // A service the scheduler cannot place the tasks it is short of reports WHY it
+        // cannot, as the error code of that condition rather than as progress it is not
+        // making ([`PlacementShortfall`]): the shortfall is the same one its event stream
+        // states in words, and it is what tells a caller polling the service that the
+        // convergence it is waiting for will not happen until the capacity exists.
+        if let Some(shortfall) = self
+            .service_short_of_its_desired_count(service)
+            .then(|| self.service_placement_shortfall(service))
+            .flatten()
+        {
+            return Some(shortfall.run_status.to_string());
+        }
         let deleting = service.status != SERVICE_ACTIVE;
         if !deleting && !service.reached_steady_state {
             return None;
@@ -2434,6 +2446,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             }
             .to_string(),
         )
+    }
+
+    /// Whether `service` holds FEWER tasks than it wants — the state a placement its
+    /// scheduler cannot make leaves it in.
+    ///
+    /// Counted off the task records the service holds, the same tally its own
+    /// `runningCount`/`pendingCount` are read from, and only for a service whose scheduler
+    /// places its tasks at all (one deploying through a task set takes them from there).
+    pub(super) fn service_short_of_its_desired_count(&self, service: &ServiceRecord) -> bool {
+        if !service.is_active() || !service.places_tasks() {
+            return false;
+        }
+        let tally = self.service_tally(&service.cluster_name, &service.name);
+        tally.running + tally.pending < service.desired_count
     }
 
     /// Whether the scheduler still has work to do for `service`.
@@ -3422,7 +3448,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // and records why on the service's event stream.
         if placements > 0 {
             match self.placement_capacity_reason(&service, &placement) {
-                Some(reason) => self.record_placement_failure(key, &reason, now),
+                Some(shortfall) => self.record_placement_failure(key, shortfall.reason, now),
                 None => {
                     for _ in 0..placements {
                         self.place_service_task(&service, definition, &placement, region, now);
@@ -3530,9 +3556,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             return Ok(());
         }
         if to_place > 0 {
-            if let Some(reason) = self.placement_capacity_reason(&service, &placement) {
+            if let Some(shortfall) = self.placement_capacity_reason(&service, &placement) {
                 let service_key = (task_set.cluster_name.clone(), task_set.service_name.clone());
-                self.record_placement_failure(&service_key, &reason, now);
+                self.record_placement_failure(&service_key, shortfall.reason, now);
                 return Ok(());
             }
         }
@@ -3542,8 +3568,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         Ok(())
     }
 
-    /// Why the scheduler cannot place a task of `service` under `placement` right now, or
-    /// `None` when it can.
+    /// What the scheduler cannot place a task of `service` under `placement` for right
+    /// now, or `None` when it can.
     ///
     /// The capacity a placement runs on has to EXIST before Amazon ECS has anywhere to
     /// put the task: "The EC2 launch type runs your tasks on Amazon EC2 instances
@@ -3551,26 +3577,35 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// capacity), and an Auto Scaling group capacity provider's capacity is the container
     /// instances its group registers — unless the provider scales that group itself, in
     /// which case the capacity is coming and the task is parked instead
-    /// ([`awaits_provisioned_capacity`]). The sentence this answers is the one `RunTask`
-    /// refuses the same condition with, so a client reads one explanation whichever call
-    /// hit it.
+    /// ([`awaits_provisioned_capacity`]). The shortfall it answers carries both spellings
+    /// the service reports it in ([`PlacementShortfall`]), so the event stream and
+    /// `runStatus` cannot disagree about which capacity was missing.
     pub fn placement_capacity_reason(
         &self,
         service: &ServiceRecord,
         placement: &Placement,
-    ) -> Option<String> {
+    ) -> Option<PlacementShortfall> {
         if self.registered_container_instances(&service.cluster_name) > 0 {
             return None;
         }
         if needs_registered_capacity(placement.launch_type.as_deref()) {
-            return Some(NO_CONTAINER_INSTANCES_MESSAGE.to_string());
+            return Some(PlacementShortfall::CLUSTER_EMPTY);
         }
         let provider = placement
             .capacity_provider_name
             .as_deref()
             .and_then(|name| self.capacity_providers.get(name))?;
-        needs_registered_capacity_now(provider)
-            .then(|| empty_capacity_provider_message(&provider.name))
+        needs_registered_capacity_now(provider).then_some(PlacementShortfall::CAPACITY_PROVIDER_EMPTY)
+    }
+
+    /// The same, for the placement the SERVICE's own scheduler makes
+    /// ([`service_placement`]) — the shortfall a service reports about itself, whichever
+    /// call or clock pass asks.
+    pub fn service_placement_shortfall(
+        &self,
+        service: &ServiceRecord,
+    ) -> Option<PlacementShortfall> {
+        self.placement_capacity_reason(service, &service_placement(service))
     }
 
     /// Append the scheduler's own account of a placement it could not make to the

@@ -258,6 +258,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        // The secret this store authenticates its page tokens under, taken under its own
+        // lock like every other read of the store ([`crate::state::page_tokens`]).
+        let token_key = state.lock().page_token_key();
         let mut matching: Vec<Setting> = {
             let guard = state.lock();
             names
@@ -301,37 +304,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         matching.sort_by(|left, right| left.name.cmp(&right.name));
 
         // `nextToken`: "The nextToken value returned from a ListAccountSettings request
-        // indicating that more results are available" — so a token this operation never
-        // minted names no page, and is refused rather than silently read as some
+        // indicating that more results are available" — so the token carries the position
+        // the next page resumes from, authenticated under this store's own secret and bound
+        // to this listing's scope ([`crate::state::page_tokens`]): it discloses no setting
+        // name, and a value this listing never minted — or whose position names no setting
+        // at all — names no page, and is refused rather than silently read as some
         // insertion point in the sequence.
-        if let Some(token) = input.next_token.as_deref() {
-            if crate::state::account_setting_spec(token).is_none() {
-                return Err(ListAccountSettingsErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(format!(
-                            "nextToken must be a token returned by a ListAccountSettings \
-                             request; got {token:?}"
-                        )),
-                    },
-                )
-                .into());
+        let page_scope = crate::state::listing_scope(
+            Self::NAME,
+            &[
+                input.name.as_deref().unwrap_or_default(),
+                input.value.as_deref().unwrap_or_default(),
+                input.principal_arn.as_deref().unwrap_or_default(),
+            ],
+        );
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let cursor = crate::state::decode_page_token(&token_key, &page_scope, token)
+                    .filter(|cursor| crate::state::account_setting_spec(cursor).is_some());
+                let Some(cursor) = cursor else {
+                    return Err(ListAccountSettingsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "nextToken must be a token returned by a ListAccountSettings \
+                                 request; got {token:?}"
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                Some(cursor)
             }
-        }
+        };
 
         let page_size = usize::try_from(input.max_results)
             .ok()
             .filter(|max_results| *max_results > 0)
             .unwrap_or(crate::state::ACCOUNT_SETTINGS_PAGE_SIZE);
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                matching.partition_point(|setting| setting.name.as_deref().unwrap_or("") < token)
+        let start = match resume_at.as_deref() {
+            Some(cursor) => {
+                matching.partition_point(|setting| setting.name.as_deref().unwrap_or("") < cursor)
             }
             None => 0,
         };
         let end = start.saturating_add(page_size).min(matching.len());
         let settings = matching[start.min(matching.len())..end].to_vec();
         // "This value is null when there are no more results to return."
-        let next_token = matching.get(end).and_then(|setting| setting.name.clone());
+        let next_token = matching.get(end).and_then(|setting| {
+            setting
+                .name
+                .as_deref()
+                .map(|name| crate::state::encode_page_token(&token_key, &page_scope, name))
+        });
 
         Ok(ListAccountSettingsOutput {
             settings: Some(settings),

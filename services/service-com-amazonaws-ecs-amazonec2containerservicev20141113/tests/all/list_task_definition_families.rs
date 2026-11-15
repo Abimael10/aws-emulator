@@ -474,10 +474,15 @@ async fn list_task_definition_families_refuses_an_out_of_range_page_size_and_an_
         "case {case:?}: the first page is the first family in order"
     );
     let token = token.unwrap_or_else(|| panic!("case {case:?}: expected a nextToken"));
-    assert_eq!(
-        token, "resumingb",
-        "case {case:?}: the token names the family the next page starts at"
-    );
+    // The token is OPAQUE: "an opaque identifier that is only used to retrieve the next
+    // items in a list and not for other programmatic purposes", so it carries none of the
+    // family names it is walking and still resumes exactly where the page stopped.
+    for family in ["resuminga", "resumingb", "resumingc"] {
+        assert!(
+            !token.contains(family),
+            "case {case:?}: the token must not carry a family name, got {token:?}"
+        );
+    }
     deregister(&router, "resumingb", 1, case).await;
     let resumed = all_pages(
         &router,

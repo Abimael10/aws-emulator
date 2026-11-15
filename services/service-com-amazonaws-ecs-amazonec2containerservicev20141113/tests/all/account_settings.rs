@@ -251,12 +251,16 @@ async fn effective_settings_paginate_at_ten_results() {
             "case {case:?}: expected a page of {expected_page} settings, got {first_page:?}"
         );
         let token = string(&first, "nextToken", case);
-        assert_eq!(
-            token,
-            ACCOUNT_SETTINGS[expected_page].0,
-            "case {case:?}: the token must name the setting the next page starts at, got \
-             {token:?}"
-        );
+        // The token is OPAQUE — "an opaque identifier that is only used to retrieve the
+        // next items in a list and not for other programmatic purposes" — so it names the
+        // position the next page starts at without carrying any setting name, and the walk
+        // below is what proves it resumes exactly there.
+        for (name, _, _) in ACCOUNT_SETTINGS {
+            assert!(
+                !token.contains(name),
+                "case {case:?}: the token must not carry a setting name, got {token:?}"
+            );
+        }
 
         let walked = all_settings(&router, request, case).await;
         let expected: Vec<String> = ACCOUNT_SETTINGS

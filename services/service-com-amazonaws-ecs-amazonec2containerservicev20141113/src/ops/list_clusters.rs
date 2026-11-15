@@ -133,7 +133,8 @@ impl From<ListClustersErrorModeled> for ListClustersError {
 /// from: the fixed words "Invalid token " followed by the token the REQUEST carried, which
 /// is the one value a caller needs to see to know which cursor to abandon. The member's
 /// own doc calls a token "an opaque identifier that is only used to retrieve the next
-/// items in a list and not for other programmatic purposes", so nothing is read out of it.
+/// items in a list and not for other programmatic purposes", so nothing is read out of it
+/// beyond whether this store minted it ([`crate::state::page_tokens`]).
 ///
 /// Local to this operation: which class and which sentence a cursor refusal carries is a
 /// property of the OPERATION, and the listings that answer
@@ -210,18 +211,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // some insertion point in the sequence. The cluster only has to be STORED,
         // whatever its status: a token minted mid-walk still resumes after the cluster it
         // names has been deleted out of this listing.
+        // `nextToken`: "This token should be treated as an opaque identifier that is only
+        // used to retrieve the next items in a list and not for other programmatic
+        // purposes." So the token carries the position the next page resumes from,
+        // authenticated under this store's own secret ([`crate::state::page_tokens`]): it
+        // discloses no cluster of the account, and a value this listing never minted names
+        // no page — the bad parameter it is, rather than some insertion point in the
+        // sequence.
+        let page_scope = crate::state::listing_scope(Self::NAME, &[]);
+        let token_key = guard.page_token_key();
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) if guard.clusters.values().any(|cluster| cluster.arn == token) => {
-                Some(token.to_string())
-            }
             Some(token) => {
-                return Err(ListClustersErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(invalid_next_token_message(token)),
-                    },
-                )
-                .into())
+                match crate::state::decode_page_token(&token_key, &page_scope, token) {
+                    Some(cursor) => Some(cursor),
+                    None => {
+                        return Err(ListClustersErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(invalid_next_token_message(token)),
+                            },
+                        )
+                        .into())
+                    }
+                }
             }
         };
 
@@ -244,8 +256,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .max_results
             .and_then(|max_results| usize::try_from(max_results).ok())
             .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
-        // The token is the ARN the next page starts at, so a page is unaffected by
-        // clusters created or deleted before it.
+        // The cursor is the position of the next page in the walk, so a page is unaffected
+        // by clusters created or deleted before it.
         let start = match resume_at.as_deref() {
             Some(resume) => matching.partition_point(|arn| arn.as_str() < resume),
             None => 0,
@@ -255,7 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let end = start.saturating_add(page_size).min(matching.len());
         let cluster_arns = matching[start..end].to_vec();
         // "This value is null when there are no more results to return."
-        let next_token = matching.get(end).cloned();
+        let next_token = matching
+            .get(end)
+            .map(|arn| crate::state::encode_page_token(&token_key, &page_scope, arn));
 
         Ok(ListClustersOutput {
             cluster_arns: Some(cluster_arns),

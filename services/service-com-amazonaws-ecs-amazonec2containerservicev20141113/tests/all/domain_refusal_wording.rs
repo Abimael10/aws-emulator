@@ -37,6 +37,8 @@
 //! nothing reaches into the state struct and a response that is not computed from
 //! persisted state cannot pass.
 
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -56,6 +58,11 @@ const CLIENT_EXCEPTION: &str = "ClientException";
 
 /// The modelled error every other refusal here carries.
 const INVALID_PARAMETER: &str = "InvalidParameterException";
+
+/// How long a wait for a cluster's attachments update to finish keeps re-reading the
+/// cluster. Generous — the wait stops the instant the condition holds — so a loaded test
+/// machine cannot make it fail.
+const ATTACHMENTS_BUDGET: Duration = Duration::from_secs(30);
 
 /// The Amazon ECS quota "Capacity providers per cluster", which bounds both lists a
 /// cluster's association may carry, from this crate's own statement of it.
@@ -711,8 +718,10 @@ async fn a_capacity_provider_that_does_not_exist_is_refused_and_changes_no_assoc
         "setup",
     )
     .await;
-    // The association the refused calls must leave alone, written by the create so no
-    // attachments update is in flight while the rows run.
+    // The association the refused calls must leave alone. Associating capacity providers
+    // puts the cluster's attachments in flight, so the setup waits for the update the
+    // create started to finish before the rows run: a cluster mid-update refuses a put for
+    // its own reason, which is not the refusal under test here.
     ok(
         &router,
         "CreateCluster",
@@ -726,6 +735,20 @@ async fn a_capacity_provider_that_does_not_exist_is_refused_and_changes_no_assoc
         "setup",
     )
     .await;
+    let deadline = Instant::now() + ATTACHMENTS_BUDGET;
+    loop {
+        let cluster =
+            described_cluster(&router, "unknownprovider", json!(["ATTACHMENTS"]), "setup").await;
+        if cluster["attachmentsStatus"] == json!("UPDATE_COMPLETE") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case \"setup\": expected the attachments update the create started to finish, \
+             got {cluster}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let before = described_cluster(&router, "unknownprovider", json!(["ATTACHMENTS"]), "setup").await;
 
     // The rows differ along which list carries the unknown name, how many names the list

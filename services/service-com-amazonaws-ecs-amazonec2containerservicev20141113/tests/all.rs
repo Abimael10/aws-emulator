@@ -37,6 +37,10 @@ mod capacity_provider_surface;
 mod capacity_providers;
 #[path = "all/classic_load_balancer_attachments.rs"]
 mod classic_load_balancer_attachments;
+// What a cluster reports while the capacity providers a request associated with it are
+// being attached, and the clock-owed completion a client waits for.
+#[path = "all/cluster_attachment_updates.rs"]
+mod cluster_attachment_updates;
 #[path = "all/cluster_capacity_and_statistics.rs"]
 mod cluster_capacity_and_statistics;
 #[path = "all/cluster_create_idempotency.rs"]
@@ -157,10 +161,19 @@ mod managed_instances_provider_members;
 mod mutating_request_authorization;
 #[path = "all/name_pattern_refusals.rs"]
 mod name_pattern_refusals;
+// Every paginated read's `nextToken` is an opaque handle: it carries no identifier of what
+// the listing walks, resumes exactly where its page stopped, and a value the listing never
+// minted names no position.
+#[path = "all/opaque_page_tokens.rs"]
+mod opaque_page_tokens;
 #[path = "all/page_size_range_refusals.rs"]
 mod page_size_range_refusals;
 #[path = "all/placement_resolution.rs"]
 mod placement_resolution;
+// What a service reports while its scheduler cannot place the tasks it wants: the error
+// code `runStatus` classifies the shortfall with, and the event that states it in words.
+#[path = "all/placement_shortfall_reporting.rs"]
+mod placement_shortfall_reporting;
 #[path = "all/primary_task_set.rs"]
 mod primary_task_set;
 // Pins the Managed Instances launch template's `monitoring` option; the module name

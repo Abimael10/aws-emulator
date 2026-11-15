@@ -301,19 +301,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .max_results
             .and_then(|max_results| usize::try_from(max_results).ok())
             .unwrap_or(crate::state::DEFAULT_LIST_DAEMON_DEPLOYMENTS_PAGE_SIZE);
-        // The token this operation mints is the ARN of the deployment the next page starts
-        // at — "an opaque identifier that is only used to retrieve the next items in a
-        // list" — so a page is unaffected by deployments started before it. A value that
-        // names no deployment of this daemon names no page: a `ClientException`, the error
-        // for a request "specifying an identifier that isn't valid", rather than some
-        // insertion point in the sequence.
+        // The token is OPAQUE ("an opaque identifier that is only used to retrieve the next
+        // items in a list and not for other programmatic purposes"): it carries the
+        // position the next page resumes from, authenticated under this store's own secret
+        // and bound to this listing's scope ([`crate::state::page_tokens`]), so it discloses
+        // no deployment of the daemon. A value this listing never minted, and one whose
+        // position names no deployment of this daemon, name no page: a `ClientException`,
+        // the error for a request "specifying an identifier that isn't valid", rather than
+        // some insertion point in the sequence.
+        let page_scope = crate::state::listing_scope(Self::NAME, &[&daemon_arn]);
+        let token_key = guard.page_token_key();
         let start = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
-                let Some(resume) = matching
-                    .iter()
-                    .find(|deployment| deployment.arn == token)
-                    .map(|deployment| deployment.order_key())
+                let Some(resume) =
+                    crate::state::decode_page_token(&token_key, &page_scope, token).and_then(
+                        |cursor| {
+                            matching
+                                .iter()
+                                .find(|deployment| deployment.arn == cursor)
+                                .map(|deployment| deployment.order_key())
+                        },
+                    )
                 else {
                     return Err(ListDaemonDeploymentsErrorModeled::ClientException(
                         ClientException {
@@ -331,7 +340,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|deployment| deployment.summary())
             .collect();
         // "This value is null when there are no more results to return."
-        let next_token = matching.get(end).map(|deployment| deployment.arn.clone());
+        let next_token = matching.get(end).map(|deployment| {
+            crate::state::encode_page_token(&token_key, &page_scope, &deployment.arn)
+        });
 
         Ok(ListDaemonDeploymentsOutput {
             daemon_deployments: Some(daemon_deployments),

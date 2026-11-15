@@ -447,10 +447,22 @@ async fn list_clusters_refuses_an_out_of_range_page_size_and_an_unminted_token()
         "case {case:?}: the first page is the first cluster in order"
     );
     let token = token.unwrap_or_else(|| panic!("case {case:?}: expected a nextToken"));
-    assert_eq!(
-        token, ordered[1],
-        "case {case:?}: the token names the cluster the next page starts at"
-    );
+    // The token is OPAQUE: "an opaque identifier that is only used to retrieve the next
+    // items in a list and not for other programmatic purposes", so it carries none of the
+    // clusters it is walking — neither the ARN of the one the next page starts at nor its
+    // name — and still resumes exactly there.
+    for arn in &ordered {
+        assert!(
+            !token.contains(arn.as_str()),
+            "case {case:?}: the token must not carry a cluster ARN, got {token:?}"
+        );
+    }
+    for name in ["resuminga", "resumingb", "resumingc"] {
+        assert!(
+            !token.contains(name),
+            "case {case:?}: the token must not carry a cluster name, got {token:?}"
+        );
+    }
     delete(&router, "resumingb", case).await;
     let resumed = all_pages(
         &router,

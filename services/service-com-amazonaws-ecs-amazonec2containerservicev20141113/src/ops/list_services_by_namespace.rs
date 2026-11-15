@@ -218,6 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
         let known_here = guard.knows_namespace(&input.namespace);
+        // The secret this store authenticates its page tokens under, taken while the guard
+        // is held: the cursor below is minted and read with it once the cross-service read
+        // has dropped the guard ([`crate::state::page_tokens`]).
+        let token_key = guard.page_token_key();
         // A service the caller deleted is no longer one of the namespace's services, the
         // same rule `ListServices` lists a cluster's services under.
         let joined: Vec<(String, String)> = guard
@@ -288,17 +292,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .max_results
             .and_then(|max_results| usize::try_from(max_results).ok())
             .unwrap_or(crate::state::DEFAULT_LIST_SERVICES_PAGE_SIZE);
-        // The token is the ARN the next page starts at — "an opaque identifier that is
-        // only used to retrieve the next items in a list" — so a page is unaffected by
-        // services created or deleted before it.
+        // The token is OPAQUE ("an opaque identifier that is only used to retrieve the next
+        // items in a list and not for other programmatic purposes"): it carries the
+        // position the next page resumes from, authenticated under this store's own secret
+        // and bound to this listing's scope ([`crate::state::page_tokens`]), so it discloses
+        // no service of the namespace and a value this listing never minted names no page at
+        // all. A page is unaffected by services created or deleted before it.
+        let page_scope = crate::state::listing_scope(Self::NAME, &[&wanted.to_string()]);
         let start = match input.next_token.as_deref() {
-            Some(token) => matching.partition_point(|arn| arn.as_str() < token),
+            Some(token) => {
+                let Some(cursor) =
+                    crate::state::decode_page_token(&token_key, &page_scope, token)
+                else {
+                    return Err(ListServicesByNamespaceErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                };
+                matching.partition_point(|arn| *arn < cursor)
+            }
             None => 0,
         };
         let end = start.saturating_add(page_size).min(matching.len());
         let service_arns = matching[start.min(matching.len())..end].to_vec();
         // "When there are no more results to return, this value is null."
-        let next_token = matching.get(end).cloned();
+        let next_token = matching
+            .get(end)
+            .map(|arn| crate::state::encode_page_token(&token_key, &page_scope, arn));
 
         Ok(ListServicesByNamespaceOutput {
             service_arns: Some(service_arns),

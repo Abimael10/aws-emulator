@@ -280,10 +280,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .max_results
             .and_then(|max_results| usize::try_from(max_results).ok())
             .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
-        // The token is the ARN the next page starts at, so a page is unaffected by
-        // instances registered or deregistered before it.
+        // The token is OPAQUE ("an opaque identifier that is only used to retrieve the next
+        // items in a list and not for other programmatic purposes"): it carries the
+        // position the next page resumes from, authenticated under this store's own secret
+        // and bound to this listing's scope ([`crate::state::page_tokens`]), so it discloses
+        // no instance of the cluster and a value this listing never minted names no page at
+        // all. A page is unaffected by instances registered or deregistered before it.
+        let page_scope = crate::state::listing_scope(Self::NAME, &[&cluster_name]);
+        let token_key = guard.page_token_key();
         let start = match input.next_token.as_deref() {
-            Some(token) => matching.partition_point(|arn| arn.as_str() < token),
+            Some(token) => {
+                let Some(cursor) =
+                    crate::state::decode_page_token(&token_key, &page_scope, token)
+                else {
+                    return Err(ListContainerInstancesErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                };
+                matching.partition_point(|arn| *arn < cursor)
+            }
             None => 0,
         };
         // `start` is a `partition_point` result, so it never exceeds the length, and
@@ -291,7 +309,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let end = start.saturating_add(page_size).min(matching.len());
         let container_instance_arns = matching[start..end].to_vec();
         // "This value is null when there are no more results to return."
-        let next_token = matching.get(end).cloned();
+        let next_token = matching
+            .get(end)
+            .map(|arn| crate::state::encode_page_token(&token_key, &page_scope, arn));
 
         Ok(ListContainerInstancesOutput {
             container_instance_arns: Some(container_instance_arns),

@@ -360,6 +360,16 @@ pub use capacity_provider_deletion::*;
 mod daemon_scheduling;
 pub use daemon_scheduling::*;
 
+/// How a service reports a placement its scheduler cannot make: the event's reason clause
+/// and the `runStatus` code that classify the same shortfall.
+mod placement_reporting;
+pub use placement_reporting::*;
+
+/// The OPAQUE continuation token every paginated read of this service hands out, and how it
+/// tells one it minted from one a caller assembled.
+mod page_tokens;
+pub use page_tokens::*;
+
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
 /// credential scope to read a region from). `emulator_arn`'s own documented default.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -2042,13 +2052,15 @@ pub fn stored_scale(requested: Option<&Scale>) -> Scale {
 /// The service event the scheduler writes when it wants to place a task and cannot.
 ///
 /// The Amazon ECS service event message for a placement that finds no instance to run
-/// on, whose `reason` sentence says WHICH capacity was missing — the same sentence
-/// `RunTask` refuses with, since both describe the one condition.
+/// on, whose `reason` sentence says WHICH capacity was missing
+/// ([`PlacementShortfall::reason`]). Everything around that clause is AWS's own fixed
+/// text, `The reason for failure is` included; the service name is the only other value
+/// the sentence carries.
 pub fn unable_to_place_message(service_name: &str, reason: &str) -> String {
     format!(
         "(service {service_name}) was unable to place a task because no container instance \
-         met all of its requirements. Reason: {reason} For more information, see the \
-         Troubleshooting section of the Amazon ECS Developer Guide."
+         met all of its requirements. The reason for failure is {reason} For more \
+         information, see the Troubleshooting section of the Amazon ECS Developer Guide."
     )
 }
 
@@ -2393,14 +2405,15 @@ impl TaskDefinitionRefusal {
     }
 }
 
-/// `ClientException$message` for a `nextToken` a paginated read cannot resume from: a
-/// value the operation never minted. ONE fixed sentence naming the member and no value.
+/// `message` for a `nextToken` a paginated read cannot resume from: a value the operation
+/// never minted ([`page_tokens`]). ONE fixed sentence naming the member and no value.
 ///
-/// Which CLASS and which sentence a cursor refusal takes is a property of the OPERATION,
-/// not of the condition: this is the one the task-definition, attribute and
-/// service-deployment listings answer (the corpus pins `ListTaskDefinitions` to it),
-/// while `ListClusters` answers [`invalid_next_token_message`] under
-/// `InvalidParameterException`.
+/// Which CLASS a cursor refusal takes is a property of the OPERATION, not of the condition:
+/// the task-definition, attribute, daemon-deployment and service-deployment listings answer
+/// this sentence under `ClientException` (the corpus pins `ListTaskDefinitions` to it) and
+/// the other paginated reads answer it under `InvalidParameterException`, while
+/// `ListClusters` words its own sentence (see that operation's
+/// `invalid_next_token_message`).
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid nextToken.";
 
 /// `InvalidParameterException$message` for a caller-supplied list that names more entries
@@ -4306,6 +4319,12 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// [`container_runtime`]). An entry exists only while the container's program is being
     /// run, so the map is the set of containers that are really executing.
     container_runs: HashMap<String, ContainerRun>,
+    /// The secret this store's `nextToken` values are authenticated under, drawn from the
+    /// system's randomness when the store is created and never reported — see
+    /// [`page_tokens`]. It is what lets a paginated read tell a token it minted from one a
+    /// caller assembled, so the position a token names cannot be forged or carried over to
+    /// another listing.
+    page_token_key: PageTokenKey,
     /// `containerArn` -> the in-process task performing that container's HEALTH-CHECK probe
     /// (see [`container_health`]). Kept for the same reason the runs above keep theirs: a
     /// probe whose container is gone is ABORTED rather than merely forgotten, so no probe

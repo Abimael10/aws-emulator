@@ -248,23 +248,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `nextToken`: "This token should be treated as an opaque identifier that is only
         // used to retrieve the next items in a list and not for other programmatic
-        // purposes." This operation mints it as the `<targetId>|<name>` of the attribute
-        // the next page starts at, so a value of any other shape is an identifier that
-        // names no page — a `ClientException`, the error for a request "specifying an
-        // identifier that isn't valid".
+        // purposes." So the token carries the `<targetId>|<name>` of the attribute the next
+        // page starts at, authenticated under this store's own secret and bound to this
+        // listing's scope ([`crate::state::page_tokens`]): it discloses no attribute of the
+        // cluster, and a value this listing never minted — or one carrying a position of any
+        // other shape — is an identifier that names no page, a `ClientException`, the error
+        // for a request "specifying an identifier that isn't valid".
+        let page_scope = crate::state::listing_scope(
+            Self::NAME,
+            &[
+                &cluster_name,
+                input.attribute_name.as_deref().unwrap_or_default(),
+                input.attribute_value.as_deref().unwrap_or_default(),
+            ],
+        );
+        let token_key = guard.page_token_key();
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match token.split_once(ATTRIBUTE_PAGE_TOKEN_SEPARATOR) {
-                Some((target_id, name)) if !target_id.is_empty() && !name.is_empty() => {
-                    Some((target_id.to_string(), name.to_string()))
-                }
-                _ => {
-                    return Err(ListAttributesErrorModeled::ClientException(ClientException {
-                        message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+            Some(token) => {
+                match crate::state::decode_page_token(&token_key, &page_scope, token)
+                    .and_then(|cursor| {
+                        let (target_id, name) =
+                            cursor.split_once(ATTRIBUTE_PAGE_TOKEN_SEPARATOR)?;
+                        (!target_id.is_empty() && !name.is_empty())
+                            .then(|| (target_id.to_string(), name.to_string()))
                     })
-                    .into())
+                {
+                    Some(position) => Some(position),
+                    None => {
+                        return Err(ListAttributesErrorModeled::ClientException(
+                            ClientException {
+                                message: Some(
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into())
+                    }
                 }
-            },
+            }
         };
 
         // "When you specify a target type and cluster, ListAttributes returns a list of
@@ -341,14 +363,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
         // "This value is null when there are no more results to return."
-        let next_token = matching
-            .get(end)
-            .map(|(target_id, attribute)| {
-                format!(
+        let next_token = matching.get(end).map(|(target_id, attribute)| {
+            crate::state::encode_page_token(
+                &token_key,
+                &page_scope,
+                &format!(
                     "{target_id}{ATTRIBUTE_PAGE_TOKEN_SEPARATOR}{}",
                     attribute.name
-                )
-            });
+                ),
+            )
+        });
 
         Ok(ListAttributesOutput {
             attributes: Some(attributes),

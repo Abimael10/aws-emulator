@@ -39,9 +39,10 @@ const ONE_SPAN: Duration = Duration::from_millis(900);
 const UNABLE_TO_PLACE: &str =
     "was unable to place a task because no container instance met all of its requirements.";
 
-/// The `reason` sentence that message carries when the cluster holds no container
-/// instance at all — the same sentence `RunTask` refuses the condition with.
-const NO_INSTANCES_REASON: &str = "Reason: No Container Instances were found in your cluster.";
+/// The `reason` clause that message carries when the cluster holds no container
+/// instance at all, behind AWS's own fixed connective.
+const NO_INSTANCES_REASON: &str =
+    "The reason for failure is No Container Instances were found in your cluster.";
 
 /// Register one Fargate-capable revision of `family` (`awsvpc` plus task-level cpu and
 /// memory), so a case may place it under either launch type.
@@ -691,7 +692,10 @@ async fn the_scheduler_records_why_it_could_not_place_a_task_and_keeps_the_desir
             "a provider that will not scale its group",
             Capacity::UnscaledProvider,
             2,
-            Some("Reason: The specified capacity provider 'unscaled' contains no container instances."),
+            Some(
+                "The reason for failure is No Container Instances were found in your \
+                 capacity provider.",
+            ),
         ),
         (
             "a Fargate service needs no registered capacity",

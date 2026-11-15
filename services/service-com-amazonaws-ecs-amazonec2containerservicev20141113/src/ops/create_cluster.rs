@@ -321,6 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let now = ::std::time::SystemTime::now();
         // What this request asks the cluster to BE — every input member but the name,
         // which is the identity a repeat is keyed on. Borrowed off the request before the
         // store is locked, and read below only when the name is already taken.
@@ -340,7 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut guard = state.lock();
-        guard.advance_clock(::std::time::SystemTime::now());
+        guard.advance_clock(now);
 
         // A `capacityProviders` list associates providers with the cluster as it is
         // created, so every name it carries — and every one its default strategy names —
@@ -413,7 +414,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let record = crate::state::ClusterRecord {
+        let mut record = crate::state::ClusterRecord {
             name: name.clone(),
             arn: crate::state::cluster_arn(&region, &name),
             status: crate::state::CLUSTER_ACTIVE.to_string(),
@@ -429,13 +430,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .service_connect_defaults
                 .as_ref()
                 .and_then(|defaults| crate::state::service_connect_defaults(&defaults.namespace)),
-            // The capacity providers this request associates are recorded above; the
-            // attachments update a LATER association starts is
-            // `PutClusterCapacityProviders`' business, and a cluster that was created
-            // with its providers has none in flight to report.
+            // The association this request makes is applied below, which is what puts the
+            // cluster's attachments in flight; a cluster created with no capacity provider
+            // has no attachment to update and reports no status at all.
             attachments_status: None,
             attachments_update_due_at: None,
         };
+        // Associating capacity providers with a cluster is what updates its ATTACHMENTS —
+        // `Cluster$attachments`: "When using a capacity provider with a cluster, the
+        // capacity provider and associated resources are returned as cluster attachments"
+        // — so a create that associates one leaves the cluster's attachments updating
+        // exactly as a later `PutClusterCapacityProviders` does, and the CLOCK completes
+        // it ([`crate::state::ClusterRecord::start_attachments_update`]). A create that
+        // associates none changes no attachment, so there is nothing to report.
+        if !record.capacity_providers.is_empty()
+            || !record.default_capacity_provider_strategy.is_empty()
+        {
+            record.start_attachments_update(now);
+        }
         let view = guard.cluster_mutation_view(&record, true);
         guard.clusters.insert(name.clone(), record);
 

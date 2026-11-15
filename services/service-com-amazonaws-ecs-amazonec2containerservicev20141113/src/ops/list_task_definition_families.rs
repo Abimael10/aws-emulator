@@ -201,31 +201,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = state.lock();
 
         // `nextToken`: "This token should be treated as an opaque identifier that is only
-        // used to retrieve the next items in a list". This operation mints it as the NAME
-        // of the family the next page starts at, so a value that names no family this
-        // account holds a revision of is an identifier that names no page — a
-        // `ClientException`, the error for a request "specifying an identifier that isn't
-        // valid" — rather than being read as some insertion point in the sequence. The
+        // used to retrieve the next items in a list". So the token carries the NAME of the
+        // family the next page starts at, authenticated under this store's own secret and
+        // bound to this listing's scope ([`crate::state::page_tokens`]): it discloses no
+        // family of the account, and a value this listing never minted — or whose position
+        // names no family this account holds a revision of — is an identifier that names no
+        // page, a `ClientException`, the error for a request "specifying an identifier that
+        // isn't valid", rather than being read as some insertion point in the sequence. The
         // family only has to be STORED, whatever its revisions' status: a token minted
         // mid-walk still resumes after the family it names has dropped out of this
         // listing's own filter.
+        let page_scope = crate::state::listing_scope(
+            Self::NAME,
+            &[
+                input.family_prefix.as_deref().unwrap_or_default(),
+                input.status.as_deref().unwrap_or_default(),
+            ],
+        );
+        let token_key = guard.page_token_key();
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token)
-                if guard
-                    .task_definitions
-                    .keys()
-                    .any(|(family, _)| family == token) =>
-            {
-                Some(token.to_string())
-            }
-            Some(_) => {
-                return Err(ListTaskDefinitionFamiliesErrorModeled::ClientException(
-                    ClientException {
-                        message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+            Some(token) => {
+                match crate::state::decode_page_token(&token_key, &page_scope, token).filter(
+                    |cursor| {
+                        guard
+                            .task_definitions
+                            .keys()
+                            .any(|(family, _)| family == cursor)
                     },
-                )
-                .into())
+                ) {
+                    Some(cursor) => Some(cursor),
+                    None => {
+                        return Err(ListTaskDefinitionFamiliesErrorModeled::ClientException(
+                            ClientException {
+                                message: Some(
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into())
+                    }
+                }
             }
         };
 
@@ -291,7 +307,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|family| (*family).to_string())
             .collect();
         // "This value is null when there are no more results to return."
-        let next_token = matching.get(end).map(|family| (*family).to_string());
+        let next_token = matching
+            .get(end)
+            .map(|family| crate::state::encode_page_token(&token_key, &page_scope, family));
 
         Ok(ListTaskDefinitionFamiliesOutput {
             families: Some(families),

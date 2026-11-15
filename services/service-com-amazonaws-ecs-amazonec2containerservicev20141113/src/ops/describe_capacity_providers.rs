@@ -314,10 +314,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|max_results| usize::try_from(max_results).ok())
             .unwrap_or(crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE)
             .min(crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE);
-        // The token is the NAME the next page starts at, so a page is unaffected by
+        // The token is OPAQUE ("This token should be treated as an opaque identifier that
+        // is only used to retrieve the next items in a list and not for other programmatic
+        // purposes"): it carries the position the next page resumes from, authenticated
+        // under this store's own secret and bound to this read's scope
+        // ([`crate::state::page_tokens`]), so it discloses no provider of the account and a
+        // value this read never minted names no page at all. A page is unaffected by
         // providers created or deleted before it.
+        let page_scope = crate::state::listing_scope(Self::NAME, &[]);
+        let token_key = guard.page_token_key();
         let start = match input.next_token.as_deref() {
-            Some(token) => matching.partition_point(|provider| provider.name.as_str() < token),
+            Some(token) => {
+                let Some(cursor) =
+                    crate::state::decode_page_token(&token_key, &page_scope, token)
+                else {
+                    return Err(DescribeCapacityProvidersErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                };
+                matching.partition_point(|provider| provider.name < cursor)
+            }
             None => 0,
         };
         let end = start.saturating_add(page_size).min(matching.len());
@@ -326,7 +345,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|provider| provider.view(include_tags))
             .collect();
         // "This value is null when there are no more results to return."
-        let next_token = matching.get(end).map(|provider| provider.name.clone());
+        let next_token = matching
+            .get(end)
+            .map(|provider| crate::state::encode_page_token(&token_key, &page_scope, &provider.name));
 
         Ok(DescribeCapacityProvidersOutput {
             capacity_providers: Some(capacity_providers),

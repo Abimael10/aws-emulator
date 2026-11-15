@@ -122,6 +122,9 @@ base64 = "0.22"
 # created in, parsed to take the address that interface is given out of that subnet's own
 # range (`state::task_interfaces`). Already in this workspace's lock file.
 ipnet = "2"
+# `hex`: the HEXADECIMAL spelling the authenticated bytes of a paginated read's `nextToken`
+# travel as, so the token is one word of URL- and log-safe text (`state::page_tokens`).
+hex = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -146,7 +149,6 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 # EventBridge and Amazon SQS are mounted beside Amazon ECS on one engine in the integration
 # tests, because this service publishes an `ECS Task State Change` event onto the default
 # event bus as a task moves and a rule on that bus delivers it to an SQS queue: without them

@@ -213,32 +213,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `nextToken`: "The nextToken value returned from a ListTaskDefinitions request
         // indicating that more results are available ... This token should be treated as
         // an opaque identifier that is only used to retrieve the next items in a list".
-        // This operation mints it as the `family:revision` of the revision the next page
-        // starts at, so a value that does not name a revision this account holds is an
-        // identifier that names no page — a `ClientException`, the error for a request
-        // "specifying an identifier that isn't valid" — rather than being read as some
-        // insertion point in the sequence. The revision itself only has to be STORED, in
-        // any status: a token minted mid-walk still resumes after the revision it names
-        // has been deregistered out of the listing.
+        // So the token carries the `family:revision` the next page starts at, authenticated
+        // under this store's own secret and bound to this listing's scope
+        // ([`crate::state::page_tokens`]): it discloses no revision of the account, and a
+        // value this listing never minted — or whose position names no revision this
+        // account holds — is an identifier that names no page, a `ClientException`, the
+        // error for a request "specifying an identifier that isn't valid", rather than being
+        // read as some insertion point in the sequence. The revision itself only has to be
+        // STORED, in any status: a token minted mid-walk still resumes after the revision it
+        // names has been deregistered out of the listing.
+        let page_scope = crate::state::listing_scope(
+            Self::NAME,
+            &[input.family_prefix.as_deref().unwrap_or_default(), status],
+        );
+        let token_key = guard.page_token_key();
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::parse_task_definition_reference(token) {
-                Some((family, Some(revision)))
-                    if guard
-                        .task_definitions
-                        .contains_key(&(family.clone(), revision)) =>
+            Some(token) => {
+                match crate::state::decode_page_token(&token_key, &page_scope, token)
+                    .as_deref()
+                    .and_then(crate::state::parse_task_definition_reference)
                 {
-                    Some((family, revision))
+                    Some((family, Some(revision)))
+                        if guard
+                            .task_definitions
+                            .contains_key(&(family.clone(), revision)) =>
+                    {
+                        Some((family, revision))
+                    }
+                    _ => {
+                        return Err(ListTaskDefinitionsErrorModeled::ClientException(
+                            ClientException {
+                                message: Some(
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into())
+                    }
                 }
-                _ => {
-                    return Err(ListTaskDefinitionsErrorModeled::ClientException(
-                        ClientException {
-                            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
-                        },
-                    )
-                    .into())
-                }
-            },
+            }
         };
         // "Returns a list of task definitions that are registered to your account" —
         // every stored revision, narrowed by the filters the request sets. Each entry
@@ -292,9 +306,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(_, _, arn)| arn.clone())
             .collect();
         // "This value is null when there are no more results to return."
-        let next_token = matching
-            .get(end)
-            .map(|(family, revision, _)| format!("{family}:{revision}"));
+        let next_token = matching.get(end).map(|(family, revision, _)| {
+            crate::state::encode_page_token(
+                &token_key,
+                &page_scope,
+                &format!("{family}:{revision}"),
+            )
+        });
 
         Ok(ListTaskDefinitionsOutput {
             task_definition_arns: Some(task_definition_arns),
