@@ -319,6 +319,8 @@ mod websocket_call_context;
 mod websocket_connect_authorization;
 #[path = "all/websocket_connect_backend.rs"]
 mod websocket_connect_backend;
+#[path = "all/websocket_connect_identity_source_socket_answer.rs"]
+mod websocket_connect_identity_source_socket_answer;
 #[path = "all/websocket_endpoint_connections.rs"]
 mod websocket_endpoint_connections;
 #[path = "all/websocket_error_class_exclusivity.rs"]
@@ -337,3 +339,5 @@ mod websocket_message_refusals;
 mod websocket_tls_transport;
 #[path = "all/websocket_transport_data_plane.rs"]
 mod websocket_transport_data_plane;
+#[path = "all/zz_tmp_probe.rs"]
+mod zz_tmp_probe;

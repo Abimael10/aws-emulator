@@ -272,7 +272,7 @@ async fn dial(authority: &str) -> tokio_tungstenite::WebSocketStream<ClientStrea
 }
 
 /// The stream a case's client holds once its TLS handshake has completed.
-type ClientStream = tokio_rustls::client::TlsStream<TcpStream>;
+pub(crate) type ClientStream = tokio_rustls::client::TlsStream<TcpStream>;
 
 #[tokio::test]
 async fn the_announced_socket_completes_a_tls_handshake_and_carries_frames() {
@@ -318,7 +318,7 @@ async fn the_announced_socket_completes_a_tls_handshake_and_carries_frames() {
 
 /// Run the client side of a TLS handshake on `conn`, accepting the emulator's own
 /// self-signed listener certificate.
-async fn upgrade_to_tls(conn: TcpStream) -> tokio_rustls::client::TlsStream<TcpStream> {
+pub(crate) async fn upgrade_to_tls(conn: TcpStream) -> tokio_rustls::client::TlsStream<TcpStream> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
