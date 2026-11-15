@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: the canonical DECLARATION LIST of every
+// cross-service suite under `tests/all/`, and nothing else.
+//
 // Single integration-test target for the router: a declaration list, and nothing else.
 //
 // Past this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
@@ -811,6 +814,8 @@ mod ebs_start_snapshot_resolves_its_kms_key;
 mod ec2_management_events;
 #[path = "all/ec2_network.rs"]
 mod ec2_network;
+#[path = "all/ec2_volume_notification_reaches_its_queue.rs"]
+mod ec2_volume_notification_reaches_its_queue;
 #[path = "all/ecr_public_action_scoped_iam_identity.rs"]
 mod ecr_public_action_scoped_iam_identity;
 #[path = "all/ecr_push_triggers_its_pipeline.rs"]

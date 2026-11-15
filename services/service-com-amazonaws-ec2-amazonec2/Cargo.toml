@@ -16,7 +16,10 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `state::volume_notifications` publishes a volume's create outcome when that outcome falls
+# due, from a bounded task that resumes then, so this service's tokio needs the timer driver and
+# the semaphore that caps those tasks on top of the workspace's features.
+tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -100,6 +103,11 @@ aws-sdk-acm = { version = "1", default-features = false, features = ["rt-tokio",
 # permissions on it are KMS's own to judge, so a volume under a key that will not produce a
 # data key is withdrawn rather than created.
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# `state::volume_notifications`: the EventBridge client an EBS volume's create outcome is
+# published through, over the in-process callback into this same emulator — the bus the event
+# reaches a client's rules on is that service's own. No network client feature is enabled: the
+# transport is the emulator's own.
+aws-sdk-eventbridge = { version = "1", default-features = false }
 # `state::flow_log_s3_delivery`: the Amazon S3 client a flow log's destination bucket policy is
 # amended through, over the in-process callback into this same emulator — the permissions the log
 # delivery service needs to write a flow log's records are Amazon S3's own resource. No network
@@ -138,6 +146,12 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # real key through the service that OWNS keys and watch what EC2 does with a volume under it.
 # TEST-ONLY — `src/` reaches that service over the in-process callback instead.
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# The EventBridge and Amazon SQS services, so the volume-notification suite can read the event a
+# volume's create outcome is published as off the queue a real rule on the real default bus
+# delivered it to, rather than from this crate's own state.
+# TEST-ONLY — `src/` publishes over the in-process callback instead.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

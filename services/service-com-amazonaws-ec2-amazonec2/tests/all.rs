@@ -20,6 +20,13 @@
 // tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/aws_managed_prefix_list_name_scopes.rs"]
 mod aws_managed_prefix_list_name_scopes;
+// The event an EBS volume's create OUTCOME is published as: one `EBS Volume Notification` on
+// the account's default EventBridge bus per volume a create was asked for, reporting the result
+// it reached and, for one that failed, why. Declared beside `prefix_lists` for the reason the
+// note above gives: the sorted neighbourhood and the tail of this file are where every new ec2
+// suite inserts its lines.
+#[path = "all/volume_create_notifications.rs"]
+mod volume_create_notifications;
 // The OPTIONAL members a read of an AMI and a read of an instance carry: every Amazon EBS
 // device of an image reports the encryption state it restores with, an image's Free Tier
 // eligibility follows its own billing, and the association reported against one private IPv4

@@ -462,7 +462,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // recorded as the withdrawal the clock then owes it
         // ([`VolumeRecord::withdrawn_at`]). A key that will serve, and an emulator with no
         // KMS to ask, leave the volume on the ordinary path to `available`
-        // ([`crate::state::volume_key_refusal`]).
+        // ([`crate::state::volume_key_refusal`]). Either way the outcome is PUBLISHED when the
+        // create is answered ([`crate::state::VolumeNotification`]), so what watches volumes
+        // learns of a volume that failed rather than waiting for one that never appears.
         //
         // A `DryRun` probe asks nothing of KMS: it is answered below without creating
         // anything, and the data key a volume is wrapped with is requested for a volume that
@@ -599,7 +601,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A volume whose encryption key refused its data key never reaches `available`: the
         // clock owes it the withdrawal instead, at the same instant, so the caller still sees
         // the `creating` volume it was answered with and then sees it gone.
-        if let Some(refusal) = key_refusal {
+        if let Some(refusal) = key_refusal.as_ref() {
             ::tracing::debug!(
                 volume_id = %volume_id,
                 refusal = %refusal,
@@ -612,16 +614,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Read the response back OUT of the store, so the caller sees what a later
-        // DescribeVolumes will see rather than the request object.
-        store
+        // DescribeVolumes will see rather than the request object — and, off the same
+        // record, the notification this create's OUTCOME is published as, so what is
+        // published is what the store settled on.
+        let created = store
             .volumes
             .get(&volume_id)
-            .map(|record| record.create_response(now))
+            .map(|record| {
+                (
+                    record.create_response(now),
+                    crate::state::VolumeNotification::of_create(
+                        record,
+                        now,
+                        &region,
+                        key_refusal.as_ref(),
+                    ),
+                )
+            })
             .ok_or_else(|| {
                 Scaffolded::internal_error(format!(
                     "the newly created volume '{volume_id}' could not be read back"
                 ))
-            })
+            });
+        // The store's guard is given back before the publication is handed on: a lock of this
+        // store is never held while another service is called.
+        drop(store);
+        let (response, notification) = created?;
+
+        // The create is ANSWERED with the `creating` volume above and its outcome —
+        // available, or failed and why — is published for whatever watches volumes once that
+        // outcome falls due, exactly ONE event per volume this call created. A replayed
+        // `ClientToken` returned above without creating anything, so it publishes nothing:
+        // the event is the outcome of a create, not of a call.
+        notification.publish_when_due(ctx.callback().clone());
+
+        Ok(response)
     }
 }
 

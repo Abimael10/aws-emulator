@@ -39,18 +39,51 @@ const TRANSPORT_REFUSALS: [&str; 2] = ["UnknownService", "AmbiguousService"];
 const VOLUME_DATA_KEY_SPEC: ::aws_sdk_kms::types::DataKeySpec =
     ::aws_sdk_kms::types::DataKeySpec::Aes256;
 
+/// What the service that owns the key SAID when it refused to produce a volume's data key.
+///
+/// Kept whole — the code and the message, as that service worded them — because the two
+/// have different readers: the code is the debug record a withdrawn volume leaves, and the
+/// message is the CAUSE the failure is reported under to anything watching the volume
+/// ([`crate::state::VolumeNotification`]). Neither reaches the caller of the create: EC2
+/// answers a create under an unusable key by taking the volume back rather than by relaying
+/// KMS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeKeyRefusal {
+    /// The error code the key's own service answered with.
+    pub code: String,
+    /// What that service said about the key, when it said anything at all.
+    pub message: Option<String>,
+}
+
+impl VolumeKeyRefusal {
+    /// WHY the volume could not be created, in the words of the service that owns the key —
+    /// which is what names the key and the state it is in ("… is disabled.").
+    ///
+    /// A refusal that carried no message at all leaves the code as the only thing that was
+    /// said, rather than an invented sentence.
+    #[must_use]
+    pub fn cause(&self) -> String {
+        self.message.clone().unwrap_or_else(|| self.code.clone())
+    }
+}
+
+impl ::std::fmt::Display for VolumeKeyRefusal {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match &self.message {
+            Some(message) => write!(formatter, "({}) {message}", self.code),
+            None => write!(formatter, "({})", self.code),
+        }
+    }
+}
+
 /// Why the key `kms_key_id` names cannot encrypt a volume, as KMS stated it, or `None` when
 /// it will serve — and also when nothing was said about it, for the reason this module's
 /// docs give.
-///
-/// The string is KMS's own `(code) message`, kept for the debug record a withdrawn volume
-/// leaves; nothing of it reaches a caller, because EC2 answers a create under an unusable
-/// key by taking the volume back rather than by relaying KMS.
 pub async fn volume_key_refusal(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     kms_key_id: &str,
-) -> Option<String> {
+) -> Option<VolumeKeyRefusal> {
     match kms_client(ctx, region)
         .generate_data_key_without_plaintext()
         .key_id(kms_key_id)
@@ -67,7 +100,7 @@ pub async fn volume_key_refusal(
 /// transport refused ([`TRANSPORT_REFUSALS`]), and one that reached no answer at all.
 fn stated_refusal<E: ProvideErrorMetadata + ::std::error::Error + 'static>(
     error: &SdkError<E, HttpResponse>,
-) -> Option<String> {
+) -> Option<VolumeKeyRefusal> {
     let SdkError::ServiceError(context) = error else {
         ::tracing::debug!(
             error = %::aws_smithy_types::error::display::DisplayErrorContext(error),
@@ -81,9 +114,9 @@ fn stated_refusal<E: ProvideErrorMetadata + ::std::error::Error + 'static>(
         ::tracing::debug!(code, "no KMS answered this volume's encryption key");
         return None;
     }
-    Some(match refused.message() {
-        Some(message) => format!("({code}) {message}"),
-        None => format!("({code})"),
+    Some(VolumeKeyRefusal {
+        code: code.to_string(),
+        message: refused.message().map(str::to_string),
     })
 }
 

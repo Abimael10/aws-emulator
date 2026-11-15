@@ -2802,6 +2802,10 @@ mod volumes;
 /// re-exported below, so a handler reaches it as `crate::state::volume_key_refusal` like any
 /// other primitive of this module.
 mod volume_encryption;
+/// The event an EBS volume's create OUTCOME is published as, onto the account's default
+/// EventBridge bus. Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::VolumeNotification` like any other primitive of this module.
+mod volume_notifications;
 mod local_gateways_and_filter_patterns;
 pub mod outpost_lags;
 mod service_link_virtual_interfaces;
@@ -2844,6 +2848,7 @@ pub use outpost_lags::*;
 pub use service_link_virtual_interfaces::*;
 pub use tag_descriptions::*;
 pub use volume_encryption::*;
+pub use volume_notifications::*;
 pub use volumes::*;
 pub use import_image_tasks_and_verified_access::*;
 pub use export_image_tasks::*;
