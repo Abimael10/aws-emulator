@@ -50,11 +50,11 @@ struct BoundCase {
 
 /// The requirement clause the framework states for a bound, built from the model's own
 /// bound (`vendor/smithy-schema-server/src/constraints.rs::Violation::requirement`).
-fn below_value(min: i64) -> String {
+pub(crate) fn below_value(min: i64) -> String {
     format!("Member must have value greater than or equal to {min}")
 }
 
-fn above_value(max: i64) -> String {
+pub(crate) fn above_value(max: i64) -> String {
     format!("Member must have value less than or equal to {max}")
 }
 

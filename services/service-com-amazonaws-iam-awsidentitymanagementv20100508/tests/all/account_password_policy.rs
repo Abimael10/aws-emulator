@@ -54,10 +54,10 @@ const CHANGE_REFUSED_MESSAGE: &str = "Either the new password does not conform t
 /// (`smithy_query(query="shape", shape="minimumPasswordLengthType")`), which is also the
 /// minimum an account that never named one holds: "if you do not specify a value for this
 /// parameter, then the operation uses the default value of `6`".
-const MIN_MINIMUM_PASSWORD_LENGTH: usize = 6;
+pub(crate) const MIN_MINIMUM_PASSWORD_LENGTH: usize = 6;
 
 /// The published ceiling of that range. See [`MIN_MINIMUM_PASSWORD_LENGTH`].
-const MAX_MINIMUM_PASSWORD_LENGTH: usize = 128;
+pub(crate) const MAX_MINIMUM_PASSWORD_LENGTH: usize = 128;
 
 /// Every symbol `PasswordPolicy$RequireSymbols` lists as satisfying that rule: "! @ # $ % ^
 /// & * ( ) _ + - = [ ] { } | '". Written out here as the catalog this suite reads the rule
@@ -609,14 +609,14 @@ async fn every_published_symbol_satisfies_the_symbol_rule() {
 const NO_SUCH_ENTITY_CODE: &str = "NoSuchEntity";
 
 /// One `GetAccountPasswordPolicy`: the operation takes no input at all.
-async fn read_policy(router: &MultiServiceRouter) -> (u16, String) {
+pub(crate) async fn read_policy(router: &MultiServiceRouter) -> (u16, String) {
     call(router, "GetAccountPasswordPolicy", &[]).await
 }
 
 /// The value the response reports for the member `tag`, or `None` when it carries that
 /// member not at all — which is how an unset optional member of `PasswordPolicy` is
 /// reported.
-fn member(body: &str, tag: &str) -> Option<String> {
+pub(crate) fn member(body: &str, tag: &str) -> Option<String> {
     let found = elements(body, tag);
     assert!(
         found.len() <= 1,

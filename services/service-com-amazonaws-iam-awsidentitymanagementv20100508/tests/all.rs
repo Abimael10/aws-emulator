@@ -31,6 +31,8 @@ mod account_aliases;
 mod account_authorization_details;
 #[path = "all/account_password_policy.rs"]
 mod account_password_policy;
+#[path = "all/account_password_policy_bounds.rs"]
+mod account_password_policy_bounds;
 #[path = "all/account_properties.rs"]
 mod account_properties;
 #[path = "all/account_singleton_authorization.rs"]
