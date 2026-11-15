@@ -145,6 +145,8 @@ mod delete_stack_single_writer;
 mod delete_stack_set;
 #[path = "all/denied_replacement_identity.rs"]
 mod denied_replacement_identity;
+#[path = "all/deployed_group_handoff.rs"]
+mod deployed_group_handoff;
 #[path = "all/detect_resource_drift.rs"]
 mod detect_resource_drift;
 #[path = "all/drift_and_resource_reads.rs"]

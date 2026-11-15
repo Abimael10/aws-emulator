@@ -1836,3 +1836,15 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 //! service crate's own, belongs in that suite's own module doc, where it is read beside the
 //! test it explains; `all/appended_notes.rs` holds the notes successive landings had left
 //! here.
+//! Single integration-test target for the router: the list of the suites it compiles.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with its
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted so the list stays sorted by
+//! name. The list holds nothing else — no blank line, no note, and no second declaration of
+//! one name — so two branches landing at once insert two lines in two places and have no
+//! prose to duplicate, re-word or mistype as an inner doc comment. An inner doc comment is
+//! legal only before the first item, so this header is the only place one may stand.
+//! `all/all_rs_is_a_canonical_declaration_list.rs`,
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` are the suites that pin those
+//! rules, for this root and for every service crate's own. What a suite covers, and why it
+//! lives in this target rather than in one service crate's, belongs in that suite's own
+//! module header, where it is read beside the test it explains.
