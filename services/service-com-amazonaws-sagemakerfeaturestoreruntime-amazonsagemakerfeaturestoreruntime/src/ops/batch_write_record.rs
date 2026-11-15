@@ -13,7 +13,10 @@
 //! leaves every other entry of the batch written, rather than failing the whole call; an
 //! entry whose feature group cannot be found is named there by the ARN a group of that
 //! name would carry. An entry the emulator's bounded store has no room for is reported in
-//! `UnprocessedEntries`, which the model documents as the entries that "can be retried".
+//! `UnprocessedEntries`, which the model documents as the entries that "can be retried",
+//! and such an entry is written NOWHERE — neither online nor into the group's OfflineStore
+//! — so the retry the response invites is the record's first write, exactly as a
+//! capacity-refused `PutRecord` writes nothing.
 //! The request-level `TtlDuration` applies to every entry that names none of its own, and
 //! an entry's own `TtlDuration` overrides it; an entry under neither is stored under the
 //! default TTL its feature group's `OnlineStoreConfig` configures.
@@ -21,7 +24,7 @@
 //! Authorization of the CALLER is not emulated, so the modelled `AccessForbidden` is
 //! unreachable, and so is `ResourceNotFound`: a write names no record that has to exist
 //! already, and an entry whose feature group cannot be found is that entry's own error
-//! rather than a failure of the batch. An entry written to a feature group that has an
+//! rather than a failure of the batch. An entry PROCESSED into a feature group that has an
 //! OfflineStore is replicated into it by the same write `PutRecord` makes
 //! ([`crate::state::offline_store`]).
 //!
@@ -286,10 +289,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 };
 
+            // The ONLINE side of the entry runs FIRST, because whether the entry was
+            // processed at all is decided here: an entry this bounded store has no room
+            // for is reported as not processed, and an entry reported that way must leave
+            // no trace in EITHER store, exactly as the single-record writer's identical
+            // capacity refusal leaves none.
+            //
+            // This service is the OnlineStore data plane, so an entry naming only the
+            // OfflineStore leaves the online store alone — as does an entry written to a
+            // feature group that HAS no OnlineStore. Neither is a failure of the entry, so
+            // neither is reported in `Errors`, and neither keeps the entry from being
+            // replicated offline below.
+            if crate::state::targets_online_store(entry.target_stores.as_ref())
+                && definition.online_store_enabled
+            {
+                // A write the emulator's bounded store has no room for is not the caller's
+                // mistake, so it is not an entry error: it is an entry that was not
+                // processed, which the model documents as one that can be retried — and a
+                // retry of it must not append a second offline row for the same record,
+                // so the offline replication below is skipped for it.
+                let Some(group) = store.group_or_create(&entry.feature_group_name) else {
+                    unprocessed_entries.push(entry.clone());
+                    continue;
+                };
+                match group.ingest(prepared) {
+                    // A historic entry is written only to the OfflineStore, which the
+                    // replication below delivers: nothing was stored online and nothing
+                    // failed.
+                    crate::state::Ingested::Stored | crate::state::Ingested::Historic => {}
+                    crate::state::Ingested::AtCapacity => {
+                        unprocessed_entries.push(entry.clone());
+                        continue;
+                    }
+                }
+            }
+
             // The OfflineStore side of the entry, held for the awaited write below: the
             // same replication `PutRecord` makes, so a record written in a batch lands in
             // the offline store exactly as the same record written on its own — including a
-            // historic one, which is written ONLY there.
+            // historic one, which is written ONLY there. Reached only by an entry the
+            // online side above did not report in `UnprocessedEntries`.
             if crate::state::targets_offline_store(entry.target_stores.as_ref()) {
                 if let Some(delivery) = definition.offline_store.as_ref() {
                     offline_writes.push((
@@ -298,30 +337,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::offline_store::OfflineRecord::of(&definition, &entry.record),
                     ));
                 }
-            }
-
-            // This service is the OnlineStore data plane, so an entry naming only the
-            // OfflineStore leaves the online store alone — as does an entry written to a
-            // feature group that HAS no OnlineStore. Neither is a failure of the entry, so
-            // neither is reported in `Errors`.
-            if !crate::state::targets_online_store(entry.target_stores.as_ref())
-                || !definition.online_store_enabled
-            {
-                continue;
-            }
-
-            // A write the emulator's bounded store has no room for is not the caller's
-            // mistake, so it is not an entry error: it is an entry that was not
-            // processed, which the model documents as one that can be retried.
-            let Some(group) = store.group_or_create(&entry.feature_group_name) else {
-                unprocessed_entries.push(entry.clone());
-                continue;
-            };
-            match group.ingest(prepared) {
-                // A historic entry is written only to the OfflineStore, which the
-                // replication above delivers: nothing was stored online and nothing failed.
-                crate::state::Ingested::Stored | crate::state::Ingested::Historic => {}
-                crate::state::Ingested::AtCapacity => unprocessed_entries.push(entry.clone()),
             }
         }
         }

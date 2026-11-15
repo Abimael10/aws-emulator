@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/batch_write_record_bulk_ingestion.rs"]
 mod batch_write_record_bulk_ingestion;
+#[path = "all/batch_write_record_capacity_refusal.rs"]
+mod batch_write_record_capacity_refusal;
 #[path = "all/error_message_length_bound.rs"]
 mod error_message_length_bound;
 #[path = "all/feature_group_default_ttl.rs"]

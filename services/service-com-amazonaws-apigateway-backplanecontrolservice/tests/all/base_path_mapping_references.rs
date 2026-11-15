@@ -322,18 +322,25 @@ async fn the_refusal_lists_the_domain_names_whose_mappings_hold_the_record() {
     // several), and the spelling of those base paths (a plain one and the `(none)` the
     // member documents). Each row drives BOTH refusals of one reference — the API the
     // mapping names and the stage of it — because one sentence states both.
+    //
+    // Each plain base path is spelled long enough that it cannot occur BY CHANCE inside the
+    // identifier the refusal names: an id is ten characters drawn from the lowercase
+    // alphanumerics, so a two-character base path lands inside one about once in a hundred
+    // runs and the assertion below — that the sentence names no base path — would read that
+    // coincidence as a failure. The rule under test is unchanged: what differs between rows
+    // is still the count of domain names, the count of mappings and the spelling.
     let rows = [
         DomainsRow {
             case: "one domain name holding one mapping",
-            mappings: &[&["v1"]],
+            mappings: &[&["releaseone"]],
         },
         DomainsRow {
             case: "one domain name holding several mappings of the same record",
-            mappings: &[&["v1", "v2", NONE_BASE_PATH]],
+            mappings: &[&["releaseone", "releasetwo", NONE_BASE_PATH]],
         },
         DomainsRow {
             case: "two domain names",
-            mappings: &[&["v1"], &[NONE_BASE_PATH]],
+            mappings: &[&["releaseone"], &[NONE_BASE_PATH]],
         },
         DomainsRow {
             case: "three domain names, one of them holding two mappings",
