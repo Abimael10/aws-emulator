@@ -1977,3 +1977,17 @@ mod cloudtrail_iam_credential_write_audit;
 // a suite no `mod` names compiles nowhere and its tests never run. Each of those fails every
 // suite in this target, and `all/all_rs_declares_each_suite_once.rs`,
 // declaration is what points it into `tests/all/`.
+// This file holds the license line, this header, and then one
+// name, and no other line. Put a new suite at `tests/all/<name>.rs` and insert its pair in
+// sorted position; what the suite covers belongs in that suite's own module header, where it
+// is read beside the test it explains.
+// Every comment in this file is an ordinary `//` one, this header included: an inner doc
+// is `E0753`, which compiles no suite of this target. With none in the file, a landing that
+// appends to the tail cannot leave one behind the first declaration.
+// A suite no `mod` names compiles nowhere and its tests never run; a suite declared twice is
+// `E0428`; and `tests/all.rs` is a test-target crate root, so a bare `mod` resolves to a
+// sibling of this file, which the layout check refuses — the `#[path]` is what points each
+// declaration into `tests/all/`. `all/all_rs_declares_each_suite_once.rs`,
+// `all/every_suite_file_is_declared.rs` check that shape.
+#[path = "all/all_rs_carries_no_inner_doc_comment.rs"]
+mod all_rs_carries_no_inner_doc_comment;

@@ -48,6 +48,14 @@ fn first_item_line(source: &str) -> Option<usize> {
     })
 }
 
+/// Whether `line` opens an inner doc comment, in either of the two spellings the language
+/// accepts — the one-line reading of the rule, owned here and shared with the sibling that
+/// reads the same classifier for every position in a declaration root rather than only for the
+/// positions past its first item.
+pub(crate) fn opens_an_inner_doc_comment(line: &str) -> bool {
+    line.starts_with("//!") || line.starts_with("/*!")
+}
+
 /// Which inner doc comments a class of file is read for — the one way the rule differs
 /// between the two classes of file an `all` target compiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +91,7 @@ fn misplaced_inner_doc_comments(source: &str, read: InnerDocComments) -> Vec<Str
                 InnerDocComments::Anywhere => line.trim_start(),
                 InnerDocComments::InColumnOne => line,
             };
-            let is_inner_doc = line.starts_with("//!") || line.starts_with("/*!");
+            let is_inner_doc = opens_an_inner_doc_comment(line);
             (is_inner_doc && index + 1 > item_line).then(|| {
                 format!(
                     "line {}: expected a plain comment (`//`), got the inner doc comment \
