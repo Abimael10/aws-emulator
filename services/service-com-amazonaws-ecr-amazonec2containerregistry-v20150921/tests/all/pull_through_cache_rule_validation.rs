@@ -54,9 +54,9 @@ struct Case<'a> {
 /// The validation table. The rows span the model's `UpstreamRegistry` values (smithy_query
 /// shape=UpstreamRegistry) with the URL syntax the `upstreamRegistryUrl` member documents
 /// for each, and differ in which credential the rule stores and in whether the upstream
-/// needs one — including upstreams the issue never cited. The two anonymous upstreams are
-/// the ECR user guide's supported-upstream table (Amazon ECR Public, Kubernetes); every
-/// other upstream authenticates its callers.
+/// needs one — including upstreams the issue never cited. Which upstreams are cached from
+/// anonymously is the ECR user guide's supported-upstream table (Amazon ECR Public,
+/// Kubernetes, Quay); every other upstream authenticates its callers.
 fn cases() -> Vec<Case<'static>> {
     vec![
         Case {
@@ -326,6 +326,197 @@ async fn a_rules_verdict_is_read_off_its_stored_configuration() {
             rule,
             "case {:?}: validating changed the stored rule",
             case.name
+        );
+    }
+}
+
+/// One row of the upstream table: the upstream a rule names, and whether a rule for it
+/// that stores NO credential of any kind validates.
+struct Upstream<'a> {
+    case: &'a str,
+    /// The prefix the rule is held under — its own, so no row reads another's rule.
+    prefix: &'a str,
+    /// `upstreamRegistry` as the rule carries it; `None` leaves the member out, so the
+    /// upstream is resolved from the URL.
+    upstream_registry: Option<&'a str>,
+    upstream_registry_url: &'a str,
+    /// The verdict a rule for that upstream with no credential stored earns.
+    valid: bool,
+}
+
+/// Whether a rule needs a credential at all is a property of the UPSTREAM it caches from:
+/// the registries ECR caches from without authenticating need none, and every other
+/// upstream is reached with the credential the rule carries.
+///
+/// The rows span the model's `UpstreamRegistry` values (smithy_query shape=UpstreamRegistry)
+/// with the URL the `upstreamRegistryUrl` member documents for each, every one of them
+/// storing no credential — including upstreams the issue never cited. Which of them ECR
+/// caches from anonymously is the ECR user guide's supported-upstream table: Amazon ECR
+/// Public, Kubernetes and Quay, the public registries whose images are pulled without
+/// credentials; the rest authenticate their callers.
+#[tokio::test]
+async fn whether_a_rule_needs_a_credential_follows_from_its_upstream() {
+    let rows = vec![
+        Upstream {
+            case: "Amazon ECR Public is cached from anonymously",
+            prefix: "anon-ecr-public",
+            upstream_registry: Some("ecr-public"),
+            upstream_registry_url: "public.ecr.aws",
+            valid: true,
+        },
+        Upstream {
+            case: "the Kubernetes registry is cached from anonymously",
+            prefix: "anon-k8s",
+            upstream_registry: Some("k8s"),
+            upstream_registry_url: "registry.k8s.io",
+            valid: true,
+        },
+        Upstream {
+            case: "Quay is cached from anonymously",
+            prefix: "anon-quay",
+            upstream_registry: Some("quay"),
+            upstream_registry_url: "quay.io",
+            valid: true,
+        },
+        Upstream {
+            case: "Docker Hub authenticates its callers",
+            prefix: "auth-docker-hub",
+            upstream_registry: Some("docker-hub"),
+            upstream_registry_url: "registry-1.docker.io",
+            valid: false,
+        },
+        Upstream {
+            case: "GitHub Container Registry authenticates its callers",
+            prefix: "auth-ghcr",
+            upstream_registry: Some("github-container-registry"),
+            upstream_registry_url: "ghcr.io",
+            valid: false,
+        },
+        Upstream {
+            case: "GitLab Container Registry authenticates its callers",
+            prefix: "auth-gitlab",
+            upstream_registry: Some("gitlab-container-registry"),
+            upstream_registry_url: "registry.gitlab.com",
+            valid: false,
+        },
+        Upstream {
+            case: "Microsoft Azure Container Registry authenticates its callers",
+            prefix: "auth-azure",
+            upstream_registry: Some("azure-container-registry"),
+            upstream_registry_url: "contoso.azurecr.io",
+            valid: false,
+        },
+        Upstream {
+            case: "an Amazon ECR upstream is reached with a role of this account",
+            prefix: "auth-ecr",
+            upstream_registry: Some("ecr"),
+            upstream_registry_url: "000000000000.dkr.ecr.us-east-2.amazonaws.com",
+            valid: false,
+        },
+    ];
+
+    let router = emulator();
+    for row in &rows {
+        let mut request = json!({
+            "ecrRepositoryPrefix": row.prefix,
+            "upstreamRegistryUrl": row.upstream_registry_url,
+        });
+        if let Some(registry) = row.upstream_registry {
+            request["upstreamRegistry"] = json!(registry);
+        }
+        ok(&router, row.case, "CreatePullThroughCacheRule", &request).await;
+
+        let validated = ok(
+            &router,
+            row.case,
+            "ValidatePullThroughCacheRule",
+            &json!({"ecrRepositoryPrefix": row.prefix}),
+        )
+        .await;
+        assert_verdict(
+            row.case,
+            row.valid,
+            (!row.valid).then_some("requires authentication"),
+            &validated,
+        );
+        assert_eq!(
+            at(&validated, "/upstreamRegistryUrl"),
+            json!(row.upstream_registry_url),
+            "case {:?}: the validate reports the stored upstream URL, got {:?}",
+            row.case,
+            at(&validated, "/upstreamRegistryUrl")
+        );
+    }
+}
+
+/// The same question answered for a rule that names NO `upstreamRegistry`: the upstream is
+/// the one its URL addresses, whatever scheme, case, port, userinfo or path the URL was
+/// written with — a host addresses one registry.
+///
+/// The rules are seeded: `CreatePullThroughCacheRule` resolves the upstream from the URL
+/// itself, so a stored rule is how a record carrying only a URL is reached.
+#[tokio::test]
+async fn an_upstream_url_alone_decides_whether_a_rule_needs_a_credential() {
+    let rows = vec![
+        Upstream {
+            case: "the bare host of an anonymous upstream",
+            prefix: "url-quay",
+            upstream_registry: None,
+            upstream_registry_url: "quay.io",
+            valid: true,
+        },
+        Upstream {
+            case: "an anonymous upstream written with a scheme, odd case, a port and a path",
+            prefix: "url-quay-full",
+            upstream_registry: None,
+            upstream_registry_url: "https://QUAY.IO:443/v2/",
+            valid: true,
+        },
+        Upstream {
+            case: "an anonymous upstream written with userinfo",
+            prefix: "url-k8s",
+            upstream_registry: None,
+            upstream_registry_url: "https://anonymous@registry.k8s.io",
+            valid: true,
+        },
+        Upstream {
+            case: "the host of an upstream that authenticates its callers",
+            prefix: "url-ghcr",
+            upstream_registry: None,
+            upstream_registry_url: "https://ghcr.io/v2/",
+            valid: false,
+        },
+        Upstream {
+            case: "a host no documented upstream URL names, so nothing says it is anonymous",
+            prefix: "url-unknown",
+            upstream_registry: None,
+            upstream_registry_url: "cgr.dev",
+            valid: false,
+        },
+    ];
+
+    let (router, engine) = emulator_with_engine();
+    for row in &rows {
+        seed_pull_through_cache_rule(
+            &engine,
+            row.prefix,
+            row.upstream_registry,
+            row.upstream_registry_url,
+            None,
+            None,
+        );
+        let validated = ok(
+            &router,
+            row.case,
+            "ValidatePullThroughCacheRule",
+            &json!({"ecrRepositoryPrefix": row.prefix}),
+        )
+        .await;
+        assert_verdict(
+            row.case,
+            row.valid,
+            (!row.valid).then_some("requires authentication"),
+            &validated,
         );
     }
 }

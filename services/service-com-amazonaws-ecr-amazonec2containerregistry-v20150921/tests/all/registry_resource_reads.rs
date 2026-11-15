@@ -873,8 +873,8 @@ async fn pull_through_cache_rule_update_and_validate_resolve_the_prefix() {
     // Validation is a verdict on the STORED rule: a rule whose configuration can
     // authenticate to its upstream validates, and one that cannot is invalid with the
     // failure naming the defect. The rows span the upstream registries the model's
-    // `UpstreamRegistry` enum carries, including the two the ECR user guide documents as
-    // anonymous, and a rule that names no upstream registry at all.
+    // `UpstreamRegistry` enum carries, including the ones the ECR user guide documents as
+    // needing no authentication, and a rule that names no upstream registry at all.
     let validations: Vec<ValidationRow<'_>> = vec![
         (
             "docker-hub without a credential",
@@ -884,11 +884,13 @@ async fn pull_through_cache_rule_update_and_validate_resolve_the_prefix() {
             true,
         ),
         (
+            // Quay is one of the upstreams ECR caches from anonymously, so a rule for it
+            // needs no credential of its own.
             "quay without a credential",
             Some("quay"),
             "quay.io",
             None,
-            true,
+            false,
         ),
         (
             "chainguard with a credential",

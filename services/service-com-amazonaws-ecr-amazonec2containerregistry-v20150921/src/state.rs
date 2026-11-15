@@ -3205,46 +3205,49 @@ pub fn pull_time_update_exclusion_limit_message() -> String {
     )
 }
 
-/// The upstream registries ECR documents as serving anonymously, each with the host it
-/// is reached at: Amazon ECR Public and Kubernetes, from the ECR user guide's
-/// supported-upstream table. One table, so the `UpstreamRegistry` value and the host it
-/// corresponds to cannot drift apart.
-pub const ANONYMOUS_UPSTREAM_REGISTRIES: [(&str, &str); 2] = [
-    ("ecr-public", "public.ecr.aws"),
-    ("k8s", "registry.k8s.io"),
-];
+/// The upstream registries ECR caches from WITHOUT a credential on the rule: the entries
+/// of the ECR user guide's supported-upstream table that require no authentication —
+/// Amazon ECR Public, Kubernetes and Quay, the public registries whose images are pulled
+/// anonymously, and the upstreams pull through cache rules were first served for. Every
+/// other `UpstreamRegistry` value (listed in `UPSTREAM_REGISTRY_VALUES`) authenticates
+/// its callers, which is why a rule naming one carries the credential it is reached with.
+///
+/// Only the `UpstreamRegistry` value is named here: the host each registry is reached at
+/// is [`DOCUMENTED_UPSTREAM_REGISTRY_URLS`]'s, the one table of per-registry URLs, so a
+/// rule that names no `upstreamRegistry` is judged by resolving its URL through that same
+/// table and the two readings cannot drift apart.
+pub const ANONYMOUS_UPSTREAM_REGISTRIES: [&str; 3] = ["ecr-public", "k8s", "quay"];
 
 /// Whether an upstream registry a pull through cache rule points at authenticates its
 /// callers, and therefore needs a credential stored on the rule.
 ///
-/// Every upstream registry ECR supports except the two in
-/// [`ANONYMOUS_UPSTREAM_REGISTRIES`] — the rest of the model's `UpstreamRegistry` enum,
-/// listed in `UPSTREAM_REGISTRY_VALUES` — requires credentials. A rule that names no
-/// upstream registry is judged by the host it points at instead.
+/// Every upstream registry ECR supports except those in
+/// [`ANONYMOUS_UPSTREAM_REGISTRIES`] requires credentials. A rule that names no upstream
+/// registry is judged by the registry its URL resolves to
+/// ([`upstream_registry_for_url`]), and a URL naming no supported registry at all is
+/// treated as one that authenticates: nothing says it serves anonymously.
 pub fn upstream_needs_credential(upstream_registry: Option<&str>, upstream_url: &str) -> bool {
-    match upstream_registry {
-        Some(registry) => !ANONYMOUS_UPSTREAM_REGISTRIES
-            .iter()
-            .any(|(anonymous, _)| *anonymous == registry),
-        None => {
-            // A registry URL's authority: what is left after an optional scheme, before
-            // the path, without the userinfo or the port, compared case-insensitively —
-            // a host is not case-sensitive, and `public.ecr.aws:443` is the same host as
-            // `public.ecr.aws`.
-            let host = upstream_url
-                .split_once("://")
-                .map_or(upstream_url, |(_, rest)| rest)
-                .split('/')
-                .next()
-                .unwrap_or_default();
-            let host = host.rsplit_once('@').map_or(host, |(_, after)| after);
-            let host = host.split_once(':').map_or(host, |(before, _)| before);
-            let host = host.to_ascii_lowercase();
-            !ANONYMOUS_UPSTREAM_REGISTRIES
-                .iter()
-                .any(|(_, anonymous_host)| *anonymous_host == host)
-        }
-    }
+    let registry = match upstream_registry {
+        Some(registry) => Some(registry),
+        None => upstream_registry_for_url(upstream_registry_host(upstream_url)),
+    };
+    registry.is_none_or(|registry| !ANONYMOUS_UPSTREAM_REGISTRIES.contains(&registry))
+}
+
+/// The HOST a rule's `upstreamRegistryUrl` addresses: what is left after an optional
+/// scheme, before the path, without the userinfo or the port — so the URL a client wrote
+/// with any of those is read as the one registry host it points at (`public.ecr.aws:443`
+/// addresses the same registry as `public.ecr.aws`). The case is left as written, because
+/// every reader of a host here compares it case-insensitively.
+///
+/// The reading is [`::service_common::data_plane_addressing`]'s, the tree's one reader of
+/// a URL's authority and of a host's name, so this service and every other agree on what
+/// host a URL names.
+fn upstream_registry_host(upstream_url: &str) -> &str {
+    use ::service_common::data_plane_addressing::{host_only, url_authority};
+
+    let authority = url_authority(upstream_url.trim());
+    host_only(authority.split('/').next().unwrap_or_default())
 }
 
 /// The Secrets Manager secret name prefix a pull through cache rule's credential is
