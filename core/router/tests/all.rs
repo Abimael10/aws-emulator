@@ -2183,3 +2183,12 @@ mod cloudformation_cloudfront_published_edge_address;
 // declaration names is compiled nowhere). EVERY comment in this file is an ordinary `//`
 // one, this header included, so no merge of two landings can leave a doc comment past the
 // harnesses or notes rather than suites; all are declared, because a file no declaration
+// Single integration-test target for the router: the declaration list of every cross-service
+// suite under `tests/all/`, and no other line.
+// Put a new suite at `tests/all/<name>.rs` and insert one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair below, in the place its name sorts to. What that suite covers belongs in
+// its own module doc, beside the test it explains; a note about THIS file belongs in
+// EVERY comment here is an ordinary `//` one, this header included, so no appended, re-typed
+// or merged copy of a line of it can be an inner doc comment past the first item. The rules
+// this root is held to are checked by `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs` rather than restated here.

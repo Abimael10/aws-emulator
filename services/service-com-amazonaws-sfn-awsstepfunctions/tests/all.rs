@@ -125,6 +125,8 @@ mod execution_xray_tracing;
 mod express_execution_arn_identity;
 #[path = "all/express_run_a_job_refusal.rs"]
 mod express_run_a_job_refusal;
+#[path = "all/express_vended_log_twin_runs.rs"]
+mod express_vended_log_twin_runs;
 #[path = "all/form_protocol_integration.rs"]
 mod form_protocol_integration;
 #[path = "all/history_event_provenance.rs"]

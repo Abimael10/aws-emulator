@@ -50,7 +50,11 @@ const CLIENT_REFUSAL_STATUS: u16 = 400;
 
 /// The one diagnosis a resource type that is not valid where the ARN was handed in is
 /// refused with.
-fn resource_type_refusal(kind: &str) -> String {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a sibling suite
+/// that asserts the same refusal reads its wording from here rather than carrying a second
+/// copy of it.
+pub(crate) fn resource_type_refusal(kind: &str) -> String {
     format!("Invalid Arn: 'Resource type not valid in this context: {kind}'")
 }
 
@@ -97,7 +101,10 @@ fn arn_fields(arn: &str) -> Vec<&str> {
 
 /// The colon-delimited fields of the RESOURCE portion of `arn`, which a six-field ARN
 /// must carry.
-fn resource_fields(case: &str, arn: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the same reason as [`resource_type_refusal`]: one reader of an execution
+/// ARN's layout, shared with the sibling suites that take an ARN apart.
+pub(crate) fn resource_fields(case: &str, arn: &str) -> Vec<String> {
     let fields = arn_fields(arn);
     assert_eq!(
         fields.len(),

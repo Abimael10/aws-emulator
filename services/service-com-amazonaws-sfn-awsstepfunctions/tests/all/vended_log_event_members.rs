@@ -52,7 +52,11 @@ const ENVELOPE_MEMBERS: &[&str] = &[
 
 /// The members of a `details` object that carry the execution's own PAYLOAD, which
 /// `includeExecutionData` decides the delivery of.
-const PAYLOAD_MEMBERS: &[&str] = &[
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a sibling suite
+/// that asserts the same redaction reads the list from here rather than carrying a second
+/// copy of it.
+pub(crate) const PAYLOAD_MEMBERS: &[&str] = &[
     "input",
     "inputDetails",
     "output",
