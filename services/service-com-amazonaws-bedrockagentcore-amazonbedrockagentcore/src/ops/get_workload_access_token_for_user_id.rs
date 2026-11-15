@@ -7,6 +7,12 @@
 //! the issuance is recorded in [`crate::state::IssuedWorkloadAccessTokens`] so this
 //! service can later say which workload and user a token it handed out stands for.
 //!
+//! Whether the CALLER may obtain a token for the identity it named is decided first, from
+//! the IAM policies in force on the principal the request signed with
+//! ([`crate::state::authorize`]), exactly as on the two sibling mints of this plane: a
+//! workload access token is scoped to one workload identity, so a principal whose grant
+//! names another identity is refused `AccessDeniedException` and nothing is minted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -162,6 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The issuing authority a token names is the AgentCore endpoint of the region the
         // request was signed for, which is read off the request's SigV4 credential scope.
         let region = crate::state::request_region(ctx.parts());
+        // The resource this call addresses: the workload identity the `workloadName` names,
+        // built from the request alone, so a refusal discloses nothing about what exists.
+        let resource = crate::state::workload_identity_arn(&region, &input.workload_name);
+        // IAM decides BEFORE anything is minted: the identity-based policies in force on the
+        // calling principal are what say whether it may obtain a token for this identity.
+        crate::state::authorize(&*self.engine, ctx, Self::NAME, &resource)
+            .map_err(GetWorkloadAccessTokenForUserIdErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetWorkloadAccessTokenForUserIdErrorModeled::InternalServerException(
                 InternalServerException {

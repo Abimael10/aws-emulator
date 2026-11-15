@@ -68,6 +68,15 @@ service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # resolves the `browserIdentifier` against the component that owns it rather than
 # taking a session's existence on trust (src/state/browser.rs).
 service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol = { workspace = true }
+# The two stores the identity plane's authorization gate reads
+# (`src/state/authorization.rs`): every operation models `AccessDeniedException`, and a
+# workload access token is scoped to ONE workload identity, so a mint decides whether IAM
+# lets the caller obtain a token for the identity it named — the SESSION a credential speaks
+# for lives in STS's store while the POLICIES in force on that principal live in IAM's. Only
+# their `state` accessors are used; the DECISION itself, and the wording of its refusal, are
+# `service-common`'s one shared evaluation.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -75,6 +84,13 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# IAM and the token service, mounted beside this one in the test harness: the policies a
+# token mint is authorized against are IAM's, and the identity a credential speaks for is
+# STS's, so the gate is driven end to end against the services that own them. They are also
+# normal dependencies of this crate (the gate reads their stores); this entry only states
+# that the harness mounts them.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # Percent-encodes an `@httpLabel` / `@httpQuery` value the way an AWS SDK does, so the
 # test harness never hand-rolls RFC 3986 escaping.
 percent-encoding = "2.3"

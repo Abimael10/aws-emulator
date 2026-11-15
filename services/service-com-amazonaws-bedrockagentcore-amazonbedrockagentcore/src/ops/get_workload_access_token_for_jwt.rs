@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkloadAccessTokenForJWT
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkloadAccessTokenForJWT`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Obtains a workload access token for the named workload identity, acting on behalf of the
+//! user the presented `userToken` speaks for. The token is MINTED here — never taken from
+//! the request — as the sibling [`crate::ops::get_workload_access_token_for_user_id`] mints
+//! one, and the issuance is recorded in [`crate::state::IssuedWorkloadAccessTokens`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkloadAccessTokenForJWT::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two decisions are taken before anything is minted, in this order:
+//!
+//! 1. whether the CALLER may obtain a token for the identity it named, from the IAM policies
+//!    in force on the principal the request signed with ([`crate::state::authorize`]) —
+//!    `AccessDeniedException` when it may not;
+//! 2. whether the presented user token is one this plane accepts
+//!    ([`crate::state::user_of_presented_token`]) — `UnauthorizedException` when it is not,
+//!    which is the class the model documents for a JWT bearer token that is invalid. The
+//!    user a minted token acts for is that token's own subject.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +168,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkloadAccessTokenForJWT` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkloadAccessTokenForJWTErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkloadAccessTokenForJWT"))
+        // The issuing authority a token names is the AgentCore endpoint of the region the
+        // request was signed for, which is read off the request's SigV4 credential scope.
+        let region = crate::state::request_region(ctx.parts());
+        // The resource this call addresses: the workload identity the `workloadName` names,
+        // built from the request alone, so a refusal discloses nothing about what exists.
+        let resource = crate::state::workload_identity_arn(&region, &input.workload_name);
+        // IAM decides BEFORE the presented token is read and before anything is minted.
+        crate::state::authorize(&*self.engine, ctx, Self::NAME, &resource)
+            .map_err(GetWorkloadAccessTokenForJWTErrorModeled::AccessDeniedException)?;
+
+        let issued_at = ::std::time::SystemTime::now();
+        // The user this call acts on behalf of is the subject of the token it presents, and
+        // a token this plane cannot accept mints nothing: the refusal carries the sentence
+        // of its own class.
+        let user_id = crate::state::user_of_presented_token(&input.user_token, issued_at)
+            .map_err(|refusal| {
+                GetWorkloadAccessTokenForJWTErrorModeled::UnauthorizedException(
+                    UnauthorizedException {
+                        message: Some(refusal.message().to_string()),
+                    },
+                )
+            })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWorkloadAccessTokenForJWTErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the shared engine does not carry this service's state".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        // The `jti` discriminator, so two tokens obtained for one workload and user inside
+        // the same second are still two distinct tokens.
+        let seq = store.next_seq();
+        // The window AWS publishes no length for, so the store's own: a token obtained now
+        // stops resolving once the clock passes it, with no call needed to make it so.
+        let expires_at = issued_at + crate::state::WORKLOAD_ACCESS_TOKEN_TTL;
+        let token = crate::state::mint_workload_access_token(
+            &region,
+            &input.workload_name,
+            Some(&user_id),
+            issued_at,
+            expires_at,
+            seq,
+        );
+        // Obtaining a token is what this operation DOES, so the issuance is written: the
+        // registry is what lets this service resolve a token it minted back to the workload
+        // and user it names.
+        store.workload_access_tokens.record(
+            token.clone(),
+            crate::state::IssuedWorkloadAccessToken {
+                workload_name: input.workload_name.clone(),
+                user_id: Some(user_id),
+                issued_at,
+                expires_at,
+            },
+            issued_at,
+        );
+
+        Ok(GetWorkloadAccessTokenForJWTOutput {
+            workload_access_token: token,
+        })
     }
 }

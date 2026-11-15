@@ -2,6 +2,19 @@
 
 //! Single integration-test target for the router.
 //!
+//! This file is a CANONICAL DECLARATION LIST: its module doc, then one
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
+//! line. Two branches landing at once then insert two lines in two places and have no prose
+//! to duplicate, re-word or mistype — which is what had happened here: the tail of this file
+//! had grown thousands of re-typed copies of this header, hundreds of them written as inner
+//! doc comments past the first item (`E0753`), so no suite of this target compiled at all.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` pins the shape, and
+//! `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` pin the two rules a landing
+//! breaks: a module declared twice is `E0428`, and an inner doc comment past the first item
+//! is `E0753`. Both fail every suite in this target, so put a new suite at
+//! `tests/all/<name>.rs`, insert its pair into the sorted list below, and leave what it
+//! covers to that suite's own module doc.
 //! This file is a LIST: one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file
 //! under `tests/all/`, sorted by name, and no other line — so two branches landing at once
 //! insert two lines in two places and have no prose to duplicate, re-word or mistype. Put a

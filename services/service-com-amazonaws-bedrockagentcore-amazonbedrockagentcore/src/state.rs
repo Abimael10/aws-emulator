@@ -38,6 +38,14 @@
 //! bytes a caller presents. The registry is bounded by the expiry of each record and by
 //! [`MAX_ISSUED_WORKLOAD_ACCESS_TOKENS`], both materialised on the WRITE path.
 //!
+//! A mint of that plane is also where this service's AUTHORIZATION decision is observable,
+//! so that decision lives in [`authorization`]: a workload access token is scoped to ONE
+//! workload identity, and whether the calling principal may obtain one for the identity the
+//! request names is decided from the IAM policies in force on it ([`authorize`]) before
+//! anything is minted. A call that presents a USER's bearer token has that token validated
+//! first too ([`presented_user_tokens`]): the token is a value to be checked, never one to
+//! be trusted.
+//!
 //! # The store has an explicit ceiling
 //!
 //! `CreateEvent` and `IngestData` are the memory plane's growth sites, and a caller
@@ -97,6 +105,17 @@ use std::time::{Duration, SystemTime};
 
 mod ab_tests;
 pub use ab_tests::*;
+
+/// Whether IAM lets a request perform the action it asks for: [`authorize`], the gate an
+/// operation takes before it mints, reads or writes anything.
+mod authorization;
+pub use authorization::*;
+
+/// The reading this plane makes of a USER's presented bearer token:
+/// [`user_of_presented_token`], which says which user a token speaks for or which class the
+/// call is refused as.
+mod presented_user_tokens;
+pub use presented_user_tokens::*;
 
 /// The batch-evaluation plane: [`BatchEvaluationRecord`], the job records
 /// `StartBatchEvaluation` writes and `GetBatchEvaluation` reports back.

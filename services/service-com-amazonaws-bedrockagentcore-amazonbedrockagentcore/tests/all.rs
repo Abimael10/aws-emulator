@@ -63,5 +63,9 @@ mod state_roundtrip;
 mod validation_constraint_wording;
 #[path = "all/validation_range_wording.rs"]
 mod validation_range_wording;
+#[path = "all/workload_access_token_authorization.rs"]
+mod workload_access_token_authorization;
+#[path = "all/workload_access_token_for_jwt.rs"]
+mod workload_access_token_for_jwt;
 #[path = "all/workload_access_tokens.rs"]
 mod workload_access_tokens;
