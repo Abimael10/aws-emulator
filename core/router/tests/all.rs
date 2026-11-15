@@ -1,52 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
-// Single integration-test target for the router: the CANONICAL DECLARATION LIST of every
-// cross-service suite under `tests/all/`, and nothing else.
-//
-// Put a new suite at `tests/all/<name>.rs` and insert ONE `#[path = "all/<name>.rs"]` /
-// `mod <name>;` pair into the sorted list below, in the one place its name sorts to. The list
-// holds those pairs and no other line — no prose between them, and NOTHING after the last one
-// — so two branches landing at once insert two lines in two places and have nothing to
-// duplicate, re-word or mistype.
-// EVERY comment in this file is an ORDINARY `//` one, this header included: a doc comment of
-// the enclosing module is legal only ahead of the first item, so one left below the list
-// compiles no suite of this target at all, and with none anywhere in the file there is no such
-// line to copy. A suite file no `mod` names is compiled nowhere, a name declared twice compiles
-// neither copy, and a suite left at the top level of `tests/` fails the build. This file is a
-// test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of it, which the layout
-// check refuses: the `#[path]` above each `mod` is what points it into `tests/all/`.
-// Suites of this target pin all of that rather than restate it:
-// Single integration-test target for the router: the canonical DECLARATION LIST of every
-// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
-// suite file, sorted by name, and no other line — no prose between the pairs, no blank line,
-// and nothing after the last pair. Two branches landing at once then insert two lines in two
-// places and have no prose to duplicate, re-word or mistype, which is what had gone wrong
-// here: the tail of this file had grown hundreds of re-typed copies of its own header.
-// EVERY comment in this file is an ORDINARY `//` one, this header included. An inner doc
-// comment (`//` followed by `!`) is legal only before the first item, so one appended past
-// the declarations is `E0753` and compiles no suite of this target; with none anywhere in the
-// file, no merge of two landings can leave one past the first item.
-// A suite file no `mod` here names is compiled nowhere and its tests never run (the build-time
-// layout check refuses it); a suite left at the top level of `tests/` fails the build; and a
-// second `mod` for one name is `E0428`, which compiles neither copy. `tests/all.rs` is a
-// test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of this file
-// (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each `mod` is what
-// points it into `tests/all/`.
+// Single integration-test target for the router: this header, then one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under `tests/all/`, sorted
+// by name, and no other line. Put a new suite at `tests/all/<name>.rs` and insert its pair
+// where its name sorts to, so two branches landing at once insert two lines in two places and
+// have no prose to duplicate, re-word or mistype.
 // What a suite covers, and why it drives the assembled router rather than one service crate,
 // belongs in that suite's OWN module header, where it is read beside the test it explains; a
-// note about THIS file belongs in `all/appended_notes.rs`. The suites
-// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
-// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs`,
+// note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
+// suite.
+// EVERY comment in this file is an ordinary `//` one, this header included: an inner doc
+// comment is legal only before the first item, so one left past the declarations is `E0753`
+// and compiles no suite of this target. With none anywhere in the file, no merge of two
+// landings can leave one there.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
+// this file under `tests/`, which the layout check refuses: the `#[path]` above each `mod` is
+// what points the declaration into `tests/all/`. A suite file no `mod` names is compiled
+// nowhere and its tests never run, and a second `mod` for one name is `E0428`.
+// The `all/all_rs_*.rs` suites, `all/every_suite_file_is_declared.rs`,
 // `all/declaration_roots_are_canonical_and_complete.rs` and
-// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs`, for this file and
-// for every service crate's own `tests/all.rs`. What a suite covers belongs in that suite's own
-// module header, and a note about THIS file in `all/appended_notes.rs`, declared below like any
-// other file.
-// The paragraphs above wrap without the indentation `clippy::doc_lazy_continuation` asks of a
-// doc list item; the lint is allowed here so a header line is a header line rather than a build
-// failure. An inner attribute, like an inner doc comment, is legal only before the first item,
-// so it stands here rather than in the list.
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin all of the
+// above, for this root and for every service crate's `tests/all.rs`, so check there rather
+// than leaving a note here.
+// An inner attribute, like an inner doc comment, is legal only before the first item, so the
+// one this target needs stands here rather than in the list below.
 #![allow(clippy::doc_lazy_continuation)]
 #[path = "all/agent_registry_signing_name_routing.rs"]
 mod agent_registry_signing_name_routing;

@@ -24,7 +24,7 @@ const REGION: &str = "us-east-1";
 const OTHER_REGION: &str = "us-west-2";
 
 /// A `PutAlarmMuteRule` request with only the members the model makes required.
-fn put_request(name: &str, expression: &str, duration: &str) -> Value {
+pub(crate) fn put_request(name: &str, expression: &str, duration: &str) -> Value {
     json!({
         "Name": name,
         "Rule": {"Schedule": {"Expression": expression, "Duration": duration}},
@@ -32,7 +32,7 @@ fn put_request(name: &str, expression: &str, duration: &str) -> Value {
 }
 
 /// The same request with `extra` merged into it, so a row states only what it varies.
-fn with_members(mut request: Value, extra: Value) -> Value {
+pub(crate) fn with_members(mut request: Value, extra: Value) -> Value {
     let (Some(target), Some(extra)) = (request.as_object_mut(), extra.as_object()) else {
         return request;
     };
@@ -60,7 +60,7 @@ fn at_expression(at: DateTime<Utc>, timezone: Tz) -> String {
 }
 
 /// A string member of a body.
-fn text(value: &Value, member: &str) -> Option<String> {
+pub(crate) fn text(value: &Value, member: &str) -> Option<String> {
     value
         .get(member)
         .and_then(Value::as_str)
@@ -703,7 +703,7 @@ async fn a_mute_rule_belongs_to_the_region_it_was_written_in() {
 
 /// The ARN of the rule `name` names in `region`, which is how a listing identifies a rule:
 /// `AlarmMuteRuleSummary` models no name member, only the ARN.
-fn rule_arn(region: &str, name: &str) -> String {
+pub(crate) fn rule_arn(region: &str, name: &str) -> String {
     format!(
         "arn:aws:cloudwatch:{region}:{}:alarm-mute-rule:{name}",
         ::engine::EMULATOR_ACCOUNT_ID
@@ -711,7 +711,7 @@ fn rule_arn(region: &str, name: &str) -> String {
 }
 
 /// The rule ARNs one `ListAlarmMuteRules` answer reports, in the order it reported them.
-fn listed_arns(listed: &Value) -> Vec<String> {
+pub(crate) fn listed_arns(listed: &Value) -> Vec<String> {
     listed
         .get("AlarmMuteRuleSummaries")
         .and_then(Value::as_array)
@@ -726,7 +726,7 @@ fn listed_arns(listed: &Value) -> Vec<String> {
 
 /// A `PutMetricAlarm` request with only the members the model makes required, so a row that
 /// filters a listing by alarm name names an alarm the store holds.
-fn put_alarm(name: &str) -> Value {
+pub(crate) fn put_alarm(name: &str) -> Value {
     json!({
         "AlarmName": name,
         "Namespace": "MyApp",
