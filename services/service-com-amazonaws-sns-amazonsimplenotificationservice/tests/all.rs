@@ -23,6 +23,9 @@ mod arn_reference_refusals;
 #[path = "all/attribute_document_parse_refusal.rs"]
 mod attribute_document_parse_refusal;
 
+#[path = "all/authorization_refusal_clause.rs"]
+mod authorization_refusal_clause;
+
 #[path = "all/confirm_subscription.rs"]
 mod confirm_subscription;
 

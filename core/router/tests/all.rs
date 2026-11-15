@@ -1777,3 +1777,20 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // The `all/all_rs_*` suites, `all/every_suite_file_is_declared.rs` and the
 // `all/declaration_roots_*` suites pin all of that, for this file and for every service
 // crate's `tests/all.rs`, so a note about those rules belongs there rather than here.
+// suite file, sorted by name, and no other line: no prose between the pairs, no blank line,
+// places and have no prose to duplicate, re-word or mistype. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair where its name sorts to.
+// note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
+// suite.
+// deliberate: a doc comment for the module is legal only ahead of the first item, so one left
+// below the list compiles no suite of this target at all — and with none anywhere in the file,
+// no appended, re-typed or merged copy of a line of it can be one.
+// A suite file no `mod` here names is compiled nowhere and its tests never run; a suite left
+// at the top level of `tests/` fails the build; and a second `mod` for one name fails every
+// suite of this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would
+// resolve to a SIBLING of this file, which the layout check refuses: the `#[path]` above each
+// `mod` is what points the declaration into `tests/all/`. The `all/all_rs_*` suites,
+// `all/every_suite_file_is_declared.rs` pin all of that, for this file and for every service
+// crate's `tests/all.rs`, so check there rather than leaving a note here.
+// An inner attribute, like a module doc comment, is legal only ahead of the first item, so the
+// one this target needs stands here rather than in the list below.
