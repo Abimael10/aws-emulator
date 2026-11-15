@@ -5,9 +5,14 @@
 //! The statement is `SELECT <select clause> FROM '<topic filter>' [WHERE <condition>]` (the
 //! AWS IoT SQL reference). The topic filter is a single-quoted literal, which no SQL grammar
 //! parses as a relation, so the one span naming it ([`super::selected_topic`], this service's
-//! lexer of that clause) is replaced by a relation name and the rest of the statement is READ
-//! by the `sqlparser` crate: the select clause and the condition are its AST, never this
+//! lexer of that clause) is replaced by a quoted identifier and the rest of the statement is
+//! READ by the `sqlparser` crate: the select clause and the condition are its AST, never this
 //! module's own parse of the text.
+//!
+//! The same pass decides whether a statement may be RECORDED at all ([`sql_rejection`]): a
+//! statement the parser cannot read is refused by the writer, so no rule is stored whose SQL
+//! could never evaluate, and the refusal reports the grammar's expectation and the place the
+//! parse stopped.
 //!
 //! What then runs over a message is the purpose-built walk in [`super::rule_expression`],
 //! which reads the message document and nothing else. This module FAILS CLOSED around it: a
@@ -22,7 +27,9 @@
 use ::serde_json::{Map, Value};
 use ::sqlparser::ast::{Expr, GroupByExpr, Select, SelectItem, SetExpr, Statement};
 use ::sqlparser::dialect::GenericDialect;
+use ::sqlparser::keywords::Keyword;
 use ::sqlparser::parser::Parser;
+use ::sqlparser::tokenizer::{Token, Tokenizer};
 
 use super::rule_expression::{evaluate, Evaluated};
 
@@ -127,15 +134,7 @@ fn parsed_statement(sql: &str) -> Option<ParsedStatement> {
         return None;
     }
     let topic = super::selected_topic(sql)?;
-    // The topic filter's span is the only part replaced, and both ends are read through `get`,
-    // so no offset can index out of bounds.
-    let standard: String = characters
-        .get(..topic.start)?
-        .iter()
-        .copied()
-        .chain(MESSAGE_RELATION.chars())
-        .chain(characters.get(topic.end..)?.iter().copied())
-        .collect();
+    let standard = standard_statement(&characters, &topic)?;
 
     let statements = Parser::parse_sql(&GenericDialect {}, &standard).ok()?;
     let [Statement::Query(query)] = statements.as_slice() else {
@@ -171,6 +170,37 @@ fn parsed_statement(sql: &str) -> Option<ParsedStatement> {
     })
 }
 
+/// `characters` with the topic filter's span rewritten so the whole statement is standard
+/// SQL the parser reads.
+///
+/// The span is replaced by a DOUBLE-quoted identifier holding the literal's own text — which
+/// is what lets the parser read as a relation the one clause no SQL grammar reads as one — and
+/// it is exactly as many characters as the span it replaces, so a position the parser reports
+/// in the result is that same position in the statement the caller sent. A literal carrying a
+/// `"` of its own cannot be quoted that way, so that one is replaced by [`MESSAGE_RELATION`]
+/// instead: the statement is still read, at the cost of shifting the positions after the span.
+fn standard_statement(characters: &[char], topic: &super::SelectedTopic) -> Option<String> {
+    let inner = characters.get(topic.start.checked_add(1)?..topic.end.checked_sub(1)?)?;
+    let mut replacement: Vec<char> = Vec::with_capacity(inner.len() + 2);
+    if inner.contains(&'"') {
+        replacement.extend(MESSAGE_RELATION.chars());
+    } else {
+        replacement.push('"');
+        replacement.extend_from_slice(inner);
+        replacement.push('"');
+    }
+    // Both ends are read through `get`, so no offset can index out of bounds.
+    Some(
+        characters
+            .get(..topic.start)?
+            .iter()
+            .copied()
+            .chain(replacement)
+            .chain(characters.get(topic.end..)?.iter().copied())
+            .collect(),
+    )
+}
+
 /// The name a selected expression carrying no alias is reported under: the last segment of the
 /// attribute path it names, so `SELECT state.reported.temp` selects `temp`. `None` for an
 /// expression that names no path — one this engine would have to name itself.
@@ -180,5 +210,170 @@ fn selected_name(expression: &Expr) -> Option<String> {
         Expr::CompoundIdentifier(identifiers) => identifiers.last().map(|last| last.value.clone()),
         Expr::Nested(inner) => selected_name(inner),
         _ => None,
+    }
+}
+
+// ============================================================================
+// Whether a statement is one the rules engine can be GIVEN at all
+// ============================================================================
+//
+// The reading above is what the engine does with a statement it HOLDS. The reading below
+// is what a WRITER of a rule does with the statement a request carries: a statement that
+// cannot be parsed is refused, so no rule is recorded whose SQL could never evaluate.
+
+/// The keyword every AWS IoT rule statement opens with.
+///
+/// The AWS IoT SQL reference gives a statement as `SELECT <attributes> FROM <topic filter>
+/// [WHERE <condition>]`, so the grammar expects this keyword first and a statement that
+/// opens with anything else is not a rule statement at all.
+const SELECT_KEYWORD: &str = "SELECT";
+
+/// What a caller is told about a statement the parser refused without saying where: the
+/// sentence the modelled error itself carries ("The Rule-SQL expression can't be parsed
+/// correctly", `smithy_query(query="shape",shape="SqlParseException")`).
+pub const UNREADABLE_SQL_MESSAGE: &str = "The Rule-SQL expression can't be parsed correctly.";
+
+/// Why a rule's SQL statement cannot be parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlRejection {
+    /// Parsing stopped at a known place: what the grammar expected there, and the 1-based
+    /// line and column of the statement it stopped at.
+    Stopped {
+        /// The token the grammar expected where parsing stopped.
+        expected: String,
+        /// The 1-based line of the statement parsing stopped at.
+        line: usize,
+        /// The 1-based column of that line parsing stopped at.
+        column: usize,
+    },
+    /// The parser refused the statement without reporting a place.
+    Unreadable,
+}
+
+impl SqlRejection {
+    /// What to tell the caller about `sql`: the expectation, a blank line, the statement
+    /// as submitted, and a caret line marking the column parsing stopped at with the
+    /// 1-based position after it.
+    ///
+    /// The fixed parts are the expectation line and the ` at <line>:<column>` suffix; the
+    /// variable parts are the submitted statement and the place its parse stopped, both
+    /// read off this request. A statement the parser placed nowhere carries the modelled
+    /// error's own sentence instead ([`UNREADABLE_SQL_MESSAGE`]).
+    pub fn message(&self, sql: &str) -> String {
+        match self {
+            Self::Stopped {
+                expected,
+                line,
+                column,
+            } => {
+                let caret = " ".repeat(column.saturating_sub(1));
+                format!("Expected '{expected}'\n\n{sql}\n{caret}^ at {line}:{column}")
+            }
+            Self::Unreadable => UNREADABLE_SQL_MESSAGE.to_string(),
+        }
+    }
+}
+
+/// Why the statement `sql` cannot be parsed, or `None` for one the parser reads whole.
+///
+/// Two readings, in the order the grammar takes them: the statement must OPEN with
+/// [`SELECT_KEYWORD`], and the whole of it must then parse as one SQL query. Both are the
+/// `sqlparser` crate's — its tokenizer says where the statement's first token is, and its
+/// parser reads the rest over the same standard-SQL rewrite the rules engine reads a
+/// stored statement with ([`parsed_statement`]) — so a statement a writer accepts is one
+/// the engine can read.
+///
+/// A statement longer than [`super::MAX_SQL_SCAN_CHARACTERS`] is NOT parsed here and so is
+/// not refused: that bound is the one every reading of a statement in this service takes,
+/// and it is what keeps this pass's work and its one allocation finite whatever a caller
+/// sends.
+pub fn sql_rejection(sql: &str) -> Option<SqlRejection> {
+    let characters: Vec<char> = sql.chars().take(super::MAX_SQL_SCAN_CHARACTERS + 1).collect();
+    if characters.len() > super::MAX_SQL_SCAN_CHARACTERS {
+        return None;
+    }
+
+    // The opening keyword. A statement that opens with any other token — or with no token
+    // at all, where the grammar expects the keyword at the end of what was sent — stops
+    // there, which is the one expectation the grammar states before it has read anything.
+    // The opening keyword, decided on the statement's own TOKENS: the tokenizer the
+    // parser itself reads with is what says where a token starts, so whitespace, a line
+    // comment and a block comment are passed over by the crate rather than by a pass
+    // written here. A statement that opens with any other token — or with no token at
+    // all — stops there, which is the one expectation the grammar states before it has
+    // read anything.
+    let tokens = match Tokenizer::new(&GenericDialect {}, sql).tokenize_with_location() {
+        Ok(tokens) => tokens,
+        // A statement the tokenizer cannot even split into tokens (an unterminated
+        // literal) is placed nowhere by it.
+        Err(_) => return Some(SqlRejection::Unreadable),
+    };
+    let opening = tokens
+        .iter()
+        .find(|token| !matches!(token.token, Token::Whitespace(_)));
+    let opens_with_select = opening.is_some_and(|token| {
+        matches!(&token.token, Token::Word(word) if word.keyword == Keyword::SELECT)
+    });
+    if !opens_with_select {
+        // An empty statement carries no token to point at, so the keyword was expected
+        // at the start of what was sent.
+        let (line, column) = opening.map_or((1, 1), |token| {
+            (
+                token.span.start.line.max(1) as usize,
+                token.span.start.column.max(1) as usize,
+            )
+        });
+        return Some(SqlRejection::Stopped {
+            expected: SELECT_KEYWORD.to_string(),
+            line,
+            column,
+        });
+    }
+
+    let standard = match super::selected_topic(sql) {
+        // A statement whose `FROM` clause names a quoted topic filter is read through the
+        // rewrite that makes it standard SQL; one that names none is already standard, so
+        // it is parsed exactly as it was sent.
+        Some(topic) => match standard_statement(&characters, &topic) {
+            Some(standard) => standard,
+            None => return Some(SqlRejection::Unreadable),
+        },
+        None => characters.iter().collect(),
+    };
+    match Parser::parse_sql(&GenericDialect {}, &standard) {
+        Ok(_) => None,
+        Err(error) => Some(parser_rejection(&error.to_string())),
+    }
+}
+
+/// What the parser's own refusal says: the token it expected and the place it stopped at.
+///
+/// `sqlparser` words a refusal as `Expected: <token>, found: <token> at Line: <line>,
+/// Column: <column>`, so the expectation and the position are read out of it rather than
+/// restated here; a refusal worded any other way places the failure nowhere
+/// ([`SqlRejection::Unreadable`]).
+fn parser_rejection(reported: &str) -> SqlRejection {
+    let expected = reported
+        .split("Expected: ")
+        .nth(1)
+        .and_then(|rest| rest.split(", found:").next())
+        .map(|expected| expected.trim().to_string());
+    let position = reported
+        .rsplit("at Line: ")
+        .next()
+        .and_then(|position| position.split_once(", Column: "))
+        .and_then(|(line, column)| {
+            Some((
+                line.trim().parse::<usize>().ok()?,
+                column.trim().parse::<usize>().ok()?,
+            ))
+        });
+    match (expected, position) {
+        (Some(expected), Some((line, column))) => SqlRejection::Stopped {
+            expected,
+            line,
+            column,
+        },
+        _ => SqlRejection::Unreadable,
     }
 }

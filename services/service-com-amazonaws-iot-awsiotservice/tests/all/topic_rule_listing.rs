@@ -270,9 +270,11 @@ fn statement_fixtures() -> Vec<RuleFixture> {
             topic_pattern: Some("literal/before/from"),
         },
         RuleFixture {
-            name: "unterminated_literal",
-            // A statement whose literal never closes names no topic filter.
-            sql: "SELECT * FROM 'never/closed",
+            name: "double_quoted_relation",
+            // The IoT SQL reference writes the topic filter as a SINGLE-quoted literal,
+            // so a double-quoted relation — which standard SQL reads as an identifier —
+            // names no topic filter.
+            sql: "SELECT * FROM \"double/quoted\"",
             disabled: None,
             topic_pattern: None,
         },

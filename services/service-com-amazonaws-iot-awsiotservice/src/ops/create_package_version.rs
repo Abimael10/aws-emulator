@@ -6,6 +6,9 @@
 //! by `versionName` inside the package named by `packageName`, and answers with the
 //! record it persisted — so `GetPackageVersion` reads back what this call reported.
 //!
+//! The one member of the record it does NOT report is the `attributes` map, which the
+//! create path withholds; see [`created_version_output`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -279,9 +282,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// This operation's response for `version`: the members the model binds on
 /// `CreatePackageVersionResponse`, read off the persisted record.
 ///
-/// `attributes` is reported only when the version carries any, because the member is
-/// optional and a version created without attributes HAS none — an empty map would
-/// claim otherwise.
+/// `attributes` is NOT among them. The create path does not reflect the attributes map
+/// the request carried — the map is `@sensitive` on both the input and the output
+/// (`smithy_query(query="shape",shape="CreatePackageVersionRequest")`), and the
+/// service does not write a caller's sensitive values back into the response that
+/// confirms the write — so what the version carries is read back through
+/// `GetPackageVersion`, off the same record.
 fn created_version_output(
     version: &crate::state::RegisteredPackageVersion,
 ) -> CreatePackageVersionOutput {
@@ -290,13 +296,7 @@ fn created_version_output(
         package_name: Some(version.package_name.clone()),
         version_name: Some(version.version_name.clone()),
         description: version.description.clone(),
-        attributes: (!version.attributes.is_empty()).then(|| {
-            version
-                .attributes
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
-        }),
+        attributes: None,
         status: Some(version.status.clone()),
         error_reason: version.error_reason.clone(),
     }

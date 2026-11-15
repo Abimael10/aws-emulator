@@ -8,6 +8,12 @@
 //! [`crate::state::DEFAULT_AWS_IOT_SQL_VERSION`] — and mints the rule's ARN and
 //! creation instant, so every later reader of the rule reports one value.
 //!
+//! A payload whose `sql` cannot be parsed is refused with the modelled
+//! `SqlParseException` (HTTP 400) and nothing is recorded: the statement is what the
+//! rule DOES, so a rule that could never select a message is not a rule the service
+//! stores. The reading is the rules engine's own
+//! ([`crate::state::rule_sql::sql_rejection`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -180,6 +186,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let rule_arn = crate::state::topic_rule_arn(&region, &input.rule_name);
+
+        // The statement is the substance of the rule, so a statement the rules engine
+        // could never read is refused BEFORE anything is recorded: the modelled
+        // `SqlParseException` ("The Rule-SQL expression can't be parsed correctly",
+        // HTTP 400), whose message reports what the grammar expected and where the
+        // parse stopped ([`crate::state::SqlRejection`]).
+        if let Some(rejection) = crate::state::sql_rejection(&input.topic_rule_payload.sql) {
+            return Err(CreateTopicRuleErrorModeled::SqlParseException(SqlParseException {
+                message: Some(rejection.message(&input.topic_rule_payload.sql)),
+            })
+            .into());
+        }
 
         let mut store = state.lock();
 

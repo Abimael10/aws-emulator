@@ -1376,3 +1376,24 @@ mod zz_probe_whole_emulator;
 // What a suite covers, and why it drives the assembled router rather than one service
 // crate, belongs in that suite's own module doc, where it is read beside the test it
 // explains; a note about this file belongs in all/appended_notes.rs.
+// Single integration-test target for the router: a CANONICAL DECLARATION LIST.
+// This file holds this header, then one `#[path = "all/<name>.rs"]` / `mod <name>;`
+// pair per suite file under `tests/all/`, sorted by name, and no other line — so two
+// branches landing at once insert two lines in two places and have no prose to duplicate,
+// re-word or mistype.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair into the sorted list below.
+// What that suite covers, and why it drives the assembled router rather than one service
+// explains; a note about THIS file belongs in `all/appended_notes.rs`.
+// The rules that bind this crate root are each pinned by a suite of its own
+// (`all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs`,
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs`), for this file
+// and for every service crate's `tests/all.rs`: a suite no `mod` names compiles nowhere and
+// its tests never run, a suite declared twice is `E0428`, and an inner doc comment (`//!`)
+// or an inner attribute is legal only BEFORE the first item — so no line of this file is an
+// inner doc comment, not even in this header, and the allowance above stands ahead of the
+// first declaration. Each of the last two fails EVERY suite of this target rather than one,
+// which is how the tail of this file, grown by concurrent landings into re-typed copies of
+// this header, came to compile no suite at all. This file is a test-target CRATE ROOT, where
+// a bare `mod` would resolve to a SIBLING of it, which the layout check refuses: the
+// `#[path]` above each declaration is what points it into `tests/all/`.

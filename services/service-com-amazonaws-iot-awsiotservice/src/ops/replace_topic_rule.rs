@@ -196,15 +196,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // '<ruleName>' was denied`: the fixed text, the single quotes and the rule name
         // the URI label carried, and nothing else — it names neither the action nor an
         // ARN and does not state that the rule is absent, so a caller cannot use the
-        // reply to confirm that a rule exists.
+        // reply to confirm that a rule exists. The sentence is the family's
+        // ([`crate::state::unauthorized_topic_rule_message`]).
         let existing = store.topic_rules.get(&input.rule_name).ok_or_else(|| {
             ReplaceTopicRuleErrorModeled::UnauthorizedException(UnauthorizedException {
-                message: Some(format!(
-                    "Access to topic rule '{}' was denied",
-                    input.rule_name
+                message: Some(crate::state::unauthorized_topic_rule_message(
+                    &input.rule_name,
                 )),
             })
         })?;
+
+        // The same reading of the statement the create takes: a payload whose `sql`
+        // the rules engine could never read is refused with the modelled
+        // `SqlParseException` (HTTP 400) and the rule the store holds is left exactly
+        // as it was, so a replace that cannot install a working statement does not
+        // destroy the working one.
+        if let Some(rejection) = crate::state::sql_rejection(&input.topic_rule_payload.sql) {
+            return Err(ReplaceTopicRuleErrorModeled::SqlParseException(SqlParseException {
+                message: Some(rejection.message(&input.topic_rule_payload.sql)),
+            })
+            .into());
+        }
 
         // "Replaces the rule. You must specify all parameters for the new rule": the
         // payload the request carries is the rule's WHOLE payload afterwards, so the

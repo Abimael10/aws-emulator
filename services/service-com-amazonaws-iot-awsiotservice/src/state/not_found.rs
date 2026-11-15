@@ -140,3 +140,16 @@ pub fn unrecognized_index_name_message(index_name: &str) -> String {
 pub fn missing_authorizer_message(authorizer_name: &str) -> String {
     format!("Authorizer {authorizer_name} not found")
 }
+
+/// How this service refuses an operation that addresses ONE topic rule by name.
+///
+/// Not a not-found either: `GetTopicRule`, `ReplaceTopicRule`, `EnableTopicRule` and
+/// `DisableTopicRule` model no not-found error, because AWS authorizes each against the
+/// rule's OWN ARN — a name that names no rule cannot be authorized — so a miss and a
+/// denial are one indistinguishable `UnauthorizedException` (401). The sentence is that
+/// family's: the fixed text and the single-quoted rule name the URI label carried, with
+/// neither the action nor an ARN in it, and no statement that the rule is absent, so a
+/// caller cannot use the reply to confirm that a rule exists.
+pub fn unauthorized_topic_rule_message(rule_name: &str) -> String {
+    format!("Access to topic rule '{rule_name}' was denied")
+}

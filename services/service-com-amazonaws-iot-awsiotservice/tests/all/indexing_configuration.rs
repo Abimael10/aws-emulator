@@ -13,6 +13,9 @@
 //!   the last `UpdateIndexingConfiguration` persisted, or — for an account that has
 //!   never updated it — the disabled configuration, every mode at the documented
 //!   `OFF` value;
+//! * on top of the stored sections the reader reports what the SERVICE fills in: each
+//!   section's `managedFields` while its indexing is on, and the `filter` structure
+//!   every thing-indexing configuration has;
 //! * the read is a read: repeating it, with no update between, reports the same
 //!   configuration and leaves the store alone;
 //! * a configuration section the update SUPPLIES replaces the stored one in full (an
@@ -21,10 +24,11 @@
 //! * `managedFields` a caller supplies are not recorded — "You can't modify managed
 //!   fields by updating fleet indexing configuration"
 //!   (`smithy_query(query="doc",shape="ThingIndexingConfiguration",member="managedFields")`);
-//! * a value outside the enum the model declares for a member, and the one documented
-//!   cross-member rule ("To enable thing connectivity indexing, *thingIndexMode* must
-//!   not be set to OFF"), are refused with the modelled `InvalidRequestException`
-//!   (400) and change nothing.
+//! * a value outside the enum the model declares for a member, and the documented
+//!   cross-member rules ("To enable thing connectivity indexing, *thingIndexMode* must
+//!   not be set to OFF", and a `namedShadowNames` selection only under
+//!   `namedShadowIndexingMode` ON), are refused with the modelled
+//!   `InvalidRequestException` (400) and change nothing.
 
 use std::sync::Arc;
 
@@ -38,7 +42,8 @@ use service_com_amazonaws_iot_awsiotservice::ops::types::{
     THING_INDEXING_MODE_VALUES,
 };
 use service_com_amazonaws_iot_awsiotservice::state::{
-    ComAmazonawsIotAwsiotserviceState, IndexingConfiguration, INDEXING_MODE_OFF, MAX_CUSTOM_FIELDS,
+    ComAmazonawsIotAwsiotserviceState, IndexingConfiguration, CONNECTIVITY_THING_FIELDS,
+    INDEXING_MODE_OFF, MAX_CUSTOM_FIELDS, REGISTRY_THING_FIELDS, THING_GROUP_FIELDS,
 };
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -167,7 +172,9 @@ impl Reply {
     }
 }
 
-/// The disabled configuration, as a read reports it: every mode `OFF`, nothing else.
+/// The disabled configuration, as a read reports it: every mode `OFF`, the empty
+/// filter structure a reader always reports, and nothing else — a section whose
+/// indexing is off has no managed fields, because nothing is indexed for it.
 fn disabled_report() -> Value {
     json!({
         "thingIndexingConfiguration": {
@@ -175,6 +182,7 @@ fn disabled_report() -> Value {
             "thingConnectivityIndexingMode": INDEXING_MODE_OFF,
             "deviceDefenderIndexingMode": INDEXING_MODE_OFF,
             "namedShadowIndexingMode": INDEXING_MODE_OFF,
+            "filter": {},
         },
         "thingGroupIndexingConfiguration": {
             "thingGroupIndexingMode": INDEXING_MODE_OFF,
@@ -216,8 +224,56 @@ fn fields_of_every_modelled_type() -> Value {
     )
 }
 
+/// One managed-field catalog as the `Fields` list a reader reports.
+fn catalog(entries: &[(&str, &str)]) -> Value {
+    Value::Array(
+        entries
+            .iter()
+            .map(|(name, field_type)| field(name, field_type))
+            .collect(),
+    )
+}
+
+/// The `managedFields` a read reports for a thing section under `mode` and
+/// `connectivity`: the fields the index's enabled DATA SOURCES contribute, and none at
+/// all while thing indexing is off.
+fn expected_thing_managed_fields(mode: &str, connectivity: &str) -> Option<Value> {
+    if mode == INDEXING_MODE_OFF {
+        return None;
+    }
+    let mut entries: Vec<(&str, &str)> = REGISTRY_THING_FIELDS.to_vec();
+    if connectivity != INDEXING_MODE_OFF {
+        entries.extend_from_slice(CONNECTIVITY_THING_FIELDS);
+    }
+    Some(catalog(&entries))
+}
+
+/// The `filter` a read reports for a thing section under `mode` that supplied
+/// `supplied`: every selection, with a selection nothing was added to reported as the
+/// empty one — and, while indexing is off, the selections the section holds and no
+/// more.
+fn expected_filter(mode: &str, supplied: Option<&Value>) -> Value {
+    let held = supplied.cloned().unwrap_or_else(|| json!({}));
+    if mode == INDEXING_MODE_OFF {
+        return held;
+    }
+    let selection = |member: &str| held.get(member).cloned().unwrap_or_else(|| json!([]));
+    json!({
+        "namedShadowNames": selection("namedShadowNames"),
+        "geoLocations": selection("geoLocations"),
+        "connectivity": {
+            "includeSocketInformation": held
+                .get("connectivity")
+                .and_then(|connectivity| connectivity.get("includeSocketInformation"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        },
+    })
+}
+
 /// The thing section as the service records it: the supplied members, each optional
-/// mode the request left out filled in with `OFF`, and `managedFields` dropped.
+/// mode the request left out filled in with `OFF`, `managedFields` the SERVICE's own
+/// rather than the caller's, and the filter structure a reader always reports.
 fn expected_thing(supplied: &Value) -> Value {
     let mut expected = Map::new();
     expected.insert(
@@ -231,15 +287,27 @@ fn expected_thing(supplied: &Value) -> Value {
             .unwrap_or_else(|| json!(INDEXING_MODE_OFF));
         expected.insert((*member).to_string(), value);
     }
-    for member in ["customFields", "filter"] {
-        if let Some(value) = supplied.get(member) {
-            expected.insert(member.to_string(), value.clone());
-        }
+    if let Some(value) = supplied.get("customFields") {
+        expected.insert("customFields".to_string(), value.clone());
     }
+    let mode = supplied["thingIndexingMode"]
+        .as_str()
+        .unwrap_or(INDEXING_MODE_OFF);
+    let connectivity = expected["thingConnectivityIndexingMode"]
+        .as_str()
+        .unwrap_or(INDEXING_MODE_OFF);
+    if let Some(managed) = expected_thing_managed_fields(mode, connectivity) {
+        expected.insert("managedFields".to_string(), managed);
+    }
+    expected.insert(
+        "filter".to_string(),
+        expected_filter(mode, supplied.get("filter")),
+    );
     Value::Object(expected)
 }
 
-/// The thing group section as the service records it, under the same rules.
+/// The thing group section as the service records it, under the same rules — the group
+/// index has no filter of its own, so only `managedFields` is added.
 fn expected_thing_group(supplied: &Value) -> Value {
     let mut expected = Map::new();
     expected.insert(
@@ -248,6 +316,16 @@ fn expected_thing_group(supplied: &Value) -> Value {
     );
     if let Some(value) = supplied.get("customFields") {
         expected.insert("customFields".to_string(), value.clone());
+    }
+    if supplied["thingGroupIndexingMode"]
+        .as_str()
+        .unwrap_or(INDEXING_MODE_OFF)
+        != INDEXING_MODE_OFF
+    {
+        expected.insert(
+            "managedFields".to_string(),
+            catalog(THING_GROUP_FIELDS),
+        );
     }
     Value::Object(expected)
 }
@@ -649,7 +727,8 @@ async fn an_update_that_supplies_no_section_changes_nothing() {
 }
 
 /// `managedFields` are the service's, not the caller's: a request that supplies them
-/// records none.
+/// records none, and the reader reports the service's own catalog for every section
+/// whose indexing is on.
 #[tokio::test]
 async fn managed_fields_a_caller_supplies_are_not_recorded() {
     let cases: &[(&str, Value)] = &[
@@ -683,17 +762,45 @@ async fn managed_fields_a_caller_supplies_are_not_recorded() {
             reply.status,
             reply.text()
         );
+        // Nothing of the caller's list reaches the store.
+        let stored = emulator.state().lock().indexing_configuration.clone();
+        assert!(
+            stored.thing.managed_fields.is_none() && stored.thing_group.managed_fields.is_none(),
+            "case {name}: the caller's managedFields were recorded as {:?} / {:?}",
+            stored.thing.managed_fields,
+            stored.thing_group.managed_fields
+        );
+        // What the reader reports is the service's own catalog for the section the
+        // request enabled, and nothing for the one it left off.
         let reported = emulator.reported(name).await;
-        for section in [
-            "thingIndexingConfiguration",
-            "thingGroupIndexingConfiguration",
-        ] {
-            assert!(
-                reported[section].get("managedFields").is_none(),
-                "case {name}: {section} reports managedFields {}",
-                reported[section]
-            );
-        }
+        assert_eq!(
+            reported["thingIndexingConfiguration"]
+                .get("managedFields")
+                .cloned(),
+            expected_thing_managed_fields(
+                reported["thingIndexingConfiguration"]["thingIndexingMode"]
+                    .as_str()
+                    .unwrap_or(INDEXING_MODE_OFF),
+                reported["thingIndexingConfiguration"]["thingConnectivityIndexingMode"]
+                    .as_str()
+                    .unwrap_or(INDEXING_MODE_OFF),
+            ),
+            "case {name}: got {}",
+            reported["thingIndexingConfiguration"]
+        );
+        let group_managed = reported["thingGroupIndexingConfiguration"]
+            .get("managedFields")
+            .cloned();
+        let group_enabled = reported["thingGroupIndexingConfiguration"]["thingGroupIndexingMode"]
+            .as_str()
+            .unwrap_or(INDEXING_MODE_OFF)
+            != INDEXING_MODE_OFF;
+        assert_eq!(
+            group_managed,
+            group_enabled.then(|| catalog(THING_GROUP_FIELDS)),
+            "case {name}: got {}",
+            reported["thingGroupIndexingConfiguration"]
+        );
     }
 }
 

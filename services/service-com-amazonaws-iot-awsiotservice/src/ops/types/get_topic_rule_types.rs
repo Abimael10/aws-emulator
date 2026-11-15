@@ -24,7 +24,25 @@ pub struct GetTopicRuleOutput {
     pub rule: Option<TopicRule>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.iot#TopicRule")]
+/// The defining characteristics of one rule a reader reports: the members `TopicRule`
+/// declares, in the model's own member order, and `properties` appended last.
+///
+/// Member set and order from `smithy_query(query="shape",shape="TopicRule")`, plus
+/// `properties` — a member the real service reports on every rule it hands back and
+/// the on-disk model omits, which is why the schema and the codec below are written
+/// out rather than derived: `#[smithy_macros::smithy(shape = ...)]` admits exactly the
+/// model's member list, so a field with no member behind it cannot be declared through
+/// it. The model's own members keep the indices and the order the model gives them, and
+/// the unmodelled one is appended LAST with its shape id in a namespace of its own, so
+/// it can neither claim to be modelled nor collide with a member the model may declare
+/// later — and a later model refresh only has to move it into place and put the derive
+/// back.
+///
+/// Deliberately absent, for the same reason the derive's output would be inert here:
+/// the constraint traits (the validating walk runs on operation INPUTS only, and this
+/// structure is output-only), the `@http` chain (baked on only for an operation's
+/// input) and `@jsonName` (no member declares one: each one's wire name IS its Smithy
+/// member name).
 #[derive(Debug, Clone, Default)]
 pub struct TopicRule {
     pub rule_name: Option<String>,
@@ -35,5 +53,210 @@ pub struct TopicRule {
     pub rule_disabled: Option<bool>,
     pub aws_iot_sql_version: Option<String>,
     pub error_action: Option<Action>,
+    pub properties: Option<Vec<String>>,
+}
+
+#[allow(non_upper_case_globals)]
+impl TopicRule {
+    const M_RULE_NAME: ::aws_smithy_schema::Schema = topic_rule_member(
+        "com.amazonaws.iot#TopicRule$ruleName",
+        "com.amazonaws.iot",
+        "ruleName",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    const M_SQL: ::aws_smithy_schema::Schema = topic_rule_member(
+        "com.amazonaws.iot#TopicRule$sql",
+        "com.amazonaws.iot",
+        "sql",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    const M_DESCRIPTION: ::aws_smithy_schema::Schema = topic_rule_member(
+        "com.amazonaws.iot#TopicRule$description",
+        "com.amazonaws.iot",
+        "description",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    const M_CREATED_AT: ::aws_smithy_schema::Schema = topic_rule_member(
+        "com.amazonaws.iot#TopicRule$createdAt",
+        "com.amazonaws.iot",
+        "createdAt",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        3,
+    );
+    const M_ACTIONS: ::aws_smithy_schema::Schema = topic_rule_member(
+        "com.amazonaws.iot#TopicRule$actions",
+        "com.amazonaws.iot",
+        "actions",
+        ::aws_smithy_schema::ShapeType::List,
+        4,
+    );
+    const M_RULE_DISABLED: ::aws_smithy_schema::Schema = topic_rule_member(
+        "com.amazonaws.iot#TopicRule$ruleDisabled",
+        "com.amazonaws.iot",
+        "ruleDisabled",
+        ::aws_smithy_schema::ShapeType::Boolean,
+        5,
+    );
+    const M_AWS_IOT_SQL_VERSION: ::aws_smithy_schema::Schema = topic_rule_member(
+        "com.amazonaws.iot#TopicRule$awsIotSqlVersion",
+        "com.amazonaws.iot",
+        "awsIotSqlVersion",
+        ::aws_smithy_schema::ShapeType::String,
+        6,
+    );
+    const M_ERROR_ACTION: ::aws_smithy_schema::Schema = topic_rule_member(
+        "com.amazonaws.iot#TopicRule$errorAction",
+        "com.amazonaws.iot",
+        "errorAction",
+        ::aws_smithy_schema::ShapeType::Structure,
+        7,
+    );
+    /// The member the on-disk model does not declare; see this structure's note for
+    /// why its shape id sits in a namespace of its own.
+    const M_PROPERTIES: ::aws_smithy_schema::Schema = topic_rule_member(
+        "com.amazonaws.iot.recorded#TopicRule$properties",
+        "com.amazonaws.iot.recorded",
+        "properties",
+        ::aws_smithy_schema::ShapeType::List,
+        8,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.iot#TopicRule",
+            "com.amazonaws.iot",
+            "TopicRule",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_RULE_NAME,
+            &Self::M_SQL,
+            &Self::M_DESCRIPTION,
+            &Self::M_CREATED_AT,
+            &Self::M_ACTIONS,
+            &Self::M_RULE_DISABLED,
+            &Self::M_AWS_IOT_SQL_VERSION,
+            &Self::M_ERROR_ACTION,
+            &Self::M_PROPERTIES,
+        ],
+    );
+}
+
+pub static TOPIC_RULE_SCHEMA: &::aws_smithy_schema::Schema = &TopicRule::SCHEMA;
+
+/// One member schema of [`TopicRule`], as the derive emits one: the member's shape id,
+/// its shape type, its wire name and its index in the member list.
+const fn topic_rule_member(
+    shape: &'static str,
+    namespace: &'static str,
+    wire_name: &'static str,
+    shape_type: ::aws_smithy_schema::ShapeType,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(shape, namespace, wire_name),
+        shape_type,
+        wire_name,
+        index,
+    )
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for TopicRule {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.rule_name.as_ref() {
+            s.write_string(&Self::M_RULE_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.sql.as_ref() {
+            s.write_string(&Self::M_SQL, value.as_str())?;
+        }
+        if let Some(value) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.actions.as_ref() {
+            s.write_list(&Self::M_ACTIONS, &|list| {
+                for action in value.iter() {
+                    list.write_struct(&Action::SCHEMA, action)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.rule_disabled.as_ref() {
+            s.write_boolean(&Self::M_RULE_DISABLED, *value)?;
+        }
+        if let Some(value) = self.aws_iot_sql_version.as_ref() {
+            s.write_string(&Self::M_AWS_IOT_SQL_VERSION, value.as_str())?;
+        }
+        if let Some(value) = self.error_action.as_ref() {
+            s.write_struct(&Self::M_ERROR_ACTION, value)?;
+        }
+        if let Some(value) = self.properties.as_ref() {
+            s.write_list(&Self::M_PROPERTIES, &|list| {
+                for property in value.iter() {
+                    list.write_string(&Self::M_PROPERTIES, property.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for TopicRule {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut rule = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => rule.rule_name = Some(d.read_string(&Self::M_RULE_NAME)?),
+                Some(1) => rule.sql = Some(d.read_string(&Self::M_SQL)?),
+                Some(2) => rule.description = Some(d.read_string(&Self::M_DESCRIPTION)?),
+                Some(3) => rule.created_at = Some(d.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(4) => {
+                    let mut actions: Vec<Action> = Vec::new();
+                    d.read_list(&Self::M_ACTIONS, &mut |list| {
+                        actions.push(
+                            <Action as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(
+                                list,
+                            )?,
+                        );
+                        Ok(())
+                    })?;
+                    rule.actions = Some(actions);
+                }
+                Some(5) => rule.rule_disabled = Some(d.read_boolean(&Self::M_RULE_DISABLED)?),
+                Some(6) => {
+                    rule.aws_iot_sql_version = Some(d.read_string(&Self::M_AWS_IOT_SQL_VERSION)?);
+                }
+                Some(7) => {
+                    rule.error_action = Some(
+                        <Action as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(
+                            d,
+                        )?,
+                    );
+                }
+                Some(8) => {
+                    let mut properties: Vec<String> = Vec::new();
+                    d.read_list(&Self::M_PROPERTIES, &mut |list| {
+                        properties.push(list.read_string(&Self::M_PROPERTIES)?);
+                        Ok(())
+                    })?;
+                    rule.properties = Some(properties);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(rule)
+    }
 }
 

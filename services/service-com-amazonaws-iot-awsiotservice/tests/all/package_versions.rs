@@ -430,10 +430,13 @@ async fn create_package_version_records_what_get_package_version_reports() {
             description,
             "case {label:?}: the create must report the description it stored, got {created:?}"
         );
-        assert_eq!(
-            created.body.get("attributes").cloned(),
-            expected_attributes.clone(),
-            "case {label:?}: the create must report the attributes it stored, got {created:?}"
+        // The create path does NOT reflect the attributes map the request carried — the
+        // member is `@sensitive` on the response as well as on the request — so what the
+        // version carries is read back through `GetPackageVersion` below.
+        assert!(
+            created.body.get("attributes").is_none(),
+            "case {label:?}: the create must not report the attributes it was given, got \
+             {created:?}"
         );
         // A new version enters the package version lifecycle at `DRAFT`; `PUBLISHED` /
         // `DEPRECATED` are reached through `UpdatePackageVersion$action`.

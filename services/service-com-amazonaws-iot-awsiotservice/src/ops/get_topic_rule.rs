@@ -137,6 +137,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The rule's ARN is the one the create minted and the record holds, so no
+        // request metadata decides what this reports.
+        let _ = ctx;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetTopicRuleErrorModeled::InternalException(InternalException {
                 message: Some("the IoT emulator has no state store attached".to_string()),
@@ -155,16 +159,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // tell a caller the rule exists and is empty, which is a different and
             // false claim.
             //
-            // The message names the action and the rule ARN the request asked for, in
-            // the form an authorization refusal takes, and does NOT state that the
-            // rule is absent: AWS collapses "no such rule" and "not permitted" into
-            // one indistinguishable 401, so a caller cannot use this reply to confirm
-            // that a rule exists.
-            let region = crate::state::request_region(ctx.parts());
+            // The sentence is the topic-rule family's
+            // ([`crate::state::unauthorized_topic_rule_message`]), so a read, a
+            // replace and an enable of the same name cannot word the same refusal
+            // three ways.
             GetTopicRuleErrorModeled::UnauthorizedException(UnauthorizedException {
-                message: Some(format!(
-                    "Not authorized to perform: iot:GetTopicRule on resource: {}",
-                    crate::state::topic_rule_arn(&region, &input.rule_name)
+                message: Some(crate::state::unauthorized_topic_rule_message(
+                    &input.rule_name,
                 )),
             })
         })?;

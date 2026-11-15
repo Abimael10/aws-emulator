@@ -170,7 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let region = crate::state::request_region(ctx.parts());
+        // Every member this handler reads is in `input` or in the store, so no request
+        // metadata is consulted.
+        let _ = ctx;
 
         let mut store = state.lock();
 
@@ -183,18 +185,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so the refusal is the modelled `UnauthorizedException` (HTTP 401) — never an
         // empty 200, which would claim a rule was enabled when none exists.
         //
-        // The message names the action and the rule ARN the request asked for, in the
-        // form an authorization refusal takes, and does NOT state that the rule is
-        // absent: AWS collapses "no such rule" and "not permitted" into one
-        // indistinguishable 401.
+        // The sentence is the topic-rule family's
+        // ([`crate::state::unauthorized_topic_rule_message`]), so a read, a replace and
+        // an enable of the same name cannot word the same refusal three ways.
         let rule = store
             .topic_rules
             .get_mut(&input.rule_name)
             .ok_or_else(|| {
                 EnableTopicRuleErrorModeled::UnauthorizedException(UnauthorizedException {
-                    message: Some(format!(
-                        "Not authorized to perform: iot:EnableTopicRule on resource: {}",
-                        crate::state::topic_rule_arn(&region, &input.rule_name)
+                    message: Some(crate::state::unauthorized_topic_rule_message(
+                        &input.rule_name,
                     )),
                 })
             })?;

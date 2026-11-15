@@ -13,16 +13,18 @@
 //!
 //! Every mode member targets a modelled enum, so the boundary validator has already
 //! refused a value outside one by the time this handler runs. What it refuses itself,
-//! with the modelled `InvalidRequestException` (HTTP 400), is the rule the model
+//! with the modelled `InvalidRequestException` (HTTP 400), are the rules the model
 //! states in prose — "To enable thing connectivity indexing, *thingIndexMode* must
-//! not be set to OFF" — and a custom-field list past the emulator's own ceiling.
+//! not be set to OFF", and "To add named shadows to your fleet indexing
+//! configuration, set `namedShadowIndexingMode` to be ON and specify your shadow
+//! names in `namedShadowNames` filter" — and a custom-field list past the emulator's
+//! own ceiling.
 //!
-//! That is the ONLY cross-member rule this model states: the `deviceDefenderIndexingMode`
-//! and `namedShadowIndexingMode` docs each constrain only themselves ("To enable
-//! Device Defender indexing, *deviceDefenderIndexingMode* must not be set to OFF",
-//! and likewise for named shadows), so neither is read here as a condition on
-//! `thingIndexingMode` and a configuration combining them is recorded as asked. Read
-//! them with
+//! Those are the cross-member rules this model states: the
+//! `deviceDefenderIndexingMode` doc constrains only itself ("To enable Device
+//! Defender indexing, *deviceDefenderIndexingMode* must not be set to OFF"), so it is
+//! not read here as a condition on `thingIndexingMode` and a configuration combining
+//! them is recorded as asked. Read them with
 //! `smithy_query(query="doc",shape="ThingIndexingConfiguration",member="deviceDefenderIndexingMode")`.
 //!
 //! ## Shape of an operation
@@ -159,12 +161,19 @@ fn check_fields(
 ///
 /// Every mode member targets a modelled enum and the custom-field names carry
 /// modelled constraints, so the boundary validator has already refused anything
-/// outside them. What is left is the rule the model states in PROSE rather than in a
-/// trait: `thingConnectivityIndexingMode` documents "STATUS – Your thing index
-/// contains connectivity status. To enable thing connectivity indexing,
-/// *thingIndexMode* must not be set to OFF", so connectivity indexing on a disabled
-/// thing index is not a configuration a caller can ask for — and the emulator's own
-/// ceiling on the caller-grown custom-field list.
+/// outside them. What is left are the rules the model states in PROSE rather than in
+/// a trait, each a precondition one member puts on another:
+///
+/// * `thingConnectivityIndexingMode` documents "STATUS – Your thing index contains
+///   connectivity status. To enable thing connectivity indexing, *thingIndexMode*
+///   must not be set to OFF", so connectivity indexing on a disabled thing index is
+///   not a configuration a caller can ask for;
+/// * `filter` documents "To add named shadows to your fleet indexing configuration,
+///   set `namedShadowIndexingMode` to be ON and specify your shadow names in
+///   `namedShadowNames` filter", so a named-shadow selection is only admissible once
+///   that mode is on — without it the selection could never take effect.
+///
+/// — and the emulator's own ceiling on the caller-grown custom-field list.
 fn check_thing_configuration(
     configuration: &ThingIndexingConfiguration,
 ) -> Result<(), UpdateIndexingConfigurationError> {
@@ -181,10 +190,40 @@ fn check_thing_configuration(
              thingIndexingMode not to be {thing_mode}"
         )));
     }
+    check_named_shadow_filter(configuration)?;
     check_fields(
         "thingIndexingConfiguration.customFields",
         configuration.custom_fields.as_ref(),
     )
+}
+
+/// Refuse a `filter.namedShadowNames` selection made while named-shadow indexing is
+/// not on.
+///
+/// The selection names the shadows to index, and `namedShadowIndexingMode` is what
+/// puts named-shadow data in the index at all ("ON – Your thing index contains named
+/// shadow"), so the two cannot disagree: a selection under a mode that is not ON would
+/// never take effect, and the service refuses the whole update rather than recording a
+/// configuration whose filter is inert. The refusal states the rule alone — it names
+/// the mode and the filter it is the precondition for, and carries nothing of the
+/// request.
+fn check_named_shadow_filter(
+    configuration: &ThingIndexingConfiguration,
+) -> Result<(), UpdateIndexingConfigurationError> {
+    let selected = configuration
+        .filter
+        .as_ref()
+        .and_then(|filter| filter.named_shadow_names.as_ref())
+        .is_some_and(|names| !names.is_empty());
+    if selected
+        && configuration.named_shadow_indexing_mode.as_deref()
+            != Some(crate::state::NAMED_SHADOW_INDEXING_MODE_ON)
+    {
+        return Err(invalid_request(
+            crate::state::NAMED_SHADOW_FILTER_WITHOUT_INDEXING_MESSAGE.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Check a supplied `thingGroupIndexingConfiguration` before any of it is recorded,

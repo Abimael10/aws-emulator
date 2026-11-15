@@ -2228,6 +2228,13 @@ impl RegisteredTopicRule {
     /// A reader clones what the writer stored, so `GetTopicRule` after
     /// `CreateTopicRule` reports the created rule member-for-member and the two
     /// cannot drift.
+    ///
+    /// `properties` is the rule's properties list, which is EMPTY for every rule this
+    /// service holds: `TopicRulePayload` — the only shape a rule is written from
+    /// (`smithy_query(query="shape",shape="TopicRulePayload")`) — declares no
+    /// properties member, so no request can declare one. It is reported as the empty
+    /// list it is rather than omitted, because the member is one a reader of a rule
+    /// always gets back (see [`TopicRule`]).
     pub fn view(&self) -> TopicRule {
         TopicRule {
             rule_name: Some(self.rule_name.clone()),
@@ -2238,6 +2245,7 @@ impl RegisteredTopicRule {
             rule_disabled: Some(self.rule_disabled),
             aws_iot_sql_version: Some(self.aws_iot_sql_version.clone()),
             error_action: self.error_action.clone(),
+            properties: Some(Vec::new()),
         }
     }
 }
@@ -2558,6 +2566,27 @@ pub const BASE_COMMAND_NAMESPACE: &str = "AWS-IoT";
 /// indexing is disabled"
 /// (`smithy_query(query="doc",shape="ThingIndexingConfiguration",member="thingIndexingMode")`).
 pub const INDEXING_MODE_OFF: &str = "OFF";
+
+/// The `NamedShadowIndexingMode` that puts NAMED SHADOW data in the thing index.
+///
+/// `NamedShadowIndexingMode` declares `OFF | ON`
+/// ([`crate::ops::types::NAMED_SHADOW_INDEXING_MODE_VALUES`]) and documents the value
+/// named here as "ON – Your thing index contains named shadow"
+/// (`smithy_query(query="doc",shape="ThingIndexingConfiguration",member="namedShadowIndexingMode")`),
+/// so it is the one mode under which a `filter.namedShadowNames` selection can take
+/// effect.
+pub const NAMED_SHADOW_INDEXING_MODE_ON: &str = "ON";
+
+/// What a caller is told when it selects shadows in `filter.namedShadowNames` while
+/// `namedShadowIndexingMode` is not [`NAMED_SHADOW_INDEXING_MODE_ON`].
+///
+/// The precondition is the one `ThingIndexingConfiguration$filter` states ("To add
+/// named shadows to your fleet indexing configuration, set `namedShadowIndexingMode`
+/// to be ON and specify your shadow names in `namedShadowNames` filter"), and the
+/// sentence names the mode and the filter alone: it has no variable part, because
+/// nothing of the request decides it.
+pub const NAMED_SHADOW_FILTER_WITHOUT_INDEXING_MESSAGE: &str =
+    "NamedShadowIndexingMode must be turned ON for providing the Filter for NamedShadowNames";
 
 /// How many custom fields one indexing configuration may carry, per section.
 ///
@@ -2888,6 +2917,7 @@ pub mod rule_action_role;
 pub mod rule_expression;
 pub mod rule_sql;
 pub mod rules_engine;
+pub use rule_sql::{sql_rejection, SqlRejection, UNREADABLE_SQL_MESSAGE};
 pub use rules_engine::{dispatch_published_message, SERVICE_PRINCIPAL};
 
 // What a TOPIC RULE DESTINATION is — the record one holds, the confirm/enable state
@@ -3041,7 +3071,7 @@ pub use not_found::{
     missing_audit_task_message, missing_authorizer_message, missing_command_message,
     missing_fleet_metric_message, missing_job_execution_job_message, missing_job_execution_message,
     missing_job_message, missing_thing_group_message, missing_thing_message,
-    missing_thing_type_message, unrecognized_index_name_message,
+    missing_thing_type_message, unauthorized_topic_rule_message, unrecognized_index_name_message,
     MISSING_THING_REGISTRATION_TASK_MESSAGE,
 };
 
@@ -3084,6 +3114,15 @@ pub mod fleet_search;
 pub use fleet_search::{
     documents_matching, terms_buckets, IndexedDocument, ScanRefusal, ATTRIBUTE_FIELD_PREFIX,
     DEFAULT_MAX_BUCKETS, MAX_MATCH_STEPS, MAX_SCANNED_DOCUMENTS, MAX_WALK_DEPTH,
+};
+
+// What a READER of the account's fleet-indexing configuration adds to what the writer
+// stored — the fields the Fleet Indexing service manages itself, and the filter
+// structure every thing-indexing configuration has — lives in
+// `state/indexing_report.rs`, beside the configuration record it projects.
+pub mod indexing_report;
+pub use indexing_report::{
+    CONNECTIVITY_THING_FIELDS, REGISTRY_THING_FIELDS, THING_GROUP_FIELDS,
 };
 
 // What a FLEET METRIC is — the record one holds, the aggregation it is configured with,

@@ -57,6 +57,8 @@ mod fleet_index_description;
 mod fleet_metrics;
 #[path = "all/indexing_configuration.rs"]
 mod indexing_configuration;
+#[path = "all/indexing_configuration_projection.rs"]
+mod indexing_configuration_projection;
 #[path = "all/job_cancellation.rs"]
 mod job_cancellation;
 #[path = "all/job_description.rs"]
@@ -153,6 +155,8 @@ mod topic_rule_listing;
 mod topic_rule_registry;
 #[path = "all/topic_rule_replacement.rs"]
 mod topic_rule_replacement;
+#[path = "all/topic_rule_sql_parsing.rs"]
+mod topic_rule_sql_parsing;
 #[path = "all/v2_logging_options.rs"]
 mod v2_logging_options;
 #[path = "all/principal_policy_attachment.rs"]

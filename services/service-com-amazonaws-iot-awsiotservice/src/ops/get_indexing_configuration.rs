@@ -8,7 +8,10 @@
 //! value makes up ([`crate::state::IndexingConfiguration::disabled`]).
 //!
 //! It is a pure READ: nothing in the store changes, so two calls with no update
-//! between them report the same configuration.
+//! between them report the same configuration. What the service itself fills in on
+//! top of the stored sections — each section's `managedFields`, and the `filter`
+//! structure every thing-indexing configuration has — is the projection in
+//! [`crate::state::indexing_report`].
 //!
 //! ## Shape of an operation
 //!
@@ -155,8 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // A pure read: the record is cloned out from under the lock and the store is
-        // left exactly as it was, so a later caller sees what this one saw.
-        let configuration = state.lock().indexing_configuration.clone();
+        // left exactly as it was, so a later caller sees what this one saw. What the
+        // reader adds to the stored sections — the service's own `managedFields`, and
+        // the `filter` structure every thing-indexing configuration has — is the
+        // projection in [`crate::state::indexing_report`].
+        let configuration = state.lock().indexing_configuration.reported();
 
         Ok(GetIndexingConfigurationOutput {
             thing_indexing_configuration: Some(configuration.thing),

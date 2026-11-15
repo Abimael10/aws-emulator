@@ -44,14 +44,15 @@
 //!
 //! AWS IoT names `InvalidRequestException` in `x-amzn-errortype` QUALIFIED with the
 //! service's API doc namespace ([`IOT_DOC_NAMESPACE`]) — the shape name, a `:`, and the
-//! namespace — which is the form a restJson1 client resolves an error shape from. Every
-//! OTHER error shape of this service is named bare, which is what the framework's
-//! serializer already writes.
+//! namespace — which is the form a restJson1 client resolves an error shape from, and it
+//! names `SqlParseException` the same way. Every OTHER error shape of this service is
+//! named bare, which is what the framework's serializer already writes.
 //!
-//! `override_operation` below therefore serves the operations that refuse with that shape
-//! — a value outside what the service recognises, and a precondition of the plane that
-//! owns the resource — behind [`ValidationRefusalErrorType`], which qualifies the shape
-//! name on the way out and changes nothing else about the response.
+//! `override_operation` below therefore serves the operations that refuse with one of
+//! those shapes — a value outside what the service recognises, a precondition of the plane
+//! that owns the resource, and a rule's SQL statement that cannot be parsed — behind
+//! [`ValidationRefusalErrorType`], each with the shape IT is known to qualify, which that
+//! wrapper qualifies on the way out while changing nothing else about the response.
 
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused, Service,
@@ -66,6 +67,9 @@ const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 /// The error shape AWS IoT refuses a request its validation layer will not accept with.
 const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
 
+/// The error shape AWS IoT refuses a rule whose SQL statement it cannot parse with.
+const SQL_PARSE_EXCEPTION: &str = "SqlParseException";
+
 /// The namespace AWS IoT's validation layer qualifies an error-shape name with in
 /// [`ERROR_TYPE_HEADER`], appended after a `:`.
 ///
@@ -76,19 +80,28 @@ const IOT_DOC_NAMESPACE: &str = "http://iot.amazonaws.com/doc/2015-10-02/";
 /// One modelled operation whose request-validation refusal is named the way AWS IoT's
 /// validation layer names it: the error shape qualified with [`IOT_DOC_NAMESPACE`].
 ///
+/// WHICH shapes are qualified is given per operation, because it is per operation that it
+/// is known: each entry of `qualified` is a shape this service's recorded responses name
+/// qualified for THIS operation, and a shape not named there keeps the bare name the
+/// framework's serializer writes.
+///
 /// Nothing else is re-implemented — the request is served by the generated
 /// [`ErasedOperation::run`], which owns deserialize -> validate -> handle -> serialize and
 /// every modelled error — and nothing but the one header is touched, so a success, a
 /// not-found and a server fault answer exactly what they answered before.
 pub struct ValidationRefusalErrorType<O> {
     operation: O,
+    qualified: &'static [&'static str],
 }
 
 impl<O> ValidationRefusalErrorType<O> {
     /// Serve `operation`, already constructed from the shared engine, behind this
-    /// wrapper.
-    pub fn new(operation: O) -> Self {
-        Self { operation }
+    /// wrapper, qualifying the error shapes `qualified` names.
+    pub fn new(operation: O, qualified: &'static [&'static str]) -> Self {
+        Self {
+            operation,
+            qualified,
+        }
     }
 }
 
@@ -101,10 +114,13 @@ impl<O: ErasedOperation> ErasedOperation for ValidationRefusalErrorType<O> {
     ) -> BoxFuture<'r, WireResponse> {
         Box::pin(async move {
             let mut response = self.operation.run(svc, req, ctx).await;
-            if response.headers().get(ERROR_TYPE_HEADER) == Some(INVALID_REQUEST_EXCEPTION) {
-                response
-                    .headers_mut()
-                    .insert(ERROR_TYPE_HEADER, qualified_invalid_request());
+            let named = response.headers().get(ERROR_TYPE_HEADER).map(str::to_owned);
+            if let Some(named) = named {
+                if self.qualified.contains(&named.as_str()) {
+                    response
+                        .headers_mut()
+                        .insert(ERROR_TYPE_HEADER, qualified_error_shape(&named));
+                }
             }
             response
         })
@@ -117,10 +133,10 @@ impl<O: ErasedOperation> ErasedOperation for ValidationRefusalErrorType<O> {
     }
 }
 
-/// `InvalidRequestException` as AWS IoT's validation layer names it in
-/// [`ERROR_TYPE_HEADER`]: the shape name, a `:`, and the service's API doc namespace.
-fn qualified_invalid_request() -> String {
-    format!("{INVALID_REQUEST_EXCEPTION}:{IOT_DOC_NAMESPACE}")
+/// An error shape as AWS IoT's validation layer names it in [`ERROR_TYPE_HEADER`]: the
+/// shape name, a `:`, and the service's API doc namespace.
+fn qualified_error_shape(shape: &str) -> String {
+    format!("{shape}:{IOT_DOC_NAMESPACE}")
 }
 
 /// The `com-amazonaws-iot-awsiotservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -139,6 +155,22 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// `InvalidRequestException`.
     delete_authorizer:
         ValidationRefusalErrorType<crate::ops::delete_authorizer::DeleteAuthorizer<Eng>>,
+    /// The fleet-indexing writer, served behind [`ValidationRefusalErrorType`] for the
+    /// same reason: a configuration whose members contradict each other is refused
+    /// `InvalidRequestException`.
+    update_indexing_configuration: ValidationRefusalErrorType<
+        crate::ops::update_indexing_configuration::UpdateIndexingConfiguration<Eng>,
+    >,
+    /// The topic-rule create, served behind [`ValidationRefusalErrorType`] because a
+    /// rule whose SQL statement cannot be parsed is refused `SqlParseException`, which
+    /// this service names qualified in the same way. Its OTHER refusals keep the bare
+    /// shape name: a create refused because the rule already exists names
+    /// `ResourceAlreadyExistsException` unqualified.
+    create_topic_rule: ValidationRefusalErrorType<crate::ops::create_topic_rule::CreateTopicRule<Eng>>,
+    /// The topic-rule replace, served behind [`ValidationRefusalErrorType`] because it
+    /// reads a statement under exactly the same rule as the create.
+    replace_topic_rule:
+        ValidationRefusalErrorType<crate::ops::replace_topic_rule::ReplaceTopicRule<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -152,9 +184,25 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             // so the wrapped reader reads the one store.
             describe_index: ValidationRefusalErrorType::new(
                 crate::ops::describe_index::DescribeIndex::new(Arc::clone(&engine)),
+                &[INVALID_REQUEST_EXCEPTION],
             ),
             delete_authorizer: ValidationRefusalErrorType::new(
-                crate::ops::delete_authorizer::DeleteAuthorizer::new(engine),
+                crate::ops::delete_authorizer::DeleteAuthorizer::new(Arc::clone(&engine)),
+                &[INVALID_REQUEST_EXCEPTION],
+            ),
+            update_indexing_configuration: ValidationRefusalErrorType::new(
+                crate::ops::update_indexing_configuration::UpdateIndexingConfiguration::new(
+                    Arc::clone(&engine),
+                ),
+                &[INVALID_REQUEST_EXCEPTION],
+            ),
+            create_topic_rule: ValidationRefusalErrorType::new(
+                crate::ops::create_topic_rule::CreateTopicRule::new(Arc::clone(&engine)),
+                &[SQL_PARSE_EXCEPTION],
+            ),
+            replace_topic_rule: ValidationRefusalErrorType::new(
+                crate::ops::replace_topic_rule::ReplaceTopicRule::new(engine),
+                &[SQL_PARSE_EXCEPTION],
             ),
         }
     }
@@ -192,6 +240,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
         if key == crate::ops::delete_authorizer::DeleteAuthorizer::<Eng>::NAME {
             return Some(&self.delete_authorizer as &dyn ErasedOperation);
+        }
+        if key
+            == crate::ops::update_indexing_configuration::UpdateIndexingConfiguration::<Eng>::NAME
+        {
+            return Some(&self.update_indexing_configuration as &dyn ErasedOperation);
+        }
+        if key == crate::ops::create_topic_rule::CreateTopicRule::<Eng>::NAME {
+            return Some(&self.create_topic_rule as &dyn ErasedOperation);
+        }
+        if key == crate::ops::replace_topic_rule::ReplaceTopicRule::<Eng>::NAME {
+            return Some(&self.replace_topic_rule as &dyn ErasedOperation);
         }
         None
     }

@@ -170,7 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let region = crate::state::request_region(ctx.parts());
+        // Every member this handler reads is in `input` or in the store, so no request
+        // metadata is consulted.
+        let _ = ctx;
 
         let mut store = state.lock();
 
@@ -179,17 +181,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // because AWS authorizes `iot:DisableTopicRule` against the rule's own ARN: a
         // name that names no rule cannot be authorized, so the refusal is the modelled
         // `UnauthorizedException` (HTTP 401) — never an empty 200, which would claim a
-        // rule was disabled when none exists. The message names the action and the ARN
-        // the request asked for and does not state that the rule is absent, exactly as
-        // `GetTopicRule`'s refusal does.
+        // rule was disabled when none exists. The sentence is the topic-rule family's
+        // ([`crate::state::unauthorized_topic_rule_message`]), exactly as
+        // `GetTopicRule`'s refusal carries it.
         let rule = store
             .topic_rules
             .get_mut(&input.rule_name)
             .ok_or_else(|| {
                 DisableTopicRuleErrorModeled::UnauthorizedException(UnauthorizedException {
-                    message: Some(format!(
-                        "Not authorized to perform: iot:DisableTopicRule on resource: {}",
-                        crate::state::topic_rule_arn(&region, &input.rule_name)
+                    message: Some(crate::state::unauthorized_topic_rule_message(
+                        &input.rule_name,
                     )),
                 })
             })?;
