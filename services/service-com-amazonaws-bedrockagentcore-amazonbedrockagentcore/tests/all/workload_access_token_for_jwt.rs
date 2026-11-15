@@ -167,7 +167,12 @@ async fn a_token_minted_for_a_presented_jwt_acts_for_that_jwt_s_subject() {
             "the longest workload name and a subject that is an address",
             "w".repeat(255),
             "user@example.com",
-            json!({ "sub": "user@example.com", "exp": seconds + 1 }),
+            // The window is as generous as the other rows': what this row is about is the
+            // workload NAME and the subject, so its presented token must still be inside its
+            // window however long the rows before it took. A token at the edge of its window
+            // — expiring at this very instant, or a moment ago — is the refusal suite's own
+            // row, where the edge is what is being tested.
+            json!({ "sub": "user@example.com", "exp": seconds + 600 }),
         ),
         (
             "a token already inside its not-before",

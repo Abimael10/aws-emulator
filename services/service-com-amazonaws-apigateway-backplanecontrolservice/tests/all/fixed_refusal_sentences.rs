@@ -14,7 +14,11 @@
 //!
 //! * `CreateVpcLink` whose `targetArns` is sent empty;
 //! * `CreateUsagePlanKey` for an API key the addressed plan already meters;
-//! * `PutMethodResponse` for a status code the addressed method already answers.
+//! * `PutMethodResponse` for a status code the addressed method already answers;
+//! * `CreateDomainNameAccessAssociation` whose `accessAssociationSource` is no VPC endpoint
+//!   id at all — the half of that member's rule the service decides on the request alone,
+//!   where a well-formed id that names no endpoint of the account earns the sentence naming
+//!   it instead (`domain_name_access_association_endpoint` holds both halves apart).
 //!
 //! The harness is this crate's existing one (`rest_api_lifecycle`), so every row goes
 //! through the multi-service router, `restJson1` (de)serialization and the mounted
@@ -22,10 +26,14 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    METHOD_RESPONSE_ALREADY_EXISTS, USAGE_PLAN_KEY_ALREADY_EXISTS, VPC_LINK_NEEDS_A_TARGET,
+    INVALID_VPC_ENDPOINT_ID, METHOD_RESPONSE_ALREADY_EXISTS, USAGE_PLAN_KEY_ALREADY_EXISTS,
+    VPC_LINK_NEEDS_A_TARGET,
 };
 
 use crate::api_key_lifecycle::create_key;
+use crate::domain_name_access_associations::{
+    association_body, create_association, private_domain,
+};
 use crate::method_response::put_method_response;
 use crate::rest_api_lifecycle::{assert_failure, string_member, Answer, Gateway};
 use crate::stage_lifecycle::api_with_a_method;
@@ -48,6 +56,11 @@ const KEY_ALREADY_SUBSCRIBED_SENTENCE: &str = "API Key is already subscribed to 
 /// What `PutMethodResponse` answers for a status code the addressed method already
 /// answers.
 const RESPONSE_ALREADY_EXISTS_SENTENCE: &str = "Response already exists for this resource";
+
+/// What `CreateDomainNameAccessAssociation` answers for an `accessAssociationSource` it
+/// cannot read as a VPC endpoint id. It names the MEMBER the request got wrong and quotes no
+/// part of it — not even the value, which is why it belongs in this suite.
+const INVALID_ENDPOINT_ID_SENTENCE: &str = "Invalid VPC endpoint ID specified.";
 
 /// The one key type a `UsagePlanKey` takes, as `UsagePlanKey$type` documents
 /// ("Currently, the valid key type is `API_KEY`").
@@ -298,6 +311,47 @@ async fn a_method_response_a_method_already_answers_is_refused_with_one_sentence
             CONFLICT,
             RESPONSE_ALREADY_EXISTS_SENTENCE,
             &[status, "GET", api.as_str(), resource.as_str()],
+            case,
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_access_association_source_is_refused_with_one_sentence() {
+    // The service's own constant is that sentence; see the VPC-link suite above.
+    assert_eq!(
+        INVALID_VPC_ENDPOINT_ID, INVALID_ENDPOINT_ID_SENTENCE,
+        "case the service constant: expected {INVALID_ENDPOINT_ID_SENTENCE:?}, got \
+         {INVALID_VPC_ENDPOINT_ID:?}"
+    );
+
+    let gateway = Gateway::new();
+    let domain = private_domain(&gateway, "unreadable-source.example.com").await;
+
+    // Rows differ along the FORM of the value that is no VPC endpoint id — a value that is
+    // no identifier at all, an id of the right prefix and the wrong width, the uppercase
+    // spelling of a well-formed one, the id of another resource EC2 mints under a longer
+    // prefix, the ARN of an endpoint rather than its id, and a bare prefix. The sentence
+    // answers all of them and quotes none of them.
+    let sources = [
+        ("no identifier at all", "not-a-valid-vpce-id"),
+        ("one digit short of a minted width", "vpce-0123456"),
+        ("the uppercase spelling of a well-formed id", "vpce-0123456789ABCDEF0"),
+        ("an endpoint SERVICE id", "vpce-svc-0123456789abcdef0"),
+        (
+            "the ARN of an endpoint rather than its id",
+            "arn:aws:ec2:us-east-1:000000000000:vpc-endpoint/vpce-0123456789abcdef0",
+        ),
+        ("the prefix alone", "vpce-"),
+    ];
+
+    for (case, source) in sources {
+        let answer = create_association(&gateway, association_body(&domain, source)).await;
+        assert_sentence(
+            &answer,
+            BAD_REQUEST,
+            INVALID_ENDPOINT_ID_SENTENCE,
+            &[source, "accessAssociationSource", domain.as_str()],
             case,
         );
     }

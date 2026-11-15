@@ -342,15 +342,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bind to that is not there. VPC endpoints are Amazon EC2's records, so the question
         // is put to the service that owns them, exactly as the domain name is resolved
         // against the records this service owns ([`crate::state::vpc_endpoints`]); a value
-        // that is not even shaped like an endpoint id is refused without a hop, with the one
-        // sentence this whole class is refused with. Both happen BEFORE the store lock is
-        // taken, so an unresolvable source writes nothing.
+        // that is not even shaped like an endpoint id is refused without a hop, with the
+        // fixed sentence that quotes nothing of the request
+        // ([`crate::state::INVALID_VPC_ENDPOINT_ID`]), where a well-formed id naming no
+        // endpoint of the account earns the sentence that names it
+        // ([`crate::state::invalid_access_association_source`]). Both happen BEFORE the
+        // store lock is taken, so an unresolvable source writes nothing.
         if input.access_association_source_type == VPCE_SOURCE_TYPE {
             if !crate::state::is_vpc_endpoint_id(&input.access_association_source) {
                 return Err(bad_request(
-                    crate::state::invalid_access_association_source(
-                        &input.access_association_source,
-                    ),
+                    crate::state::INVALID_VPC_ENDPOINT_ID.to_string(),
                 ));
             }
             crate::state::vpc_endpoints::resolve_access_association_source(

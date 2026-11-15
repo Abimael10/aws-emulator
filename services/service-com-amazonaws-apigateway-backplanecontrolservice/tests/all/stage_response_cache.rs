@@ -473,14 +473,18 @@ enum Ends {
 #[tokio::test]
 async fn the_methods_own_settings_key_caches_it_as_the_whole_stage_key_does() {
     // Rows differ along the `methodSettings` key the caching is turned on under: the
-    // method's own path, in the escaped spelling `PatchOperation$path` documents, and the
-    // whole-stage wildcard. Both name the invoked method, so both cache it — which is what
-    // tells a wrong key construction from the wildcard fallback answering for it. A third
-    // spelling, the resource path written with a literal separator (`/items/GET/…`), names
-    // no method at all and is refused by `UpdateStage`, so it stores no key for this lookup
-    // to resolve; `patch_entry_precedence` pins that refusal.
+    // method's own path in the escaped spelling `PatchOperation$path` documents, the same
+    // path with its leading separator left to the pointer's own — the spelling
+    // `MethodSetting$ResourcePath` states a path in, and so the key a
+    // CloudFormation-managed stage carries — and the whole-stage wildcard. All three name
+    // the invoked method, so all three cache it, which is what tells a wrong key
+    // construction from the wildcard fallback answering for it. A fourth spelling, a
+    // resource path whose INNER separator is written literally, names no method at all and
+    // is refused by `UpdateStage`, so it stores no key for this lookup to resolve;
+    // `method_setting_resource_half_spellings` pins that refusal.
     let rows: &[(&str, &str)] = &[
         ("the method's own key, escaped", "/~1items/GET"),
+        ("the method's own key, unprefixed", "/items/GET"),
         ("the whole-stage key", "/*/*"),
     ];
 

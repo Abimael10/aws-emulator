@@ -1429,16 +1429,19 @@ fn stage_patches(
     Ok(patches)
 }
 
-/// The `methodSettings` key one setting is written on: the resource path with every `/`
-/// inside it escaped as a JSON Pointer requires, then the HTTP method — or the stage-wide
-/// path where the entry names neither.
+/// The `methodSettings` key one setting is written on, which is also the path `UpdateStage`
+/// addresses that setting by: the method path `{resource_path}/{http_method}`
+/// (`Stage$methodSettings`), with the pointer's own leading separator standing for the
+/// resource path's — the way `MethodSetting$ResourcePath` states one, which "must include a
+/// forward slash" and spells every separator INSIDE the path as the JSON Pointer escape
+/// (`/~1resource~1subresource` for `/resource/subresource`). A declaration that spells an
+/// inner separator plainly is encoded here rather than refused, so either spelling of one
+/// path names one method. The stage-wide path stands where the entry names neither half.
 fn method_setting_path(resource_path: &str, http_method: &str) -> String {
     if resource_path.is_empty() || http_method.is_empty() {
         return EVERY_METHOD.to_string();
     }
-    if resource_path == "*" {
-        return format!("*/{http_method}");
-    }
+    let resource_path = resource_path.strip_prefix('/').unwrap_or(resource_path);
     format!("{}/{http_method}", resource_path.replace('/', "~1"))
 }
 
@@ -1847,14 +1850,23 @@ mod tests {
     }
 
     /// A method setting is written on the path `UpdateStage` reads a method by: the resource
-    /// path escaped as a JSON Pointer requires and then the verb, or the stage-wide path
-    /// where the entry names no one method.
+    /// path as the declaration states it, the pointer's own leading separator standing for
+    /// its initial one, and then the verb — or the stage-wide path where the entry names no
+    /// one method.
     #[test]
     fn a_method_setting_is_written_on_the_method_path_it_names() {
         let cases: &[(&str, &str, &str, &str)] = &[
-            ("one method", "/items", "GET", "~1items/GET"),
-            ("a nested path", "/items/{id}", "PUT", "~1items~1{id}/PUT"),
+            ("one method", "/items", "GET", "items/GET"),
+            ("a nested path", "/items/{id}", "PUT", "items~1{id}/PUT"),
+            (
+                "a nested path the declaration already encoded",
+                "/~1items~1{id}",
+                "PUT",
+                "~1items~1{id}/PUT",
+            ),
+            ("the root resource", "/", "GET", "/GET"),
             ("every method of a resource", "*", "*", "*/*"),
+            ("every method, as the type states it", "/*", "*", "*/*"),
             ("the whole stage", "", "", "*/*"),
             ("a verb with no path", "", "GET", "*/*"),
         ];
@@ -1889,7 +1901,7 @@ mod tests {
             "/clientCertificateId",
             "/accessLogSettings/destinationArn",
             "/accessLogSettings/format",
-            "/~1items/GET/metrics/enabled",
+            "/items/GET/metrics/enabled",
         ] {
             assert!(
                 paths.contains(&expected.to_string()),

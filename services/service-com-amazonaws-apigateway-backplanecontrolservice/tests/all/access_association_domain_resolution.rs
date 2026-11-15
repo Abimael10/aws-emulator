@@ -32,7 +32,9 @@
 //! association suite's own, and the EC2 and domain-name helpers the sibling suites'.
 
 use serde_json::json;
-use service_com_amazonaws_apigateway_backplanecontrolservice::state::DOMAIN_NAME_NOT_FOUND;
+use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
+    DOMAIN_NAME_NOT_FOUND, INVALID_VPC_ENDPOINT_ID,
+};
 
 use crate::domain_name_access_association_endpoint::{
     execute_api_endpoint, network, not_a_valid_endpoint_id,
@@ -169,9 +171,17 @@ async fn the_domain_name_an_association_is_for_is_resolved_first_and_by_its_own_
             answer.body
         );
         let message = string_member(&answer.body, "message", &case);
+        // Either SOURCE sentence is the source's own, which is what this asserts: the
+        // well-formed id the account has no endpoint under earns the one that names it, and
+        // the value that is no endpoint id at all the fixed one — and neither is the domain
+        // name's.
+        let expected = if source.starts_with("vpce-") {
+            not_a_valid_endpoint_id(source)
+        } else {
+            INVALID_VPC_ENDPOINT_ID.to_string()
+        };
         assert_eq!(
-            message,
-            not_a_valid_endpoint_id(source),
+            message, expected,
             "case {case:?}: expected the SOURCE refusal once the domain name resolved, got \
              {message:?}"
         );

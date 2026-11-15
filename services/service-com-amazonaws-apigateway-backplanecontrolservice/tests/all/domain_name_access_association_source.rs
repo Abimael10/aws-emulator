@@ -8,10 +8,10 @@
 //! > With `accessAssociationSourceType` `VPCE`, `CreateDomainNameAccessAssociation`'s
 //! > `accessAssociationSource` must be the ID of a VPC endpoint — the prefix EC2 mints every
 //! > endpoint id under and one of its two hexadecimal widths, in lower case. A value that is
-//! > not one is the modelled `BadRequestException` (400) carrying the identifier the request
-//! > sent followed by the fixed text " is not a valid VPC endpoint id", and NOTHING is
-//! > created: no association is stored and the collection still reports exactly the records
-//! > the admitted creates made.
+//! > not one is the modelled `BadRequestException` (400) carrying the FIXED sentence
+//! > "Invalid VPC endpoint ID specified." — which quotes no part of the request — and
+//! > NOTHING is created: no association is stored and the collection still reports exactly
+//! > the records the admitted creates made.
 //!
 //! The rows span what that rule generalises over: each width EC2 mints and one glyph either
 //! side of each, the uppercase spelling of an otherwise well-formed id, a non-hexadecimal
@@ -30,7 +30,7 @@
 //! helpers rather than a second spelling of them.
 
 use serde_json::json;
-use service_com_amazonaws_apigateway_backplanecontrolservice::state::invalid_access_association_source;
+use service_com_amazonaws_apigateway_backplanecontrolservice::state::INVALID_VPC_ENDPOINT_ID;
 
 use crate::domain_name_access_associations::{
     association_body, create_association, list_associations, private_domain,
@@ -121,10 +121,8 @@ async fn an_access_association_source_must_be_a_vpc_endpoint_id() {
         );
         let message = string_member(&answer.body, "message", case);
         assert_eq!(
-            message,
-            invalid_access_association_source(source),
-            "case {case:?}: expected the identifier refusal naming the source sent, got \
-             {message:?}"
+            message, INVALID_VPC_ENDPOINT_ID,
+            "case {case:?}: expected the fixed identifier refusal, got {message:?}"
         );
     }
 

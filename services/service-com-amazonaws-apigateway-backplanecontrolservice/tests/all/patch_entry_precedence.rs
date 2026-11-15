@@ -494,15 +494,20 @@ async fn a_stage_refuses_a_pointer_it_has_no_member_for_as_a_method_setting_path
 
     // Rows span the FORMS of a pointer a stage cannot apply: a member no shape declares, a
     // member the service assigns, a one-token method path followed by a GROUPED setting
-    // name, a method path whose resource half is no resource path (so it names no method of
-    // the API the stage serves, and the data plane would never resolve a setting stored
-    // under it), a method path with no setting after it, and a setting with no method path
-    // before it. Each is sent under every op a path can ride in on.
+    // name, a method path whose resource half carries an unescaped separator of its own (so
+    // nothing of the pointer says where that path stops, and the data plane would never
+    // resolve a setting stored under it), a method path with no setting after it, and a
+    // setting with no method path before it. Each is sent under every op a path can ride in
+    // on.
+    //
+    // A two-token method path whose resource half simply LEAVES its leading separator to the
+    // pointer (`/pets/GET/…`) is not one of them: that is the spelling
+    // `MethodSetting$ResourcePath` states a path in, so it names the method `pets/GET` and is
+    // applied — see `a_method_settings_key_is_the_method_path_its_pointer_names`.
     let paths = [
         "/sim2realNoSuchField",
         "/stageName",
         "/~1pets~1GET/throttling/rateLimit",
-        "/pets/GET/metrics/enabled",
         "/pets~1GET/metricsEnabled",
         "/~1pets/GET",
         "/metrics/enabled",

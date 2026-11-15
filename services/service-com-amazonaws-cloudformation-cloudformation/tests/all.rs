@@ -23,8 +23,16 @@ mod appconfig_refused_create_exception;
 mod appconfig_resource_types;
 #[path = "all/apigateway_account_resource.rs"]
 mod apigateway_account_resource;
+// What a resource Amazon API Gateway refused reports on its `CREATE_FAILED` event: that
+// service's own sentence plus its SDK's diagnostic of the refused call.
+#[path = "all/apigateway_refused_resource_sdk_diagnostic.rs"]
+mod apigateway_refused_resource_sdk_diagnostic;
 #[path = "all/apigateway_request_validation_resources.rs"]
 mod apigateway_request_validation_resources;
+// The per-method settings an `AWS::ApiGateway::Stage` declares, reported by the method path
+// the declaration named them for.
+#[path = "all/apigateway_stage_method_settings.rs"]
+mod apigateway_stage_method_settings;
 #[path = "all/apigateway_vpc_link_resources.rs"]
 mod apigateway_vpc_link_resources;
 #[path = "all/apigatewayv2_api_property_updates.rs"]

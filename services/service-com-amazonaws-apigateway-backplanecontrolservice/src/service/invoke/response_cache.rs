@@ -82,8 +82,14 @@ pub(super) fn cache_plan(
     }
     // "Specifies the time to live (TTL), in seconds, for cached responses. The higher the
     // TTL, the longer the response will be cached": a TTL of zero holds a response for no
-    // time at all, so nothing is cached.
-    let Ok(ttl) = u64::try_from(settings.cache_ttl_in_seconds) else {
+    // time at all, so nothing is cached. The stored value is HELD to the published range of
+    // the setting ([`crate::ops::update_stage::CACHE_TTL_RANGE`], the same range the write
+    // path refuses a patch outside), so no span this emulator holds an entry for can be one
+    // the clock cannot add to the present instant.
+    let seconds = settings
+        .cache_ttl_in_seconds
+        .min(*crate::ops::update_stage::CACHE_TTL_RANGE.end());
+    let Ok(ttl) = u64::try_from(seconds) else {
         return Caching::Off;
     };
     if ttl == 0 {
@@ -151,12 +157,14 @@ fn invalidation_refusal(req: &RtRequest, call: &resource_policy::Call<'_>) -> Ga
 /// A `methodSettings` key is the method path a patch addressed —
 /// `{resource_path}/{http_method}`, with the resource path's own `/` written as the JSON
 /// Pointer escape ([`ESCAPED_PATH_SEPARATOR`]) where the pointer spelled the method path in
-/// two reference tokens and decoded where it spelled it in one — or
-/// [`EVERY_METHOD_SETTINGS_KEY`]. Both spellings of the method's own key are tried, the
-/// escaped one first, and they are the only two `UpdateStage` can store: a pointer whose
-/// resource half is no resource path names no method there, so no stored key can fail to
-/// resolve here. The whole-stage key is the fallback, which is what makes a
-/// `/*/*/caching/enabled` patch cache every method.
+/// two reference tokens, decoded where it spelled it in one, and with the LEADING separator
+/// left to the pointer where the patch spelled the path the way
+/// `MethodSetting$ResourcePath` does (which is how a CloudFormation-managed stage is
+/// patched) — or [`EVERY_METHOD_SETTINGS_KEY`]. Every spelling of the method's own key is
+/// tried before the whole-stage one, and they are the only keys `UpdateStage` can store: a
+/// pointer whose resource half carries an unescaped separator names no method there, so no
+/// stored key can fail to resolve here. The whole-stage key is the fallback, which is what
+/// makes a `/*/*/caching/enabled` patch cache every method.
 pub(super) fn method_settings_in_force<'s>(
     stage: &'s StageEntry,
     matched_path: &str,
@@ -164,10 +172,18 @@ pub(super) fn method_settings_in_force<'s>(
 ) -> Option<&'s MethodSetting> {
     let verb = wire_verb(verb);
     let escaped = matched_path.replace('/', ESCAPED_PATH_SEPARATOR);
-    [format!("{escaped}/{verb}"), format!("{matched_path}/{verb}")]
-        .iter()
-        .find_map(|key| stage.method_settings.get(key))
-        .or_else(|| stage.method_settings.get(EVERY_METHOD_SETTINGS_KEY))
+    let unprefixed = matched_path
+        .strip_prefix('/')
+        .unwrap_or(matched_path)
+        .replace('/', ESCAPED_PATH_SEPARATOR);
+    [
+        format!("{escaped}/{verb}"),
+        format!("{matched_path}/{verb}"),
+        format!("{unprefixed}/{verb}"),
+    ]
+    .iter()
+    .find_map(|key| stage.method_settings.get(key))
+    .or_else(|| stage.method_settings.get(EVERY_METHOD_SETTINGS_KEY))
 }
 
 /// The key the stage's cache holds this call's response under.
@@ -294,9 +310,13 @@ pub(super) fn cached_entry(
     answer: IntegrationAnswer,
     ttl: ::std::time::Duration,
 ) -> CachedResponse {
+    let held_from = ::std::time::Instant::now();
     CachedResponse {
         answer,
-        expires_at: ::std::time::Instant::now() + ttl,
+        // Adding a duration to an instant PANICS on a sum the clock cannot represent, so the
+        // expiry is taken with the checked addition: an entry whose expiry does not fit is
+        // already due, which is what an entry held for no time at all is.
+        expires_at: held_from.checked_add(ttl).unwrap_or(held_from),
     }
 }
 

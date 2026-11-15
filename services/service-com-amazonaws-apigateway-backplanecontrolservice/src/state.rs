@@ -4068,15 +4068,26 @@ pub fn is_vpc_endpoint_id(value: &str) -> bool {
             .all(|glyph| glyph.is_ascii_hexdigit() && !glyph.is_ascii_uppercase())
 }
 
-/// The `BadRequestException` message for an `accessAssociationSource` that is not the id of
-/// a VPC endpoint of the account, which is what a `VPCE` access association's source must be
-/// ("For a VPCE, the value is the VPC endpoint ID").
+/// The `BadRequestException` message for an `accessAssociationSource` that is not SHAPED
+/// like a VPC endpoint id at all ([`is_vpc_endpoint_id`]), which is what a `VPCE` access
+/// association's source must be ("For a VPCE, the value is the VPC endpoint ID").
+///
+/// ENTIRELY FIXED TEXT, as the recorded refusal of a malformed source asserts: the sentence
+/// states which MEMBER the request got wrong and quotes NO part of it, so the value the
+/// caller sent never travels back in it. That is the half of this member's rule the service
+/// decides on the request alone — a value it cannot even read as an identifier — and it is
+/// therefore worded differently from the half that needs the account's endpoints to decide
+/// ([`invalid_access_association_source`]).
+pub const INVALID_VPC_ENDPOINT_ID: &str = "Invalid VPC endpoint ID specified.";
+
+/// The `BadRequestException` message for a well-formed VPC endpoint id that names NO VPC
+/// endpoint of the account, which is the other half of the same member's rule.
 ///
 /// VERBATIM from the recorded refusal, which asserts the sentence exactly: the VARIABLE part
 /// is the identifier the request sent, and the fixed text is " is not a valid VPC endpoint
-/// id". ONE sentence for the whole class — a value that is not shaped like an endpoint id and
-/// one that is but names no endpoint of the account are the same fact about the same member,
-/// so both are refused with it.
+/// id". A source this service could READ as an endpoint id but not RESOLVE names a resource
+/// the caller can go and look for, so the refusal quotes it back; one that is no identifier
+/// at all is refused with [`INVALID_VPC_ENDPOINT_ID`] instead.
 pub fn invalid_access_association_source(access_association_source: &str) -> String {
     format!("{access_association_source} is not a valid VPC endpoint id")
 }

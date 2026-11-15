@@ -19,7 +19,9 @@
 //! > account has in the Region the caller addressed: one that does is created (201) and
 //! > listed, and one that does not is the modelled `BadRequestException` (400) whose message
 //! > is the identifier the request sent followed by the fixed text " is not a valid VPC
-//! > endpoint id", with no association stored for it.
+//! > endpoint id", with no association stored for it. A value the service cannot even READ
+//! > as an endpoint id is decided on the request alone, so it never reaches that service and
+//! > is refused with the fixed sentence that quotes nothing of the request.
 //!
 //! The rows span what that rule generalises over: which endpoints the account holds (two,
 //! created through EC2, each binding its own association), each hexadecimal width EC2 mints
@@ -39,6 +41,7 @@ use crate::domain_name_access_associations::{
     association_body, create_association, list_associations, private_domain,
 };
 use crate::rest_api_lifecycle::{gateway_with_ec2, page_items, string_member, Gateway};
+use service_com_amazonaws_apigateway_backplanecontrolservice::state::INVALID_VPC_ENDPOINT_ID;
 
 const BAD_REQUEST: &str = "BadRequestException";
 
@@ -238,45 +241,54 @@ async fn an_access_association_source_must_name_a_vpc_endpoint_the_account_has()
     // Rows differ along WHY the identifier names no endpoint of the account: a well-formed
     // id of each width EC2 mints that nothing was created under, an id one digit away from
     // one the account does hold, an endpoint that was removed, and the forms that are not an
-    // endpoint id at all.
+    // endpoint id at all. The last group is decided on the REQUEST alone, so its refusal is
+    // the fixed sentence rather than the one that names the identifier.
     let one_digit_off = {
         let held = &held[0];
         let (body, last) = held.split_at(held.len() - 1);
         let shifted = if last == "0" { "1" } else { "0" };
         format!("{body}{shifted}")
     };
-    let refused: Vec<(String, String)> = vec![
+    let refused: Vec<(String, String, bool)> = vec![
         (
             "a well-formed 17-digit id the account has no endpoint under".to_string(),
             "vpce-0123456789abcdef0".to_string(),
+            true,
         ),
         (
             "a well-formed 8-digit id the account has no endpoint under".to_string(),
             "vpce-0a1b2c3d".to_string(),
+            true,
         ),
         (
             "an id one digit away from one the account does hold".to_string(),
             one_digit_off,
+            true,
         ),
         (
             "the id of an endpoint that was created and then removed".to_string(),
             removed.clone(),
+            true,
         ),
         (
             "the uppercase spelling of an id the account holds".to_string(),
             held[0].to_uppercase(),
+            false,
         ),
         (
             "an endpoint SERVICE id rather than an endpoint id".to_string(),
             "vpce-svc-0123456789abcdef0".to_string(),
+            false,
         ),
         (
             "the ARN of an endpoint rather than its id".to_string(),
             format!("arn:aws:ec2:{REGION}:000000000000:vpc-endpoint/{}", held[0]),
+            false,
         ),
         (
             "a VPC id rather than an endpoint id".to_string(),
             "vpc-0123456789abcdef0".to_string(),
+            false,
         ),
         (
             "an id the account holds with its prefix stripped".to_string(),
@@ -284,10 +296,11 @@ async fn an_access_association_source_must_name_a_vpc_endpoint_the_account_has()
                 .strip_prefix("vpce-")
                 .expect("an endpoint id carries the prefix")
                 .to_string(),
+            false,
         ),
     ];
 
-    for (case, source) in &refused {
+    for (case, source, readable) in &refused {
         let answer = create_association(&gateway, association_body(&domain, source)).await;
         assert_eq!(
             (answer.status, answer.error.as_deref()),
@@ -298,11 +311,14 @@ async fn an_access_association_source_must_name_a_vpc_endpoint_the_account_has()
             answer.body
         );
         let message = string_member(&answer.body, "message", case);
+        let expected = if *readable {
+            not_a_valid_endpoint_id(source)
+        } else {
+            INVALID_VPC_ENDPOINT_ID.to_string()
+        };
         assert_eq!(
-            message,
-            not_a_valid_endpoint_id(source),
-            "case {case:?}: expected the identifier refusal naming the source sent, got \
-             {message:?}"
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
     }
 
@@ -316,7 +332,7 @@ async fn an_access_association_source_must_name_a_vpc_endpoint_the_account_has()
          {sources:?}",
         held.len()
     );
-    for (case, source) in &refused {
+    for (case, source, _) in &refused {
         assert!(
             !sources.contains(source),
             "case {case:?}: expected no association stored for it, got {sources:?}"

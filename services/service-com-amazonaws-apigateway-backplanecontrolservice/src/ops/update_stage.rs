@@ -31,9 +31,12 @@
 //!   the method followed by the setting it writes (`/~1pets/GET/metrics/enabled`), the
 //!   key being `{resource-path}/{HTTP-METHOD}` or `*/*` as `Stage$methodSettings`
 //!   documents — so a `/` inside the resource path is escaped `~1` in the PATH while the
-//!   separator before the HTTP method is a real one, the KEY carries the method path
-//!   unescaped, and a pointer that escapes that separator too names no method at all — see
-//!   [`apply_method_setting_patch`], [`METHOD_PATH_TOKENS`] and [`method_settings_key`].
+//!   separator before the HTTP method is a real one, the path's own LEADING separator is
+//!   either escaped too or left to the pointer's (`/pets/GET/…`, the spelling
+//!   `MethodSetting$ResourcePath` states a path in), the KEY carries the method path as the
+//!   pointer spelled it, and a pointer that escapes the separator before the method too
+//!   names the method in ONE token instead — see [`apply_method_setting_patch`],
+//!   [`METHOD_PATH_TOKENS`] and [`method_settings_key`].
 //! * a pointer that is no member of the `Stage` shape is read as such a method path, so
 //!   it is refused as one — see [`STAGE_INVALID_PATCH_PATH`].
 //! * `accessLogSettings` and `canarySettings`, structures whose own members are
@@ -281,7 +284,11 @@ fn patch_stage_bool(current: &mut bool, patch: &Patch) -> Result<(), PatchFailur
 /// The range of `MethodSetting$cacheTtlInSeconds`: API Gateway documents a default TTL of
 /// 300 seconds and a maximum of 3600 seconds for a method cache, and 0 ("the higher the
 /// TTL, the longer the response will be cached") disables caching.
-const CACHE_TTL_RANGE: ::std::ops::RangeInclusive<i32> = 0..=3600;
+///
+/// `pub(crate)` for the DATA plane, which honours the same bound when it holds a response
+/// for a stored TTL ([`crate::service::invoke`]): one range, so the setting a patch may
+/// write and the span an entry may be held for cannot disagree.
+pub(crate) const CACHE_TTL_RANGE: ::std::ops::RangeInclusive<i32> = 0..=3600;
 
 /// The `BadRequestException` message for a `cacheTtlInSeconds` that is not a whole number
 /// of seconds inside [`CACHE_TTL_RANGE`].
@@ -954,9 +961,12 @@ const METHOD_PATH_TOKENS: usize = 2;
 /// A pointer spells the method in one of the two ways API Gateway reads:
 ///
 /// * as its own two reference tokens, `/{resource_path}/{http_method}/…` — the separator
-///   before the method is a real one and the resource path's own `/` is escaped — and then
-///   the setting, in either spelling [`METHOD_SETTING_NAMES`] lists. The method is keyed as
-///   the pointer spelled it (`~1pets/GET`), escapes included;
+///   before the method is a real one and every separator INSIDE the resource path is
+///   escaped, its leading one either escaped too (`/~1pets/GET/…`) or left to the pointer's
+///   own leading separator (`/pets/GET/…`, the spelling `MethodSetting$ResourcePath` states
+///   a path in) — and then the setting, in either spelling [`METHOD_SETTING_NAMES`] lists.
+///   The method is keyed as the pointer spelled it (`~1pets/GET`, `pets/GET`), escapes
+///   included;
 /// * as ONE token carrying the whole method path, `/{escaped_method_path}/{setting}`, and
 ///   then the setting's own member name. That token has to be decoded for the method to be
 ///   read out of it at all, so the method is keyed decoded (`/pets/GET`) — which is why the
@@ -964,10 +974,14 @@ const METHOD_PATH_TOKENS: usize = 2;
 ///   stage patched both ways shows.
 ///
 /// A pointer that is neither — a one-token method path followed by a GROUPED setting name,
-/// a tail that names no setting, a path that stops at the method, a method path whose
-/// resource half is no resource path — names no setting of a method, and so never becomes
-/// a `methodSettings` entry: a key the method the request named does not resolve to is a
-/// setting no invoke of that method would ever consult.
+/// a tail that names no setting, a path that stops at the method — names no setting of a
+/// method, and so never becomes a `methodSettings` entry.
+///
+/// In the two-token spelling the first reference token IS the resource half, whatever it
+/// spells, so nothing is asked of it beyond the SETTING that has to follow the method: a
+/// resource path whose inner separator went unescaped (`/pets/{petId}/GET/metrics/enabled`)
+/// pushes the verb into the tail, which then names no setting, and is refused by that
+/// question alone.
 fn method_setting(patch: &Patch) -> Option<(String, &'static str)> {
     if let Some(tail) = patch
         .tokens
@@ -975,9 +989,6 @@ fn method_setting(patch: &Patch) -> Option<(String, &'static str)> {
         .filter(|tail| !tail.is_empty())
     {
         if let Some(setting) = named_setting(&tail.join("/")) {
-            if !names_a_resource(patch.tokens.first()?) {
-                return None;
-            }
             return Some((spelled_method_path(patch)?, setting));
         }
     }
@@ -997,14 +1008,15 @@ fn method_setting(patch: &Patch) -> Option<(String, &'static str)> {
     Some((method_path.clone(), setting))
 }
 
-/// Whether `resource_path` is the resource half of a method path: a RESOURCE path, which
-/// "begins with a '/'" as `Resource$path` spells one — so a pointer escapes that `/` as
-/// `~1` — or the token that stands for every resource of the stage.
+/// Whether `resource_path` is the resource half of a method path spelled WHOLE inside one
+/// reference token: a RESOURCE path, which "begins with a '/'" as `Resource$path` spells one
+/// — so the pointer escapes that `/` as `~1` — or the token that stands for every resource
+/// of the stage.
 ///
-/// A method path names a method of the API the stage serves, so a token that is no resource
-/// path names no method, whatever setting follows it: the resource path has to be spelled
-/// the way the API's own resources are, which is also the spelling the data plane resolves
-/// a method's settings by ([`crate::service::invoke`]).
+/// Asked of the ONE-token spelling alone: there, nothing but the token itself says where the
+/// resource path stops and the HTTP method begins, so a token whose head is no resource path
+/// names no method. The two-token spelling supplies its own separators and needs no such
+/// question ([`method_setting`]).
 fn names_a_resource(resource_path: &str) -> bool {
     resource_path.starts_with('/') || resource_path == EVERY_RESOURCE
 }

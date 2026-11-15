@@ -4166,6 +4166,17 @@ const UNNAMED_CODE_PREFIX: &str = "HTTP ";
 /// Each entry also carries the SHAPE that service's SDK words the diagnostic in
 /// ([`SdkDiagnostic`]), which is the SDK's and cannot be derived from the service.
 const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
+    // Amazon API Gateway's SDK names it `ApiGateway` — that model's own
+    // `awsService.cloudFormationName`, which is also the name its SDK client carries
+    // (`smithy_query(query="service_info")` on that service's model: `sdkId: "API Gateway"`,
+    // `cloudFormationName: ApiGateway`). The shape is the bare ENVELOPE, with no attempt
+    // count after it, as the recorded `ResourceStatusReason` of an
+    // `AWS::ApiGateway::Deployment` created for a REST API that has no methods carries it
+    // (`"<the service's sentence> (Service: ApiGateway, Status Code: 400, Request ID: …)"`,
+    // where Amazon Route 53's below carries `(SDK Attempt Count: …)` past the closing
+    // parenthesis). Every type this emulator provisions over this signing name is that
+    // service's or API Gateway v2's ([`provisioning::apigateway_rest_api`]).
+    ("apigateway", "ApiGateway", SdkDiagnostic::Envelope),
     // AWS AppConfig's SDK names it by that model's own `sdkId`, which is also the
     // `cloudFormationName` the type names of its resources carry
     // (`smithy_query(query="service_info")` on that service's model: `sdkId: "AppConfig"`,

@@ -220,6 +220,10 @@ mod integration_response;
 mod method_integration;
 #[path = "all/method_response.rs"]
 mod method_response;
+// The RESOURCE half of a method-setting pointer: each spelling of the resource path a patch
+// may address a setting by, and the `methodSettings` key the stage reports it under.
+#[path = "all/method_setting_resource_half_spellings.rs"]
+mod method_setting_resource_half_spellings;
 #[path = "all/patch_updates.rs"]
 mod patch_updates;
 // A REST API's own resource policy on the `execute-api` data plane: which requests to a
