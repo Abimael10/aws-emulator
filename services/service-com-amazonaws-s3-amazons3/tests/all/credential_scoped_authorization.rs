@@ -58,7 +58,7 @@ const REGION: &str = "us-east-1";
 /// The access-key id standing for the account's own published credential, which writes this
 /// suite's fixtures: neither STS nor IAM holds a record of it, so it resolves to the account's
 /// ambient identity.
-const ACCOUNT_KEY: &str = "AKIDEMULATOR";
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEMULATOR";
 
 /// The bucket every row addresses.
 const BUCKET: &str = "credential-scoped-subject";
@@ -81,31 +81,31 @@ const SESSION_SECONDS: i32 = 3600;
 /// An emulator holding S3 beside the two services a decision about a credential reads from:
 /// IAM (the principal and its identity-based documents) and STS (the session a credential was
 /// minted for).
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 /// What a dispatched request answered: the status, and the body as text.
-struct Answer {
-    status: u16,
-    body: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Answer {
     /// The `<Code>` of S3's restXml error document (the model sets `noErrorWrapping`, so it is
     /// the document's own child).
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         element(&self.body, "Code").unwrap_or_else(|| self.body.clone())
     }
 
     /// The `<Message>` of that same document.
-    fn error_message(&self) -> String {
+    pub(crate) fn error_message(&self) -> String {
         element(&self.body, "Message").unwrap_or_default()
     }
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -129,7 +129,13 @@ impl Emulator {
 
     /// One S3 request, presented as signed with `access_key_id` — which is where this emulator
     /// reads which principal a request speaks for.
-    async fn s3(&self, access_key_id: &str, method: &str, uri: &str, body: &[u8]) -> Answer {
+    pub(crate) async fn s3(
+        &self,
+        access_key_id: &str,
+        method: &str,
+        uri: &str,
+        body: &[u8],
+    ) -> Answer {
         let host = format!("s3.{REGION}.amazonaws.com");
         let request = http::Request::builder()
             .method(method)
@@ -154,7 +160,7 @@ impl Emulator {
     }
 
     /// One awsQuery call to IAM or STS, presented as signed with `access_key_id`.
-    async fn query(
+    pub(crate) async fn query(
         &self,
         access_key_id: &str,
         signing_name: &str,
@@ -233,7 +239,7 @@ impl Emulator {
 
     /// An IAM user carrying exactly `document` as its inline policy, and the three credentials
     /// a row calls as.
-    async fn user_with_document(&self, name: &str, document: &str) -> Credentials {
+    pub(crate) async fn user_with_document(&self, name: &str, document: &str) -> Credentials {
         let (status, body) = self
             .query(
                 ACCOUNT_KEY,
@@ -454,9 +460,13 @@ impl Emulator {
 
 /// The three credentials of one IAM user, which differ only in what the MFA condition key
 /// answers for them.
-struct Credentials {
+///
+/// `pub(crate)`: the hardening-pattern suite ([`super::deny_unless_mfa_hardening`]) drives the
+/// same three credentials of one user against a deny written over every action but the MFA
+/// bootstrap, through this one mint rather than a second copy of it.
+pub(crate) struct Credentials {
     /// The user's own ARN, which every refusal of any of the three names.
-    arn: String,
+    pub(crate) arn: String,
     /// The user's long-term access key: the MFA key carries NO value for it.
     long_term: String,
     /// A session minted without an MFA challenge: the key answers `false`.
@@ -474,7 +484,7 @@ struct Session {
 
 /// WHICH credential a row's expectation is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Presented {
+pub(crate) enum Presented {
     /// The user's long-term access key, for which the MFA key is absent.
     LongTermKey,
     /// A session minted with no MFA challenge, for which it is `false`.
@@ -485,7 +495,7 @@ enum Presented {
 
 impl Presented {
     /// The access key id this credential signs with.
-    fn access_key_id(self, credentials: &Credentials) -> &str {
+    pub(crate) fn access_key_id(self, credentials: &Credentials) -> &str {
         match self {
             Self::LongTermKey => &credentials.long_term,
             Self::PlainSession => &credentials.plain_session,
@@ -659,7 +669,7 @@ struct MfaRow {
 
 /// The credentials every row of the MFA table is driven with, in the order its verdicts are
 /// written in.
-const PRESENTED: [Presented; 3] = [
+pub(crate) const PRESENTED: [Presented; 3] = [
     Presented::LongTermKey,
     Presented::PlainSession,
     Presented::MfaSession,

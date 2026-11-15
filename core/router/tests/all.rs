@@ -1745,3 +1745,22 @@ mod lambda_sqs_event_source_attempt_reservation;
 //! this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each
 //! `mod` is what points it into `tests/all/`. The notes earlier landings appended to this
 //! list live in `all/appended_notes.rs`.
+// Single integration-test target for the router. This file is the declaration LIST and
+// nothing else: one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by
+// name, with no blank line, no prose and no doc comment between the pairs.
+// Why it carries no prose: every landing appends to this one file, and the two ways it breaks
+// take every suite of the target down with it — the same `mod` twice is `E0428`, and an inner
+// doc comment (`//!`) past the first item is `E0753`. A list of nothing but pairs gives two
+// branches landing at once two lines to insert in two places, and no text to duplicate,
+// re-word or mistype, so EVERY comment in this file is an ordinary `//` one, this header
+// included: with no inner doc comment anywhere, no merge of two landings can put one past the
+// first item.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
+// this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each
+// `mod` is what points it into `tests/all/`.
+// What a suite covers, and why it lives in THIS target rather than in a service crate's own,
+// belongs in that suite's own module header, where it is read beside the test it explains.
+// `all/all_rs_declares_each_suite_once.rs`, `all/every_suite_file_is_declared.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` check these rules — the first three for this
+// file and for every service crate's `tests/all.rs` — and `all/appended_notes.rs` keeps the
+// notes earlier landings had appended here.

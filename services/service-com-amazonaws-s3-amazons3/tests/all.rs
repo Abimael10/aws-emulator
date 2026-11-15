@@ -157,6 +157,8 @@ mod copy_source_url_encoding;
 mod credential_scoped_authorization;
 #[path = "all/default_object_checksum.rs"]
 mod default_object_checksum;
+#[path = "all/deny_unless_mfa_hardening.rs"]
+mod deny_unless_mfa_hardening;
 #[path = "all/directory_bucket_conditional_deletes.rs"]
 mod directory_bucket_conditional_deletes;
 #[path = "all/directory_bucket_listings.rs"]
