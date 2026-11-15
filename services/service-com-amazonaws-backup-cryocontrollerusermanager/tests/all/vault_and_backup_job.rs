@@ -219,6 +219,23 @@ pub(crate) fn string_at(body: &Value, member: &str) -> String {
         .to_string()
 }
 
+/// The ARN of a backup vault of this account in `region`, as the model documents
+/// the form ("for example,
+/// `arn:aws:backup:us-east-1:123456789012:backup-vault:aBackupVault`").
+///
+/// Shared with the sibling suites for the reason given on [`router`]: a vault is
+/// identified by its name within one account AND one Region, so more than one
+/// suite needs to spell that ARN.
+pub(crate) fn vault_arn(region: &str, name: &str) -> String {
+    format!("arn:aws:backup:{region}:{ACCOUNT}:backup-vault:{name}")
+}
+
+/// The tag set a tag read reports, as a JSON object; a resource carrying no tags
+/// reports an empty map.
+pub(crate) fn reported_tags(body: &Value) -> Value {
+    body.get("Tags").cloned().unwrap_or(Value::Null)
+}
+
 /// A deterministic name of `length` characters drawn from [`NAME_ALPHABET`], so
 /// the length bound is exercised across the whole admitted alphabet rather than
 /// on one hand-picked spelling.

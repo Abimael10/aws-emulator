@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::vault_and_backup_job::{
-    call_in_region, create_vault_in, error_code, router, string_at, ACCOUNT, REGION,
+    call_in_region, create_vault_in, error_code, router, string_at, vault_arn, ACCOUNT, REGION,
 };
 
 /// The name every case deploys into more than one Region — the multi-Region
@@ -39,13 +39,6 @@ const SHARED_NAME: &str = "shared-vault-name";
 /// The role a backup job is run with.
 fn role() -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/service-role/AWSBackupDefaultServiceRole")
-}
-
-/// The ARN of a backup vault of this account in `region`, as the model documents
-/// the form ("for example,
-/// `arn:aws:backup:us-east-1:123456789012:backup-vault:aBackupVault`").
-fn vault_arn(region: &str, name: &str) -> String {
-    format!("arn:aws:backup:{region}:{ACCOUNT}:backup-vault:{name}")
 }
 
 /// `DescribeBackupVault` through a client bound to `region`.

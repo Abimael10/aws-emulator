@@ -75,6 +75,8 @@ mod recovery_point_denial_sentence;
 mod recovery_point_read;
 #[path = "all/refused_job_start_publishes_no_event.rs"]
 mod refused_job_start_publishes_no_event;
+#[path = "all/refused_vault_create_tag_side_effects.rs"]
+mod refused_vault_create_tag_side_effects;
 #[path = "all/restore_access_vault.rs"]
 mod restore_access_vault;
 #[path = "all/resource_tags.rs"]

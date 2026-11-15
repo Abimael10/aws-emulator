@@ -4787,3 +4787,6 @@ mod appended_notes;
 //! precedes: `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a
 //! SIBLING of this file (`tests/<name>.rs`), which the layout check refuses. The `#[path]`
 //! is what points the module into `tests/all/`.
+//! every suite in this target.
+//! the first item one is `E0753` and compiles no suite of this target, so a note further
+//! down must be an ordinary `//` comment. Below, add a declaration — not a note about one.

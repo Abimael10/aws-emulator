@@ -24,7 +24,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::recovery_point_deletion::{router_with_engine, start_point};
-use crate::vault_and_backup_job::{call, create_vault, error_code, string_at, ACCOUNT, PAST_SETTLE, REGION};
+use crate::vault_and_backup_job::{
+    call, create_vault, error_code, reported_tags, string_at, ACCOUNT, PAST_SETTLE, REGION,
+};
 
 /// The sentence this service states for "the ARN a tagging call carries names
 /// no resource of this account" — fixed text.
@@ -54,11 +56,6 @@ async fn list_tags(router: &MultiServiceRouter, resource_arn: &str, query: &str)
         None,
     )
     .await
-}
-
-/// The tags the read reports, as a JSON object.
-fn reported_tags(body: &Value) -> Value {
-    body.get("Tags").cloned().unwrap_or(Value::Null)
 }
 
 /// A tag written through the tagging call joins the tags the resource's own
