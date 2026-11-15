@@ -95,6 +95,8 @@ mod certificate_options_not_issued_class;
 mod certificate_options_update;
 #[path = "all/certificate_pending_validation_window.rs"]
 mod certificate_pending_validation_window;
+#[path = "all/certificate_read_projection_members.rs"]
+mod certificate_read_projection_members;
 #[path = "all/certificate_refusal_classes.rs"]
 mod certificate_refusal_classes;
 #[path = "all/certificate_retrieval.rs"]

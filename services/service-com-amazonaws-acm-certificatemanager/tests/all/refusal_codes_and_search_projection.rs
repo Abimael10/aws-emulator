@@ -261,7 +261,7 @@ async fn bad_parameters_of_a_domain_validation_listing_are_one_validation_except
         .collect();
     assert_eq!(
         names,
-        vec!["alt.classify.example.com"],
+        vec!["classify.example.com"],
         "the resumed page carries the name after the one the token named, got {names:?}"
     );
 }

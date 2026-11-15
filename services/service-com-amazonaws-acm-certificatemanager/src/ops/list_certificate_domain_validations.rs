@@ -5,10 +5,20 @@
 //! Reports one `DomainValidationSummary` per name on a stored certificate, projected
 //! from that certificate's persisted per-domain validation records: the method the
 //! certificate was requested with, the status that validation currently stands at, and
-//! the challenge the method publishes, all under the summary's
+//! the kind of challenge that method asks for, all under the summary's
 //! `RequestedValidationConfiguration`. Nothing here is echoed from the request beyond
 //! the certificate it names — `RequestCertificate` wrote those records, and this
 //! operation reads them.
+//!
+//! The challenge names the evidence the method asks for; the per-name evidence itself —
+//! the DNS record to publish and the mail suffix ACM writes to — is
+//! `DescribeCertificate`'s to report
+//! (`CertificateDetail$DomainValidationOptions[*].ResourceRecord` /
+//! `[*].ValidationDomain`), so the DNS arm here carries no record of its own and the
+//! email arm's `ValidationDomain` is the covered name this summary is about.
+//!
+//! The summaries are reported in DOMAIN-NAME order, the total order this paginated read
+//! cuts and resumes its pages in.
 //!
 //! Every defect of the request's own parameters — a `CertificateArn` that names no ACM
 //! certificate, a `NextToken` this service did not issue — is ONE refusal class with
@@ -241,10 +251,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The stored order: the certificate's own domain name first, then its subject
-        // alternative names. A `NextToken` resumes against that same order, so the
-        // order a page is cut in and the order it is resumed in cannot drift apart.
-        let validations = certificate.domain_validations.as_slice();
+        // This operation's own list order: the covered names in DOMAIN-NAME order, which
+        // is the total order a paginated read needs — independent of the order the
+        // records were stored in, so the order a page is cut in is the order a
+        // `NextToken` resumes in however the certificate was requested. (The
+        // certificate's DETAIL reports the same names in the order the request named
+        // them, which is that projection's own order.)
+        let mut validations = certificate.domain_validations.clone();
+        validations.sort_by_key(|record| record.domain_name.to_ascii_lowercase());
+        let validations = validations.as_slice();
         let start = match resume_after.as_deref() {
             None => 0,
             // The token names the last domain the previous page emitted, so this page
@@ -323,24 +338,46 @@ fn domain_validation_summary(
     DomainValidationSummary {
         domain_name: record.domain_name.clone(),
         active_validation_configuration: None,
-        requested_validation_configuration: Some(ValidationConfiguration {
-            validation_method: Some(record.validation_method.clone()),
-            validation_status: Some(record.validation_status.clone()),
-            validation_challenge: validation_challenge(record),
-        }),
+        requested_validation_configuration: Some(requested_configuration(record)),
     }
 }
 
-/// The challenge a domain's validation configuration carries: the evidence the
+/// One domain's `ValidationConfiguration`: the method its validation stands under, the
+/// `DomainStatus` that validation currently has, and the challenge the method asks for.
+fn requested_configuration(
+    record: &crate::state::DomainValidationRecord,
+) -> ValidationConfiguration {
+    ValidationConfiguration {
+        validation_method: Some(record.validation_method.clone()),
+        validation_status: Some(record.validation_status.clone()),
+        validation_challenge: validation_challenge(record),
+    }
+}
+
+/// The challenge a domain's validation configuration carries: the KIND of evidence the
 /// requested method asks for, read off the record `RequestCertificate` stored.
 ///
 /// `ValidationChallenge` is a union with one member per method whose challenge the
-/// model describes — `EmailValidationChallenge` (the mailboxes ACM wrote to and the
-/// domain it wrote them at) and `DnsValidationChallenge` (the CNAME to publish), from
+/// model describes — `EmailValidationChallenge` (the mailboxes ACM mails and the domain
+/// it mails them for) and `DnsValidationChallenge` (the CNAME to publish), from
 /// `smithy_query(query="shape", shape="com.amazonaws.acm#ValidationChallenge")`.
 /// `ValidationMethod` has a third value, `HTTP`, that the union models no variant for,
 /// so an HTTP-validated domain carries no challenge here rather than one of the two
 /// shapes that would describe evidence it does not use.
+///
+/// Each arm is about THIS domain and carries no evidence another projection owns, which
+/// is what the recorded responses of this operation serve:
+///
+/// * the email arm names the addresses ACM has used — the empty list until a dispatch
+///   has used one — and `ValidationDomain` is the name this summary is about: the
+///   covered domain name as the request wrote it, its wildcard label included. The mail
+///   SUFFIX ACM writes to for that name is the certificate's own record to report,
+///   on `CertificateDetail$DomainValidationOptions[*].ValidationDomain`;
+/// * the DNS arm carries no resource record at all, because the record to publish is
+///   likewise reported by `DescribeCertificate`, on
+///   `CertificateDetail$DomainValidationOptions[*].ResourceRecord`, and a client that
+///   published a CNAME taken from here would publish one this operation is not the
+///   source of.
 fn validation_challenge(
     record: &crate::state::DomainValidationRecord,
 ) -> Option<ValidationChallenge> {
@@ -348,17 +385,14 @@ fn validation_challenge(
         crate::state::VALIDATION_METHOD_EMAIL => Some(
             ValidationChallenge::EmailValidationChallenge(EmailValidationChallenge {
                 validation_emails: Some(record.validation_emails.clone()),
-                validation_domain: record.validation_domain.clone(),
+                validation_domain: Some(record.domain_name.clone()),
             }),
         ),
-        // The CNAME to publish, which only a DNS-validated domain has one of.
-        crate::state::VALIDATION_METHOD_DNS => {
-            record.resource_record.clone().map(|resource_record| {
-                ValidationChallenge::DnsValidationChallenge(DnsValidationChallenge {
-                    resource_record: Some(resource_record),
-                })
-            })
-        }
+        // The DNS challenge this domain stands under, named as the challenge it is;
+        // the CNAME itself belongs to `DescribeCertificate`'s projection.
+        crate::state::VALIDATION_METHOD_DNS => Some(
+            ValidationChallenge::DnsValidationChallenge(DnsValidationChallenge::default()),
+        ),
         // `HTTP`: the union models no member for it, so there is no challenge to
         // report rather than one describing evidence the method does not use.
         _ => None,

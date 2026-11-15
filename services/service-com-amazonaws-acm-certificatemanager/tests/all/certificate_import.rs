@@ -397,17 +397,50 @@ async fn describe_reports_the_imported_certificate() {
             generated.not_after
         );
         // "This value exists only when the certificate type is IMPORTED"
-        // (`CertificateDetail$ImportedAt`), and the two instants that belong to a
-        // certificate ACM issued or was asked to issue do not.
+        // (`CertificateDetail$ImportedAt`), while `IssuedAt` belongs to a certificate
+        // ACM issued itself. `CreatedAt` is the instant the record came into being,
+        // which for an import is the instant the material was brought in.
         assert!(
             detail["ImportedAt"].is_number(),
             "case {case:?}: expected an ImportedAt instant, got {detail}"
         );
-        for absent in ["CreatedAt", "IssuedAt", "DomainValidationOptions", "FailureReason"] {
+        assert_eq!(
+            detail["CreatedAt"], detail["ImportedAt"],
+            "case {case:?}: an imported certificate was created when it was imported, got {detail}"
+        );
+        for absent in ["IssuedAt", "FailureReason"] {
             assert!(
                 detail[absent].is_null(),
                 "case {case:?}: {absent} does not belong to an imported certificate, got {detail}"
             );
+        }
+        // One `DomainValidationOptions` entry per name the certificate covers, carrying
+        // the name ALONE: ACM validated none of them — the material came from outside —
+        // so no entry carries a status, a method or a challenge.
+        let validations = detail["DomainValidationOptions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: no DomainValidationOptions in {detail}"));
+        assert_eq!(
+            validations
+                .iter()
+                .map(|entry| entry["DomainName"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>(),
+            names.iter().map(|name| (*name).to_string()).collect::<Vec<_>>(),
+            "case {case:?}: expected one validation entry per covered name, got {detail}"
+        );
+        for entry in validations {
+            for member in [
+                "ValidationStatus",
+                "ValidationMethod",
+                "ValidationDomain",
+                "ValidationEmails",
+                "ResourceRecord",
+            ] {
+                assert!(
+                    entry[member].is_null(),
+                    "case {case:?}: ACM validated nothing for an imported certificate, so {member} must be absent, got {entry}"
+                );
+            }
         }
 
         let key_usages: Vec<String> = detail["KeyUsages"]

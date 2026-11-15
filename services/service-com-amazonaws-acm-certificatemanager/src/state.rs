@@ -578,11 +578,18 @@ pub const KEY_PAIR_ORIGIN_CUSTOMER_PROVIDED: &str = "CUSTOMER_PROVIDED";
 /// (`CertificateOptions$Export` doc).
 pub const EXPORT_DISABLED: &str = "DISABLED";
 
-/// `CertificateTransparencyLoggingPreference` when `Options` names none: "All public
-/// certificates are recorded in a certificate transparency log" and "certificate
-/// transparency logging opt-out is no longer available" (`CertificateOptions` doc), so
-/// a certificate that asked for nothing is logged.
+/// `CertificateTransparencyLoggingPreference` when the `Options` of a certificate ACM
+/// ISSUES name none: "All public certificates are recorded in a certificate
+/// transparency log" and "certificate transparency logging opt-out is no longer
+/// available" (`CertificateOptions` doc), so a public certificate that asked for
+/// nothing is logged.
 pub const TRANSPARENCY_LOGGING_ENABLED: &str = "ENABLED";
+
+/// `CertificateTransparencyLoggingPreference` when the `Options` of a certificate ACM
+/// did NOT issue name none: the statement above is about the certificates ACM issues,
+/// and an imported certificate is logged by whoever issued it rather than by ACM, so
+/// ACM reports no transparency logging of its own for one.
+pub const TRANSPARENCY_LOGGING_DISABLED: &str = "DISABLED";
 
 /// `CertificateDetail$Issuer` ("the name of the certificate authority that issued and
 /// signed the certificate") for a public certificate ACM issues: Amazon's own CA
@@ -922,8 +929,8 @@ pub struct DomainValidationRecord {
     /// Empty until the mail has actually gone out — the initial dispatch the clock owes
     /// a request ([`Certificate::pending_validation_email`]), or a
     /// `ResendValidationEmail` — and empty for a name validated by DNS or HTTP, where a
-    /// mailbox list does not apply at all; [`domain_validation`] reports the difference
-    /// from the record's own method.
+    /// mailbox list does not apply at all; [`domain_validation`] reports the list only
+    /// once it names a mailbox ACM used.
     pub validation_emails: Vec<String>,
     /// The CNAME to publish, for DNS validation.
     pub resource_record: Option<ResourceRecord>,
@@ -3844,6 +3851,19 @@ pub fn export_option(cert: &Certificate) -> String {
         .unwrap_or_else(|| EXPORT_DISABLED.to_string())
 }
 
+/// The `CertificateTransparencyLoggingPreference` a certificate that asked for none
+/// carries: a certificate ACM ISSUED is recorded in a public certificate transparency
+/// log, and one whose material came from outside ACM is not — ACM logs no certificate
+/// it did not issue, which is what the recorded responses of an imported certificate
+/// report, so the preference it reports for one is the disabled value.
+fn default_transparency_logging(cert: &Certificate) -> &'static str {
+    if cert.is_imported() {
+        TRANSPARENCY_LOGGING_DISABLED
+    } else {
+        TRANSPARENCY_LOGGING_ENABLED
+    }
+}
+
 /// A certificate's `CertificateOptions` as a response reports them: every preference
 /// the certificate carries, defaulted where the request named none, so a client that
 /// set one can read it back and one that set nothing sees what ACM applied.
@@ -3858,7 +3878,7 @@ pub fn certificate_options(cert: &Certificate) -> CertificateOptions {
             cert.options
                 .as_ref()
                 .and_then(|options| options.certificate_transparency_logging_preference.clone())
-                .unwrap_or_else(|| TRANSPARENCY_LOGGING_ENABLED.to_string()),
+                .unwrap_or_else(|| default_transparency_logging(cert).to_string()),
         ),
         export: Some(export_option(cert)),
         validation_method: cert
@@ -3950,8 +3970,8 @@ pub fn expiry_events_configuration(
 /// `ValidationEmails` is "a list of email addresses that ACM used to send domain
 /// validation emails" (`DomainValidation$ValidationEmails` doc), so it belongs to a
 /// domain validated BY EMAIL: it is reported for such a domain — as the empty list
-/// once no mailbox was used, which is a validation that never ran — and is absent for
-/// a domain validated by DNS or HTTP, where ACM sends no mail at all.
+/// while ACM has used no address yet — and is absent for a domain validated by DNS or
+/// HTTP, where ACM sends no mail at all.
 fn domain_validation(record: &DomainValidationRecord) -> DomainValidation {
     DomainValidation {
         domain_name: record.domain_name.clone(),
@@ -3964,6 +3984,34 @@ fn domain_validation(record: &DomainValidationRecord) -> DomainValidation {
         http_redirect: record.http_redirect.clone(),
         validation_method: Some(record.validation_method.clone()),
     }
+}
+
+/// A certificate's `CertificateDetail$DomainValidationOptions`: one entry per name the
+/// certificate covers, in the order the names are stored, since the member "contains
+/// information about the initial validation of each domain name"
+/// (`CertificateDetail$DomainValidationOptions` doc).
+///
+/// An entry reports the per-name facts of the validation ACM RAN for that name. A
+/// certificate whose material came from outside ACM was never validated by ACM, so its
+/// entries carry the covered name alone — no status, no method and no challenge, none
+/// of which any validation of this service's produced — and the list is the names the
+/// imported certificate itself asserts. The member's own doc adds "this field exists
+/// only when the certificate type is AMAZON_ISSUED", but the recorded responses of an
+/// imported certificate carry the name list, so the list is reported for every stored
+/// certificate.
+fn domain_validation_options(cert: &Certificate) -> Option<Vec<DomainValidation>> {
+    if !cert.domain_validations.is_empty() {
+        return Some(cert.domain_validations.iter().map(domain_validation).collect());
+    }
+    (!cert.subject_alternative_names.is_empty()).then(|| {
+        cert.subject_alternative_names
+            .iter()
+            .map(|name| DomainValidation {
+                domain_name: name.clone(),
+                ..DomainValidation::default()
+            })
+            .collect()
+    })
 }
 
 /// A stored certificate as `DescribeCertificate`'s `CertificateDetail`.
@@ -3980,12 +4028,12 @@ pub fn certificate_detail(cert: &Certificate, in_use_by: Vec<String>) -> Certifi
         domain_name: Some(cert.domain_name.clone()),
         subject_alternative_names: Some(cert.subject_alternative_names.clone()),
         managed_by: cert.managed_by.clone(),
-        domain_validation_options: (!cert.domain_validations.is_empty())
-            .then(|| cert.domain_validations.iter().map(domain_validation).collect()),
+        domain_validation_options: domain_validation_options(cert),
         // "The time at which the certificate was requested"
-        // (`CertificateDetail$CreatedAt` doc): an imported certificate was never
-        // requested, so it reports the instant it was imported instead.
-        created_at: (!cert.is_imported()).then(|| to_date_time(cert.created_at)),
+        // (`CertificateDetail$CreatedAt` doc): the instant the record was created,
+        // which every stored certificate carries — for one a client imported, the
+        // instant the import brought it into ACM.
+        created_at: Some(to_date_time(cert.created_at)),
         issued_at: cert.issued_at.map(to_date_time),
         imported_at: cert.imported_at.map(to_date_time),
         // The serial the signing authority assigned, which only a record holding a
@@ -4082,9 +4130,9 @@ pub fn certificate_summary(cert: &Certificate, in_use: bool) -> CertificateSumma
         renewal_eligibility: Some(cert.renewal_eligibility().to_string()),
         not_before: cert.not_before.map(to_date_time),
         not_after: cert.not_after.map(to_date_time),
-        // As on `CertificateDetail`: `CreatedAt` is when the certificate was
-        // REQUESTED, and an imported one carries its import instant instead.
-        created_at: (!cert.is_imported()).then(|| to_date_time(cert.created_at)),
+        // As on `CertificateDetail`: `CreatedAt` is the instant the record was
+        // created, reported for every certificate.
+        created_at: Some(to_date_time(cert.created_at)),
         issued_at: cert.issued_at.map(to_date_time),
         imported_at: cert.imported_at.map(to_date_time),
         // Present only for a revoked certificate, as on `CertificateDetail`.
@@ -4420,7 +4468,10 @@ pub fn certificate_search_result(cert: &Certificate, in_use: bool) -> Certificat
         }),
         certificate_metadata: Some(CertificateMetadata::AcmCertificateMetadata(
             AcmCertificateMetadata {
-                created_at: (!cert.is_imported()).then(|| to_date_time(cert.created_at)),
+                // As on `CertificateDetail`, and the member this operation's default
+                // `SortBy` of `CREATED_AT` orders a page by, so a client can read the
+                // value the page was ordered on.
+                created_at: Some(to_date_time(cert.created_at)),
                 exported: Some(cert.exported),
                 in_use: Some(in_use),
                 issued_at: cert.issued_at.map(to_date_time),

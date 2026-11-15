@@ -6,10 +6,10 @@
 //!
 //! RULE: every summary carries exactly `DomainName` plus
 //! `RequestedValidationConfiguration` — the method the certificate was requested with,
-//! the status that validation stands at, and the challenge that method publishes — and
-//! no `ActiveValidationConfiguration`, which is the configuration "currently in effect"
-//! and differs from the requested one only for a domain MIGRATED onto another
-//! validation method, something no operation this service models performs.
+//! the status that validation stands at, and the challenge naming the evidence that
+//! method asks for — and no `ActiveValidationConfiguration`, which is the configuration
+//! "currently in effect" and differs from the requested one only for a domain MIGRATED
+//! onto another validation method, something no operation this service models performs.
 //!
 //! The table spans what the rule generalises over: every modelled `ValidationMethod`
 //! and the absence of one, a public request (whose names nobody can prove control of)
@@ -115,11 +115,20 @@ fn assert_configuration_member(case: &str, summary: &Value, method: &str, status
             "case {case}: an email-validated domain carries the EmailValidationChallenge \
              arm, got {summary}"
         ),
-        "DNS" => assert!(
-            challenge["DnsValidationChallenge"].is_object(),
-            "case {case}: a DNS-validated domain carries the DnsValidationChallenge arm, \
-             got {summary}"
-        ),
+        "DNS" => {
+            assert!(
+                challenge["DnsValidationChallenge"].is_object(),
+                "case {case}: a DNS-validated domain carries the DnsValidationChallenge arm, \
+                 got {summary}"
+            );
+            // The CNAME to publish is `DescribeCertificate`'s to report, on
+            // `CertificateDetail$DomainValidationOptions[*].ResourceRecord`; this arm
+            // names the challenge and carries no record of its own.
+            assert!(
+                challenge["DnsValidationChallenge"]["ResourceRecord"].is_null(),
+                "case {case}: the DNS challenge here carries no resource record, got {summary}"
+            );
+        }
         "HTTP" => assert!(
             challenge.is_null(),
             "case {case}: the challenge union models no HTTP member, got {summary}"
@@ -198,10 +207,13 @@ async fn every_summary_reports_the_requested_configuration() {
         // same member.
         hold_pending_validations(&engine);
         let pending = paged_summaries(&router, &arn, 1).await;
+        // Every covered name, in the domain-name order this operation pages in.
+        let mut in_name_order = expected_names.clone();
+        in_name_order.sort();
         assert_eq!(
             names(&pending),
-            expected_names,
-            "case {case}: expected one summary per stored name in stored order, got {pending:?}"
+            in_name_order,
+            "case {case}: expected one summary per covered name in domain-name order, got {pending:?}"
         );
         for summary in &pending {
             let domain = summary["DomainName"].as_str().unwrap_or_default();
@@ -223,13 +235,16 @@ async fn every_summary_reports_the_requested_configuration() {
             "case {case}: the outcome changes statuses, never the set of names, got {settled:?}"
         );
         let described = described_validations(&router, &arn).await;
-        for (index, summary) in settled.iter().enumerate() {
+        // The name the request made primary, which is the first name ACM judges.
+        let primary = body["DomainName"].as_str().unwrap_or_default().to_string();
+        for summary in settled.iter() {
             let domain = summary["DomainName"].as_str().unwrap_or_default();
             let row = format!("{case}/{domain}/terminal");
             // A request ACM refuses up front carries the failed verdict on the one name
-            // it stopped at — the first it could not validate — so the names behind it
-            // keep the status they were waiting in, while an issuance proves them all.
-            let status = if terminal == FAILED && index > 0 {
+            // it stopped at — the first it could not validate, which is the primary name
+            // here — so the names behind it keep the status they were waiting in, while
+            // an issuance proves them all.
+            let status = if terminal == FAILED && domain != primary {
                 PENDING_VALIDATION
             } else {
                 terminal

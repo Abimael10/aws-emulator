@@ -134,8 +134,8 @@ pub(crate) fn names(list: &[Value]) -> Vec<String> {
 }
 
 /// Assert one summary against the `DescribeCertificate` record of the same domain:
-/// same method, same status, and the challenge the model describes for that method
-/// carrying the very values the record holds.
+/// same method, same status, and the challenge the model describes for that method,
+/// naming the evidence that method asks for.
 pub(crate) fn assert_summary_matches_record(
     case: &str,
     summary: &Value,
@@ -169,21 +169,27 @@ pub(crate) fn assert_summary_matches_record(
 
     let challenge = &requested["ValidationChallenge"];
     match method {
-        // `DnsValidationChallenge` carries the CNAME to publish.
+        // `DnsValidationChallenge` names the challenge the domain stands under; the
+        // CNAME to publish is `DescribeCertificate`'s to report, on
+        // `DomainValidationOptions[*].ResourceRecord`, so this arm carries no record
+        // of its own.
         "DNS" => {
-            assert_eq!(
-                challenge["DnsValidationChallenge"]["ResourceRecord"],
-                described["ResourceRecord"],
-                "case {case}: expected the stored CNAME record, got {summary}"
+            assert!(
+                challenge["DnsValidationChallenge"].is_object(),
+                "case {case}: a DNS-validated domain carries the DnsValidationChallenge arm, got {summary}"
             );
-            assert_eq!(
-                challenge["DnsValidationChallenge"]["ResourceRecord"]["Type"].as_str(),
-                Some("CNAME"),
-                "case {case}: a DNS validation record is a CNAME, got {summary}"
+            assert!(
+                challenge["DnsValidationChallenge"]["ResourceRecord"].is_null(),
+                "case {case}: the CNAME is reported by DescribeCertificate, not here, got {summary}"
+            );
+            assert!(
+                !described["ResourceRecord"].is_null(),
+                "case {case}: the stored record must still carry the CNAME, got {described}"
             );
         }
-        // `EmailValidationChallenge` carries the mailboxes ACM wrote to and the domain
-        // it wrote them at.
+        // `EmailValidationChallenge` carries the addresses ACM used and the domain this
+        // summary is about; the mail SUFFIX ACM writes to for that domain is the
+        // certificate's detail to report, on `DomainValidationOptions[*].ValidationDomain`.
         "EMAIL" => {
             let email = &challenge["EmailValidationChallenge"];
             assert_eq!(
@@ -193,8 +199,12 @@ pub(crate) fn assert_summary_matches_record(
             );
             assert_eq!(
                 email["ValidationDomain"],
-                described["ValidationDomain"],
-                "case {case}: expected the stored validation domain, got {summary}"
+                summary["DomainName"],
+                "case {case}: the challenge names the domain it is about, got {summary}"
+            );
+            assert!(
+                !described["ValidationDomain"].is_null(),
+                "case {case}: the detail must still report the suffix ACM mails, got {described}"
             );
         }
         // `ValidationChallenge` is a union over EMAIL and DNS only
@@ -215,8 +225,9 @@ pub(crate) fn assert_summary_matches_record(
     }
 }
 
-/// RULE: one summary per name on the stored certificate, in the stored order, each
-/// one's active configuration projected from that domain's persisted validation.
+/// RULE: one summary per name on the stored certificate, in this operation's own
+/// domain-name order, each one's requested configuration projected from that domain's
+/// persisted validation.
 #[tokio::test]
 async fn summaries_project_every_stored_domain_validation() {
     // Rows differ along the method asked for (every modelled value, and none), the
@@ -284,10 +295,14 @@ async fn summaries_project_every_stored_domain_validation() {
         hold_pending_validations(&engine);
 
         let (list, next) = summaries(&router, &json!({ "CertificateArn": arn })).await;
+        // Every covered name, in the domain-name order this operation reports in.
+        let mut in_name_order: Vec<String> =
+            expected_names.iter().map(|n| (*n).to_string()).collect();
+        in_name_order.sort();
         assert_eq!(
             names(&list),
-            expected_names.iter().map(|n| (*n).to_string()).collect::<Vec<_>>(),
-            "case {case}: expected one summary per stored name, in stored order, got {list:?}"
+            in_name_order,
+            "case {case}: expected one summary per covered name, in domain-name order, got {list:?}"
         );
         assert!(
             next.is_none(),
@@ -366,13 +381,15 @@ async fn the_reported_status_follows_the_clock_owed_outcome() {
             "case {case}: the outcome changes statuses, never the set of names, got {terminal:?}"
         );
         let described = described_validations(&router, &arn).await;
-        for (index, summary) in terminal.iter().enumerate() {
+        // The name the request made primary, which is the first name ACM judges.
+        let primary = body["DomainName"].as_str().unwrap_or_default();
+        for summary in terminal.iter() {
             let domain = summary["DomainName"].as_str().unwrap_or_default();
             // The clock-owed outcome of a request ACM refuses up front is the verdict on
-            // the ONE name it stopped at — the first it could not validate — so the
-            // names behind it keep the status they were waiting in, while an issuance
-            // proves every name at once.
-            let expected_status = if *expected == "FAILED" && index > 0 {
+            // the ONE name it stopped at — the first it could not validate, which is the
+            // primary name here — so the names behind it keep the status they were
+            // waiting in, while an issuance proves every name at once.
+            let expected_status = if *expected == "FAILED" && domain != primary {
                 "PENDING_VALIDATION"
             } else {
                 *expected
@@ -396,8 +413,8 @@ async fn the_reported_status_follows_the_clock_owed_outcome() {
 }
 
 /// RULE: `MaxItems` bounds one page and `NextToken` resumes after the last domain it
-/// emitted, so paging walks every name exactly once in the stored order whatever the
-/// page size.
+/// emitted, so paging walks every name exactly once in the operation's own
+/// domain-name order whatever the page size.
 #[tokio::test]
 async fn paging_walks_every_domain_once() {
     let sans = [
@@ -420,8 +437,11 @@ async fn paging_walks_every_domain_once() {
     .await;
     hold_pending_validations(&engine);
 
+    // Every covered name, in the DOMAIN-NAME order this operation pages in (so the
+    // wildcard, whose '*' sorts before every letter, comes first).
     let mut expected = vec!["a.page.example.com".to_string()];
     expected.extend(sans.iter().map(|san| (*san).to_string()));
+    expected.sort();
 
     // Page sizes spanning the boundary: one at a time, divisors and non-divisors of
     // the name count, exactly the count, one past it, and the member's maximum — plus
@@ -478,7 +498,7 @@ async fn paging_walks_every_domain_once() {
         }
         assert_eq!(
             walked, expected,
-            "case {case}: expected every stored name once in stored order, got {walked:?}"
+            "case {case}: expected every name once in domain-name order, got {walked:?}"
         );
         let expected_pages = match max_items {
             Some(max) => expected.len().div_ceil(*max),
@@ -604,8 +624,8 @@ async fn forged_next_tokens_are_refused() {
     let (first, issued) = summaries(&router, &json!({ "CertificateArn": arn, "MaxItems": 1 })).await;
     assert_eq!(
         names(&first),
-        vec!["token.example.com".to_string()],
-        "a MaxItems=1 page carries the first stored name, got {first:?}"
+        vec!["alt.token.example.com".to_string()],
+        "a MaxItems=1 page carries the first name in domain-name order, got {first:?}"
     );
     let issued = issued.expect("a page that stopped short of the names issues a NextToken");
 
@@ -658,7 +678,7 @@ async fn forged_next_tokens_are_refused() {
         summaries(&router, &json!({ "CertificateArn": arn, "NextToken": issued })).await;
     assert_eq!(
         names(&second),
-        vec!["alt.token.example.com".to_string()],
+        vec!["token.example.com".to_string()],
         "the issued token resumes after the name it named, got {second:?}"
     );
     assert!(
