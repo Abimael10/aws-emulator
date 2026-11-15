@@ -699,24 +699,34 @@ async fn a_send_that_resolves_no_node_at_all_is_refused() {
     seed_inventory(&engine);
 
     // One row per way a send names no selection: neither member, both empty, and target
-    // keys that are not ones a command selects nodes by.
+    // keys that are not ones a command selects nodes by — the two of which are refused with
+    // the sentence AWS states for a target key, which names the FORMS a caller may spell
+    // rather than the key it was handed (recorded behaviour — fixtures
+    // `ssm-ecsm-run-command-on-an-unmanaged-instance-refusals` and
+    // `ssm-vscan-traj-send-command-validation-order`).
+    let invalid_target_key = "The target key is not valid. You can specify instance IDs, or \
+                             use tag:name=value, tag-key=value or \
+                             resource-groups:attribute=value.";
     let rows = vec![
-        ("neither member", json!({"DocumentName": AGENT})),
+        ("neither member", json!({"DocumentName": AGENT}), None),
         (
             "both members empty",
             json!({"DocumentName": AGENT, "InstanceIds": [], "Targets": []}),
+            None,
         ),
         (
             "a key no tool targets by",
             json!({"DocumentName": AGENT, "Targets": [{"Key": "Fleet", "Values": ["web"]}]}),
+            Some(invalid_target_key),
         ),
         (
             "a tag form with no tag key",
             json!({"DocumentName": AGENT, "Targets": [{"Key": "tag:", "Values": ["dev"]}]}),
+            Some(invalid_target_key),
         ),
     ];
 
-    for (case, body) in rows {
+    for (case, body, stated) in rows {
         let before = stored_commands(&engine);
         let (status, refused) = send(&router, &body).await;
         assert_eq!(
@@ -724,6 +734,13 @@ async fn a_send_that_resolves_no_node_at_all_is_refused() {
             (400, "ValidationException"),
             "case {case:?}: expected the send to be refused, got {status} with {refused:?}"
         );
+        if let Some(stated) = stated {
+            assert_eq!(
+                error_message(&refused),
+                stated,
+                "case {case:?}: expected {stated:?}, got {refused:?}"
+            );
+        }
         assert_eq!(
             stored_commands(&engine),
             before,
@@ -764,7 +781,12 @@ async fn a_document_the_region_holds_none_of_or_a_version_it_lacks_is_refused() 
 
     // One row per spelling of the document and per version: a published name, a created
     // name, the created document's ARN, the two version aliases and the one version it
-    // carries, against names and versions neither holds.
+    // carries, against names and versions neither holds. A refused row carries the modelled
+    // error it is refused with and whether that refusal states a MESSAGE beside the code:
+    // a name this endpoint resolves no document for is refused with the code alone (the
+    // recorded refusal of such a send carries no `Message` member — fixture
+    // `ssm-vscan-traj-send-command-validation-order` step `task#2`), while the refusals
+    // about a document that WAS resolved word what was wrong with it.
     let arn = format!(
         "arn:aws:ssm:{REGION}:{}:document/Restart-Agent",
         engine::emulator_account_id()
@@ -782,7 +804,12 @@ async fn a_document_the_region_holds_none_of_or_a_version_it_lacks_is_refused() 
         64,
         "a Sha256 hash is 64 hexadecimal characters, got {hash:?}"
     );
-    let rows: Vec<(&str, Value, Option<&str>)> = vec![
+    /// One row of the table below: the case, the request body, and what the send is
+    /// answered with — the modelled error and whether its refusal states a MESSAGE beside
+    /// the code, or `None` where the send is served.
+    type Resolved = (&'static str, Value, Option<(&'static str, bool)>);
+
+    let rows: Vec<Resolved> = vec![
         (
             "a published document",
             json!({"DocumentName": AGENT, "InstanceIds": [LINUX]}),
@@ -811,7 +838,7 @@ async fn a_document_the_region_holds_none_of_or_a_version_it_lacks_is_refused() 
         (
             "a name neither the account nor the catalogue holds",
             json!({"DocumentName": "No-Such-Document", "InstanceIds": [LINUX]}),
-            Some("InvalidDocument"),
+            Some(("InvalidDocument", false)),
         ),
         (
             "a document ARN of another account",
@@ -819,7 +846,7 @@ async fn a_document_the_region_holds_none_of_or_a_version_it_lacks_is_refused() 
                 "DocumentName": "arn:aws:ssm:us-west-2:999988887777:document/Restart-Agent",
                 "InstanceIds": [LINUX],
             }),
-            Some("InvalidDocument"),
+            Some(("InvalidDocument", false)),
         ),
         (
             "a document ARN of another Region",
@@ -827,7 +854,7 @@ async fn a_document_the_region_holds_none_of_or_a_version_it_lacks_is_refused() 
                 "DocumentName": format!("arn:aws:ssm:eu-west-1:{}:document/Restart-Agent", engine::emulator_account_id()),
                 "InstanceIds": [LINUX],
             }),
-            Some("InvalidDocument"),
+            Some(("InvalidDocument", false)),
         ),
         (
             "an ARN of another service",
@@ -835,12 +862,12 @@ async fn a_document_the_region_holds_none_of_or_a_version_it_lacks_is_refused() 
                 "DocumentName": "arn:aws:lambda:us-west-2:000000000000:function/Restart-Agent",
                 "InstanceIds": [LINUX],
             }),
-            Some("InvalidDocument"),
+            Some(("InvalidDocument", false)),
         ),
         (
             "a version the document doesn't carry",
             json!({"DocumentName": AGENT, "DocumentVersion": "7", "InstanceIds": [LINUX]}),
-            Some("InvalidDocumentVersion"),
+            Some(("InvalidDocumentVersion", true)),
         ),
         (
             "the Sha256 hash of the document's own content",
@@ -865,7 +892,7 @@ async fn a_document_the_region_holds_none_of_or_a_version_it_lacks_is_refused() 
                 "DocumentHashType": "Sha256",
                 "InstanceIds": [LINUX],
             }),
-            Some("InvalidDocument"),
+            Some(("InvalidDocument", true)),
         ),
         (
             "a Sha1 hash, of which this service holds none",
@@ -893,11 +920,19 @@ async fn a_document_the_region_holds_none_of_or_a_version_it_lacks_is_refused() 
                     "case {case:?}: a command reports the document's NAME, got {reported:?}"
                 );
             }
-            Some(code) => assert_eq!(
-                (status, error_code(&parsed).as_str()),
-                (400, code),
-                "case {case:?}: expected {code}, got {status} with {parsed:?}"
-            ),
+            Some((code, states_a_message)) => {
+                assert_eq!(
+                    (status, error_code(&parsed).as_str()),
+                    (400, code),
+                    "case {case:?}: expected {code}, got {status} with {parsed:?}"
+                );
+                assert_eq!(
+                    !parsed["Message"].is_null(),
+                    states_a_message,
+                    "case {case:?}: expected the refusal to state a message: \
+                     {states_a_message}, got {parsed:?}"
+                );
+            }
         }
     }
 }

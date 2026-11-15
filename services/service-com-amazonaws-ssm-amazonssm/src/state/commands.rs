@@ -115,7 +115,7 @@ pub const TARGET_KEY_RESOURCE_GROUP: &str = "ResourceGroup";
 
 /// The target keys a send may name, in the `Target` doc's own order: the node-id forms,
 /// the tag forms ([`super::TAG_FILTER_KEY_PREFIX`] and [`super::TAG_KEY_FILTER_KEY`]) and
-/// the resource-group forms. What a refusal of an unsupported key lists.
+/// the resource-group forms.
 pub fn supported_target_keys() -> Vec<&'static str> {
     vec![
         TARGET_KEY_INSTANCE_IDS,
@@ -126,6 +126,15 @@ pub fn supported_target_keys() -> Vec<&'static str> {
         TARGET_KEY_RESOURCE_GROUP,
     ]
 }
+
+/// How a send refuses a target whose `Key` is none of the forms it selects nodes by: the
+/// sentence names the FORMS a caller may spell rather than the key it was handed, so it is
+/// the same text whatever arrived (recorded behaviour — corpus `simparity-wire-aws-v1`,
+/// fixtures `ssm-ecsm-run-command-on-an-unmanaged-instance-refusals` step `task#4` and
+/// `ssm-vscan-traj-send-command-validation-order`).
+pub const INVALID_TARGET_KEY: &str = "The target key is not valid. You can specify instance \
+                                      IDs, or use tag:name=value, tag-key=value or \
+                                      resource-groups:attribute=value.";
 
 /// One invocation of a command: the copy of it that one managed node holds.
 #[derive(Debug, Clone)]

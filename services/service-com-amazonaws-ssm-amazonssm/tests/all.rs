@@ -47,6 +47,8 @@ mod cloud_connectors;
 mod command_history;
 #[path = "all/command_invocation_listing.rs"]
 mod command_invocation_listing;
+#[path = "all/constraint_set_refusal_wording.rs"]
+mod constraint_set_refusal_wording;
 #[path = "all/default_patch_baselines.rs"]
 mod default_patch_baselines;
 #[path = "all/documents.rs"]

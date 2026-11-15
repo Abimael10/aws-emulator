@@ -51,12 +51,14 @@
 //!   own walk found — the accepted value set of an enumerated type, in the order this
 //!   service lists it, with the value half dropped for the types that state none.
 //! * [`StatedPerOperation`] states the SAME refusal one step earlier, with the REQUEST in
-//!   hand, so the clause stated at a COLLECTION member can quote the collection the caller
-//!   submitted. The framework's walk renders a list as its size (`<n> items`), which is
-//!   not a value any caller sent; `service_common::validation` re-reads the request and
-//!   renders it as the list it was (`[<element>, …]`). Every modelled operation is served
-//!   behind it, because a `@length` on a list is a property of an INPUT SHAPE rather than
-//!   of one operation.
+//!   hand, which is what the two halves of that wording no violation carries need: the
+//!   clause stated at a COLLECTION member quotes the collection the caller submitted — the
+//!   framework's walk renders a list as its size (`<n> items`), which is not a value any
+//!   caller sent, so `service_common::validation` re-reads the request and renders it as the
+//!   list it was (`[<element>, …]`) — and the constraint sets this service states beyond the
+//!   ones this checkout's model declares are applied to the values the request carried.
+//!   Every modelled operation is served behind it, because a constraint is a property of an
+//!   INPUT SHAPE rather than of one operation.
 //!
 //! Both paths go through [`refusal::stated_refusal`], so the same request cannot be
 //! answered with different words depending on which of them caught it.
@@ -287,10 +289,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 ///
 /// Nothing else is re-implemented. A request this wrapper does not refuse is handed to the
 /// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
-/// serialize, telemetry and every modelled error. The violations come from the framework's
-/// own machinery ([`stated_refusal`]), so this can neither refuse a request the framework's
-/// walk would accept nor accept one it would refuse. The cost is that a request it does not
-/// refuse is read twice, once here and once in the operation's own sequence, because the
+/// serialize, telemetry and every modelled error. Every MODELLED constraint comes from the
+/// framework's own machinery ([`stated_refusal`]), so this wrapper accepts no request that
+/// walk would refuse; what it adds is the constraints the live service enforces that this
+/// checkout's model does not declare (`refusal::stated_constraints`), which it refuses here
+/// because no layer below it knows them. The cost is that a request it does not refuse is
+/// read twice, once here and once in the operation's own sequence, because the
 /// framework hands no already-built input to an operation; the structurally right place for
 /// the collecting half is the frozen crate, which `services/common/src/validation.rs`
 /// records as the core seam this re-read exists only until (its header names the filed gap:
@@ -306,8 +310,8 @@ impl<O> StatedPerOperation<O> {
     }
 }
 
-/// How this service states every modelled constraint `req` breaks, for the operation `O`:
-/// the violations the framework's own walk found, and the refusal [`refusal`] words them as.
+/// How this service states every constraint `req` breaks, for the operation `O`: the
+/// violations the framework's own walk found, and the refusal [`refusal`] words them as.
 /// `None` when the request breaks none — and for a failure that is NOT a refusal (a body the
 /// codec cannot read at all, a member of the wrong type), which the framework's own walk
 /// answers in its own envelope.
@@ -317,9 +321,12 @@ impl<O> StatedPerOperation<O> {
 /// yields the framework's own violations (the protocol's deserializer for an absent
 /// `@required` member, `constraints::validate` over the built input), each paired with how a
 /// clause can state the value it is about — which for a COLLECTION member is the collection
-/// itself, the one thing a violation does not carry. Nothing is re-checked here and no
-/// second copy of that walk lives in this crate: both halves are bounded where those bounds
-/// are stated.
+/// itself, the one thing a violation does not carry. The request is read once more for what
+/// no violation carries at all ([`refusal::submitted_request`]): the values the request
+/// submitted, which the constraint sets this service states beyond the model's are applied
+/// to, and the collections a clause grouped at a collection member quotes. Nothing is
+/// re-checked by hand here and no second copy of the framework's walk lives in this crate:
+/// every half is bounded where those bounds are stated.
 fn stated_refusal<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
@@ -330,7 +337,9 @@ fn stated_refusal<O: Operation>(
         .iter()
         .map(|(violation, _)| violation.clone())
         .collect();
-    let stated = refusal::validation_refusal_quoting_collections(O::NAME, refused)?;
+    let submitted = refusal::submitted_request::<O>(protocol, req);
+    let stated =
+        refusal::validation_refusal_quoting_collections(O::NAME, refused, &submitted)?;
     Some((violations, stated))
 }
 

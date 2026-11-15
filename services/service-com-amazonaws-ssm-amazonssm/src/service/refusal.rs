@@ -10,7 +10,9 @@
 //! the member paths, the requirement clauses and the value each clause quotes are rendered
 //! by `aws_smithy_schema_server`, the one writer of that sentence. Four things about a
 //! refusal of this service are NOT the framework's, and are stated here as rules over every
-//! operation rather than as cases keyed on one recorded request:
+//! operation rather than as cases keyed on one recorded request (three more, about WHICH
+//! constraints a clause is stated over and HOW a `@pattern` is quoted, are
+//! [`stated_constraints`]'s):
 //!
 //! 1. THE ORDER an enumerated type's value set is listed in. A refusal of a value outside
 //!    an enumerated type names the values that type admits, and this service lists them in
@@ -48,10 +50,11 @@
 //!
 //! 4. WHICH CONSTRAINTS of a member a refusal states, and WHICH EXPRESSION a
 //!    regular-expression clause names. A clause names the expression the live service
-//!    validates with, which for an already-anchored alternation is the alternation without
-//!    the outer anchors the model wraps it in ([`without_redundant_anchors`]), and a value
-//!    outside SEVERAL constraints of one member is stated against each of them
-//!    ([`as_stated_clauses`]) rather than against the first.
+//!    PUBLISHES for the member's shape, and a value outside SEVERAL constraints of one member
+//!    is stated against each of them rather than against the first — including the
+//!    constraints the live service enforces that this checkout's model does not declare.
+//!    Both halves are [`stated_constraints`]'s, whose header states them in full, so one
+//!    reading of an anchor and one statement of a shape's constraint set serve every clause.
 //!
 //! The fifth difference is not a wording rule but a reading one: the value a clause
 //! stated at a COLLECTION member quotes is the collection the caller submitted, which no
@@ -63,23 +66,29 @@
 //! `service_common::validation_message::quoting_the_submitted_collection` is the one
 //! statement of the restoring rule. Nothing else about a clause is restored: a value the
 //! framework WITHHELD stays withheld, whatever the echo holds.
+//!
+//! The same reading of the request answers the other two things no violation carries: the
+//! VALUES the request submitted, which rule 4's constraint sets are applied to
+//! ([`stated_constraints::restating_the_stated_sets`]), and the COLLECTION a clause grouped
+//! at a collection member quotes ([`Submitted`], collected once per refused request). The
+//! refusal path that has no modelled operation to read the request against states the same
+//! sets over the value each violation itself carries.
 
-use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
-use crate::state::{
-    MANAGED_NODE_ID_MAX_LENGTH, MANAGED_NODE_ID_MIN_LENGTH, MANAGED_NODE_ID_PATTERN,
-};
+mod stated_constraints;
+
+use std::collections::HashMap;
+
+use ::aws_smithy_runtime_api::http::Request as RtRequest;
+use ::aws_smithy_schema::Schema;
+use ::aws_smithy_schema_server::constraints::Violation;
 use ::service_common::validation::SubmittedEcho;
 use ::service_common::validation_message::{
-    in_hashed_enum_order, in_stated_enum_order, quoting_the_submitted_collection,
-    StatedEnumValueSets,
+    aws_validation_refusal_over_elements_stating, in_hashed_enum_order, in_stated_enum_order,
+    quoting_the_submitted_collection, StatedEnumValueSets,
 };
-use ::smithy_server_runtime::{Refusal, Refused};
-
-/// The wire error code (`__type` / `x-amzn-errortype`) of this service's boundary refusal:
-/// `ValidationException`, 400, which is also the code the framework's own default picks for
-/// a broken modelled constraint — so a client branches on one code whichever layer refused
-/// it.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
+use ::smithy_server_runtime::{
+    DeserializableStruct, Operation, Refusal, Refused, ServerHttpProtocol,
+};
 
 /// `com.amazonaws.ssm#CloudConnectorFilterKey` as this checkout's model declares it
 /// (`smithy_query(query="shape",shape="CloudConnectorFilterKey")`), which is the set a
@@ -238,7 +247,7 @@ const ACCEPTED_VALUE_SETS: &StatedEnumValueSets<'static> = &[
 /// requirement it broke, and nothing of what the caller sent.
 ///
 /// Recorded behaviour of this service, and recorded for every member and every constraint
-/// class of these two:
+/// class of these four:
 ///
 /// * `DescribeSessions` — fixture
 ///   `ssm-sshp-traj-session-manager-ssh-document-and-state-mistakes`, step `task#3` (a
@@ -248,6 +257,16 @@ const ACCEPTED_VALUE_SETS: &StatedEnumValueSets<'static> = &[
 ///   step `task#1` (an `Operator` outside its enumerated type, stated
 ///   `Value at 'filtersWithOperator.1.member.operator' …`) and step `task#6` (a
 ///   `MaxResults` above its `@range` maximum, stated `Value at 'maxResults' …`).
+/// * `StartExecutionPreview` — fixtures `ssm-execution-preview-automation-workflow`, step
+///   `task#4`, and `ssm-execution-preview-invalid-document-error`, step `task#1` (a
+///   `DocumentVersion` outside its expression AND over the length the service holds one to,
+///   and a `DocumentName` outside the expression the service publishes for it), each clause
+///   stated `Value at '<member>' …`.
+/// * `ListOpsItemEvents` — fixtures `ssm-opsitem-read-apis-on-unknown-id`, step `task#3` (an
+///   `Operator` outside `OpsItemEventFilterOperator`, stated
+///   `Value at 'filters.1.member.operator' …`) and `ssm-ops-item-events-error-paths`, step
+///   `task#1` (a filter VALUE outside what an OpsItem id may be, stated at the values member
+///   with no value either).
 ///
 /// So the decision belongs to the OPERATION rather than to one member, one list position
 /// or one constraint class — and every OTHER operation quotes the value the framework
@@ -255,110 +274,33 @@ const ACCEPTED_VALUE_SETS: &StatedEnumValueSets<'static> = &[
 /// by `GetInventory` (fixture `ssm-w22n-traj-inventory-filter-mistakes`), and the keys
 /// `ListCloudConnectors`, `ListCommandInvocations` and `DescribeOpsItems` refuse are quoted
 /// too.
-const VALUELESS_OPERATIONS: &[&str] = &["DescribeSessions", "DescribeInstanceProperties"];
+const VALUELESS_OPERATIONS: &[&str] = &[
+    "DescribeSessions",
+    "DescribeInstanceProperties",
+    "StartExecutionPreview",
+    "ListOpsItemEvents",
+];
 
 /// Whether the clauses of a refusal of `operation` state no value: it is one of
 /// [`VALUELESS_OPERATIONS`]. `None` — a refusal that named no modelled operation at all —
-/// quotes the value, which is what every operation but those two does.
+/// quotes the value, which is what every operation but those does.
 fn states_no_value(operation: Option<&str>) -> bool {
     operation.is_some_and(|operation| VALUELESS_OPERATIONS.contains(&operation))
 }
 
-/// The regular expression a refusal of this service states for a member whose modelled
-/// `@pattern` is an ALREADY ANCHORED alternation wrapped in a second pair of anchors.
-///
-/// A refusal states the expression the live service validates with, and this model wraps that
-/// expression in `^…$` whether or not it is anchored already: the managed-node id pattern is
-/// checked in as `^(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)$`, two self-anchored branches inside a
-/// redundant outer pair, and a refusal of it names the alternation itself — the expression
-/// `crate::state::MANAGED_NODE_ID_PATTERN` reports for a node id read out of a FILTER, so one
-/// caller is told one expression wherever the id travelled.
-///
-/// Both halves of that reading are the shared ones, called rather than restated: dropping the
-/// model's whole-value pair is `service_common::validation::unanchored`, and whether what is
-/// left pins the ends of each of its own branches — the discriminator that makes the dropped
-/// pair redundant — is `service_common::validation::anchors_its_own_ends`. This states which
-/// of that module's renderings this service's dialect is: the drop happens exactly where the
-/// branches anchor themselves, which is the one case the outer pair adds nothing to, and
-/// every other pattern is stated as the model writes it.
-///
-/// `None` when there is nothing redundant to drop, which keeps the framework's own rendering.
-fn without_redundant_anchors(pattern: &str) -> Option<String> {
-    let inner = ::service_common::validation::unanchored(pattern);
-    (inner != pattern && ::service_common::validation::anchors_its_own_ends(&inner))
-        .then_some(inner)
-}
-
-/// Whether `violation` is a value that is not a managed-node id: it broke the `@pattern` of
-/// this service's `InstanceId` shape ([`without_redundant_anchors`],
-/// `crate::state::MANAGED_NODE_ID_PATTERN`) at a scalar member, rather than inside a
-/// collection — a clause stated at a collection member aggregates its element's constraints
-/// instead of stating one of them.
-fn is_not_a_managed_node_id(violation: &Violation) -> bool {
-    if violation.path.contains('.') {
-        return false;
-    }
-    match &violation.kind {
-        ViolationKind::Pattern(pattern) => {
-            without_redundant_anchors(pattern).as_deref() == Some(MANAGED_NODE_ID_PATTERN)
-        }
-        _ => false,
-    }
-}
-
-/// The clauses a refusal states for one violation: usually the one it is, and for a value
-/// that is not a managed-node id, one clause per constraint of that shape the value is
-/// outside of.
-///
-/// The `InstanceId` shape carries a LENGTH beside its pattern in the live service — at least
-/// [`MANAGED_NODE_ID_MIN_LENGTH`] and at most [`MANAGED_NODE_ID_MAX_LENGTH`] characters — and
-/// a refusal states every constraint of a member the value broke rather than the first of
-/// them, in the order the service lists that shape's constraints: the maximum length, the
-/// minimum length, then the pattern. A value whose length a response does not carry (a member
-/// whose value is withheld) is stated against the pattern alone, because the length clauses
-/// are about a value this refusal does not have.
-fn as_stated_clauses(violation: Violation) -> Vec<Violation> {
-    if !is_not_a_managed_node_id(&violation) {
-        return vec![violation];
-    }
-    let length = violation
-        .value
-        .as_deref()
-        .map(|value| i64::try_from(value.chars().count()).unwrap_or(i64::MAX));
-    let mut clauses = Vec::new();
-    let mut broken = |kind: ViolationKind| {
-        clauses.push(Violation {
-            kind,
-            ..violation.clone()
-        });
-    };
-    if length.is_some_and(|length| length > MANAGED_NODE_ID_MAX_LENGTH) {
-        broken(ViolationKind::MaxLength(MANAGED_NODE_ID_MAX_LENGTH));
-    }
-    if length.is_some_and(|length| length < MANAGED_NODE_ID_MIN_LENGTH) {
-        broken(ViolationKind::MinLength(MANAGED_NODE_ID_MIN_LENGTH));
-    }
-    clauses.push(violation);
-    clauses
-}
-
 /// `violation` as this service states it: the accepted value set in place of the declared
-/// one (rule 2), listed in this service's order (rule 1), a regular expression as the service
-/// validates with it ([`without_redundant_anchors`]), and the value half dropped where the
-/// operation states none (rule 3).
+/// one (rule 2), listed in this service's order (rule 1), with the value half dropped where
+/// the operation states none (rule 3).
 ///
 /// The CLAUSE is still the framework's — only what goes into it moves — so the member path,
 /// the requirement's wording and the punctuation around them keep coming from the one place
 /// that writes them. A valueless clause is the framework's own rendering of a violation
-/// whose value a response does not carry, rather than a second sentence spelled here.
+/// whose value a response does not carry, rather than a second sentence spelled here. The
+/// EXPRESSION a `@pattern` clause names is rule 4's and is applied by the renderer
+/// ([`stated_constraints::quoted_pattern`]), so one reading of an anchor serves every clause.
 fn stated(violation: &Violation, valueless: bool) -> Violation {
     let accepted = in_stated_enum_order(violation, ACCEPTED_VALUE_SETS);
-    let mut listed = in_hashed_enum_order(&accepted);
-    if let ViolationKind::Pattern(pattern) = &listed.kind {
-        if let Some(stated) = without_redundant_anchors(pattern) {
-            listed.kind = ViolationKind::Pattern(stated);
-        }
-    }
+    let listed = in_hashed_enum_order(&accepted);
     if valueless {
         return Violation {
             value: None,
@@ -369,43 +311,119 @@ fn stated(violation: &Violation, valueless: bool) -> Violation {
     listed
 }
 
-/// How this service states a set of broken modelled constraints: its `ValidationException`,
-/// carrying the framework's envelope over the clauses of the violations as this service
-/// states their contents. `operation` is the modelled operation the request named, or
-/// `None` when it named none.
+/// What the REQUEST itself answers about a refusal of it — the two things no violation
+/// carries — collected once for the request being refused.
+///
+/// Empty for a request no codec can read, which is a failure the framework's own walk words:
+/// nothing of this service's wording rests on a body it could not open.
+#[derive(Debug, Default)]
+pub(super) struct Submitted {
+    /// Every list of SCALAR elements the request carried, rendered the way a clause quotes a
+    /// collection (`[<element>, …]`), keyed by the member path the validating walk reports
+    /// that list at.
+    lists: HashMap<String, String>,
+    /// How a clause states the value of every member position the request filled, by the
+    /// member path the validating walk reports that position at — the values the constraint
+    /// sets this service states are applied to.
+    ///
+    /// The RENDERINGS rather than the submitted bytes, because a number is a value a clause
+    /// states and not bytes a caller sent (the leaf walk records none for one), and a
+    /// `@range` is a constraint the service states its own bound for.
+    values: Vec<(String, String)>,
+    /// The operation's own input schema, which the element constraint set of a collection
+    /// this service states no set of its own for is read off.
+    schema: Option<&'static Schema>,
+}
+
+/// Read `req` as the operation `O`'s input and collect [`Submitted`] from it.
+///
+/// The one shared collecting walk does both halves
+/// (`service_common::validation::submitted_renderings` / `submitted_lists`), so a member path
+/// spelled here is spelled the way the framework's constraint walk spells it and nothing of
+/// that bookkeeping is mirrored in this crate. Both are bounded where those bounds are
+/// stated: past them a value is simply not offered, and the framework's own clause stands.
+pub(super) fn submitted_request<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Submitted {
+    let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
+        return Submitted::default();
+    };
+    let read = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer);
+    drop(deserializer);
+    let Ok(input) = read else {
+        return Submitted::default();
+    };
+    Submitted {
+        lists: ::service_common::validation::submitted_lists(&input, O::INPUT_SCHEMA),
+        values: ::service_common::validation::submitted_renderings(&input, O::INPUT_SCHEMA)
+            .into_iter()
+            .filter_map(|(path, rendering)| rendering.map(|rendering| (path, rendering)))
+            .collect(),
+        schema: Some(O::INPUT_SCHEMA),
+    }
+}
+
+/// How this service states a set of broken constraints: its `ValidationException` (400, the
+/// code the framework's own default picks for a broken constraint too, so a client branches
+/// on one code whichever layer refused it), carrying AWS's envelope over the clauses of the
+/// violations as this service states their contents. `operation` is the modelled operation
+/// the request named, or `None` when it named none.
+///
+/// The envelope, the clauses and the grouping of a constraint broken by a collection's
+/// elements are the shared statement of AWS's own wording
+/// (`service_common::validation_message`), which this service chooses three things in: how a
+/// `@pattern` is quoted, the element set a grouped clause nests, and whether that clause
+/// quotes the collection ([`stated_constraints`]).
 ///
 /// `None` when there is nothing to state, which keeps the framework's own wording rather
 /// than answering with an empty message.
 pub(super) fn validation_refusal(
     operation: Option<&str>,
     violations: &[Violation],
+    submitted: &Submitted,
 ) -> Option<Refused> {
     let valueless = states_no_value(operation);
-    let stated: Vec<Violation> = violations
+    // The member whose whole stated set a clause names is restated FIRST, so what follows
+    // states the contents of each clause of that set exactly as it states any other.
+    let restated = stated_constraints::restating_the_stated_sets(
+        operation,
+        violations.to_vec(),
+        &submitted.values,
+        submitted.schema,
+    );
+    let stated: Vec<Violation> = restated
         .iter()
-        .cloned()
-        .flat_map(as_stated_clauses)
-        .map(|violation| stated(&violation, valueless))
+        .map(|violation| stated(violation, valueless))
         .collect();
-    Some(Refused {
-        code: VALIDATION_EXCEPTION.to_string(),
-        message: ::aws_smithy_schema_server::envelope(&stated)?,
-    })
+    aws_validation_refusal_over_elements_stating(
+        &Refusal::Invalid(stated),
+        stated_constraints::quoted_pattern,
+        |collection| {
+            if valueless {
+                return None;
+            }
+            submitted.lists.get(collection).cloned()
+        },
+        |collection| stated_constraints::element_requirement(operation, collection, submitted.schema),
+    )
 }
 
-/// How this service states a set of broken modelled constraints, for a caller holding the
-/// ECHO of each refused value beside the violation: the clause stated at a COLLECTION
-/// member quotes the collection the caller submitted, where the framework's walk stored its
-/// own summary of one, and every other clause is exactly [`validation_refusal`]'s.
+/// How this service states a set of broken constraints with the REQUEST in hand: the clause
+/// stated at a COLLECTION member quotes the collection the caller submitted, where the
+/// framework's walk stored its own summary of one, and every other clause is exactly
+/// [`validation_refusal`]'s — which that entry point also states the whole constraint set of
+/// a member over, from the values this request carried.
 pub(super) fn validation_refusal_quoting_collections(
     operation: &str,
     refused: Vec<(Violation, SubmittedEcho)>,
+    submitted: &Submitted,
 ) -> Option<Refused> {
     let quoting: Vec<Violation> = refused
         .into_iter()
         .map(|(violation, echo)| quoting_the_submitted_collection(violation, echo))
         .collect();
-    validation_refusal(Some(operation), &quoting)
+    validation_refusal(Some(operation), &quoting, submitted)
 }
 
 /// How this service states one framework-level [`Refusal`], or `None` to keep the
@@ -422,7 +440,9 @@ pub(super) fn validation_refusal_quoting_collections(
 /// words that denial differently.
 pub(super) fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
     match refusal {
-        Refusal::Invalid(violations) => validation_refusal(None, violations),
+        Refusal::Invalid(violations) => {
+            validation_refusal(None, violations, &Submitted::default())
+        }
         _ => None,
     }
 }
@@ -435,6 +455,7 @@ mod tests {
 
     use super::*;
     use ::aws_smithy_schema_server::constraints::ViolationKind;
+    use crate::state::MANAGED_NODE_ID_PATTERN;
 
     /// `com.amazonaws.ssm#SessionState`
     /// (`smithy_query(query="shape",shape="SessionState")`), written out here rather than
@@ -485,7 +506,7 @@ mod tests {
     /// The message of the refusal `violations` are stated as, for a request that named
     /// `operation`.
     fn message_for(operation: Option<&str>, violations: &[Violation]) -> String {
-        validation_refusal(operation, violations)
+        validation_refusal(operation, violations, &Submitted::default())
             .expect("violations to state are stated")
             .message
     }
@@ -653,29 +674,36 @@ mod tests {
 
     /// Every other violation keeps the framework's clause whole — including the value a
     /// clause stated at a COLLECTION member quotes, which is the collection the caller
-    /// submitted.
+    /// submitted — with the one exception the rules above own: the expression a `@pattern`
+    /// requirement quotes is the one this service publishes.
     #[test]
     fn every_other_violation_keeps_the_frameworks_clause() {
-        let cases: &[(&str, Violation)] = &[
+        // (case, the violation the walk reported, the clause it is stated as)
+        let cases: &[(&str, Violation, &str)] = &[
             (
                 "a list over its length maximum, quoting the list",
-                violation(
-                    "names",
-                    ViolationKind::MaxLength(10),
-                    Some("[/a, /b, /c]"),
-                ),
+                violation("names", ViolationKind::MaxLength(10), Some("[/a, /b, /c]")),
+                "Value '[/a, /b, /c]' at 'names' failed to satisfy constraint: Member must \
+                 have length less than or equal to 10",
             ),
             (
                 "an absent required member",
                 violation("name", ViolationKind::MissingRequiredMember, None),
+                "Value null at 'name' failed to satisfy constraint: Member must not be null",
             ),
             (
+                // The clause's requirement is the expression this service PUBLISHES, which
+                // is the model's text without the whole-value pair it wraps one in
+                // ([`stated_constraints::quoted_pattern`]); everything else about the clause
+                // is the framework's.
                 "a value outside a pattern",
                 violation(
-                    "instanceId",
-                    ViolationKind::Pattern("^i-\\w{8}$".to_string()),
-                    Some("not a node"),
+                    "documentName",
+                    ViolationKind::Pattern("^[a-zA-Z0-9_\\-.]{3,128}$".to_string()),
+                    Some("no"),
                 ),
+                "Value 'no' at 'documentName' failed to satisfy constraint: Member must \
+                 satisfy regular expression pattern: [a-zA-Z0-9_\\-.]{3,128}",
             ),
             (
                 "a number over its range maximum",
@@ -684,11 +712,13 @@ mod tests {
                     ViolationKind::MaxValue("50".to_string()),
                     Some("51"),
                 ),
+                "Value '51' at 'maxResults' failed to satisfy constraint: Member must have \
+                 value less than or equal to 50",
             ),
         ];
-        for (case, broken) in cases {
+        for (case, broken, clause) in cases {
             let stated = message(std::slice::from_ref(broken));
-            let expected = format!("1 validation error detected: {}", broken.message());
+            let expected = format!("1 validation error detected: {clause}");
             assert_eq!(
                 stated, expected,
                 "case {case:?}: expected {expected:?}, got {stated:?}"
@@ -717,48 +747,72 @@ mod tests {
         );
     }
 
-    /// RULE 4, the expression half: a clause names the expression the service validates with,
-    /// which for an alternation whose branches anchor themselves is that alternation without
-    /// the outer anchors the model wraps it in — and every other pattern is the model's own.
+    /// RULE 4, the expression half: a clause names the expression the service PUBLISHES for
+    /// the member's shape, which is the model's text without the whole-value pair the model
+    /// wraps that expression in — and the model's own text for the shapes this service
+    /// publishes as declared.
+    ///
+    /// The rows are the expressions of real members of this model, with the rendering each
+    /// recorded refusal of one shows: the drop is recorded for the UUID of an inventory
+    /// deletion (fixture `ssm-describe-inventory-deletions-listing-and-lookup`), the
+    /// OpsMetadata ARN (`ssm-ops-metadata-error-paths`), a document version
+    /// (`ssm-execution-preview-automation-workflow`) and the managed-node alternation
+    /// (`ssm-vscan-traj-inventory-entries-type-and-id-mistakes`), and the model's own text is
+    /// recorded for the inventory type name (same fixture, step `task#4`) and for the
+    /// document name the execution preview publishes
+    /// (`ssm-execution-preview-invalid-document-error`).
     #[test]
     fn a_pattern_clause_names_the_expression_the_service_validates_with() {
-        // (case, the modelled pattern a violation carries, the expression the clause names)
-        let cases: &[(&str, &str, &str)] = &[
+        // (case, the modelled pattern a violation carries, the value it refused, the
+        // expression the clause names). Each value is one the member's whole stated set has
+        // nothing else to say about, so each row states the one clause this rule is about.
+        let cases: &[(&str, &str, &str, &str)] = &[
             (
                 "the managed-node id alternation, anchored twice",
                 r"^(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)$",
+                "not-a-node-id",
                 MANAGED_NODE_ID_PATTERN,
             ),
             (
-                "a single branch whose anchors ARE the outer pair",
-                r"^i-\w{8}$",
-                r"^i-\w{8}$",
+                "a UUID, whose pair the model wrote around it",
+                "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                "not-a-deletion-id",
+                "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
             ),
             (
-                "an unanchored expression",
+                "an OpsMetadata ARN",
+                r"^arn:(aws[a-zA-Z-]*)?:ssm:[a-z0-9-\.]{0,63}:[a-z0-9-\.]{0,63}:opsmetadata\/([a-zA-Z0-9-_\.\/]*)$",
+                "not-an-arn",
+                r"arn:(aws[a-zA-Z-]*)?:ssm:[a-z0-9-\.]{0,63}:[a-z0-9-\.]{0,63}:opsmetadata\/([a-zA-Z0-9-_\.\/]*)",
+            ),
+            (
+                "a document version, anchored inside its own alternation",
+                r"^([$]LATEST|[$]DEFAULT|^[1-9][0-9]*$)$",
+                "nope",
+                r"([$]LATEST|[$]DEFAULT|^[1-9][0-9]*$)",
+            ),
+            (
+                "an unanchored expression, which has no pair to drop",
                 r"[a-f0-9]{8}",
+                "not-hexadecimal",
                 r"[a-f0-9]{8}",
             ),
             (
-                "an anchored group that is not an alternation of anchored branches",
-                r"^(arn:aws:ssm:.*)$",
-                r"^(arn:aws:ssm:.*)$",
-            ),
-            (
-                "an alternation one of whose branches does not anchor itself",
-                r"^(^a$)|(b$)$",
-                r"^(^a$)|(b$)$",
+                "an inventory type name, which this service publishes as declared",
+                "^(AWS|Custom):.*$",
+                "Application",
+                "^(AWS|Custom):.*$",
             ),
         ];
-        for (case, modelled, expected) in cases {
+        for (case, modelled, value, expected) in cases {
             let broken = violation(
                 "documentVersion",
                 ViolationKind::Pattern((*modelled).to_string()),
-                Some("not-a-version"),
+                Some(value),
             );
             let stated = message(std::slice::from_ref(&broken));
             let expected = format!(
-                "1 validation error detected: Value 'not-a-version' at 'documentVersion' failed \
+                "1 validation error detected: Value '{value}' at 'documentVersion' failed \
                  to satisfy constraint: Member must satisfy regular expression pattern: \
                  {expected}"
             );
@@ -840,7 +894,7 @@ mod tests {
     #[test]
     fn no_violations_state_no_refusal() {
         assert!(
-            validation_refusal(None, &[]).is_none(),
+            validation_refusal(None, &[], &Submitted::default()).is_none(),
             "case no violations: expected no refusal to be worded"
         );
         assert!(

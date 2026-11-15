@@ -359,10 +359,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A name no document of this endpoint resolves is refused with the error code alone.
+        // The recorded refusal of such a send carries NO `Message` member at all (corpus
+        // `simparity-wire-aws-v1`, fixture `ssm-vscan-traj-send-command-validation-order`
+        // step `task#2`, whose replay the code-alone refusal is what makes pass), unlike the
+        // refusals this operation words below about a document it DID resolve — a version it
+        // lacks, a hash its content does not produce — each of which names what was wrong.
         let invalid_document = || {
-            SendCommandErrorModeled::InvalidDocument(InvalidDocument {
-                message: Some(format!("Document {} doesn't exist", input.document_name)),
-            })
+            SendCommandErrorModeled::InvalidDocument(InvalidDocument { message: None })
         };
         // "This can be a public document or a custom document. To run a shared document
         // belonging to another account, specify the document Amazon Resource Name (ARN)"
@@ -492,12 +496,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut described: Option<Vec<String>> = None;
         for target in &targets {
             let selected = crate::state::commands::nodes_matching_target(&store, &region, target)
-                .map_err(|key| {
-                    crate::scaffolded::Scaffolded::validation(format!(
-                        "Target key '{key}' isn't one of the target keys a command selects \
-                         managed nodes by: {}",
-                        crate::state::commands::supported_target_keys().join(", ")
-                    ))
+                .map_err(|_| {
+                    crate::scaffolded::Scaffolded::validation(
+                        crate::state::commands::INVALID_TARGET_KEY,
+                    )
                 })?;
             let selected: Vec<String> = selected.into_iter().map(str::to_string).collect();
             described = Some(match described {

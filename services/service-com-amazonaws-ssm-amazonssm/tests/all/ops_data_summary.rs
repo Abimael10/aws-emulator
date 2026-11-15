@@ -1014,7 +1014,9 @@ async fn a_value_violating_two_modelled_constraints_states_both_clauses() {
     // `OpsAggregatorType` is `len 1..20, pattern ^(range|count|sum)$`
     // (`smithy_query(query="shape", shape="OpsAggregatorType")`), so a longer value that is
     // also outside the pattern violates BOTH, and the refusal states one clause per
-    // violation under the envelope that counts them.
+    // violation under the envelope that counts them. The clause quotes the expression the
+    // service PUBLISHES for the shape — the model's text without the whole-value pair it
+    // wraps a published expression in (`crate::service::refusal`).
     let value = "not-a-real-aggregator-type";
     let (status, parsed) = call(
         &router,
@@ -1042,7 +1044,7 @@ async fn a_value_violating_two_modelled_constraints_states_both_clauses() {
             "2 validation errors detected: Value '{value}' at '{path}' failed to satisfy \
              constraint: Member must have length less than or equal to 20; Value '{value}' at \
              '{path}' failed to satisfy constraint: Member must satisfy regular expression \
-             pattern: ^(range|count|sum)$"
+             pattern: (range|count|sum)"
         ),
         "both violated constraints are stated, got {parsed}"
     );
