@@ -33,11 +33,11 @@ use service_com_amazonaws_athena_amazonathena::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The bucket every query in these suites writes its results into.
-const BUCKET: &str = "athena-saved-results";
+pub(crate) const BUCKET: &str = "athena-saved-results";
 
 /// A second bucket, named by a request whose workgroup overrides it: nothing may be written
 /// there.
-const DECOY_BUCKET: &str = "athena-decoy-results";
+pub(crate) const DECOY_BUCKET: &str = "athena-decoy-results";
 
 /// How long past [`QUERY_EXECUTION_COMPLETION`] a test waits for a started query to be
 /// readable in its terminal state.
@@ -58,7 +58,7 @@ fn authorization(service: &str) -> String {
 
 /// Athena and Amazon S3 mounted on ONE shared engine, the way the router mounts every
 /// service: the object store Athena saves results into is the one S3's own operations read.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -96,6 +96,17 @@ async fn athena(router: &MultiServiceRouter, operation: &str, body: &Value) -> (
 /// One path-style request to the emulator's Amazon S3 front door, and its status and body
 /// as text.
 async fn s3(router: &MultiServiceRouter, method: &str, path: &str) -> (u16, String) {
+    let (status, _, body) = s3_served(router, method, path).await;
+    (status, body)
+}
+
+/// The same request, answering the `Content-Type` the object store SERVED the body with as
+/// well — what a reader of a saved results object is told its bytes are.
+pub(crate) async fn s3_served(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+) -> (u16, Option<String>, String) {
     let request = http::Request::builder()
         .method(method)
         .uri(path)
@@ -104,14 +115,20 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str) -> (u16, Stri
         .body(bytes::Bytes::new())
         .expect("a well-formed request");
     let response = router.dispatch(request).await;
+    let media_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     (
         response.status().as_u16(),
+        media_type,
         String::from_utf8_lossy(response.body()).to_string(),
     )
 }
 
 /// `PUT /<bucket>` — `CreateBucket` — so a query's results have somewhere to land.
-async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
+pub(crate) async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
     let (status, body) = s3(router, "PUT", &format!("/{bucket}")).await;
     assert!(
         (200..300).contains(&status),
@@ -120,7 +137,11 @@ async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
 }
 
 /// The keys `ListObjectsV2` lists under `prefix`, in the order the listing reports them.
-async fn listed_keys(router: &MultiServiceRouter, bucket: &str, prefix: &str) -> Vec<String> {
+pub(crate) async fn listed_keys(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    prefix: &str,
+) -> Vec<String> {
     let (status, body) = s3(
         router,
         "GET",
@@ -144,7 +165,7 @@ async fn object(router: &MultiServiceRouter, bucket: &str, key: &str) -> (u16, S
 }
 
 /// Start one query and return the `QueryExecutionId` it minted.
-async fn start(router: &MultiServiceRouter, case: &str, request: &Value) -> String {
+pub(crate) async fn start(router: &MultiServiceRouter, case: &str, request: &Value) -> String {
     let (status, answer) = athena(router, "StartQueryExecution", request).await;
     assert_eq!(
         status, 200,
@@ -165,7 +186,7 @@ async fn start(router: &MultiServiceRouter, case: &str, request: &Value) -> Stri
 /// POLLED rather than slept through: the suites start every row's query before reading any
 /// of them back, so the span a completion is owed after elapses once for the whole table
 /// instead of once per row.
-async fn succeeded(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
+pub(crate) async fn succeeded(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
     let attempts = ((QUERY_EXECUTION_COMPLETION + SETTLE_GRACE).as_millis()
         / POLL_INTERVAL.as_millis())
         + 20;
@@ -193,7 +214,11 @@ async fn succeeded(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
 }
 
 /// Create the workgroup `name` with `configuration`.
-async fn create_work_group(router: &MultiServiceRouter, name: &str, configuration: Value) {
+pub(crate) async fn create_work_group(
+    router: &MultiServiceRouter,
+    name: &str,
+    configuration: Value,
+) {
     let (status, created) = athena(
         router,
         "CreateWorkGroup",

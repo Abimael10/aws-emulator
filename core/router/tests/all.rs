@@ -1999,3 +1999,12 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
 // declaration into `tests/all/`.
+// suite file, sorted by name, and no other line, so two branches landing at once insert two
+// lines in two places and have no prose to duplicate, re-word or mistype. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair in the one place its name sorts to.
+// re-typed copies of this header that successive landings appended had done. With no `//!` in
+// the file at all, no merge of two landings can leave one past the first item.
+// SIBLING of this file, which the layout check refuses: the `#[path]` is what points each
+// explains; a note about THIS file belongs in `all/appended_notes.rs`, declared below like any
+// other suite. `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` and

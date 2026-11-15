@@ -65,6 +65,9 @@ mod query_execution_lifecycle;
 #[path = "all/query_failure_classification.rs"]
 mod query_failure_classification;
 
+#[path = "all/query_result_object_fetch.rs"]
+mod query_result_object_fetch;
+
 #[path = "all/query_result_objects.rs"]
 mod query_result_objects;
 
