@@ -1319,3 +1319,20 @@ mod zz_probe_whole_emulator;
 // service crate's `tests/all.rs`, so check there rather than leaving a note here. Some of
 // the files below are shared harnesses or probes rather than suites; all are declared,
 // because a file no declaration names is compiled nowhere.
+// Single integration-test target for the router: the declaration list of its cross-service
+// suites, and nothing else.
+// One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under `tests/all/`,
+// sorted by name, and NO other line. Put a new suite at `tests/all/<name>.rs` and insert its
+// pair into the sorted list below — so two branches landing at once insert two lines in two
+// places and have no prose to duplicate, re-word or mistype. What a suite covers, and why it
+// drives the assembled router rather than one service crate, belongs in that suite's OWN
+// module doc, where it is read beside the test it explains.
+// deliberate: an inner doc comment (`//!`) is legal only before the first item, so one left
+// past the list is `E0753` and compiles no suite of this target at all. With none anywhere in
+// the file, no appended, re-typed or merged copy of one of its lines can be one.
+// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` check these rules, for this file and
+// for every service crate's `tests/all.rs`, so check there rather than leaving a note here.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
+// this file, which the layout check refuses: the `#[path]` above each declaration is what
+// points it into `tests/all/`.
