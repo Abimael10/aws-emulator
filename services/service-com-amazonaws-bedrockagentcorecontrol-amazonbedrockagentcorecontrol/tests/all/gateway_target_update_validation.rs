@@ -7,11 +7,12 @@
 //! [`MultiServiceRouter::dispatch`], so the wire protocol (`restJson1`), the boundary
 //! constraint validation and the handler are all exercised, against the one shared engine.
 //!
-//! The rule under test: a request whose BODY cannot be rendered into the operation's
-//! modelled response is an invalid request whatever the path names, so it is refused with
-//! the modelled `ValidationException` (HTTP 400) BEFORE the resource the URI path addresses
-//! is resolved, and only a body-valid request reaches the lookup that answers the modelled
-//! `ResourceNotFoundException` (404).
+//! The rule under test: the resources the URI PATH addresses are resolved FIRST, so a path
+//! naming a gateway or a target that is not there is the modelled
+//! `ResourceNotFoundException` (404) whatever the body carries; only the members the MODEL
+//! constrains are refused ahead of that lookup (the boundary enforces them), and a body this
+//! operation cannot render into its modelled response is the modelled `ValidationException`
+//! (HTTP 400) once the resources it names are known to be there.
 //!
 //! The two body members this service's gateway-target writes judge, read off the model
 //! (`smithy_query(query="operation",operation="UpdateGatewayTarget")` /
@@ -19,7 +20,8 @@
 //! `UpdateGatewayTarget`'s request and `@required` with exactly one entry on its response,
 //! and the update REPLACES the target's whole configuration — so a body that defines none
 //! leaves the response nothing to report; `name` is optional on `CreateGatewayTarget`'s
-//! request and `@required` on every response that reports a target. A body that DOES define
+//! request and `@required` on every response that reports a target. Neither is `@required` on
+//! the request, so neither refusal can precede the path's own lookup. A body that DOES define
 //! the member is served, and nothing a refused request carried is written.
 
 use std::sync::Arc;
@@ -216,10 +218,10 @@ async fn update_target(
     .await
 }
 
-/// A body that defines no credential provider configurations is refused 400 whatever the
-/// path names — a target that is there, a target that is not, a gateway that is not, a
-/// gateway the clock still owes a transition — and nothing it asked for is written. Only a
-/// body-valid request reaches the lookup that answers 404.
+/// A body that defines no credential provider configurations is refused 400 once the gateway
+/// and the target the path names are resolved — for a target that is there, and for a gateway
+/// the clock still owes a transition — and nothing it asked for is written. A path naming a
+/// resource that is NOT there answers the modelled 404 instead, whatever the body left out.
 #[tokio::test]
 async fn an_update_that_defines_no_credential_providers_is_refused() {
     let router = router();
@@ -250,7 +252,7 @@ async fn an_update_that_defines_no_credential_providers_is_refused() {
     );
 
     // (case, gatewayIdentifier, targetId, the body the row sends)
-    let rows: [(&str, String, String, Value); 7] = [
+    let rows: [(&str, String, String, Value); 4] = [
         (
             "a gateway and a target that are both there",
             gateway_id.clone(),
@@ -288,26 +290,6 @@ async fn an_update_that_defines_no_credential_providers_is_refused() {
                 }]},
             }}}}),
         ),
-        // The body verdict is reached BEFORE the path is resolved, so a path naming a
-        // resource that is not there gets the body's refusal and not the 404.
-        (
-            "a targetId naming no target of a gateway that is there",
-            gateway_id.clone(),
-            ABSENT_TARGET_ID.to_string(),
-            json!({"targetConfiguration": openapi_configuration("{\"openapi\":\"3.1.0\"}")}),
-        ),
-        (
-            "a gatewayIdentifier naming no gateway",
-            ABSENT_GATEWAY_ID.to_string(),
-            target_id.clone(),
-            json!({"targetConfiguration": openapi_configuration("{\"openapi\":\"3.1.0\"}")}),
-        ),
-        (
-            "neither the gateway nor the target is there",
-            ABSENT_GATEWAY_ID.to_string(),
-            ABSENT_TARGET_ID.to_string(),
-            json!({"targetConfiguration": openapi_configuration("{\"openapi\":\"3.1.0\"}")}),
-        ),
     ];
 
     for (case, gateway, target, body) in rows {
@@ -326,40 +308,70 @@ async fn an_update_that_defines_no_credential_providers_is_refused() {
         );
     }
 
-    // Only a request whose BODY this operation can serve reaches the lookup, and that is
-    // the request a path naming a resource that is not there answers the modelled 404 for.
-    let absent_rows: [(&str, String, String, &str); 3] = [
+    // The path is resolved FIRST, so a path naming a resource that is not there answers the
+    // modelled 404 — for a body that carries the member and for one that leaves it out
+    // alike, since neither is a member the model requires of the request.
+    let configured = json!({
+        "targetConfiguration": openapi_configuration("{\"openapi\":\"3.1.0\"}"),
+        "credentialProviderConfigurations": [
+            {"credentialProviderType": "CALLER_IAM_CREDENTIALS"}
+        ],
+    });
+    let bodyless = json!({
+        "targetConfiguration": openapi_configuration("{\"openapi\":\"3.1.0\"}")
+    });
+    let gateway_absent = "Failed to retrieve gateway because it doesn't exist. Retry the request \
+                          with a different resource identifier.";
+    let target_absent = "Failed to retrieve target because it doesn't exist. Retry the request \
+                         with a different resource identifier.";
+    // (case, gatewayIdentifier, targetId, the body the row sends, the sentence it earns)
+    let absent_rows: [(&str, String, String, &Value, &str); 6] = [
         (
             "a targetId naming no target of a gateway that is there",
             gateway_id.clone(),
             ABSENT_TARGET_ID.to_string(),
-            "Failed to retrieve target because it doesn't exist. Retry the request with a \
-             different resource identifier.",
+            &configured,
+            target_absent,
         ),
         (
             "a gatewayIdentifier naming no gateway",
             ABSENT_GATEWAY_ID.to_string(),
             target_id.clone(),
-            "Failed to retrieve gateway because it doesn't exist. Retry the request with a \
-             different resource identifier.",
+            &configured,
+            gateway_absent,
         ),
         (
             "neither the gateway nor the target is there",
             ABSENT_GATEWAY_ID.to_string(),
             ABSENT_TARGET_ID.to_string(),
-            "Failed to retrieve gateway because it doesn't exist. Retry the request with a \
-             different resource identifier.",
+            &configured,
+            gateway_absent,
+        ),
+        (
+            "a targetId naming no target, and a body that defines no credential providers",
+            gateway_id.clone(),
+            ABSENT_TARGET_ID.to_string(),
+            &bodyless,
+            target_absent,
+        ),
+        (
+            "a gatewayIdentifier naming no gateway, and a body that defines none either",
+            ABSENT_GATEWAY_ID.to_string(),
+            target_id.clone(),
+            &bodyless,
+            gateway_absent,
+        ),
+        (
+            "neither resource there, and a body that defines none either",
+            ABSENT_GATEWAY_ID.to_string(),
+            ABSENT_TARGET_ID.to_string(),
+            &bodyless,
+            gateway_absent,
         ),
     ];
 
-    for (case, gateway, target, message) in absent_rows {
-        let body = json!({
-            "targetConfiguration": openapi_configuration("{\"openapi\":\"3.1.0\"}"),
-            "credentialProviderConfigurations": [
-                {"credentialProviderType": "CALLER_IAM_CREDENTIALS"}
-            ],
-        });
-        let (status, refused) = update_target(&router, &gateway, &target, &body).await;
+    for (case, gateway, target, body, message) in absent_rows {
+        let (status, refused) = update_target(&router, &gateway, &target, body).await;
         assert_eq!(
             (status, error_code(&refused).as_str()),
             (404, "ResourceNotFoundException"),
@@ -487,13 +499,13 @@ async fn an_update_that_defines_the_credential_providers_is_served() {
     }
 }
 
-/// The same precedence on the other gateway-target write: `CreateGatewayTarget` judges the
-/// body member it needs for its modelled response (`name`, `@required` on every response
-/// that reports a target) before it resolves the gateway the path addresses, so a body that
-/// omits it is the modelled 400 even for a `gatewayIdentifier` naming no gateway, while a
-/// body that carries it reaches the lookup and gets the modelled 404.
+/// The same precedence on the other gateway-target write: `CreateGatewayTarget` resolves the
+/// gateway the path addresses before it judges the body member it needs for its modelled
+/// response (`name`, optional on the request and `@required` on every response that reports a
+/// target), so a `gatewayIdentifier` naming no gateway is the modelled 404 even for a body
+/// that omits it, while a body that omits it on a gateway that IS there is the modelled 400.
 #[tokio::test]
-async fn a_create_that_defines_no_name_is_refused_before_the_gateway_is_resolved() {
+async fn a_create_resolves_the_gateway_before_it_judges_the_name() {
     let router = router();
     let gateway_id = settled_gateway(&router, "createprecedencegate").await;
 
@@ -515,9 +527,11 @@ async fn a_create_that_defines_no_name_is_refused_before_the_gateway_is_resolved
             "no name, and a gatewayIdentifier naming no gateway",
             ABSENT_GATEWAY_ID,
             false,
-            400,
-            "ValidationException",
-            "name: is required".to_string(),
+            404,
+            "ResourceNotFoundException",
+            "Failed to retrieve gateway because it doesn't exist. Retry the request with a \
+             different resource identifier."
+                .to_string(),
         ),
         (
             "a name, and a gatewayIdentifier naming no gateway",

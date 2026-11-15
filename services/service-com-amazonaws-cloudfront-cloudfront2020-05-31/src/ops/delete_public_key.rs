@@ -190,10 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(::std::time::SystemTime::now());
 
         // The key being deleted is resolved first: every refusal below is about the record
-        // this id names, and nothing is removed for an id the store does not hold.
+        // this id names, and nothing is removed for an id the store does not hold. The FORM
+        // of the `Id` is a property of the request, so it decides which of the one code's
+        // two sentences the refusal carries
+        // ([`crate::state::unresolved_public_key_id`]).
         let Some(stored) = store.public_key(&input.id) else {
             return Err(DeletePublicKeyErrorModeled::NoSuchPublicKey(
-                crate::state::no_such_public_key(),
+                crate::state::unresolved_public_key_id(&input.id),
             )
             .into());
         };

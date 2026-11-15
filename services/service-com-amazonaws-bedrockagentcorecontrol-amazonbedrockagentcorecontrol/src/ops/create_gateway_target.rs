@@ -218,26 +218,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
-        // The BODY is judged before the resource the PATH addresses is resolved:
-        // a body this operation cannot render into its modelled response is an
-        // invalid request whatever the path names, so it is refused with the
-        // modelled 400 and the gateway lookup that can answer 404 is never
-        // reached.
+        // The resource the PATH addresses is resolved BEFORE this operation's own
+        // judgement of the body: a `gatewayIdentifier` naming no gateway is the
+        // modelled 404 whatever else the request carries, because the only body
+        // members refused ahead of a lookup are the ones the MODEL constrains
+        // (`gatewayIdentifier` and `targetConfiguration` are `@required`, each
+        // enforced at the boundary), and `name` is not one of them
+        // (`smithy_query operation=CreateGatewayTarget`).
         //
-        // `name` is optional on the request and `@required` on every response
-        // that reports a target, so a target with no name is refused rather than
-        // stored under a name this service invented for it.
-        let name = input.name.ok_or_else(|| {
-            CreateGatewayTargetErrorModeled::ValidationException(
-                crate::state::field_validation_failed("name", "is required"),
-            )
-        })?;
-
         // Everything that can be decided from stored state alone is decided
-        // next, and the store guard is DROPPED before the cross-service call
+        // here, and the store guard is DROPPED before the cross-service call
         // below: a lock is not held across an await, and the Lambda the target
         // names is resolved only for a request that would otherwise be written.
-        let gateway_arn = {
+        let (gateway_arn, name) = {
             let mut store = state.lock();
             // A gateway whose deletion the clock has already made due is gone
             // before this call looks for it.
@@ -256,6 +249,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
                 CreateGatewayTargetErrorModeled::ResourceNotFoundException(
                     crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+                )
+            })?;
+            // `name` is optional on the request and `@required` on every response
+            // that reports a target, so a target with no name is refused rather
+            // than stored under a name this service invented for it — once the
+            // gateway the target would belong to is known to be there.
+            let name = input.name.clone().ok_or_else(|| {
+                CreateGatewayTargetErrorModeled::ValidationException(
+                    crate::state::field_validation_failed("name", "is required"),
                 )
             })?;
             // A target is served BY the gateway, so the gateway has to be ready
@@ -288,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            gateway.gateway_arn.clone()
+            (gateway.gateway_arn.clone(), name)
         };
 
         // The cross-service check: a Lambda MCP target must name a function that

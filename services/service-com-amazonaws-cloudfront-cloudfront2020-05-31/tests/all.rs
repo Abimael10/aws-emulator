@@ -306,6 +306,8 @@ mod published_routing_endpoint;
 mod public_key_absent_id_one_sentence;
 #[path = "all/public_key_delete.rs"]
 mod public_key_delete;
+#[path = "all/public_key_id_form_boundary.rs"]
+mod public_key_id_form_boundary;
 #[path = "all/public_key_id_is_resolved_against_the_store.rs"]
 mod public_key_id_is_resolved_against_the_store;
 #[path = "all/public_key_lifecycle.rs"]

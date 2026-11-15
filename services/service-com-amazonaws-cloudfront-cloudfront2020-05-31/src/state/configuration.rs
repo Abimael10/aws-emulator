@@ -3192,23 +3192,47 @@ pub const MAX_PUBLIC_KEY_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
 /// public key — so nothing from the request belongs in the text and every path that raises
 /// this code reads the same.
 ///
-/// This is the answer an operation that ADDRESSES a public key by its `Id` gives an id it
-/// cannot resolve, whatever form the value takes. `GetPublicKey` and its siblings declare
-/// this one error, and the `Id` they address the key by is a plain `string` the model
-/// constrains in no way, so no value can fail to be READABLE as a public key id: every id
-/// the store holds no key under — an id of the public key namespace that was never minted or
-/// of no minted id's width, a well-formed identifier of another resource kind this service
-/// mints, a name, a caller reference, a word of no id shape at all — puts the request in one
-/// and the same condition, the key that is ABSENT, which is the recorded contract for this
-/// resource.
-///
-/// Another resource of this service whose recorded answers DO split on the form of the value
-/// — a field-level encryption profile or configuration, for whose `Id` CloudFront reports an
-/// identifier it cannot read — is read by its own rule
-/// ([`unresolved_field_level_encryption_profile_id`]).
+/// This is the answer an operation gives a WELL-FORMED public key id — one written the way
+/// CloudFront writes a public key identifier ([`is_public_key_id`]) — that the account holds
+/// no key under: the key was named readably and is simply not there. An `Id` outside that
+/// form is the identifier the service reports it cannot read instead
+/// ([`unresolved_public_key_id`]), and a public key id borne by a submitted DOCUMENT rather
+/// than by the request's path addresses nothing, so it is resolved against the store alone
+/// and reports the absent key whatever its shape.
 pub fn no_such_public_key() -> crate::ops::types::NoSuchPublicKey {
     crate::ops::types::NoSuchPublicKey {
         message: Some(NO_SUCH_PUBLIC_KEY_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled `NoSuchPublicKey` (HTTP 404) an operation ADDRESSED by a public key `Id` in
+/// its path answers an `Id` it cannot resolve.
+///
+/// The SAME split [`unresolved_field_level_encryption_profile_id`] makes for another
+/// resource of this service, over this kind's own predicate ([`is_public_key_id`]):
+/// `GetPublicKey` and its siblings model this one not-found code, so one code and one status
+/// cover two conditions and the MESSAGE is what tells them apart, decided from the value
+/// alone and therefore before the store is consulted. Only a value written the way
+/// CloudFront writes a public key identifier — the public key namespace letter followed by an
+/// identifier body of the width it issues one at — is an identifier the service READS, so the
+/// store holding no key under it is the absent-key sentence
+/// ([`NO_SUCH_PUBLIC_KEY_MESSAGE`]); every other value — another resource kind's identifier,
+/// this namespace at a width CloudFront issues none at, a lower-cased identifier, a UUID, a
+/// name, a caller reference, a word — is the identifier the service reports it cannot read
+/// ([`id_format_invalid_message`]). Both sentences are fixed text and neither echoes the
+/// value submitted.
+///
+/// Only an identifier that ADDRESSES the operation is judged this way: a public key id borne
+/// by a submitted DOCUMENT (an `EncryptionEntity$PublicKeyId` on a field-level encryption
+/// profile write) addresses nothing, so it is resolved against the store alone and reports
+/// the absent key whatever its shape ([`no_such_public_key`]).
+pub fn unresolved_public_key_id(id: &str) -> crate::ops::types::NoSuchPublicKey {
+    if is_public_key_id(id) {
+        no_such_public_key()
+    } else {
+        crate::ops::types::NoSuchPublicKey {
+            message: Some(id_format_invalid_message("Id")),
+        }
     }
 }
 

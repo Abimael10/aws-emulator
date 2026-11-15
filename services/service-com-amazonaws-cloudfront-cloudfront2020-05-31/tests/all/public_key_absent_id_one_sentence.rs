@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! ONE sentence for every `Id` the account holds no public key under, over every operation
-//! that addresses a public key by `Id`.
+//! TWO sentences under ONE code, over every operation that addresses a public key by `Id`.
 //!
 //! RULE: `GetPublicKey`, `GetPublicKeyConfig`, `UpdatePublicKey` and `DeletePublicKey` model
 //! one 404 error for an `Id` they cannot resolve — `NoSuchPublicKey`
 //! (`smithy_query(query="operation",operation="GetPublicKey,GetPublicKeyConfig,UpdatePublicKey,DeletePublicKey")`)
-//! — and the `Id` they take is a plain `string` the model constrains in no way, so no value
-//! can fail to be READABLE as a public key id: every `Id` the store holds no key under puts
-//! the request in one condition, the key that is ABSENT, and is answered with that kind's one
-//! does-not-exist sentence. The sentence is fixed text and echoes nothing the request sent.
+//! — so one code and one status cover two conditions and the MESSAGE is what tells them
+//! apart, decided from the value alone: an `Id` written the way CloudFront writes a public key
+//! identifier (the namespace letter followed by an identifier body of the width it issues one
+//! at) that the account holds no key under is the key that is ABSENT, and every other value is
+//! the identifier the service reports it cannot READ. Both sentences are fixed text and
+//! neither echoes the value the request sent.
 //!
 //! The rows span what the rule generalises over — the RELATION a value has to the identifier
 //! namespaces this service mints in: a live distribution id, a live key group's UUID, both
@@ -33,9 +34,14 @@ use crate::public_key_delete::delete_key;
 use crate::public_key_lifecycle::{create_key, get_key, pem, Key};
 use crate::web_acl_association::create as create_distribution_returning_id;
 
-/// The one sentence `NoSuchPublicKey` carries, written out here rather than read off the
-/// crate under test: the WORDING is what these rows are held to.
+/// The sentence `NoSuchPublicKey` carries for an `Id` OF the form a public key identifier
+/// takes that the account holds no key under, written out here rather than read off the crate
+/// under test: the WORDING is what these rows are held to.
 const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
+
+/// The sentence the same code carries for an `Id` outside that form: the identifier the
+/// service reports it cannot read, naming the member that carried it.
+const ID_FORMAT_INVALID: &str = "Id format is invalid";
 
 /// `GET /2020-05-31/public-key/{Id}/config` — the second reader of the one stored record.
 async fn get_key_config(router: &MultiServiceRouter, id: &str) -> Answer {
@@ -63,7 +69,7 @@ async fn update_key(router: &MultiServiceRouter, id: &str, body: &str, if_match:
 }
 
 #[tokio::test]
-async fn one_sentence_covers_every_unresolvable_public_key_id() {
+async fn one_sentence_each_covers_the_unresolvable_public_key_ids_of_either_form() {
     let router = emulator();
 
     // The one key the account holds, plus a distribution and a key group whose ids are
@@ -109,38 +115,60 @@ async fn one_sentence_covers_every_unresolvable_public_key_id() {
         .unwrap_or_default()
         .to_string();
 
-    // (case, the `Id` each operation is addressed with)
-    let rows: Vec<(&str, String)> = vec![
-        ("a live distribution id", distribution_id),
-        ("a live key group id, drawn as a UUID", group_id),
+    // (case, the `Id` each operation is addressed with, the sentence it is refused with)
+    let rows: Vec<(&str, String, &str)> = vec![
+        ("a live distribution id", distribution_id, ID_FORMAT_INVALID),
+        (
+            "a live key group id, drawn as a UUID",
+            group_id,
+            ID_FORMAT_INVALID,
+        ),
         (
             "a field-level encryption profile id",
             format!("{FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX}6AAAAAAAAAAAA"),
+            ID_FORMAT_INVALID,
         ),
         (
             "a field-level encryption configuration id",
             format!("{FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX}7AAAAAAAAAAAA"),
+            ID_FORMAT_INVALID,
         ),
         (
             "the public key prefix with too short a body",
             format!("{PUBLIC_KEY_ID_PREFIX}2AAA"),
+            ID_FORMAT_INVALID,
         ),
         (
             "the public key prefix with too long a body",
             format!("{PUBLIC_KEY_ID_PREFIX}2AAAAAAAAAAAAAAAAAAA"),
+            ID_FORMAT_INVALID,
         ),
         (
             "a public key id of this namespace that was never minted",
             "K2NEVERMINTED1".to_string(),
+            NO_SUCH_PUBLIC_KEY,
         ),
-        ("the stored id in lower case", known.to_lowercase()),
-        ("the stored id with one character appended", format!("{known}9")),
+        (
+            "the stored id in lower case",
+            known.to_lowercase(),
+            ID_FORMAT_INVALID,
+        ),
+        (
+            "the stored id with one character appended",
+            format!("{known}9"),
+            ID_FORMAT_INVALID,
+        ),
         (
             "the caller reference rather than the id",
             present.caller_reference.clone(),
+            ID_FORMAT_INVALID,
         ),
-        ("a bare digit", "0".to_string()),
-        ("a word of no CloudFront id shape at all", "..".to_string()),
+        ("a bare digit", "0".to_string(), ID_FORMAT_INVALID),
+        (
+            "a word of no CloudFront id shape at all",
+            "..".to_string(),
+            ID_FORMAT_INVALID,
+        ),
     ];
 
     let body = Key {
@@ -149,7 +177,7 @@ async fn one_sentence_covers_every_unresolvable_public_key_id() {
     }
     .xml();
 
-    for (case, id) in &rows {
+    for (case, id, sentence) in &rows {
         for (operation, answer) in [
             ("GetPublicKey", get_key(&router, id).await),
             ("GetPublicKeyConfig", get_key_config(&router, id).await),
@@ -169,8 +197,8 @@ async fn one_sentence_covers_every_unresolvable_public_key_id() {
             );
             let message = answer.root().find_text("Message").unwrap_or_default();
             assert_eq!(
-                message, NO_SUCH_PUBLIC_KEY,
-                "case {case:?} ({operation}, Id {id:?}): expected {NO_SUCH_PUBLIC_KEY:?}, got \
+                message, *sentence,
+                "case {case:?} ({operation}, Id {id:?}): expected {sentence:?}, got \
                  {message:?}"
             );
             assert!(

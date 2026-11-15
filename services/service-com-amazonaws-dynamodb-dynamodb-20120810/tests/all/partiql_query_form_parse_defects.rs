@@ -9,9 +9,12 @@
 //! over the parser's phrase for the position the parse stopped at: text that READ as one
 //! complete expression with a token left over stopped at that token (`Unexpected token after
 //! expression`), while text that IS one complete expression parsed as a query and
-//! manipulates no data whatever it spells (`Expected data manipulation`). A misspelled verb
-//! is the first of those: the misspelling is a name, which is a complete expression, and the
-//! clause word after it belongs to no expression.
+//! manipulates no data whatever it spells (`Expected data manipulation`). An expression
+//! carries on across the language's binary value operators, so text whose operand after one
+//! of those does not read completed no expression at all and states no data manipulation
+//! either: a misspelled `INSERT` stops at the clause word no operator introduced, while a
+//! misspelled `SELECT` reads a name, the multiplication operator, and a keyword where that
+//! operator's right operand belongs.
 //!
 //! The rows differ along what the rule generalises over: the FORM of the leading expression
 //! (a bare name, a quoted name, a string literal, a number, a path with steps, a comparison,
@@ -101,8 +104,21 @@ fn rows() -> Vec<(&'static str, String, &'static str)> {
             TRAILING_TOKEN,
         ),
         (
-            "a misspelled SELECT, an operator left over",
+            // The recorded case: the multiplication operator carries the expression on,
+            // and the keyword where its right operand belongs is no operand, so the text
+            // completed no expression at all.
+            "a misspelled SELECT, the operator's right operand a keyword",
             format!("SELCT * FROM \"{TABLE}\""),
+            NO_MANIPULATION,
+        ),
+        (
+            "a name, an operator, and a name after it",
+            format!("{TABLE} + rows"),
+            NO_MANIPULATION,
+        ),
+        (
+            "a name, an operator, a name, and a word left over",
+            format!("{TABLE} - rows junk"),
             TRAILING_TOKEN,
         ),
         (

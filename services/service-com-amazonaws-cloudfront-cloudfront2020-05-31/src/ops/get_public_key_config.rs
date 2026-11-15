@@ -146,9 +146,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key is owed by the CLOCK either — the model gives it no status and no deadline —
         // so there is nothing to settle before reading one.
         let store = state.lock();
+        // The `Id` the request addresses the key by is read before the store is consulted:
+        // a value outside the form CloudFront writes a public key identifier in is the
+        // identifier it reports it cannot read, and one OF that form the account holds no
+        // key under is the key that is absent
+        // ([`crate::state::unresolved_public_key_id`]).
         let Some(stored) = store.public_key(&input.id) else {
             return Err(GetPublicKeyConfigErrorModeled::NoSuchPublicKey(
-                crate::state::no_such_public_key(),
+                crate::state::unresolved_public_key_id(&input.id),
             )
             .into());
         };

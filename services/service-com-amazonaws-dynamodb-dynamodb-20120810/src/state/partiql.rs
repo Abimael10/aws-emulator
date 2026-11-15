@@ -1475,16 +1475,21 @@ impl StatementParser<'_> {
     /// * text that reads as no expression at all states no manipulation of data either,
     ///   which is the defect it keeps.
     ///
+    /// An expression CARRIES ON across the language's binary VALUE operators
+    /// ([`Self::at_value_operator`]), so the text has not completed one at such an
+    /// operator however much of it read before: what decides is the operand after it. Text
+    /// whose continued expression reads through to its end is one expression and
+    /// manipulates no data; text whose operand after the operator does not read is one
+    /// INCOMPLETE expression, so it read as no expression at all and keeps that same
+    /// defect — which is why a misspelled `SELECT` (`SELCT * FROM …`, a name, the
+    /// multiplication operator, and a keyword where its right operand belongs) states no
+    /// data manipulation while a misspelled `INSERT` stops at a clause word no operator
+    /// introduced.
+    ///
     /// The walk is a LOOK: the statement is refused whatever it finds, so where the cursor
     /// is left does not matter, and no further parse reads from it.
     fn query_defect(&mut self) -> ParseDefect {
-        let opened_at = self.at;
-        let mut read = self.disjunction().is_ok();
-        if !read {
-            self.at = opened_at;
-            read = self.operand().is_ok();
-        }
-        if !read {
+        if !self.read_query_expression() {
             return ParseDefect::NotDataManipulation;
         }
         // The `;` that ends a query is part of no expression and is not text carrying on
@@ -1494,6 +1499,53 @@ impl StatementParser<'_> {
         } else {
             ParseDefect::TrailingToken
         }
+    }
+
+    /// Read ONE expression of the query form, across every binary value operator it
+    /// carries on with, and report whether the text read as one at all.
+    fn read_query_expression(&mut self) -> bool {
+        if !self.read_query_term() {
+            return false;
+        }
+        while self.at_value_operator() {
+            // The operator belongs to the expression, so what follows it is read as the
+            // operand it introduces: an operand that does not read leaves the expression
+            // unfinished, which is text that read as no expression.
+            self.at += 1;
+            if !self.read_query_term() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// One term of the query form: the predicate form ([`Self::disjunction`]) where the
+    /// text states an operator of one, and the bare operand form ([`Self::operand`])
+    /// otherwise — each of which is a complete expression on its own.
+    fn read_query_term(&mut self) -> bool {
+        let opened_at = self.at;
+        if self.disjunction().is_ok() {
+            return true;
+        }
+        self.at = opened_at;
+        if self.operand().is_ok() {
+            return true;
+        }
+        self.at = opened_at;
+        false
+    }
+
+    /// Whether the parser stands on a binary operator that joins one VALUE to another —
+    /// the arithmetic operators of the language this dialect is a part of.
+    ///
+    /// These are the operators an expression carries on with, as against the relational
+    /// and logical ones the predicate form ([`Self::disjunction`]) already reads: a token
+    /// of this set says the expression continues whatever stands after it.
+    fn at_value_operator(&self) -> bool {
+        matches!(
+            self.peek(),
+            Some(Token::Star) | Some(Token::Plus) | Some(Token::Minus)
+        )
     }
 
     /// The operation the text's leading keywords name, when they name one of the

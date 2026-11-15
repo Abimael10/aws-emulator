@@ -92,9 +92,11 @@ async fn text_that_states_no_data_manipulation_and_a_bound_table_name_are_refuse
 
     // The rows differ in WHAT the text reads as: a bare name, a quoted name, a literal and
     // a predicate each read as one complete expression and nothing more, so each states no
-    // data manipulation; a misspelled verb, a bare name with a word after it and a
+    // data manipulation; a misspelled `INSERT`, a bare name with a word after it and a
     // statement of another dialect each read as a name with a token left over, which is
-    // where the parse stopped.
+    // where the parse stopped. A misspelled `SELECT` is the first of those again: the
+    // multiplication operator carries the expression on and the keyword after it is no
+    // operand, so the text completed no expression at all.
     for (case, statement, reason) in [
         ("a bare name alone", TABLE.to_string(), NO_MANIPULATION),
         (
@@ -111,7 +113,7 @@ async fn text_that_states_no_data_manipulation_and_a_bound_table_name_are_refuse
         (
             "a misspelled SELECT",
             format!("SELCT * FROM \"{TABLE}\""),
-            TRAILING_TOKEN,
+            NO_MANIPULATION,
         ),
         (
             "a misspelled INSERT",

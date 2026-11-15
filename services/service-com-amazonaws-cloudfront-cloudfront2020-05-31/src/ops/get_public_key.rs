@@ -140,13 +140,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let store = state.lock();
 
-        // "The identifier of the public key you are getting": an id no stored key carries
-        // names no public key, whatever form the value takes — this `Id` is a plain string
-        // the model constrains in no way, so which ids were issued is the store's business
-        // and nothing about the value is refused ahead of it.
+        // "The identifier of the public key you are getting": the SHAPE of the value is a
+        // property of the request, so it is read before the store is consulted — an `Id`
+        // outside the form CloudFront writes a public key identifier in is the identifier
+        // it reports it cannot read, and one OF that form the account holds no key under is
+        // the key that is absent
+        // ([`crate::state::unresolved_public_key_id`]).
         let Some(stored) = store.public_key(&input.id) else {
             return Err(GetPublicKeyErrorModeled::NoSuchPublicKey(
-                crate::state::no_such_public_key(),
+                crate::state::unresolved_public_key_id(&input.id),
             )
             .into());
         };

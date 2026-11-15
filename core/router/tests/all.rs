@@ -2436,3 +2436,17 @@ mod declaration_roots_are_canonical_and_complete;
 //!   `tests/` — which the layout check refuses. The `#[path]` is what points each
 //!   declaration into `tests/all/` (`all/all_rs_is_a_canonical_declaration_list.rs`).
 //! the test it explains; the notes landings had appended to this file live in
+// deliberate: an inner doc comment (`//` followed by `!`) is legal only before the first
+// item, so one that lands past the declarations — which is what concurrent landings
+// appending to this file kept producing — is `E0753` and compiles no suite of this target.
+// With no inner doc comment anywhere in the file, no merge of two landings can put one past
+// the first item.
+// per suite file under `tests/all/`, sorted by name, and no other line — so two branches
+// landing at once insert two lines in two places and have no prose to duplicate, re-word or
+// mistype. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a
+// SIBLING (`tests/<name>.rs`), which the layout check refuses; the `#[path]` is what points
+// name is `E0428` and fails every suite in this target. A suite no `mod` names compiles
+// nowhere and its tests never run, and a suite left at the top level of `tests/` fails the
+// build.
+// test it explains and cannot collide with a concurrent landing. A note about this file
+// itself belongs in `all/appended_notes.rs`.

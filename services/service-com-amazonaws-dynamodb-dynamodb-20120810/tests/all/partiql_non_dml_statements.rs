@@ -9,7 +9,9 @@
 //! the parse of it stopped at: text that reads as ONE complete expression (the language's
 //! other statement form, a query) states no data manipulation, while text with a token left
 //! over past that expression stopped at that token, which nothing in the dialect can follow
-//! an expression with.
+//! an expression with. An expression carries on across the language's binary value
+//! operators, so text whose operand after one of those does not read completed no
+//! expression at all and states no data manipulation too.
 //!
 //! The rows differ along WHAT the text spells instead: a bare name, a quoted name, a
 //! literal, a predicate, a misspelling of each of the four verbs, a statement of another
@@ -95,9 +97,9 @@ async fn text_that_states_none_of_the_served_verbs_manipulates_no_data() {
             TRAILING_TOKEN,
         ),
         (
-            "a misspelled SELECT",
+            "a misspelled SELECT, whose operator has no operand after it",
             format!("SELCT * FROM \"{TABLE}\""),
-            TRAILING_TOKEN,
+            NO_DATA_MANIPULATION,
         ),
         (
             "a misspelled INSERT",
