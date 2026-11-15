@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstancePatchStatesForPatchGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstancePatchStatesForPatchGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The high-level patch compliance state of the managed nodes in ONE patch group — the
+//! read half of this service's patch-state slice. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstancePatchStatesForPatchGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it reports is what the store holds ([`crate::state::instance_patch_states`]): one
+//! report per node a patching operation has gathered compliance for, in ascending node-id
+//! order, narrowed by every filter the request carries and served one page at a time. A
+//! read — nothing is written, so a later caller sees the same reports.
+//!
+//! Patch compliance is gathered ON a node, by the patching operation Patch Manager runs
+//! there, and no operation of this service's model reports one, so a patch group whose
+//! nodes have never been patched holds no state and this read reports none rather than
+//! compliance nobody collected.
+//!
+//! Three things are refused rather than served:
+//!
+//! * a filter naming a key outside this read's own vocabulary
+//!   ([`crate::state::instance_patch_states::INSTANCE_PATCH_STATE_FILTER_KEYS`]), or
+//!   carrying a value that is not the non-negative integer such a filter compares a count
+//!   against — refused as the validation of the request it is
+//!   ([`crate::state::instance_patch_states::instance_patch_state_filter_rejection`]);
+//! * a `NextToken` that is not a token this read hands out — the node id a page resumes
+//!   at — which is no page of this group to continue (`InvalidNextToken`);
+//! * a `MaxResults` outside the modelled range, which the centralized boundary walk
+//!   already refuses before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +167,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstancePatchStatesForPatchGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstancePatchStatesForPatchGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstancePatchStatesForPatchGroup"))
+        use crate::state::instance_patch_states::{
+            instance_patch_state_filter_rejection, instance_patch_state_filter_value,
+            instance_patch_state_page_size,
+        };
+        use crate::state::{managed_node_id_is_well_formed, request_region, INVALID_NEXT_TOKEN};
+
+        // The `Filters` list's length, each filter's `Values` count and the `MaxResults`
+        // range are MODELLED constraints the centralized walk has already refused anything
+        // outside of. What is decided here is which of this group's reports the request's
+        // criteria select.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeInstancePatchStatesForPatchGroupErrorModeled::InternalServerError(
+                    InternalServerError {
+                        message: Some(
+                            "this service is mounted on an engine that holds no state".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A filter compares one patch-compliance count of a report against one number, so
+        // it has to name a count this read knows and a number to compare it with. A filter
+        // that names neither cannot be served, and the request is refused before a single
+        // report is read.
+        let mut filters: Vec<(&str, &str, i64)> = Vec::new();
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            if let Some(why) = instance_patch_state_filter_rejection(
+                &filter.key,
+                &filter.r#type,
+                &filter.values,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation(why));
+            }
+            // Every value of an accepted filter is a number: the refusal above is what
+            // decides that, so this walk cannot drift from it.
+            filters.extend(
+                filter
+                    .values
+                    .iter()
+                    .filter_map(|value| instance_patch_state_filter_value(value))
+                    .map(|value| (filter.key.as_str(), filter.r#type.as_str(), value)),
+            );
+        }
+
+        let page_size = instance_patch_state_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this read hands out is the node id the next page starts at, so a token
+        // that is not shaped like a node id was never one of ours.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if managed_node_id_is_well_formed(token) => Some(token),
+            Some(_) => {
+                return Err(
+                    DescribeInstancePatchStatesForPatchGroupErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        // Systems Manager is regional: a report is reached through the endpoint of the
+        // Region the node it was gathered on is registered with, which is the Region this
+        // request was signed for. The store yields that Region's reports for this group in
+        // ascending node-id order, which is what makes the resume cursor total.
+        let region = request_region(ctx.parts());
+        let store = state.lock();
+        let mut instance_patch_states = Vec::new();
+        let mut next_token = None;
+        for (id, report) in store.instance_patch_states_in_group(&region, &input.patch_group) {
+            if resume_from.is_some_and(|from| id < from) {
+                continue;
+            }
+            // Two filters narrow together: a report is reported only when EVERY comparison
+            // the request carries holds of it.
+            if !filters
+                .iter()
+                .all(|(key, comparison, value)| report.matches_filter(key, comparison, *value))
+            {
+                continue;
+            }
+            if instance_patch_states.len() == page_size {
+                // The page is full and a report is still waiting: hand the caller the node
+                // id it resumes at, so the next request continues where this one stopped.
+                next_token = Some(id.to_string());
+                break;
+            }
+            instance_patch_states.push(report.to_instance_patch_state());
+        }
+
+        // "If there are no additional items to return, the string is empty" — reported as
+        // no token at all, which is how this protocol spells an absent member.
+        Ok(DescribeInstancePatchStatesForPatchGroupOutput {
+            instance_patch_states: Some(instance_patch_states),
+            next_token,
+        })
     }
 }

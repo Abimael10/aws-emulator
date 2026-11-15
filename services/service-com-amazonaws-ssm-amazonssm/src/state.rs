@@ -109,6 +109,15 @@
 //! ([`patch_baselines::PREDEFINED_BASELINES`]), which is the default until a register says
 //! otherwise — so every operating system has a default and the read invents none.
 //!
+//! What a patching operation REPORTED about a node lives beside them
+//! ([`instance_patch_states`]), keyed by `(region, node id)`: the high-level patch
+//! compliance state of one node, which `DescribeInstancePatchStatesForPatchGroup` reports
+//! for the nodes of one patch group, narrowed by the count filters that read accepts
+//! ([`instance_patch_states::INSTANCE_PATCH_STATE_FILTER_KEYS`]). Patch compliance is
+//! gathered on the node by the patching operation Patch Manager runs there, and no call of
+//! this service's model reports one, so a group whose nodes have never been patched is
+//! reported as holding no state rather than compliance nobody collected.
+//!
 //! Beside the baselines is the **patch metadata Patch Manager publishes**
 //! ([`patch_properties`]): the products, product families, classifications and severities
 //! the patches available for an operating system carry, which exist in every account and
@@ -247,6 +256,10 @@ pub mod ops_item_related_items;
 /// The patch baselines Patch Manager holds, the ones Systems Manager predefines, and
 /// which of them is the default for an operating system.
 pub mod patch_baselines;
+
+/// The high-level patch compliance state a patching operation reported for a managed
+/// node, and how a patch-group read narrows, orders and pages those reports.
+pub mod instance_patch_states;
 
 /// The patch metadata Patch Manager publishes for an operating system — the products,
 /// product families, classifications and severities its available patches carry — which
@@ -3506,6 +3519,17 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// baselines of one store never carry one id.
     pub patch_baseline_sequence: u64,
 
+    /// The patch compliance state of each managed node a patching operation has reported
+    /// one for, keyed by `(region, node id)`: a report is gathered on a node registered
+    /// with one Region's endpoint, and the next patching operation on that node supersedes
+    /// it, so one node holds at most one. A `BTreeMap` so a read walks a stable, total
+    /// order — ascending by node id within one Region — and can resume a page from the id
+    /// it stopped at rather than from an offset. Nothing a caller can send starts a
+    /// patching operation here, so the store holds the reports that have been made and
+    /// invents none: see [`instance_patch_states`].
+    pub instance_patch_states:
+        BTreeMap<(String, String), instance_patch_states::InstancePatchStateRecord>,
+
     /// The default patch baseline of each operating system, keyed by
     /// `(region, operating system)`: "Systems Manager supports creating multiple default
     /// patch baselines. For example, you can create a default patch baseline for each
@@ -3603,6 +3627,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             patch_baselines: BTreeMap::new(),
             patch_baseline_sequence: 0,
             default_patch_baselines: BTreeMap::new(),
+            instance_patch_states: BTreeMap::new(),
             resource_data_syncs: BTreeMap::new(),
             access_requests: BTreeMap::new(),
             access_request_sequence: 0,

@@ -67,6 +67,8 @@ mod hybrid_activations;
 mod identity_document_in_the_guest;
 #[path = "all/instance_association_status.rs"]
 mod instance_association_status;
+#[path = "all/instance_patch_states_for_patch_group.rs"]
+mod instance_patch_states_for_patch_group;
 #[path = "all/instance_properties.rs"]
 mod instance_properties;
 #[path = "all/just_in_time_node_access.rs"]
