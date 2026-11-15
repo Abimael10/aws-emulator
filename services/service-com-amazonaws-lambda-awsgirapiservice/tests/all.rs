@@ -387,6 +387,8 @@ mod invocation_count_series;
 mod invocation_duration_report_agreement;
 #[path = "all/invocation_duration_statistics_reads.rs"]
 mod invocation_duration_statistics_reads;
+#[path = "all/invocation_emf_metric_materialisation.rs"]
+mod invocation_emf_metric_materialisation;
 #[path = "all/invocation_error_indicator.rs"]
 mod invocation_error_indicator;
 #[path = "all/invocation_init_phase.rs"]
