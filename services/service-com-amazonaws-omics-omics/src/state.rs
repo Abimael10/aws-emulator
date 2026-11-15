@@ -9,7 +9,7 @@
 //! **run group** that caps the compute those runs may use (`CreateRunGroup` /
 //! `GetRunGroup` / `ListRunGroups`), the **run cache** a run reads task outputs from (`CreateRunCache` /
 //! `GetRunCache`) and the **sequence store** that holds read sets
-//! (`CreateSequenceStore` / `GetSequenceStore`), together with the **multipart read set
+//! (`CreateSequenceStore` / `GetSequenceStore` / `DeleteSequenceStore`), together with the **multipart read set
 //! upload** a caller initiates against that store
 //! (`CreateMultipartReadSetUpload`). Each resource is stored exactly once, keyed by the numeric id
 //! the model's `^[0-9]+$` patterns describe (a version by its name, inside its
@@ -230,6 +230,15 @@ pub fn delete_workflow_version_not_found_message(
 /// the kind of resource that was requested and nothing of the request. Stated once because
 /// every share operation answering that condition words it the same way.
 pub const SHARE_NOT_FOUND_MESSAGE: &str = "Requested share not found";
+
+/// What every operation that resolves a modelled `SequenceStoreId` answers when this
+/// emulator holds no store for it.
+///
+/// The service words this refusal as FIXED text for the resource class, echoing no id
+/// back, so the one sentence stands for every operation that looks a sequence store up
+/// (`GetSequenceStore`, `DeleteSequenceStore`, and an operation reaching a store through
+/// its path).
+pub const SEQUENCE_STORE_NOT_FOUND_MESSAGE: &str = "The specified sequence store does not exist.";
 
 /// What `CreateShare` answers when the resource the request offers is not one this
 /// emulator holds.
@@ -1036,6 +1045,27 @@ impl ComAmazonawsOmicsOmicsState {
         self.sequence_stores.get(&numeric_id(id)?)
     }
 
+    /// Remove the sequence store the modelled `SequenceStoreId` `id` names, together
+    /// with everything held INSIDE it, and answer the record that was removed (`None`
+    /// when no store carries that id).
+    ///
+    /// The store's own tags and the multipart read set uploads initiated against it live
+    /// inside the store: every upload operation names the store its upload belongs to, so
+    /// an upload left behind here would be a record nothing could ever read, finish or
+    /// abort. `DeleteSequenceStore` documents that reclamation for the tags ("When a
+    /// sequence store is deleted, all tags associated with the store are also deleted"),
+    /// and it is the same rule for every other record scoped to the store.
+    pub fn remove_sequence_store(&mut self, id: &str) -> Option<SequenceStore> {
+        let key = numeric_id(id)?;
+        let store = self.sequence_stores.remove(&key)?;
+        // Matched on the store's NUMERIC key, the same normalisation every lookup in this
+        // crate uses, so an upload that spells its store's id differently (the modelled
+        // `^[0-9]+$` admits leading zeros) is still reclaimed with it.
+        self.multipart_read_set_uploads
+            .retain(|_, upload| numeric_id(&upload.sequence_store_id) != Some(key));
+        Some(store)
+    }
+
     /// The multipart read set upload the modelled `UploadId` `upload_id` names INSIDE
     /// the sequence store `sequence_store_id`, or `None`.
     ///
@@ -1591,6 +1621,8 @@ pub enum AuditOutcome {
     RunDeleted,
     /// A sequence store was minted and stored.
     SequenceStoreCreated,
+    /// A stored sequence store was removed from the store, with everything held inside it.
+    SequenceStoreDeleted,
     /// A multipart read set upload was initiated and stored against a sequence store.
     MultipartReadSetUploadCreated,
     /// A run cache was minted and stored.
@@ -1632,6 +1664,7 @@ impl AuditOutcome {
             Self::RunStarted => "run-started",
             Self::RunDeleted => "run-deleted",
             Self::SequenceStoreCreated => "sequence-store-created",
+            Self::SequenceStoreDeleted => "sequence-store-deleted",
             Self::MultipartReadSetUploadCreated => "multipart-read-set-upload-created",
             Self::RunCacheCreated => "run-cache-created",
             Self::RunGroupCreated => "run-group-created",

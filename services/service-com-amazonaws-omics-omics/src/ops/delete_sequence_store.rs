@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSequenceStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSequenceStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a sequence store: the record is REMOVED from [`crate::state`], together with
+//! everything held inside it (its tags, and the multipart read set uploads initiated
+//! against it, which are reachable only through the store), so a following
+//! `GetSequenceStore` answers the modelled `ResourceNotFoundException` (HTTP 404) and an
+//! upload cannot be initiated against the id any more. An id this emulator holds no store
+//! for is that same 404.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSequenceStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The documented "only when it does not contain any read sets" restriction has nothing to
+//! weigh here yet: no operation in this crate mints a read set
+//! (`CompleteMultipartReadSetUpload`, the one that would, is still a scaffold), so no store
+//! can hold one and the modelled `ConflictException` has no state to arise from.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +155,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSequenceStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSequenceStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSequenceStore"))
+        // Every branch below records the call through `crate::state::audit`: a delete
+        // leaves no trace in the store, so the log is the only place its effect is
+        // attributable afterwards.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            DeleteSequenceStoreErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics sequence store registry is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        // Settle first, so the record this call reclaims is the one every other reader
+        // would report at this instant.
+        registry.settle(now_ms);
+
+        // The store and everything scoped to it go in one step, under the state module's
+        // own rule, so no upload is left holding an id nothing can reach.
+        let Some(store) = registry.remove_sequence_store(&input.id) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.id),
+            );
+            return Err(DeleteSequenceStoreErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SEQUENCE_STORE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::SequenceStoreDeleted,
+            Some(&store.id),
+        );
+
+        // The modelled response carries no members: the deletion itself is the answer.
+        Ok(DeleteSequenceStoreOutput {})
     }
 }

@@ -249,10 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateMultipartReadSetUploadErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: format!(
-                                "no sequence store with id {} exists in this region",
-                                input.sequence_store_id
-                            ),
+                            message: crate::state::SEQUENCE_STORE_NOT_FOUND_MESSAGE.to_string(),
                         },
                     )
                     .into(),

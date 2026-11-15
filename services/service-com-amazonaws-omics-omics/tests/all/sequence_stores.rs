@@ -56,17 +56,17 @@ const SEQUENCE_STORE_ID_WIDTH: (usize, usize) = (10, 36);
 const KEY_ARN: &str = "arn:aws:kms:us-west-2:000000000000:key/omics-emulator-key";
 
 /// `POST /sequencestore`.
-async fn create_store(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+pub(crate) async fn create_store(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "POST", "/sequencestore", Some(body)).await
 }
 
 /// `GET /sequencestore/{id}`.
-async fn get_store(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn get_store(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/sequencestore/{id}"), None).await
 }
 
 /// The `id` member of a 200 create response, after asserting the status.
-fn created_store_id(case: &str, status: u16, body: &Value) -> String {
+pub(crate) fn created_store_id(case: &str, status: u16, body: &Value) -> String {
     assert_eq!(status, 200, "case {case:?}: expected 200, got {body:?}");
     let id = body
         .get("id")
@@ -98,7 +98,11 @@ fn assert_sequence_store_id(case: &str, id: &str) {
 ///
 /// Polling rather than sleeping a fixed span: the status is owed to the clock, so what is
 /// asserted is that it arrives, not when a single read happened to land.
-async fn await_store_status(router: &MultiServiceRouter, id: &str, expected: &str) -> Value {
+pub(crate) async fn await_store_status(
+    router: &MultiServiceRouter,
+    id: &str,
+    expected: &str,
+) -> Value {
     let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
     loop {
         let (status, body) = get_store(router, id).await;

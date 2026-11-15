@@ -189,10 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(&input.id),
             );
             GetSequenceStoreErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "no sequence store with id {} exists in this region",
-                    input.id
-                ),
+                message: crate::state::SEQUENCE_STORE_NOT_FOUND_MESSAGE.to_string(),
             })
         })?;
         crate::state::audit(

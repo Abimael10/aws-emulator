@@ -23,6 +23,8 @@ mod resource_shares;
 mod run_caches;
 #[path = "all/run_groups.rs"]
 mod run_groups;
+#[path = "all/sequence_store_deletion.rs"]
+mod sequence_store_deletion;
 #[path = "all/sequence_stores.rs"]
 mod sequence_stores;
 #[path = "all/state_roundtrip.rs"]
