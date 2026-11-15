@@ -203,6 +203,8 @@ mod refused_conditional_write_metering;
 mod required_member_refusals;
 #[path = "all/request_latency_metrics.rs"]
 mod request_latency_metrics;
+#[path = "all/request_outcome_metrics.rs"]
+mod request_outcome_metrics;
 #[path = "all/request_shape_validation_classes.rs"]
 mod request_shape_validation_classes;
 #[path = "all/request_validation_refusals.rs"]

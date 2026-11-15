@@ -337,11 +337,20 @@ fn charge_refused(
     factor: f64,
     at: ::std::time::SystemTime,
 ) {
-    if let Ok(table) = store.table_mut(region, name) {
-        let mut capacity = table.refused_write_capacity(stored);
-        capacity.table *= factor;
-        table.charge_refused_item_write(partition, &capacity, at);
-    }
+    let Ok(table) = store.table_mut(region, name) else {
+        return;
+    };
+    let mut capacity = table.refused_write_capacity(stored);
+    capacity.table *= factor;
+    table.charge_refused_item_write(partition, &capacity, at);
+    // The refusal is itself counted, beside the capacity it cost: one failed attempt to
+    // perform a conditional write, in the table's own series for them
+    // ([`crate::state::request_outcome_metrics`]). Booked under the name the STORE holds this
+    // table under, which is the table the series belongs to however the request addressed it.
+    let table_name = table.name.clone();
+    store
+        .pending_outcomes
+        .record_conditional_check_failed(&table_name, at);
 }
 
 /// Count what one MULTI-ITEM request reported consuming into the series of each table it

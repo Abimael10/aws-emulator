@@ -705,6 +705,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The items this read HANDS BACK are the table's `ReturnedItemCount` for the
+        // operation that returned them ([`crate::state::request_outcome_metrics`]): the
+        // figure this response reports as its `Count`, which is what a filter left of the
+        // page rather than what the page evaluated.
+        store
+            .pending_outcomes
+            .record_returned_items(&name, OPERATION, count, now);
         Ok(ScanOutput {
             items,
             count,
@@ -714,6 +721,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The API this operation is served as, which is the `Operation` dimension value the
+/// per-operation CloudWatch series of a request it served are booked under
+/// ([`crate::state::request_outcome_metrics`]).
+const OPERATION: &str = "Scan";
 
 /// The modelled server error for a request that cannot reach this service's store.
 fn store_unavailable() -> ScanError {

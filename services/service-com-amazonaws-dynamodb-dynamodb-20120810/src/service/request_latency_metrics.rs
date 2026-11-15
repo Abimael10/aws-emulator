@@ -57,12 +57,6 @@ const NAMESPACE: &str = "AWS/DynamoDB";
 /// The metric that reports how long a served request took.
 const SUCCESSFUL_REQUEST_LATENCY: &str = "SuccessfulRequestLatency";
 
-/// The dimension that names the table a series belongs to.
-const TABLE_NAME_DIMENSION: &str = "TableName";
-
-/// The dimension that names the API the requests of a series were made with.
-const OPERATION_DIMENSION: &str = "Operation";
-
 /// The unit an elapsed time is published in: the `StandardUnit` value for milliseconds,
 /// which is what a request latency is reported in.
 const MILLISECONDS_UNIT: &str = "Milliseconds";
@@ -309,12 +303,9 @@ fn publish<Eng: Send + Sync + 'static>(
         .map_or(0.0, |since| since.as_secs_f64());
     let mut store = metrics.lock();
     for table in tables {
-        let dimensions: cloudwatch::state::DimensionSet = [
-            (TABLE_NAME_DIMENSION.to_string(), table.clone()),
-            (OPERATION_DIMENSION.to_string(), operation.to_string()),
-        ]
-        .into_iter()
-        .collect();
+        // The one spelling of the `{TableName, Operation}` pair, shared with every other
+        // family published under it ([`crate::state::operation_dimensions`]).
+        let dimensions = crate::state::operation_dimensions(table, operation);
         let key = cloudwatch::state::MetricKey {
             namespace: NAMESPACE.to_string(),
             metric_name: SUCCESSFUL_REQUEST_LATENCY.to_string(),

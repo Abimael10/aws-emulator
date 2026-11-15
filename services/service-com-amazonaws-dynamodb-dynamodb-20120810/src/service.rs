@@ -649,6 +649,10 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
                 &answered,
                 took,
             );
+            // And where what the request's outcome WAS is counted: the items a read returned
+            // and the writes a condition turned down, settled under the store's lock and
+            // published with it released ([`crate::state::request_outcome_metrics`]).
+            crate::state::publish_pending_request_outcomes(&*self.engine);
             front_door::announced(req, reported(answered))
         })
     }

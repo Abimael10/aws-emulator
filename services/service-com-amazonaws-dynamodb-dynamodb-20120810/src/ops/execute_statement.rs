@@ -613,6 +613,13 @@ fn select_items(
             .into(),
         );
     }
+    // The items this read HANDS BACK are the table's `ReturnedItemCount` for the operation
+    // that returned them ([`crate::state::request_outcome_metrics`]): the items this
+    // response carries, which is what the statement's predicate left of the page.
+    let returned = i32::try_from(items.len()).unwrap_or(i32::MAX);
+    store
+        .pending_outcomes
+        .record_returned_items(name, OPERATION, returned, now);
     Ok(ExecuteStatementOutput {
         items: Some(items),
         next_token,
@@ -916,6 +923,11 @@ fn condition_failed(item: Option<crate::state::Item>) -> ExecuteStatementError {
     )
     .into()
 }
+
+/// The API this operation is served as, which is the `Operation` dimension value the
+/// per-operation CloudWatch series of a request it served are booked under
+/// ([`crate::state::request_outcome_metrics`]).
+const OPERATION: &str = "ExecuteStatement";
 
 /// The modelled server error for a request that cannot reach this service's store.
 fn store_unavailable() -> ExecuteStatementError {

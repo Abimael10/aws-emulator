@@ -6873,3 +6873,11 @@ mod appended_notes;
 //! wants no restatement here.
 #[path = "all/all_rs_is_a_canonical_declaration_list.rs"]
 mod all_rs_is_a_canonical_declaration_list;
+//! suite left at the top level of `tests/` fails the build. `tests/all.rs` is a
+//! test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING (`tests/boot_serve.rs`)
+//! — the `#[path]` is what points it into `tests/all/`.
+//! same name is `E0428` and fails every suite in this target. THIS BLOCK IS THE ONLY
+//! PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past the first item one is
+//! `E0753` and compiles no suite of this target, so add a declaration below, never a
+//! note about one — the notes earlier landings appended live in
+//! `all/appended_notes.rs`. `all/all_rs_declares_each_suite_once.rs` and

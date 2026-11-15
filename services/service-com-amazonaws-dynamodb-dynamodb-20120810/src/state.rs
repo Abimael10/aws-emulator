@@ -2944,6 +2944,15 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// themselves). Bounded by [`MAX_PENDING_STREAM_RECORDS`]; drained by
     /// [`publish_item_changes`].
     pub pending_stream_records: Vec<PendingStreamRecord>,
+    /// What the requests served against this store's tables have COUNTED — the items a read
+    /// returned, the writes a condition turned down — and this service has not published to
+    /// CloudWatch yet ([`request_outcome_metrics::publish_pending_request_outcomes`]).
+    ///
+    /// Held by the store rather than by a table, for the reason
+    /// [`Self::pending_stream_records`] is: the outcome is settled under this lock and the
+    /// series it belongs to lives in another service's store, which cannot be written under
+    /// it, so the observation waits here in between.
+    pub pending_outcomes: request_outcome_metrics::Pending,
 }
 
 /// The `ResourceNotFoundException` message the CONTROL plane answers with: the
@@ -4473,6 +4482,14 @@ pub use consumed_capacity_metrics::{
 pub mod provisioned_capacity_metrics;
 
 pub use provisioned_capacity_metrics::publish_due_provisioned_capacity;
+
+/// The CloudWatch series this service counts a request's OUTCOME into — the items a read
+/// returned and the writes a condition turned down — in their own file: they are about what a
+/// request DID rather than about the table and item store itself. Re-exported below, so every
+/// caller still names them `crate::state::…`.
+pub mod request_outcome_metrics;
+
+pub use request_outcome_metrics::{operation_dimensions, publish_pending_request_outcomes};
 
 // ===========================================================================
 // The PartiQL dialect `ExecuteStatement` runs
