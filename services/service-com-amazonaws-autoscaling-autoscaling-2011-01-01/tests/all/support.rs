@@ -246,8 +246,10 @@ pub async fn create_target_group(
 }
 
 /// Create one Amazon EC2 launch template over that service's own wire, so a group launches
-/// from a template the account actually holds.
-pub async fn create_launch_template(router: &MultiServiceRouter, name: &str) {
+/// from a template the account actually holds, and answer the `(id, latest version number)`
+/// that service assigned it — values a suite naming the template by id or by version takes
+/// from EC2 rather than writing out.
+pub async fn create_launch_template(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let (status, body) = ec2_query(
         router,
         "CreateLaunchTemplate",
@@ -262,6 +264,53 @@ pub async fn create_launch_template(router: &MultiServiceRouter, name: &str) {
         status, 200,
         "CreateLaunchTemplate for {name:?} expected 200, got {status}: {body}"
     );
+    let id = tag_value(&body, "launchTemplateId");
+    let latest_version = tag_value(&body, "latestVersionNumber");
+    assert!(
+        !id.is_empty() && !latest_version.is_empty(),
+        "CreateLaunchTemplate for {name:?} must report the template's id and latest version \
+         number, got {body}"
+    );
+    (id, latest_version)
+}
+
+/// Where a group places the instances it launches, for a suite whose cases span both ways of
+/// stating it.
+///
+/// THE ONE COPY for the suites here that create one group per placement: a group states
+/// either the Availability Zones it places instances in or the subnets it places them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// `AvailabilityZones`, naming the zone a seeded subnet is in.
+    Zone,
+    /// `VPCZoneIdentifier`, naming that subnet.
+    Subnet,
+}
+
+/// The path IAM reserves for a service-linked role, followed by the service principal Amazon
+/// EC2 Auto Scaling acts under.
+///
+/// SOURCE: a service-linked role is filed under `/aws-service-role/<service principal>/`, and
+/// this service's principal is `autoscaling.amazonaws.com` — the principal IAM's own catalog
+/// of published service-linked roles names for Amazon EC2 Auto Scaling.
+pub const DEFAULT_SERVICE_LINKED_ROLE_PATH: &str = "/aws-service-role/autoscaling.amazonaws.com/";
+
+/// The name of the role a group is bound to when its create names none.
+///
+/// SOURCE: `CreateAutoScalingGroupType$ServiceLinkedRoleARN` — "By default, Amazon EC2 Auto
+/// Scaling uses a service-linked role named `AWSServiceRoleForAutoScaling`, which it creates
+/// if it does not exist."
+pub const DEFAULT_SERVICE_LINKED_ROLE_NAME: &str = "AWSServiceRoleForAutoScaling";
+
+/// The ARN of that role: fixed text apart from the account id, which is the caller's own
+/// account.
+///
+/// THE ONE COPY for every suite here that reads the role a group is bound to.
+pub fn default_service_linked_role_arn() -> String {
+    format!(
+        "arn:aws:iam::{}:role{DEFAULT_SERVICE_LINKED_ROLE_PATH}{DEFAULT_SERVICE_LINKED_ROLE_NAME}",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// The owned parameters of a case, as the `&[(&str, &str)]` [`query`] takes.

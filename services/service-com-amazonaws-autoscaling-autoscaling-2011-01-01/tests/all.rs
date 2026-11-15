@@ -91,6 +91,8 @@ mod scaling_policies;
 mod scaling_activity_log;
 #[path = "all/service_linked_role_binding.rs"]
 mod service_linked_role_binding;
+#[path = "all/service_linked_role_in_group_reads.rs"]
+mod service_linked_role_in_group_reads;
 #[path = "all/set_desired_capacity_on_subnet_placed_groups.rs"]
 mod set_desired_capacity_on_subnet_placed_groups;
 #[path = "all/set_instance_protection_refusal_fidelity.rs"]

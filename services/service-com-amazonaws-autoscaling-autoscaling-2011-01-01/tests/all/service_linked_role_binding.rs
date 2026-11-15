@@ -30,36 +30,14 @@ use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508 as iam_service;
 
 use crate::support::{
-    borrowed, create_launch_template, iam_query, p, query, seed_subnets, tag_value, tag_values,
+    borrowed, create_launch_template, default_service_linked_role_arn, iam_query, p, query,
+    seed_subnets, tag_value, tag_values, Placement, DEFAULT_SERVICE_LINKED_ROLE_NAME,
+    DEFAULT_SERVICE_LINKED_ROLE_PATH,
 };
-
-/// The path IAM reserves for a service-linked role, followed by the service principal
-/// Amazon EC2 Auto Scaling acts under.
-///
-/// SOURCE: a service-linked role is filed under `/aws-service-role/<service principal>/`,
-/// and this service's principal is `autoscaling.amazonaws.com` — the principal IAM's own
-/// catalog of published service-linked roles names for Amazon EC2 Auto Scaling.
-const DEFAULT_ROLE_PATH: &str = "/aws-service-role/autoscaling.amazonaws.com/";
-
-/// The name of the role a group is bound to when its create names none.
-///
-/// SOURCE: `CreateAutoScalingGroupType$ServiceLinkedRoleARN` — "By default, Amazon EC2 Auto
-/// Scaling uses a service-linked role named `AWSServiceRoleForAutoScaling`, which it creates
-/// if it does not exist."
-const DEFAULT_ROLE_NAME: &str = "AWSServiceRoleForAutoScaling";
 
 /// Another service's own service-linked role, used by a row that names a role which is NOT
 /// this service's default: Amazon EC2 Fleet's, as IAM publishes it.
 const OTHER_SERVICE_ROLE_NAME: &str = "AWSServiceRoleForEC2Fleet";
-
-/// The ARN of the default service-linked role: fixed text apart from the account id, which
-/// is the caller's account.
-fn default_role_arn() -> String {
-    format!(
-        "arn:aws:iam::{}:role{DEFAULT_ROLE_PATH}{DEFAULT_ROLE_NAME}",
-        ::engine::emulator_account_id()
-    )
-}
 
 /// The trust policy the roles this suite creates in IAM carry, which is all `CreateRole`
 /// asks of one.
@@ -81,15 +59,6 @@ enum Named {
     HeldRoleUnderPath,
     /// It names ANOTHER service's own service-linked role.
     OtherServicesRole,
-}
-
-/// Where the group places its instances.
-#[derive(Debug, Clone, Copy)]
-enum Placement {
-    /// `AvailabilityZones`, naming the zone a seeded subnet is in.
-    Zone,
-    /// `VPCZoneIdentifier`, naming that subnet.
-    Subnet,
 }
 
 /// One row: the case, what the create names, and how the group is placed.
@@ -239,10 +208,12 @@ async fn a_group_reports_the_service_linked_role_it_is_bound_to() {
         let case = row.case;
         let (router, engine) = emulator();
         let subnet = seed_subnets(&engine, 1).remove(0);
-        create_launch_template(&router, LAUNCH_TEMPLATE).await;
+        // This suite names the template by name, so the id and version the helper answers
+        // are not read here.
+        let _ = create_launch_template(&router, LAUNCH_TEMPLATE).await;
 
         let expected = match row.named {
-            Named::Nothing | Named::DefaultRole => default_role_arn(),
+            Named::Nothing | Named::DefaultRole => default_service_linked_role_arn(),
             Named::HeldRole => create_role(&router, "asg-role", "/").await,
             Named::HeldRoleUnderPath => {
                 create_role(&router, "asg-role-under-path", "/service-role/").await
@@ -283,7 +254,7 @@ async fn a_group_reports_the_service_linked_role_it_is_bound_to() {
 async fn the_default_role_is_the_one_iam_holds_for_this_service() {
     let (router, engine) = emulator();
     let subnet = seed_subnets(&engine, 1).remove(0);
-    create_launch_template(&router, LAUNCH_TEMPLATE).await;
+    let _ = create_launch_template(&router, LAUNCH_TEMPLATE).await;
 
     let (status, body) = create_group(
         &router,
@@ -303,20 +274,20 @@ async fn the_default_role_is_the_one_iam_holds_for_this_service() {
     // The ARN the group names is a role IAM itself reports under the published name, filed
     // under the path IAM reserves for a service-linked role: a client that reads the group's
     // role to grant it something can resolve that role.
-    let (arn, path) = role_arn_from_iam(&router, DEFAULT_ROLE_NAME).await;
+    let (arn, path) = role_arn_from_iam(&router, DEFAULT_SERVICE_LINKED_ROLE_NAME).await;
     assert_eq!(
         reported, arn,
         "case \"the default role\": expected the group to name the role IAM reports under \
-         {DEFAULT_ROLE_NAME:?} ({arn:?}), got {reported:?}"
+         {DEFAULT_SERVICE_LINKED_ROLE_NAME:?} ({arn:?}), got {reported:?}"
     );
     assert_eq!(
-        path, DEFAULT_ROLE_PATH,
-        "case \"the default role\": expected IAM to file it under {DEFAULT_ROLE_PATH:?}, got \
-         {path:?}"
+        path, DEFAULT_SERVICE_LINKED_ROLE_PATH,
+        "case \"the default role\": expected IAM to file it under \
+         {DEFAULT_SERVICE_LINKED_ROLE_PATH:?}, got {path:?}"
     );
     assert_eq!(
         reported,
-        default_role_arn(),
+        default_service_linked_role_arn(),
         "case \"the default role\": expected the published ARN, got {reported:?}"
     );
 }
@@ -325,7 +296,7 @@ async fn the_default_role_is_the_one_iam_holds_for_this_service() {
 async fn an_update_changes_the_bound_role_only_when_it_names_one() {
     let (router, engine) = emulator();
     let subnet = seed_subnets(&engine, 1).remove(0);
-    create_launch_template(&router, LAUNCH_TEMPLATE).await;
+    let _ = create_launch_template(&router, LAUNCH_TEMPLATE).await;
     let held = create_role(&router, "asg-updated-role", "/").await;
 
     let (status, body) = create_group(
@@ -347,7 +318,7 @@ async fn an_update_changes_the_bound_role_only_when_it_names_one() {
         (
             "an update that names no role",
             None,
-            default_role_arn(),
+            default_service_linked_role_arn(),
         ),
         (
             "an update that names a role of the account",
