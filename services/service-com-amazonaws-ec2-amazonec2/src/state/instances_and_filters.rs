@@ -210,6 +210,7 @@ impl ComAmazonawsEc2Amazonec2State {
     ) -> Option<InstanceStateName> {
         let instance = self.instances.get_mut(instance_id)?;
         let previous = instance.state;
+        let placed_by = instance.spot_instance_request_id.clone();
         if !previous.is_terminating() {
             instance.state = InstanceStateName::ShuttingDown;
             instance.pending_transition =
@@ -219,6 +220,19 @@ impl ComAmazonawsEc2Amazonec2State {
                 INSTANCE_STATE_REASON_USER_INITIATED_SHUTDOWN.to_string(),
                 INSTANCE_STATE_REASON_MESSAGE_USER_INITIATED_SHUTDOWN.to_string(),
             ));
+            // "`terminated` - an instance was terminated by the user" is an event of the
+            // history of the Spot Fleet request that placed this instance, if a fleet placed
+            // it: this writer is IDEMPOTENT — an instance already terminating is left as it
+            // is — so one termination records one event, at the instant it was asked for. An
+            // instance no fleet placed records nothing.
+            if let Some(request_id) = placed_by {
+                self.record_spot_fleet_instance_event(
+                    &request_id,
+                    instance_id,
+                    EVENT_SUB_TYPE_TERMINATED,
+                    at,
+                );
+            }
         }
         Some(previous)
     }

@@ -2733,6 +2733,12 @@ mod nat_gateways_and_vpn_connections;
 /// reaches it as `crate::state::VpnConnectionSpec` like any primitive of this module.
 mod vpn_connection_creation;
 mod spot_fleets;
+/// The EVENT HISTORY one Spot Fleet request has been through: the stored event, the modelled
+/// `HistoryRecord` it is reported as, and the position a report of it pages over — in a file of
+/// its own rather than as more lines beside the fleet record. Everything it declares is
+/// re-exported below, so a handler reaches it as `crate::state::SpotFleetHistoryEvent` like any
+/// primitive of this module.
+mod spot_fleet_history;
 mod spot_instance_requests;
 mod store_image_tasks_and_route_servers;
 /// Which route tables each route server may install its learned routes into: the
@@ -2868,6 +2874,7 @@ pub use store_image_tasks_and_route_servers::*;
 pub use route_server_propagations::*;
 pub use spot_instance_requests::*;
 pub use spot_fleets::*;
+pub use spot_fleet_history::*;
 pub use nat_gateways_and_vpn_connections::*;
 pub use vpn_connection_creation::*;
 pub use network_insights::*;

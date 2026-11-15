@@ -647,7 +647,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 message: Some(SPOT_STATUS_MESSAGE_FULFILLED.to_string()),
                 update_time: Some(system_time_to_date_time(at)),
             });
-            record.view.instance_id = Some(instance_id);
+            record.view.instance_id = Some(instance_id.clone());
             // "The Availability Zone in which the request is launched" — known only now
             // that it has been launched. Its zone ID is deliberately NOT set beside it:
             // "either launchedAvailabilityZone or launchedAvailabilityZoneId can be
@@ -655,6 +655,16 @@ impl ComAmazonawsEc2Amazonec2State {
             record.view.launched_availability_zone = Some(availability_zone);
             record.fulfillment = None;
         }
+        // "`launched` - a new instance was launched" is an event of the history of the Spot
+        // Fleet request that placed this Spot Instance request, if a fleet placed it: the
+        // launch happened when the fulfillment fell due, which is the instant it is recorded
+        // at. A request a caller placed itself belongs to no fleet and records nothing.
+        self.record_spot_fleet_instance_event(
+            request_id,
+            &instance_id,
+            EVENT_SUB_TYPE_LAUNCHED,
+            at,
+        );
     }
 
     /// Leave one due Spot Instance request `open` carrying

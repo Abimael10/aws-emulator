@@ -302,6 +302,11 @@ pub struct SpotFleetRequestRecord {
     pub pending: Option<SpotFleetRequestTransition>,
     /// The Spot Instance requests this fleet placed, in placement order.
     pub placements: Vec<SpotFleetPlacement>,
+    /// The events this fleet has been through, in the order they were recorded — what
+    /// `DescribeSpotFleetRequestHistory` reports. Each event ([`SpotFleetHistoryEvent`]) is
+    /// recorded at the instant it happened, by the writer that made it happen, so a report of
+    /// the history derives nothing and writes nothing.
+    pub history: Vec<SpotFleetHistoryEvent>,
     /// The Region the request was signed for, which the instances its placements launch need
     /// for their private DNS names. Not a member of any modelled Spot Fleet shape.
     pub region: String,
@@ -351,10 +356,15 @@ impl SpotFleetRequestRecord {
             .as_ref()
             .filter(|pending| now >= pending.due_at)
             .filter(|pending| pending.to != SPOT_FLEET_STATE_CANCELLED || !running_instances)
-            .map(|pending| pending.to);
-        if let Some(to) = due {
+            .map(|pending| (pending.to, pending.at));
+        if let Some((to, at)) = due {
             self.view.spot_fleet_request_state = Some(to.to_string());
             self.pending = None;
+            // "A change in the status or configuration of the Spot Fleet request" is an event
+            // of the fleet's history, recorded at the instant the change FELL DUE rather than
+            // the instant somebody read it — the state changed when the move fell due.
+            self.history
+                .push(SpotFleetHistoryEvent::fleet_request_change(to, at));
         }
         let target = self.target_capacity();
         let on_demand = self
@@ -739,6 +749,14 @@ impl ComAmazonawsEc2Amazonec2State {
                     SPOT_FLEET_STATE_ACTIVE,
                 )),
                 placements,
+                // The first event of every fleet's history: "`submitted` - the EC2 Fleet or
+                // Spot Fleet request is being evaluated and Amazon EC2 is preparing to launch
+                // the target number of instances" (`EventInformation$EventSubType`), which is
+                // the state this write puts the fleet in, at the instant it was created.
+                history: vec![SpotFleetHistoryEvent::fleet_request_change(
+                    SPOT_FLEET_STATE_SUBMITTED,
+                    created_at,
+                )],
                 region: spec.region,
             },
         );
@@ -868,6 +886,19 @@ impl ComAmazonawsEc2Amazonec2State {
         let placements = record.placements.clone();
 
         let at = SystemTime::now();
+        let current_state = if terminate_instances {
+            SPOT_FLEET_STATE_CANCELLED_TERMINATING
+        } else {
+            SPOT_FLEET_STATE_CANCELLED_RUNNING
+        };
+        // The cancellation is itself "a change in the status or configuration of the Spot Fleet
+        // request", so it is one event of the fleet's history, at the instant the cancellation
+        // was asked for — recorded BEFORE the instances it terminates record theirs, because
+        // the request was cancelled first and they are terminated because it was.
+        self.record_spot_fleet_history_event(
+            fleet_id,
+            SpotFleetHistoryEvent::fleet_request_change(current_state, at),
+        );
         for placement in &placements {
             // Each request the fleet placed is cancelled through the ONE writer of a Spot
             // Instance request's cancellation, so a request cancelled with its fleet and one
@@ -887,11 +918,6 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         }
 
-        let current_state = if terminate_instances {
-            SPOT_FLEET_STATE_CANCELLED_TERMINATING
-        } else {
-            SPOT_FLEET_STATE_CANCELLED_RUNNING
-        };
         let record = self.spot_fleet_requests.get_mut(fleet_id)?;
         record.view.spot_fleet_request_state = Some(current_state.to_string());
         // The `active` the clock owed a `submitted` fleet is not owed a cancelled one; what it

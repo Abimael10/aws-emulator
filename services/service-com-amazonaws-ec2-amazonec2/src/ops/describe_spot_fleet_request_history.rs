@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSpotFleetRequestHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSpotFleetRequestHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSpotFleetRequestHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the events the one Spot Fleet request the call names has been through,
+//! read out of the history [`crate::state`] records for that fleet — each `BatchState` it
+//! entered and each instance its placements launched or its cancellation terminated — from the
+//! requested `StartTime` on, as far back as the events are available for, narrowed to one
+//! `EventType` where the request names one, and cut into `MaxResults`-sized pages in event
+//! order. The events are recorded when they HAPPEN, by
+//! the writers that make them happen, so this operation writes nothing and two reports a
+//! moment apart carry the same records. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +155,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSpotFleetRequestHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSpotFleetRequestHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSpotFleetRequestHistory"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            MAX_PAGE_SIZE, PageTokenRule, date_time_to_system_time,
+            decode_scoped_page_token, invalid_pagination_token_for,
+            require_known_spot_fleet_request, require_service_state,
+            require_well_formed_spot_fleet_request_id, SPOT_FLEET_HISTORY_AVAILABILITY,
+            scoped_page_from_cursor, spot_fleet_history_position, spot_fleet_history_record_view,
+            system_time_to_date_time,
+        };
+
+        // `ctx` carries request metadata only; a Spot Fleet request and the events it has been
+        // through are the account's, so the Region the call was signed for does not narrow
+        // them. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The ID of the Spot Fleet request"
+        // (`DescribeSpotFleetRequestHistoryRequest$SpotFleetRequestId`): something that is not
+        // a Spot Fleet request id at all is refused BEFORE any lookup, so a caller can tell a
+        // typo from a fleet the account does not hold. The lookup below asks the same question
+        // again through [`require_known_spot_fleet_request`], so neither path can skip it.
+        require_well_formed_spot_fleet_request_id(&input.spot_fleet_request_id)?;
+
+        // `EventType` targets the modelled `EventType` catalog and `MaxResults` the `@range`
+        // 1..1000 of `DescribeSpotFleetRequestHistoryMaxResults`, so a value outside either is
+        // already refused before this handler runs: the only thing left to do with them is
+        // read one as a narrowing and the other as a page size.
+
+        // "The token to include in another request to get the next page of items"
+        // (`$NextToken`) — scoped to the fleet whose history it was minted while paging, so a
+        // token from another fleet's history is refused rather than resumed from here, and
+        // anything else is refused rather than read as a position.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                decode_scoped_page_token(token, &input.spot_fleet_request_id)
+                    .ok_or_else(|| invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The clock first: a Spot Instance request whose fulfillment has fallen due has
+        // already launched its instance and a fleet whose state move has fallen due has
+        // already made it, so both have already RECORDED the event each one is. Every such
+        // move was owed at this instant whether or not anybody called, so no event this report
+        // leaves out could have been reported by an earlier call either.
+        store.materialize_due_transitions();
+
+        // "The ID of the Spot Fleet request": an id that names no fleet of the account is an
+        // error, not an empty history.
+        let record = require_known_spot_fleet_request(&store, &input.spot_fleet_request_id)?;
+
+        // DryRun sits AFTER every parameter has been validated and the named fleet resolved:
+        // the flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "The starting date and time for the events, in UTC format"
+        // (`$StartTime`): the events from that instant ON, compared as INSTANTS through the
+        // one conversion this crate reads a modelled timestamp with rather than as renderings
+        // of them. A start in the future selects no event rather than being refused — the
+        // member publishes no bound — and one earlier than the events are available for
+        // reaches only as far back as they ARE ([`SPOT_FLEET_HISTORY_AVAILABILITY`]).
+        let available_from = ::std::time::SystemTime::now()
+            .checked_sub(SPOT_FLEET_HISTORY_AVAILABILITY)
+            .unwrap_or(::std::time::UNIX_EPOCH);
+        let from = date_time_to_system_time(input.start_time).max(available_from);
+
+        // "The type of events to describe. By default, all events are described"
+        // (`$EventType`), compared against the event's own `HistoryRecord$EventType`.
+        let wanted_type = input.event_type.as_deref();
+
+        let mut selected: Vec<(String, crate::ops::types::HistoryRecord)> = record
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.at >= from)
+            .filter(|(_, event)| wanted_type.is_none_or(|wanted| wanted == event.event_type))
+            .map(|(recorded, event)| {
+                (
+                    spot_fleet_history_position(event.at, recorded),
+                    spot_fleet_history_record_view(event),
+                )
+            })
+            .collect();
+
+        // Page in the order the history RAN — oldest event first, the position it was recorded
+        // at breaking a tie between two events of one instant — which is the order the cursor
+        // below names a position in. Total, so the cursor always advances.
+        selected.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        // A request that names no page size gets the largest page this service serves, so the
+        // `NextToken` path behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more items to return" (`$NextToken`): a token
+        // only when a further event follows this page, through the crate's one reading of that
+        // rule. The token is scoped to this fleet, because each fleet's history is its own
+        // order and a position in one names nothing in another.
+        let (page, next_token) = scoped_page_from_cursor(
+            &input.spot_fleet_request_id,
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |(position, _)| position.as_str(),
+        );
+
+        // "All records up to this time were retrieved. If nextToken indicates that there are
+        // more items, this value is not present" (`$LastEvaluatedTime`): the instant this
+        // history was evaluated at, on the page that completes the walk. It is never before an
+        // event this report carries, so a caller that asks again from it misses nothing —
+        // which is what the operation's own note about the delay before an event can be
+        // described promises ("Spot Fleet events are delayed by up to 30 seconds … this
+        // ensures that you can query by the last evaluated time and not miss a recorded
+        // event"), an event of this emulator being describable as soon as it has happened.
+        let last_evaluated_time = next_token.is_none().then(|| {
+            let evaluated_at = record
+                .history
+                .iter()
+                .map(|event| event.at)
+                .fold(::std::time::SystemTime::now(), ::std::cmp::Ord::max);
+            system_time_to_date_time(evaluated_at)
+        });
+
+        let history_records: Vec<crate::ops::types::HistoryRecord> = page
+            .iter()
+            .map(|(_, history_record)| history_record.clone())
+            .collect();
+
+        Ok(DescribeSpotFleetRequestHistoryOutput {
+            // "Information about the events in the history of the Spot Fleet request"
+            // (`$HistoryRecords`): the page selected above, EMPTY rather than absent for a
+            // fleet that has no event in the requested window.
+            history_records: Some(history_records),
+            last_evaluated_time,
+            next_token,
+            // "The ID of the Spot Fleet request" and "the starting date and time for the
+            // events": the fleet the report is of, as the store holds it, and the window it
+            // was read over, as the request named it.
+            spot_fleet_request_id: Some(record.spot_fleet_request_id().to_string()),
+            start_time: Some(input.start_time),
+        })
     }
 }

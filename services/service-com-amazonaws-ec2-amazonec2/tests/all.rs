@@ -1376,6 +1376,9 @@ mod spot_fleet_instances;
 // it placed, and what it reports per fleet.
 #[path = "all/spot_fleet_request_cancellation.rs"]
 mod spot_fleet_request_cancellation;
+// The events `DescribeSpotFleetRequestHistory` reports for one Spot Fleet request.
+#[path = "all/spot_fleet_request_history.rs"]
+mod spot_fleet_request_history;
 #[path = "all/spot_fleet_requests.rs"]
 mod spot_fleet_requests;
 #[path = "all/spot_instance_requests.rs"]

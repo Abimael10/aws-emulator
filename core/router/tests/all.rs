@@ -1449,3 +1449,20 @@ mod sts_session_context_keys;
 // file. The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
 // `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` check all of the
 // above, for this file and for every service crate's `tests/all.rs`, so check there rather
+// per suite file under `tests/all/`, sorted by name, and no other line — so two branches
+// landing at once insert two lines in two places and have no prose to duplicate, re-word or
+// mistype. Put a new suite at `tests/all/<name>.rs` and insert its pair where its name sorts
+// crate, belongs in that suite's own module header, where it is read beside the test it
+// explains, and a note about THIS file belongs in `all/appended_notes.rs`, which is declared
+// below like any other suite. NOTHING stands after the last pair, for the same reason.
+// EVERY comment here is an ordinary `//` one, this header included, and that is deliberate:
+// an inner doc comment documents the module it stands in, so the language accepts it only
+// ahead of the first item, and one a landing leaves below the list is `E0753` and compiles no
+// suite of this target. With none anywhere in the file, no appended, re-typed or merged copy
+// of one of these lines can be one.
+// declaration is what points it into `tests/all/`. A suite no `mod` here names is compiled
+// nowhere and its tests never run, and a suite declared twice is `E0428` — either fails this
+// whole target. `all/all_rs_carries_no_inner_doc_comment.rs`,
+// crate's own, so check there rather than leaving a note here.
+// An inner attribute, like an inner doc comment, is legal only before the first item, so it
+// stands here rather than in the list below.
