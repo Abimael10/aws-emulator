@@ -14,7 +14,9 @@
 
 use aes::cipher::block_padding::NoPadding;
 use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit};
+use aes::cipher::{
+    BlockDecrypt, BlockDecryptMut, BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit,
+};
 use aes::{Aes128, Aes192, Aes256};
 use cmac::{Cmac, Mac};
 use des::TdesEde3;
@@ -60,6 +62,25 @@ pub(super) fn tdes_encrypt_blocks(key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
         encrypted.extend_from_slice(&block);
     }
     Some(encrypted)
+}
+
+/// Every 8-byte block of `data`, decrypted under the TDES key `key` on its own: the
+/// inverse of [`tdes_encrypt_blocks`], which is what recovers a key from an AS 2805 key
+/// cryptogram.
+///
+/// `None` under the same conditions as the encryption it inverts.
+pub(super) fn tdes_decrypt_blocks(key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    if data.is_empty() || !data.len().is_multiple_of(TDES_BLOCK) {
+        return None;
+    }
+    let cipher = <TdesEde3 as KeyInit>::new_from_slice(&tdes_bundle(key)?).ok()?;
+    let mut decrypted = Vec::with_capacity(data.len());
+    for encrypted in data.chunks(TDES_BLOCK) {
+        let mut block = GenericArray::clone_from_slice(encrypted);
+        cipher.decrypt_block(&mut block);
+        decrypted.extend_from_slice(&block);
+    }
+    Some(decrypted)
 }
 
 /// One 16-byte block encrypted under the AES key `key`, whichever of the three AES key
@@ -143,4 +164,41 @@ pub(super) fn aes_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<
         _ => return None,
     };
     Some(encrypted.to_vec())
+}
+
+/// CBC decryption of `data` under the TDES key `key` from the initialisation vector
+/// `iv`: the inverse of [`tdes_cbc_encrypt`], which is what recovers the plaintext
+/// payload of a key block on its way in.
+///
+/// The mode strips no padding of its own, for the same reason the encryption applies
+/// none: the payload carries the standard's own.
+pub(super) fn tdes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    let bundle = tdes_bundle(key)?;
+    let mut buffer = data.to_vec();
+    let decrypted = cbc::Decryptor::<TdesEde3>::new_from_slices(&bundle, iv)
+        .ok()?
+        .decrypt_padded_mut::<NoPadding>(&mut buffer)
+        .ok()?;
+    Some(decrypted.to_vec())
+}
+
+/// CBC decryption under an AES key, under the same rule as [`tdes_cbc_decrypt`].
+pub(super) fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    let mut buffer = data.to_vec();
+    let decrypted = match key.len() {
+        16 => cbc::Decryptor::<Aes128>::new_from_slices(key, iv)
+            .ok()?
+            .decrypt_padded_mut::<NoPadding>(&mut buffer)
+            .ok()?,
+        24 => cbc::Decryptor::<Aes192>::new_from_slices(key, iv)
+            .ok()?
+            .decrypt_padded_mut::<NoPadding>(&mut buffer)
+            .ok()?,
+        32 => cbc::Decryptor::<Aes256>::new_from_slices(key, iv)
+            .ok()?
+            .decrypt_padded_mut::<NoPadding>(&mut buffer)
+            .ok()?,
+        _ => return None,
+    };
+    Some(decrypted.to_vec())
 }

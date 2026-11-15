@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ASC X9.143 (TR-31) key block an exported key is wrapped in.
+//! The ASC X9.143 (TR-31) key block a key travels in, in both directions.
 //!
-//! One concern: turning a key's stored material, plus the header fields a caller asked
-//! for, into the ASCII key block `ExportKey` answers with — encrypted and
-//! authenticated under a wrapping key this store also holds. The key material itself
-//! never leaves [`super`] in the clear: this module reads it, wraps it, and hands back
-//! the block.
+//! One concern: the key block itself. [`build`] turns a key's stored material, plus the
+//! header fields a caller asked for, into the ASCII block `ExportKey` answers with, and
+//! [`parse`] reads such a block back into the key it carries and what its header says
+//! about that key — which is what `ImportKey` stores. Both are encrypted and
+//! authenticated under a key encryption key this store also holds, and the key material
+//! itself never leaves [`super`] in the clear: this module wraps it, unwraps it, and
+//! hands back the block or the key.
 //!
 //! The block is the one the standard defines, built with real primitives
 //! ([`super::block_cipher`]):
@@ -17,7 +19,12 @@
 //!   key, version `D` for an AES one;
 //! * the MAC is a CMAC over the header, the optional blocks and the plaintext payload;
 //! * that MAC is the initialisation vector of the payload's CBC encryption, so the
-//!   authentication is bound to the ciphertext.
+//!   authentication is bound to the ciphertext — and a block read back is authenticated
+//!   by recomputing that MAC over what came out and comparing it with what the block
+//!   carries.
+//!
+//! Each table over a header field sits beside its inverse, so the two directions cannot
+//! come to disagree about what a character means.
 //!
 //! What is written here is the block's own layout, which no crate on the registry
 //! implements; every cipher, MAC and chaining step is a crate's.
@@ -27,7 +34,8 @@ use std::collections::BTreeMap;
 use crate::ops::types::KeyModesOfUse;
 
 use super::block_cipher::{
-    aes_cbc_encrypt, aes_cmac, tdes_cbc_encrypt, tdes_cmac, AES_BLOCK, TDES_BLOCK,
+    aes_cbc_decrypt, aes_cbc_encrypt, aes_cmac, tdes_cbc_decrypt, tdes_cbc_encrypt, tdes_cmac,
+    AES_BLOCK, TDES_BLOCK,
 };
 
 /// The version id of a key block whose protection key is a TDES key: the TDES key
@@ -178,6 +186,193 @@ pub(super) fn build(block: &KeyBlock<'_>) -> Result<String, String> {
         hex::encode_upper(&ciphertext),
         hex::encode_upper(&mac)
     ))
+}
+
+/// One key block read back: the key it carries, and what its header says about that
+/// key.
+///
+/// The header fields a key RECORD does not keep are read, checked and dropped rather
+/// than carried here: its key version number and its optional blocks say things about
+/// the transfer (`Key` models no member for either), and its own length field and
+/// padding block describe the block's layout.
+#[derive(Debug, Clone)]
+pub(super) struct ParsedKeyBlock {
+    /// The key material the block carried, recovered from its payload.
+    pub payload: Vec<u8>,
+    /// The header's algorithm character, which with the payload's length is what names
+    /// the key's `KeyAlgorithm`.
+    pub algorithm: char,
+    /// The header's two-character key usage.
+    pub usage_code: String,
+    /// The header's mode of use character.
+    pub mode: char,
+    /// The header's exportability character.
+    pub exportability: char,
+}
+
+/// Read `block` back under the protection key it was wrapped with, or say why it is
+/// not a key block that key authenticates.
+///
+/// The exact inverse of [`build`], step for step: the header is clear text, the
+/// payload's encryption key and the block's MAC key are derived from the protection
+/// key by the same binding method, the payload is decrypted from the MAC the block
+/// carries as its initialisation vector, and the MAC is then RECOMPUTED over the
+/// header, the optional blocks and the recovered plaintext and compared with the one
+/// the block carries — so a block whose header, payload or MAC was altered after it
+/// was built, or one built under another key, is refused rather than unwrapped into
+/// whatever the ciphertext happens to decrypt to.
+///
+/// Every refusal says which field of the block could not be read, for the caller to
+/// word the refusal from: a key block is read by a party that was sent one, so what a
+/// SENDER is told about it is the importing operation's decision
+/// ([`super::key_import`]), not this module's.
+pub(super) fn parse(
+    block: &str,
+    protection_key: &[u8],
+    protection_key_algorithm: &str,
+) -> Result<ParsedKeyBlock, String> {
+    let (version, block_size, mac_len) = binding_method(protection_key_algorithm)?;
+    let malformed = |what: &str| what.to_string();
+    if !block.is_ascii() || block.len() < HEADER_LEN {
+        return Err(malformed(&format!(
+            "a key block is at least the {HEADER_LEN} characters of its header"
+        )));
+    }
+
+    let header = &block[..HEADER_LEN];
+    let version_id = header[..1].chars().next().unwrap_or_default();
+    if version_id != version {
+        return Err(malformed(&format!(
+            "it carries the key block version {version_id}, and a key block protected by a \
+             {protection_key_algorithm} key carries version {version}"
+        )));
+    }
+    let total: usize = header[1..5]
+        .parse()
+        .map_err(|_| malformed("its length field is not four decimal digits"))?;
+    if total != block.len() {
+        return Err(malformed(&format!(
+            "its length field says {total} characters and it carries {}",
+            block.len()
+        )));
+    }
+    let usage_code = header[5..7].to_string();
+    let algorithm = header[7..8].chars().next().unwrap_or_default();
+    let mode = header[8..9].chars().next().unwrap_or_default();
+    let exportability = header[11..12].chars().next().unwrap_or_default();
+    let optional_count: usize = header[12..14]
+        .parse()
+        .map_err(|_| malformed("its optional block count is not two decimal digits"))?;
+
+    let region_end = read_optional_blocks(block, optional_count, &malformed)?;
+    let wrapped = &block[region_end..];
+    let payload_len = wrapped
+        .len()
+        .checked_sub(mac_len * 2)
+        .filter(|len| *len > 0 && len.is_multiple_of(block_size * 2))
+        .ok_or_else(|| {
+            malformed(&format!(
+                "its wrapped payload and MAC are {} characters, and a key block protected by a \
+                 {protection_key_algorithm} key carries a {mac_len}-byte MAC after a whole \
+                 number of {block_size}-byte cipher blocks",
+                wrapped.len()
+            ))
+        })?;
+    let ciphertext = hex::decode(&wrapped[..payload_len])
+        .map_err(|_| malformed("its wrapped payload is not hexadecimal"))?;
+    let mac = hex::decode(&wrapped[payload_len..])
+        .map_err(|_| malformed("its MAC is not hexadecimal"))?;
+
+    let unusable = || "it could not be unwrapped under the wrapping key named".to_string();
+    let encryption_key =
+        derive(protection_key, DERIVE_USAGE_ENCRYPTION, version).ok_or_else(unusable)?;
+    let mac_key = derive(protection_key, DERIVE_USAGE_MAC, version).ok_or_else(unusable)?;
+    let plaintext = if version == VERSION_TDES {
+        tdes_cbc_decrypt(&encryption_key, &mac, &ciphertext)
+    } else {
+        aes_cbc_decrypt(&encryption_key, &mac, &ciphertext)
+    }
+    .ok_or_else(unusable)?;
+
+    let mut authenticated = Vec::with_capacity(region_end + plaintext.len());
+    authenticated.extend_from_slice(&block.as_bytes()[..region_end]);
+    authenticated.extend_from_slice(&plaintext);
+    let recomputed = if version == VERSION_TDES {
+        tdes_cmac(&mac_key, &authenticated)
+    } else {
+        aes_cmac(&mac_key, &authenticated)
+    }
+    .ok_or_else(unusable)?;
+    if recomputed != mac {
+        return Err("its MAC does not authenticate it under the wrapping key named, so the key \
+                    block is not intact or was not wrapped under that key"
+            .to_string());
+    }
+
+    Ok(ParsedKeyBlock {
+        payload: read_payload(&plaintext, &malformed)?,
+        algorithm,
+        usage_code,
+        mode,
+        exportability,
+    })
+}
+
+/// The offset the wrapped payload of `block` starts at: past its header and past the
+/// `count` optional blocks that header says follow it.
+///
+/// Each block is framed exactly as [`optional_block_region`] writes one: its
+/// two-character id, its length as two hexadecimal characters counting the id and the
+/// length field themselves, then its value. The values are not kept — an optional block
+/// carries data about the transfer rather than about the key — but every one of them is
+/// walked, so a header region whose framing does not add up is refused instead of being
+/// mistaken for the start of the payload.
+fn read_optional_blocks(
+    block: &str,
+    count: usize,
+    malformed: &dyn Fn(&str) -> String,
+) -> Result<usize, String> {
+    let mut at = HEADER_LEN;
+    for _ in 0..count {
+        let framed = block
+            .get(at..at + OPTIONAL_BLOCK_OVERHEAD)
+            .ok_or_else(|| malformed("it ends inside one of its optional blocks"))?;
+        let len = usize::from_str_radix(&framed[2..4], 16).map_err(|_| {
+            malformed("an optional block's length is not two hexadecimal characters")
+        })?;
+        if len < OPTIONAL_BLOCK_OVERHEAD || block.len() < at + len {
+            return Err(malformed(&format!(
+                "the optional block {} says it is {len} characters long",
+                &framed[..2]
+            )));
+        }
+        at += len;
+    }
+    Ok(at)
+}
+
+/// The key material a key block's decrypted payload carries: the length in bits the
+/// payload opens with, then that many bits of key, then padding this service ignores.
+fn read_payload(plaintext: &[u8], malformed: &dyn Fn(&str) -> String) -> Result<Vec<u8>, String> {
+    let bits = plaintext
+        .get(..2)
+        .map(|field| u16::from_be_bytes([field[0], field[1]]))
+        .ok_or_else(|| malformed("its payload carries no key length"))?;
+    if !bits.is_multiple_of(8) {
+        return Err(malformed(&format!(
+            "its payload says the key is {bits} bits, which is not a whole number of bytes"
+        )));
+    }
+    let len = usize::from(bits / 8);
+    plaintext
+        .get(2..2 + len)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| {
+            malformed(&format!(
+                "its payload says the key is {bits} bits and carries {} bytes",
+                plaintext.len().saturating_sub(2)
+            ))
+        })
 }
 
 /// The binding method a key block protected by `key_algorithm` uses: its version id,
@@ -361,6 +556,28 @@ fn algorithm_code(key_algorithm: &str) -> Option<char> {
     Some(code)
 }
 
+/// The modelled `KeyAlgorithm` of a key whose header gives its algorithm as `code` and
+/// whose recovered material is `key_len` bytes.
+///
+/// The header names the key's FAMILY ([`algorithm_code`]) and the payload says how long
+/// the key is, so the two together name one modelled algorithm: each row below pairs a
+/// character that table renders with a length `super::material_len` gives for exactly
+/// one value of that family. The two families a key block cannot determine are absent
+/// and answer `None`: an HMAC key's hash is not in the header (two of the modelled HMAC
+/// algorithms share a key length), and an RSA or elliptic curve key is one half of a
+/// pair rather than a secret of a known length.
+pub(super) fn key_algorithm_from_code(code: char, key_len: usize) -> Option<&'static str> {
+    let key_algorithm = match (code, key_len) {
+        ('T', 16) => "TDES_2KEY",
+        ('T', 24) => "TDES_3KEY",
+        ('A', 16) => "AES_128",
+        ('A', 24) => "AES_192",
+        ('A', 32) => "AES_256",
+        _ => return None,
+    };
+    Some(key_algorithm)
+}
+
 /// The header's mode of use character for `modes`.
 ///
 /// The standard gives one character per permitted use, and a key's nine modelled modes
@@ -395,4 +612,50 @@ fn mode_of_use(modes: &KeyModesOfUse) -> Option<char> {
         return None;
     };
     Some(mode)
+}
+
+/// The modes of use a key carries whose header gives its mode of use as `mode`.
+///
+/// The inverse of [`mode_of_use`]: the standard's one character per permitted use, read
+/// back as the modelled members that name those uses. A character names BOTH the data
+/// operation and the key operation it permits — the standard's own readings are "both
+/// encrypt and decrypt / wrap and unwrap" for `B`, "encrypt / wrap only" for `E` and
+/// "decrypt / unwrap only" for `D` — so each of them is read back as both: a header
+/// cannot say which of the two a key is restricted to, and inventing a restriction it
+/// does not state would deny the imported key a use the block permits.
+///
+/// `None` for a character the standard does not define.
+pub(super) fn modes_of_use_from_code(mode: char) -> Option<KeyModesOfUse> {
+    let mut modes = KeyModesOfUse::default();
+    let encipher = |modes: &mut KeyModesOfUse| {
+        modes.encrypt = true;
+        modes.wrap = true;
+    };
+    let decipher = |modes: &mut KeyModesOfUse| {
+        modes.decrypt = true;
+        modes.unwrap = true;
+    };
+    match mode {
+        'N' => modes.no_restrictions = true,
+        'B' => {
+            encipher(&mut modes);
+            decipher(&mut modes);
+        }
+        'C' => {
+            modes.generate = true;
+            modes.verify = true;
+        }
+        'D' => decipher(&mut modes),
+        'E' => encipher(&mut modes),
+        'G' => modes.generate = true,
+        'S' => modes.sign = true,
+        'T' => {
+            modes.sign = true;
+            decipher(&mut modes);
+        }
+        'V' => modes.verify = true,
+        'X' => modes.derive_key = true,
+        _ => return None,
+    }
+    Some(modes)
 }

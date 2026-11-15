@@ -27,6 +27,8 @@ mod certificate_signing_request;
 mod export_and_replication_parameters;
 #[path = "all/export_key.rs"]
 mod export_key;
+#[path = "all/import_key.rs"]
+mod import_key;
 #[path = "all/key_lifecycle.rs"]
 mod key_lifecycle;
 #[path = "all/key_modes_of_use_discriminator.rs"]

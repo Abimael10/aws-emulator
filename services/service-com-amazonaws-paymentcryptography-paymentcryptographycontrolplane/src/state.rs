@@ -54,6 +54,8 @@ mod block_cipher;
 mod dukpt;
 /// What `ExportKey` asks of this store, and the wrapped key it answers with.
 mod key_export;
+/// What `ImportKey` asks of this store: the key a caller's wrapped material carries.
+mod key_import;
 /// The ASC X9.143 (TR-31) key block an exported key is wrapped in.
 mod key_block;
 /// Which resource-based policy documents this service attaches to a key, and how it
@@ -76,10 +78,12 @@ pub use mpa_association::{
 };
 
 pub use key_export::{
-    ExportRejection, KeyExport, WrappedKeyMaterial, KEY_CLASS_PUBLIC_KEY,
+    ExportRejection, KeyExport, KeyProtectionUse, WrappedKeyMaterial, KEY_CLASS_PUBLIC_KEY,
     KEY_USAGE_BASE_DERIVATION_KEY, KEY_USAGE_DIGITAL_SIGNATURE, WRAPPED_KEY_FORMAT_CRYPTOGRAM,
     WRAPPED_KEY_FORMAT_TR31, WRAPPING_KEY_ALGORITHMS, WRAPPING_KEY_USAGES,
 };
+
+pub use key_import::{ImportRejection, KeyImport};
 
 /// The ARN service namespace for this service (`arnNamespace` / sigv4 name
 /// `payment-cryptography`, from OPERATIONS.md's wire-protocol section).
@@ -193,6 +197,10 @@ pub fn key_not_in_state(key_arn: &str, required_state: &str) -> String {
 /// documentation: "For keys created within Amazon Web Services Payment
 /// Cryptography, the value is `AWS_PAYMENT_CRYPTOGRAPHY`."
 pub const KEY_ORIGIN_AWS: &str = "AWS_PAYMENT_CRYPTOGRAPHY";
+
+/// The `KeyOrigin` of a key that was imported, from the same documentation: "For keys
+/// imported into Amazon Web Services Payment Cryptography, the value is `EXTERNAL`."
+pub const KEY_ORIGIN_EXTERNAL: &str = "EXTERNAL";
 
 /// `KeyReplicationState` values, from
 /// `smithy_query(query="shape",shape="KeyReplicationState")`.
@@ -858,6 +866,34 @@ pub struct NewKey {
     pub replication_regions: Vec<String>,
 }
 
+/// One key to store, with its material already in hand.
+///
+/// What a create has after it has drawn a key's material and what an import has after
+/// it has recovered one, so both reach the store through the one writer
+/// ([`ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState::store_key`])
+/// and a key's record cannot depend on which call brought it.
+#[derive(Debug)]
+struct KeyRecord {
+    /// Immutable after creation: what the key is for, what it is, and what may be done
+    /// with it.
+    key_attributes: KeyAttributes,
+    /// The key's own material, which its check value is computed from.
+    material: KeyMaterial,
+    /// The key pair this key IS, for a key of an asymmetric algorithm.
+    key_pair: Option<AsymmetricKeyPair>,
+    /// Where the material came from: generated here, or imported.
+    key_origin: &'static str,
+    /// `KeyCheckValueAlgorithm`: the algorithm the stored check value is computed by,
+    /// or the key's own default when the request named none.
+    key_check_value_algorithm: Option<String>,
+    exportable: bool,
+    enabled: Option<bool>,
+    derive_key_usage: Option<String>,
+    tags: BTreeMap<String, String>,
+    /// The regions this key replicates to; empty takes the account's defaults.
+    replication_regions: Vec<String>,
+}
+
 /// Why a key could not be minted.
 #[derive(Debug, Clone)]
 pub enum MintRejection {
@@ -1001,51 +1037,12 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
                  service generates key material for"
             ))
         })?;
-        // The algorithm in effect is the one the request named, or the one this
-        // key's own algorithm dictates when it named none.
-        let kcv_algorithm = match request.key_check_value_algorithm.clone() {
-            Some(named) => named,
-            None => default_kcv_algorithm(&key_algorithm)
-                .ok_or_else(|| {
-                    MintRejection::Invalid(format!(
-                        "KeyAttributes.KeyAlgorithm {key_algorithm} has no default \
-                         KeyCheckValueAlgorithm in this service"
-                    ))
-                })?
-                .to_string(),
-        };
 
         // The store's capacity is judged BEFORE any material is drawn, so a create
         // the store has no room for costs no key generation, and the only refusal
         // ordering left below is the one the request itself earns.
-        if self.keys.len() >= MAX_KEYS {
-            return Err(MintRejection::QuotaExceeded(format!(
-                "this account already holds the maximum of {MAX_KEYS} keys"
-            )));
-        }
-
-        // "New keys created in this account will automatically be replicated to
-        // these regions unless explicitly configured otherwise during key creation"
-        // (`EnabledReplicationRegions`' own documentation), so a create that named no
-        // regions of its own takes the account's defaults as they stand now, and one
-        // that named its own keeps them and overrides the defaults.
-        let uses_default_replication_regions = request.replication_regions.is_empty();
-        let requested_regions: Vec<String> = if uses_default_replication_regions {
-            self.enabled_replication_regions.iter().cloned().collect()
-        } else {
-            request.replication_regions
-        };
-        // Replication to each of them starts with this call, so the key is a
-        // Multi-Region primary from the moment it exists and its replicas settle a
-        // span later, exactly as they do when a later call adds a region.
-        let replication_regions: BTreeMap<String, ReplicaRegion> = requested_regions
-            .into_iter()
-            .map(|region| (region, ReplicaRegion::started(now)))
-            .collect();
-        if replication_regions.len() > MAX_KEY_REPLICATION_REGIONS {
-            return Err(MintRejection::QuotaExceeded(format!(
-                "a key cannot replicate to more than {MAX_KEY_REPLICATION_REGIONS} regions"
-            )));
+        if let Some(full) = self.capacity_rejection() {
+            return Err(full);
         }
 
         let material = self.fresh_material(material_len);
@@ -1073,6 +1070,84 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
                 ))
             })?)
         };
+
+        self.store_key(
+            region,
+            KeyRecord {
+                key_attributes: request.key_attributes,
+                material,
+                key_pair,
+                // The service generates the key material while the call runs, so this
+                // key's material is its own and came from nowhere else.
+                key_origin: KEY_ORIGIN_AWS,
+                key_check_value_algorithm: request.key_check_value_algorithm,
+                exportable: request.exportable,
+                enabled: request.enabled,
+                derive_key_usage: request.derive_key_usage,
+                tags,
+                replication_regions: request.replication_regions,
+            },
+            now,
+        )
+    }
+
+    /// Store `record` as a key of this store in `region` and answer the stored record.
+    ///
+    /// The one place a key record is created, whichever call brought the material: a
+    /// create that generated it ([`Self::mint_key`]) or an import that recovered it from
+    /// wrapped material ([`key_import`]). Everything a key carries that is not about
+    /// where its material came from is decided here — the ARN it is stored under, the
+    /// check value computed from the material in hand, the replication configuration and
+    /// the state and timestamps a created key starts in — so an imported key and a
+    /// generated one are the same kind of record and every reader reports them alike.
+    fn store_key(
+        &mut self,
+        region: &str,
+        record: KeyRecord,
+        now: SystemTime,
+    ) -> Result<StoredKey, MintRejection> {
+        let key_algorithm = record.key_attributes.key_algorithm.clone();
+        // The algorithm in effect is the one the request named, or the one this
+        // key's own algorithm dictates when it named none.
+        let kcv_algorithm = match record.key_check_value_algorithm.clone() {
+            Some(named) => named,
+            None => default_kcv_algorithm(&key_algorithm)
+                .ok_or_else(|| {
+                    MintRejection::Invalid(format!(
+                        "KeyAttributes.KeyAlgorithm {key_algorithm} has no default \
+                         KeyCheckValueAlgorithm in this service"
+                    ))
+                })?
+                .to_string(),
+        };
+        if let Some(full) = self.capacity_rejection() {
+            return Err(full);
+        }
+
+        // "New keys created in this account will automatically be replicated to
+        // these regions unless explicitly configured otherwise during key creation"
+        // (`EnabledReplicationRegions`' own documentation), so a call that named no
+        // regions of its own takes the account's defaults as they stand now, and one
+        // that named its own keeps them and overrides the defaults.
+        let uses_default_replication_regions = record.replication_regions.is_empty();
+        let requested_regions: Vec<String> = if uses_default_replication_regions {
+            self.enabled_replication_regions.iter().cloned().collect()
+        } else {
+            record.replication_regions
+        };
+        // Replication to each of them starts with this call, so the key is a
+        // Multi-Region primary from the moment it exists and its replicas settle a
+        // span later, exactly as they do when a later call adds a region.
+        let replication_regions: BTreeMap<String, ReplicaRegion> = requested_regions
+            .into_iter()
+            .map(|region| (region, ReplicaRegion::started(now)))
+            .collect();
+        if replication_regions.len() > MAX_KEY_REPLICATION_REGIONS {
+            return Err(MintRejection::QuotaExceeded(format!(
+                "a key cannot replicate to more than {MAX_KEY_REPLICATION_REGIONS} regions"
+            )));
+        }
+
         // An id no stored key is using, so the insert below can only add a record.
         let key_id = self.fresh_key_id(region).ok_or_else(|| {
             MintRejection::QuotaExceeded(
@@ -1082,17 +1157,17 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
         let key_arn = key_arn(region, &key_id);
         let mut stored = StoredKey {
             key_arn: key_arn.clone(),
-            key_attributes: request.key_attributes,
+            key_attributes: record.key_attributes,
             // Filled in below, from the material this record holds.
             key_check_value: String::new(),
             key_check_value_algorithm: kcv_algorithm.clone(),
             // `Enabled`'s own documentation: "The default value is enabled."
-            enabled: request.enabled.unwrap_or(true),
-            exportable: request.exportable,
-            // The service generates the key material while the call runs, so a
-            // created key is complete by the time `CreateKey` answers.
+            enabled: record.enabled.unwrap_or(true),
+            exportable: record.exportable,
+            // The key's material is in hand while the call runs, so the key is
+            // complete by the time the call answers.
             key_state: KEY_STATE_CREATE_COMPLETE.to_string(),
-            key_origin: KEY_ORIGIN_AWS.to_string(),
+            key_origin: record.key_origin.to_string(),
             create_timestamp: now,
             // The material exists from the moment the key does, so the key is
             // usable for cryptographic operations from then on.
@@ -1100,15 +1175,15 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
             // Written by `StopKeyUsage`, the call that stops this key's use.
             usage_stop_timestamp: None,
             delete_pending_timestamp: None,
-            derive_key_usage: request.derive_key_usage,
+            derive_key_usage: record.derive_key_usage,
             replication_regions,
             uses_default_replication_regions,
-            tags,
-            // A created key carries no policy of its own: one is attached by the call that
-            // asks for it, and `CreateKey` takes no policy document.
+            tags: record.tags,
+            // A new key carries no policy of its own: one is attached by the call that
+            // asks for it, and neither a create nor an import takes a policy document.
             resource_policy: None,
-            material,
-            key_pair,
+            material: record.material,
+            key_pair: record.key_pair,
         };
         stored.key_check_value = stored.check_value_under(&kcv_algorithm).ok_or_else(|| {
             MintRejection::Invalid(format!(
@@ -1123,6 +1198,15 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
         // record, never replace one.
         self.keys.insert(key_arn, stored.clone());
         Ok(stored)
+    }
+
+    /// Why no further key can be stored, or `None` while this store has room for one.
+    fn capacity_rejection(&self) -> Option<MintRejection> {
+        (self.keys.len() >= MAX_KEYS).then(|| {
+            MintRejection::QuotaExceeded(format!(
+                "this account already holds the maximum of {MAX_KEYS} keys"
+            ))
+        })
     }
 
     /// The account's default key replication regions, in one stable order.

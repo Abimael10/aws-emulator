@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -236,18 +227,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Every modelled constraint on this input has already been refused by the
+        // centralized walk: the key material union carrying exactly one mechanism,
+        // each mechanism's own required members, the length and pattern of every
+        // identifier, certificate and wrapped block, and every enum's value list. What
+        // is left for this body is what the model cannot say — which keys this store
+        // holds, whether the key encryption key named can unwrap, and whether the
+        // wrapped material is intact and is the key it says it is.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportKey"))
+        // That walk is also what bounds this handler's work: the material a request can
+        // carry is `Tr31WrappedKeyBlock` (56..9984 characters) or
+        // `WrappedKeyCryptogram` (16..4096), so a few kilobytes at most reach a cipher
+        // and the whole import is microseconds of block cipher — which is why it runs
+        // inline rather than on the blocking pool `CreateKey` needs for the hundreds of
+        // milliseconds an RSA key pair costs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal("the payment cryptography key store is unavailable")
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now();
+
+        let tags = input.tags.unwrap_or_default();
+        let replication_regions = input.replication_regions.unwrap_or_default();
+        // `RequesterComment` is "the comment from the requester explaining the reason
+        // for the import" of a key whose import needs Multi-Party Approval. That is a
+        // slice of its own — `AssociateMpaTeam` records which operations are protected
+        // and `Key.MpaStatus` reports an approval session — and no reader of a key
+        // reports the comment, so nothing here stores it.
+        let import = crate::state::KeyImport {
+            region: &region,
+            key_check_value_algorithm: input.key_check_value_algorithm.as_deref(),
+            enabled: input.enabled,
+            tags: &tags,
+            replication_regions: &replication_regions,
+        };
+
+        let stored = match &input.key_material {
+            // The two SYMMETRIC key exchange mechanisms. "For symmetric key exchange,
+            // Amazon Web Services Payment Cryptography uses the ANSI X9 TR-31 norm"
+            // (the operation's own documentation): the material arrives wrapped under a
+            // key encryption key this store already holds, so both are recovered from
+            // that key and from the request's own bytes and from nothing else.
+            ImportKeyMaterial::Tr31KeyBlock(request) => state
+                .lock()
+                .import_tr31_key_block(&import, request, now)
+                .map_err(refusal)?,
+            ImportKeyMaterial::As2805KeyCryptogram(request) => state
+                .lock()
+                .import_as2805_key_cryptogram(&import, request, now)
+                .map_err(refusal)?,
+            // The two PUBLIC KEY CERTIFICATE imports, and the three ASYMMETRIC key
+            // exchange mechanisms. Each of them needs a capability no operation of this
+            // emulator has yet: a root certificate this service trusts, against which a
+            // trusted certificate's chain is checked and which the other three name as
+            // `CertificateAuthorityPublicKeyIdentifier`, and — for TR-34 and the RSA
+            // key cryptogram — the import token and wrapping key pair
+            // `GetParametersForImport` hands out, which is itself still a scaffold. The
+            // 501 is the honest answer for material nothing here can unwrap yet: it
+            // says nobody has written these mechanisms, not that the request is bad.
+            ImportKeyMaterial::RootCertificatePublicKey(_) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "ImportKey for a root certificate public key",
+                ))
+            }
+            ImportKeyMaterial::TrustedCertificatePublicKey(_) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "ImportKey for a trusted certificate public key",
+                ))
+            }
+            ImportKeyMaterial::Tr34KeyBlock(_) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "ImportKey for a TR-34 key block",
+                ))
+            }
+            ImportKeyMaterial::KeyCryptogram(_) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "ImportKey for an RSA key cryptogram",
+                ))
+            }
+            ImportKeyMaterial::DiffieHellmanTr31KeyBlock(_) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "ImportKey for an ECDH derived TR-31 key block",
+                ))
+            }
+        };
+
+        // An import brings key material into the service, so it leaves the same local
+        // audit trail every other state change does — the operation, the key that now
+        // exists and the principal who asked, and none of the material itself.
+        crate::state::record_mutation(ctx.parts(), Self::NAME, &stored.key_arn);
+        // Answered from the record that was just stored, so a later `GetKey` reports
+        // the same ARN, attributes, check value, origin and timestamps.
+        Ok(ImportKeyOutput {
+            key: stored.to_key(now),
+        })
     }
+}
+
+/// One refused import, as this operation's modelled error.
+///
+/// An identifier that names no key this store holds is the modelled
+/// `ResourceNotFoundException`, carrying the identifier the request asked for; a bound
+/// the stored key would take this account past is the modelled
+/// `ServiceQuotaExceededException`; this service's own failure is the modelled
+/// `InternalServerException`; anything else about the request — material that is not
+/// intact, or that is not the key the request says it is — is the modelled
+/// `ValidationException`.
+fn refusal(rejection: crate::state::ImportRejection) -> ImportKeyError {
+    match rejection {
+        crate::state::ImportRejection::NotFound(identifier) => {
+            ImportKeyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                resource_id: Some(identifier),
+            })
+        }
+        crate::state::ImportRejection::Invalid(why) => {
+            ImportKeyErrorModeled::ValidationException(ValidationException { message: Some(why) })
+        }
+        crate::state::ImportRejection::QuotaExceeded(why) => {
+            ImportKeyErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+                message: Some(why),
+            })
+        }
+        crate::state::ImportRejection::Internal(why) => {
+            ImportKeyErrorModeled::InternalServerException(InternalServerException {
+                message: Some(why),
+            })
+        }
+    }
+    .into()
+}
+
+/// This service's own failure, which is the modelled `InternalServerException`: the
+/// request is admissible and the service could not serve it.
+fn internal(why: &str) -> ImportKeyError {
+    ImportKeyErrorModeled::InternalServerException(InternalServerException {
+        message: Some(why.to_string()),
+    })
+    .into()
 }

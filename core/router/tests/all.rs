@@ -2142,3 +2142,20 @@ mod s3_notification_lambda_invoke_grant_gates_delivery;
 // test it explains; the notes earlier landings appended to this file live in
 // the declarations is `E0753` and compiles no suite of this target. With no inner doc comment
 // in the file at all, no merge of two landings can leave one past the first item.
+// Single integration-test target for the router: the DECLARATION LIST, and nothing
+// else.
+// deliberate: an inner doc comment (`//` followed by `!`) is legal only before the
+// first item, so one that lands past the declarations is `E0753` and compiles no
+// suite of this target. With none anywhere in the file, no merge of two landings can
+// put one past the first item.
+// The list below is DECLARATIONS ONLY: one `#[path = "all/<name>.rs"]` / `mod
+// <name>;` pair per suite file under `tests/all/`, sorted by name, and no other line
+// — and NOTHING after the last pair — so two branches landing at once insert two
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a
+// SIBLING of this file, which the layout check refuses: the `#[path]` is what points
+// each declaration into `tests/all/`. Declare each suite exactly ONCE: a second `mod`
+// for one name is `E0428` and fails every suite here.
+// WHAT a suite covers, and WHY it belongs to this cross-service target rather than to
+// one service crate's own, is stated in that suite's own module doc, where it is read
+// beside the test it explains. A note about this file itself belongs in
+// `all/appended_notes.rs`. Four suites pin the rules above rather than restating

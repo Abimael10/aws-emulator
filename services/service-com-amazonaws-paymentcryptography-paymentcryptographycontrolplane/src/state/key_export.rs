@@ -73,6 +73,49 @@ const TR31_USAGE_INITIAL_DUKPT_KEY: &str = "B1";
 /// byte, so a whole block is always enough whichever binding method is in use.
 const MAX_PAYLOAD_PADDING: usize = AES_BLOCK;
 
+/// Which way a key encryption key protects a key: wrapping one on its way out of the
+/// service, or unwrapping one on its way in.
+///
+/// The two directions ask the same four questions of the key encryption key — what it
+/// is for, which cipher it is, what its modes of use permit and whether it is still
+/// enabled — and differ only in the mode of use each needs, so they are one lookup
+/// ([`KeyStore::key_encryption_key`]) parameterised by this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyProtectionUse {
+    /// `ExportKey`: the key encryption key wraps the key under export.
+    Wrap,
+    /// `ImportKey`: the key encryption key unwraps the key under import.
+    Unwrap,
+}
+
+impl KeyProtectionUse {
+    /// The `KeyModesOfUse` member this direction requires, named as a refusal words it.
+    fn mode(self) -> &'static str {
+        match self {
+            Self::Wrap => "Wrap",
+            Self::Unwrap => "Unwrap",
+        }
+    }
+
+    /// Whether `modes` permit this direction. `NoRestrictions` is "no restrictions on
+    /// the use of the key", so it permits either one.
+    fn permitted_by(self, modes: &KeyModesOfUse) -> bool {
+        modes.no_restrictions
+            || match self {
+                Self::Wrap => modes.wrap,
+                Self::Unwrap => modes.unwrap,
+            }
+    }
+
+    /// What happens to the key in this direction, as a refusal words it.
+    fn what(self) -> &'static str {
+        match self {
+            Self::Wrap => "wrapped for export",
+            Self::Unwrap => "unwrapped on import",
+        }
+    }
+}
+
 /// Why a key could not be exported.
 #[derive(Debug, Clone)]
 pub enum ExportRejection {
@@ -143,7 +186,11 @@ impl KeyStore {
         // store's generator, and no key record is touched.
         let padding = self.fresh_padding(MAX_PAYLOAD_PADDING);
         let key = self.exportable_key(export.export_key_identifier, now)?;
-        let wrapping = self.wrapping_key(&request.wrapping_key_identifier, now)?;
+        let wrapping = self.key_encryption_key(
+            &request.wrapping_key_identifier,
+            KeyProtectionUse::Wrap,
+            now,
+        )?;
         let payload = export_payload(key, export.dukpt_initial_key)?;
         if !is_symmetric_algorithm(&payload.key_algorithm) {
             return Err(ExportRejection::Invalid(format!(
@@ -210,7 +257,11 @@ impl KeyStore {
         now: SystemTime,
     ) -> Result<WrappedKeyMaterial, ExportRejection> {
         let key = self.exportable_key(export.export_key_identifier, now)?;
-        let wrapping = self.wrapping_key(&request.wrapping_key_identifier, now)?;
+        let wrapping = self.key_encryption_key(
+            &request.wrapping_key_identifier,
+            KeyProtectionUse::Wrap,
+            now,
+        )?;
         let payload = export_payload(key, export.dukpt_initial_key)?;
         if !is_symmetric_algorithm(&payload.key_algorithm) {
             return Err(ExportRejection::Invalid(format!(
@@ -233,20 +284,14 @@ impl KeyStore {
             )));
         }
 
-        let mut varianted = wrapping.material.bytes().to_vec();
-        for component in varianted.chunks_mut(TDES_BLOCK) {
-            if let Some(leading) = component.first_mut() {
-                *leading ^= variant;
-            }
-        }
-        let cryptogram =
-            tdes_encrypt_blocks(&varianted, &payload.material).ok_or_else(|| {
-                ExportRejection::Invalid(format!(
-                    "a {} key is not a whole number of TDES blocks, so it has no AS 2805 key \
-                     cryptogram",
-                    payload.key_algorithm
-                ))
-            })?;
+        let varianted = as2805_varianted_key(wrapping.material.bytes(), variant);
+        let cryptogram = tdes_encrypt_blocks(&varianted, &payload.material).ok_or_else(|| {
+            ExportRejection::Invalid(format!(
+                "a {} key is not a whole number of TDES blocks, so it has no AS 2805 key \
+                 cryptogram",
+                payload.key_algorithm
+            ))
+        })?;
 
         let (key_check_value, key_check_value_algorithm) =
             check_value(&payload, export.key_check_value_algorithm)?;
@@ -330,18 +375,24 @@ impl KeyStore {
         Ok(key)
     }
 
-    /// The wrapping key `identifier` names, refusing one that cannot wrap a key for
-    /// export.
+    /// The wrapping key `identifier` names, refusing one that cannot protect a key
+    /// block or a key cryptogram in `protection`'s direction.
     ///
-    /// A key encryption key is what wraps an exported key, and it has to be able to:
-    /// its `KeyUsage` says it is one ([`WRAPPING_KEY_USAGES`]), its `KeyAlgorithm` is a
-    /// symmetric cipher a key is encrypted under, its `KeyModesOfUse` permit wrapping,
-    /// and it is still enabled — `UsageStopTimestamp` is "the date and time after which
-    /// Amazon Web Services Payment Cryptography will stop using the key material for
-    /// cryptographic operations", and wrapping a key is one.
-    fn wrapping_key(
+    /// A key encryption key is what protects a key leaving or entering the service, and
+    /// it has to be able to: its `KeyUsage` says it is one ([`WRAPPING_KEY_USAGES`]),
+    /// its `KeyAlgorithm` is a symmetric cipher a key is encrypted under, its
+    /// `KeyModesOfUse` permit this direction, and it is still enabled —
+    /// `UsageStopTimestamp` is "the date and time after which Amazon Web Services
+    /// Payment Cryptography will stop using the key material for cryptographic
+    /// operations", and wrapping or unwrapping a key is one.
+    ///
+    /// Shared by the export this module serves and by the import of a key wrapped under
+    /// a key this store holds ([`super::key_import`]), so one direction cannot come to
+    /// require something of a key encryption key that the other does not.
+    pub(super) fn key_encryption_key(
         &self,
         identifier: &str,
+        protection: KeyProtectionUse,
         now: SystemTime,
     ) -> Result<&StoredKey, ExportRejection> {
         let key = self
@@ -350,28 +401,29 @@ impl KeyStore {
         let attributes = &key.key_attributes;
         if !WRAPPING_KEY_USAGES.contains(&attributes.key_usage.as_str()) {
             return Err(ExportRejection::Invalid(format!(
-                "the wrapping key {} is a {} key, and a key is wrapped for export under a key \
-                 whose KeyUsage is one of {}",
+                "the wrapping key {} is a {} key, and a key is {} under a key whose KeyUsage is \
+                 one of {}",
                 key.key_arn,
                 attributes.key_usage,
+                protection.what(),
                 WRAPPING_KEY_USAGES.join(", ")
             )));
         }
         if !WRAPPING_KEY_ALGORITHMS.contains(&attributes.key_algorithm.as_str()) {
             return Err(ExportRejection::Invalid(format!(
-                "the wrapping key {} is a {} key, and a key is wrapped for export under one of \
-                 {}",
+                "the wrapping key {} is a {} key, and a key is {} under one of {}",
                 key.key_arn,
                 attributes.key_algorithm,
+                protection.what(),
                 WRAPPING_KEY_ALGORITHMS.join(", ")
             )));
         }
-        let modes = &attributes.key_modes_of_use;
-        if !(modes.wrap || modes.no_restrictions) {
+        if !protection.permitted_by(&attributes.key_modes_of_use) {
             return Err(ExportRejection::Invalid(format!(
-                "the wrapping key {} has no Wrap in its KeyModesOfUse, so it cannot wrap a key \
-                 for export",
-                key.key_arn
+                "the wrapping key {} has no {} in its KeyModesOfUse, so it cannot {}",
+                key.key_arn,
+                protection.mode(),
+                protection.what()
             )));
         }
         if !key.enabled {
@@ -477,7 +529,12 @@ fn check_value(
 /// name, so a usage the model gains later answers `None` and the export is refused
 /// instead of being rendered under a usage guessed from its spelling. Source:
 /// `smithy_query(query="shape",shape="KeyUsage")`.
-fn tr31_key_usage(key_usage: &str) -> Option<&'static str> {
+///
+/// The one map between the two vocabularies in this crate: the import of a key block
+/// ([`super::key_import`]) reads a header's usage back by searching the modelled values
+/// for the one this answers that code for, so neither direction can carry a table of
+/// its own that disagrees with the other.
+pub(super) fn tr31_key_usage(key_usage: &str) -> Option<&'static str> {
     let code = match key_usage {
         "TR31_B0_BASE_DERIVATION_KEY" => "B0",
         "TR31_C0_CARD_VERIFICATION_KEY" => "C0",
@@ -537,7 +594,10 @@ fn exportability_code(requested: Option<&str>) -> Result<char, ExportRejection> 
 /// (`smithy_query(query="shape",shape="As2805KeyVariant")`), and the rows below are
 /// those constants. Matched exactly rather than parsed out of the name, so a variant the
 /// model gains later is refused instead of being formed from a guess.
-fn as2805_variant(variant: &str) -> Option<u8> {
+///
+/// Shared with the import of a key cryptogram ([`super::key_import`]), which forms the
+/// same variant of the same key encryption key to recover the key from it.
+pub(super) fn as2805_variant(variant: &str) -> Option<u8> {
     let constant = match variant {
         "TERMINAL_MAJOR_KEY_VARIANT_00" => 0x00,
         "PIN_ENCRYPTION_KEY_VARIANT_28" => 0x28,
@@ -546,4 +606,20 @@ fn as2805_variant(variant: &str) -> Option<u8> {
         _ => return None,
     };
     Some(constant)
+}
+
+/// The variant of the key encryption key `material` that an AS 2805 key cryptogram is
+/// encrypted under: the standard forms it by applying the variant constant to the
+/// leading byte of each component of the key.
+///
+/// Its own inverse, since it is an exclusive or, so the export that forms a cryptogram
+/// and the import that recovers the key from one call the same function.
+pub(super) fn as2805_varianted_key(material: &[u8], variant: u8) -> Vec<u8> {
+    let mut varianted = material.to_vec();
+    for component in varianted.chunks_mut(TDES_BLOCK) {
+        if let Some(leading) = component.first_mut() {
+            *leading ^= variant;
+        }
+    }
+    varianted
 }
