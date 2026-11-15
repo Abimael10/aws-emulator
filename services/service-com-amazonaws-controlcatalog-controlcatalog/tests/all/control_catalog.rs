@@ -112,8 +112,10 @@ pub(crate) async fn drain(
     body: &str,
 ) -> Vec<Value> {
     /// More pages than the catalog could ever hold: a token that fails to advance
-    /// would otherwise loop forever.
-    const PAGE_LIMIT: usize = 500;
+    /// would otherwise loop forever. The catalog records a dozen or so mappings per
+    /// published control, so the bound is well clear of a one-item-per-page walk of
+    /// the whole mapping collection.
+    const PAGE_LIMIT: usize = 5_000;
 
     let mut items: Vec<Value> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();

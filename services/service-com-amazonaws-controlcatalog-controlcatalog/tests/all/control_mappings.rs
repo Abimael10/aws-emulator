@@ -283,7 +283,9 @@ async fn a_control_arn_the_catalog_does_not_publish_selects_no_mapping() {
     let unpublished: [(&str, &str); 4] = [
         (
             "a catalog ARN this catalog does not publish",
-            "arn:aws:controlcatalog:::control/1038h7d21e6g8i10g6v3xsssi",
+            // An identifier no published control carries: an ARN the catalog DOES
+            // publish resolves, so it cannot stand for the unpublished case.
+            "arn:aws:controlcatalog:::control/notapublishedcontrolid001",
         ),
         (
             "a catalog ARN in another partition",

@@ -25,6 +25,18 @@ Issue-Commit: db695ebaafb06a378036ed97fdfaee3dfb3329ce
 
 # controlcatalog control reads miss AWS's published catalog: GetControl 404s on published ARNs and a ListControls page comes back empty (2 causes)
 
+> _Resolution note (added when this report was moved): the rule both causes turn on is
+> fixed — the catalog seed records each published control's own identity, so a read by a
+> published ARN resolves it and every filtered walk reaches the whole filtered set at any
+> page size, and the representative GetControl step answers 200 with the catalog's record.
+> A residual remains that this fix cannot close: the published 25-character identifiers,
+> release instants, console descriptions and per-control Region lists of the other
+> recorded controls are not disclosed by this report or by the replay and no rule computes
+> them from the request, so the recorded walk is still longer than the catalog this
+> emulator holds and the replay still reports this issue's keys as failing. A later report
+> that discloses more of the catalog's own content can extend the seed table
+> (`src/state/published_controls.rs`) without touching either reader._
+
 > _Note: this issue was identified against the code base at commit `db695ebaafb06a378036ed97fdfaee3dfb3329ce`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

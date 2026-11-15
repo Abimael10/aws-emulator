@@ -1279,3 +1279,13 @@ mod zz_probe_whole_emulator;
 //! THESE LINES ARE THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE:
 //! past the first item one is `E0753` and compiles no suite of this target. Below, add a
 //! declaration — not a note about one, and not a copy of this header.
+//! `E0428`, which fails every suite in this target. An inner doc comment (`//!`) is legal
+//! only before the first item, so THIS header is the only place one may stand — past it,
+//! `//!` is `E0753` and compiles nothing, so write a note further down as an ordinary
+//! `//` comment or, better, not at all. Append nothing to the end of this file but a
+//! declaration.
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of that —
+//! one declaration per suite file, no inner doc comment past this header — for this file
+//! and for every service crate's `tests/all.rs`, so leave the rules there rather than
+//! restating them here.
+//! this file, which the layout check refuses: the `#[path]` attribute is what points each

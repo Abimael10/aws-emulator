@@ -947,6 +947,29 @@ const CATALOG_EPOCH: i64 = 1_701_043_200;
 /// One day in seconds, the step between seeded catalog timestamps.
 const DAY: i64 = 86_400;
 
+/// How many days before [`CATALOG_EPOCH`] a minted release instant can fall.
+const RELEASE_WINDOW_DAYS: u64 = 2_000;
+
+/// A deterministic release instant for a control whose published release time this
+/// catalog does not record, minted from its slug the same way its identifier is
+/// ([`catalog_id`]).
+///
+/// `CreateTime` is a property of the CONTROL — the instant it was released as a
+/// governance capability — not of where it sits in any table or listing, so the instant
+/// is derived from the control's own slug rather than from its position: adding a control
+/// to the published table must not re-date the controls published beside it. Fixed and
+/// hash-derived, so the catalog a client reads is identical in every process and on
+/// every run.
+fn minted_release_time(slug: &str) -> i64 {
+    let digest = Sha256::digest(slug.as_bytes());
+    let window = u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("a SHA-256 digest is 32 bytes, so its first 8 are a u64"),
+    );
+    CATALOG_EPOCH - ((window % RELEASE_WINDOW_DAYS) as i64) * DAY
+}
+
 /// Build the catalog this emulator serves.
 ///
 /// The ontology (domains, objectives, common controls) is the whole published table in
@@ -1068,10 +1091,10 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
     //
     // `CreateTime` is the instant the catalog publishes as the control's release time,
     // read from that same published record, so controls the catalog released together
-    // carry one instant. Only a control whose published record this catalog does not
-    // hold — one already served under a minted identifier — is dated positionally;
-    // either way the instant is fixed (see CATALOG_EPOCH), so the catalog a client reads
-    // is identical in every process and on every run.
+    // carry one instant. Only a control whose published release instant this catalog does
+    // not hold is dated from its own slug (see `minted_release_time`); either way the
+    // instant belongs to the control and is fixed, so the catalog a client reads is
+    // identical in every process and on every run.
     // Every recorded published record names a row of the table below: a stale entry
     // would otherwise leave its control served under a minted identifier with no signal.
     debug_assert!(
@@ -1082,7 +1105,7 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
                 .any(|seed| seed.slug == record.slug)),
         "a published catalog record must name a published control"
     );
-    for (position, seed) in published_controls::PUBLISHED_CONTROLS.iter().enumerate() {
+    for seed in published_controls::PUBLISHED_CONTROLS {
         let arn = control_arn(seed.slug);
         // The parameters of the surface that implements the control, so two controls
         // over one implementation report one parameter set.
@@ -1124,10 +1147,11 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
                     })
                     .collect(),
                 // The instant the catalog publishes as this control's release time,
-                // where its published record holds one; a control served under a minted
-                // identifier is dated from its position in the table instead.
+                // where its published record holds one; a control whose release instant
+                // this catalog does not record is dated from its own slug instead, never
+                // from its position in the table.
                 create_time: published_controls::published_release_time(seed.slug)
-                    .unwrap_or(CATALOG_EPOCH + (position as i64) * DAY),
+                    .unwrap_or_else(|| minted_release_time(seed.slug)),
                 governed_resources: seed
                     .governed_resources
                     .iter()

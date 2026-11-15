@@ -67,11 +67,11 @@
 //! control's published identity: the catalog is account-independent, so one ARN names
 //! the control for every caller, in every partition and on every run. A control whose
 //! published record is recorded in [`PUBLISHED_CATALOG_RECORDS`] is therefore served
-//! under that identifier and with that release time; for a control it does not name —
-//! and for the ontology in [`super::published_ontology`] — this emulator mints an
-//! identifier deterministically from the row's `slug` (see `super::catalog_id`) and
-//! derives the timestamp the same deterministic way (see `super::seed_catalog`). The
-//! slug never appears on the wire.
+//! under that identifier and, where the record holds one, with that release time; for a
+//! control it does not name — and for the ontology in [`super::published_ontology`] —
+//! this emulator mints an identifier deterministically from the row's `slug` (see
+//! `super::catalog_id`) and derives the release instant from that same slug (see
+//! `super::minted_release_time`). The slug never appears on the wire.
 
 /// `ControlParameterRequirement`: a parameter the caller must supply.
 pub(super) const REQUIRED: &str = "REQUIRED";
@@ -106,9 +106,9 @@ const PREVENTIVE: &str = "PREVENTIVE";
 const PROACTIVE: &str = "PROACTIVE";
 
 /// The `ControlSeverity` values this table's controls are published with, as the modeled
-/// enum spells them. The enum also declares `LOW`, which no control published here
-/// carries: a control's severity is the one the catalog publishes for it, not a value
-/// chosen to cover the enum.
+/// enum spells them. A control's severity is the one the catalog publishes for it, not a
+/// value chosen to cover the enum.
+const LOW: &str = "LOW";
 const MEDIUM: &str = "MEDIUM";
 const HIGH: &str = "HIGH";
 const CRITICAL: &str = "CRITICAL";
@@ -138,18 +138,57 @@ const GCP: &[&str] = &["GCP"];
 /// Region sets a REGIONAL control in this catalog deploys to. A control is available
 /// in the Regions its implementing service is, which differs between controls, so the
 /// table picks the set per row.
-const BROAD_REGIONS: &[&str] = &[
-    "ap-southeast-2",
-    "eu-central-1",
-    "eu-west-1",
-    "us-east-1",
-    "us-east-2",
-    "us-west-2",
-];
-const CORE_REGIONS: &[&str] = &["eu-west-1", "us-east-1", "us-west-2"];
 const US_REGIONS: &[&str] = &["us-east-1", "us-west-2"];
 /// A GLOBAL control deploys to no Region of its own.
 const NO_REGIONS: &[&str] = &[];
+
+/// Every commercial Region of the `aws` partition, which is the deployable-Region set of
+/// a control whose implementing surface is generally available: `DeployableRegions`
+/// reports "the Regions in which the control is available for deployment"
+/// (`smithy_query(query="doc", shape="RegionConfiguration", member="DeployableRegions")`),
+/// and a control implemented by a generally available service — an AWS Config managed
+/// rule or a Security Hub control over a service offered partition-wide — is available
+/// for deployment wherever that partition offers the service. Ordered by Region code, the
+/// order the catalog reports them in.
+///
+/// It is the partition-wide set, so for a control whose implementing service is offered
+/// in fewer Regions it is an upper bound rather than a read fact; a control the catalog
+/// publishes a narrower availability for carries its own set on its row.
+const GENERALLY_AVAILABLE_REGIONS: &[&str] = &[
+    "af-south-1",
+    "ap-east-1",
+    "ap-east-2",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-south-2",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "ap-southeast-5",
+    "ap-southeast-7",
+    "ca-central-1",
+    "ca-west-1",
+    "eu-central-1",
+    "eu-central-2",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-south-2",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "il-central-1",
+    "me-central-1",
+    "me-south-1",
+    "mx-central-1",
+    "sa-east-1",
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+];
 
 /// A control that supports no control parameter: nothing is supplied when it is
 /// enabled, so its `ParameterRequirementSummary` is `NONE`.
@@ -158,6 +197,11 @@ const NO_PARAMETERS: &[(&str, &str)] = &[];
 /// A control that is published under no catalog designator of its own (its aliases,
 /// if any, are the derived ones).
 const NO_DESIGNATORS: &[&str] = &[];
+
+/// A control whose own check no published compliance-framework item names: the framework
+/// requirements it satisfies are the ones its control OBJECTIVE is cross-walked into (see
+/// [`OBJECTIVE_FRAMEWORKS`]), and nothing beyond them is recorded on the row.
+const NO_FRAMEWORK_ITEMS: &[FrameworkItem] = &[];
 
 /// A resource set that no available resource type can represent: "If
 /// GovernedResources cannot be represented by available resource types, it's returned
@@ -296,7 +340,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: CORE_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::CloudTrail::Trail"],
         governed_providers: AWS,
@@ -322,7 +366,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: Some("AWS-GR_DETECT_CLOUDTRAIL_ENABLED_ON_MEMBER_ACCOUNTS"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: BROAD_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::CloudTrail::Trail"],
         governed_providers: AWS,
@@ -349,7 +393,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: &["CONFIG.CLOUDTRAIL.DT.10"],
         scope: REGIONAL,
-        deployable_regions: BROAD_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         // Parameterised by the implementing rule; see `CONFIG_RULE_PARAMETERS`.
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::CloudTrail::Trail"],
@@ -374,7 +418,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: CORE_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::CloudTrail::Trail"],
         governed_providers: AWS,
@@ -404,7 +448,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: &["CONFIG.S3.DT.8"],
         scope: REGIONAL,
-        deployable_regions: CORE_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::S3::Bucket"],
         governed_providers: AWS,
@@ -434,7 +478,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: Some("AWS-GR_S3_BUCKET_PUBLIC_READ_PROHIBITED"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: BROAD_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::S3::Bucket"],
         governed_providers: AWS,
@@ -461,7 +505,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: Some("AWS-GR_AUDIT_BUCKET_PUBLIC_READ_PROHIBITED"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: BROAD_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::S3::Bucket"],
         governed_providers: AWS,
@@ -485,7 +529,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: Some("AWS-GR_S3_BUCKET_PUBLIC_WRITE_PROHIBITED"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: BROAD_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::S3::Bucket"],
         governed_providers: AWS,
@@ -510,7 +554,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: Some("AWS-GR_AUDIT_BUCKET_PUBLIC_WRITE_PROHIBITED"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: BROAD_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::S3::Bucket"],
         governed_providers: AWS,
@@ -535,7 +579,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: &["CONFIG.S3.DT.15"],
         scope: REGIONAL,
-        deployable_regions: CORE_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::S3::Bucket"],
         governed_providers: AWS,
@@ -659,7 +703,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: Some("AWS-GR_ENCRYPTED_VOLUMES"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: BROAD_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         // The KMS key the rule checks volumes against is its input parameter; see
         // `CONFIG_RULE_PARAMETERS`.
         parameters: NO_PARAMETERS,
@@ -687,7 +731,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: &["CONFIG.EC2.DT.48"],
         scope: REGIONAL,
-        deployable_regions: CORE_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         // Parameterised by the implementing rule; see `CONFIG_RULE_PARAMETERS`.
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::EC2::VPC"],
@@ -712,7 +756,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: Some("AWS-GR_RESTRICTED_SSH"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: BROAD_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::EC2::SecurityGroup"],
         governed_providers: AWS,
@@ -736,7 +780,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: Some("AWS-GR_RDS_SNAPSHOTS_PUBLIC_PROHIBITED"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: CORE_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         // The catalog publishes no available resource type for the snapshot sharing this
         // control governs.
@@ -763,7 +807,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: Some("AWS-GR_RDS_STORAGE_ENCRYPTED"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: CORE_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::RDS::DBInstance"],
         governed_providers: AWS,
@@ -787,7 +831,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: BROAD_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::GuardDuty::Detector"],
         governed_providers: AWS,
@@ -811,7 +855,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: CORE_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::Logs::LogGroup"],
         governed_providers: AWS,
@@ -836,7 +880,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: CORE_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::S3::Bucket"],
         governed_providers: AWS,
@@ -861,7 +905,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: BROAD_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::CloudTrail::Trail"],
         governed_providers: AWS,
@@ -1096,7 +1140,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
-        deployable_regions: CORE_REGIONS,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::RDS::DBInstance"],
         governed_providers: AWS,
@@ -1107,6 +1151,930 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
             // "Protection of information at rest".
             (NIST_SP_800_53_R5, "SC-28"),
         ],
+    },
+    // --- AWS Config managed rules: the rest of the Config-implemented catalog ----
+    //
+    // The catalog publishes a control for EVERY managed rule the implementing surface
+    // governs a resource with, so the rows below carry the rest of the AWS Config managed
+    // rules this catalog publishes controls over, each with that rule's own published
+    // identifier, title and description and the resource type it evaluates. A row carries
+    // only the designators the catalog records for it: a `CONFIG.…` designator is a
+    // lookup key a client joins on, so one the catalog publishes but this crate does not
+    // record is left absent rather than invented.
+    ControlSeed {
+        slug: "acm-pca-certificate-authority-tagged",
+        name: "Checks if AWS Private CA certificate authorities have tags",
+        description: "Checks if AWS Private CA certificate authorities have tags. The \
+                      rule is NON_COMPLIANT if the certificate authority has no tags, or \
+                      if it is missing a tag key or value the rule's input parameter \
+                      names.",
+        behavior: DETECTIVE,
+        severity: LOW,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("ACMPCA_CERTIFICATE_AUTHORITY_TAGGED"),
+        control_tower_identifier: None,
+        designators: &["CONFIG.ACM-PCA.DT.2"],
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        // Parameterised by the implementing rule; see `CONFIG_RULE_PARAMETERS`.
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::ACMPCA::CertificateAuthority"],
+        governed_providers: AWS,
+        implements: "maintain-an-asset-inventory",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "cognito-user-pool-advanced-security-enabled",
+        name: "Checks if an Amazon Cognito user pool has advanced security enabled",
+        description: "Checks if an Amazon Cognito user pool has advanced security \
+                      enabled. The rule is NON_COMPLIANT if advanced security is not \
+                      enabled for the user pool, or if its security mode is weaker than \
+                      the mode the rule's input parameter names.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("COGNITO_USER_POOL_ADVANCED_SECURITY_ENABLED"),
+        control_tower_identifier: None,
+        designators: &["CONFIG.COGNITO-IDP.DT.1"],
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::Cognito::UserPool"],
+        governed_providers: AWS,
+        implements: "intrusion-detection-deployment",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "efs-encrypted-check",
+        name: "Checks if Amazon Elastic File System (Amazon EFS) file systems are \
+               encrypted",
+        description: "Checks if Amazon Elastic File System (Amazon EFS) file systems are \
+                      encrypted. The rule is NON_COMPLIANT if the file system is not \
+                      encrypted, or if it is encrypted with a key other than the one the \
+                      rule's input parameter names.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("EFS_ENCRYPTED_CHECK"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::EFS::FileSystem"],
+        governed_providers: AWS,
+        implements: "encrypt-data-at-rest-in-storage-services",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "dynamodb-table-encrypted-kms",
+        name: "Checks if the Amazon DynamoDB table is encrypted with AWS Key Management \
+               Service (KMS)",
+        description: "Checks if the Amazon DynamoDB table is encrypted with AWS Key \
+                      Management Service (KMS). The rule is NON_COMPLIANT if the table \
+                      is not encrypted with a KMS key, or if it is encrypted with a key \
+                      the rule's input parameter does not name.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("DYNAMODB_TABLE_ENCRYPTED_KMS"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::DynamoDB::Table"],
+        governed_providers: AWS,
+        implements: "encrypt-data-at-rest-in-storage-services",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "sns-encrypted-kms",
+        name: "Checks if an Amazon Simple Notification Service (Amazon SNS) topic is \
+               encrypted with AWS Key Management Service (AWS KMS)",
+        description: "Checks if an Amazon Simple Notification Service (Amazon SNS) topic \
+                      is encrypted with AWS Key Management Service (AWS KMS). The rule \
+                      is NON_COMPLIANT if the topic is not encrypted with a KMS key.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("SNS_ENCRYPTED_KMS"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::SNS::Topic"],
+        governed_providers: AWS,
+        implements: "encrypt-data-at-rest-in-storage-services",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "rds-snapshot-encrypted",
+        name: "Checks if Amazon Relational Database Service (Amazon RDS) DB snapshots are \
+               encrypted",
+        description: "Checks if Amazon Relational Database Service (Amazon RDS) DB \
+                      snapshots are encrypted. The rule is NON_COMPLIANT if the snapshot \
+                      is not encrypted.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("RDS_SNAPSHOT_ENCRYPTED"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::RDS::DBSnapshot"],
+        governed_providers: AWS,
+        implements: "encrypt-data-at-rest-in-storage-services",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "opensearch-encrypted-at-rest",
+        name: "Checks if Amazon OpenSearch Service domains have encryption at rest \
+               enabled",
+        description: "Checks if Amazon OpenSearch Service domains have encryption at rest \
+                      enabled. The rule is NON_COMPLIANT if the domain does not have \
+                      encryption at rest enabled.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("OPENSEARCH_ENCRYPTED_AT_REST"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::OpenSearchService::Domain"],
+        governed_providers: AWS,
+        implements: "encrypt-data-at-rest-in-storage-services",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "redshift-cluster-configuration-check",
+        name: "Checks whether Amazon Redshift clusters have the specified settings",
+        description: "Checks whether Amazon Redshift clusters have the specified \
+                      settings. The rule is NON_COMPLIANT if the cluster is not \
+                      encrypted or is not logging audit information, or if its node type \
+                      is not one the rule's input parameters name.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("REDSHIFT_CLUSTER_CONFIGURATION_CHECK"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::Redshift::Cluster"],
+        governed_providers: AWS,
+        implements: "encrypt-data-at-rest-in-storage-services",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "redshift-require-tls-ssl",
+        name: "Checks if Amazon Redshift clusters require TLS/SSL encryption to connect \
+               to SQL clients",
+        description: "Checks if Amazon Redshift clusters require TLS/SSL encryption to \
+                      connect to SQL clients. The rule is NON_COMPLIANT if the cluster's \
+                      parameter group does not require an encrypted connection.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("REDSHIFT_REQUIRE_TLS_SSL"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::Redshift::Cluster"],
+        governed_providers: AWS,
+        implements: "enforce-encryption-in-transit",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "elb-tls-https-listeners-only",
+        name: "Checks if your Classic Load Balancer is configured with SSL or HTTPS \
+               listeners",
+        description: "Checks if your Classic Load Balancer is configured with SSL or \
+                      HTTPS listeners. The rule is NON_COMPLIANT if a listener is not \
+                      configured with SSL or HTTPS.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("ELB_TLS_HTTPS_LISTENERS_ONLY"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::ElasticLoadBalancing::LoadBalancer"],
+        governed_providers: AWS,
+        implements: "enforce-encryption-in-transit",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "elbv2-acm-certificate-required",
+        name: "Checks if Application Load Balancers and Network Load Balancers have \
+               listeners that are configured to use certificates from AWS Certificate \
+               Manager",
+        description: "Checks if Application Load Balancers and Network Load Balancers \
+                      have listeners that are configured to use certificates from AWS \
+                      Certificate Manager. The rule is NON_COMPLIANT if a listener uses \
+                      a certificate that AWS Certificate Manager does not issue.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("ELBV2_ACM_CERTIFICATE_REQUIRED"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::ElasticLoadBalancingV2::LoadBalancer"],
+        governed_providers: AWS,
+        implements: "enforce-encryption-in-transit",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "s3-bucket-logging-enabled",
+        name: "Checks whether logging is enabled for your S3 buckets",
+        description: "Checks whether logging is enabled for your S3 buckets. The rule is \
+                      NON_COMPLIANT if server access logging is not enabled, or if it \
+                      does not deliver to the target bucket and prefix the rule's input \
+                      parameters name.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("S3_BUCKET_LOGGING_ENABLED"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::S3::Bucket"],
+        governed_providers: AWS,
+        implements: "enable-centralized-logging",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "cloud-trail-cloud-watch-logs-enabled",
+        name: "Checks whether AWS CloudTrail trails are configured to send logs to Amazon \
+               CloudWatch Logs",
+        description: "Checks whether AWS CloudTrail trails are configured to send logs to \
+                      Amazon CloudWatch Logs. The rule is NON_COMPLIANT if a trail does \
+                      not deliver to a CloudWatch Logs log group, or if its last delivery \
+                      is older than the age the rule's input parameter allows.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("CLOUD_TRAIL_CLOUD_WATCH_LOGS_ENABLED"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::CloudTrail::Trail"],
+        governed_providers: AWS,
+        implements: "enable-centralized-logging",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "elb-logging-enabled",
+        name: "Checks if the Application Load Balancer and the Classic Load Balancer have \
+               logging enabled",
+        description: "Checks if the Application Load Balancer and the Classic Load \
+                      Balancer have logging enabled. The rule is NON_COMPLIANT if access \
+                      logging is not enabled, or if it does not deliver to a bucket the \
+                      rule's input parameter names.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("ELB_LOGGING_ENABLED"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &[
+            "AWS::ElasticLoadBalancing::LoadBalancer",
+            "AWS::ElasticLoadBalancingV2::LoadBalancer",
+        ],
+        governed_providers: AWS,
+        implements: "enable-centralized-logging",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "api-gw-execution-logging-enabled",
+        name: "Checks that all methods in Amazon API Gateway stages have logging enabled",
+        description: "Checks that all methods in Amazon API Gateway stages have logging \
+                      enabled. The rule is NON_COMPLIANT if logging is not enabled, or if \
+                      the logging level is not one the rule's input parameter names.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("API_GW_EXECUTION_LOGGING_ENABLED"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::ApiGateway::Stage", "AWS::ApiGatewayV2::Stage"],
+        governed_providers: AWS,
+        implements: "enable-centralized-logging",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "ec2-instance-no-public-ip",
+        name: "Checks whether Amazon Elastic Compute Cloud (Amazon EC2) instances have a \
+               public IP association",
+        description: "Checks whether Amazon Elastic Compute Cloud (Amazon EC2) instances \
+                      have a public IP association. The rule is NON_COMPLIANT if the \
+                      instance has a public IP address associated with it.",
+        behavior: DETECTIVE,
+        severity: HIGH,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("EC2_INSTANCE_NO_PUBLIC_IP"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::EC2::Instance"],
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "rds-instance-public-access-check",
+        name: "Checks whether Amazon Relational Database Service (Amazon RDS) instances \
+               are not publicly accessible",
+        description: "Checks whether Amazon Relational Database Service (Amazon RDS) \
+                      instances are not publicly accessible. The rule is NON_COMPLIANT if \
+                      the publiclyAccessible field of the instance configuration is true.",
+        behavior: DETECTIVE,
+        severity: CRITICAL,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("RDS_INSTANCE_PUBLIC_ACCESS_CHECK"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::RDS::DBInstance"],
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "lambda-function-public-access-prohibited",
+        name: "Checks whether the AWS Lambda function policy attached to the Lambda \
+               resource prohibits public access",
+        description: "Checks whether the AWS Lambda function policy attached to the \
+                      Lambda resource prohibits public access. The rule is NON_COMPLIANT \
+                      if the policy allows public access.",
+        behavior: DETECTIVE,
+        severity: CRITICAL,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("LAMBDA_FUNCTION_PUBLIC_ACCESS_PROHIBITED"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::Lambda::Function"],
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "eks-endpoint-no-public-access",
+        name: "Checks whether the Amazon Elastic Kubernetes Service (Amazon EKS) endpoint \
+               is not publicly accessible",
+        description: "Checks whether the Amazon Elastic Kubernetes Service (Amazon EKS) \
+                      endpoint is not publicly accessible. The rule is NON_COMPLIANT if \
+                      the cluster's endpoint is publicly accessible.",
+        behavior: DETECTIVE,
+        severity: HIGH,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("EKS_ENDPOINT_NO_PUBLIC_ACCESS"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::EKS::Cluster"],
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "redshift-cluster-public-access-check",
+        name: "Checks whether Amazon Redshift clusters are not publicly accessible",
+        description: "Checks whether Amazon Redshift clusters are not publicly \
+                      accessible. The rule is NON_COMPLIANT if the publiclyAccessible \
+                      field of the cluster configuration is true.",
+        behavior: DETECTIVE,
+        severity: HIGH,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("REDSHIFT_CLUSTER_PUBLIC_ACCESS_CHECK"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::Redshift::Cluster"],
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "sagemaker-notebook-no-direct-internet-access",
+        name: "Checks whether direct internet access is disabled for an Amazon SageMaker \
+               notebook instance",
+        description: "Checks whether direct internet access is disabled for an Amazon \
+                      SageMaker notebook instance. The rule is NON_COMPLIANT if the \
+                      notebook instance reaches the internet directly.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("SAGEMAKER_NOTEBOOK_NO_DIRECT_INTERNET_ACCESS"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: US_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::SageMaker::NotebookInstance"],
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "ebs-snapshot-public-restorable-check",
+        name: "Checks whether Amazon Elastic Block Store (Amazon EBS) snapshots are not \
+               publicly restorable",
+        description: "Checks whether Amazon Elastic Block Store (Amazon EBS) snapshots \
+                      are not publicly restorable. The rule is NON_COMPLIANT if an \
+                      Amazon EBS snapshot is restorable by all Amazon Web Services \
+                      accounts.",
+        behavior: DETECTIVE,
+        severity: HIGH,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("EBS_SNAPSHOT_PUBLIC_RESTORABLE_CHECK"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        // The snapshot sharing this control governs has no available resource type of
+        // its own, so the catalog publishes the list empty.
+        governed_resources: NO_GOVERNED_RESOURCES,
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "iam-user-unused-credentials-check",
+        name: "Checks whether your Amazon Web Services Identity and Access Management \
+               (IAM) users have passwords or active access keys that have not been used \
+               within the specified number of days",
+        description: "Checks whether your Amazon Web Services Identity and Access \
+                      Management (IAM) users have passwords or active access keys that \
+                      have not been used within the specified number of days. The rule is \
+                      NON_COMPLIANT if a credential has gone unused for longer than the \
+                      age the rule's input parameter allows.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("IAM_USER_UNUSED_CREDENTIALS_CHECK"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: GLOBAL,
+        deployable_regions: NO_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::IAM::User"],
+        governed_providers: AWS,
+        implements: "credential-rotation",
+        frameworks: &[
+            // "Ensure credentials unused for 45 days or greater are disabled".
+            (CIS_AWS_BENCHMARK_V3_0, "1.12"),
+        ],
+    },
+    ControlSeed {
+        slug: "secretsmanager-rotation-enabled-check",
+        name: "Checks if AWS Secrets Manager secrets have rotation enabled",
+        description: "Checks if AWS Secrets Manager secrets have rotation enabled. The \
+                      rule is NON_COMPLIANT if the secret does not have rotation \
+                      enabled.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("SECRETSMANAGER_ROTATION_ENABLED_CHECK"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::SecretsManager::Secret"],
+        governed_providers: AWS,
+        implements: "credential-rotation",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "cmk-backing-key-rotation-enabled",
+        name: "Checks if automatic key rotation is enabled for each AWS Key Management \
+               Service (AWS KMS) customer managed key",
+        description: "Checks if automatic key rotation is enabled for each AWS Key \
+                      Management Service (AWS KMS) customer managed key. The rule is \
+                      NON_COMPLIANT if automatic key rotation is not enabled for the key.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("CMK_BACKING_KEY_ROTATION_ENABLED"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::KMS::Key"],
+        governed_providers: AWS,
+        implements: "credential-rotation",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "mfa-enabled-for-iam-console-access",
+        name: "Checks whether multi-factor authentication (MFA) is enabled for all Amazon \
+               Web Services Identity and Access Management (IAM) users that use a console \
+               password",
+        description: "Checks whether multi-factor authentication (MFA) is enabled for all \
+                      Amazon Web Services Identity and Access Management (IAM) users that \
+                      use a console password. The rule is NON_COMPLIANT if an IAM user \
+                      with a console password has no MFA device enabled.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: GLOBAL,
+        deployable_regions: NO_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::IAM::User"],
+        governed_providers: AWS,
+        implements: "require-multi-factor-authentication",
+        frameworks: &[
+            // "Ensure MFA is enabled for all IAM users that have a console password".
+            (CIS_AWS_BENCHMARK_V3_0, "1.10"),
+        ],
+    },
+    ControlSeed {
+        slug: "root-account-hardware-mfa-enabled",
+        name: "Checks whether your Amazon Web Services account is enabled to use a \
+               hardware multi-factor authentication (MFA) device to sign in with root \
+               credentials",
+        description: "Checks whether your Amazon Web Services account is enabled to use a \
+                      hardware multi-factor authentication (MFA) device to sign in with \
+                      root credentials. The rule is NON_COMPLIANT if no hardware MFA \
+                      device is enabled for the root user.",
+        behavior: DETECTIVE,
+        severity: CRITICAL,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("ROOT_ACCOUNT_HARDWARE_MFA_ENABLED"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: GLOBAL,
+        deployable_regions: NO_REGIONS,
+        parameters: NO_PARAMETERS,
+        // The root user's own credentials, which no available resource type represents.
+        governed_resources: NO_GOVERNED_RESOURCES,
+        governed_providers: AWS,
+        implements: "require-multi-factor-authentication",
+        frameworks: &[
+            // "Ensure hardware MFA is enabled for the root user account".
+            (CIS_AWS_BENCHMARK_V3_0, "1.6"),
+        ],
+    },
+    ControlSeed {
+        slug: "iam-policy-no-statements-with-admin-access",
+        name: "Checks whether the default version of Amazon Web Services Identity and \
+               Access Management (IAM) policies do not have administrator access",
+        description: "Checks whether the default version of Amazon Web Services Identity \
+                      and Access Management (IAM) policies do not have administrator \
+                      access. The rule is NON_COMPLIANT if the policy's default version \
+                      allows every action on every resource.",
+        behavior: DETECTIVE,
+        severity: HIGH,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("IAM_POLICY_NO_STATEMENTS_WITH_ADMIN_ACCESS"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: GLOBAL,
+        deployable_regions: NO_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::IAM::Policy"],
+        governed_providers: AWS,
+        implements: "privileged-access-approval",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "restricted-common-ports",
+        name: "Checks whether the security groups in use do not allow unrestricted \
+               incoming TCP traffic to the specified ports",
+        description: "Checks whether the security groups in use do not allow unrestricted \
+                      incoming TCP traffic to the specified ports. The rule is \
+                      NON_COMPLIANT if a security group allows inbound traffic from any \
+                      address to a port the rule's input parameters name.",
+        behavior: DETECTIVE,
+        severity: HIGH,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("RESTRICTED_INCOMING_TRAFFIC"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::EC2::SecurityGroup"],
+        governed_providers: AWS,
+        implements: "restrict-administrative-port-exposure",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "vpc-default-security-group-closed",
+        name: "Checks whether the default security group of any Amazon Virtual Private \
+               Cloud (Amazon VPC) does not allow inbound or outbound traffic",
+        description: "Checks whether the default security group of any Amazon Virtual \
+                      Private Cloud (Amazon VPC) does not allow inbound or outbound \
+                      traffic. The rule is NON_COMPLIANT if the default security group \
+                      has one or more inbound or outbound rules.",
+        behavior: DETECTIVE,
+        severity: HIGH,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("VPC_DEFAULT_SECURITY_GROUP_CLOSED"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::EC2::SecurityGroup"],
+        governed_providers: AWS,
+        implements: "restrict-administrative-port-exposure",
+        frameworks: &[
+            // "Ensure the default security group of every VPC restricts all traffic".
+            (CIS_AWS_BENCHMARK_V3_0, "5.4"),
+        ],
+    },
+    // --- Security Hub controls: the rest of the Security Hub-implemented catalog -
+    //
+    // One row per Security Hub control the catalog publishes, under that control's own
+    // Security Hub id — which is also the designator the catalog publishes it under (see
+    // `aliases`).
+    ControlSeed {
+        slug: "securityhub-s3-1",
+        name: "S3 general purpose buckets should have block public access settings enabled",
+        description: "Checks whether the bucket-level block public access settings of an \
+                      Amazon S3 general purpose bucket are enabled, and reports the \
+                      finding in Security Hub.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("S3.1"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::S3::Bucket"],
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "securityhub-s3-5",
+        name: "S3 general purpose buckets should require requests to use SSL",
+        description: "Checks whether an Amazon S3 general purpose bucket has a policy \
+                      that requires requests to use SSL, and reports the finding in \
+                      Security Hub.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("S3.5"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::S3::Bucket"],
+        governed_providers: AWS,
+        implements: "enforce-encryption-in-transit",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "securityhub-ec2-2",
+        name: "VPC default security groups should not allow inbound or outbound traffic",
+        description: "Checks whether the default security group of a virtual private \
+                      cloud allows inbound or outbound traffic, and reports the finding \
+                      in Security Hub.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("EC2.2"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::EC2::SecurityGroup"],
+        governed_providers: AWS,
+        implements: "restrict-administrative-port-exposure",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "securityhub-rds-2",
+        name: "RDS DB instances should prohibit public access, determined by the \
+               PubliclyAccessible configuration",
+        description: "Checks whether an Amazon RDS database instance is publicly \
+                      accessible, as its PubliclyAccessible configuration reports, and \
+                      reports the finding in Security Hub.",
+        behavior: DETECTIVE,
+        severity: CRITICAL,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("RDS.2"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::RDS::DBInstance"],
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "securityhub-rds-3",
+        name: "RDS DB instances should have encryption at rest enabled",
+        description: "Checks whether storage encryption is enabled for an Amazon RDS \
+                      database instance, and reports the finding in Security Hub.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("RDS.3"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::RDS::DBInstance"],
+        governed_providers: AWS,
+        implements: "encrypt-data-at-rest-in-storage-services",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "securityhub-efs-1",
+        name: "Elastic File System should be configured to encrypt file data at rest \
+               using AWS KMS",
+        description: "Checks whether an Amazon EFS file system encrypts file data at rest \
+                      with an AWS KMS key, and reports the finding in Security Hub.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("EFS.1"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::EFS::FileSystem"],
+        governed_providers: AWS,
+        implements: "encrypt-data-at-rest-in-storage-services",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "securityhub-cloudtrail-4",
+        name: "CloudTrail log file validation should be enabled",
+        description: "Checks whether log file integrity validation is enabled on a \
+                      CloudTrail trail, and reports the finding in Security Hub.",
+        behavior: DETECTIVE,
+        severity: LOW,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("CloudTrail.4"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::CloudTrail::Trail"],
+        governed_providers: AWS,
+        implements: "log-integrity-protection",
+        frameworks: &[
+            // "Ensure CloudTrail log file validation is enabled".
+            (CIS_AWS_BENCHMARK_V3_0, "3.2"),
+        ],
+    },
+    ControlSeed {
+        slug: "securityhub-iam-1",
+        name: "IAM policies should not allow full \"*\" administrative privileges",
+        description: "Checks whether a customer managed IAM policy allows every action on \
+                      every resource, and reports the finding in Security Hub.",
+        behavior: DETECTIVE,
+        severity: HIGH,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("IAM.1"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: GLOBAL,
+        deployable_regions: NO_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::IAM::Policy"],
+        governed_providers: AWS,
+        implements: "privileged-access-approval",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "securityhub-iam-3",
+        name: "IAM users' access keys should be rotated every 90 days or less",
+        description: "Checks whether an active IAM access key has been rotated within the \
+                      last 90 days, and reports the finding in Security Hub.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("IAM.3"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: GLOBAL,
+        deployable_regions: NO_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::IAM::AccessKey"],
+        governed_providers: AWS,
+        implements: "credential-rotation",
+        frameworks: &[
+            // "Ensure access keys are rotated every 90 days or less".
+            (CIS_AWS_BENCHMARK_V3_0, "1.14"),
+        ],
+    },
+    ControlSeed {
+        slug: "securityhub-kms-4",
+        name: "AWS KMS key rotation should be enabled",
+        description: "Checks whether automatic key rotation is enabled for an AWS KMS \
+                      customer managed key, and reports the finding in Security Hub.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("KMS.4"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::KMS::Key"],
+        governed_providers: AWS,
+        implements: "credential-rotation",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
+        slug: "securityhub-guardduty-1",
+        name: "GuardDuty should be enabled",
+        description: "Checks whether Amazon GuardDuty is enabled in the account and \
+                      Region, and reports the finding in Security Hub.",
+        behavior: DETECTIVE,
+        severity: HIGH,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("GuardDuty.1"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::GuardDuty::Detector"],
+        governed_providers: AWS,
+        implements: "intrusion-detection-deployment",
+        frameworks: &[
+            // "Ensure GuardDuty is enabled".
+            (CIS_AWS_BENCHMARK_V3_0, "3.8"),
+        ],
+    },
+    ControlSeed {
+        slug: "securityhub-config-1",
+        name: "AWS Config should be enabled and use the service-linked role for resource \
+               recording",
+        description: "Checks whether AWS Config is enabled in the account and Region and \
+                      records resource configurations with the service-linked role, and \
+                      reports the finding in Security Hub.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("Config.1"),
+        control_tower_identifier: None,
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        parameters: NO_PARAMETERS,
+        // The account's own configuration recorder, which no available resource type
+        // represents.
+        governed_resources: NO_GOVERNED_RESOURCES,
+        governed_providers: AWS,
+        implements: "maintain-an-asset-inventory",
+        frameworks: NO_FRAMEWORK_ITEMS,
     },
 ];
 
@@ -1119,10 +2087,13 @@ pub(super) struct PublishedCatalogRecord {
     /// The opaque identifier the control's published ARN carries.
     pub(super) identifier: &'static str,
     /// The instant the catalog publishes as the control's release time, in seconds since
-    /// the Unix epoch: `CreateTime` "notes the time when the control was released (start
-    /// of its life) as a governance capability in Amazon Web Services"
-    /// (`smithy_query(query="shape", shape="ControlSummary")`).
-    pub(super) release_time: i64,
+    /// the Unix epoch, where this crate records it: `CreateTime` "notes the time when the
+    /// control was released (start of its life) as a governance capability in Amazon Web
+    /// Services" (`smithy_query(query="shape", shape="ControlSummary")`). `None` for a
+    /// control whose published identifier is recorded but whose release instant is not —
+    /// the two are separate published facts, so recording the identifier does not wait on
+    /// the instant.
+    pub(super) release_time: Option<i64>,
 }
 
 /// The published catalog record of every control this catalog records one for.
@@ -1144,55 +2115,55 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
     PublishedCatalogRecord {
         slug: "multi-region-cloud-trail-enabled",
         identifier: "d5kdbugbadk3r481vtwnvoynv",
-        release_time: 1_539_993_600,
+        release_time: Some(1_539_993_600),
     },
     PublishedCatalogRecord {
         slug: "s3-bucket-server-side-encryption-enabled",
         identifier: "d4wgeffz6izrb627c2yb8nq8d",
-        release_time: 1_515_110_400,
+        release_time: Some(1_515_110_400),
     },
     // The account-wide and the log-archive control over public S3 reads were released
     // together, so the catalog dates both with one instant.
     PublishedCatalogRecord {
         slug: "s3-bucket-public-read-prohibited",
         identifier: "8sw3pbid15t9cbww8d2w2qwgf",
-        release_time: 1_542_240_000,
+        release_time: Some(1_542_240_000),
     },
     PublishedCatalogRecord {
         slug: "audit-bucket-public-read-prohibited",
         identifier: "9jzlkwys54gzgsx3pmkqnx8l1",
-        release_time: 1_542_240_000,
+        release_time: Some(1_542_240_000),
     },
     PublishedCatalogRecord {
         slug: "s3-bucket-public-write-prohibited",
         identifier: "9j9nwxj789d82sypnukhyyowy",
-        release_time: 1_542_240_000,
+        release_time: Some(1_542_240_000),
     },
     PublishedCatalogRecord {
         slug: "audit-bucket-public-write-prohibited",
         identifier: "ci9ov6vzjoi6vzkajgademvvo",
-        release_time: 1_542_240_000,
+        release_time: Some(1_542_240_000),
     },
     PublishedCatalogRecord {
         slug: "s3-bucket-ssl-requests-only",
         identifier: "e5efjudq0b347dgxn86o8fg2o",
-        release_time: 1_479_772_800,
+        release_time: Some(1_479_772_800),
     },
     PublishedCatalogRecord {
         slug: "vpc-flow-logs-enabled",
         identifier: "22484xhzccf9twis5gmdt7uic",
-        release_time: 1_536_710_400,
+        release_time: Some(1_536_710_400),
     },
     // Both RDS controls were released together, so they too share one instant.
     PublishedCatalogRecord {
         slug: "rds-snapshots-public-prohibited",
         identifier: "1h4eyqyyonp19dlrreqf1i3w0",
-        release_time: 1_564_444_800,
+        release_time: Some(1_564_444_800),
     },
     PublishedCatalogRecord {
         slug: "rds-storage-encrypted",
         identifier: "e34kieahgkm0lggs5g0s412jt",
-        release_time: 1_564_444_800,
+        release_time: Some(1_564_444_800),
     },
     // The Security Hub-implemented controls the catalog publishes under their `SH.`
     // designators: the instant recorded here is the one the catalog publishes as the
@@ -1204,17 +2175,32 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
     PublishedCatalogRecord {
         slug: "securityhub-cloudtrail-1",
         identifier: "435u8u4w5bsf02tkxga5jisbc",
-        release_time: 1_669_593_600,
+        release_time: Some(1_669_593_600),
     },
     PublishedCatalogRecord {
         slug: "securityhub-iam-4",
         identifier: "ezfflnh8xgshxb78grtt5sjc5",
-        release_time: 1_669_593_600,
+        release_time: Some(1_669_593_600),
     },
     PublishedCatalogRecord {
         slug: "securityhub-iam-5",
         identifier: "6g3gbim493yofkc9eg6vvnahm",
-        release_time: 1_669_593_600,
+        release_time: Some(1_669_593_600),
+    },
+    // Two controls of the wider AWS Config-implemented surface: the catalog publishes
+    // each of them under the identifier recorded here, and records a release instant for
+    // the first of the two only. That instant is later than every other instant recorded
+    // above because the catalog released this control later, not because it is dated by
+    // anything in this crate.
+    PublishedCatalogRecord {
+        slug: "acm-pca-certificate-authority-tagged",
+        identifier: "6yl9xxuky13vzaxi3n6lm73k5",
+        release_time: Some(1_779_840_000),
+    },
+    PublishedCatalogRecord {
+        slug: "cognito-user-pool-advanced-security-enabled",
+        identifier: "1038h7d21e6g8i10g6v3xsssi",
+        release_time: None,
     },
 ];
 
@@ -1233,9 +2219,9 @@ pub(super) fn published_catalog_identifier(slug: &str) -> Option<&'static str> {
 }
 
 /// The instant the catalog publishes as the release time of the control `slug` names, or
-/// `None` when this catalog records no published record for it.
+/// `None` when this catalog records no published release instant for it.
 pub(super) fn published_release_time(slug: &str) -> Option<i64> {
-    published_catalog_record(slug).map(|record| record.release_time)
+    published_catalog_record(slug).and_then(|record| record.release_time)
 }
 
 /// The input parameters an AWS Config managed rule takes: `(rule identifier, [(parameter
@@ -1291,6 +2277,51 @@ const CONFIG_RULE_PARAMETERS: &[(&str, &[(&str, &str)])] = &[
         &[("centralMonitoringAccount", OPTIONAL)],
     ),
     ("CLOUDWATCH_LOG_GROUP_ENCRYPTED", &[("KmsKeyId", OPTIONAL)]),
+    ("ACMPCA_CERTIFICATE_AUTHORITY_TAGGED", &[("tags", OPTIONAL)]),
+    (
+        "COGNITO_USER_POOL_ADVANCED_SECURITY_ENABLED",
+        &[("SecurityMode", OPTIONAL)],
+    ),
+    ("EFS_ENCRYPTED_CHECK", &[("KmsKeyId", OPTIONAL)]),
+    ("DYNAMODB_TABLE_ENCRYPTED_KMS", &[("kmsKeyArns", OPTIONAL)]),
+    ("SNS_ENCRYPTED_KMS", &[("kmsKeyIds", OPTIONAL)]),
+    (
+        // The two settings this rule checks have no default, so the caller must supply
+        // them; the node types it narrows to do have one.
+        "REDSHIFT_CLUSTER_CONFIGURATION_CHECK",
+        &[
+            ("clusterDbEncrypted", REQUIRED),
+            ("loggingEnabled", REQUIRED),
+            ("nodeTypes", OPTIONAL),
+        ],
+    ),
+    (
+        "S3_BUCKET_LOGGING_ENABLED",
+        &[("targetBucket", OPTIONAL), ("targetPrefix", OPTIONAL)],
+    ),
+    (
+        "CLOUD_TRAIL_CLOUD_WATCH_LOGS_ENABLED",
+        &[("expectedDeliveryWindowAge", OPTIONAL)],
+    ),
+    ("ELB_LOGGING_ENABLED", &[("s3BucketNames", OPTIONAL)]),
+    (
+        "API_GW_EXECUTION_LOGGING_ENABLED",
+        &[("loggingLevel", OPTIONAL)],
+    ),
+    (
+        "IAM_USER_UNUSED_CREDENTIALS_CHECK",
+        &[("maxCredentialUsageAge", OPTIONAL)],
+    ),
+    (
+        "RESTRICTED_INCOMING_TRAFFIC",
+        &[
+            ("blockedPort1", OPTIONAL),
+            ("blockedPort2", OPTIONAL),
+            ("blockedPort3", OPTIONAL),
+            ("blockedPort4", OPTIONAL),
+            ("blockedPort5", OPTIONAL),
+        ],
+    ),
 ];
 
 /// The control parameters a published control supports.
