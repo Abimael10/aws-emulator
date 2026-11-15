@@ -1512,3 +1512,33 @@ mod zz_probe_whole_emulator;
 mod cloudformation_http_api_lambda_invoke_permission;
 #[path = "all/cloudformation_generated_table_name_resolves_in_dynamodb.rs"]
 mod cloudformation_generated_table_name_resolves_in_dynamodb;
+// Single integration-test target for the router: this header, the one inner attribute below
+// it, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under
+// `tests/all/`, sorted by name, and no other line.
+// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the one
+// place its name sorts to. The list holds those pairs and nothing else — no prose between
+// them, no blank line, and nothing at all after the last one — so two branches landing at once
+// insert two lines in two places and have no prose to duplicate, re-word or mistype. What a
+// suite covers, and why it drives the assembled router rather than one service crate, belongs
+// in that suite's OWN module header, where it is read beside the test it explains.
+// This header is ONE block, for the same reason: copies of it re-typed by successive landings
+// are what had grown in the tail of this file and in the header itself, and
+// `all/appended_prose.rs` record what those copies had said.
+// Every comment here is an ordinary `//` one, this one included: a doc comment of the
+// enclosing module, like an inner attribute, is legal only ahead of the first item, so a copy
+// left among or below the declarations compiles no suite of this target at all rather than
+// failing one test. A suite file no `mod` here names is compiled nowhere and its tests never
+// run; a name declared twice compiles neither copy; and a suite left at the top level of
+// `tests/` fails the build. Some of the files declared below are shared harnesses or probes
+// rather than suites, and each is declared for that reason.
+// This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it
+// under `tests/`, which the layout check refuses: the `#[path]` above each declaration is what
+// The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/all_rs_carries_one_header_block.rs`, `all/all_rs_declares_each_suite_once.rs`,
+// `all/every_suite_file_is_declared.rs` pin every rule above, for this root and for every
+// service crate's own, so check there rather than leaving a note here.
+// The lint allowed below is for the suite files this root compiles: a module header that wraps
+// a paragraph without the indentation `clippy::doc_lazy_continuation` asks of a doc list item
+// is a note rather than a build failure.
+#[path = "all/all_rs_carries_one_header_block.rs"]
+mod all_rs_carries_one_header_block;

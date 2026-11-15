@@ -126,7 +126,7 @@ fn the_reader_reports_a_list_line_that_is_not_half_of_a_pair() {
     let head = "// SPDX-License-Identifier: CC0-1.0\n\n//! The target.\n//!\n//! Its rules.\n";
     let first = "#[path = \"all/boot_serve.rs\"]\nmod boot_serve;\n";
     let second = "#[path = \"all/query_wire.rs\"]\nmod query_wire;\n";
-    let cases: [(&str, String, &[&str], usize); 12] = [
+    let cases: [(&str, String, &[&str], usize); 16] = [
         ("an empty root", String::new(), &[], 0),
         ("a header and nothing else", head.to_string(), &[], 0),
         ("one pair under a header", format!("{head}{first}"), &["boot_serve"], 0),
@@ -187,6 +187,38 @@ fn the_reader_reports_a_list_line_that_is_not_half_of_a_pair() {
             &["query_wire"],
             1,
         ),
+        (
+            "a visibility on the mod half of a pair",
+            format!("{head}#[path = \"all/boot_serve.rs\"]\npub mod boot_serve;\n"),
+            &[],
+            1,
+        ),
+        (
+            "a note trailing the mod half of a pair",
+            format!("{head}#[path = \"all/boot_serve.rs\"]\nmod boot_serve; // the harness\n"),
+            &[],
+            1,
+        ),
+        (
+            // An inner attribute is legal only before the first item, so one among the
+            // declarations compiles no suite of this target at all; the header skip is over by
+            // then, so the reader reports it like any other line.
+            "an inner attribute among the declarations",
+            format!("{head}{first}#![allow(dead_code)]\n{second}"),
+            &["boot_serve", "query_wire"],
+            1,
+        ),
+        (
+            // The shape this root had grown: prose past the end of the list, with the
+            // declarations a landing appended standing after it instead of in the list.
+            "prose and a pair appended past the end of the list",
+            format!(
+                "{head}{first}{second}// Declared last, because the end of the file is where \
+                 this landing wrote.\n#[path = \"all/ec2_network.rs\"]\nmod ec2_network;\n"
+            ),
+            &["boot_serve", "query_wire", "ec2_network"],
+            1,
+        ),
     ];
 
     for case in &cases {
@@ -207,7 +239,7 @@ fn the_reader_reports_a_list_line_that_is_not_half_of_a_pair() {
 #[test]
 fn the_reader_reports_a_name_out_of_order() {
     // Each ordering a list of names can be in, and how many adjacent pairs break the sort.
-    let cases: [(&str, &[&str], usize); 7] = [
+    let cases: [(&str, &[&str], usize); 8] = [
         ("no names", &[], 0),
         ("one name", &["boot_serve"], 0),
         ("two sorted names", &["boot_serve", "query_wire"], 0),
@@ -222,6 +254,21 @@ fn the_reader_reports_a_name_out_of_order() {
         (
             "a reversed run",
             &["query_wire", "ec2_network", "boot_serve"],
+            2,
+        ),
+        (
+            // Several landings appending past the end of the sorted list rather than into it,
+            // which is the shape this root had grown: the run break at each name that follows
+            // one sorting after it.
+            "a sorted run with three names appended past its end",
+            &[
+                "boot_serve",
+                "query_wire",
+                "zz_probe",
+                "ec2_network",
+                "s3_notification",
+                "apigateway_stage",
+            ],
             2,
         ),
     ];
