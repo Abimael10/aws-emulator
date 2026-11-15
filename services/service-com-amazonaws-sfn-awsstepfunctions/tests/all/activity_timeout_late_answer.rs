@@ -54,11 +54,16 @@ const WORKER: &str = "late-answer-worker";
 const IN_TIME_OUTPUT: &str = r#"{"ok":1}"#;
 
 /// What the worker that answers too late would have reported.
-const LATE_OUTPUT: &str = r#"{"late":true}"#;
+///
+/// `pub(crate)`, like the three helpers below: `tests/all.rs` is this binary's crate root,
+/// so the suite that drives SEVERAL activities' bounds side by side
+/// (`crate::concurrent_activity_bound_isolation`) makes the same late calls through these
+/// rather than carrying a second copy of them.
+pub(crate) const LATE_OUTPUT: &str = r#"{"late":true}"#;
 
 /// The error a worker's own failure report carries, for the row whose failure arrives
 /// too late to be recorded.
-const LATE_ERROR: &str = "WorkerFailed";
+pub(crate) const LATE_ERROR: &str = "WorkerFailed";
 
 /// When the worker that claimed the task answers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,7 +134,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// The request one of the three calls a token-holder can make carries.
-fn reply_request(operation: &str, token: &str) -> Value {
+pub(crate) fn reply_request(operation: &str, token: &str) -> Value {
     match operation {
         "SendTaskSuccess" => json!({ "taskToken": token, "output": LATE_OUTPUT }),
         "SendTaskFailure" => json!({ "taskToken": token, "error": LATE_ERROR }),
