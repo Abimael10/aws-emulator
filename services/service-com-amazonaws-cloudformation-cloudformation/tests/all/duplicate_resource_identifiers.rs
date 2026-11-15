@@ -11,18 +11,21 @@
 //!   exist, so a `Ref` to one of them resolves to the identifier that resource carries, and
 //!   only a declaration that names the resource nowhere gets CloudFormation's generated
 //!   `<stack>-<logical id>-<unique id>` name.
-//! * So a template whose two declarations resolve to ONE identifier asks the owning service
-//!   to create the second resource under a name it already holds, and that service's own
-//!   uniqueness rule refuses it: the second resource is `CREATE_FAILED` in the stack's event
-//!   history while the first stays `CREATE_COMPLETE`, and the stack takes the terminal status
-//!   its failed create is owed — rolled back to `ROLLBACK_COMPLETE`, with what it created
-//!   disposed of, unless the operation asked for the failed state to be kept.
+//! * So a template whose two declarations resolve to ONE identifier cannot be carried out,
+//!   and it is CLOUDFORMATION that establishes that: it holds its own record of which of a
+//!   stack's resources holds which physical name, so the second declaration is refused
+//!   before the service that owns the type is asked at all (`state::physical_name`, whose
+//!   reason `kept_collision_event_reason.rs` pins). The second resource is `CREATE_FAILED`
+//!   in the stack's event history while the first stays `CREATE_COMPLETE`, and the stack
+//!   takes the terminal status its failed create is owed — rolled back to
+//!   `ROLLBACK_COMPLETE`, with what it created disposed of, unless the operation asked for
+//!   the failed state to be kept.
 //!
 //! The first table's rows differ along what the rule generalises over: how the second
 //! declaration spells the name it claims (a `Ref` to the first resource, an `Fn::Sub` over
-//! it, the same literal text), which service owns the type whose uniqueness rule refuses the
-//! create, and — as a control — two declarations whose names DIFFER, which both deploy. The
-//! second table spans the deployment configurations a failed create settles under.
+//! it, the same literal text), which service owns the type whose namespace the contested
+//! name is in, and — as a control — two declarations whose names DIFFER, which both deploy.
+//! The second table spans the deployment configurations a failed create settles under.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -107,9 +110,8 @@ fn rows() -> Vec<Row> {
             second_settles_to: resource_status::CREATE_FAILED,
             claimed: "/dup-literal/p",
         },
-        // Another owning service, with its own uniqueness rule for the type's name
-        // (`EntityAlreadyExists`): the rule is the owning service's to state, not this
-        // crate's.
+        // Another namespace, the ACCOUNT's rather than a Region's: the record CloudFormation
+        // reads is its own either way, so the outcome is the same.
         Row {
             case: "two roles claiming one role name",
             stack: "dup-role",
@@ -166,7 +168,7 @@ async fn physical_id(router: &MultiServiceRouter, stack: &str, logical_id: &str)
 }
 
 #[tokio::test]
-async fn a_second_declaration_claiming_one_identifier_fails_in_the_owning_service() {
+async fn a_second_declaration_claiming_one_identifier_fails_the_resource() {
     for row in rows() {
         let router = router();
         let case = row.case;

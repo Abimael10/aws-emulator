@@ -269,6 +269,8 @@ mod in_flight_resource_status;
 mod initiating_resource_events;
 #[path = "all/in_place_resource_updates.rs"]
 mod in_place_resource_updates;
+#[path = "all/kept_collision_event_reason.rs"]
+mod kept_collision_event_reason;
 #[path = "all/kept_failed_create.rs"]
 mod kept_failed_create;
 #[path = "all/lambda_backed_custom_resources.rs"]

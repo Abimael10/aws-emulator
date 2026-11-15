@@ -44,7 +44,11 @@ const LOGICAL_ID: &str = "Thing";
 
 /// The wrapper CloudFormation puts around a refusal the service that OWNS the type answered,
 /// which is what a reason reported by that service rather than by CloudFormation opens with.
-const HANDLER_WRAPPER: &str = "Resource handler returned message:";
+///
+/// `pub(crate)` because `kept_collision_event_reason.rs` holds the same-stack half of this
+/// rule to the same obligation — CloudFormation's own reason carries no such wrapper — so the
+/// sentence is spelled ONCE.
+pub(crate) const HANDLER_WRAPPER: &str = "Resource handler returned message:";
 
 /// A template declaring one `AWS::SSM::Parameter` under the name it is given. The type's
 /// required properties are its `Type` and its `Value` (source: the CloudFormation resource

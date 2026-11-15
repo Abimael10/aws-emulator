@@ -1221,3 +1221,13 @@ mod zz_probe_whole_emulator;
 //! to live in THIS target rather than in a service crate's own, belongs in that suite's own
 //! module header, where it is read beside the test it explains — not here, where one note per
 //! suite buries the list this file exists to be.
+//! place to insert and nothing to keep consistent. A suite no `mod` names compiles nowhere
+//! and its tests never run; a suite left at the top level of `tests/` fails the build; and a
+//! suite declared twice is `E0428`, which fails every suite in this target. `#[path]` is what
+//! points the declaration into `tests/all/`: this file is a test-target CRATE ROOT, so a bare
+//! `mod` would resolve to a sibling of it.
+//! THIS BLOCK IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past the
+//! first item one is `E0753` and compiles no suite of this target. Below, add a declaration —
+//! not a note about one. `all/all_rs_declares_each_suite_once.rs` and
+//! this file and for every service crate's `tests/all.rs`, so check there rather than leaving
+//! a note here.
