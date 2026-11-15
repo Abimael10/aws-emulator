@@ -12,7 +12,7 @@
 //! call still sees the run starting, and a second start of a job already at its
 //! `MaxConcurrentRuns` is refused.
 //!
-//! The job's SCRIPT is then executed ([`crate::state::perform_owed_job_runs`]): a run of a
+//! The job's SCRIPT is then handed off ([`crate::state::perform_owed_job_runs`]): a run of a
 //! job is one execution of the script its `JobCommand$ScriptLocation` names, with this
 //! request's `Arguments` on its command line, so the state the run comes to rest in is
 //! whatever that execution came to — `SUCCEEDED` for a script that exited cleanly, and the
@@ -21,15 +21,19 @@
 //! execution answered, so the run PASSES THROUGH `RUNNING` for as long as its script takes
 //! and a client polling `GetJobRun` for progress observes every state it goes through.
 //!
+//! The execution is the RUN's work rather than this request's: it is performed on a TASK of
+//! this process, so this call answers with the run's id as soon as the run is recorded —
+//! `StartJobRun` "starts a job run", it does not wait for one — and a client that polls
+//! straight afterwards observes the run while its script is still running.
+//!
 //! That execution happens IN THIS PROCESS and reaches nothing of the host: the script is
 //! compiled and run by the embedded Python interpreter ([`crate::state::job_script`]), so no
 //! process is spawned, no shell is involved, no host path is resolved, and the script can
 //! reach no host socket, process, library, file or environment variable — the one
 //! destination its AWS SDK calls have is this same emulator, over the framework's in-process
-//! callback. It is awaited with NO store guard held and bounded before anything runs: one
-//! script at a time out of [`crate::state::MAX_CONCURRENT_JOB_SCRIPT_RUNS`], at most
-//! [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] per call with nothing further started past
-//! [`crate::state::JOB_SCRIPT_CALL_CEILING`], each script stopped at
+//! callback. It is bounded before anything runs: one script at a time out of
+//! [`crate::state::MAX_CONCURRENT_JOB_SCRIPT_RUNS`], at most
+//! [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] handed off per call, each script stopped at
 //! [`crate::state::JOB_SCRIPT_RUN_CEILING`] (which clamps the job's own `Timeout` down), and
 //! inside the step, memory, recursion and output ceilings the interpreter is given.
 //!
@@ -393,20 +397,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             run_id
         };
 
-        // The run's own work: ONE execution of the job's script with this run's arguments.
-        // The script is compiled and run INSIDE this process by the embedded Python
-        // interpreter ([`crate::state::job_script`]) — no process is spawned, no shell is
-        // involved, no host path is resolved and the script can reach no host socket,
-        // process, library, file or environment variable: the only destination its AWS SDK
-        // calls have is this same emulator, over the in-process callback. What this request
-        // spends is bounded before anything runs: one script at a time out of
-        // [`crate::state::MAX_CONCURRENT_JOB_SCRIPT_RUNS`] with a bounded wait, at most
-        // [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] scripts and no further one started
-        // past [`crate::state::JOB_SCRIPT_CALL_CEILING`], each script stopped at
-        // [`crate::state::JOB_SCRIPT_RUN_CEILING`] (which clamps the job's own `Timeout`
-        // down) and inside the step, memory, recursion and output ceilings the interpreter
-        // is given. An attempt the job's retry policy owes this run is performed by a LATER
-        // call, once this attempt has come to rest, so one start runs one script.
+        // The run's own work: ONE execution of the job's script with this run's arguments,
+        // handed to a TASK of this process rather than performed inside this call — the run
+        // goes on after this request is answered, which is what lets a client observe it
+        // while its script is still running. The script is compiled and run INSIDE this
+        // process by the embedded Python interpreter ([`crate::state::job_script`]) — no
+        // process is spawned, no shell is involved, no host path is resolved and the script
+        // can reach no host socket, process, library, file or environment variable: the only
+        // destination its AWS SDK calls have is this same emulator, over the in-process
+        // callback. What one run spends is bounded before anything runs: one script at a time
+        // out of [`crate::state::MAX_CONCURRENT_JOB_SCRIPT_RUNS`], whose permit is taken
+        // before anything is handed off, at
+        // most [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] handed off per call, each
+        // script stopped at [`crate::state::JOB_SCRIPT_RUN_CEILING`] (which clamps the job's
+        // own `Timeout` down) and inside the step, memory, recursion and output ceilings the
+        // interpreter is given. An attempt the job's retry policy owes this run is performed
+        // by a LATER call, once this attempt has come to rest, so one start runs one script.
         //
         // What each execution came to is recorded on the run it belongs to as the state that
         // run comes to REST in — owed one span after the run has been `RUNNING`, and never

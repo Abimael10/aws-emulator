@@ -351,7 +351,10 @@ async fn a_submitted_stop_moves_each_named_run_to_stopped() {
             );
         }
         for run_id in &untouched {
-            let run = get_run(&router, name, run_id).await;
+            // A run nobody stopped comes to rest in what its own execution came to, which the
+            // service performs past the call that started it: it is read back until it HAS
+            // come to rest.
+            let run = crate::job_runs::run_at_rest(&router, &engine, case, name, run_id).await;
             assert_eq!(
                 run.get("JobRunState").and_then(Value::as_str),
                 Some(JOB_RUN_STATE_FAILED),
@@ -393,9 +396,11 @@ async fn a_run_the_stop_cannot_reach_is_reported_per_run() {
     set_due_instant(&engine, "other-job", far_future());
 
     // A run of this job that the clock already finished, and one a stop already finished.
+    // The first is read back until it HAS come to rest: what it comes to rest in is what its
+    // own execution came to, performed past the call that started it.
     let settled = start_runs_in_flight(&router, &engine, name, 1).await[0].clone();
-    set_due_instant(&engine, name, already_past());
-    let _ = get_run(&router, name, &settled).await;
+    crate::job_runs::run_at_rest(&router, &engine, "a run the clock finished", name, &settled)
+        .await;
     let already_stopped = start_runs_in_flight(&router, &engine, name, 1).await[0].clone();
     stop_runs(&router, name, std::slice::from_ref(&already_stopped)).await;
     set_due_instant(&engine, name, already_past());

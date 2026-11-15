@@ -3579,24 +3579,49 @@ pub fn queue_name_from_arn<'a>(arn: &'a str, region: &str) -> Option<&'a str> {
     }
 }
 
-/// The message every `QueueDoesNotExist` refusal carries, whatever the request named.
+/// The message a `QueueDoesNotExist` refusal carries where the request addressed the queue
+/// BY ITS URL — every operation of this service but the one that resolves a NAME.
 ///
-/// Amazon SQS answers this error with ONE fixed string — "The specified queue does not
-/// exist." — for every operation and every queue: the error CODE
+/// RECORDED: a `SendMessage` to a url no queue answers to is refused
+/// `AWS.SimpleQueueService.NonExistentQueue` with this sentence, whose closing clause names
+/// the API version the queue was addressed through ("for this wsdl version"). It is ONE fixed
+/// string for every such operation and every queue: the error CODE
 /// (`AWS.SimpleQueueService.NonExistentQueue` / `QueueDoesNotExist`, from the model's
-/// `awsQueryError`) is what identifies the condition, and the message is a constant a
-/// client can match on. It deliberately does not name the queue, so a caller probing for
-/// a queue it may not address is never handed the name it probed back.
-pub const QUEUE_DOES_NOT_EXIST_MESSAGE: &str = "The specified queue does not exist.";
+/// `awsQueryError`) is what identifies the condition, and the message is a constant a client
+/// can match on. It deliberately does not name the queue, so a caller probing for a queue it
+/// may not address is never handed the url it probed back.
+///
+/// The NAME-addressed lookup words the same absence without that clause
+/// ([`QUEUE_NAME_DOES_NOT_EXIST_MESSAGE`]), because the name it was given belongs to no API
+/// version.
+pub const QUEUE_DOES_NOT_EXIST_MESSAGE: &str =
+    "The specified queue does not exist for this wsdl version.";
 
-/// The modelled refusal for a `QueueUrl` or `QueueName` no queue of this account answers
-/// to, carrying [`QUEUE_DOES_NOT_EXIST_MESSAGE`] verbatim.
+/// The message the same refusal carries where the request addressed the queue BY NAME —
+/// `GetQueueUrl`, which is the one operation that does.
+///
+/// RECORDED: a `GetQueueUrl` for a name this account holds no queue under is refused
+/// `AWS.SimpleQueueService.NonExistentQueue` with this sentence and no further clause. Like
+/// the url-addressed one it names neither the name nor the owner the caller probed with.
+pub const QUEUE_NAME_DOES_NOT_EXIST_MESSAGE: &str = "The specified queue does not exist.";
+
+/// The modelled refusal for a `QueueUrl` no queue of this account answers to, carrying
+/// [`QUEUE_DOES_NOT_EXIST_MESSAGE`] verbatim.
 ///
 /// Takes no argument on purpose: nothing of the request may reach this payload, so no
 /// caller can word a message of its own that echoes a url, a name or an owner.
 pub fn queue_does_not_exist() -> QueueDoesNotExist {
     QueueDoesNotExist {
         message: Some(QUEUE_DOES_NOT_EXIST_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled refusal for a `QueueName` this account holds no queue under, carrying
+/// [`QUEUE_NAME_DOES_NOT_EXIST_MESSAGE`] verbatim — and nothing of the request, for the
+/// reason above.
+pub fn queue_name_does_not_exist() -> QueueDoesNotExist {
+    QueueDoesNotExist {
+        message: Some(QUEUE_NAME_DOES_NOT_EXIST_MESSAGE.to_string()),
     }
 }
 

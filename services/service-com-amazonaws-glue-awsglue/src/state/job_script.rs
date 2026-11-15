@@ -9,8 +9,9 @@
 //! job arguments associated with this run … that your own job-execution script consumes".
 //! So a run of a job IS one execution of that script with those arguments, and the state
 //! the run comes to rest in is whatever that execution came to: `SUCCEEDED` for a script
-//! that exited cleanly, and the modelled failure state carrying the SCRIPT'S own error for
-//! one that raised.
+//! that exited cleanly — one that ran to its end, and one that ENDED THE PROGRAM with an exit
+//! status of zero ([`SCRIPT_ENTRY_SOURCE`]) — and the modelled failure state carrying the
+//! SCRIPT'S own error for one that raised or exited with any other status.
 //!
 //! That is what this module does, and nothing about it is synthesised:
 //!
@@ -30,11 +31,14 @@
 //!
 //! # Where the script runs from, and when
 //!
-//! The execution is performed where a run is BEGUN — by `StartJobRun`, by a trigger's
-//! actions, or by a trigger whose batch window the clock ran out on — with no store guard
-//! held, exactly as a column statistics task run reads its table's data
-//! ([`super::compute_column_statistics`]). A run whose script has not been performed yet is
-//! marked [`JobRunEntry::awaiting_script`], so an operation that reads a job's runs performs
+//! The execution is HANDED OFF where a run is BEGUN — by `StartJobRun`, by a trigger's
+//! actions, or by a trigger whose batch window the clock ran out on — to a task of this
+//! process, with no store guard held and with no request waiting on it. That is what a job run
+//! IS: `StartJobRun` "starts a job run" and answers the id it minted, while the run itself
+//! goes on in the background, so the call that starts a run is not held for as long as the
+//! script takes and a client polling `GetJobRun` observes the run WHILE its script is running
+//! rather than only before and after it. A run whose script has not been performed yet is
+//! marked [`JobRunEntry::awaiting_script`], so an operation that reads a job's runs hands off
 //! what that run was already owed rather than reporting a run nothing is running: the
 //! execution was owed the instant the run began, whoever began it.
 //!
@@ -47,16 +51,16 @@
 //! # Bounds
 //!
 //! A script is caller-supplied code, so every bound is this emulator's and none of them is
-//! reachable from the script: how many scripts run at once
-//! ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], with a bounded wait for a permit), how many one call
-//! performs ([`MAX_JOB_SCRIPT_RUNS_PER_CALL`]) and for how long
-//! ([`JOB_SCRIPT_CALL_CEILING`]), how long one script's own run may last
-//! ([`JOB_SCRIPT_RUN_CEILING`], which also clamps the job's own `Timeout`), how much of THIS
-//! HOST's time one run may take ([`JOB_SCRIPT_HOST_CEILING`], which the engine stops the run
-//! on) and how long the call waits for the thread it runs on ([`JOB_SCRIPT_HOST_WAIT`]), how
-//! large the script may be ([`MAX_JOB_SCRIPT_BYTES`], enforced by the ranged read), and the
-//! step ([`MAX_JOB_SCRIPT_STEPS`]), memory, recursion, log and answer ceilings the interpreter
-//! is given ([`job_script_budget`]).
+//! reachable from the script: how many scripts run at once and how many handed-off executions
+//! can be in flight at a time ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], whose permit is taken
+//! before anything is spawned, with no wait), how many executions one call hands off
+//! ([`MAX_JOB_SCRIPT_RUNS_PER_CALL`] over at most [`MAX_JOBS_PER_SCRIPT_CALL`] jobs), how long
+//! one script's own run may last ([`JOB_SCRIPT_RUN_CEILING`], which also clamps the job's own
+//! `Timeout`), how much of THIS HOST's time one run may take ([`JOB_SCRIPT_HOST_CEILING`],
+//! which the engine stops the run on) and how long the task waits for the thread it runs on
+//! ([`JOB_SCRIPT_HOST_WAIT`]), how large the script may be ([`MAX_JOB_SCRIPT_BYTES`], enforced
+//! by the ranged read), and the step ([`MAX_JOB_SCRIPT_STEPS`]), memory, recursion, log and
+//! answer ceilings the interpreter is given ([`job_script_budget`]).
 //!
 //! # What decides the state a run comes to rest in
 //!
@@ -113,20 +117,28 @@ pub const MAX_JOB_SCRIPT_BYTES: usize = 1024 * 1024;
 /// The longest ONE run of a job script may last in the RUN'S OWN time, whatever the job's
 /// `Timeout` says.
 ///
-/// CHOSEN, not an AWS duration: `Timeout` is stated in minutes and may be as long as seven
-/// days, and the execution happens inside the call that begins the run — so this is the span
-/// this emulator gives a script, and the job's own `Timeout` is clamped DOWN to it before it
-/// bounds anything ([`job_script_budget`]). Because the shortest `Timeout` the model admits
-/// is one minute (`Timeout`'s `@range(min: 1)`), this ceiling is what binds every run today,
-/// and a script that runs past it is reported in the state `Job$Timeout` documents for a run
-/// that was terminated for taking too long.
+/// CHOSEN, not an AWS duration: `Timeout` is "the maximum time that a job run can consume
+/// resources before it is terminated and enters TIMEOUT status" and is stated in minutes, as
+/// long as seven days — so this is the span this emulator gives a script, and the job's own
+/// `Timeout` is clamped DOWN to it before it bounds anything ([`job_script_budget`]). Because
+/// the shortest `Timeout` the model admits is one minute (`Timeout`'s `@range(min: 1)`), this
+/// ceiling is what binds every run today, and a script that runs past it is reported in the
+/// state `Job$Timeout` documents for a run that was terminated for taking too long.
 ///
-/// It is a span of the RUN's own time rather than of this host's: it is read against a clock
-/// the run itself drives ([`JOB_SCRIPT_CLOCK_TICK`]) and spent by the waits the script asks
-/// for, so what a run comes to rest in is the same on an idle host and on a loaded one, and
-/// the host's own speed is not what decides whether a script was terminated. What the run may
-/// take of THIS host is bounded beside it ([`JOB_SCRIPT_HOST_CEILING`]).
-pub const JOB_SCRIPT_RUN_CEILING: Duration = Duration::from_secs(5);
+/// It is generous beside the waits a job script asks for while a client polls the run through
+/// its lifecycle — a script that waits for work to settle before it publishes is ordinary Glue
+/// — because a wait a script asks for KEEPS ITS VALUE: the span is read against a clock the run
+/// itself drives whose waits really pass ([`python::Clock::waiting`]), so the run is reported
+/// `RUNNING` for as long as its script waits and the effects it makes afterwards happen
+/// afterwards.
+///
+/// It remains a span of the RUN's own time rather than of this host's: it is spent by the waits
+/// the script asks for and by one tick per traced event it delivers
+/// ([`JOB_SCRIPT_CLOCK_TICK`]), and by nothing of this host's speed — so what a run comes to
+/// rest in is the same on an idle host and on a loaded one, and the host's own speed is not
+/// what decides whether a script was terminated. What the run may take of THIS host is bounded
+/// beside it ([`JOB_SCRIPT_HOST_CEILING`]).
+pub const JOB_SCRIPT_RUN_CEILING: Duration = Duration::from_secs(40);
 
 /// How far ONE reading of a job script run's clock moves it.
 ///
@@ -150,11 +162,12 @@ pub const JOB_SCRIPT_CLOCK_TICK: Duration = Duration::from_nanos(100);
 ///
 /// It is generous beside the span the engine's phases take in the run's own time
 /// ([`INIT_PHASE_LIMIT`] standing the execution environment up, then
-/// [`JOB_SCRIPT_RUN_CEILING`] of script) — this host may need several times as long of its own
-/// for the same work when it is loaded, and a script that FINISHED must be reported on what it
-/// came to rather than on the host's load — and it is many times the host time the whole step
-/// budget spends ([`MAX_JOB_SCRIPT_STEPS`]), so a script that computes without end is still
-/// answered by that budget rather than by this ceiling.
+/// [`JOB_SCRIPT_RUN_CEILING`] of script) — the waits a script asks for really pass, so that
+/// span is host time as well, this host may need several times as long of its own for the same
+/// work when it is loaded, and a script that FINISHED must be reported on what it came to
+/// rather than on the host's load — and it is many times the host time the whole step budget
+/// spends ([`MAX_JOB_SCRIPT_STEPS`]), so a script that computes without end is still answered
+/// by that budget rather than by this ceiling.
 ///
 /// A run this ceiling stops is one this emulator GAVE UP ON: it is reported in the state a run
 /// that ended on a service error reports, carrying [`job_run_script_host_ceiling_reached`],
@@ -167,7 +180,7 @@ pub const JOB_SCRIPT_HOST_CEILING: Duration = INIT_PHASE_LIMIT
 /// ([`JOB_SCRIPT_HOST_CEILING`]).
 const HOST_CEILING_OVER_THE_ENGINE_SPAN: u32 = 3;
 
-/// How long the call that performs ONE execution waits for the thread that execution runs on.
+/// How long the task that performs ONE execution waits for the thread that execution runs on.
 ///
 /// The host ceiling above plus the grace the engine's own stop needs to land: the stop is
 /// latched by the host and RAISED at the next traced event the interpreter delivers, so a
@@ -182,55 +195,51 @@ pub const JOB_SCRIPT_HOST_WAIT: Duration =
 /// How long the engine's own stop is given to land, once the host ceiling has latched it.
 ///
 /// CHOSEN: the stop is raised at the next traced event, which a running script delivers at
-/// once; this is what the call allows for it before it stops waiting.
+/// once; this is what the task allows for it before it stops waiting.
 pub const JOB_SCRIPT_STOP_GRACE: Duration = Duration::from_secs(5);
 
-/// How many job scripts run at once in this process.
+/// How many job scripts run at once in this process, which is also how many handed-off
+/// executions can be in flight at a time.
 ///
-/// CHOSEN: a script runs per job run, so without this the bounds above would be multiplied
-/// by the number of runs an account starts. Two scripts run at a time and the rest wait for
-/// a permit.
-pub const MAX_CONCURRENT_JOB_SCRIPT_RUNS: usize = 2;
-
-/// How long a run waits for one of [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], at most.
-///
-/// CHOSEN: the wait is bounded, so the call that began the run answers either way, and it is
-/// narrowed further by what the CALL has left of [`JOB_SCRIPT_CALL_CEILING`] — so waiting for
-/// an interpreter cannot take a request past that span. A run that waited the whole wait has
-/// not been performed at all: it stays [`JobRunEntry::awaiting_script`], so a later call
-/// performs it rather than this one reporting an outcome nothing produced.
-pub const JOB_SCRIPT_PERMIT_WAIT: Duration = Duration::from_secs(5);
+/// CHOSEN: a script runs per job run, and a script that WAITS holds its interpreter for as
+/// long as it waits, so without this the bounds above would be multiplied by the number of
+/// runs an account starts. This many scripts run at a time — enough for the runs a client
+/// starts beside each other (a job and the job its trigger chains, an allowed run beside a
+/// refused one, a workflow's actions) to be in flight together while a run that waits holds
+/// one of them — and a run that finds no free interpreter is handed off by NOBODY: the permit
+/// is taken before anything is spawned ([`hand_off_job_script`]), so the run stays
+/// [`JobRunEntry::awaiting_script`] and a later call hands it off. Nothing waits for a permit,
+/// so neither a task nor a buffered script accumulates behind this bound.
+pub const MAX_CONCURRENT_JOB_SCRIPT_RUNS: usize = 8;
 
 /// The permits [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`] hands out, for the whole process: the
 /// bound is on how many scripts this emulator runs at once, whichever job or caller asked.
 ///
-/// Held as an owned permit MOVED INTO the thread that runs the script, so it is given back
-/// when that thread really ends — including a run the caller has already given up waiting
-/// for, which would otherwise take this bound past its count while its thread was still
-/// going.
+/// Taken with no wait at all, BEFORE an execution is handed off, and held as an owned permit
+/// MOVED INTO the thread that runs the script — so it is given back when that thread really
+/// ends, including for a run the caller has already given up waiting for, which would
+/// otherwise take this bound past its count while its thread was still going.
 static JOB_SCRIPT_RUN_PERMITS: ::std::sync::LazyLock<::std::sync::Arc<::tokio::sync::Semaphore>> =
     ::std::sync::LazyLock::new(|| {
         ::std::sync::Arc::new(::tokio::sync::Semaphore::new(MAX_CONCURRENT_JOB_SCRIPT_RUNS))
     });
 
-/// How many job scripts ONE call performs.
+/// How many job scripts ONE call hands off.
 ///
-/// CHOSEN: a call that finds several runs awaiting their script performs this many and
-/// leaves the rest for the next call, so no single request can be made to run an unbounded
+/// CHOSEN: a call that finds several runs awaiting their script hands off this many and
+/// leaves the rest for the next call, so no single request can be made to start an unbounded
 /// number of scripts.
 pub const MAX_JOB_SCRIPT_RUNS_PER_CALL: usize = 8;
 
-/// How long ONE call spends performing owed scripts before it leaves the rest to the next
+/// How long ONE call spends handing off owed scripts before it leaves the rest to the next
 /// call.
 ///
 /// CHOSEN: the ceiling on what a REQUEST costs, beside the ceiling on what one script's own
-/// run costs ([`JOB_SCRIPT_RUN_CEILING`]). A further script is STARTED only while the call
-/// has not already spent this span, the wait for an interpreter is narrowed to what is left
-/// of it ([`JOB_SCRIPT_PERMIT_WAIT`]), and no script in flight is ever cancelled — so a run
-/// is never left claimed by an execution nobody is waiting for, and the longest a call can be
-/// held is this span plus what the LAST execution it began is waited for
-/// ([`JOB_SCRIPT_HOST_WAIT`]) rather than the product of that wait and
-/// [`MAX_JOB_SCRIPT_RUNS_PER_CALL`].
+/// run costs ([`JOB_SCRIPT_RUN_CEILING`]). A further execution is handed off only while the
+/// call has not already spent this span — handing one off is a claim under the store's guard
+/// and a task, so a call reaches this only when the store itself is contended — and no
+/// execution in flight is ever waited for, so the longest a call can be held is this span and
+/// not the product of a script's own span and [`MAX_JOB_SCRIPT_RUNS_PER_CALL`].
 pub const JOB_SCRIPT_CALL_CEILING: Duration = Duration::from_secs(5);
 
 /// How many jobs ONE call performs owed scripts for, for the same reason.
@@ -609,28 +618,28 @@ fn configured_timeout(timeout_minutes: i32) -> Duration {
     timeout_minutes_as_duration(timeout_minutes, MAX_TIMEOUT_MINUTES)
 }
 
-/// Perform the script of every run of `job_names` that is still awaiting one, and record
-/// what each execution came to.
+/// Hand off the script of every run of `job_names` that is still awaiting one, so each of
+/// those runs executes and records what its execution came to.
 ///
 /// This is the ONE place a job run's script is run from, so a run begun by `StartJobRun`, by
 /// a trigger's actions and by a trigger whose batch window ran out are all executed the same
-/// way. Awaited with NO store guard held: the plan is copied out under the guard, the script
-/// runs without it, and the outcome is recorded under it again.
+/// way. Nothing of it happens under the store's guard: the plan is copied out under the
+/// guard, the script runs without it, and the outcome is recorded under it again.
 ///
-/// What the run REPORTS while and after that is the clock's: the state the execution came to
-/// is owed one span after the run has been [`JOB_RUN_STATE_RUNNING`], and never before one
-/// span after the execution answered ([`JobRunEntry::record_execution`]) — so a client
-/// observes the run starting, then running, then at rest, whichever call performed which
-/// part.
+/// The execution is the RUN's work and not the request's, so this call does not wait for it:
+/// each claimed execution is handed to a task of this process ([`hand_off_job_script`]) and
+/// the call answers. That is what makes a job run observable while it is in flight — the run
+/// is `STARTING`, then [`JOB_RUN_STATE_RUNNING`] for as long as its script runs, and only one
+/// span after that execution answered the state it came to
+/// ([`JobRunEntry::record_execution`]) — and what keeps the call that starts a run from being
+/// held for as long as the script takes.
 ///
-/// NOTHING IS SPAWNED: each script is compiled and executed inside this process by the
+/// NO PROCESS IS SPAWNED: each script is compiled and executed inside this process by the
 /// embedded interpreter, contained and bounded as the module docs set out. What ONE call
-/// costs is bounded twice over — at most [`MAX_JOB_SCRIPT_RUNS_PER_CALL`] scripts, and a
-/// further one started only while the call has not already spent
-/// [`JOB_SCRIPT_CALL_CEILING`] — so a slow or looping script cannot hold the request that
-/// called this open beyond that span and what the last execution it began is waited for
-/// ([`JOB_SCRIPT_HOST_WAIT`]), and the runs it did not reach stay owed rather than being
-/// reported as anything.
+/// costs is bounded all the same — at most [`MAX_JOB_SCRIPT_RUNS_PER_CALL`] executions handed
+/// off over at most [`MAX_JOBS_PER_SCRIPT_CALL`] jobs, and a further one handed off only while
+/// the call has not already spent [`JOB_SCRIPT_CALL_CEILING`] — and the runs it did not reach
+/// stay owed rather than being reported as anything.
 ///
 /// A run that FAILED and still has retry budget owes the service a further attempt
 /// (`Job$MaxRetries`), which is recorded once that run has come to rest and performed by
@@ -647,9 +656,9 @@ pub async fn perform_owed_job_runs<Eng: ::std::marker::Send + ::std::marker::Syn
         return;
     };
     let began = ::std::time::Instant::now();
-    let mut performed = 0usize;
+    let mut handed_off = 0usize;
     for job_name in job_names.iter().take(MAX_JOBS_PER_SCRIPT_CALL) {
-        while performed < MAX_JOB_SCRIPT_RUNS_PER_CALL
+        while handed_off < MAX_JOB_SCRIPT_RUNS_PER_CALL
             && began.elapsed() < JOB_SCRIPT_CALL_CEILING
         {
             // What the next owed execution is, resolved under the guard; the guard is
@@ -682,54 +691,26 @@ pub async fn perform_owed_job_runs<Eng: ::std::marker::Send + ::std::marker::Syn
                 }
             };
 
-            let Some(execution) = perform_job_script(
+            // The credential the run's own calls are made with is minted HERE, where the
+            // request's own context is: it is the session of the job's execution role
+            // ([`execution_role_identity`], the one mint this workspace has for one), and the
+            // execution the run is handed is given it rather than reaching for a credential of
+            // its own.
+            let identity = execution_role_identity(
                 engine,
-                ctx,
-                region,
-                &plan,
-                JOB_SCRIPT_CALL_CEILING.saturating_sub(began.elapsed()),
-            )
-            .await
-            else {
-                // Nothing ran: the claim goes back, so a later call performs the run rather
-                // than this one reporting an outcome no execution produced.
-                let mut store = state.lock();
-                if let Some(job) = store.job_mut(region, job_name) {
-                    job.release_script_claim(&plan.run_id);
-                }
-                break;
-            };
-            performed += 1;
-
-            let mut store = state.lock();
-            let Some(job) = store.job_mut(region, job_name) else {
-                break;
-            };
-            if let Some(run) = job.run_mut(&plan.run_id) {
-                run.record_execution(&execution.outcome, SystemTime::now());
-            }
-            // "job.commit() … updates the state of the job bookmark": the position the
-            // script's own commit reached is stored against the job, so the NEXT run of it
-            // resumes from there. A run that committed none leaves the bookmark where it is,
-            // and a reset is what drops it.
-            if let Some(position) = execution.committed_bookmark {
-                job.bookmark
-                    .get_or_insert_with(JobBookmarkState::default)
-                    .record_commit(position);
-            }
-            ::tracing::info!(
-                job = %plan.job_name,
-                run = %plan.run_id,
-                state = %execution.outcome.job_run_state(),
-                "ran a Glue job run's script"
+                ctx.credential_store(),
+                &plan.role_arn,
+                &plan.job_name,
+                SystemTime::now(),
             );
+            let access = function_sdk_access(engine, ctx, region, &plan.role_arn, &plan.job_name);
+            if !hand_off_job_script(&state, ctx.callback(), region, plan, identity, access) {
+                break;
+            }
+            handed_off += 1;
         }
     }
 
-    // A run that has COME TO REST is an event this service publishes: the state changes the
-    // clock materialised above are recorded and put on the account's default EventBridge bus
-    // here, with the store's guard released, so the call that brings a run to rest is the
-    // call that publishes it ([`super::job_run_events`]).
     // A run that has COME TO REST is an event this service publishes: the state changes the
     // clock materialised above are recorded here, with the store's guard released, and the
     // publication — and every state the clock still owes these runs — is handed to the clock
@@ -738,9 +719,153 @@ pub async fn perform_owed_job_runs<Eng: ::std::marker::Send + ::std::marker::Syn
         ctx.callback(),
         &state,
         region,
-        // The jobs this call performed owed work for, bounded the same way that work is.
+        // The jobs this call handed owed work off for, bounded the same way that work is.
         &job_names[..job_names.len().min(MAX_JOBS_PER_SCRIPT_CALL)],
     );
+}
+
+/// Hand ONE claimed execution to a task of this process, and answer whether it was taken on.
+///
+/// The run's script is the RUN's work: it is performed past the life of the request that
+/// claimed it, so the caller is not held for as long as the script takes and the run is
+/// observable while its script runs. Everything the execution needs is OWNED — the plan copied
+/// out of the store, the Region, the store handle, the callback this emulator's services reach
+/// each other through, and the credential the run's own calls are signed with — so the task
+/// holds nothing of the request.
+///
+/// What bounds the hand-off is the INTERPRETER PERMIT, taken HERE and before anything is
+/// spawned: at most [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`] executions exist at a time for the whole
+/// process, whichever job or caller asked, so neither the tasks in flight nor the script bytes
+/// they buffer grow with the number of runs an account starts. The permit is OWNED and travels
+/// with the execution into the thread its script runs on, so it is given back when that thread
+/// ends. The task's handle is kept on the store
+/// ([`ComAmazonawsGlueAwsglueState::record_handed_off_job_script`]), so an execution this
+/// service began stays reachable rather than detached.
+///
+/// `false` where the execution was NOT handed off — no async runtime to run it on, or no free
+/// interpreter — in which case the claim goes straight back, so the run stays owed its script
+/// and a later call hands it off rather than this one reporting an outcome no execution
+/// produced.
+fn hand_off_job_script(
+    state: &::engine::ServiceState<ComAmazonawsGlueAwsglueState>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    plan: JobScriptPlan,
+    identity: Option<CallerIdentity>,
+    access: Option<AwsAccess>,
+) -> bool {
+    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
+        release_script_claim(state, region, &plan);
+        return false;
+    };
+    let Ok(permit) = ::std::sync::Arc::clone(&JOB_SCRIPT_RUN_PERMITS).try_acquire_owned() else {
+        ::tracing::debug!(
+            job = %plan.job_name,
+            run = %plan.run_id,
+            "a Glue job run found no free interpreter for its script, so it stays owed one"
+        );
+        release_script_claim(state, region, &plan);
+        return false;
+    };
+    let performed = ::engine::ServiceState::clone(state);
+    let callback = callback.clone();
+    let region = region.to_string();
+    let handle = runtime.spawn(async move {
+        perform_handed_off_job_script(
+            &performed, &callback, &region, &plan, identity, access, permit,
+        )
+        .await;
+    });
+    state.lock().record_handed_off_job_script(handle);
+    true
+}
+
+/// Perform ONE handed-off execution and record what it came to on the run it belongs to.
+///
+/// The outcome is recorded under the store's guard, taken only once the execution has
+/// answered: the state the run comes to REST in is what that execution came to, due one span
+/// after the run has been [`JOB_RUN_STATE_RUNNING`] and never before one span after the
+/// execution answered ([`JobRunEntry::record_execution`]). An execution nothing ran gives the
+/// claim back instead, so a later call performs it.
+async fn perform_handed_off_job_script(
+    state: &::engine::ServiceState<ComAmazonawsGlueAwsglueState>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    plan: &JobScriptPlan,
+    identity: Option<CallerIdentity>,
+    access: Option<AwsAccess>,
+    permit: ::tokio::sync::OwnedSemaphorePermit,
+) {
+    let Some(execution) =
+        perform_job_script(callback, region, plan, identity, access, permit).await
+    else {
+        // Nothing ran: the claim goes back, so a later call performs the run rather than
+        // anything reporting an outcome no execution produced.
+        release_script_claim(state, region, plan);
+        return;
+    };
+    {
+        let mut store = state.lock();
+        let Some(job) = store.job_mut(region, &plan.job_name) else {
+            return;
+        };
+        if let Some(run) = job.run_mut(&plan.run_id) {
+            run.record_execution(&execution.outcome, SystemTime::now());
+        }
+        // "job.commit() … updates the state of the job bookmark": the position the script's
+        // own commit reached is stored against the job, so the NEXT run of it resumes from
+        // there. A run that committed none leaves the bookmark where it is, and a reset is
+        // what drops it.
+        if let Some(position) = execution.committed_bookmark {
+            job.bookmark
+                .get_or_insert_with(JobBookmarkState::default)
+                .record_commit(position);
+        }
+    }
+    ::tracing::info!(
+        job = %plan.job_name,
+        run = %plan.run_id,
+        state = %execution.outcome.job_run_state(),
+        "ran a Glue job run's script"
+    );
+    // The state this execution decided is still OWED to the run: the clock pump waits for it,
+    // materialises it and publishes the event it produces, so a client that reacts to the run
+    // through EventBridge observes it without calling Glue again
+    // ([`super::job_run_events`]).
+    record_and_publish_job_run_state_changes(
+        callback,
+        state,
+        region,
+        ::std::slice::from_ref(&plan.job_name),
+    );
+}
+
+/// Give the claim on `plan`'s execution back, for an execution nothing performed.
+fn release_script_claim(
+    state: &::engine::ServiceState<ComAmazonawsGlueAwsglueState>,
+    region: &str,
+    plan: &JobScriptPlan,
+) {
+    let mut store = state.lock();
+    if let Some(job) = store.job_mut(region, &plan.job_name) {
+        job.release_script_claim(&plan.run_id);
+    }
+}
+
+impl ComAmazonawsGlueAwsglueState {
+    /// Keep the task a handed-off execution is running on, and drop the handles of the ones
+    /// that have ENDED.
+    ///
+    /// An execution this service began stays reachable while it runs — so it can be abandoned
+    /// deliberately rather than merely forgotten — and what is kept is bounded by the permits
+    /// a hand-off has to take first ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`]): the handles of
+    /// finished executions are dropped on every record, so the list holds the ones in flight
+    /// and nothing else.
+    pub fn record_handed_off_job_script(&mut self, handle: ::tokio::task::JoinHandle<()>) {
+        self.handed_off_job_scripts
+            .retain(|running| !running.is_finished());
+        self.handed_off_job_scripts.push(handle);
+    }
 }
 
 /// Run ONE job script and answer what it came to, with the bookmark it committed, or `None`
@@ -750,16 +875,18 @@ pub async fn perform_owed_job_runs<Eng: ::std::marker::Send + ::std::marker::Syn
 /// script it does not serve, the exception the script raised, or the bound the interpreter
 /// stopped it at.
 ///
-/// `left_of_the_call` is what the CALL still has of [`JOB_SCRIPT_CALL_CEILING`], which caps
-/// the wait for a permit: waiting for an interpreter cannot then take the call past its own
-/// span, so the longest a request is held is that span plus what the execution it began is
-/// waited for ([`JOB_SCRIPT_HOST_WAIT`]).
-async fn perform_job_script<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
-    engine: &Eng,
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+/// `identity` is the session of the job's execution role the script is fetched and run as,
+/// `access` the seam its own AWS calls travel this emulator over — both built by the call that
+/// claimed this execution, where the request's own context is ([`perform_owed_job_runs`]) — and
+/// `permit` this execution's share of [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], taken before it was
+/// handed off, which travels into the thread the script runs on.
+async fn perform_job_script(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     plan: &JobScriptPlan,
-    left_of_the_call: Duration,
+    identity: Option<CallerIdentity>,
+    access: Option<AwsAccess>,
+    permit: ::tokio::sync::OwnedSemaphorePermit,
 ) -> Option<JobScriptExecution> {
     // A job run is performed BY Glue acting as the job's `Role` ("the name or Amazon
     // Resource Name (ARN) of the IAM role associated with this job", `Job$Role`), so the
@@ -767,9 +894,10 @@ async fn perform_job_script<Eng: ::std::marker::Send + ::std::marker::Sync + 'st
     // assume that role at all: a role whose trust policy does not admit the Glue service
     // principal backs no run, and the run fails before anything of the job is fetched or
     // executed. Only what IAM ANSWERED fails the run (see
-    // [`super::glue_role_is_unassumable`]), so a role nothing can be shown about — including
-    // an emulator with no IAM to ask — is admitted. Awaited with no store guard held.
-    if glue_role_is_unassumable(ctx, region, &plan.role_arn).await {
+    // [`super::glue_role_is_unassumable_through`]), so a role nothing can be shown about —
+    // including an emulator with no IAM to ask — is admitted. Awaited with no store guard
+    // held.
+    if glue_role_is_unassumable_through(callback, region, &plan.role_arn).await {
         ::tracing::debug!(
             job = %plan.job_name,
             run = %plan.run_id,
@@ -824,14 +952,7 @@ async fn perform_job_script<Eng: ::std::marker::Send + ::std::marker::Sync + 'st
     // `None` where no session could be minted — nothing is known about the role — in which
     // case the read is made with the credential the framework hands this emulator's handlers,
     // as every other in-process read between two emulated services is.
-    let identity = execution_role_identity(
-        engine,
-        ctx.credential_store(),
-        &plan.role_arn,
-        &plan.job_name,
-        SystemTime::now(),
-    );
-    let source = match read_script(ctx.callback(), region, &bucket, &key, identity.clone()).await {
+    let source = match read_script(callback, region, &bucket, &key, identity).await {
         Ok(source) => source,
         Err(ScriptNotRead::Denied) => {
             ::tracing::debug!(
@@ -857,34 +978,13 @@ async fn perform_job_script<Eng: ::std::marker::Send + ::std::marker::Sync + 'st
         }
     };
 
-    // How many scripts run at once is bounded, and the wait for a permit is bounded twice:
-    // by its own span and by what the CALL has left — so a request is never held past
-    // [`JOB_SCRIPT_CALL_CEILING`] waiting for an interpreter. A run that waited the whole
-    // wait has not been performed.
-    // The permit is OWNED and travels with the script's own thread, so it is given back when
-    // that thread ends rather than when this caller stops waiting for it.
-    let permit_wait = JOB_SCRIPT_PERMIT_WAIT.min(left_of_the_call);
-    let permit = match ::tokio::time::timeout(
-        permit_wait,
-        ::std::sync::Arc::clone(&JOB_SCRIPT_RUN_PERMITS).acquire_owned(),
-    )
-    .await
-    {
-        Ok(Ok(permit)) => permit,
-        _ => {
-            ::tracing::debug!(
-                job = %plan.job_name,
-                run = %plan.run_id,
-                "a Glue job run found no free interpreter for its script, so it stays owed one"
-            );
-            return None;
-        }
-    };
+    // The permit this execution holds was taken BEFORE it was handed off, so it is here
+    // already: the script is read and run under it, and it is given back when the thread it
+    // travels into ends.
     // The calls the script itself makes are made as the role the job runs as, over the same
     // in-process callback, and the script never sees the credential. It is the SAME session
     // the script was fetched with: the mint holds one per role and run environment, so the
     // fetch and the run speak for one identity.
-    let access = function_sdk_access(engine, ctx, region, &plan.role_arn, &plan.job_name);
     Some(run_script(plan, &source, &key, access, permit).await)
 }
 
@@ -969,7 +1069,7 @@ async fn read_script(
 /// together with the bookmark its own commit left.
 ///
 /// The interpreter is synchronous and CPU-bound, so it runs on a thread with a stack of its
-/// own rather than on the async runtime, and the caller's wait for it is the host backstop
+/// own rather than on the async runtime, and the wait for it is the host backstop
 /// ([`JOB_SCRIPT_HOST_WAIT`]).
 ///
 /// The span the engine bounds the run itself by is read against a clock the RUN drives
@@ -1054,8 +1154,13 @@ async fn run_script(
                 // run comes to rest in is what the script came to rather than what this
                 // host's load made of it — stating what the run may take of THIS host
                 // besides, which is the bound the engine stops it on whatever its own clock
-                // reads.
-                &python::Clock::driven(JOB_SCRIPT_CLOCK_TICK).within(JOB_SCRIPT_HOST_CEILING),
+                // reads. The waits it asks for really PASS ([`python::Clock::waiting`]): a
+                // job run is observed by a client while it is in flight, so a script that
+                // waits keeps its run `RUNNING` for that span and the effects it makes after
+                // waiting are made after it.
+                &python::Clock::driven(JOB_SCRIPT_CLOCK_TICK)
+                    .waiting()
+                    .within(JOB_SCRIPT_HOST_CEILING),
             );
             let _ = sender.send(finished);
         });
@@ -1163,9 +1268,18 @@ const SCRIPT_ENTRY_FUNCTION: &str = "run";
 /// run — as the `__main__` module, with the job's arguments on `sys.argv` — and lets
 /// whatever the script raises travel out to the engine, which is what reports it.
 ///
+/// A script is a PROGRAM, so the way it ENDS is its exit status: `sys.exit()` raises
+/// `SystemExit`, whose `code` is `None` for a plain `sys.exit()` and the status for
+/// `sys.exit(status)` — and Python's own rule is that `None` is equivalent to zero and any
+/// other object means a failure. So a script that exits with a status of zero (or with none at
+/// all) ran to its end and the run SUCCEEDS, while one that exits with any other status failed
+/// and that status travels on as the program's own, exactly as a non-zero exit of a job script
+/// on a Glue worker fails its run.
+///
 /// It is also the two ends of the JOB BOOKMARK: the point the job's last committed run left
 /// is taken up before the script runs, and what the script's own `job.commit()` reached is
-/// what the module ANSWERS with, for the service to store against the job.
+/// what the module ANSWERS with, for the service to store against the job — including for a
+/// script that committed and then exited, because that script did commit.
 ///
 /// Nothing here is a bound or a containment: both are the engine's, in host code no script
 /// can reach.
@@ -1188,7 +1302,15 @@ def run(event, context):
     # A script is run as a program, so its globals are those of the main module and its
     # `if __name__ == "__main__":` guard holds, exactly as on a Glue worker.
     script_globals = {"__name__": "__main__", "__file__": event["path"]}
-    exec(compile(event["source"], event["path"], "exec"), script_globals)
+    try:
+        exec(compile(event["source"], event["path"], "exec"), script_globals)
+    except SystemExit as exiting:
+        # How a program ENDS: `sys.exit()` with no status, or with zero, is a script that ran
+        # to its end, so the run comes to rest on what the script did rather than on the
+        # exception that ended it. Any other status is the script failing, and it travels on
+        # to the engine as the program's own exit status.
+        if exiting.code is not None and exiting.code != 0:
+            raise
     # What the run answers with is the bookmark the script's own commit left, which the
     # service stores for the next run of this job; a script that committed none answers none.
     return {"bookmark": _bookmark.committed()}

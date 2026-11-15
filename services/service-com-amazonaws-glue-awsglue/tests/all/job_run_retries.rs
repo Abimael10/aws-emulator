@@ -414,10 +414,13 @@ async fn the_chain_falls_due_on_the_wall_clock_without_anything_writing_an_insta
     ok(&router, "CreateJob", &job_body(name, json!({ "MaxRetries": 2 }))).await;
     let first = start_run(&router, &json!({ "JobName": name })).await;
 
-    // The chain is one attempt per owed span, so three attempts are due within a few of
-    // them. The poll is bounded, and a window that closes before the chain is complete
-    // fails the row rather than hanging.
-    let deadline = SystemTime::now() + 10 * JOB_RUN_SETTLES_AFTER;
+    // The chain is one attempt per owed span, and each attempt's own EXECUTION happens past
+    // the call that began it — so what the poll waits for is the CONDITION that the chain has
+    // settled, against a deadline far longer than the spans themselves, generous enough that a
+    // loaded host reaches the same verdict as an idle one. Nothing here asserts how long it
+    // took, and a window that closes before the chain is complete fails the row rather than
+    // hanging.
+    let deadline = SystemTime::now() + 40 * JOB_RUN_SETTLES_AFTER;
     let mut runs = listed_runs(&router, case, name).await;
     while SystemTime::now() < deadline {
         if runs.len() == 3 && runs.iter().all(|run| run["CompletedOn"].is_number()) {

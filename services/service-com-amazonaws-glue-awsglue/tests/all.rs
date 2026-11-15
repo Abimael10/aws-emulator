@@ -257,6 +257,8 @@ mod job_not_found_message;
 mod job_regions;
 #[path = "all/job_run_execution_role.rs"]
 mod job_run_execution_role;
+#[path = "all/job_run_in_flight.rs"]
+mod job_run_in_flight;
 #[path = "all/job_run_listing.rs"]
 mod job_run_listing;
 #[path = "all/job_run_miss_message.rs"]

@@ -458,8 +458,10 @@ async fn listing_runs_reports_the_state_the_clock_owes_and_changes_nothing_else(
 
     // Once the clock owes the transition, the listing reports it — and keeps reporting the
     // same thing, so the listing materialises what was due rather than moving a run
-    // because it was read.
-    set_due_instant(&engine, name, SystemTime::UNIX_EPOCH);
+    // because it was read. Each run is read back until it HAS come to rest: what it comes to
+    // rest in is what its own execution came to, which the service performs past the call
+    // that started it.
+    crate::job_runs::runs_at_rest(&router, &engine, "the transition fell due", name).await;
     let settled = ok(&router, "GetJobRuns", &json!({ "JobName": name })).await;
     let again = ok(&router, "GetJobRuns", &json!({ "JobName": name })).await;
     assert_eq!(
@@ -511,8 +513,16 @@ async fn a_retry_chain_is_listed_newest_first_with_each_link_intact() {
             .unwrap_or_else(|| panic!("StartJobRun must answer a JobRunId, got {answer}"))
             .to_string();
         chain.push(id);
-        // The run just started must finish before the next attempt retries it.
-        set_due_instant(&engine, name, SystemTime::UNIX_EPOCH);
+        // The run just started must finish before the next attempt retries it, so it is read
+        // back until it HAS come to rest.
+        crate::job_runs::run_at_rest(
+            &router,
+            &engine,
+            "a chain of three attempts",
+            name,
+            chain.last().unwrap_or_else(|| panic!("the chain holds its newest link")),
+        )
+        .await;
         assert_eq!(
             chain.len(),
             attempt + 1,

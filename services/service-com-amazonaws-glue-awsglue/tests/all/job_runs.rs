@@ -640,10 +640,12 @@ async fn a_started_run_is_read_back_through_get_job_run() {
             "case {case:?}: reading a run must not move it; first {run}, then {again}"
         );
 
-        // Once the owed transition is due the run is terminal, with the reason it did
-        // not run, and everything the start recorded is still reported unchanged.
-        set_due_instant(&engine, name, already_past());
-        let settled = get_run(&router, name, &run_id).await;
+        // Once the run has come to rest it is terminal, with the reason it did not run, and
+        // everything the start recorded is still reported unchanged. The run is read back
+        // until it HAS come to rest: the execution it is owed is performed past the call that
+        // started it, so the state it comes to rest in falls due once that execution
+        // answered.
+        let settled = run_at_rest(&router, &engine, case, name, &run_id).await;
         assert_eq!(
             settled.get("JobRunState").and_then(Value::as_str),
             Some(JOB_RUN_STATE_FAILED),
@@ -819,8 +821,10 @@ async fn a_start_past_the_jobs_concurrency_limit_is_refused() {
             "case {case:?}: the refused start must record no run"
         );
 
-        // Finishing the runs in flight frees every slot again.
-        set_due_instant(&engine, &name, already_past());
+        // Finishing the runs in flight frees every slot again: each of them is read back
+        // until it HAS come to rest, because the execution a run is owed is performed past
+        // the call that started it and the slot a run holds is freed when the RUN finishes.
+        runs_at_rest(&router, &engine, case, &name).await;
         start_run(&router, &json!({ "JobName": name })).await;
         assert_eq!(
             stored_runs(&engine, &name).len(),
@@ -976,8 +980,10 @@ async fn a_retry_names_the_run_it_retries_and_bumps_the_attempt() {
     // Each row is one further retry, so the attempt number is asserted over a sequence
     // rather than at a single point.
     for attempt in 1..=3i64 {
-        // A retry is a new run, so the one it retries must have finished first.
-        set_due_instant(&engine, name, already_past());
+        // A retry is a new run, so the one it retries must have finished first: it is read
+        // back until it HAS come to rest, because the execution it is owed is performed past
+        // the call that started it.
+        run_at_rest(&router, &engine, "a retried run", name, &previous).await;
         let retry = start_run(
             &router,
             &json!({ "JobName": name, "JobRunId": previous.clone() }),
@@ -1244,7 +1250,9 @@ async fn an_unservable_start_is_refused_with_the_modeled_error() {
             Some(i64::from(timeout)),
             "case timeout {timeout}: a timeout within the documented bounds round-trips, got {run}"
         );
-        set_due_instant(&engine, "refusals", already_past());
+        // The slot this run holds is freed once the RUN has finished, so the next row's
+        // start is admitted: the run is read back until it has come to rest.
+        run_at_rest(&router, &engine, "a served timeout", "refusals", &run_id).await;
     }
 }
 
@@ -1257,14 +1265,15 @@ async fn a_job_keeps_a_bounded_number_of_runs() {
     ok(&router, "CreateJob", &job_body(name, json!({}))).await;
 
     // Reaching the window over the wire takes one request per run, which is what a
-    // client would do; each run is settled so the next start is admitted.
+    // client would do; each run is read back until it has come to REST, because the slot it
+    // holds is freed when the run finishes and the next start is admitted then.
     let mut first_ids: Vec<String> = Vec::new();
     for index in 0..MAX_RUNS_PER_JOB + 5 {
         let run_id = start_run(&router, &json!({ "JobName": name })).await;
+        run_at_rest(&router, &engine, "a bounded window of runs", name, &run_id).await;
         if index < 5 {
             first_ids.push(run_id);
         }
-        set_due_instant(&engine, name, already_past());
     }
 
     let held = stored_runs(&engine, name);

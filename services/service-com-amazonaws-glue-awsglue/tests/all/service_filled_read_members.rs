@@ -30,7 +30,7 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::job_runs::{already_past, emulator_with_engine, set_due_instant};
+use crate::job_runs::emulator_with_engine;
 use crate::wire::{call, emulator, ok, CALLER_PRINCIPAL, REGION};
 
 /// The IAM role a job or session of these suites runs as. Its NAME is the part after the
@@ -539,7 +539,17 @@ async fn a_run_a_firing_began_reports_the_runs_its_predicate_named() {
         .as_str()
         .expect("a run reports its Id")
         .to_string();
-    set_due_instant(&engine, predicate_job, already_past());
+    // The state it comes to REST in is what its own execution came to, which the service
+    // performs past the call that started the run, so it is read back until it has come to
+    // rest rather than read once.
+    crate::job_runs::run_at_rest(
+        &router,
+        &engine,
+        "the run the predicate is about",
+        predicate_job,
+        &preceding_id,
+    )
+    .await;
 
     let actions = json!([{ "JobName": triggered_job }]);
     ok(

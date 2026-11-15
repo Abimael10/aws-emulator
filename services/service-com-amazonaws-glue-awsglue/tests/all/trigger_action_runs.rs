@@ -33,7 +33,7 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::job_runs::{already_past, emulator_with_engine, far_future, job_body, set_due_instant};
+use crate::job_runs::{emulator_with_engine, far_future, job_body, set_due_instant};
 use crate::wire::{call_in_region, ok, REGION};
 
 /// The crawler an action can name instead of a job.
@@ -429,9 +429,11 @@ async fn a_firing_is_bounded_by_the_jobs_concurrency_ceiling() {
             );
         }
 
-        // Once the clock has finished the runs in flight, the next firing begins a run
-        // again: the ceiling is on runs in flight, not on firings ever made.
-        set_due_instant(&engine, &job, already_past());
+        // Once the runs in flight have finished, the next firing begins a run again: the
+        // ceiling is on runs in flight, not on firings ever made. Each run is read back until
+        // it HAS come to rest, because the execution a run is owed is performed past the call
+        // that began it and the slot it holds is freed when the RUN finishes.
+        crate::job_runs::runs_at_rest(&router, &engine, case, &job).await;
         start_trigger(&router, case, &trigger).await;
         let runs = job_runs(&router, &job).await;
         assert_eq!(

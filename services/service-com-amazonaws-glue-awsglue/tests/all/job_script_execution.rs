@@ -19,9 +19,10 @@
 //! The recorded case — a script that writes a token object under the key its `--key` and
 //! `--token` arguments name, run by a `glue:startJobRun.sync` task — is ONE row of the table
 //! below; the rows differ along what the script does (exits cleanly, writes an object,
-//! resolves its arguments through `awsglue.utils`, raises, fails to compile, reaches for the
-//! host, runs past its wall clock), how the script is reachable at all (staged, missing, not
-//! named, in a language no engine here runs) and what the run therefore comes to rest in.
+//! resolves its arguments through `awsglue.utils`, ends the program with an exit status of its
+//! own, raises, fails to compile, reaches for the host, runs past its wall clock), how the
+//! script is reachable at all (staged, missing, not named, in a language no engine here runs)
+//! and what the run therefore comes to rest in.
 //!
 //! The due instant a run's terminal state falls at is moved THROUGH THE STORE rather than
 //! slept for, and every run is read back until it has come to rest
@@ -311,6 +312,44 @@ const RAISES: &str = r#"
 raise ValueError("the input partition is malformed")
 "#;
 
+/// A script that writes its token and then ENDS the program with a status of zero, which is
+/// how a Python program exits cleanly (`sys.exit`).
+const EXITS_WITH_ZERO: &str = r#"
+import sys
+
+import boto3
+
+named = dict(zip(sys.argv[1::2], sys.argv[2::2]))
+boto3.client("s3").put_object(
+    Bucket=named["--bucket"],
+    Key=named["--key"],
+    Body=named["--token"].encode("utf-8"),
+)
+sys.exit(0)
+"#;
+
+/// The same, ending the program with NO status at all — which Python reads as zero.
+const EXITS_WITH_NO_STATUS: &str = r#"
+import sys
+
+import boto3
+
+named = dict(zip(sys.argv[1::2], sys.argv[2::2]))
+boto3.client("s3").put_object(
+    Bucket=named["--bucket"],
+    Key=named["--key"],
+    Body=named["--token"].encode("utf-8"),
+)
+sys.exit()
+"#;
+
+/// A script that ends the program with a NON-ZERO status, which is a script that failed.
+const EXITS_WITH_A_FAILURE_STATUS: &str = r#"
+import sys
+
+sys.exit(3)
+"#;
+
 /// A script that raises something else, so the reason the run reports is the exception's own
 /// type and message rather than one fixed sentence.
 const RAISES_KEY_ERROR: &str = r#"
@@ -418,6 +457,33 @@ async fn a_runs_terminal_state_is_what_its_script_came_to() {
         Row::new("a script that raises", "script-raises", RAISES).failing(
             JOB_RUN_STATE_FAILED,
             Reason::Exact("ValueError: the input partition is malformed".to_string()),
+        ),
+        // How a PROGRAM ends is its exit status: zero (and none at all, which Python reads as
+        // zero) is a script that ran to its end, and any other status is one that failed.
+        Row {
+            writes_token: true,
+            ..Row::new(
+                "a script that exits with a status of zero",
+                "script-exits-zero",
+                EXITS_WITH_ZERO,
+            )
+        },
+        Row {
+            writes_token: true,
+            ..Row::new(
+                "a script that exits with no status at all",
+                "script-exits-bare",
+                EXITS_WITH_NO_STATUS,
+            )
+        },
+        Row::new(
+            "a script that exits with a non-zero status",
+            "script-exits-failing",
+            EXITS_WITH_A_FAILURE_STATUS,
+        )
+        .failing(
+            JOB_RUN_STATE_FAILED,
+            Reason::StartsWith("SystemExit".to_string()),
         ),
         Row::new(
             "a script that raises a different exception",

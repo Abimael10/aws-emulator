@@ -239,8 +239,23 @@ pub async fn glue_role_is_unassumable(
     region: &str,
     role: &str,
 ) -> bool {
-    ::service_common::iam_role::role_is_unassumable(
-        ctx,
+    glue_role_is_unassumable_through(ctx.callback(), region, role).await
+}
+
+/// [`glue_role_is_unassumable`] asked through the emulator's own callback rather than through
+/// a request's context, for work this service performs on a task of its own — a job run's
+/// script, which is executed past the life of the call that started the run
+/// ([`super::job_script`]).
+///
+/// The question, the grounds and the answer are [`glue_role_is_unassumable`]'s; only who is
+/// asking differs ([`::service_common::iam_role::role_is_unassumable_through`]).
+pub async fn glue_role_is_unassumable_through(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    role: &str,
+) -> bool {
+    ::service_common::iam_role::role_is_unassumable_through(
+        callback,
         region,
         &glue_role_reference(role).arn,
         GLUE_SERVICE_PRINCIPAL,

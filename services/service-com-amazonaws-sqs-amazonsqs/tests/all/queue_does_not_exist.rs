@@ -3,9 +3,12 @@
 //! End-to-end tests for the ONE refusal every operation of this service shares.
 //!
 //! The rule under test: **a request naming a queue this account does not have is refused
-//! as `QueueDoesNotExist` carrying Amazon SQS's own fixed message, "The specified queue
-//! does not exist.", whatever the request named and whichever operation it called.** The
-//! message is a constant — the error CODE
+//! as `QueueDoesNotExist` carrying Amazon SQS's own fixed message for the FORM the request
+//! addressed that queue in — "The specified queue does not exist for this wsdl version."
+//! for a `QueueUrl`, whose closing clause names the API version the url was addressed
+//! through, and "The specified queue does not exist." for the `QueueName` the one
+//! name-addressed operation resolves — whatever the request named and whichever operation
+//! it called.** Each message is a constant — the error CODE
 //! (`AWS.SimpleQueueService.NonExistentQueue` / `QueueDoesNotExist`, from the model's
 //! `awsQueryError`) is what identifies the condition — so a client matching on AWS's
 //! documented text recognises the absence, and the queue the caller probed for is never
@@ -14,12 +17,14 @@
 //! The table spans what the rule generalises over: the OPERATION (every one that resolves
 //! a queue, addressed by url and by name), and the FORM of the absence (a name never
 //! created, a url of another account, an owner id that is not this emulator's, a value
-//! that is not a url at all, and a queue that was deleted). The expected message is the
-//! constant exported by [`service_com_amazonaws_sqs_amazonsqs::state`], never a string
+//! that is not a url at all, and a queue that was deleted). The expected messages are the
+//! constants exported by [`service_com_amazonaws_sqs_amazonsqs::state`], never strings
 //! copied out of an answer.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_sqs_amazonsqs::state::QUEUE_DOES_NOT_EXIST_MESSAGE;
+use service_com_amazonaws_sqs_amazonsqs::state::{
+    QUEUE_DOES_NOT_EXIST_MESSAGE, QUEUE_NAME_DOES_NOT_EXIST_MESSAGE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{account, call, create_ok, emulator, error_code, HOST, OTHER_ACCOUNT};
@@ -72,14 +77,15 @@ fn url_requests(url: &str) -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// Assert one refusal: a 400 `QueueDoesNotExist` whose message is AWS's constant and
-/// mentions nothing of the request.
+/// Assert one refusal: a 400 `QueueDoesNotExist` whose message is AWS's constant for the
+/// form the request addressed the queue in, and which mentions nothing of the request.
 async fn assert_refused(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
     request: &Value,
     probed: &str,
+    expected: &str,
 ) {
     let (status, parsed) = call(router, operation, request).await;
     assert_eq!(
@@ -89,7 +95,7 @@ async fn assert_refused(
     );
     let message = message_of(&parsed);
     assert_eq!(
-        message, QUEUE_DOES_NOT_EXIST_MESSAGE,
+        message, expected,
         "case {operation} on {case}: expected AWS's fixed message, got {message:?}"
     );
     assert!(
@@ -131,14 +137,22 @@ async fn every_url_addressed_operation_refuses_an_absent_queue_with_the_fixed_me
 
     for (case, url, probed) in &cases {
         for (operation, request) in url_requests(url) {
-            assert_refused(&router, case, operation, &request, probed).await;
+            assert_refused(
+                &router,
+                case,
+                operation,
+                &request,
+                probed,
+                QUEUE_DOES_NOT_EXIST_MESSAGE,
+            )
+            .await;
         }
     }
 }
 
 /// `GetQueueUrl` resolves a queue by NAME, and refuses a name this account has no queue
-/// for — and a request naming another owner — with exactly the same message: nothing of
-/// the name or the owner id the caller supplied appears in it.
+/// for — and a request naming another owner — with the message AWS answers a name with:
+/// nothing of the name or the owner id the caller supplied appears in it.
 #[tokio::test]
 async fn get_queue_url_refuses_an_absent_name_with_the_fixed_message() {
     let router = emulator();
@@ -163,7 +177,15 @@ async fn get_queue_url_refuses_an_absent_name_with_the_fixed_message() {
     ];
 
     for (case, request, probed) in &cases {
-        assert_refused(&router, case, "GetQueueUrl", request, probed).await;
+        assert_refused(
+            &router,
+            case,
+            "GetQueueUrl",
+            request,
+            probed,
+            QUEUE_NAME_DOES_NOT_EXIST_MESSAGE,
+        )
+        .await;
     }
 
     // The queue that does exist still resolves, so the refusals above are about the queue
@@ -190,7 +212,15 @@ async fn a_deleted_queue_is_refused_exactly_as_one_that_never_existed() {
     );
 
     for (operation, request) in url_requests(&url) {
-        assert_refused(&router, "a queue that was deleted", operation, &request, "transient").await;
+        assert_refused(
+            &router,
+            "a queue that was deleted",
+            operation,
+            &request,
+            "transient",
+            QUEUE_DOES_NOT_EXIST_MESSAGE,
+        )
+        .await;
     }
     assert_refused(
         &router,
@@ -198,6 +228,7 @@ async fn a_deleted_queue_is_refused_exactly_as_one_that_never_existed() {
         "GetQueueUrl",
         &json!({"QueueName": "transient"}),
         "transient",
+        QUEUE_NAME_DOES_NOT_EXIST_MESSAGE,
     )
     .await;
 }

@@ -1357,6 +1357,15 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// The running pump's task handle, kept so the pump it replaces is aborted rather than
     /// merely forgotten.
     pub clock_pump: Option<::tokio::task::JoinHandle<()>>,
+    /// The tasks the HANDED-OFF job script executions are running on
+    /// ([`hand_off_job_script`]), kept so an execution this service began is reachable — and
+    /// so abortable — rather than detached.
+    ///
+    /// Bounded by construction: a hand-off takes one of
+    /// [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`]'s permits BEFORE it spawns, so at most that many
+    /// executions are ever in flight, and the handles of the ones that have ended are dropped
+    /// whenever another is recorded ([`Self::record_handed_off_job_script`]).
+    pub handed_off_job_scripts: Vec<::tokio::task::JoinHandle<()>>,
 }
 
 impl ComAmazonawsGlueAwsglueState {
@@ -2473,7 +2482,7 @@ impl ComAmazonawsGlueAwsglueState {
         now: SystemTime,
     ) {
         self.settle_due_action_job_runs(region, workflow_name, now);
-        let awaited = self.workflow_runs_awaiting_their_actions(region, workflow_name);
+        let awaited = self.workflow_runs_awaiting_their_actions(region, workflow_name, now);
         let Some(workflow) = self.workflow_mut(workflow_name) else {
             return;
         };
@@ -2492,12 +2501,18 @@ impl ComAmazonawsGlueAwsglueState {
     /// all, is absent from the answer: there is nothing left for it to wait for. An action
     /// whose job run the store no longer holds is nothing to wait for either.
     ///
+    /// An action whose job run owes its next state to its own EXECUTION rather than to the
+    /// clock — a run whose script is running, which carries no due instant while it does — is
+    /// waited for one span on and looked at again, so a composite is never reported at rest
+    /// while a run it is made of is still going.
+    ///
     /// The walk is over the runs this workflow holds, bounded by [`MAX_RUNS_PER_WORKFLOW`],
     /// each naming the actions of one trigger.
     fn workflow_runs_awaiting_their_actions(
         &self,
         region: &str,
         workflow_name: &str,
+        now: SystemTime,
     ) -> BTreeMap<String, SystemTime> {
         let Some(workflow) = self.workflow(workflow_name) else {
             return BTreeMap::new();
@@ -2512,7 +2527,11 @@ impl ComAmazonawsGlueAwsglueState {
                         .and_then(|job| job.run(&begun.run_id))
                 })
                 .filter(|job_run| !job_run.is_terminal())
-                .filter_map(|job_run| job_run.settles_at)
+                .map(|job_run| {
+                    job_run.settles_at.unwrap_or_else(|| {
+                        now.checked_add(JOB_RUN_SETTLES_AFTER).unwrap_or(now)
+                    })
+                })
                 .max();
             if let Some(latest) = latest {
                 awaited.insert(run.id.clone(), latest);

@@ -135,7 +135,10 @@ async fn events(router: &MultiServiceRouter, operation: &str, body: Value) -> Va
 }
 
 /// Call one SQS operation.
-async fn sqs(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+///
+/// Shared with the suite that drives a run's own script to its effect on a queue
+/// ([`crate::job_run_in_flight`]), so both read one spelling of this dispatch.
+pub(crate) async fn sqs(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let (status, parsed) = rpc(router, "sqs", "AmazonSQS", "1.0", operation, body).await;
     assert_eq!(
         status, 200,

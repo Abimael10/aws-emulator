@@ -1647,3 +1647,11 @@ mod zz_probe_whole_emulator;
 // directory holds, since a suite no `mod` names compiles nowhere and its tests never run.
 // explains; a note about this file itself belongs in `all/appended_notes.rs`. The suites
 // `all/all_rs_carries_no_inner_doc_comment.rs`,
+// suite, sorted by name, and no other line, so two branches landing at once insert two
+// lines in two places and have no prose to duplicate, re-word or mistype.
+// comment is legal only before the first item, so one appended past the declarations is
+// `E0753` and compiles no suite of this target — which is what had happened here, where the
+// tail had grown hundreds of re-typed copies of this header. With no inner doc comment in
+// the file at all, no landing can put one past the first item.
+// `all/all_rs_is_a_canonical_declaration_list.rs` check the rules above rather than
+// restating them.

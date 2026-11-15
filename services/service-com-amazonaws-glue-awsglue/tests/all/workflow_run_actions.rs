@@ -36,7 +36,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_glue_awsglue::state::{NODE_TYPE_CRAWLER, NODE_TYPE_JOB};
 
-use crate::job_runs::{already_past, emulator_with_engine, far_future, job_body, set_due_instant};
+use crate::job_runs::{emulator_with_engine, far_future, job_body, set_due_instant};
 use crate::wire::{call_in_region, ok, REGION};
 
 /// The role ARN the crawler below is registered with.
@@ -536,7 +536,10 @@ async fn a_runs_statistics_move_as_the_clock_moves_its_job_runs() {
             set_due_instant(&engine, &job, far_future());
         }
         if due {
-            set_due_instant(&engine, &job, already_past());
+            // Each run the actions began is read back until it HAS come to rest: what a run
+            // comes to rest in is what its own execution came to — performed past the call
+            // that began the run — or the stop a client submitted for it.
+            crate::job_runs::runs_at_rest(&router, &engine, case, &job).await;
         }
 
         let runs = workflow_runs(&router, &workflow, false).await;

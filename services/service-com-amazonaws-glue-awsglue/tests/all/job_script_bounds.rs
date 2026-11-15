@@ -13,9 +13,13 @@
 //! Every case goes over the wire through the shared [`crate::wire`] harness, with the script
 //! staged through Amazon S3's own `PutObject` and the run read back through `GetJobRun`, so
 //! what is asserted is HTTP behaviour over state the data plane really holds. Nothing here
-//! sleeps or reads this host's clock: the due instant a run's terminal state falls at is
-//! moved through the store ([`crate::job_runs::set_due_instant`]), and the waits the scripts
-//! below ask for are spans of their own run's time.
+//! sleeps or reads this host's clock, and nothing asserts on how long anything took: the due
+//! instant a run's terminal state falls at is moved through the store
+//! ([`crate::job_runs::set_due_instant`]) and each run is polled for the CONDITION that it has
+//! come to rest. The waits the SCRIPTS below ask for are spans of their own run's time and
+//! really pass, because a job run is observed while it is in flight — so a row whose script
+//! asks to wait past the span its run is given takes that span, and the row's verdict is still
+//! the script's own doing rather than this host's speed.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
@@ -46,13 +50,16 @@ print("this script was not stopped")
 
 /// A script whose MANY SMALL waits add up past that span, so what stops it is the total of
 /// the waits it asked for rather than any one of them.
-const WAITS_IN_SMALL_SPANS: &str = r#"
-import time
-
-for asked in range(20):
-    time.sleep(1)
-print("this script was not stopped")
-"#;
+///
+/// How many it asks for is read off the span itself rather than written out, so the script
+/// stays one that asks for more of it than there is however that span is set.
+fn waits_in_small_spans() -> String {
+    let waits = JOB_SCRIPT_RUN_CEILING.as_secs() + 1;
+    format!(
+        "import time\n\nfor asked in range({waits}):\n    time.sleep(1)\nprint(\"this script \
+         was not stopped\")\n"
+    )
+}
 
 /// A script that waits a span well inside the one its run is given and then exits cleanly.
 const WAITS_INSIDE_THE_SPAN: &str = r#"
@@ -116,6 +123,7 @@ async fn create_job(router: &MultiServiceRouter, name: &str, location: &str) {
 #[tokio::test]
 async fn what_stops_a_script_is_its_own_work_and_its_own_waits() {
     // (case, the script, the state the run must come to rest in, its ErrorMessage)
+    let small_spans = waits_in_small_spans();
     let rows: [(&str, &str, &str, Reason); 6] = [
         (
             "a script that exits at once",
@@ -143,7 +151,7 @@ async fn what_stops_a_script_is_its_own_work_and_its_own_waits() {
         ),
         (
             "a script whose many small waits add up past that span",
-            WAITS_IN_SMALL_SPANS,
+            small_spans.as_str(),
             JOB_RUN_STATE_TIMEOUT,
             Reason::Exact(job_run_script_ceiling_reached()),
         ),

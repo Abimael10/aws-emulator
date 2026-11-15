@@ -29,7 +29,11 @@
 //! A WAIT the run asked for is spent through the clock too ([`Clock::wait`]), because waiting
 //! is how time passes: on this host's own clock the thread really waits, and on a clock the
 //! host drives the span is advanced on the clock instead — so the wait costs the RUN the span
-//! it asked for and none of this host's time.
+//! it asked for and none of this host's time. A clock the host drives may also be asked to let
+//! those waits REALLY pass ([`Clock::waiting`]), for a run whose effects a client observes
+//! while it is still in flight: the span is both advanced on the clock and waited out, so what
+//! the run does after a wait happens after that span really has gone by, while the run's own
+//! deadline is still spent by what the run asked for rather than by this host's speed.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -58,6 +62,10 @@ pub struct Clock {
     /// own, whose readings are this host's time already, and a clock used only to drive a run
     /// from a test.
     host_ceiling: Option<Duration>,
+    /// Whether a WAIT the run asks for also really passes on this host ([`Clock::waiting`]).
+    /// `false` — the default for a clock the host drives — spends the span on this clock
+    /// alone; this host's own clock waits either way.
+    waits_on_the_host: bool,
     /// When this clock was built, in THIS HOST's own time, which is what the ceiling above is
     /// measured from.
     built_at: Instant,
@@ -75,6 +83,7 @@ impl Clock {
             readings: Arc::new(AtomicU64::new(0)),
             waited: Arc::new(AtomicU64::new(0)),
             host_ceiling: None,
+            waits_on_the_host: false,
             built_at: Instant::now(),
         }
     }
@@ -94,6 +103,7 @@ impl Clock {
             readings: Arc::new(AtomicU64::new(0)),
             waited: Arc::new(AtomicU64::new(0)),
             host_ceiling: None,
+            waits_on_the_host: false,
             built_at: Instant::now(),
         }
     }
@@ -113,8 +123,27 @@ impl Clock {
             readings: Arc::new(AtomicU64::new(0)),
             waited: Arc::new(AtomicU64::new(0)),
             host_ceiling: None,
+            waits_on_the_host: false,
             built_at: Instant::now(),
         }
+    }
+
+    /// The same clock, where a WAIT the run asks for also REALLY passes on this host.
+    ///
+    /// A clock the host drives spends a wait on the clock alone, which is what makes the span
+    /// a run is given a span of its own doings; it also makes a run's whole execution happen in
+    /// whatever host time the work itself takes, so a client watching that run cannot observe
+    /// it between two of its own waits. This is for a run a client observes WHILE IT IS IN
+    /// FLIGHT: the span is advanced on the clock AND waited out, so the run's deadline is still
+    /// spent by the waits it asked for and by nothing of this host's speed, while what the run
+    /// does after a wait happens after that span really has gone by.
+    ///
+    /// The wait is made on the run's own thread, which is where the guest asked for it, and no
+    /// guest code decides whether a clock waits: the caller that builds the clock does.
+    #[must_use]
+    pub fn waiting(mut self) -> Self {
+        self.waits_on_the_host = true;
+        self
     }
 
     /// The same clock, with a CEILING on how much of THIS HOST's own time a run bounded
@@ -162,12 +191,22 @@ impl Clock {
     /// wait costs the run the span it asked for, the run's deadline falls after the waits it
     /// really asked for, and how fast this host happens to be running spends neither.
     ///
+    /// A clock the host drives that was built [`Self::waiting`] does BOTH: the span is advanced
+    /// on the clock, so the deadline still falls where the run's own waits took it, and it is
+    /// waited out as well, so the run's later work really happens after it.
+    ///
     /// The caller decides how long a run may be made to wait for — the span handed here is
     /// already clamped to what the run has left — and no guest code reaches this.
     pub fn wait(&self, span: Duration) {
         if self.base.is_none() {
             ::std::thread::sleep(span);
             return;
+        }
+        // A clock the host drives may still be asked to let the run's waits really pass
+        // ([`Self::waiting`]), so a run whose effects are observed while it is in flight does
+        // its waiting where the guest asked for it.
+        if self.waits_on_the_host {
+            ::std::thread::sleep(span);
         }
         let nanos = u64::try_from(span.as_nanos()).unwrap_or(u64::MAX);
         let _ = self
@@ -353,6 +392,16 @@ mod tests {
                 Clock::driven(Duration::ZERO),
                 &[Duration::from_secs(30)],
                 Duration::from_secs(30),
+            ),
+            (
+                // A clock whose waits also really pass ([`Clock::waiting`]) spends them on
+                // itself just the same, so what the run's deadline reads is still the span the
+                // run asked for. The spans are tiny because the row is about what the CLOCK
+                // then reads, not about how long the thread took over them.
+                "spans on a clock its readings drive that also waits them out",
+                Clock::driven(Duration::ZERO).waiting(),
+                &[Duration::from_millis(1), Duration::from_millis(2)],
+                Duration::from_millis(3),
             ),
         ];
         for (case, clock, asked, total) in cases {
