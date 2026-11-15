@@ -166,6 +166,23 @@ fn is_malformed_arn(violation: &Violation) -> bool {
         && matches!(violation.kind, ViolationKind::Pattern(_))
 }
 
+/// The value of `violation` a sentence of this service's own can NAME, and `None` when
+/// there is none to name.
+///
+/// [`malformed_arn_message`] states the refused value as bare prose rather than between
+/// delimiters, so a value with no text in it cannot be read back out of that sentence at
+/// all. Two cases carry none: the member was ABSENT (the collector's `value: None`), and
+/// the member was PRESENT holding nothing a sentence can show — the empty value, or one
+/// that is only whitespace. Both are refused in the framework's own clauses instead
+/// ([`refusal_message`]), which quote the value between `'` and state the requirement it
+/// missed.
+fn nameable_value(violation: &Violation) -> Option<&str> {
+    violation
+        .value
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+}
+
 /// The sentence this service refuses `violations` with, or `None` when there is nothing
 /// to refuse.
 ///
@@ -186,13 +203,16 @@ fn is_malformed_arn(violation: &Violation) -> bool {
 /// leaves ([`held_within_the_message_maximum`]). A sentence already inside the maximum is
 /// returned exactly as the framework worded it.
 pub(crate) fn refusal_message(violations: &[Violation]) -> Option<String> {
-    // Only when the value is actually known: a pattern violation that captured none
-    // would otherwise be reported as "Input arn  is malformed", which tells the caller
-    // nothing, so the framework's own clause is kept for it instead.
+    // This service's own wording stands in for the framework's clauses only where it tells
+    // the caller MORE than they do, which is the value it names: a violation carrying no
+    // value a sentence can show ([`nameable_value`]) would be reported as
+    // "Input arn  is malformed", which states neither the value nor the requirement and
+    // discards every other clause the walk collected for the same member, so the
+    // framework's own clauses are kept for it instead.
     let malformed_arn = violations
         .iter()
         .filter(|violation| is_malformed_arn(violation))
-        .find_map(|violation| violation.value.as_deref());
+        .find_map(nameable_value);
     if let Some(value) = malformed_arn {
         // One clause, one value: its room is the whole member less this wording's prose.
         let room = LARGEST_MESSAGE_BYTES.saturating_sub(malformed_arn_prose_bytes());
@@ -544,8 +564,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 #[cfg(test)]
 mod tests {
     use super::{
-        refusal_message, Violation, ViolationKind, ARN_MEMBER_PATH, LARGEST_CLAUSE_PROSE_BYTES,
-        LARGEST_MESSAGE_BYTES, LARGEST_QUOTED_VALUE_BYTES,
+        constraints, refusal_message, Violation, ViolationKind, ARN_MEMBER_PATH,
+        LARGEST_CLAUSE_PROSE_BYTES, LARGEST_MESSAGE_BYTES, LARGEST_QUOTED_VALUE_BYTES,
     };
 
     /// The `@pattern` every ARN-valued member of this model declares, as the framework
@@ -699,6 +719,80 @@ mod tests {
             malformed.starts_with("Input arn ") && malformed.ends_with(" is malformed"),
             "case \"the malformed-ARN wording\": expected this service's own wording, got \
              {malformed:?}"
+        );
+    }
+
+    /// RULE: the malformed-ARN wording this service answers in place of the framework's
+    /// clauses is answered only where it can NAME the refused value; a value with no text
+    /// in it — one the walk recorded without a value at all, and one present holding
+    /// nothing but whitespace — is refused with the framework's own clauses, which quote
+    /// the value and state every requirement it missed.
+    ///
+    /// Rows differ along what the rule generalises over: whether the refused value has text
+    /// to name, over the forms a value with none arrives in.
+    #[test]
+    fn the_malformed_arn_wording_is_answered_only_where_it_names_a_value() {
+        let arn_pattern_violation = |value: Option<&str>| Violation {
+            path: ARN_MEMBER_PATH.to_string(),
+            kind: ViolationKind::Pattern(JOB_ARN_PATTERN.to_string()),
+            value: value.map(ToString::to_string),
+            sensitive: false,
+        };
+
+        // Values a sentence can name: the wording states the value as the request sent it,
+        // whitespace around its text included.
+        for (case, value) in [
+            ("a value that is not an ARN at all", "not-a-job-arn"),
+            ("a one-character value", "x"),
+            ("a value of punctuation alone", "::::"),
+            ("text surrounded by spaces", " not-a-job-arn "),
+        ] {
+            let message = refusal_message(&[arn_pattern_violation(Some(value))])
+                .unwrap_or_else(|| panic!("case {case:?}: expected a refusal sentence"));
+            let expected = format!("Input arn {value} is malformed");
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+        }
+
+        // Values a sentence can name NOTHING of: the framework's clauses stand instead.
+        for (case, value) in [
+            ("no value recorded at all", None),
+            ("the empty value", Some("")),
+            ("one space", Some(" ")),
+            ("three spaces", Some("   ")),
+            ("one tab", Some("\t")),
+        ] {
+            let violation = arn_pattern_violation(value);
+            let expected = constraints::envelope(std::slice::from_ref(&violation))
+                .unwrap_or_else(|| panic!("case {case:?}: expected the framework's clause"));
+            let message = refusal_message(&[violation])
+                .unwrap_or_else(|| panic!("case {case:?}: expected a refusal sentence"));
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected the framework's own clause {expected:?}, got {message:?}"
+            );
+        }
+
+        // And the clause the walk collected BESIDE the pattern one for a value under the
+        // modelled minimum reaches the sentence, which is the requirement a caller acts on.
+        let under_the_minimum = [
+            Violation {
+                path: ARN_MEMBER_PATH.to_string(),
+                kind: ViolationKind::MinLength(1),
+                value: Some(String::new()),
+                sensitive: false,
+            },
+            arn_pattern_violation(Some("")),
+        ];
+        let message =
+            refusal_message(&under_the_minimum).expect("a refusal of the empty ARN value");
+        let clause = under_the_minimum[0].message();
+        assert!(
+            message.contains(&clause),
+            "case \"the empty value's length clause\": expected the refusal to state {clause:?}, \
+             got {message:?}"
         );
     }
 }

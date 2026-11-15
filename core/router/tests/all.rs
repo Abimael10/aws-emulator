@@ -1295,3 +1295,21 @@ mod zz_probe_whole_emulator;
 //! MAY STAND IN THIS FILE: past the first item one is `E0753` and compiles no suite of
 //! this target, so what goes below is a declaration, never a note about one.
 //! it into `tests/all/`.
+//! sorted. A suite that is not declared here compiles nowhere and its tests never run,
+//! and a suite left at the top level of `tests/` fails the build.
+//! Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the
+//! same name is `E0428`. An inner doc comment (`//!`) is legal only BEFORE the first
+//! item, so these header lines are the only place one may stand — a note written with
+//! `//!` further down this file is `E0753`. Either fails every suite in this target, so
+//! a note below belongs in an ordinary `//` comment, and a rule belongs here.
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` checks the notes, for this
+//! file and for every service crate's `tests/all.rs`, so check there rather than
+//! leaving a note in the list below.
+//! This file is a LIST, not a place to record a landing: it carries one `#[path]`/`mod`
+//! pair per suite and nothing else. Each suite's own module doc says what it covers and
+//! why it has to live in this target rather than in a service crate, which is where that
+//! belongs — a note repeated here drifts from it, and concurrent landings each appending
+//! one is what grew this file past the project's file-length ceiling.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
+// (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` is what points
+// each declaration into `tests/all/`.
