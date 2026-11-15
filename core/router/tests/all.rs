@@ -1888,3 +1888,14 @@ mod cloudtrail_iam_credential_write_audit;
 // service crate's own, is stated in that suite's OWN module header, where it is read beside
 // the test it explains. A note about THIS file belongs in `all/appended_notes.rs`.
 // `all/declaration_roots_are_canonical_and_complete.rs`, beside
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair into the sorted list below — one pair
+// per suite and no other line, so two branches landing at once insert two lines in two
+// places and have no prose to duplicate, re-word or mistype.
+// past the declarations is `E0753` and compiles no suite of this target — which is what
+// repeated landings appending to the tail of this file had produced. With no inner doc
+// level of `tests/` fails the build; and a suite declared twice is `E0428`, which fails
+// every suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod`
+// would resolve to a SIBLING of this file, which the layout check refuses: the `#[path]`
+// above each `mod` is what points it into `tests/all/`.
+// `all/every_suite_file_is_declared.rs` check those rules rather than restating them.
+// explains; a note about THIS file belongs in `all/appended_notes.rs`.

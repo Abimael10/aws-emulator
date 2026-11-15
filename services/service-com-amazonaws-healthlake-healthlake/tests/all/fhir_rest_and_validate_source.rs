@@ -40,6 +40,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-east-1/healthlake/aws4_request, \
      SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
+/// The host an SDK resolves this service's endpoint to, which every request below
+/// carries unless a suite names another one.
+pub(crate) const ENDPOINT_HOST: &str = "healthlake.us-east-1.amazonaws.com";
+
 /// The emulated HealthLake service behind the production router.
 ///
 /// `pub(crate)` so the sibling suites of this test target drive the service exactly the
@@ -116,7 +120,7 @@ impl HealthLake {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
-            .header("host", "healthlake.us-east-1.amazonaws.com")
+            .header("host", ENDPOINT_HOST)
             .header("authorization", AUTHORIZATION)
             .header("content-type", "application/x-amz-json-1.0")
             .header("x-amz-target", format!("HealthLake.{operation}"))
@@ -142,12 +146,34 @@ impl HealthLake {
         content_type: &str,
         body: Vec<u8>,
     ) -> (u16, Value) {
-        let request = http::Request::builder()
+        self.rest_from_host(Some(ENDPOINT_HOST), method, uri, content_type, body)
+            .await
+    }
+
+    /// The same dispatch from a client that reached this emulator on `host` — or, with
+    /// `None`, from one that sent no `Host` header at all.
+    ///
+    /// A non-RPC surface is addressed by HTTP method and path, and the host a client
+    /// used to reach the endpoint is no part of that addressing, so
+    /// `tests/all/data_transformation_endpoint_host.rs` varies it over the hosts a
+    /// client may have been pointed at.
+    pub(crate) async fn rest_from_host(
+        &self,
+        host: Option<&str>,
+        method: &str,
+        uri: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (u16, Value) {
+        let mut builder = http::Request::builder()
             .method(method)
             .uri(uri)
-            .header("host", "healthlake.us-east-1.amazonaws.com")
             .header("authorization", AUTHORIZATION)
-            .header("content-type", content_type)
+            .header("content-type", content_type);
+        if let Some(host) = host {
+            builder = builder.header("host", host);
+        }
+        let request = builder
             .body(bytes::Bytes::from(body))
             .expect("the request builds");
         let response = self.router.dispatch(request).await;
@@ -170,7 +196,7 @@ impl HealthLake {
         let request = http::Request::builder()
             .method(method)
             .uri(uri)
-            .header("host", "healthlake.us-east-1.amazonaws.com")
+            .header("host", ENDPOINT_HOST)
             .header("authorization", AUTHORIZATION)
             .header("content-type", "application/fhir+json")
             .body(bytes::Bytes::from(payload))

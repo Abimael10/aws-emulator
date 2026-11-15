@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/control_plane_error_semantics.rs"]
 mod control_plane_error_semantics;
+#[path = "all/data_transformation_endpoint_host.rs"]
+mod data_transformation_endpoint_host;
 #[path = "all/data_transformation_job.rs"]
 mod data_transformation_job;
 #[path = "all/data_transformation_job_listing.rs"]

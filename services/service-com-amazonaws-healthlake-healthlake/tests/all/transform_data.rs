@@ -42,15 +42,15 @@ use crate::fhir_datastore_lifecycle::{error_code, error_message};
 use crate::fhir_rest_and_validate_source::HealthLake;
 
 /// The media type a transform request's JSON body travels as.
-const JSON: &str = "application/json";
+pub(crate) const JSON: &str = "application/json";
 
 /// The path the surface publishes, from the modelled `@http(uri: "/transform-data")`.
-const TRANSFORM_DATA_PATH: &str = "/transform-data";
+pub(crate) const TRANSFORM_DATA_PATH: &str = "/transform-data";
 
 /// A `ProfileId` the service never minted: 32 characters of the modelled
 /// `^[a-f0-9]{32}$` alphabet, so it is refused for being absent rather than for being
 /// outside the member's rules.
-const UNMINTED_PROFILE_ID: &str = "00000000000000000000000000000000";
+pub(crate) const UNMINTED_PROFILE_ID: &str = "00000000000000000000000000000000";
 
 /// The bucket the sample data file a profile is inferred from is staged in.
 const BUCKET: &str = "transform-sample-data";
@@ -58,7 +58,7 @@ const BUCKET: &str = "transform-sample-data";
 /// The mapping config a CSV profile declares, as a caller writes it: one table, and
 /// one resource mapping per entry of `resources`, each carrying one rule per
 /// (source column, element path) pair.
-fn csv_mapping(
+pub(crate) fn csv_mapping(
     table: Option<&str>,
     primary_key: Option<&str>,
     resources: &[(&str, &[(&str, &str)])],
@@ -109,7 +109,7 @@ fn ccda(sections: &[(&str, &str)]) -> String {
 /// `ProfileId`, after reading the mapping back through
 /// `GetDataTransformationProfile` — so the content a transform applies is content the
 /// service really stored.
-async fn create_profile(
+pub(crate) async fn create_profile(
     service: &HealthLake,
     name: &str,
     source_format: &str,
@@ -169,7 +169,12 @@ async fn transform(service: &HealthLake, request: &Value) -> (u16, Value) {
 }
 
 /// One transform request over a single CSV file.
-fn csv_request(profile_id: &str, file: &str, content: &str, flags: &[(&str, bool)]) -> Value {
+pub(crate) fn csv_request(
+    profile_id: &str,
+    file: &str,
+    content: &str,
+    flags: &[(&str, bool)],
+) -> Value {
     let files: Map<String, Value> =
         Map::from_iter([(file.to_string(), Value::from(content))]);
     let mut request = json!({
@@ -183,7 +188,7 @@ fn csv_request(profile_id: &str, file: &str, content: &str, flags: &[(&str, bool
 }
 
 /// The FHIR resources the answered Bundle carries, asserted to be a Bundle at all.
-fn resources(case: &str, payload: &Value) -> Vec<Value> {
+pub(crate) fn resources(case: &str, payload: &Value) -> Vec<Value> {
     let transformed = payload["TransformedData"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: the answer carries TransformedData, got {payload}"));
