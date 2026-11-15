@@ -184,13 +184,9 @@ fn question_metric(
     answer: Option<&AnswerRecord>,
 ) -> Option<QuestionMetric> {
     let risk = identified_risk(question, answer)?;
-    let answer = answer?;
-    let best_practices = question
-        .best_practices
-        .iter()
-        .zip(answer.reported_choice_answers(question))
-        .filter(|(_, reported)| reported.status == CHOICE_STATUS_UNSELECTED)
-        .map(|(choice, _)| BestPractice {
+    let best_practices = unselected_best_practices(question, answer)
+        .into_iter()
+        .map(|choice| BestPractice {
             choice_id: Some(choice.id.clone()),
             choice_title: Some(choice.title.clone()),
         })

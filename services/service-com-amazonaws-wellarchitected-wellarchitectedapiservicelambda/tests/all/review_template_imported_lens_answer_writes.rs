@@ -53,11 +53,10 @@ const PUBLISHED_VERSION: &str = "1.0";
 const ANSWERED: &str = "ANSWERED";
 const UNANSWERED: &str = "UNANSWERED";
 
-/// Two members of the `ChoiceStatus` value set
+/// One member of the `ChoiceStatus` value set
 /// (`smithy_query(query="shape", shape="ChoiceStatus")`): the status of a choice an answer
-/// records as in place, and of one it does not.
+/// records as in place.
 const SELECTED: &str = "SELECTED";
-const UNSELECTED: &str = "UNSELECTED";
 
 /// A `QuestionId` of the AWS Well-Architected Framework lens, as this emulator's own stable
 /// ids spell it (pinned by `super::question_choice_catalog`): a question no imported
@@ -166,7 +165,8 @@ fn choice_statuses(answer: &Value) -> BTreeMap<String, String> {
 
 /// Assert an answer records what the request wrote, against the question the DOCUMENT
 /// defines: the question's identity, its whole choice catalog, the choices in place, one
-/// status per choice the question offers, the notes written and the answered state.
+/// per-choice answer per choice the answer ANSWERS, the notes written and the answered
+/// state.
 fn assert_records(
     case: &str,
     answer: &Value,
@@ -202,14 +202,8 @@ fn assert_records(
     let expected: BTreeMap<String, String> = question
         .choices
         .iter()
-        .map(|(choice_id, _)| {
-            let status = if selected.contains(choice_id) {
-                SELECTED
-            } else {
-                UNSELECTED
-            };
-            (choice_id.clone(), status.to_string())
-        })
+        .filter(|(choice_id, _)| selected.contains(choice_id))
+        .map(|(choice_id, _)| (choice_id.clone(), SELECTED.to_string()))
         .collect();
     let actual = choice_statuses(answer);
     assert_eq!(

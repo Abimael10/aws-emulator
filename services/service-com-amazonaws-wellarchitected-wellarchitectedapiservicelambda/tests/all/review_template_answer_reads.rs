@@ -160,7 +160,13 @@ fn recorded_answer(state: Recorded, offered: &[String]) -> (Option<AnswerRecord>
             ANSWERED
         },
         selected: selected.clone(),
-        choice_statuses: choice_statuses.clone(),
+        // A read reports the choices the answer ANSWERS: the stored statuses other than
+        // UNSELECTED, which belongs to the question's catalog rather than to its answer.
+        choice_statuses: choice_statuses
+            .iter()
+            .filter(|(_, status)| status.as_str() != UNSELECTED)
+            .map(|(choice_id, status)| (choice_id.clone(), status.clone()))
+            .collect(),
         is_applicable,
         reason,
     };

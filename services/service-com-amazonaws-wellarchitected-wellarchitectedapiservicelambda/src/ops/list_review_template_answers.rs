@@ -304,20 +304,7 @@ fn answer_summary(
                 .map(|answer| answer.selected_choices_of(question))
                 .unwrap_or_default(),
         ),
-        choice_answer_summaries: Some(
-            answer
-                .map(|answer| {
-                    answer
-                        .reported_choice_answers(question)
-                        .map(|choice| ChoiceAnswerSummary {
-                            choice_id: Some(choice.choice_id.to_string()),
-                            status: Some(choice.status.to_string()),
-                            reason: choice.reason.map(str::to_string),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        ),
+        choice_answer_summaries: Some(crate::state::choice_answer_summaries_of(question, answer)),
         // A question applies unless an answer says it does not.
         is_applicable: Some(answer.is_none_or(|answer| answer.is_applicable)),
         // "The status of whether or not this question has been answered"

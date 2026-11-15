@@ -304,25 +304,30 @@ async fn selected_choices_replace_the_best_practices_an_answer_records() {
                 expected_selection,
                 "case {case:?}: the answer must record {expected_selection:?} as in place, got {answer:?}"
             );
-            let expected_statuses: BTreeMap<String, String> = asks
-                .iter()
-                .map(|choice_id| {
-                    let status = if expected_selection.contains(choice_id) {
-                        "SELECTED"
-                    } else {
-                        "UNSELECTED"
-                    };
-                    (choice_id.clone(), status.to_string())
-                })
-                .collect();
-            let actual_statuses: BTreeMap<String, String> = choice_answers(&answer)
-                .into_iter()
-                .map(|(choice_id, (status, _, _))| (choice_id, status))
-                .collect();
+            // The per-choice answers are the choices the answer ANSWERS — the selected
+            // ones — each reported once, with the reason and the notes it records for
+            // that choice, empty until something records one. A choice the selection
+            // leaves out is reported through the question's catalog and `SelectedChoices`
+            // alone.
+            let expected_answers: BTreeMap<String, (String, Option<String>, Option<String>)> =
+                expected_selection
+                    .iter()
+                    .map(|choice_id| {
+                        (
+                            choice_id.clone(),
+                            (
+                                "SELECTED".to_string(),
+                                Some(String::new()),
+                                Some(String::new()),
+                            ),
+                        )
+                    })
+                    .collect();
+            let actual_answers = choice_answers(&answer);
             assert_eq!(
-                actual_statuses, expected_statuses,
-                "case {case:?}: the answer must report every choice of the question once, with \
-                 the selected ones SELECTED, expected {expected_statuses:?}, got {actual_statuses:?}"
+                actual_answers, expected_answers,
+                "case {case:?}: the answer must report one entry per answered choice, \
+                 expected {expected_answers:?}, got {actual_answers:?}"
             );
             let risk = expected_risk(expected_selection.len(), asks.len(), true);
             assert_eq!(
@@ -400,20 +405,26 @@ async fn a_choice_update_records_the_status_reason_and_notes_of_its_choice() {
             let answer = answer_of(&recorded);
             let answered = choice_answers(&answer);
             let actual = answered.get(&under_test).cloned();
-            let expected = Some((
-                status.to_string(),
-                Some(reason.to_string()),
-                Some(notes.clone()),
-            ));
+            // An answer reports the choices it ANSWERS, so the updated choice is reported
+            // while the update records a status other than UNSELECTED for it, and an
+            // update that unselects it leaves it out of the list.
+            let expected = (status != "UNSELECTED").then(|| {
+                (
+                    status.to_string(),
+                    Some(reason.to_string()),
+                    Some(notes.clone()),
+                )
+            });
             assert_eq!(
                 actual, expected,
                 "case {case:?}: the updated choice must record {expected:?}, got {actual:?}"
             );
+            // The question's other choices were never spoken about, so they stay
+            // unselected and no entry reports them.
             assert_eq!(
                 answered.len(),
-                asks.len(),
-                "case {case:?}: updating one choice must leave the question's other choices \
-                 answered too, got {answered:?}"
+                usize::from(status != "UNSELECTED"),
+                "case {case:?}: only the choices the answer answers are reported, got {answered:?}"
             );
 
             let expected_selection: Vec<String> = if status == "SELECTED" {

@@ -2487,3 +2487,14 @@ mod declaration_roots_are_canonical_and_complete;
 // Concurrent landings had appended their own copies of this header to the file, and the
 // doc list items among them wrap without the indentation `clippy::doc_lazy_continuation`
 // asks for; the lint is allowed here so the header is a header rather than a build failure.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, in its sorted position. The list holds
+//! those pairs and nothing else, so two branches landing at once insert two lines in two
+//! places and have no prose to duplicate, re-word or mistype.
+//! A suite no `mod` names compiles nowhere and fails the layout check; a suite declared
+//! twice is `E0428`; an inner doc comment (`//!`) past the first item is `E0753`. Each of
+//! the three fails every suite in this target, so this header is the only place prose may
+//! stand, and what goes below is a declaration, never a note about one. The three rules are
+//! checked by `all/all_rs_declares_each_suite_once.rs`,
+//! crate's `tests/all.rs`, so a note about a rule belongs there rather than here.
+//! service crate's own, is stated in that suite's own module header, where it is read beside
+//! the test it explains; the notes landings had appended to the tail of this file live in

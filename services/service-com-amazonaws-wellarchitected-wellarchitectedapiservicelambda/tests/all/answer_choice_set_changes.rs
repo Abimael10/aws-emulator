@@ -47,10 +47,9 @@ const RISK_MEDIUM: &str = "MEDIUM";
 const RISK_NONE: &str = "NONE";
 const RISK_UNANSWERED: &str = "UNANSWERED";
 
-/// Two of the `ChoiceStatus` members
+/// One of the `ChoiceStatus` members
 /// (`smithy_query(query="shape", shape="ChoiceStatus")`).
 const SELECTED: &str = "SELECTED";
-const UNSELECTED: &str = "UNSELECTED";
 
 /// A lens document defining ONE pillar with ONE question offering exactly `choices`, in
 /// that order.
@@ -457,22 +456,17 @@ const CHANGES: &[ChoiceSetChange] = &[
 ];
 
 /// What every reader of the answer must report once the review is against `choices`: one
-/// per-choice entry per choice of THAT version, in its order, `SELECTED` exactly where the
-/// answer recorded a choice the version still asks about as in place.
+/// per-choice entry per choice of THAT version the answer ANSWERS — the ones it still
+/// records as in place, in the version's order. A choice the answer leaves unselected is
+/// reported through the question's own catalog and not as a per-choice answer.
 fn expected_choice_answers(
     choices: &[&str],
     in_place: &[&str],
 ) -> Vec<(String, String)> {
     choices
         .iter()
-        .map(|choice_id| {
-            let status = if in_place.contains(choice_id) {
-                SELECTED
-            } else {
-                UNSELECTED
-            };
-            ((*choice_id).to_string(), status.to_string())
-        })
+        .filter(|choice_id| in_place.contains(choice_id))
+        .map(|choice_id| ((*choice_id).to_string(), SELECTED.to_string()))
         .collect()
 }
 

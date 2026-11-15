@@ -777,7 +777,9 @@ async fn a_stored_answer_is_reported_and_rated() {
         } = row;
         // What the read must report follows from the statuses the answer records: the
         // choices in place are the ones recorded `SELECTED`, and the per-choice answers
-        // are one entry per choice of the question, in the lens's own choice order.
+        // are one entry per choice of the question the answer ANSWERS — a status other
+        // than `UNSELECTED` — in the lens's own choice order, each carrying the reason
+        // recorded for that choice, empty until one is.
         let selected: Vec<&str> = statuses
             .iter()
             .filter(|(_, status)| *status == "SELECTED")
@@ -792,7 +794,10 @@ async fn a_stored_answer_is_reported_and_rated() {
         let expected_choice_answers = Value::Array(
             statuses
                 .iter()
-                .map(|(choice_id, status)| json!({ "ChoiceId": choice_id, "Status": status }))
+                .filter(|(_, status)| *status != "UNSELECTED")
+                .map(|(choice_id, status)| {
+                    json!({ "ChoiceId": choice_id, "Status": status, "Reason": "" })
+                })
                 .collect::<Vec<Value>>(),
         );
         let status_refs: Vec<(&str, &str)> = statuses

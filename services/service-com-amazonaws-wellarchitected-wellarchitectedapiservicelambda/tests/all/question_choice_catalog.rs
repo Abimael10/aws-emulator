@@ -37,9 +37,8 @@ const FRAMEWORK_QUESTIONS: usize = 11 + 11 + 13 + 5 + 11 + 6;
 const CHOICE_ID_RANGE: (usize, usize) = (1, 64);
 const CHOICE_TITLE_RANGE: (usize, usize) = (1, 512);
 
-/// `ChoiceStatus` members, from `smithy_query(query="shape", shape="ChoiceStatus")`.
+/// One `ChoiceStatus` member, from `smithy_query(query="shape", shape="ChoiceStatus")`.
 const SELECTED: &str = "SELECTED";
-const UNSELECTED: &str = "UNSELECTED";
 
 /// One question's choice catalog as the wire reports it: `(ChoiceId, Title)` in the
 /// order the lens offers the choices.
@@ -49,9 +48,9 @@ type Catalog = Vec<(String, String)>;
 type Catalogs = BTreeMap<String, Catalog>;
 
 /// One row of the answer table: the case name, the `ChoiceId`s the answer records as in
-/// place, and the `Risk` that answer carries. The status of every choice of the question
-/// follows from the first: the choices named are `SELECTED` and every other choice of the
-/// question `UNSELECTED`, which is the key space those statuses live in.
+/// place, and the `Risk` that answer carries. The per-choice answers follow from the
+/// first: the choices named are `SELECTED` and the choices the answer leaves out are
+/// reported through the question's own catalog rather than as answers.
 type AnswerRow = (&'static str, Vec<String>, &'static str);
 
 /// `GET /workloads/{WorkloadId}/lensReviews/{LensAlias}/answers`. The query members
@@ -411,18 +410,13 @@ async fn a_discovered_choice_id_round_trips_through_the_stored_answer() {
                 question_id,
                 answered_over(&ids, &selected_refs, true, None),
             );
-            // What the read must report for every choice of the question: the ids the
-            // answer named are in place and the rest are not.
+            // What the read must report: one entry per choice the answer ANSWERS — the ids
+            // it named are in place, and a choice it leaves out is reported through the
+            // question's catalog alone.
             let choice_answers: Vec<(String, String)> = ids
                 .iter()
-                .map(|choice_id| {
-                    let status = if selected.contains(choice_id) {
-                        SELECTED
-                    } else {
-                        UNSELECTED
-                    };
-                    (choice_id.clone(), status.to_string())
-                })
+                .filter(|choice_id| selected.contains(choice_id))
+                .map(|choice_id| (choice_id.clone(), SELECTED.to_string()))
                 .collect();
 
             let summaries = collect_summaries(&case, &[], Some(50), |query| {

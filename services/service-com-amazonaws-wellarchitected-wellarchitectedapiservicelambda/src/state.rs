@@ -183,7 +183,8 @@ pub use official_lenses::{
 
 use crate::ops::types::{
     AccountJiraConfigurationOutput, AgentProfileSummary, AgentRecommendationGenerationSummary,
-    AgentRecommendationSummary, AggregationConfiguration, Choice, ChoiceAnswer, ConflictException,
+    AgentRecommendationSummary, AggregationConfiguration, Choice, ChoiceAnswer,
+    ChoiceAnswerSummary, ChoiceContent, ConflictException,
     ContextContent, ContextSummary, GetGlobalSettingsOutput, GoalSummary, JiraConfiguration,
     JiraSelectedQuestionConfiguration, LensReview, LensShareSummary, LensSummary,
     Milestone, MilestoneSummary, PillarReviewSummary, Profile, ProfileQuestion,
@@ -489,6 +490,10 @@ impl FrameworkQuestion {
                     id: self.choice_id(index),
                     title: best_practice.title.to_string(),
                     description: best_practice.description.map(str::to_string),
+                    // Per-choice improvement-plan prose "only applies to custom lenses"
+                    // (`Choice$ImprovementPlan`), so an AWS-official lens's catalog row
+                    // carries none.
+                    improvement_plan: None,
                 })
                 .collect(),
         }
@@ -527,11 +532,13 @@ impl ReviewQuestion {
     ///
     /// It is the only place a client can discover the `ChoiceId`s that
     /// `UpdateAnswer$SelectedChoices` and `ChoiceUpdates` name, so every projection of a
-    /// question reports it from here and they cannot disagree. `HelpfulResource`,
-    /// `ImprovementPlan` and `AdditionalResources` are left off: they "only appl[y] to
-    /// custom lenses" (`smithy_query(query="shape", shape="Choice")`) and the lens document
-    /// format's per-choice prose is not recorded ([`parse_lens_json`]), so there is nothing
-    /// to report in them, and every one is optional.
+    /// question reports it from here and they cannot disagree. `ImprovementPlan` is "the
+    /// improvement plan (both text and URL) for a particular choice" and "only applies to
+    /// custom lenses" (`smithy_query(query="shape", shape="Choice")`), so it is reported
+    /// for a choice whose lens content declares one and left off for a choice whose lens
+    /// declares none. `HelpfulResource` and `AdditionalResources` are left off: they only
+    /// apply to custom lenses too and are not content this emulator's lens documents record
+    /// ([`parse_lens_json`]), so there is nothing to report in them, and both are optional.
     pub fn choices(&self) -> Vec<Choice> {
         self.best_practices
             .iter()
@@ -542,7 +549,10 @@ impl ReviewQuestion {
                 // best practice, and absent for a lens that publishes none.
                 description: best_practice.description.clone(),
                 helpful_resource: None,
-                improvement_plan: None,
+                improvement_plan: best_practice
+                    .improvement_plan
+                    .as_ref()
+                    .map(LensChoiceContent::to_choice_content),
                 additional_resources: None,
             })
             .collect()
@@ -1028,8 +1038,10 @@ impl AnswerRecord {
     /// and no reason or notes.
     ///
     /// The whole choice set is recorded rather than only the choices a request speaks
-    /// about, so an answered question reports one `ChoiceAnswers` entry per choice of the
-    /// question however it was answered.
+    /// about, so the answer REMEMBERS a status for every choice of the question however it
+    /// was answered — which is not the same thing as the choices a read reports it for:
+    /// a read reports the ones the answer ANSWERS
+    /// ([`Self::answered_choice_answers`]).
     pub fn for_question(question: &ReviewQuestion) -> Self {
         Self {
             choice_answers: question
@@ -1109,6 +1121,29 @@ impl AnswerRecord {
                 notes: stored.and_then(|choice| choice.notes.as_deref()),
             }
         })
+    }
+
+    /// The choices of `question` this answer ANSWERS: the ones it records a status other
+    /// than [`CHOICE_STATUS_UNSELECTED`] for, in the lens's own choice order.
+    ///
+    /// A per-choice answer list is "a list of selected choices to a question in your
+    /// workload" (`Answer$ChoiceAnswers`, `AnswerSummary$ChoiceAnswerSummaries`), so what
+    /// it reports is the choices the answer SAYS something about — a best practice it
+    /// records as in place, or one it records as not applying to this review. Every choice
+    /// of a question starts out unselected and goes back to being unselected when a later
+    /// update drops it from the selection, so an unselected choice is not something the
+    /// answer says: it belongs to the question's own choice catalog
+    /// ([`ReviewQuestion::choices`]), which every read reports beside this list.
+    ///
+    /// This is the same reading of "answers a choice" the risk derivation applies
+    /// ([`Self::risk`]), so a question whose answer reports NO per-choice answer here is
+    /// exactly one that rates [`RISK_UNANSWERED`].
+    pub fn answered_choice_answers<'answer>(
+        &'answer self,
+        question: &'answer ReviewQuestion,
+    ) -> impl Iterator<Item = ReportedChoiceAnswer<'answer>> + 'answer {
+        self.reported_choice_answers(question)
+            .filter(|choice| choice.status != CHOICE_STATUS_UNSELECTED)
     }
 
     /// The `SelectedChoices` this answer reports for `question`: the choices of the
@@ -1198,6 +1233,88 @@ pub fn identified_risk(
     matches!(risk, RISK_HIGH | RISK_MEDIUM).then_some(risk)
 }
 
+/// The per-choice answers a read of an answer reports — `Answer$ChoiceAnswers` and
+/// `ReviewTemplateAnswer$ChoiceAnswers`, "a list of selected choices to a question in your
+/// workload".
+///
+/// One entry per choice of `question` the answer ANSWERS
+/// ([`AnswerRecord::answered_choice_answers`]), in the lens's own choice order, and an
+/// empty list for a question nothing has answered. Each entry carries every member the
+/// shape models: the choice, its status, and the reason and the notes recorded with it —
+/// each of the last two EMPTY until something records one, because they describe the
+/// per-choice answer the list reports rather than being part of what makes it an entry.
+///
+/// One place, because the write that records an answer (`UpdateAnswer`,
+/// `UpdateReviewTemplateAnswer`) and every read of one (`GetAnswer`, `ListAnswers`,
+/// `GetReviewTemplateAnswer`, `ListReviewTemplateAnswers`) report this list, and they
+/// cannot disagree about which choices an answer answers.
+pub fn choice_answers_of(
+    question: &ReviewQuestion,
+    answer: Option<&AnswerRecord>,
+) -> Vec<ChoiceAnswer> {
+    answer
+        .map(|answer| {
+            answer
+                .answered_choice_answers(question)
+                .map(|choice| ChoiceAnswer {
+                    choice_id: Some(choice.choice_id.to_string()),
+                    status: Some(choice.status.to_string()),
+                    reason: Some(choice.reason.unwrap_or_default().to_string()),
+                    notes: Some(choice.notes.unwrap_or_default().to_string()),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// [`choice_answers_of`] as a SUMMARY reports it —
+/// `AnswerSummary$ChoiceAnswerSummaries` and
+/// `ReviewTemplateAnswerSummary$ChoiceAnswerSummaries`: the same per-choice answers of the
+/// same choices, less the notes, which `ChoiceAnswerSummary` models no member for.
+pub fn choice_answer_summaries_of(
+    question: &ReviewQuestion,
+    answer: Option<&AnswerRecord>,
+) -> Vec<ChoiceAnswerSummary> {
+    choice_answers_of(question, answer)
+        .into_iter()
+        .map(|choice| ChoiceAnswerSummary {
+            choice_id: choice.choice_id,
+            status: choice.status,
+            reason: choice.reason,
+        })
+        .collect()
+}
+
+/// The best practices of `question` an answer LEAVES OUT: the choices it records
+/// [`CHOICE_STATUS_UNSELECTED`] for, in the lens's own choice order — and none at all for
+/// a question nothing has answered.
+///
+/// A best practice contributes to a question's risk exactly while the answer leaves it
+/// out; a choice the answer records as in place, or as not applying to this review,
+/// contributes nothing. The choices are resolved against the QUESTION the answer answers
+/// ([`AnswerRecord::reported_choice_answers`]), so they are the best practices the review's
+/// lens version defines, each with the content that lens declares for it.
+///
+/// One place, because the best practices a report says contribute to a question's risk
+/// (`QuestionMetric$BestPractices`) and the per-choice improvement plan of a lens review
+/// (`ImprovementSummary$ImprovementPlans`) are both the choices one answer leaves out, and
+/// the two cannot disagree about which choices those are.
+pub fn unselected_best_practices<'question>(
+    question: &'question ReviewQuestion,
+    answer: Option<&AnswerRecord>,
+) -> Vec<&'question LensChoice> {
+    let Some(answer) = answer else {
+        return Vec::new();
+    };
+    question
+        .best_practices
+        .iter()
+        .zip(answer.reported_choice_answers(question))
+        .filter(|(_, reported)| reported.status == CHOICE_STATUS_UNSELECTED)
+        .map(|(best_practice, _)| best_practice)
+        .collect()
+}
+
 /// The `Answer` projection of one question of a lens review: the question as the LENS
 /// defines it, plus the answer the reviewed resource records for it.
 ///
@@ -1234,21 +1351,7 @@ pub fn answer_projection(
                 .map(|answer| answer.selected_choices_of(question))
                 .unwrap_or_default(),
         ),
-        choice_answers: Some(
-            answer
-                .map(|answer| {
-                    answer
-                        .reported_choice_answers(question)
-                        .map(|choice| crate::ops::types::ChoiceAnswer {
-                            choice_id: Some(choice.choice_id.to_string()),
-                            status: Some(choice.status.to_string()),
-                            reason: choice.reason.map(str::to_string),
-                            notes: choice.notes.map(str::to_string),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        ),
+        choice_answers: Some(choice_answers_of(question, answer)),
         // A question applies unless an answer says it does not.
         is_applicable: Some(answer.is_none_or(|answer| answer.is_applicable)),
         risk: Some(
@@ -2509,21 +2612,7 @@ pub fn review_template_answer(
                 .map(|answer| answer.selected_choices_of(question))
                 .unwrap_or_default(),
         ),
-        choice_answers: Some(
-            answer
-                .map(|answer| {
-                    answer
-                        .reported_choice_answers(question)
-                        .map(|choice| ChoiceAnswer {
-                            choice_id: Some(choice.choice_id.to_string()),
-                            status: Some(choice.status.to_string()),
-                            reason: choice.reason.map(str::to_string),
-                            notes: choice.notes.map(str::to_string),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        ),
+        choice_answers: Some(choice_answers_of(question, answer)),
         // A question applies unless an answer says it does not.
         is_applicable: Some(answer.is_none_or(|answer| answer.is_applicable)),
         // "The status of whether or not this question has been answered": the stored
@@ -2555,6 +2644,37 @@ pub struct LensChoice {
     /// `Choice$Description` — the prose the lens publishes for this best practice, and
     /// `None` for a lens that publishes none.
     pub description: Option<String>,
+    /// The improvement plan this best practice carries: "the improvement plan (both text
+    /// and URL) for a particular choice" (`Choice$ImprovementPlan`), which "only applies
+    /// to custom lenses" — the `improvementPlan` a custom lens document declares for the
+    /// choice, and `None` for a lens whose content declares none.
+    pub improvement_plan: Option<LensChoiceContent>,
+}
+
+/// One per-choice content entry a custom lens document declares: the text it displays and
+/// the URL it points at, the two members `ChoiceContent` models.
+///
+/// `displayText` is what the document has to carry for the entry to say anything, so it is
+/// held by value; `url` is optional in the lens JSON format specification and so is the
+/// modelled member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LensChoiceContent {
+    /// `ChoiceContent$DisplayText` / `ChoiceImprovementPlan$DisplayText`.
+    pub display_text: String,
+    /// `ChoiceContent$Url` / `ChoiceImprovementPlan$ImprovementPlanUrl`, and `None` for an
+    /// entry the document declares no URL on.
+    pub url: Option<String>,
+}
+
+impl LensChoiceContent {
+    /// This entry as the modelled `ChoiceContent` a question's choice catalog reports it
+    /// in (`Choice$ImprovementPlan`, `Choice$HelpfulResource`).
+    pub fn to_choice_content(&self) -> ChoiceContent {
+        ChoiceContent {
+            display_text: Some(self.display_text.clone()),
+            url: self.url.clone(),
+        }
+    }
 }
 
 /// One rule that maps the choices selected for a question to the risk the answer
@@ -2960,6 +3080,20 @@ const LENS_DESCRIPTION_LENGTH: (usize, usize) = (1, 1024);
 /// them.
 const LENS_JSON_REQUIRED_PROPERTIES: [&str; 3] = ["name", "pillars", "schemaVersion"];
 
+/// `ChoiceContent$DisplayText`'s modelled length bounds
+/// (`smithy_query(query="shape", shape="ChoiceContent")`: length 1..1024), which the
+/// `displayText` of a choice's content entry becomes.
+const LENS_CHOICE_CONTENT_DISPLAY_TEXT_LENGTH: (usize, usize) = (1, 1024);
+
+/// `ChoiceContent$Url`'s modelled length bounds (length 1..1024), which the `url` of a
+/// choice's content entry becomes.
+const LENS_CHOICE_CONTENT_URL_LENGTH: (usize, usize) = (1, 1024);
+
+/// The `improvementPlan` property of a choice in the lens JSON format specification: the
+/// per-choice remediation the lens author writes, which `Choice$ImprovementPlan` and
+/// `ChoiceImprovementPlan` report.
+const LENS_JSON_IMPROVEMENT_PLAN: &str = "improvementPlan";
+
 /// The type an instance HAS, in the vocabulary a schema declares a type in — what a finding
 /// about a type names the instance by.
 fn lens_json_type(value: &::serde_json::Value) -> &'static str {
@@ -3026,6 +3160,36 @@ fn lens_json_string(
         ));
     }
     Ok(text.to_string())
+}
+
+/// One per-choice CONTENT entry of a lens document — a `{displayText, url}` object the
+/// format declares on a choice — or `None` when the document declares none under `member`.
+///
+/// The entry says nothing without its text, so `displayText` is required of an entry that
+/// is there at all, and `url` is optional: both are read within the bounds the modelled
+/// `ChoiceContent` carries for them, so a document cannot declare content this service
+/// would then report outside the shape that reports it.
+fn lens_json_choice_content(
+    object: &::serde_json::Value,
+    member: &str,
+) -> Result<Option<LensChoiceContent>, LensJsonRejection> {
+    let entry = match object.get(member) {
+        None | Some(::serde_json::Value::Null) => return Ok(None),
+        Some(entry) => entry,
+    };
+    if !entry.is_object() {
+        return Err(lens_json_type_finding(entry, "object"));
+    }
+    let display_text = lens_json_string(
+        entry,
+        "displayText",
+        LENS_CHOICE_CONTENT_DISPLAY_TEXT_LENGTH,
+    )?;
+    let url = match entry.get("url") {
+        None | Some(::serde_json::Value::Null) => None,
+        Some(_) => Some(lens_json_string(entry, "url", LENS_CHOICE_CONTENT_URL_LENGTH)?),
+    };
+    Ok(Some(LensChoiceContent { display_text, url }))
 }
 
 /// A required, non-empty array member of a lens document.
@@ -3149,6 +3313,14 @@ pub fn parse_lens_json(document: &str) -> Result<LensDefinition, LensJsonRejecti
                     // The lens JSON format specification carries no per-choice prose, so
                     // an imported lens publishes none.
                     description: None,
+                    // "The improvement plan details" the lens AUTHOR writes for this best
+                    // practice: the document's own `improvementPlan` entry, kept so the
+                    // question's choice catalog and the improvement plan of a review of
+                    // this lens report what the document declares.
+                    improvement_plan: lens_json_choice_content(
+                        choice_value,
+                        LENS_JSON_IMPROVEMENT_PLAN,
+                    )?,
                 });
             }
 

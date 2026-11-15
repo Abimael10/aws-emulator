@@ -364,3 +364,8 @@ mod error_type_header_form;
 // sorted middle is what repeatedly refused to merge.
 #[path = "all/consolidated_report.rs"]
 mod consolidated_report;
+// Appended at the end for the same reason as the declaration above.
+#[path = "all/answered_choice_projection.rs"]
+mod answered_choice_projection;
+#[path = "all/custom_lens_improvement_plans.rs"]
+mod custom_lens_improvement_plans;

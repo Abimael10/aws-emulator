@@ -303,13 +303,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .questions
             .iter()
             .filter_map(|question| {
-                let risk = crate::state::identified_risk(
-                    question,
-                    workload.answer(&input.lens_alias, &question.question_id),
-                )?;
+                let answer = workload.answer(&input.lens_alias, &question.question_id);
+                let risk = crate::state::identified_risk(question, answer)?;
                 Some(improvement_summary(
                     question,
                     risk,
+                    answer,
                     workload
                         .question_jira_configuration(&input.lens_alias, &question.question_id),
                 ))
@@ -333,10 +332,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The `ImprovementSummary` for one question of a lens review: the question as the lens
-/// defines it, plus the risk the workload's stored answer is rated at.
+/// defines it, the risk the workload's stored answer is rated at, and the per-choice
+/// improvement plan of the best practices that answer leaves out.
 fn improvement_summary(
     question: &crate::state::ReviewQuestion,
     risk: &str,
+    answer: Option<&crate::state::AnswerRecord>,
     jira_configuration: Option<JiraConfiguration>,
 ) -> ImprovementSummary {
     ImprovementSummary {
@@ -345,21 +346,60 @@ fn improvement_summary(
         question_title: Some(question.title.clone()),
         risk: Some(risk.to_string()),
         // `ImprovementPlanUrl` is the per-question improvement-plan DOCUMENT a lens
-        // publishes, and `ImprovementPlans` the per-choice one, which "is only applicable
-        // to custom lenses" (`smithy_query(query="shape", shape="ImprovementSummary")`).
-        // Neither is content this emulator's lens carries — it ships a question's pillar,
-        // title and best practices and nothing else, the same reason
-        // `Choice$ImprovementPlan` is left off that question's choice catalog — and both
-        // members are optional, so they are omitted rather than filled with a URL that
-        // documents nothing.
+        // publishes, which is not content this emulator's lens documents record — a lens
+        // declares its remediation per CHOICE — and the member is optional, so it is left
+        // off rather than filled with a URL that documents nothing.
         improvement_plan_url: None,
-        improvement_plans: None,
+        improvement_plans: improvement_plans(question, answer),
         // The integration state of this question's issue in the integrated service,
         // which exists once a sync has recorded one
         // (`crate::state::WorkloadRecord::question_jira_configuration`, the one place every
         // read of an answer reads it from).
         jira_configuration,
     }
+}
+
+/// `ImprovementSummary$ImprovementPlans` — "the improvement plan details", which "is only
+/// applicable to custom lenses" (`smithy_query(query="shape", shape="ImprovementSummary")`).
+///
+/// A question is in the improvement plan because its answer leaves best practices out, and
+/// what there is to improve is exactly those best practices: one `ChoiceImprovementPlan`
+/// per choice of the question the answer leaves unselected
+/// (`crate::state::unselected_best_practices`, the one place that selection lives), in the
+/// lens's own choice order, each carrying the `displayText` and `url` the lens's own content
+/// declares as that choice's improvement plan.
+///
+/// The per-choice improvement plan is content only a custom lens's document declares, so a
+/// review whose lens declares none for any of those choices reports no plan detail at all
+/// and the optional member is left off — an AWS-official lens's review being the case the
+/// member's own doc names.
+fn improvement_plans(
+    question: &crate::state::ReviewQuestion,
+    answer: Option<&crate::state::AnswerRecord>,
+) -> Option<Vec<ChoiceImprovementPlan>> {
+    let left_out = crate::state::unselected_best_practices(question, answer);
+    if !left_out
+        .iter()
+        .any(|choice| choice.improvement_plan.is_some())
+    {
+        return None;
+    }
+    Some(
+        left_out
+            .into_iter()
+            .map(|choice| ChoiceImprovementPlan {
+                choice_id: Some(choice.id.clone()),
+                display_text: choice
+                    .improvement_plan
+                    .as_ref()
+                    .map(|plan| plan.display_text.clone()),
+                improvement_plan_url: choice
+                    .improvement_plan
+                    .as_ref()
+                    .and_then(|plan| plan.url.clone()),
+            })
+            .collect(),
+    )
 }
 
 /// What a `NextToken` this service did not issue is answered with. The token is this

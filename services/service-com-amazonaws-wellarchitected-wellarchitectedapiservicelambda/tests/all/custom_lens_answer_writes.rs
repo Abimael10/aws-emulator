@@ -310,14 +310,8 @@ fn assert_recorded(case: &str, answer: &Value, summary: &Value, selected: &[Stri
     let expected_statuses: Vec<(String, String)> = {
         let mut statuses: Vec<(String, String)> = choices
             .iter()
-            .map(|choice_id| {
-                let status = if selected.contains(choice_id) {
-                    "SELECTED"
-                } else {
-                    "UNSELECTED"
-                };
-                (choice_id.clone(), status.to_string())
-            })
+            .filter(|choice_id| selected.contains(choice_id))
+            .map(|choice_id| (choice_id.clone(), "SELECTED".to_string()))
             .collect();
         statuses.sort();
         statuses
@@ -325,7 +319,7 @@ fn assert_recorded(case: &str, answer: &Value, summary: &Value, selected: &[Stri
     assert_eq!(
         choice_statuses(answer, "ChoiceAnswers"),
         expected_statuses,
-        "case {case:?}: every choice of the question must record its status, got {answer:?}"
+        "case {case:?}: the answer must report one entry per choice it answers, got {answer:?}"
     );
     assert_eq!(
         answer.get("Risk").and_then(Value::as_str),
@@ -482,7 +476,11 @@ async fn an_answer_to_an_imported_lenss_question_records_every_member() {
             choice_id.clone(),
             json!({ "Status": status, "Reason": reason, "Notes": format!("why {choice_id}") }),
         );
-        expected_statuses.push((choice_id.clone(), status.to_string()));
+        // An answer reports the choices it ANSWERS, so a choice this walk records
+        // UNSELECTED for is not one of them.
+        if status != "UNSELECTED" {
+            expected_statuses.push((choice_id.clone(), status.to_string()));
+        }
     }
     expected_statuses.sort();
 

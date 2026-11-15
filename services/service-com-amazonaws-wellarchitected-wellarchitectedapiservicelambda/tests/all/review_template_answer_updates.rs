@@ -200,24 +200,16 @@ fn choice_answer(answer: &Value, choice_id: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// Rewrite the `ChoiceAnswers` entry of `choice_id` in an EXPECTED answer the way a
-/// `ChoiceUpdate` rewrites the stored one: the status it names, plus only the reason and
-/// notes it carries.
-fn expect_choice_replaced(
-    answer: &mut Value,
-    choice_id: &str,
-    status: &str,
-    reason: Option<&str>,
-    notes: Option<&str>,
-) {
-    let mut entry = json!({ "ChoiceId": choice_id, "Status": status });
-    if let Some(reason) = reason {
-        entry["Reason"] = json!(reason);
-    }
-    if let Some(notes) = notes {
-        entry["Notes"] = json!(notes);
-    }
-    *entry_of(answer, choice_id) = entry;
+/// Drop the `ChoiceAnswers` entry of `choice_id` from an EXPECTED answer, the way a write
+/// that leaves that choice UNSELECTED does: an answer reports only the choices it answers,
+/// so a choice it no longer answers takes its whole entry — reason and notes included —
+/// out of the list.
+fn expect_choice_unanswered(answer: &mut Value, choice_id: &str) {
+    answer
+        .get_mut("ChoiceAnswers")
+        .and_then(Value::as_array_mut)
+        .expect("the answer must carry a ChoiceAnswers list")
+        .retain(|entry| member(entry, "ChoiceId") != Some(choice_id));
 }
 
 /// Rewrite only the STATUS of the `ChoiceAnswers` entry of `choice_id` in an EXPECTED
@@ -238,9 +230,10 @@ fn entry_of<'a>(answer: &'a mut Value, choice_id: &str) -> &'a mut Value {
         .unwrap_or_else(|| panic!("the answer must carry a ChoiceAnswers entry for {choice_id:?}"))
 }
 
-/// Assert the answer records exactly `selected` as the choices in place: those choices
-/// `SELECTED`, every other choice the question offers `UNSELECTED`, and the question
-/// answered and applying.
+/// Assert the answer records exactly `selected` as the choices in place: one per-choice
+/// entry per selected choice — the choices the answer ANSWERS — and the question answered
+/// and applying. A choice the selection leaves out is reported through the question's own
+/// `Choices` catalog rather than as an answer.
 fn assert_records_selection(case: &str, answer: &Value, offered: &[String], selected: &[String]) {
     assert_eq!(
         member(answer, "AnswerStatus"),
@@ -254,14 +247,8 @@ fn assert_records_selection(case: &str, answer: &Value, offered: &[String], sele
     );
     let expected: BTreeMap<String, String> = offered
         .iter()
-        .map(|choice_id| {
-            let status = if selected.contains(choice_id) {
-                SELECTED
-            } else {
-                UNSELECTED
-            };
-            (choice_id.clone(), status.to_string())
-        })
+        .filter(|choice_id| selected.contains(choice_id))
+        .map(|choice_id| (choice_id.clone(), SELECTED.to_string()))
         .collect();
     let actual = choice_statuses(answer);
     assert_eq!(
@@ -589,13 +576,20 @@ async fn a_choice_update_replaces_that_choices_answer() {
             &case,
         );
 
-        let mut expected = json!({ "ChoiceId": target, "Status": status });
-        if let Some(reason) = reason.as_deref() {
-            expected["Reason"] = json!(reason);
-        }
-        if let Some(notes) = notes.as_deref() {
-            expected["Notes"] = json!(notes);
-        }
+        // An answer reports the choices it ANSWERS, and each entry carries the reason and
+        // the notes recorded for that choice, each empty until something records one. A
+        // choice this update leaves UNSELECTED is not one the answer answers, so no entry
+        // reports it.
+        let expected = if status == UNSELECTED {
+            Value::Null
+        } else {
+            json!({
+                "ChoiceId": target,
+                "Status": status,
+                "Reason": reason.clone().unwrap_or_default(),
+                "Notes": notes.clone().unwrap_or_default(),
+            })
+        };
         let actual = choice_answer(&written, &target);
         assert_eq!(
             actual, expected,
@@ -603,12 +597,13 @@ async fn a_choice_update_replaces_that_choices_answer() {
         );
 
         // Every other choice of the question is untouched by an update that does not name
-        // it, and the selected choices follow the statuses.
+        // it — so it is still unselected, and no per-choice answer reports it — and the
+        // selected choices follow the statuses.
         let statuses = choice_statuses(&written);
         for choice_id in offered.iter().filter(|choice_id| **choice_id != target) {
             assert_eq!(
-                statuses.get(choice_id).map(String::as_str),
-                Some(UNSELECTED),
+                statuses.get(choice_id),
+                None,
                 "case {case:?}: choice {choice_id:?} was not named, got {written:?}"
             );
         }
@@ -739,9 +734,10 @@ async fn each_answer_member_is_written_independently() {
                 let (first, second) = (first.clone(), second.clone());
                 move |expected: &mut Value| {
                     // Only each choice's STATUS moves: the reason and notes a
-                    // `ChoiceUpdate` wrote for the second choice stay as stored.
+                    // `ChoiceUpdate` wrote for the second choice stay as stored. The first
+                    // choice is left unselected, so the answer stops answering it.
                     expected["SelectedChoices"] = json!([second.clone()]);
-                    expect_choice_status(expected, &first, UNSELECTED);
+                    expect_choice_unanswered(expected, &first);
                     expect_choice_status(expected, &second, SELECTED);
                 }
             }),
@@ -752,9 +748,10 @@ async fn each_answer_member_is_written_independently() {
             Box::new({
                 let second = second.clone();
                 move |expected: &mut Value| {
-                    // The update carries that choice's answer in full, so the reason and
-                    // notes it leaves out are gone.
-                    expect_choice_replaced(expected, &second, UNSELECTED, None, None);
+                    // The update carries that choice's answer in full and records it
+                    // unselected, so the answer stops answering that choice and the reason
+                    // and notes it had go with it.
+                    expect_choice_unanswered(expected, &second);
                 }
             }),
         ),

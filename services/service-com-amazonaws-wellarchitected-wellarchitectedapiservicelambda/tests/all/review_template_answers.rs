@@ -382,7 +382,12 @@ async fn a_stored_answer_is_reported_on_its_question() {
         let choice_answer_summaries = Value::Array(
             case.statuses
                 .iter()
-                .map(|(choice_id, status)| json!({ "ChoiceId": choice_id, "Status": status }))
+                // A summary reports the choices the answer ANSWERS, each with the reason
+                // recorded for that choice — empty until something records one.
+                .filter(|(_, status)| *status != "UNSELECTED")
+                .map(|(choice_id, status)| {
+                    json!({ "ChoiceId": choice_id, "Status": status, "Reason": "" })
+                })
                 .collect::<Vec<Value>>(),
         );
         let status_refs: Vec<(&str, &str)> = case

@@ -553,9 +553,11 @@ async fn only_questions_identified_as_risks_are_reported_with_the_best_practices
                     "case {case:?}: {question_id} must be reported under its own pillar"
                 );
 
-                // The best practices contributing to the risk: the choices the answer does
-                // NOT record as selected, with the titles the question's choice catalog
-                // gives them.
+                // The best practices contributing to the risk: the choices the answer
+                // leaves UNSELECTED, with the titles the question's choice catalog gives
+                // them. An answer reports only the choices it ANSWERS, so the ones it
+                // leaves out are exactly the catalog choices its per-choice answers do not
+                // name.
                 let choice_ids = framework_choice_ids(question_id);
                 let selected: Vec<String> = stored
                     .get("SelectedChoices")
@@ -565,18 +567,17 @@ async fn only_questions_identified_as_risks_are_reported_with_the_best_practices
                     .iter()
                     .filter_map(|choice| choice.as_str().map(ToString::to_string))
                     .collect();
-                let applicable: Vec<String> = stored
+                let answered: Vec<String> = stored
                     .get("ChoiceAnswers")
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default()
                     .iter()
-                    .filter(|choice| text(choice, "Status") == Some("UNSELECTED"))
                     .filter_map(|choice| text(choice, "ChoiceId").map(ToString::to_string))
                     .collect();
                 let expected: Vec<String> = choice_ids
                     .iter()
-                    .filter(|choice_id| applicable.contains(choice_id))
+                    .filter(|choice_id| !answered.contains(choice_id))
                     .cloned()
                     .collect();
                 let actual: Vec<String> = question
