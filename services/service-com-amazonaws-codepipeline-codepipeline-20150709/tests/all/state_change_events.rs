@@ -628,6 +628,446 @@ async fn every_execution_stage_and_action_state_change_reaches_the_rules_queue()
     }
 }
 
+/// The pipelines the pattern table below runs: the one a rule's pattern names, and a twin
+/// whose events a pattern scoped to the first must not select.
+const FILTERED_PIPELINE: &str = "events-filter-one";
+const TWIN_PIPELINE: &str = "events-filter-two";
+
+/// One state change, as the pattern table names it: which pipeline moved, which kind of
+/// event the move owes, and the resource and the state that event reports.
+#[derive(Debug, Clone)]
+struct Transition {
+    pipeline: &'static str,
+    detail_type: &'static str,
+    stage: &'static str,
+    action: &'static str,
+    state: &'static str,
+}
+
+impl Transition {
+    /// The key one published event is compared by, whether it was read from a queue or
+    /// from the routing log.
+    fn key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.pipeline, self.detail_type, self.stage, self.action, self.state
+        )
+    }
+}
+
+/// The key of one event delivered as an SQS message, or routed onto the bus.
+fn key_of(pipeline: &str, detail_type: &str, detail: &Value) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        pipeline,
+        detail_type,
+        detail["stage"].as_str().unwrap_or_default(),
+        detail["action"].as_str().unwrap_or_default(),
+        detail["state"].as_str().unwrap_or_default(),
+    )
+}
+
+/// Every state change a two-stage run of `pipeline` that succeeds owes an event for, in
+/// the order the transitions happen: the execution starts, each stage starts with its
+/// action and finishes with it, and the execution finishes.
+fn transitions_of(pipeline: &'static str) -> Vec<Transition> {
+    let mut transitions = vec![Transition {
+        pipeline,
+        detail_type: PIPELINE_STATE_CHANGE,
+        stage: "",
+        action: "",
+        state: "STARTED",
+    }];
+    for (stage, action) in [("Source", "Src"), ("Deploy", "Dep")] {
+        for (detail_type, action_name, state) in [
+            (STAGE_STATE_CHANGE, "", "STARTED"),
+            (ACTION_STATE_CHANGE, action, "STARTED"),
+            (ACTION_STATE_CHANGE, action, "SUCCEEDED"),
+            (STAGE_STATE_CHANGE, "", "SUCCEEDED"),
+        ] {
+            transitions.push(Transition {
+                pipeline,
+                detail_type,
+                stage,
+                action: action_name,
+                state,
+            });
+        }
+    }
+    transitions.push(Transition {
+        pipeline,
+        detail_type: PIPELINE_STATE_CHANGE,
+        stage: "",
+        action: "",
+        state: "SUCCEEDED",
+    });
+    transitions
+}
+
+/// One row of the pattern table: a rule, the `EventPattern` it is created with, its own
+/// queue, and WHICH of the published state changes that pattern selects.
+struct Filter {
+    /// What this row is about, named in every assertion.
+    case: &'static str,
+    /// The rule and the queue this row owns, so a delivery is attributable to it.
+    rule: &'static str,
+    queue: &'static str,
+    /// The pattern the rule is created with.
+    pattern: Value,
+    /// The state changes the pattern matches — the events this row's queue must receive,
+    /// and no others.
+    selects: Box<dyn Fn(&Transition) -> bool>,
+}
+
+/// Wait until every execution of `pipeline` has finished.
+///
+/// A pipeline RUNS when it is created (`TriggerType` `CreatePipeline`), so the execution a
+/// test starts next would be entering stages beside that run: waiting for it keeps the
+/// graded execution the only one running, so nothing it does is superseded.
+async fn given_earlier_runs_finished(emulator: &Emulator, pipeline: &str) {
+    let deadline = Instant::now() + WAIT;
+    let mut listed = Value::Null;
+    while Instant::now() < deadline {
+        listed = emulator
+            .cp("ListPipelineExecutions", &json!({ "pipelineName": pipeline }))
+            .await;
+        let running = listed["pipelineExecutionSummaries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|summary| {
+                !matches!(
+                    summary["status"].as_str().unwrap_or_default(),
+                    "Succeeded" | "Failed" | "Stopped" | "Superseded" | "Cancelled"
+                )
+            });
+        if !running {
+            return;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    panic!(
+        "case {pipeline:?}: the run the pipeline's creation started never finished; its \
+         executions are {listed:#?}"
+    );
+}
+
+/// A rule's pattern decides WHICH of the published state changes reach that rule's queue.
+///
+/// The RULE under test, one level above the suite above: every state change CodePipeline
+/// publishes is matched against each rule's `EventPattern` on the bus, and a rule whose
+/// pattern matches delivers exactly those events to its SQS target — so a pattern naming
+/// the detail-types of the execution and stage moves and one pipeline in `detail`
+/// receives that pipeline's execution- and stage-level events and nothing else, while a
+/// pattern naming another clause selects by that clause instead. Each delivered envelope
+/// carries the account and the Region the pipeline runs in and the pipeline's ARN among
+/// its `resources`.
+///
+/// The table's rows differ along WHICH CLAUSE the pattern filters by — the source alone,
+/// a list of detail-types together with a `detail` member, one detail-type, a pipeline
+/// name, a state, a stage, and a source nothing publishes — because the rule is about
+/// matching a published event against a pattern, not about one pattern. One pair of runs
+/// serves every row: the rules are installed before the executions start, so each row's
+/// queue sees the same published events and differs only in what its pattern selects.
+#[tokio::test]
+async fn a_rules_pattern_decides_which_published_state_changes_reach_its_queue() {
+    let filters: Vec<Filter> = vec![
+        Filter {
+            case: "a pattern naming only the source",
+            rule: "filter-source",
+            queue: "filter-source-queue",
+            pattern: json!({ "source": [EVENT_SOURCE] }),
+            selects: Box::new(|_| true),
+        },
+        Filter {
+            case: "a pattern naming the execution and stage detail-types and one pipeline",
+            rule: "filter-execution-and-stage",
+            queue: "filter-execution-and-stage-queue",
+            pattern: json!({
+                "source": [EVENT_SOURCE],
+                "detail-type": [PIPELINE_STATE_CHANGE, STAGE_STATE_CHANGE],
+                "detail": { "pipeline": [FILTERED_PIPELINE] },
+            }),
+            selects: Box::new(|transition| {
+                transition.pipeline == FILTERED_PIPELINE
+                    && transition.detail_type != ACTION_STATE_CHANGE
+            }),
+        },
+        Filter {
+            case: "a pattern naming only the action detail-type",
+            rule: "filter-actions",
+            queue: "filter-actions-queue",
+            pattern: json!({
+                "source": [EVENT_SOURCE],
+                "detail-type": [ACTION_STATE_CHANGE],
+            }),
+            selects: Box::new(|transition| transition.detail_type == ACTION_STATE_CHANGE),
+        },
+        Filter {
+            case: "a pattern naming the other pipeline in the detail",
+            rule: "filter-twin",
+            queue: "filter-twin-queue",
+            pattern: json!({
+                "source": [EVENT_SOURCE],
+                "detail": { "pipeline": [TWIN_PIPELINE] },
+            }),
+            selects: Box::new(|transition| transition.pipeline == TWIN_PIPELINE),
+        },
+        Filter {
+            case: "a pattern naming one state in the detail",
+            rule: "filter-succeeded",
+            queue: "filter-succeeded-queue",
+            pattern: json!({
+                "source": [EVENT_SOURCE],
+                "detail": { "state": ["SUCCEEDED"] },
+            }),
+            selects: Box::new(|transition| transition.state == "SUCCEEDED"),
+        },
+        Filter {
+            // A pipeline-level event carries no `stage`, so a `stage` clause selects the
+            // stage and action events of that stage and nothing else.
+            case: "a pattern naming one stage in the detail",
+            rule: "filter-deploy-stage",
+            queue: "filter-deploy-stage-queue",
+            pattern: json!({
+                "source": [EVENT_SOURCE],
+                "detail": { "stage": ["Deploy"] },
+            }),
+            selects: Box::new(|transition| transition.stage == "Deploy"),
+        },
+        Filter {
+            case: "a pattern naming another service's source",
+            rule: "filter-other-source",
+            queue: "filter-other-source-queue",
+            pattern: json!({ "source": ["aws.codebuild"] }),
+            selects: Box::new(|_| false),
+        },
+    ];
+
+    let emulator = Emulator::new();
+    emulator.bucket(SOURCE_BUCKET).await;
+    emulator.bucket(DEPLOY_BUCKET).await;
+
+    // Every rule is installed BEFORE anything runs, so each row's queue is offered the
+    // same published events.
+    let mut queues: Vec<String> = Vec::new();
+    for filter in &filters {
+        let (url, queue_arn) = given_queue(&emulator, filter.queue).await;
+        emulator
+            .events(
+                "PutRule",
+                &json!({
+                    "Name": filter.rule,
+                    "EventPattern": filter.pattern.to_string(),
+                    "State": "ENABLED",
+                }),
+            )
+            .await;
+        emulator
+            .events(
+                "PutTargets",
+                &json!({
+                    "Rule": filter.rule,
+                    "Targets": [{ "Id": "t1", "Arn": queue_arn }],
+                }),
+            )
+            .await;
+        queues.push(url);
+    }
+
+    // The pipelines are created while the source object is NOT there, so the run each
+    // creation started fails at its source action; the graded execution is started once
+    // those runs have finished.
+    let rows = [
+        (FILTERED_PIPELINE, "filter/one.zip"),
+        (TWIN_PIPELINE, "filter/two.zip"),
+    ];
+    for (pipeline, key) in rows {
+        emulator.bucket(&artifact_bucket(pipeline)).await;
+        emulator
+            .cp(
+                "CreatePipeline",
+                &declaration(
+                    pipeline,
+                    json!([
+                        source_stage(SOURCE_BUCKET, SOURCE_KEY, ARTIFACT),
+                        deploy_stage("Deploy", ARTIFACT, DEPLOY_BUCKET, key, false),
+                    ]),
+                    None,
+                ),
+            )
+            .await;
+    }
+    for (pipeline, _) in rows {
+        given_earlier_runs_finished(&emulator, pipeline).await;
+    }
+    emulator
+        .put_object(
+            SOURCE_BUCKET,
+            SOURCE_KEY,
+            &zip_of(&[("payload.txt", b"filtered".as_slice())]),
+        )
+        .await;
+
+    // The two graded executions, and the identity every event of each must report.
+    let mut runs: Vec<(&'static str, String, String)> = Vec::new();
+    for (pipeline, _) in rows {
+        let arn = pipeline_arn(&emulator, pipeline).await;
+        let started = emulator
+            .cp("StartPipelineExecution", &json!({ "name": pipeline }))
+            .await;
+        let execution = started["pipelineExecutionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {pipeline:?}: no pipelineExecutionId in {started}"))
+            .to_string();
+        runs.push((pipeline, execution, arn));
+    }
+    let account = runs
+        .first()
+        .and_then(|(_, _, arn)| arn.split(':').nth(4))
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !account.is_empty(),
+        "case \"the pipeline ARN\": every event's account comes from the pipeline's ARN, \
+         which named none in {runs:?}"
+    );
+
+    // What each row's queue must hold: the published state changes its pattern selects.
+    let published: Vec<Transition> = runs
+        .iter()
+        .flat_map(|(pipeline, _, _)| transitions_of(pipeline))
+        .collect();
+    let expected: Vec<Vec<String>> = filters
+        .iter()
+        .map(|filter| {
+            let mut keys: Vec<String> = published
+                .iter()
+                .filter(|transition| (filter.selects)(transition))
+                .map(Transition::key)
+                .collect();
+            keys.sort();
+            keys
+        })
+        .collect();
+
+    // Poll every row's queue until each holds at least what its pattern selects. No
+    // CodePipeline operation is called while this waits, so every message collected was
+    // published by the service driving the executions on its own.
+    let graded: Vec<&str> = runs
+        .iter()
+        .map(|(_, execution, _)| execution.as_str())
+        .collect();
+    let deadline = Instant::now() + WAIT;
+    let mut collected: Vec<Vec<Value>> = vec![Vec::new(); filters.len()];
+    // Set once every row holds what its pattern selects, so the loop drains the queues ONE
+    // more time before it ends: a message too many — an event a pattern does not select,
+    // or a second copy of one it does — is then part of what the assertions below compare
+    // rather than something that arrives after them.
+    let mut settled = false;
+    loop {
+        for (index, queue) in queues.iter().enumerate() {
+            let fresh = receive(&emulator, queue).await;
+            collected[index].extend(fresh.into_iter().filter(|message| {
+                graded
+                    .iter()
+                    .any(|execution| message["detail"]["execution-id"] == json!(execution))
+            }));
+        }
+        if settled {
+            break;
+        }
+        let waiting: Vec<&str> = filters
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| collected[*index].len() < expected[*index].len())
+            .map(|(_, filter)| filter.case)
+            .collect();
+        if waiting.is_empty() {
+            settled = true;
+            continue;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cases {waiting:?}: the rules' queues never received every state change their \
+             patterns select; they hold {collected:#?}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    for (index, filter) in filters.iter().enumerate() {
+        let case = filter.case;
+        let delivered = &collected[index];
+        let mut delivered_keys: Vec<String> = delivered
+            .iter()
+            .map(|message| {
+                key_of(
+                    message["detail"]["pipeline"].as_str().unwrap_or_default(),
+                    message["detail-type"].as_str().unwrap_or_default(),
+                    &message["detail"],
+                )
+            })
+            .collect();
+        delivered_keys.sort();
+        assert_eq!(
+            delivered_keys, expected[index],
+            "case {case:?}: expected one message per state change the pattern selects, \
+             got {delivered_keys:#?}"
+        );
+
+        for message in delivered {
+            let pipeline = message["detail"]["pipeline"].as_str().unwrap_or_default();
+            let arn = runs
+                .iter()
+                .find(|(name, _, _)| *name == pipeline)
+                .map(|(_, _, arn)| arn.clone())
+                .unwrap_or_else(|| panic!("case {case:?}: unknown pipeline in {message}"));
+            assert_eq!(
+                message["source"],
+                json!(EVENT_SOURCE),
+                "case {case:?}: every envelope must carry the CodePipeline source, got \
+                 {message}"
+            );
+            assert_eq!(
+                message["account"],
+                json!(&account),
+                "case {case:?}: every envelope must carry the account, got {message}"
+            );
+            assert_eq!(
+                message["region"],
+                json!(REGION),
+                "case {case:?}: every envelope must carry the Region, got {message}"
+            );
+            assert_eq!(
+                message["resources"],
+                json!([arn]),
+                "case {case:?}: every envelope must name the pipeline's ARN, got {message}"
+            );
+        }
+
+        // The same events as EventBridge matched them, in publication order: the ORDER of
+        // one pipeline's transitions is what the bus routed, which a standard queue's
+        // reads do not promise to preserve.
+        for (pipeline, execution, _) in &runs {
+            let routed: Vec<String> = routed_for(&emulator, execution)
+                .iter()
+                .filter(|event| event.matched_rules.iter().any(|rule| rule == filter.rule))
+                .map(|event| key_of(pipeline, &event.detail_type, &event.detail))
+                .collect();
+            let wanted: Vec<String> = transitions_of(pipeline)
+                .iter()
+                .filter(|transition| (filter.selects)(transition))
+                .map(Transition::key)
+                .collect();
+            assert_eq!(
+                routed, wanted,
+                "case {case:?}: expected {pipeline} to have matched the pattern once per \
+                 selected state change, in order, got {routed:#?}"
+            );
+        }
+    }
+}
+
 /// A state change is published ONCE: reading the execution again publishes no second
 /// event for a status that has not moved since.
 ///

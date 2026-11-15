@@ -1578,3 +1578,16 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` above each `mod` is what
 // points it into `tests/all/`. A suite file no `mod` here names fails the build, and a suite
 // left at the top level of `tests/` is a test target of its own, which fails it too.
+//! pair, inserted INTO the sorted list: one pair per suite and nothing else, so a landing
+//! has one place to insert and nothing to keep consistent.
+//! A suite no `mod` names compiles nowhere and its tests never run; a suite left at the
+//! top level of `tests/` fails the build; and a suite declared twice is `E0428`, which
+//! compiles no suite of this target. THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT
+//! (`//!`) MAY STAND IN THIS FILE: past the first item one is `E0753` and compiles
+//! nothing, so what goes below is a DECLARATION — never a note about one, and never a
+//! copy of this header.
+//! for every service crate's `tests/all.rs`, so the rules are stated there rather than
+//! restated here.
+//! (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` above each `mod`
+//! WHY a suite belongs to this cross-service target rather than to one service crate's
+//! own is stated in that suite's OWN module doc, which is where it stays current and is
