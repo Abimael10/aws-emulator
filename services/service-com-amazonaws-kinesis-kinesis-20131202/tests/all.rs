@@ -71,6 +71,8 @@ mod merge_adjacency;
 mod pagination_token_classification;
 #[path = "all/record_distribution_strategy.rs"]
 mod record_distribution_strategy;
+#[path = "all/record_distribution_write_paths.rs"]
+mod record_distribution_write_paths;
 #[path = "all/record_flow.rs"]
 mod record_flow;
 #[path = "all/refusal_message_templates.rs"]
