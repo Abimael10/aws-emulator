@@ -880,53 +880,57 @@ async fn a_report_outside_the_stated_rules_is_refused() {
     // (case, the BillingPeriodRange member, the expected status)
     // The published maximum is 12 months ("You can specify up to 12 months",
     // `smithy_query(query="doc",shape="GetBillingGroupCostReportInput",member="BillingPeriodRange")`):
-    // each bound of the range is tested, and one month past it.
+    // each bound of the range is tested, and one month past it. Every span is named
+    // relative to the service's own current billing period, which is the period the group
+    // under test was created in — a report is of a group that was billing in the periods it
+    // covers (`tests/all/billing_group_cost_report_period_scope.rs` owns that rule), so a
+    // row that is to be SERVED names a range covering that period.
     let ranges: Vec<(&str, Value, u16)> = vec![
         (
             "a one-month range",
             json!({
-                "InclusiveStartBillingPeriod": "2026-05",
-                "ExclusiveEndBillingPeriod": "2026-06",
+                "InclusiveStartBillingPeriod": period(0),
+                "ExclusiveEndBillingPeriod": period(1),
             }),
             200,
         ),
         (
             "a range of the published maximum twelve months",
             json!({
-                "InclusiveStartBillingPeriod": "2026-01",
-                "ExclusiveEndBillingPeriod": "2027-01",
+                "InclusiveStartBillingPeriod": period(-11),
+                "ExclusiveEndBillingPeriod": period(1),
             }),
             200,
         ),
         (
             "a range one month past the published maximum",
             json!({
-                "InclusiveStartBillingPeriod": "2026-01",
-                "ExclusiveEndBillingPeriod": "2027-02",
+                "InclusiveStartBillingPeriod": period(-11),
+                "ExclusiveEndBillingPeriod": period(2),
             }),
             400,
         ),
         (
             "a range whose exclusive end is its inclusive start",
             json!({
-                "InclusiveStartBillingPeriod": "2026-05",
-                "ExclusiveEndBillingPeriod": "2026-05",
+                "InclusiveStartBillingPeriod": period(0),
+                "ExclusiveEndBillingPeriod": period(0),
             }),
             400,
         ),
         (
             "a range whose end precedes its start",
             json!({
-                "InclusiveStartBillingPeriod": "2026-06",
-                "ExclusiveEndBillingPeriod": "2026-05",
+                "InclusiveStartBillingPeriod": period(1),
+                "ExclusiveEndBillingPeriod": period(0),
             }),
             400,
         ),
         (
             "a reversed range spelled with single-digit months",
             json!({
-                "InclusiveStartBillingPeriod": "2026-6",
-                "ExclusiveEndBillingPeriod": "2026-5",
+                "InclusiveStartBillingPeriod": one_digit_month(&period(1)),
+                "ExclusiveEndBillingPeriod": one_digit_month(&period(0)),
             }),
             400,
         ),
@@ -1064,8 +1068,8 @@ async fn a_report_writes_nothing_so_a_later_read_sees_the_same_summary() {
             json!({
                 "Arn": group.clone(),
                 "BillingPeriodRange": {
-                    "InclusiveStartBillingPeriod": "2026-01",
-                    "ExclusiveEndBillingPeriod": "2026-04",
+                    "InclusiveStartBillingPeriod": period(-1),
+                    "ExclusiveEndBillingPeriod": period(2),
                 },
                 "GroupBy": ["BILLING_PERIOD", "PRODUCT_NAME"],
             }),

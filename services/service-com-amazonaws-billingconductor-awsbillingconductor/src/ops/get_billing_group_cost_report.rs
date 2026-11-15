@@ -231,15 +231,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // group a delete has since removed still was for the periods before that delete
         // took effect — the same groups the period-scoped listings report
         // (`crate::state::billing_groups_in`). So the record the delete kept is resolved
-        // here too, and which periods it answers for is checked once the range below is
-        // known; an ARN no stored and no deleted group carries names no group at all.
+        // here too, and which periods EITHER of them answers for is checked once the range
+        // below is known; an ARN no stored and no deleted group carries names no group at
+        // all.
         let group_arn = crate::state::normalize_billing_group_arn(&input.arn);
-        let live = state.billing_groups.get(&group_arn);
-        let deleted = match live {
-            Some(_) => None,
-            None => state.deleted_billing_group(&group_arn),
-        };
-        let Some(group) = live.or(deleted.map(|deleted| &deleted.record)) else {
+        let Some(group) = state.billing_groups.get(&group_arn).or_else(|| {
+            state
+                .deleted_billing_group(&group_arn)
+                .map(|deleted| &deleted.record)
+        }) else {
             return Err(no_such_billing_group(&group_arn));
         };
 
@@ -284,17 +284,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // A group the store no longer holds is the subject of a report only for the
-        // billing periods before the delete took it
-        // (`crate::state::DeletedBillingGroupRecord::reported_in`): a range that covers
-        // none of them asks about a period that held no such group.
-        if let Some(deleted) = deleted {
-            if !billing_periods
-                .iter()
-                .any(|period| deleted.reported_in(period))
-            {
-                return Err(no_such_billing_group(&group_arn));
-            }
+        // Which billing periods the addressed group was billing in is the crate's ONE
+        // period-scoped answer about a group
+        // (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::billing_group_billing_in`,
+        // the same rule `crate::state::billing_groups_in` answers for a whole period): a
+        // stored group bills from the period it was created in on, and a group a delete
+        // has removed up to the period that delete was made in. A range that covers none
+        // of those periods asks only about periods that held no such group — the same
+        // answer whether or not the store still holds the group.
+        if !billing_periods
+            .iter()
+            .any(|period| state.billing_group_billing_in(&group_arn, period))
+        {
+            return Err(no_such_billing_group(&group_arn));
         }
 
         // "A list of strings that specify the attributes that are used to break down

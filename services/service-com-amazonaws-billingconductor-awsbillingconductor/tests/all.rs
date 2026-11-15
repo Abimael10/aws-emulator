@@ -47,6 +47,8 @@ mod billing_group_billing_periods;
 mod billing_group_core_loop;
 #[path = "all/billing_group_cost_report.rs"]
 mod billing_group_cost_report;
+#[path = "all/billing_group_cost_report_period_scope.rs"]
+mod billing_group_cost_report_period_scope;
 #[path = "all/billing_group_period_occupancy.rs"]
 mod billing_group_period_occupancy;
 #[path = "all/billing_group_size_one_rule.rs"]

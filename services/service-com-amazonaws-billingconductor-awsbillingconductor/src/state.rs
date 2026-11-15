@@ -3418,6 +3418,24 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         groups
     }
 
+    /// Was the billing group `group_arn` BILLING in `billing_period` — is it one of the
+    /// groups a read scoped to that period reports ([`Self::billing_groups_in`])?
+    ///
+    /// The same question [`Self::billing_groups_in`] answers for a whole period, asked
+    /// about the ONE group a read addresses by ARN, so a read of one group cannot
+    /// disagree with the listing of the period it asks about: a stored group bills from
+    /// the period it was created in on ([`VersionedResource::exists_in`]) and a group a
+    /// delete has since removed billed up to, but not including, the period that delete
+    /// was made in ([`DeletedBillingGroupRecord::reported_in`]). An ARN neither a stored
+    /// nor a deleted group carries names no group billing in any period at all.
+    pub fn billing_group_billing_in(&self, group_arn: &str, billing_period: &str) -> bool {
+        if let Some(group) = self.billing_groups.get(group_arn) {
+            return group.exists_in(billing_period);
+        }
+        self.deleted_billing_group(group_arn)
+            .is_some_and(|deleted| deleted.reported_in(billing_period))
+    }
+
     /// The record a delete kept of the billing group `group_arn`, if any: the NEWEST
     /// deletion of it, the way [`Self::deleted_billing_group_occupying_name`] takes the
     /// newest deletion that held a name.

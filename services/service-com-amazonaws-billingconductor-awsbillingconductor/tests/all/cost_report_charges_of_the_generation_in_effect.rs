@@ -30,6 +30,11 @@ use service_com_amazonaws_billingconductor_awsbillingconductor::{
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
+/// The month arithmetic over a `BillingPeriod` this crate's period-scoped suites share
+/// (`tests/all/pricing_rule_association_periods.rs`), so one ordering rule serves every
+/// one of them.
+use crate::pricing_rule_association_periods::period_start_millis;
+
 /// An AWS-managed pricing plan every billing group here computes with: the
 /// `PricingPlanFullArn` pattern enumerates it, so no plan has to be created first
 /// (`smithy_query(query="shape",shape="PricingPlanFullArn")`).
@@ -50,8 +55,10 @@ struct Case {
     expected: Vec<(String, f64)>,
 }
 
-/// A live emulator holding only this service.
+/// A live emulator holding only this service, with the engine kept so a group can be
+/// backdated to a billing period the rows read from.
 struct Emulator {
+    engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
@@ -70,8 +77,8 @@ impl Emulator {
             .lock()
             .payer_account_id = Some(::engine::emulator_account_id().to_string());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { engine, router }
     }
 
     /// Send a JSON body to one of this service's routes with the method the model binds
@@ -104,7 +111,16 @@ impl Emulator {
         (status, parsed)
     }
 
-    /// Create a billing group and return its ARN.
+    /// Create a billing group BILLING FROM the previous billing period on, and return its
+    /// ARN.
+    ///
+    /// A billing group bills a consolidated family FOR a billing period, so every read of
+    /// one is of the periods it was billing in — from the period it was created in onward.
+    /// The rows here read the period BEFORE the current one, which a group the wire created
+    /// now was not billing in, and the wire cannot create a group in a past period (a
+    /// create happens now): so the stored creation instant is backdated, the one thing the
+    /// test cannot ask the service for (the convention
+    /// `tests/all/billing_group_billing_periods.rs` owns).
     async fn billing_group(&self, name: &str) -> String {
         let (status, body) = self
             .send(
@@ -121,7 +137,23 @@ impl Emulator {
             status, 200,
             "case billing group {name:?}: expected HTTP 200, got {status} with {body}"
         );
-        member_str(&body, "Arn", &format!("billing group {name:?}"))
+        let arn = member_str(&body, "Arn", &format!("billing group {name:?}"));
+        self.created_in(&arn, &period(-1));
+        arn
+    }
+
+    /// Backdate `group`'s creation — and its only generation — to `billing_period`, as if
+    /// the creating call had been made in that period.
+    fn created_in(&self, group: &str, billing_period: &str) {
+        let at = period_start_millis(billing_period);
+        let state = self.engine.state::<BillingConductorState>();
+        let mut state = state.lock();
+        let record = state
+            .billing_groups
+            .get_mut(group)
+            .expect("setup created_in: the group was created above");
+        record.creation_time_millis = at;
+        record.last_modified_time_millis = at;
     }
 
     /// Create a custom line item of `group` carrying `charge_details`, in effect from the
@@ -659,17 +691,15 @@ async fn an_item_no_generation_of_which_applies_in_a_period_charges_nothing_in_i
                 "case {label:?}: expected GetBillingGroupCostReport to report ProformaCost \
                  {expected}, got {via_report}"
             );
-            // The listing reports a billing group only from the period the group was
-            // created in on — every group here was created in the current one — so the
-            // earlier period is asserted through the report that takes a range.
-            if billing_period.as_str() >= current.as_str() {
-                let via_listing = em.listed_proforma(&label, &case.group, billing_period).await;
-                assert!(
-                    (via_listing - expected).abs() < TOLERANCE,
-                    "case {label:?}: expected ListBillingGroupCostReports to report \
-                     ProformaCost {expected}, got {via_listing}"
-                );
-            }
+            // Both reports answer the same period from the same charges, and every group
+            // here was billing in every period a row reads, so the listing answers the
+            // same amount for it.
+            let via_listing = em.listed_proforma(&label, &case.group, billing_period).await;
+            assert!(
+                (via_listing - expected).abs() < TOLERANCE,
+                "case {label:?}: expected ListBillingGroupCostReports to report \
+                 ProformaCost {expected}, got {via_listing}"
+            );
         }
     }
 }
