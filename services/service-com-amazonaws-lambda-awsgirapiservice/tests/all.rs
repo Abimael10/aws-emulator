@@ -415,6 +415,8 @@ mod kinesis_event_source_delivery;
 mod kinesis_event_source_handler_run;
 #[path = "all/kinesis_event_source_handler_writes_dynamodb.rs"]
 mod kinesis_event_source_handler_writes_dynamodb;
+#[path = "all/kinesis_event_source_handler_writes_kinesis.rs"]
+mod kinesis_event_source_handler_writes_kinesis;
 #[path = "all/layer_archive_unzipped_size.rs"]
 mod layer_archive_unzipped_size;
 #[path = "all/layer_listing.rs"]

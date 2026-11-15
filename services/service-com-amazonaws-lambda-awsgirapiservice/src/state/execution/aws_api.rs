@@ -859,6 +859,30 @@ pub const APIS: &[Api] = &[
         },
         answer_model: Some(&OPENSEARCHSERVERLESS_ANSWERS),
     },
+    // `services/service-com-amazonaws-kinesis-kinesis-20131202/smithy-model/
+    // com-amazonaws-kinesis-kinesis-20131202.json`: awsJson1_1, sigv4Name `kinesis`,
+    // endpointPrefix `kinesis`, sdkId `Kinesis`, service shape `Kinesis_20131202`.
+    //
+    // A DATA STREAM is on both sides of a function: it is one of the event sources that
+    // invokes a function at all ([`super::super::event_source_poller`]), and the stream a
+    // handler WRITES is how one stage of a streaming pipeline hands its work to the next —
+    // the records a handler produces from the batch it was handed, forwarded with
+    // `PutRecord`/`PutRecords`, and the shards a handler reads itself with
+    // `GetShardIterator`/`GetRecords`. A handler that cannot reach this service can consume a
+    // stream but produce nothing onto one, so the effect of an invocation a stream drove is
+    // observable nowhere.
+    Api {
+        sdk_token: "kinesis",
+        signing_name: "kinesis",
+        endpoint_prefix: "kinesis",
+        model: Some(KINESIS_MODEL),
+        protocol: Protocol::AwsJson {
+            target_prefix: "Kinesis_20131202",
+            json_version: "1.1",
+            query_compatible: false,
+        },
+        answer_model: Some(&KINESIS),
+    },
 ];
 
 /// Whether `named` and `asked` name the ONE service.
@@ -1031,6 +1055,10 @@ pub(super) const OPENSEARCHSERVERLESS_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-opensearchserverless-opensearchserverless/smithy-model/\
      com-amazonaws-opensearchserverless-opensearchserverless.json"
 );
+pub(super) const KINESIS_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-kinesis-kinesis-20131202/smithy-model/\
+     com-amazonaws-kinesis-kinesis-20131202.json"
+);
 /// THIS service's own model, read the same way as every other entry's: a call a handler makes
 /// to Lambda is bound by the model this crate is generated from, so the surface a running
 /// function reaches is the surface this emulator serves.
@@ -1174,6 +1202,10 @@ static OPENSEARCHSERVERLESS_ANSWERS: super::blob_members::ServiceModel =
         source: OPENSEARCHSERVERLESS_MODEL,
         plan: ::std::sync::OnceLock::new(),
     };
+static KINESIS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: KINESIS_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
 
 /// The Bedrock Agent runtime plane's own model, which a call to it is bound by — embedded
 /// exactly as [`APIGATEWAY`] is, and for the same reason: the wire facts of each operation are
@@ -2094,7 +2126,7 @@ mod tests {
                 Some("states"),
             ),
             ("a single-word id", "s3", Some("s3")),
-            ("a service no entry answers to", "kinesis", None),
+            ("a service no entry answers to", "polly", None),
             ("the empty token", "", None),
         ];
         for (case, named, expected) in rows {
@@ -2124,7 +2156,7 @@ mod tests {
             // The one question asked out of OpenSearch's model is how a request to it is
             // bound, which its protocol entry carries, so no model is held on the entry.
             ("OpenSearch", "opensearch", "es", false),
-            ("no service at all", "kinesis", "not-a-service", false),
+            ("no service at all", "polly", "not-a-service", false),
         ];
         for (case, one, other, held) in rows {
             let first = held_model(one).map(|(_at, model)| model);
@@ -2265,7 +2297,7 @@ mod tests {
             );
         }
         for (case, asked) in [
-            ("a service this emulator does not serve", "kinesis"),
+            ("a service this emulator does not serve", "polly"),
             ("the empty token", ""),
             ("a token of hyphens alone", "--"),
             ("one with a doubled hyphen", "rds--data"),

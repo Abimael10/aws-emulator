@@ -104,6 +104,9 @@ pub mod dynamodb_stream;
 pub mod failure_destination;
 /// How a Kinesis data stream is listed, read and handed over.
 pub mod kinesis_stream;
+/// What a mapping's `FilterCriteria` admit of one batch, and what each record is matched as.
+mod record_filter;
+use record_filter::admitted_of;
 
 /// How long the poller waits before looking at an idle shard again. Short enough that a
 /// record put on the stream is delivered promptly, long enough not to spin.
@@ -974,7 +977,8 @@ struct FailedAttempt {
 
 /// The event ONE batch is handed over as: "Lambda reads items from the event source and
 /// invokes the function", and what it invokes the function with carries one envelope per
-/// record read, under `Records`, in the order the shard holds them.
+/// record HANDED OVER, under `Records`, in the order the shard holds them — so a record the
+/// mapping's criteria rejected is in no invocation at all ([`admitted_of`]).
 ///
 /// Each envelope is the one the record's own source built for it ([`ShardRecord::envelope`]),
 /// so this composition is the one part of the hand-over that is the same for every source.
@@ -985,98 +989,6 @@ fn batch_event(records: &[ShardRecord]) -> Value {
             .map(|record| record.envelope.clone())
             .collect::<Vec<Value>>(),
     })
-}
-
-/// What a mapping's `FilterCriteria` admitted of ONE batch read off a shard.
-enum Admitted<'batch> {
-    /// Every record of the batch: what a mapping carrying no criteria polls, and what a
-    /// batch each record of which matches a pattern comes to.
-    Whole(&'batch [ShardRecord]),
-    /// Some of the batch: the records the criteria admitted, in the order the shard holds
-    /// them, and the sequence numbers of the ones they rejected.
-    Part {
-        /// The records the function is invoked with.
-        invoking: Vec<ShardRecord>,
-        /// The records no pattern matched, by sequence number: they are the PASS's own to
-        /// account for, since no invocation will report about them.
-        rejected: Vec<String>,
-    },
-}
-
-impl Admitted<'_> {
-    /// The records the function is to be invoked with, and `None` when the criteria admitted
-    /// no record of the batch at all — which is a batch there is no invocation to make for.
-    fn invoking(&self) -> Option<&[ShardRecord]> {
-        let invoking = match self {
-            Self::Whole(records) => *records,
-            Self::Part { invoking, .. } => invoking.as_slice(),
-        };
-        (!invoking.is_empty()).then_some(invoking)
-    }
-
-    /// The records of the batch this pass HANDLED, by sequence number: the ones the
-    /// invocation reported as processed, plus the ones the criteria rejected.
-    ///
-    /// A rejected record is discarded by the poller itself — "FilterCriteria … determine
-    /// whether Lambda should process an event", and one that is not to be processed is never
-    /// handed to the function — so it is handled as soon as it has been read, which is what
-    /// lets the shard's position move past it ([`checkpointed_through`]).
-    fn handled(&self, processed: &[String]) -> Vec<String> {
-        match self {
-            Self::Whole(_) => processed.to_vec(),
-            Self::Part { rejected, .. } => {
-                let mut handled = processed.to_vec();
-                handled.extend(rejected.iter().cloned());
-                handled
-            }
-        }
-    }
-}
-
-/// What `criteria` admit of `records`, read as the mapping's source hands each record over.
-///
-/// The decision about one record is the shared one
-/// ([`super::event_source_filter::Filters`]); what is a shard source's own is the record each
-/// one is matched AS ([`filter_event`]).
-fn admitted_of<'batch>(
-    criteria: &super::event_source_filter::Filters,
-    run: &ShardSourcedMapping,
-    records: &'batch [ShardRecord],
-) -> Admitted<'batch> {
-    if criteria.admits_everything() {
-        return Admitted::Whole(records);
-    }
-    let mut budget = super::event_source_filter::budget();
-    let mut invoking: Vec<ShardRecord> = Vec::new();
-    let mut rejected: Vec<String> = Vec::new();
-    for record in records {
-        if criteria.admits(&filter_event(run.source, &record.envelope), &mut budget) {
-            invoking.push(record.clone());
-        } else {
-            rejected.push(record.sequence_number.clone());
-        }
-    }
-    if rejected.is_empty() {
-        return Admitted::Whole(records);
-    }
-    Admitted::Part {
-        invoking,
-        rejected,
-    }
-}
-
-/// One record as the FILTER sees it: the record the function receives, with a payload the
-/// source carries as opaque text read as the document that text spells where it spells one —
-/// the same rule a queue source's body follows ([`super::sqs_poller`]).
-fn filter_event(source: ShardSource, envelope: &Value) -> Cow<'_, Value> {
-    match source {
-        // A DynamoDB stream record carries the change itself as members of its own — which
-        // mutation it was, the item's keys and the images the stream captures, each a typed
-        // attribute map — so the record the function receives IS the document a pattern names
-        // fields in.
-        ShardSource::DynamoDbStream => Cow::Borrowed(envelope),
-        ShardSource::Kinesis => kinesis_stream::filter_event(envelope),
-    }
 }
 
 /// Every open and closed shard of the mapped stream, in the order the stream reports them

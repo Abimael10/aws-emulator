@@ -190,33 +190,40 @@ fn record_envelope(
     envelope
 }
 
-/// One record as the FILTER sees it: the record the function receives, with the payload it
-/// carries as base64 text read as the document that text spells when it spells one.
+/// One record as the FILTER sees it: the record's OWN fields, as the Kinesis data plane
+/// reports them, with the payload it carries as base64 text read as the document that text
+/// spells.
 ///
-/// A function always receives `data` as the base64 text the event carries — the record's data
-/// "can be any payload" — but a filter names the fields INSIDE that payload, so for matching
-/// it is decoded and read as the JSON document it holds. A payload that is anything else, a
-/// bare scalar or bytes that are no document at all included, stays the text it is, so a
-/// pattern naming fields in it matches nothing rather than matching something else. It is the
-/// rule a queue source follows for a structured body
-/// ([`crate::state::sqs_poller`]), stated here because the member it is about is this
-/// source's own.
+/// The criteria decide a record of the SOURCE — the fields that source reported, before the
+/// record is wrapped in the envelope an invocation carries ([`super::admitted_of`]) — so a
+/// clause names the fields one Kinesis record HAS: `partitionKey`, `sequenceNumber`,
+/// `approximateArrivalTimestamp` and `data`. A DynamoDB stream record is decided the same
+/// way, and because the record THAT source reports is already the envelope, a clause there
+/// names `eventName` and `dynamodb`.
+///
+/// A record's data is bytes a producer put, which travel base64-encoded, and a clause for
+/// that member is written for the document those bytes spell: so the member is read as that
+/// document where they spell one — an object or a list, which is what a clause names fields
+/// inside — and left as the text it travels as where they do not, a bare scalar and bytes
+/// that are no text at all included, so a clause naming fields in such a payload admits the
+/// record no more than one whose values disagreed. It is the rule a queue source follows for
+/// a structured body ([`crate::state::sqs_poller`]), stated here because the member it is
+/// about is this source's own.
 pub(super) fn filter_event(envelope: &Value) -> Cow<'_, Value> {
-    let payload = envelope
+    let mut event = envelope
         .get("kinesis")
-        .and_then(|kinesis| kinesis.get("data"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let payload = event
+        .get("data")
         .and_then(Value::as_str)
         .and_then(|data| ::aws_smithy_types::base64::decode(data).ok())
         .and_then(|bytes| ::serde_json::from_slice::<Value>(&bytes).ok())
         .filter(|document| document.is_object() || document.is_array());
-    match payload {
-        Some(document) => {
-            let mut event = envelope.clone();
-            event["kinesis"]["data"] = document;
-            Cow::Owned(event)
-        }
-        None => Cow::Borrowed(envelope),
+    if let Some(document) = payload {
+        event["data"] = document;
     }
+    Cow::Owned(event)
 }
 
 #[cfg(test)]
@@ -309,59 +316,57 @@ mod tests {
         }
     }
 
-    /// RULE: the record a filter is matched against is the record the function receives, with
-    /// the payload it carries as base64 text read as the document that text spells when it
-    /// spells one; every other payload stays the text the function receives.
+    /// RULE: the record a filter is matched against carries the record's OWN fields, as the
+    /// Kinesis data plane reports them, with the payload it carries as base64 text read as the
+    /// document that text spells; every other payload stays the text the record travels it as.
     ///
-    /// The rows differ along what the rule generalises over: what the payload holds (an
-    /// object, an array, a bare scalar, text that is no document at all, and no payload at
-    /// all).
+    /// The rows differ along what the rule generalises over: what the payload holds — an
+    /// object, an array, a bare scalar, text that is no document at all, bytes that are no
+    /// text at all, and no payload at all.
     #[test]
-    fn a_filter_sees_the_payload_as_the_document_it_spells() {
+    fn a_filter_sees_the_records_own_fields_with_its_payload_as_the_document_it_spells() {
         let run = run();
         let sequence_number = "49590338271490256608559692538361571095921575989136588898";
-        // (case, the record's data, what the filter must see under `kinesis.data`)
-        let rows: Vec<(&str, &[u8], ::serde_json::Value)> = vec![
+        // (case, the record's data, what the filter must see under `data`; `None` where the
+        // bytes spell no document and the member stays the text it travels as)
+        let rows: Vec<(&str, &[u8], Option<::serde_json::Value>)> = vec![
             (
                 "a-json-object",
                 br#"{"city":"Seattle","count":2}"#,
-                ::serde_json::json!({ "city": "Seattle", "count": 2 }),
-            ),
-            ("a-json-array", b"[1,2,3]", ::serde_json::json!([1, 2, 3])),
-            (
-                "a-bare-scalar",
-                b"12",
-                ::serde_json::json!(::aws_smithy_types::base64::encode(b"12".as_slice())),
+                Some(::serde_json::json!({ "city": "Seattle", "count": 2 })),
             ),
             (
-                "text-that-is-no-document",
-                b"not a document",
-                ::serde_json::json!(::aws_smithy_types::base64::encode(
-                    b"not a document".as_slice()
-                )),
+                "a-json-array",
+                b"[1,2,3]",
+                Some(::serde_json::json!([1, 2, 3])),
             ),
-            (
-                "an-empty-payload",
-                b"",
-                ::serde_json::json!(::aws_smithy_types::base64::encode(b"".as_slice())),
-            ),
+            // A bare scalar names nothing to descend into, so it stays the text the member
+            // travels as.
+            ("a-bare-scalar", b"12", None),
+            ("text-that-is-no-document", b"not a document", None),
+            ("bytes-that-are-no-text-at-all", b"\x00\xff\x80payload", None),
+            ("an-empty-payload", b"", None),
         ];
         for (case, data, expected) in rows {
             let record = record(sequence_number, data, None);
             let envelope = record_envelope(&record, "shardId-000000000000", &run);
             let event = filter_event(&envelope);
+            let expected = expected
+                .unwrap_or_else(|| ::serde_json::json!(::aws_smithy_types::base64::encode(data)));
             assert_eq!(
-                event["kinesis"]["data"], expected,
-                "case {case:?}: expected the filter to see {expected}, got {}",
-                event["kinesis"]["data"]
+                event["data"], expected,
+                "case {case:?}: expected the filter to see data {expected}, got {event}"
             );
-            // Nothing else about the record changes: a filter names fields of the record the
-            // function receives.
+            // The record's other fields are the ones the source reported for it.
             assert_eq!(
-                event["eventSourceARN"],
-                ::serde_json::json!(run.stream_arn),
-                "case {case:?}: the record the filter sees must still name its stream, got \
-                 {event}"
+                event["partitionKey"],
+                ::serde_json::json!("orders"),
+                "case {case:?}: expected the record's own partition key, got {event}"
+            );
+            assert_eq!(
+                event["sequenceNumber"],
+                ::serde_json::json!(sequence_number),
+                "case {case:?}: expected the record's own sequence number, got {event}"
             );
         }
     }

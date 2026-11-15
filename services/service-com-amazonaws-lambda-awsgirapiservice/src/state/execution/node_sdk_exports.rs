@@ -316,7 +316,7 @@ mod tests {
                 exports.errors.len()
             );
         }
-        for token in ["kinesis", "", "not-a-service"] {
+        for token in ["polly", "", "not-a-service"] {
             let exports = client_exports(token);
             assert!(
                 exports.operations.is_empty() && exports.errors.is_empty(),

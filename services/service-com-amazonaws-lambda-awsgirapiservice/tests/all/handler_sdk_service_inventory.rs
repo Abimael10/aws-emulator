@@ -63,6 +63,7 @@ const MUST_REACH: &[&str] = &[
     "apigatewaymanagementapi",
     "dynamodb",
     "events",
+    "kinesis",
     "logs",
     "opensearch",
     "rekognition",
