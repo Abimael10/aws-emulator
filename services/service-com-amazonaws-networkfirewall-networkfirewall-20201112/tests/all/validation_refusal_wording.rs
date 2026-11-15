@@ -310,18 +310,11 @@ async fn a_scalar_constraint_is_stated_without_the_submitted_value() {
             RULE_GROUP_TYPE_SET.to_string(),
         ),
         (
-            "a misspelled rule group type on the create path",
-            "CreateRuleGroup",
-            json!({
-                "RuleGroupName": "rg-three",
-                "Type": "Stateful",
-                "Capacity": 10,
-                "RuleGroup": { "RulesSource": { "RulesString": "pass tcp any any -> any any (sid:1;)" } },
-            }),
-            "type",
-            RULE_GROUP_TYPE_SET.to_string(),
-        ),
-        (
+            // The rule-group type on a WRITE of a rule group is not here: that
+            // member is the writing operation's own parameter — it has to match
+            // the document the same request carries — and a value the public API
+            // does not accept is refused as the invalid type it is, with the
+            // modelled client error (`crate::rule_group_rule_validation`).
             "a lower-case rule order, nested two members deep",
             "CreateFirewallPolicy",
             json!({

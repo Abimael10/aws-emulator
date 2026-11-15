@@ -43,6 +43,12 @@ aws-sdk-s3 = { version = "1", default-features = false }
 # Gateway Load Balancer VPC endpoint, which is EC2's resource and the only thing a route
 # can name as its `VpcEndpointId` target (`state::firewall_endpoints`).
 aws-sdk-ec2 = { version = "1", default-features = false }
+# The Suricata rule parser the stateful rules a caller submits in Suricata flat format are
+# read with, so nothing here hand-writes a parse of that format
+# (`state::stateful_rules`). Pinned EXACTLY: the crate publishes no stable line yet, and an
+# exact requirement is what keeps a later pre-release from being picked up for a parser on
+# the untrusted-input path.
+suricatax-rule-parser = "=0.2.0-alpha.1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

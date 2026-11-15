@@ -17101,6 +17101,7 @@ dependencies = [
  "service-com-amazonaws-s3-amazons3",
  "service-common",
  "sha2 0.10.9",
+ "suricatax-rule-parser",
  "tokio",
  "tracing",
 ]
@@ -21949,6 +21950,16 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "suricatax-rule-parser"
+version = "0.2.0-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1500d7bab894f36c4ca1b83130790a4b6be2262814e3a82020e03332c83c8583"
+dependencies = [
+ "nom 8.0.0",
+ "serde",
+]
 
 [[package]]
 name = "syn"

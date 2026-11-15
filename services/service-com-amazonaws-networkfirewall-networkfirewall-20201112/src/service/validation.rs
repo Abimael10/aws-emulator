@@ -9,12 +9,14 @@
 //! reached from [`crate::service`]'s `override_refusal`, the one seam that sees a refusal
 //! taken before dispatch.
 //!
-//! Four rules distinguish this service's wording from the framework's default. The first is
-//! keyed to MEMBERS — the references this service resolves itself, one half of which is a
-//! reference only on an operation acting on a resource that already exists — and the next two
-//! are keyed to nothing at all, so each of those holds for every constrained member of every
-//! operation of this service; the last is keyed to the SHAPE a member targets, since what a
-//! requirement states about a shape is a property of that shape:
+//! Five rules distinguish this service's wording from the framework's default. Two are keyed
+//! to the OPERATION as well as to what was refused — the references this service resolves
+//! itself, one half of which is a reference only on an operation acting on a resource that
+//! already exists, and the rule-group type, which is a parameter of its own only on an
+//! operation that writes a rule group — and the next two are keyed to nothing at all, so each
+//! of those holds for every constrained member of every operation of this service; rule 3 is
+//! keyed to the SHAPE a member targets, since what a requirement states about a shape is a
+//! property of that shape:
 //!
 //! 0. a value in a member that carries a RESOURCE REFERENCE this service resolves itself
 //!    ([`REFERENCE_ARN_MEMBERS`], [`REFERENCE_NAME_MEMBERS`]), refused because it is outside
@@ -46,6 +48,16 @@
 //!    that enumerates an enumerated type's value set states the set the SERVICE states —
 //!    which for the rule-group type is wider than the public model's, and for the
 //!    generated-rules type is the model's values in another order ([`SERVICE_VALUE_SETS`]).
+//! 4. a RULE-GROUP TYPE outside the values the public API accepts, on an operation that
+//!    WRITES a rule group ([`crate::service::served_operation::writes_a_rule_group`]), is no
+//!    validation clause: the type is that operation's own parameter — it must match the
+//!    document the same request carries — so the request is refused as the invalid rule-group
+//!    type it is ([`crate::state::INVALID_RULE_GROUP_TYPE_MESSAGE`]) with the same modelled
+//!    client error rule 0 answers with. Being no constraint of that input, the type is also
+//!    not among the clauses a request that breaks a constraint the operation DOES declare is
+//!    refused with: such a request never reaches the operation, so it is answered with that
+//!    constraint's clause alone. On every operation that takes the same member to pick which
+//!    rule groups to act on, a refused value keeps the clause rule 3 states it in.
 //!
 //! Rules 1 and 2 are AWS's own wording rather than this service's, and both are implemented
 //! once for the fleet in `service_common::validation_message`, which this module DELEGATES to
@@ -54,7 +66,7 @@
 //! elements), and the envelope, the member paths, the element sets and every requirement
 //! sentence stay the framework's and that module's. So does the `@pattern` rendering rule 3
 //! names: `service_common::validation` carries one function per dialect the fleet's
-//! recordings show, and this service states WHICH of them it is recorded in. Rule 0, the
+//! recordings show, and this service states WHICH of them it is recorded in. Rules 0 and 4, the
 //! value sets of rule 3, and that choice are the only wording this service owns, because what
 //! each states is a fact about THIS service.
 //!
@@ -124,21 +136,28 @@ const REFERENCE_NAME_MEMBERS: [&str; 4] = [
 /// restated here are affected and every other enumerated member of this service keeps the
 /// values its model declares.
 const SERVICE_VALUE_SETS: &[(&[&str], &[&str])] = &[
-    (
-        &["STATELESS", "STATEFUL", "STATEFUL_DOMAIN"],
-        &[
-            "FIREWALL",
-            "STATELESS",
-            "IPS",
-            "STATEFUL",
-            "IPS_DOMAIN",
-            "STATEFUL_DOMAIN",
-        ],
-    ),
+    (MODELLED_RULE_GROUP_TYPES, SERVICE_RULE_GROUP_TYPES),
     (
         &["ALLOWLIST", "DENYLIST", "REJECTLIST", "ALERTLIST"],
         &["ALLOWLIST", "DENYLIST", "ALERTLIST", "REJECTLIST"],
     ),
+];
+
+/// The rule-group type values the PUBLIC model declares
+/// (`smithy_query(query="shape",shape="RuleGroupType")`), in its declaration order —
+/// which is how a violation about that type is recognised among this service's other
+/// enumerated members (see [`SERVICE_VALUE_SETS`], keyed by the whole modelled set).
+const MODELLED_RULE_GROUP_TYPES: &[&str] = &["STATELESS", "STATEFUL", "STATEFUL_DOMAIN"];
+
+/// The rule-group type values the SERVICE's own enumeration carries, in the order it
+/// states them: the three the public model declares plus the three it does not.
+const SERVICE_RULE_GROUP_TYPES: &[&str] = &[
+    "FIREWALL",
+    "STATELESS",
+    "IPS",
+    "STATEFUL",
+    "IPS_DOMAIN",
+    "STATEFUL_DOMAIN",
 ];
 
 /// Every operation INPUT shape of this service, as the schemas codegen derives from the
@@ -287,7 +306,8 @@ fn stated_pattern(pattern: &str) -> String {
 ///
 /// Rule 0 is answered first and on its own: a refused resource REFERENCE is not a validation
 /// clause this service states, it is the modelled refusal its handlers answer the same defect
-/// with. Everything else takes the shared rendering, whose error code travels with the
+/// with, and rule 4 is the same for a refused rule-group type on an operation that writes one.
+/// Everything else takes the shared rendering, whose error code travels with the
 /// message and names the one every operation of this service declares for a refused input.
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
@@ -296,9 +316,28 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     if let Some(refused) = malformed_reference(violations) {
         return Some(refused);
     }
+    // Rule 4 is answered next, and over the violations rather than over the rendering: on an
+    // operation that WRITES a rule group, the type is the operation's own parameter, so it is
+    // no constraint of that operation's input at all — the value reaches the operation, which
+    // refuses it. It is therefore dropped from the set the clauses are rendered from, and the
+    // modelled refusal is answered only when the boundary refused NOTHING ELSE: a request that
+    // also breaks a constraint the operation does declare never reaches the operation, so what
+    // it is refused with is that constraint's clause and the type is not mentioned.
+    let (invalid_type, declared): (Vec<Violation>, Vec<Violation>) =
+        if crate::service::served_operation::writes_a_rule_group() {
+            violations.iter().cloned().partition(names_a_rule_group_type)
+        } else {
+            (Vec::new(), violations.to_vec())
+        };
+    if !invalid_type.is_empty() && declared.is_empty() {
+        return Some(Refused {
+            code: MODELLED_REFUSAL_CODE.to_owned(),
+            message: crate::state::INVALID_RULE_GROUP_TYPE_MESSAGE.to_owned(),
+        });
+    }
     // Rule 3 is applied to the violations BEFORE the clauses are rendered, so the clause
     // itself, its member path and the words around the value set stay the framework's.
-    let stated: Vec<Violation> = violations.iter().map(in_service_value_set).collect();
+    let stated: Vec<Violation> = declared.iter().map(in_service_value_set).collect();
     service_common::validation_message::aws_validation_refusal_over_elements_withholding(
         &Refusal::Invalid(stated),
         INPUT_SCHEMAS,
@@ -311,10 +350,28 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     )
 }
 
-/// The error shape rule 0 answers with: the client error every operation of this service
-/// declares for a request whose reference is bad, which is the shape its handlers return for
-/// the same defect (`smithy_query(query="shape",shape="InvalidRequestException")`).
-const REFERENCE_REFUSAL_CODE: &str = "InvalidRequestException";
+/// The error shape rules 0 and 4 answer with: the client error every operation of this service
+/// declares for a request whose reference or whose rule-group type is bad, which is the shape
+/// its handlers return for the same defect
+/// (`smithy_query(query="shape",shape="InvalidRequestException")`).
+const MODELLED_REFUSAL_CODE: &str = "InvalidRequestException";
+
+/// Rule 4: whether `violation` is about a RULE-GROUP TYPE.
+///
+/// Keyed on the whole value set the public model declares for that type — the same keying
+/// [`SERVICE_VALUE_SETS`] uses, since what a type enumerates is a property of the type and not
+/// of one member — and nothing else: WHICH operations read that member as the type they write
+/// is the one fact about the operation this wording needs, and it comes from
+/// [`crate::service::served_operation::writes_a_rule_group`].
+fn names_a_rule_group_type(violation: &Violation) -> bool {
+    let ViolationKind::EnumValue(declared) = &violation.kind else {
+        return false;
+    };
+    declared
+        .iter()
+        .map(String::as_str)
+        .eq(MODELLED_RULE_GROUP_TYPES.iter().copied())
+}
 
 /// Rule 0: the malformed-reference refusal when EVERY violation is a reference member whose
 /// value cannot be a resource ARN or a resource name, and `None` otherwise.
@@ -350,7 +407,7 @@ fn malformed_reference(violations: &[Violation]) -> Option<Refused> {
         crate::state::NAME_INVALID_FORMAT_MESSAGE
     };
     Some(Refused {
-        code: REFERENCE_REFUSAL_CODE.to_owned(),
+        code: MODELLED_REFUSAL_CODE.to_owned(),
         message: message.to_owned(),
     })
 }

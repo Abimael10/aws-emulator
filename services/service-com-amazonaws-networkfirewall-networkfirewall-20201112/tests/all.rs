@@ -59,6 +59,8 @@ mod rule_group_mutations;
 mod rule_group_policy_associations;
 #[path = "all/rule_group_response_members.rs"]
 mod rule_group_response_members;
+#[path = "all/rule_group_rule_validation.rs"]
+mod rule_group_rule_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stateless_default_actions.rs"]

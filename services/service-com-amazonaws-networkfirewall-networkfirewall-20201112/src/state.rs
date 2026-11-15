@@ -14,11 +14,12 @@ use crate::ops::types::{
     FirewallPolicy, FirewallPolicyMetadata, FirewallPolicyResponse, FirewallStatus, FlowFilter,
     FlowOperation, FlowOperationMetadata, LogDestinationConfig, LoggingConfiguration,
     MatchAttributes, PerObjectStatus, PortRange, RuleGroup, RuleGroupMetadata, RuleGroupResponse,
-    SourceMetadata, SubnetMapping, SummaryConfiguration, SyncState, Tag,
+    SourceMetadata, StatelessRule, SubnetMapping, SummaryConfiguration, SyncState, Tag,
 };
 
 pub mod firewall_endpoints;
 pub mod log_destinations;
+pub mod stateful_rules;
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, from the
 /// model's `aws.api#service` trait: `arnNamespace: network-firewall`
@@ -371,21 +372,29 @@ pub fn stateless_default_action_breach(policy: &FirewallPolicy) -> Option<String
 
     members
         .iter()
-        .find_map(|(member, actions)| stateless_action_list_breach(member, actions, &declared))
+        .find_map(|(member, actions)| stateless_action_list_breach(member, member, actions, &declared))
 }
 
 /// Why the list `member` carries is not a set of actions this service can act
 /// on, or `None` when it is, applying the three conditions
 /// [`stateless_default_action_breach`] states in the order it states them.
+///
+/// `member` names the list in the stem and `context` is the input path it sits
+/// on: the two coincide for a top-level member of a firewall policy document,
+/// and differ for a list nested inside a document (a stateless rule's `Actions`,
+/// [`stateless_rule_action_breach`]). The CONDITIONS are the same wherever the
+/// list sits, because they are conditions on the one documented action
+/// vocabulary, so there is one implementation of them.
 fn stateless_action_list_breach(
     member: &str,
+    context: &str,
     actions: &[String],
     declared: &HashSet<&str>,
 ) -> Option<String> {
     if actions.is_empty() {
         return Some(context_message(
             &format!("{member} cannot be null or empty"),
-            member,
+            context,
         ));
     }
 
@@ -396,7 +405,7 @@ fn stateless_action_list_breach(
         return Some(parameter_context_message(
             &format!("{member} is invalid"),
             action,
-            member,
+            context,
         ));
     }
 
@@ -414,7 +423,7 @@ fn stateless_action_list_breach(
         parameter_context_message(
             &format!("{member} cannot exist together"),
             &standard.join(", "),
-            member,
+            context,
         )
     })
 }
@@ -490,6 +499,12 @@ pub fn rules_source_member(group: &RuleGroup) -> &'static str {
 /// the one that is set must belong to the half the `Type` names; and
 /// "<RuleVariables> ... You can only use these for stateful rule groups"
 /// (`RuleGroup$RuleVariables`).
+///
+/// A member set on the wrong half is refused in the service's request-derived
+/// shape with a context and no bracketed value ([`context_message`]): the member
+/// itself is what is in the wrong place, so the stem names it and the context is
+/// the input path it arrived on, and no part of the submitted document is quoted
+/// back.
 pub fn rule_group_document_breach(group_type: &str, group: &RuleGroup) -> Option<String> {
     let source = &group.rules_source;
     let stateless = source.stateless_rules_and_custom_actions.is_some();
@@ -515,13 +530,10 @@ pub fn rule_group_document_breach(group_type: &str, group: &RuleGroup) -> Option
         ));
     }
     if (group_type == RULE_GROUP_STATELESS) != stateless {
-        return Some(format!(
-            "A {group_type} rule group's RuleGroup.RulesSource must specify {}.",
-            if group_type == RULE_GROUP_STATELESS {
-                "StatelessRulesAndCustomActions"
-            } else {
-                "RulesString, RulesSourceList or StatefulRules"
-            }
+        let member = rules_source_member(group);
+        return Some(context_message(
+            &format!("{member} is invalid"),
+            &format!("RulesSource.{member}"),
         ));
     }
     if group_type == RULE_GROUP_STATELESS && group.rule_variables.is_some() {
@@ -530,6 +542,104 @@ pub fn rule_group_document_breach(group_type: &str, group: &RuleGroup) -> Option
         );
     }
     None
+}
+
+/// The input path one stateless rule of a submitted rule group document sits on,
+/// as this service's refusals name it.
+///
+/// The rule is located by its `Priority` rather than by its position in the
+/// list, which is what `StatelessRule$Priority` makes possible: "You must ensure
+/// that the priority settings are unique for the rule group", so the priority
+/// identifies one rule of the document ([`stateless_rule_breach`] refuses a
+/// document where it does not).
+pub fn stateless_rule_path(priority: i32) -> String {
+    format!("StatelessRulesAndCustomActions.StatelessRules[Priority={priority}]")
+}
+
+/// Why `group`'s stateless rules are not rules this service can act on, or
+/// `None` when they are — including for a document that carries no stateless
+/// rules at all, which this check has nothing to say about.
+///
+/// Two conditions, each stated by the documentation of the member it is about:
+///
+/// * a priority identifies ONE rule of the group: "You must ensure that the
+///   priority settings are unique for the rule group ... To ensure unique
+///   priority settings for your rule groups, set unique priorities for the
+///   stateless rules that you define inside any single `StatelessRules` object"
+///   (`StatelessRule$Priority`). Two rules sharing one is therefore a bad
+///   request, not a rule group with an undefined evaluation order;
+/// * every entry of a rule's `Actions` must NAME an action — one of the
+///   [`STATELESS_STANDARD_ACTIONS`] ([`is_standard_stateless_action`]) or a
+///   custom action the SAME `StatelessRulesAndCustomActions` declares
+///   ("Additionally, you can specify a custom action. To do this, you define a
+///   custom action by name and type, then provide the name you've assigned to
+///   the action in this `Actions` setting") — the list may not be empty, and
+///   only ONE of its entries may be standard: "For every rule, you must specify
+///   exactly one of the following standard actions" (`RuleDefinition$Actions`).
+///   These are the conditions a firewall policy's stateless default actions are
+///   read by, because it is the same documented vocabulary, so they have one
+///   implementation ([`stateless_action_list_breach`]) and this rule states only
+///   where the list sits.
+///
+/// Either way the document is refused rather than retained: a stored rule group
+/// whose rules have no defined order, or whose action nothing implements, would
+/// inspect traffic differently from the rule group the caller asked for.
+///
+/// Each refusal takes the service's request-derived message shape
+/// ([`parameter_context_message`]): the stem names the member and what failed
+/// about it, the brackets carry the offending value, and the context is the input
+/// path that value sits on ([`stateless_rule_path`]). The conditions are reported
+/// in the order they are stated above — the collection's own invariant before any
+/// one rule's contents — and within one condition the first rule in request order.
+pub fn stateless_rule_breach(group: &RuleGroup) -> Option<String> {
+    let stateless = group
+        .rules_source
+        .stateless_rules_and_custom_actions
+        .as_ref()?;
+
+    let mut seen: HashSet<i32> = HashSet::new();
+    for rule in &stateless.stateless_rules {
+        if !seen.insert(rule.priority) {
+            let priority = rule.priority.to_string();
+            return Some(parameter_context_message(
+                "Priority has duplicate values",
+                &priority,
+                &stateless_rule_path(rule.priority),
+            ));
+        }
+    }
+
+    // The document's own custom action names, collected once, so checking one
+    // rule's actions costs one lookup per action however many the document
+    // declares.
+    let declared: HashSet<&str> = stateless
+        .custom_actions
+        .iter()
+        .flatten()
+        .map(|custom| custom.action_name.as_str())
+        .collect();
+    stateless
+        .stateless_rules
+        .iter()
+        .find_map(|rule| stateless_rule_action_breach(rule, &declared))
+}
+
+/// Why `rule`'s `Actions` are not actions this service can act on: the one
+/// implementation of the documented action vocabulary
+/// ([`stateless_action_list_breach`]), applied to the list this rule carries,
+/// with the member stated as `Actions` and the context the input path that list
+/// sits on — the rule located by its priority ([`stateless_rule_path`]).
+fn stateless_rule_action_breach(rule: &StatelessRule, declared: &HashSet<&str>) -> Option<String> {
+    let context = format!(
+        "{}.RuleDefinition.Actions",
+        stateless_rule_path(rule.priority)
+    );
+    stateless_action_list_breach(
+        "Actions",
+        &context,
+        &rule.rule_definition.actions,
+        declared,
+    )
 }
 
 /// The actions a resource policy on a shared RULE GROUP MAY grant, from the AWS
@@ -1431,6 +1541,21 @@ pub const DELETE_IN_USE_MESSAGE: &str = "Unable to delete the object because it 
 /// the recorded one.
 pub const INVALID_RESOURCE_POLICY_MESSAGE: &str =
     "The supplied policy does not match RAM managed permissions.";
+
+/// What a request naming a rule-group TYPE the public API does not accept is
+/// refused with.
+///
+/// `RuleGroupType` is one enumeration service-side and a subset of it in the
+/// public model (`smithy_query(query="shape",shape="RuleGroupType")` declares
+/// three values, and a refused value enumerates a wider set — see
+/// [`crate::service`]'s validation wording): a value the service's own
+/// enumeration carries but the public API does not accept breaks no declared
+/// constraint, so it is refused as the invalid type it is, with the modelled
+/// client error and this one constant. It carries nothing from the request —
+/// neither the submitted type nor the values that are accepted — so the text is
+/// the recorded one.
+pub const INVALID_RULE_GROUP_TYPE_MESSAGE: &str =
+    "The rule group type isn't valid. Enter a valid type, and try again.";
 
 /// A refusal whose message IS built from the request: a fixed stem, then the
 /// offending value in parameter brackets.

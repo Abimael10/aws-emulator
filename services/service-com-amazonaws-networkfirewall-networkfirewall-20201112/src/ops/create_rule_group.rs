@@ -238,17 +238,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(breach) = crate::state::rule_group_document_breach(&input.r#type, &rule_group) {
             return Err(invalid_request(&breach));
         }
+        // The rules themselves, before any accounting over them: a priority
+        // identifies one rule of the group and every action has to name an
+        // action (`crate::state::stateless_rule_breach`), and a stateful rule
+        // given in Suricata flat format has to be one the engine can load
+        // (`crate::state::stateful_rules`).
+        if let Some(breach) = crate::state::stateless_rule_breach(&rule_group) {
+            return Err(invalid_request(&breach));
+        }
+        if let Some(breach) = crate::state::stateful_rules::breach(&rule_group) {
+            return Err(invalid_request(&breach));
+        }
 
         // "Rule group capacity is fixed at creation ... When you reference a rule group
         // from a firewall policy, Network Firewall reserves this capacity": a rule
         // group whose rules already need more than the capacity reserved for it could
         // never be used, so the request is refused rather than stored.
-        if input.capacity < 1 {
-            return Err(invalid_request(&format!(
-                "Capacity must be at least 1 capacity unit; this request asked for {}.",
-                input.capacity
-            )));
-        }
         if input.capacity > crate::state::MAX_RULE_GROUP_CAPACITY {
             return Err(CreateRuleGroupErrorModeled::LimitExceededException(
                 LimitExceededException {

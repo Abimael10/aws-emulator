@@ -289,6 +289,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(invalid_request(&breach));
         }
+        // The same check of the rules themselves the create path runs, on the
+        // document this update would land.
+        if let Some(breach) = crate::state::stateless_rule_breach(&record.rule_group) {
+            return Err(invalid_request(&breach));
+        }
+        if let Some(breach) = crate::state::stateful_rules::breach(&record.rule_group) {
+            return Err(invalid_request(&breach));
+        }
         // "When you update a rule group, you are limited to this capacity ... You
         // can't change or exceed this capacity when you update the rule group"
         // (`CreateRuleGroupRequest$Capacity`).

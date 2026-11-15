@@ -64,6 +64,30 @@ pub(crate) fn serves_an_existing_resource() -> bool {
     served_operation().is_some_and(|served| !names_a_new_resource(&served))
 }
 
+/// The operations whose `Type` member names the type OF THE RULE GROUP THE REQUEST WRITES,
+/// rather than a type to report on.
+///
+/// The model is what says so: `CreateRuleGroup$Type` and `UpdateRuleGroup$Type` both state
+/// "indicates whether the rule group is stateless or stateful" about the rule group the call
+/// writes — and both operations refuse a document whose contents the type does not match —
+/// while every other operation taking the same member takes it to pick WHICH rule groups to
+/// act on or report (`ListRuleGroups$Type` "indicates the general category of the rule group",
+/// `DescribeRuleGroup$Type` identifies one beside its name). A type the public API does not
+/// accept is therefore the writing operation's own refusal, and elsewhere stays the validation
+/// clause the boundary raised.
+///
+/// Sorted, which [`writes_a_rule_group`] relies on for `binary_search` and
+/// `the_rule_group_writes_are_sorted` pins.
+const RULE_GROUP_WRITES: &[&str] = &["CreateRuleGroup", "UpdateRuleGroup"];
+
+/// Whether the operation being served writes a rule group ([`RULE_GROUP_WRITES`]).
+///
+/// `false` outside any served operation, for the same reason
+/// [`serves_an_existing_resource`] is.
+pub(crate) fn writes_a_rule_group() -> bool {
+    served_operation().is_some_and(|served| RULE_GROUP_WRITES.binary_search(&&*served).is_ok())
+}
+
 /// `resp` as this service answers it, for a request the wrapper below served: a modelled error
 /// body whose text is in the member this model declares it in.
 ///
@@ -141,13 +165,58 @@ mod tests {
         );
     }
 
-    /// Outside a served operation nothing of an operation's wording applies, so the
-    /// reference reading of a resource-name member is off.
+    /// RULE: a rule group's `Type` is a type the request WRITES on the create and the update
+    /// of a rule group, and a type to report on everywhere else.
+    ///
+    /// The rows span both writes, the two reads of a rule group that take the same member
+    /// beside a name, the listing that filters on it, a write of another resource kind and an
+    /// operation that takes no rule-group type at all.
+    #[test]
+    fn only_a_rule_group_write_names_the_type_it_writes() {
+        // (the operation, whether it writes a rule group)
+        let rows: &[(&str, bool)] = &[
+            ("CreateRuleGroup", true),
+            ("UpdateRuleGroup", true),
+            ("DescribeRuleGroup", false),
+            ("DeleteRuleGroup", false),
+            ("ListRuleGroups", false),
+            ("CreateFirewallPolicy", false),
+            ("DescribeFirewall", false),
+        ];
+
+        for (operation, writes) in rows {
+            assert_eq!(
+                RULE_GROUP_WRITES.binary_search(operation).is_ok(),
+                *writes,
+                "case {operation:?}: expected writes_a_rule_group = {writes}"
+            );
+        }
+    }
+
+    /// [`RULE_GROUP_WRITES`] is searched by `binary_search`, which a list out of order
+    /// answers wrongly for.
+    #[test]
+    fn the_rule_group_writes_are_sorted() {
+        let mut sorted = RULE_GROUP_WRITES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            RULE_GROUP_WRITES, &sorted[..],
+            "expected the operations sorted, got {RULE_GROUP_WRITES:?}"
+        );
+    }
+
+    /// Outside a served operation nothing of an operation's wording applies, so neither the
+    /// reference reading of a resource-name member nor the writing reading of a rule-group
+    /// type is on.
     #[tokio::test]
     async fn no_served_operation_reads_as_no_existing_resource() {
         assert!(
             !serves_an_existing_resource(),
             "expected no existing resource outside a served operation"
+        );
+        assert!(
+            !writes_a_rule_group(),
+            "expected no rule-group write outside a served operation"
         );
     }
 }
