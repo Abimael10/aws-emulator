@@ -23,6 +23,8 @@ mod canary_run_outcomes;
 mod canary_schedule_running_bound;
 #[path = "all/client_error_message_wording.rs"]
 mod client_error_message_wording;
+#[path = "all/dry_run_lifecycle.rs"]
+mod dry_run_lifecycle;
 #[path = "all/group_deletion.rs"]
 mod group_deletion;
 #[path = "all/group_disassociation.rs"]

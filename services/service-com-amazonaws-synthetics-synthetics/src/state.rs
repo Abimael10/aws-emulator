@@ -607,8 +607,8 @@ impl StoredRun {
     }
 }
 
-/// One dry run of a canary: the identity the API addresses it by, and the configuration it
-/// exercises.
+/// One dry run of a canary: the identity the API addresses it by, the configuration it
+/// exercises, and the lifecycle of its own that `GetCanary(DryRunId)` reports.
 ///
 /// `StartCanaryDryRun` runs a canary that already exists with a configuration that may
 /// differ from the canary's own, without changing the canary. The configuration is
@@ -616,11 +616,36 @@ impl StoredRun {
 /// rewrite what the dry run was given; the snapshot carries no run history and no nested
 /// dry runs of its own, because those belong to the canary record rather than to one of
 /// its configurations.
+///
+/// `GetCanaryRequest$DryRunId`: "You can use this DryRunId to retrieve information about
+/// the dry run", so the status and the timeline a read addressed by a `DryRunId` reports
+/// are THIS dry run's — it executes independently of the canary's own schedule, so its
+/// progress is recorded here rather than read off the canary.
 #[derive(Debug, Clone)]
 pub struct StoredDryRun {
     /// `DryRunConfigOutput$DryRunId`, a minted [`new_uuid`].
     pub id: String,
     pub config: Box<StoredCanary>,
+    /// The `StoredRun::id` of the run this dry run started: the work whose finishing is
+    /// what finishes the dry run.
+    pub run_id: String,
+    /// Where this dry run is in its OWN lifecycle: in progress while its run executes
+    /// ([`CanaryState::Running`]), terminal once that run has finished.
+    pub state: CanaryState,
+    /// Why a dry run that ended in [`CanaryState::Error`] has no verdict, taken from the
+    /// run that could not produce one. `None` for every other state.
+    pub state_reason: Option<String>,
+    /// When the dry run was started, which is also when it was created: a dry run exists
+    /// by being started, so `CanaryTimeline$Created` and `$LastStarted` are this instant.
+    pub started: SystemTime,
+    /// The instant of the dry run's last lifecycle change, `CanaryTimeline$LastModified`.
+    pub last_modified: SystemTime,
+    /// When the dry run's run ended, `CanaryTimeline$LastStopped`; `None` while it is in
+    /// progress.
+    pub stopped: Option<SystemTime>,
+    /// The instant at which the clock owes the move out of the in-progress state, the same
+    /// instant the run this dry run started is owed its outcome.
+    pub finish_due: Option<SystemTime>,
 }
 
 /// One canary, as this emulator persists it. Every reported field is read from here.
@@ -705,6 +730,11 @@ impl StoredCanary {
                 run.outcome_due = None;
             }
         }
+        // A dry run's own lifecycle moves with the run it started, which the loop above has
+        // just settled at this same instant. It has to stay AHEAD of `expire_runs` below:
+        // the verdict a dry run reads is its run's, so a dry run settled after its run had
+        // been dropped from the retained history would take the no-verdict branch.
+        self.settle_dry_runs(now);
         // A canary whose schedule bounds how long it runs stops on its own once that bound
         // has passed and the runs it started are finished: `rate(0 …)` "causes the canary to
         // run only once when it is started", and a non-zero `DurationInSeconds` is how long
@@ -728,6 +758,50 @@ impl StoredCanary {
         self.runs
             .iter()
             .any(|run| run.state == CanaryRunState::Running && run.dry_run_id.is_none())
+    }
+
+    /// Finish every dry run whose own run has finished and whose terminal state the clock
+    /// already owes at `now`, and nothing else.
+    ///
+    /// A dry run is in progress from the call that starts it until the run it started has a
+    /// verdict: that run IS the dry run's work, so the dry run ends when it ends, whatever
+    /// the canary's own schedule is doing meanwhile. A dry run whose run produced a verdict
+    /// has finished executing and is therefore `STOPPED`; one whose run produced none —
+    /// its artifacts could not be stored, so the configuration under test never ran to a
+    /// result — ends in `ERROR` carrying that run's reason, which is the fault a dry run
+    /// exists to surface before the configuration is promoted.
+    fn settle_dry_runs(&mut self, now: SystemTime) {
+        // Split borrow: the run history is a different field of `self`, so it can be read
+        // while the dry runs are borrowed mutably.
+        let runs = &self.runs;
+        for dry_run in &mut self.dry_runs {
+            if dry_run.state != CanaryState::Running
+                || !dry_run.finish_due.is_some_and(|due| now >= due)
+            {
+                continue;
+            }
+            // The run this dry run started, while the history still holds it.
+            let run = runs.iter().find(|run| run.id == dry_run.run_id);
+            if run.is_some_and(|run| run.state == CanaryRunState::Running) {
+                // Its work is still open, so the dry run has not finished.
+                continue;
+            }
+            let failed = run.filter(|run| run.state != CanaryRunState::Passed);
+            let finished = run
+                .and_then(|run| run.completed)
+                .or(dry_run.finish_due)
+                .unwrap_or(now);
+            dry_run.state = match failed {
+                Some(_) => CanaryState::Error,
+                // A dry run whose run the history no longer retains still FINISHED: the
+                // verdict has expired, the execution has not.
+                None => CanaryState::Stopped,
+            };
+            dry_run.state_reason = failed.and_then(|run| run.state_reason.clone());
+            dry_run.stopped = Some(finished);
+            dry_run.last_modified = finished;
+            dry_run.finish_due = None;
+        }
     }
 
     /// Drop every finished run the canary's retention period no longer covers.
@@ -805,16 +879,35 @@ impl StoredCanary {
     }
 
     /// Project this canary as one of its dry runs configures it: every configuration
-    /// member comes from the dry run's snapshot, while identity, status and timeline come
-    /// from the live record — a dry run carries a configuration, it is not a second canary.
+    /// member comes from the dry run's snapshot, its status and its timeline from the dry
+    /// run's OWN lifecycle, and its identity and tags from the live record — a dry run
+    /// carries a configuration and a lifecycle, it is not a second canary.
+    ///
+    /// `GetCanaryRequest$DryRunId`: "You can use this DryRunId to retrieve information
+    /// about the dry run", so what a read addressed by a `DryRunId` reports is the dry
+    /// run's progress; the canary's own state answers the same read WITHOUT one.
     pub fn to_dry_run_canary(&self, dry_run: &StoredDryRun) -> Canary {
         let live = self.to_canary();
         let mut canary = dry_run.config.to_canary();
         canary.id = live.id;
         canary.name = live.name;
-        canary.status = live.status;
-        canary.timeline = live.timeline;
         canary.tags = live.tags;
+        canary.status = Some(CanaryStatus {
+            state: Some(dry_run.state.as_wire().to_string()),
+            state_reason: dry_run.state_reason.clone(),
+            // `CanaryStatus$StateReasonCode`: "If the canary creation or update failed,
+            // this field displays the reason code" — a dry run that could not produce a
+            // verdict is neither, and no `CanaryStateReasonCode` member names that
+            // failure, so the reason is reported in prose alone rather than under a code
+            // that means something else.
+            state_reason_code: None,
+        });
+        canary.timeline = Some(CanaryTimeline {
+            created: Some(dry_run.started.into()),
+            last_modified: Some(dry_run.last_modified.into()),
+            last_started: Some(dry_run.started.into()),
+            last_stopped: dry_run.stopped.map(Into::into),
+        });
         canary.dry_run_config = Some(self.dry_run_config_output(dry_run));
         canary
     }

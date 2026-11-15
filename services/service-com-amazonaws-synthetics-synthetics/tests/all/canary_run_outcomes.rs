@@ -30,17 +30,22 @@ use crate::group_membership::{error_of, ok};
 
 /// The Region every call in this suite is signed for, and the Region the bucket and the
 /// role below live in.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` here and on the setup below because the dry-run lifecycle suite asserts its
+/// own rule over the SAME account resources a run needs — the execution role and the
+/// artifact bucket — and sharing this setup is what keeps the two suites from carrying two
+/// copies of it.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The bucket a canary's artifacts are written to, created through Amazon S3's own API.
-const BUCKET: &str = "canary-artifacts";
+pub(crate) const BUCKET: &str = "canary-artifacts";
 
 /// The object a run's report is stored as. The layout is the emulator's own and is stated
 /// where it is chosen (`src/state/canary_run.rs`).
 const REPORT_OBJECT: &str = "SyntheticsReport.json";
 
 /// The action a run needs on the artifacts it writes.
-const ARTIFACT_WRITE_ACTION: &str = "s3:PutObject";
+pub(crate) const ARTIFACT_WRITE_ACTION: &str = "s3:PutObject";
 
 /// The service principal a canary's execution role is assumed by.
 const SYNTHETICS_PRINCIPAL: &str = "synthetics.amazonaws.com";
@@ -60,7 +65,11 @@ fn trust_document() -> String {
 
 /// Create `role_name` through IAM itself, with `statements` as its one inline permissions
 /// policy (none at all when the list is empty), and answer the ARN IAM minted for it.
-async fn create_role(iam: &::aws_sdk_iam::Client, role_name: &str, statements: Value) -> String {
+pub(crate) async fn create_role(
+    iam: &::aws_sdk_iam::Client,
+    role_name: &str,
+    statements: Value,
+) -> String {
     let arn = iam
         .create_role()
         .role_name(role_name)
@@ -88,13 +97,13 @@ async fn create_role(iam: &::aws_sdk_iam::Client, role_name: &str, statements: V
 }
 
 /// One policy statement: `effect` the `actions` on `resources`.
-fn statement(effect: &str, actions: Value, resources: Value) -> Value {
+pub(crate) fn statement(effect: &str, actions: Value, resources: Value) -> Value {
     json!({ "Effect": effect, "Action": actions, "Resource": resources })
 }
 
 /// Create the suite's bucket through Amazon S3's own API, so the objects asserted on below
 /// exist only because S3 holds them.
-async fn create_bucket(s3: &::aws_sdk_s3::Client) {
+pub(crate) async fn create_bucket(s3: &::aws_sdk_s3::Client) {
     s3.create_bucket()
         .bucket(BUCKET)
         .send()
@@ -125,7 +134,7 @@ async fn object_body(s3: &::aws_sdk_s3::Client, key: &str) -> Option<Value> {
 
 /// A `CreateCanary` body: every required member, with the row's own role, artifact location
 /// and schedule.
-fn canary_body(name: &str, role_arn: &str, location: &str, schedule: &str) -> Value {
+pub(crate) fn canary_body(name: &str, role_arn: &str, location: &str, schedule: &str) -> Value {
     json!({
         "Name": name,
         "Code": { "Handler": "index.handler", "S3Bucket": "scripts", "S3Key": "canary.zip" },
@@ -138,7 +147,7 @@ fn canary_body(name: &str, role_arn: &str, location: &str, schedule: &str) -> Va
 
 /// Create the canary and wait for the provisioning transition the clock owes it, so the
 /// start below is not refused for a canary that is still `CREATING`.
-async fn ready_canary(aws: &Synthetics, case: &str, body: Value) {
+pub(crate) async fn ready_canary(aws: &Synthetics, case: &str, body: Value) {
     let name = body["Name"].as_str().unwrap_or_default().to_string();
     ok(&format!("{case}/create"), aws.create(body).await);
     let canary = poll_until(

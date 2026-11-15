@@ -131,9 +131,9 @@ use std::time::SystemTime;
 use crate::state::{
     canary_run::RunWork, canary_state_conflict, is_published_runtime_version,
     is_s3_artifact_location, new_uuid, source_location_arn, unknown_runtime_version,
-    CanaryRunState, CanaryTransition, StoredArtifactConfig, StoredCode, StoredDependency,
-    StoredDryRun, StoredRun, StoredRunConfig, StoredVpcConfig, ARTIFACT_S3_LOCATION_MALFORMED,
-    CANARY_NOT_FOUND, RUN_SETTLE, STORE_UNAVAILABLE,
+    CanaryRunState, CanaryState, CanaryTransition, StoredArtifactConfig, StoredCode,
+    StoredDependency, StoredDryRun, StoredRun, StoredRunConfig, StoredVpcConfig,
+    ARTIFACT_S3_LOCATION_MALFORMED, CANARY_NOT_FOUND, RUN_SETTLE, STORE_UNAVAILABLE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -389,18 +389,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant rather than after the one the request arrived at — a caller reading
         // straight after the answer still sees the run open.
         let started = SystemTime::now();
+        let finish_due = started + RUN_SETTLE;
         let run = StoredRun {
-            id: run_id,
+            id: run_id.clone(),
             name: config.name.clone(),
             state: CanaryRunState::Running,
             state_reason: None,
             state_reason_code: None,
             started,
             completed: None,
-            outcome_due: Some(started + RUN_SETTLE),
+            outcome_due: Some(finish_due),
             outcome: Some(outcome),
             artifact_s3_location: config.artifact_s3_location.clone(),
             dry_run_id: Some(dry_run_id.clone()),
+        };
+        // The dry run's OWN lifecycle: in progress from this call until the run above has
+        // finished, which is the instant the clock owes that run its outcome. It is the dry
+        // run's progress a `GetCanary(DryRunId)` read reports, and the canary's state is
+        // untouched by it — the dry run is independent of the canary's schedule.
+        let dry_run = StoredDryRun {
+            id: dry_run_id.clone(),
+            config: Box::new(config),
+            run_id,
+            state: CanaryState::Running,
+            state_reason: None,
+            started,
+            last_modified: started,
+            stopped: None,
+            finish_due: Some(finish_due),
         };
 
         let mut guard = state.lock();
@@ -419,13 +435,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        canary.begin_dry_run(
-            StoredDryRun {
-                id: dry_run_id.clone(),
-                config: Box::new(config),
-            },
-            run,
-        );
+        canary.begin_dry_run(dry_run, run);
 
         // Read the answer back out of the stored record, under the same lock as the write,
         // so the response can never describe anything other than what was persisted.
