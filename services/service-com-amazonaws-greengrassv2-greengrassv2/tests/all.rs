@@ -29,6 +29,8 @@ mod core_device_fleet;
 mod deployment_cancellation;
 #[path = "all/deployment_history_and_tag_removal.rs"]
 mod deployment_history_and_tag_removal;
+#[path = "all/deployment_listing_is_a_pure_report.rs"]
+mod deployment_listing_is_a_pure_report;
 #[path = "all/identity_authorization.rs"]
 mod identity_authorization;
 #[path = "all/not_found_refusal_class_per_route.rs"]

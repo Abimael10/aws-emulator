@@ -37,6 +37,11 @@
 //! status a deployment is in when it is deleted, and how many of a resource's keys an
 //! untag names (one, several, all, none of them present) — not along the names, which the
 //! rules say nothing about.
+//!
+//! This suite OWNS the deployment-listing harness (the router, the deployment calls and
+//! the body readers); the sibling suite
+//! `tests/all/deployment_listing_is_a_pure_report.rs` drives the same front door through
+//! it, so a `ListDeployments` request is built and read exactly one way across this crate.
 
 use std::sync::Arc;
 
@@ -76,7 +81,7 @@ const MUST_BE_CANCELED_MESSAGE: &str =
 
 /// The emulator front door with only this service mounted, over ONE shared engine —
 /// exactly how `core/router` assembles it.
-fn emulator() -> MultiServiceRouter {
+pub fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -138,7 +143,7 @@ async fn get(router: &MultiServiceRouter, path: &str) -> (u16, Value) {
 }
 
 /// A string member of a JSON object, or the empty string when absent.
-fn text(value: &Value, key: &str) -> String {
+pub fn text(value: &Value, key: &str) -> String {
     value
         .get(key)
         .and_then(Value::as_str)
@@ -147,7 +152,7 @@ fn text(value: &Value, key: &str) -> String {
 }
 
 /// The wire error code of a `restJson1` error body.
-fn error_code(body: &Value) -> String {
+pub fn error_code(body: &Value) -> String {
     let code = text(body, "__type");
     if code.is_empty() {
         "<no __type>".to_string()
@@ -157,7 +162,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// An ARN as a client percent-encodes a non-greedy `@httpLabel`.
-fn encoded_label(arn: &str) -> String {
+pub fn encoded_label(arn: &str) -> String {
     arn.replace(':', "%3A").replace('/', "%2F")
 }
 
@@ -172,18 +177,18 @@ fn deployment_arn(deployment_id: &str) -> String {
 }
 
 /// An IoT thing ARN: one of the two target forms a deployment may name.
-fn thing_target(name: &str) -> String {
+pub fn thing_target(name: &str) -> String {
     format!("arn:aws:iot:{REGION}:{ACCOUNT}:thing/{name}")
 }
 
 /// An IoT thing-group ARN: the other target form, and the only one a subdeployment's
 /// parent may be.
-fn thing_group_target(name: &str) -> String {
+pub fn thing_group_target(name: &str) -> String {
     format!("arn:aws:iot:{REGION}:{ACCOUNT}:thinggroup/{name}")
 }
 
 /// `CreateDeployment` for `request`; answers the new deployment's id.
-async fn create_deployment(router: &MultiServiceRouter, request: &Value) -> String {
+pub async fn create_deployment(router: &MultiServiceRouter, request: &Value) -> String {
     let (status, created) = post(router, "/greengrass/v2/deployments", request).await;
     assert_eq!(
         status, 201,
@@ -198,17 +203,17 @@ async fn create_deployment(router: &MultiServiceRouter, request: &Value) -> Stri
 }
 
 /// One deployment for `target`, with no other member set.
-async fn deploy_to(router: &MultiServiceRouter, target: &str) -> String {
+pub async fn deploy_to(router: &MultiServiceRouter, target: &str) -> String {
     create_deployment(router, &json!({ "targetArn": target })).await
 }
 
 /// `GetDeployment` on `deployment_id`.
-async fn get_deployment(router: &MultiServiceRouter, deployment_id: &str) -> (u16, Value) {
+pub async fn get_deployment(router: &MultiServiceRouter, deployment_id: &str) -> (u16, Value) {
     get(router, &format!("/greengrass/v2/deployments/{deployment_id}")).await
 }
 
 /// `CancelDeployment` on `deployment_id`.
-async fn cancel_deployment(router: &MultiServiceRouter, deployment_id: &str) -> (u16, Value) {
+pub async fn cancel_deployment(router: &MultiServiceRouter, deployment_id: &str) -> (u16, Value) {
     post(
         router,
         &format!("/greengrass/v2/deployments/{deployment_id}/cancel"),
@@ -232,7 +237,7 @@ async fn delete_deployment(
 }
 
 /// `ListDeployments` with `query` appended to its path.
-async fn list_deployments(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
+pub async fn list_deployments(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
     let path = if query.is_empty() {
         "/greengrass/v2/deployments".to_string()
     } else {
@@ -242,7 +247,7 @@ async fn list_deployments(router: &MultiServiceRouter, query: &str) -> (u16, Val
 }
 
 /// The `deploymentId`s a listing reported, in the order it reported them.
-fn listed_ids(body: &Value) -> Vec<String> {
+pub fn listed_ids(body: &Value) -> Vec<String> {
     body.get("deployments")
         .and_then(Value::as_array)
         .map(|entries| {

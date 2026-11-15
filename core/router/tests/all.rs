@@ -7491,3 +7491,7 @@ mod events_lambda_target_permission_granted_after_the_rule;
 // `all/appended_notes.rs` holds the notes successive landings had appended here.
 //! the test it explains.
 //! file, which the layout check refuses: the `#[path]` is what points each declaration into
+//! declaration — not a note about one, and not another copy of these lines.
+//! what points the declaration into `tests/all/`.
+//! What a suite covers, and why it lives in this cross-service target rather than in one
+//! the test it describes.

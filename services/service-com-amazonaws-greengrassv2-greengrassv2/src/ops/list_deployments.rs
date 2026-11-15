@@ -198,32 +198,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let latest_only = history_filter == st::HISTORY_FILTER_LATEST_ONLY;
 
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .unwrap_or(st::MAX_PAGE_SIZE)
-                .clamp(1, st::MAX_PAGE_SIZE),
-        )
-        .unwrap_or(1);
-
-        let resume_at = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match st::decode_cursor(token) {
-                Some(key) => Some(key),
-                None => {
-                    return Err(ListDeploymentsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: "nextToken is not a token this service issued.".to_string(),
-                            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                            fields: Some(vec![ValidationExceptionField {
-                                name: "nextToken".to_string(),
-                                message: "the cursor could not be decoded".to_string(),
-                            }]),
-                        },
-                    )
-                    .into())
-                }
-            },
+        // How big a page is and where one starts are what every paginated reader of this
+        // service shares (`st::paging`), so this listing pages exactly as the others do
+        // and words a cursor it cannot read exactly as they do.
+        let page_size = st::page_size(input.max_results);
+        let resume_at = match st::cursor(input.next_token.as_deref()) {
+            st::Cursor::Start => None,
+            st::Cursor::ResumeAt(key) => Some(key),
+            st::Cursor::Unreadable => {
+                return Err(ListDeploymentsErrorModeled::ValidationException(
+                    st::unreadable_next_token(),
+                )
+                .into())
+            }
         };
 
         // A pure report: every member below is READ from the stored deployment, so two
