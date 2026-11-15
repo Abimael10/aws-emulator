@@ -18,9 +18,9 @@
 //!
 //! The rows span what the rule generalises over: how the launch STATES its primary nodes
 //! (the uniform `MasterInstanceType`/`InstanceCount` form, an explicit `MASTER` instance
-//! group, a `MASTER` instance fleet), how many primaries that comes to (one, two, three,
-//! and three split across On-Demand and Spot capacity), and what the request asked for
-//! (`false`, absent, `true`).
+//! group, a `MASTER` instance fleet), how many primaries that comes to (one, two, three),
+//! which market the primary fleet buys them in (On-Demand, Spot), and what the request asked
+//! for (`false`, absent, `true`).
 
 use serde_json::{json, Value};
 
@@ -117,8 +117,10 @@ fn cases() -> Vec<Case> {
             protected: true,
         },
         Case {
-            label: "three primaries split across On-Demand and Spot capacity",
-            instances: fleets(1, 2),
+            // The primary fleet buys its capacity in ONE market, so the Spot side of the
+            // rule is a fleet that targets Spot units alone.
+            label: "three primaries in a Spot instance fleet",
+            instances: fleets(0, 3),
             requested: Some(false),
             protected: true,
         },

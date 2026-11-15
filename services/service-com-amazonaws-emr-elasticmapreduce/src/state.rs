@@ -113,6 +113,12 @@ pub use instance_fleet_modification::*;
 mod launch_defaults;
 pub use launch_defaults::*;
 
+/// The cluster SHAPES a launch may ask for — which fleet capacities, placement groups,
+/// primary counts and configuration nestings Amazon EMR provisions, and the sentence each
+/// refusal is worded by — split out and re-exported the same way.
+mod launch_shape_refusals;
+pub use launch_shape_refusals::*;
+
 /// What a cluster has COST so far — the normalized instance hours every read of it
 /// derives — split out and re-exported the same way.
 mod normalized_hours;
@@ -3944,17 +3950,9 @@ pub fn primary_instance_group_refusal(
     instances: &JobFlowInstancesConfig,
     requested: &[InstanceGroupConfig],
 ) -> Option<&'static str> {
-    // The implied groups are derived only where they are the ones the launch provisions.
-    let implied = if requested.is_empty() {
-        implied_instance_group_configs(instances)
-    } else {
-        Vec::new()
-    };
-    let groups = if requested.is_empty() {
-        implied.as_slice()
-    } else {
-        requested
-    };
+    // The groups the launch provisions, which for a launch stating its instances the
+    // uniform way are the ones that form implies ([`launch_instance_groups`]).
+    let groups = launch_instance_groups(instances, requested);
     match groups
         .iter()
         .filter(|group| group.instance_role == instance_group_type::MASTER)

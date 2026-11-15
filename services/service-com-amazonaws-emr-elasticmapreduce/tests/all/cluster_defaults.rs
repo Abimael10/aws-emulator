@@ -231,23 +231,21 @@ async fn a_served_configuration_always_reports_its_property_map() {
         }
     }
 
-    // One tree spanning the forms the rule generalises over: a parent that sets
-    // properties and nests children, a child that sets none and nests one of its own, a
-    // grandchild that sets one, and a sibling leaf that sets none.
+    // One tree spanning the forms the rule generalises over: a parent that sets properties
+    // and nests nothing, an environment classification that sets none and nests the section
+    // it exports, a nested child that sets one, and a sibling leaf that sets none.
     let configurations = json!([
         {
             "Classification": "spark-defaults",
             "Properties": { "spark.executor.memory": "2g" },
+        },
+        {
+            "Classification": "spark-env",
             "Configurations": [
-                {
-                    "Classification": "spark-env",
-                    "Configurations": [
-                        { "Classification": "export", "Properties": { "PYSPARK_PYTHON": "python3" } },
-                    ],
-                },
-                { "Classification": "spark-log4j" },
+                { "Classification": "export", "Properties": { "PYSPARK_PYTHON": "python3" } },
             ],
         },
+        { "Classification": "spark-log4j" },
         { "Classification": "core-site", "Properties": {} },
     ]);
     let expected = vec![
@@ -833,11 +831,12 @@ async fn a_placement_group_the_launch_does_not_create_is_not_reported() {
         expected: Vec<(&'static str, Option<&'static str>)>,
     }
 
-    // `com.amazonaws.emr#PlacementGroupStrategy` values, every one the model declares
-    // (`smithy_query(query="shape", shape="PlacementGroupStrategy")`): `SPREAD`,
-    // `PARTITION`, `CLUSTER` each ask for a placement group of that strategy, and `NONE`
-    // asks for none. A configuration that names no strategy at all is still a request for
-    // a group.
+    // The entries a cluster's primary nodes may be placed by: `SPREAD` asks for a
+    // placement group spread across the hardware, `NONE` asks for none, and an entry that
+    // names no strategy at all is still a request for a group. The strategies a primary
+    // placement group is NOT configured with (`PARTITION`, `CLUSTER`), and the roles that
+    // are not placed, launch no cluster at all — those refusals are the subject of
+    // `tests/all/launch_cluster_shapes.rs`.
     let cases = vec![
         Case {
             label: "strategy NONE",
@@ -848,16 +847,6 @@ async fn a_placement_group_the_launch_does_not_create_is_not_reported() {
             label: "strategy SPREAD",
             requested: json!([{ "InstanceRole": "MASTER", "PlacementStrategy": "SPREAD" }]),
             expected: vec![("MASTER", Some("SPREAD"))],
-        },
-        Case {
-            label: "strategy PARTITION",
-            requested: json!([{ "InstanceRole": "MASTER", "PlacementStrategy": "PARTITION" }]),
-            expected: vec![("MASTER", Some("PARTITION"))],
-        },
-        Case {
-            label: "strategy CLUSTER",
-            requested: json!([{ "InstanceRole": "MASTER", "PlacementStrategy": "CLUSTER" }]),
-            expected: vec![("MASTER", Some("CLUSTER"))],
         },
         Case {
             label: "no strategy named",
@@ -880,6 +869,23 @@ async fn a_placement_group_the_launch_does_not_create_is_not_reported() {
                 json!({
                     "ReleaseLabel": "emr-6.15.0",
                     "PlacementGroupConfigs": case.requested.clone(),
+                    // A placement group places the primaries of a multi-primary cluster,
+                    // which keeps its file system on core nodes.
+                    "Instances": {
+                        "KeepJobFlowAliveWhenNoSteps": true,
+                        "InstanceGroups": [
+                            {
+                                "InstanceRole": "MASTER",
+                                "InstanceType": "m5.xlarge",
+                                "InstanceCount": 3,
+                            },
+                            {
+                                "InstanceRole": "CORE",
+                                "InstanceType": "m5.xlarge",
+                                "InstanceCount": 2,
+                            },
+                        ],
+                    },
                 }),
             ))
             .await;

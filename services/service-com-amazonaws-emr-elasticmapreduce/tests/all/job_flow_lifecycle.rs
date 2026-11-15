@@ -1578,6 +1578,10 @@ async fn documented_limits_are_enforced_at_their_bounds() {
             "InstanceFleets alone",
             json!({ "InstanceFleets": [{
                 "InstanceFleetType": "MASTER",
+                // A fleet targets capacity it can provision: "at least one of
+                // TargetSpotCapacity and TargetOnDemandCapacity should be greater than 0"
+                // (`InstanceFleetConfig$TargetOnDemandCapacity` doc).
+                "TargetOnDemandCapacity": 1,
                 "InstanceTypeConfigs": [{ "InstanceType": "m5.xlarge" }] }] }),
         ),
     ] {

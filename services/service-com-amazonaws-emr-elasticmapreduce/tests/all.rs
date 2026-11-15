@@ -63,6 +63,8 @@ mod job_flow_id_refusal_sentence;
 mod job_flow_lifecycle;
 #[path = "all/job_flow_role.rs"]
 mod job_flow_role;
+#[path = "all/launch_cluster_shapes.rs"]
+mod launch_cluster_shapes;
 #[path = "all/malformed_input_refusals.rs"]
 mod malformed_input_refusals;
 #[path = "all/managed_scaling_policy.rs"]

@@ -596,11 +596,16 @@ async fn a_launch_states_its_capacity_with_a_primary_instance_group() {
             case: "one primary group of three nodes, which is how a cluster is made available",
             instances: json!({
                 "KeepJobFlowAliveWhenNoSteps": true,
-                "InstanceGroups": [{
-                    "InstanceRole": "MASTER",
-                    "InstanceType": "m5.xlarge",
-                    "InstanceCount": 3,
-                }],
+                "InstanceGroups": [
+                    {
+                        "InstanceRole": "MASTER",
+                        "InstanceType": "m5.xlarge",
+                        "InstanceCount": 3,
+                    },
+                    // A highly available cluster keeps its file system on core nodes, so
+                    // the three-primary shape names a core group beside them.
+                    group("CORE"),
+                ],
             }),
             refusal: None,
         },

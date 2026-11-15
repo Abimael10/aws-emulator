@@ -581,6 +581,7 @@ async fn a_highly_available_cluster_is_not_offered_unhealthy_node_replacement() 
             json!({
                 "InstanceGroups": [
                     { "InstanceRole": "MASTER", "InstanceType": "m5.xlarge", "InstanceCount": 3 },
+                    { "InstanceRole": "CORE", "InstanceType": "m5.xlarge", "InstanceCount": 2 },
                 ],
                 "UnhealthyNodeReplacement": true,
             }),

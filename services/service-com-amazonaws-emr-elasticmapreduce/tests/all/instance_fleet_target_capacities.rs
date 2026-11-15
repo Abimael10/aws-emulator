@@ -12,9 +12,12 @@
 //! `ModifyInstanceFleet`, whose two capacities travel in one call.
 //!
 //! The rows span what the rule generalises over: which markets a fleet asked units of (only
-//! On-Demand, only Spot, both, an explicit zero of one, an explicit zero of both), the node
-//! type the fleet hosts, and whether the fleet arrived with the cluster or through
-//! `AddInstanceFleet`. Every value is read back over the wire through `ListInstanceFleets`.
+//! On-Demand, only Spot, both, an explicit zero of one), the node type the fleet hosts, and
+//! whether the fleet arrived with the cluster or through `AddInstanceFleet`. A fleet that
+//! asks for no units of EITHER market launches no cluster at all — that refusal is the
+//! subject of `tests/all/launch_cluster_shapes.rs` — so the zero of both markets is read on
+//! the fleet of a running cluster, in its own case below. Every value is read back over the
+//! wire through `ListInstanceFleets`.
 
 use serde_json::{json, Value};
 
@@ -65,14 +68,17 @@ const CASES: &[Case] = &[
         reported_on_demand: 5,
         reported_spot: 0,
     },
-    Case {
-        label: "an explicit zero of both markets",
-        requested_on_demand: Some(0),
-        requested_spot: Some(0),
-        reported_on_demand: 0,
-        reported_spot: 0,
-    },
 ];
+
+/// The zero of both markets, on the one path that takes it: a fleet of a cluster that is
+/// already running.
+const NO_UNITS_AT_ALL: Case = Case {
+    label: "an explicit zero of both markets",
+    requested_on_demand: Some(0),
+    requested_spot: Some(0),
+    reported_on_demand: 0,
+    reported_spot: 0,
+};
 
 /// The fleet configuration one row asks for, hosting `fleet_type`.
 fn fleet_config(case: &Case, fleet_type: &str, name: &str) -> Value {
@@ -214,4 +220,53 @@ async fn every_fleet_reports_both_target_capacities() {
             .unwrap_or_else(|| panic!("case {label:?}: the added TASK fleet must be listed"));
         assert_capacities(label, case, &task, false);
     }
+}
+
+/// THE SAME RULE for the zero of BOTH markets: a fleet of a running cluster that asks for no
+/// units reports both targets as 0 rather than leaving either member out.
+#[tokio::test]
+async fn a_fleet_asking_for_no_units_reports_both_targets_as_zero() {
+    let emr = Emr::new();
+    let label = NO_UNITS_AT_ALL.label;
+
+    let launched = emr
+        .ok(
+            "RunJobFlow",
+            json!({
+                "Name": label,
+                "ReleaseLabel": "emr-6.15.0",
+                "JobFlowRole": INSTANCE_PROFILE,
+                "ServiceRole": SERVICE_ROLE,
+                "Instances": {
+                    "KeepJobFlowAliveWhenNoSteps": true,
+                    "InstanceFleets": [{
+                        "Name": "master",
+                        "InstanceFleetType": "MASTER",
+                        "TargetOnDemandCapacity": 1,
+                        "InstanceTypeConfigs": [{ "InstanceType": "m5.xlarge" }],
+                    }],
+                },
+            }),
+        )
+        .await;
+    let cluster_id = launched["JobFlowId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {label:?}: RunJobFlow answers an id, got {launched}"))
+        .to_string();
+
+    emr.ok(
+        "AddInstanceFleet",
+        json!({
+            "ClusterId": cluster_id.clone(),
+            "InstanceFleet": fleet_config(&NO_UNITS_AT_ALL, "TASK", "no-units"),
+        }),
+    )
+    .await;
+    let listed = fleets_by_name(&emr, label, &cluster_id).await;
+    let task = listed
+        .iter()
+        .find(|(name, _)| name == "no-units")
+        .map(|(_, fleet)| fleet.clone())
+        .unwrap_or_else(|| panic!("case {label:?}: the added TASK fleet must be listed"));
+    assert_capacities(label, &NO_UNITS_AT_ALL, &task, false);
 }

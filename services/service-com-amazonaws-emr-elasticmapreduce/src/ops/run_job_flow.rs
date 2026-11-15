@@ -378,6 +378,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // An instance fleet has to ask for capacity it can provision, and the fleet that
+        // runs the cluster's PRIMARY nodes buys that capacity in ONE market
+        // ([`crate::state::instance_fleet_shape_refusal`]): a launch whose fleet does
+        // neither describes capacity nothing provisions, so it is refused before any
+        // cluster state is written.
+        for config in input.instances.instance_fleets.iter().flatten() {
+            if let Some(message) = crate::state::instance_fleet_shape_refusal(config) {
+                return Err(refuse(message));
+            }
+        }
+
         // One cluster carries a bounded number of instance groups, the same way it
         // carries a bounded number of fleets. The configs are TAKEN rather than cloned —
         // they are moved into the records below, and nothing downstream reads
@@ -410,6 +421,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Err(message) = validate_instance_group_config(config) {
                 return Err(refuse(message));
             }
+        }
+
+        // The cluster SHAPE the launch describes, read off the collections it provisions:
+        // the instance groups it named or its uniform form implies
+        // ([`crate::state::launch_instance_groups`]) and the fleets it carried, which
+        // together settle how many PRIMARY nodes the cluster comes up with
+        // ([`crate::state::primary_node_count`]).
+        let launch_fleets = input
+            .instances
+            .instance_fleets
+            .as_deref()
+            .unwrap_or_default();
+        let launch_groups =
+            crate::state::launch_instance_groups(&input.instances, &requested_group_configs);
+        let launch_primary_nodes = primary_node_count(&launch_groups, launch_fleets);
+
+        // More than one primary node is a capability of the RELEASE the cluster runs
+        // ([`crate::state::multi_primary_release_refusal`]), which is a reading of the
+        // label the launch named rather than of the catalog this service publishes: a
+        // primary group of several instances on a release that provisions one is refused
+        // for the shape it asks that release for.
+        if let Some(message) = crate::state::multi_primary_release_refusal(
+            input.release_label.as_deref(),
+            &launch_groups,
+        ) {
+            return Err(refuse(message.to_string()));
         }
 
         // A cluster runs ONE Amazon EMR release, chosen EITHER by the release label or by
@@ -495,6 +532,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(refuse(message.to_string()));
             }
         }
+
+        // "The configuration specifies the placement strategy that can be applied to
+        // instance roles during cluster creation" (`PlacementGroupConfig` doc): which role
+        // may be placed, which strategy places it, and whether this cluster has primary
+        // nodes to spread are all read before anything is stored
+        // ([`crate::state::placement_group_refusal`]), so no cluster is left holding a
+        // placement group Amazon EMR does not create.
+        if let Some(message) = crate::state::placement_group_refusal(
+            input
+                .placement_group_configs
+                .as_deref()
+                .unwrap_or_default(),
+            launch_primary_nodes,
+        ) {
+            return Err(refuse(message.to_string()));
+        }
+
+        // A highly available cluster keeps the file system its primaries coordinate on
+        // CORE nodes ([`crate::state::highly_available_core_group_refusal`]), so a launch
+        // describing several primaries and no core instance group is told what is missing
+        // rather than handed a cluster with nowhere to put its data.
+        if let Some(message) = crate::state::highly_available_core_group_refusal(&launch_groups) {
+            return Err(refuse(message.to_string()));
+        }
+
+        // "A list of additional configurations to apply within a configuration object"
+        // (`Configuration$Configurations` doc) is a configuration INSIDE another one, and a
+        // classification its parent does not hold is applied by nothing
+        // ([`crate::state::launch_classification_refusal`]) — on the cluster's own tree, on
+        // an instance group's and on an instance fleet's instance types alike.
+        if let Some(message) = crate::state::launch_classification_refusal(
+            input.configurations.as_deref().unwrap_or_default(),
+            &launch_groups,
+            launch_fleets,
+        ) {
+            return Err(refuse(message));
+        }
+        drop(launch_groups);
 
         // "A maximum of 256 steps are allowed in each job flow." (RunJobFlow doc.)
         let step_configs = input.steps.take().unwrap_or_default();
