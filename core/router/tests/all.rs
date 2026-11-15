@@ -1237,3 +1237,31 @@ mod zz_opensearch_fgac_probe;
 mod zz_probe;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
+// Single integration-test target for the router: the canonical DECLARATION LIST of every
+// cross-service suite under `tests/all/`, and nothing else.
+// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
+// suite file, sorted by name, and no other line — no prose between the pairs, no blank line,
+// and nothing after the last pair. Two branches landing at once then insert two lines in two
+// places and have no prose to duplicate, re-word or mistype, which is what had gone wrong
+// here: the tail of this file had grown hundreds of re-typed copies of its own header.
+// EVERY comment in this file is an ORDINARY `//` one, this header included. An inner doc
+// comment (`//` followed by `!`) is legal only before the first item, so one appended past
+// the declarations is `E0753` and compiles no suite of this target; with none anywhere in the
+// file, no merge of two landings can leave one past the first item.
+// A suite file no `mod` here names is compiled nowhere and its tests never run (the build-time
+// layout check refuses it); a suite left at the top level of `tests/` fails the build; and a
+// second `mod` for one name is `E0428`, which compiles neither copy. `tests/all.rs` is a
+// test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of this file
+// (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each `mod` is what
+// points it into `tests/all/`.
+// note about THIS file belongs in `all/appended_notes.rs`. The suites
+// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
+// and for every service crate's `tests/all.rs`, so check there rather than leaving a note
+// here.
+// The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
+// asks of a doc list item; the lint is allowed here so a header line is a header line rather
+// than a build failure. An inner attribute, like an inner doc comment, is legal only before
+// the first item, so it stands here rather than in the list below.

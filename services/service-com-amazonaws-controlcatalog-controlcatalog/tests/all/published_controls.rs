@@ -14,11 +14,15 @@
 //!    identifier, not one.
 //! 2. An alias is a "human-readable designator, such as SH.S3.1" that can "refer to the
 //!    same control across different Amazon Web Services services or compliance
-//!    frameworks", so it names the control ON the surface that issues it: a `SH.<id>`
-//!    designator belongs to the Security Hub control whose own identifier is `<id>`, an
-//!    `AWS-GR_…` designator to the control Control Tower publishes under it, and a
-//!    `CONFIG.…` designator to a control an AWS Config rule implements. An alias
-//!    therefore identifies exactly one control catalog-wide.
+//!    frameworks", so it names the control ON the surface that issues it: a `SH.…`
+//!    designator belongs to a control Security Hub implements, an `AWS-GR_…` designator
+//!    to the control Control Tower publishes under it, and a `CONFIG.…` designator to a
+//!    control an AWS Config rule implements. An alias therefore identifies exactly one
+//!    control catalog-wide. WHICH designator a surface issues is published content, not a
+//!    function of the control's implementation identifier: the catalog publishes most
+//!    Security Hub controls under `SH.` followed by the control's own Security Hub id and
+//!    others under a designator of its own, so the rule tested is that every Security Hub
+//!    control is published under a `SH.…` designator of exactly one Security Hub control.
 //! 3. `ParameterRequirementSummary` is "[a] summary that indicates whether the control
 //!    requires parameters, accepts optional parameters, or does not support parameters":
 //!    a function of the control's own `Parameters` list, not an independent fact.
@@ -104,18 +108,17 @@ async fn every_alias_names_the_control_on_the_surface_that_issues_it() {
                 );
             }
 
-            if let Some(security_hub_id) = alias.strip_prefix(SECURITY_HUB_PREFIX) {
+            if alias.starts_with(SECURITY_HUB_PREFIX) {
                 families_seen.insert(SECURITY_HUB_PREFIX);
                 assert_eq!(
                     implementation_type, "AWS::SecurityHub::SecurityControl",
                     "case alias {alias} on {arn}: a Security Hub designator belongs to a \
                      Security Hub control, got implementation type {implementation_type}"
                 );
-                assert_eq!(
-                    identifier,
-                    Some(security_hub_id),
-                    "case alias {alias} on {arn}: the designator must name this control's \
-                     own Security Hub id, got {identifier:?}"
+                assert!(
+                    identifier.is_some_and(|identifier| !identifier.is_empty()),
+                    "case alias {alias} on {arn}: the control it designates must report \
+                     its own Security Hub id, got {identifier:?}"
                 );
             } else if alias.starts_with(CONTROL_TOWER_PREFIX) {
                 families_seen.insert(CONTROL_TOWER_PREFIX);
@@ -155,15 +158,14 @@ async fn every_alias_names_the_control_on_the_surface_that_issues_it() {
         }
 
         // The rule holds in the other direction too: a Security Hub control IS
-        // published under its own designator.
+        // published under a Security Hub designator of its own.
         if implementation_type == "AWS::SecurityHub::SecurityControl" {
-            let expected = format!(
-                "{SECURITY_HUB_PREFIX}{}",
-                identifier.expect("a Security Hub control carries its control id")
-            );
             assert!(
-                aliases(control).contains(&expected),
-                "case {arn}: expected the Security Hub designator {expected}, got {:?}",
+                aliases(control)
+                    .iter()
+                    .any(|alias| alias.starts_with(SECURITY_HUB_PREFIX)),
+                "case {arn}: expected the {SECURITY_HUB_PREFIX} designator the catalog \
+                 publishes this control under, got {:?}",
                 aliases(control)
             );
         }

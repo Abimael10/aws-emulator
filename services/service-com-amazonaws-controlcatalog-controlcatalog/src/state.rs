@@ -1116,8 +1116,9 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
             Control {
                 arn,
                 control_tower_identifier: seed.control_tower_identifier.map(str::to_string),
-                // Derived from the identifiers the designators are a function of, so
-                // one surface's designator cannot land on another surface's control.
+                // The designators the catalog publishes the control under, read off its
+                // own record: a designator is published content, not a value computed
+                // from the control's implementation identifier.
                 aliases: published_controls::aliases(seed),
                 name: seed.name.to_string(),
                 description: seed.description.to_string(),

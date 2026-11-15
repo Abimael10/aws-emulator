@@ -54,9 +54,14 @@
 //!   modeled `ParameterRequirementSummary` is DERIVED from that list (see
 //!   [`parameter_requirement_summary`]) rather than written per row, because it is
 //!   defined as a summary of exactly that list.
-//! * `aliases` are DERIVED for the two designators that are functions of an identifier
-//!   (see [`aliases`]); only a designator that is neither — a `CONFIG.…` or `CT.…`
-//!   catalog designator — is written in the row.
+//! * `aliases` are the designators the catalog PUBLISHES the control under, written in
+//!   the row (see [`aliases`]). A designator is catalog CONTENT, not a function of the
+//!   control's implementation identifier: the catalog publishes most Security Hub
+//!   controls under `SH.` followed by the control's own Security Hub id, but it
+//!   publishes others under a designator of its own (`SH.{SERVICE}.DT.{N}`, the same
+//!   shape as the `CONFIG.…` designators), so the designators cannot be computed from
+//!   the id. Only the Control Tower designator is read off the row's
+//!   `control_tower_identifier`, because the designator IS that identifier.
 //! * the compliance-framework items a control satisfies are mostly a property of the
 //!   control OBJECTIVE it implements, not of its own row, so they are recorded once per
 //!   objective in [`OBJECTIVE_FRAMEWORKS`]; a row carries only the items that name its
@@ -98,6 +103,18 @@ const EXEMPTED_PRINCIPAL_ARNS: &str = "ExemptedPrincipalArns";
 /// Resource ARNs exempted from the control.
 const EXEMPTED_RESOURCE_ARNS: &str = "ExemptedResourceArns";
 
+// The parameters Security Hub publishes for the control that checks AWS Config resource
+// recording, under Security Hub's own names: whether the recorder must cover every
+// resource type, and the resource types it must cover when it does not. Source: Security
+// Hub's documented parameters for that control, which the catalog publishes as the
+// control's `Parameters` — a control the implementing service parameterises is published
+// as accepting them, which is what its `ParameterRequirementSummary` then summarises.
+
+/// Whether every resource type has to be recorded.
+const RECORD_ALL_RESOURCES: &str = "recordAllResources";
+/// The resource types that have to be recorded when not every type is.
+const RESOURCE_TYPES: &str = "resourceTypes";
+
 /// `ControlBehavior`: the control reports on resources that already exist.
 const DETECTIVE: &str = "DETECTIVE";
 /// `ControlBehavior`: the control blocks a non-compliant action.
@@ -127,7 +144,8 @@ pub(super) const CLOUDFORMATION_HOOK: &str = "AWS::CloudFormation::Type::HOOK";
 
 /// The `SH.` designator prefix a Security Hub control is published under. The
 /// `Aliases` documentation gives `SH.S3.1` as its example of a "human-readable
-/// designator", and `S3.1` is that control's own Security Hub id.
+/// designator", and `S3.1` is that control's own Security Hub id; what follows the
+/// prefix is published content, so a control's own designator is recorded on its row.
 pub(super) const SECURITY_HUB_ALIAS_PREFIX: &str = "SH.";
 
 /// `GovernedProviders` values: "a value of AWS indicates that the control governs
@@ -272,19 +290,23 @@ pub(super) struct ControlSeed {
     pub(super) implementation_identifier: Option<&'static str>,
     /// The Control Tower `AWS-GR_…` identifier, for a control Control Tower publishes.
     pub(super) control_tower_identifier: Option<&'static str>,
-    /// Catalog designators that are not a function of an identifier (`CONFIG.…`,
-    /// `CT.…`); the `SH.` and Control Tower designators are derived, not written here.
+    /// Every catalog designator the control is published under (`CONFIG.…`, `CT.…`,
+    /// `SH.…`) — published content, so it is written here rather than computed. Only the
+    /// Control Tower designator is left out, because it is the `AWS-GR_…` identifier
+    /// `control_tower_identifier` already records (see [`aliases`]).
     pub(super) designators: &'static [&'static str],
     /// `ControlScope`.
     pub(super) scope: &'static str,
     /// Empty for a GLOBAL control: `DeployableRegions` does not apply to it.
     pub(super) deployable_regions: &'static [&'static str],
-    /// `(name, ControlParameterRequirement)` for each EXEMPTION parameter the control
-    /// supports, named from the modeled vocabulary ([`ALLOWED_REGIONS`] and the names
-    /// beside it). The parameters of the surface that implements the control are not
-    /// written here: they belong to that surface, so a control an AWS Config managed rule
-    /// implements takes its parameters from [`CONFIG_RULE_PARAMETERS`]. Read a control's
-    /// whole parameter list through [`parameters`].
+    /// `(name, ControlParameterRequirement)` for each parameter the control publishes
+    /// itself: the EXEMPTION parameters of a control Control Tower deploys, named from the
+    /// modeled vocabulary ([`ALLOWED_REGIONS`] and the names beside it), and — for a
+    /// Security Hub control the implementing service parameterises — that control's own
+    /// Security Hub parameters, under Security Hub's own names. An AWS Config managed
+    /// rule's parameters are NOT written here: they belong to the rule, so a control that
+    /// rule implements takes them from [`CONFIG_RULE_PARAMETERS`]. Read a control's whole
+    /// parameter list through [`parameters`].
     pub(super) parameters: &'static [(&'static str, &'static str)],
     pub(super) governed_resources: &'static [&'static str],
     pub(super) governed_providers: &'static [&'static str],
@@ -878,7 +900,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("S3.4"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.S3.4"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -903,7 +925,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("CloudTrail.1"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.CloudTrail.1"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -927,7 +949,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("IAM.4"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.IAM.4"],
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
         parameters: NO_PARAMETERS,
@@ -956,7 +978,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("IAM.5"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.IAM.5"],
         scope: REGIONAL,
         deployable_regions: US_REGIONS,
         parameters: NO_PARAMETERS,
@@ -980,7 +1002,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("GCP.Storage.1"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.GCP.Storage.1"],
         scope: REGIONAL,
         deployable_regions: US_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1826,9 +1848,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     // --- Security Hub controls: the rest of the Security Hub-implemented catalog -
     //
-    // One row per Security Hub control the catalog publishes, under that control's own
-    // Security Hub id — which is also the designator the catalog publishes it under (see
-    // `aliases`).
+    // One row per Security Hub control the catalog publishes, each carrying the
+    // designator the catalog publishes it under (see `aliases`).
     ControlSeed {
         slug: "securityhub-s3-1",
         name: "S3 general purpose buckets should have block public access settings enabled",
@@ -1840,7 +1861,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("S3.1"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.S3.1"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1860,7 +1881,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("S3.5"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.S3.5"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1872,15 +1893,14 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-ec2-2",
         name: "VPC default security groups should not allow inbound or outbound traffic",
-        description: "Checks whether the default security group of a virtual private \
-                      cloud allows inbound or outbound traffic, and reports the finding \
-                      in Security Hub.",
+        description: "This AWS control checks whether the default security group of a \
+                      VPC allows inbound or outbound traffic.",
         behavior: DETECTIVE,
-        severity: MEDIUM,
+        severity: HIGH,
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("EC2.2"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.EC2.2"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1891,17 +1911,17 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "securityhub-rds-2",
-        name: "RDS DB instances should prohibit public access, determined by the \
+        name: "RDS DB Instances should prohibit public access, as determined by the \
                PubliclyAccessible configuration",
-        description: "Checks whether an Amazon RDS database instance is publicly \
-                      accessible, as its PubliclyAccessible configuration reports, and \
-                      reports the finding in Security Hub.",
+        description: "This AWS control checks whether Amazon RDS instances are publicly \
+                      accessible by evaluating the PubliclyAccessible field in the \
+                      instance configuration item.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("RDS.2"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.RDS.2"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1912,15 +1932,15 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "securityhub-rds-3",
-        name: "RDS DB instances should have encryption at rest enabled",
-        description: "Checks whether storage encryption is enabled for an Amazon RDS \
-                      database instance, and reports the finding in Security Hub.",
+        name: "RDS DB instances should have encryption at-rest enabled",
+        description: "This AWS control checks whether storage encryption is enabled for \
+                      your Amazon RDS DB instances.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("RDS.3"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.RDS.3"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1931,16 +1951,19 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "securityhub-efs-1",
-        name: "Elastic File System should be configured to encrypt file data at rest \
+        name: "Elastic File System should be configured to encrypt file data at-rest \
                using AWS KMS",
-        description: "Checks whether an Amazon EFS file system encrypts file data at rest \
-                      with an AWS KMS key, and reports the finding in Security Hub.",
+        description: "This AWS control checks whether Amazon Elastic File System is \
+                      configured to encrypt file data using AWS KMS. The check fails if \
+                      the encrypted key is set to false on DescribeFileSystems or if the \
+                      KmsKeyId key on DescribeFileSystems doesn't match the KmsKeyId \
+                      parameter for efs-encrypted-check.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("EFS.1"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.EFS.1"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1952,14 +1975,14 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-cloudtrail-4",
         name: "CloudTrail log file validation should be enabled",
-        description: "Checks whether log file integrity validation is enabled on a \
-                      CloudTrail trail, and reports the finding in Security Hub.",
+        description: "This AWS control checks whether CloudTrail log file validation is \
+                      enabled.",
         behavior: DETECTIVE,
         severity: LOW,
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("CloudTrail.4"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.CloudTrail.4"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1974,14 +1997,19 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-iam-1",
         name: "IAM policies should not allow full \"*\" administrative privileges",
-        description: "Checks whether a customer managed IAM policy allows every action on \
-                      every resource, and reports the finding in Security Hub.",
+        description: "This AWS control checks whether the default version of AWS \
+                      Identity and Access Management policies (also known as customer \
+                      managed policies) do not have administrator access with a \
+                      statement that has \"Effect\": \"Allow\" with \"Action\": \"*\" \
+                      over \"Resource\": \"*\". It only checks for the customer managed \
+                      policies that you created, but does not check for full access to \
+                      individual services, such as \"S3:*\".",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("IAM.1"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.IAM.1"],
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1993,18 +2021,20 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-iam-3",
         name: "IAM users' access keys should be rotated every 90 days or less",
-        description: "Checks whether an active IAM access key has been rotated within the \
-                      last 90 days, and reports the finding in Security Hub.",
+        description: "This AWS control checks whether the active access keys are rotated \
+                      within 90 days.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("IAM.3"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.IAM.3"],
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
         parameters: NO_PARAMETERS,
-        governed_resources: &["AWS::IAM::AccessKey"],
+        // The catalog publishes the identity whose keys are checked as the resource type
+        // this control governs, not the key resource itself.
+        governed_resources: &["AWS::IAM::User"],
         governed_providers: AWS,
         implements: "credential-rotation",
         frameworks: &[
@@ -2015,14 +2045,16 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-kms-4",
         name: "AWS KMS key rotation should be enabled",
-        description: "Checks whether automatic key rotation is enabled for an AWS KMS \
-                      customer managed key, and reports the finding in Security Hub.",
+        description: "This AWS control checks whether automatic key rotation is enabled \
+                      for each customer managed AWS KMS key. The control fails if \
+                      automatic key rotation of the KMS key isn't enabled. This control \
+                      doesn't check KMS keys with imported key material.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("KMS.4"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.KMS.4"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -2034,14 +2066,14 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-guardduty-1",
         name: "GuardDuty should be enabled",
-        description: "Checks whether Amazon GuardDuty is enabled in the account and \
-                      Region, and reports the finding in Security Hub.",
+        description: "This AWS control checks whether Amazon GuardDuty is enabled in \
+                      your AWS account and region.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("GuardDuty.1"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["SH.GuardDuty.1"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -2057,18 +2089,22 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         slug: "securityhub-config-1",
         name: "AWS Config should be enabled and use the service-linked role for resource \
                recording",
-        description: "Checks whether AWS Config is enabled in the account and Region and \
-                      records resource configurations with the service-linked role, and \
-                      reports the finding in Security Hub.",
+        description: "This AWS control checks whether AWS Config is enabled in your AWS \
+                      account and region and records resource configurations with the \
+                      AWS Config service-linked role.",
         behavior: DETECTIVE,
-        severity: MEDIUM,
+        severity: CRITICAL,
         implementation_type: SECURITY_HUB_CONTROL,
         implementation_identifier: Some("Config.1"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        // The catalog publishes this control under a designator of its own rather than
+        // under its Security Hub id.
+        designators: &["SH.CONFIG.DT.1"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
-        parameters: NO_PARAMETERS,
+        // Security Hub parameterises this control, so the catalog publishes it as
+        // accepting those parameters, none of which the caller has to supply.
+        parameters: &[(RECORD_ALL_RESOURCES, OPTIONAL), (RESOURCE_TYPES, OPTIONAL)],
         // The account's own configuration recorder, which no available resource type
         // represents.
         governed_resources: NO_GOVERNED_RESOURCES,
@@ -2166,12 +2202,10 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
         release_time: Some(1_564_444_800),
     },
     // The Security Hub-implemented controls the catalog publishes under their `SH.`
-    // designators: the instant recorded here is the one the catalog publishes as the
-    // release time of the `SH.CloudTrail.1` control. This catalog holds no separate
-    // record of the other two controls' release instants, and dates them with the same
-    // one because the catalog publishes Security Hub's control identifiers as one
-    // release and dates controls it released together with a single instant (see the
-    // pairs above) — not because a record of each was read.
+    // designators. The catalog released most of them as one body of governance
+    // capability, so they carry one release instant; the two that were released on their
+    // own carry the instant recorded for each (see `securityhub-kms-4` and
+    // `securityhub-config-1` at the end of this group).
     PublishedCatalogRecord {
         slug: "securityhub-cloudtrail-1",
         identifier: "435u8u4w5bsf02tkxga5jisbc",
@@ -2186,6 +2220,59 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
         slug: "securityhub-iam-5",
         identifier: "6g3gbim493yofkc9eg6vvnahm",
         release_time: Some(1_669_593_600),
+    },
+    PublishedCatalogRecord {
+        slug: "securityhub-cloudtrail-4",
+        identifier: "624yg0j9d8swiglwfc1m4kvnm",
+        release_time: Some(1_669_593_600),
+    },
+    PublishedCatalogRecord {
+        slug: "securityhub-ec2-2",
+        identifier: "dowsaumj3n874siszx3j94m9n",
+        release_time: Some(1_669_593_600),
+    },
+    PublishedCatalogRecord {
+        slug: "securityhub-efs-1",
+        identifier: "5cksj6jdycadjupdbviikn1w7",
+        release_time: Some(1_669_593_600),
+    },
+    PublishedCatalogRecord {
+        slug: "securityhub-guardduty-1",
+        identifier: "62smpoz33dsy0oa7u1iwa58lz",
+        release_time: Some(1_669_593_600),
+    },
+    PublishedCatalogRecord {
+        slug: "securityhub-iam-1",
+        identifier: "a7ertnvgba7449o25l6s75nrj",
+        release_time: Some(1_669_593_600),
+    },
+    PublishedCatalogRecord {
+        slug: "securityhub-iam-3",
+        identifier: "bxh5ltpzbcr59zexx3llhg3l9",
+        release_time: Some(1_669_593_600),
+    },
+    PublishedCatalogRecord {
+        slug: "securityhub-rds-2",
+        identifier: "bbns1svmi60sz11i658ot4amf",
+        release_time: Some(1_669_593_600),
+    },
+    PublishedCatalogRecord {
+        slug: "securityhub-rds-3",
+        identifier: "dsrtfqf4g9gvlguj5hqahozla",
+        release_time: Some(1_669_593_600),
+    },
+    // Released after the body above, so the catalog dates it with its own instant.
+    PublishedCatalogRecord {
+        slug: "securityhub-kms-4",
+        identifier: "esv514s4zvnxdunuijbgerpn3",
+        release_time: Some(1_701_043_200),
+    },
+    // The most recently released of this group, and the one the catalog publishes under
+    // its own `SH.CONFIG.DT.1` designator rather than under its Security Hub id.
+    PublishedCatalogRecord {
+        slug: "securityhub-config-1",
+        identifier: "9r3or4f2x3aq1jrnma6ddfp2y",
+        release_time: Some(1_779_840_000),
     },
     // Two controls of the wider AWS Config-implemented surface: the catalog publishes
     // each of them under the identifier recorded here, and records a release instant for
@@ -2889,24 +2976,31 @@ pub(super) fn framework_mappings(seed: &ControlSeed) -> Vec<(&'static str, Strin
 /// can refer to the same control across different Amazon Web Services services or
 /// compliance frameworks" (`smithy_query(query="doc", shape="ControlSummary",
 /// member="Aliases")`). A designator therefore names the control ON the surface that
-/// issues it: the Security Hub designator of a Security Hub control is `SH.` followed
-/// by that control's own Security Hub id, and a control Control Tower publishes is
-/// designated by its Control Tower identifier. Both are DERIVED here from the
-/// identifier they are a function of, which is what keeps one surface's designator off
-/// another surface's control: a control implemented by a Config rule cannot wear a
-/// Security Hub control's `SH.…` designator, because the Security Hub control is its
-/// own row in [`PUBLISHED_CONTROLS`].
+/// issues it, and WHICH designator that surface issues is published content: the catalog
+/// publishes most Security Hub controls under `SH.` followed by the control's own
+/// Security Hub id, and others under a designator of its own (`SH.{SERVICE}.DT.{N}`), so
+/// a designator cannot be computed from the identifier and is read off the control's row
+/// instead. The one exception is the Control Tower designator, which IS the `AWS-GR_…`
+/// identifier the row already records.
 pub(super) fn aliases(seed: &ControlSeed) -> Vec<String> {
+    // A Security Hub control is published under a Security Hub designator, so a row that
+    // records none would be served without the designator a client joins it to its
+    // Security Hub control by.
+    debug_assert!(
+        seed.implementation_type != SECURITY_HUB_CONTROL
+            || seed
+                .designators
+                .iter()
+                .any(|designator| designator.starts_with(SECURITY_HUB_ALIAS_PREFIX)),
+        "{}: a Security Hub control records the {SECURITY_HUB_ALIAS_PREFIX} designator \
+         the catalog publishes it under",
+        seed.slug
+    );
     let mut aliases: Vec<String> = seed
         .designators
         .iter()
         .map(|designator| (*designator).to_string())
         .collect();
-    if seed.implementation_type == SECURITY_HUB_CONTROL {
-        if let Some(identifier) = seed.implementation_identifier {
-            aliases.push(format!("{SECURITY_HUB_ALIAS_PREFIX}{identifier}"));
-        }
-    }
     if let Some(identifier) = seed.control_tower_identifier {
         aliases.push(identifier.to_string());
     }

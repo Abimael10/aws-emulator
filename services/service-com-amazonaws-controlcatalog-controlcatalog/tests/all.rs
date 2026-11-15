@@ -53,6 +53,8 @@ mod published_control_release_record;
 mod published_controls;
 #[path = "all/published_ontology.rs"]
 mod published_ontology;
+#[path = "all/published_security_hub_controls.rs"]
+mod published_security_hub_controls;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/related_control_relations.rs"]
