@@ -157,6 +157,8 @@ mod dynamic_reference_names;
 mod dynamic_references;
 #[path = "all/dynamodb_table_creation_window.rs"]
 mod dynamodb_table_creation_window;
+#[path = "all/dynamodb_table_drift.rs"]
+mod dynamodb_table_drift;
 #[path = "all/dynamodb_table_resources.rs"]
 mod dynamodb_table_resources;
 #[path = "all/dynamodb_table_settings.rs"]

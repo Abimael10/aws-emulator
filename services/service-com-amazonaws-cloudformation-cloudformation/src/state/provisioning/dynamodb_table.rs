@@ -64,6 +64,15 @@
 //! that service has not put into force yet: the declaration is not applied while it is still
 //! being applied, so a client that reads the setting back the instant the stack completes is
 //! answered what the template declared.
+//!
+//! ## What a drift check reads back
+//!
+//! The same reads answer what the table IS NOW ([`actual_configuration`]): `DescribeTable`
+//! for the table itself and the owning read of each declared setting, each reported under the
+//! property the TYPE declares it as. So a drift check tells a table whose properties were
+//! changed out of band (reported MODIFIED, with the differing properties) from one that is no
+//! longer there (reported DELETED, which only that service answering it holds no such table
+//! establishes).
 
 use std::collections::BTreeMap;
 
@@ -490,6 +499,145 @@ async fn delete_table(
 /// nothing and is no longer there to wait for.
 pub(super) fn removal() -> Removal {
     Removal::Gone
+}
+
+/// The error codes DynamoDB answers for a table it NO LONGER HOLDS: the control-plane code
+/// every table call of that service answers ([`TABLE_NOT_FOUND`]), and the one the reads
+/// that report a table's own settings model instead
+/// (`DescribeContinuousBackups`/`DescribeTimeToLive`'s `TableNotFoundException`).
+const TABLE_GONE_CODES: &[&str] = &[TABLE_NOT_FOUND, "TableNotFoundException"];
+
+/// Whether a refusal is DynamoDB answering that it holds no such table, judged on the CODE
+/// and never on a message, which carries the request's own table name.
+fn holds_no_table(refusal: &Refusal) -> bool {
+    TABLE_GONE_CODES.contains(&refusal.code.as_str())
+}
+
+/// The `TableDescription` members a drift check reports under the property of the SAME name:
+/// what `DescribeTable` answers for each of them is what `AWS::DynamoDB::Table` declares
+/// under that spelling, so the two sides of the comparison name the same configuration.
+///
+/// Source: `TableDescription`'s own members
+/// (`smithy_query(query="shape",shape="TableDescription")`), intersected with the properties
+/// the type publishes. A description member whose value the type spells differently is
+/// translated instead ([`SUMMARISED_PROPERTIES`], [`actual_configuration`]).
+///
+/// `AttributeDefinitions` is deliberately NOT among them: DynamoDB reports the definitions in
+/// an order of its own rather than the declared one, and the comparison walks a list element
+/// by element, so comparing the two would read that order as a changed configuration. Nor is
+/// `TableName`: it is the resource's own IDENTITY, which the read this answer comes from was
+/// ADDRESSED by, and the comparison leaves that property out for exactly that reason
+/// ([`super::super::drift`]).
+const REPORTED_MEMBERS: &[&str] = &[
+    "DeletionProtectionEnabled",
+    "GlobalSecondaryIndexes",
+    "KeySchema",
+    "LocalSecondaryIndexes",
+    "OnDemandThroughput",
+    "ProvisionedThroughput",
+    "WarmThroughput",
+];
+
+/// The properties the description reports INSIDE a summary of its own: the property the type
+/// declares, and the path its value sits at in the description.
+///
+/// Source: `TableDescription$TableThroughputModeSummary` ("the read/write throughput mode of
+/// the table"), `$BillingModeSummary` ("the details for the read/write capacity mode", whose
+/// own note says a table that has never been on-demand reports none) and
+/// `$TableClassSummary` ("details of the table class"). The mode is read from the newer
+/// summary first, and from the older one for an answer that carries only that; the FIRST path
+/// an answer carries is the one reported, so one property is never reported twice.
+const SUMMARISED_PROPERTIES: &[(&str, &[&str])] = &[
+    (
+        "BillingMode",
+        &["TableThroughputModeSummary", "TableThroughputMode"],
+    ),
+    ("BillingMode", &["BillingModeSummary", "BillingMode"]),
+    ("TableClass", &["TableClassSummary", "TableClass"]),
+];
+
+/// The table's configuration as Amazon DynamoDB reports it, for drift detection: the
+/// properties of `AWS::DynamoDB::Table` that service answers for, each under the name the
+/// TYPE declares it as. A table that service no longer holds was deleted (`None`).
+///
+/// Two reads stand behind it, which is how the type's properties are configured in the first
+/// place ([`create`]): `DescribeTable` for the table itself, and the read that owns each
+/// SETTING the declaration carries ([`settings::reported_configuration`]) — a property no
+/// member of `DescribeTable` carries is one no `DescribeTable` answer can report.
+///
+/// A property neither read reports is left out rather than guessed at: the comparison takes
+/// an absent property as no evidence about the resource, which is what a service reporting
+/// the configuration it models rather than every property a template may declare means. Left
+/// out for that reason are the table's tag set and its resource-based policy, neither of
+/// which `DescribeTable` carries, and `SSESpecification`, which the description spells under
+/// other member names (`SSEDescription`) and whose key it names by the ARN that service
+/// resolved, where a declaration may state an alias or a key id.
+///
+/// Only the members a declaration STATES are compared, so a member the reported value carries
+/// beside them — the flag the API's own `StreamSpecification` requires, the counters a
+/// throughput description carries — says nothing about the resource; a member the declaration
+/// states and the service reports no value for is the configuration genuinely no longer
+/// carrying it.
+pub(super) async fn actual_configuration(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let Some(description) = describe(ctx, region, &resource.physical_resource_id).await? else {
+        return Ok(None);
+    };
+    let mut reported = Map::new();
+    for property in REPORTED_MEMBERS {
+        if let Some(value) = declared_in(&description, property) {
+            reported.insert((*property).to_string(), value.clone());
+        }
+    }
+    for (property, path) in SUMMARISED_PROPERTIES {
+        if reported.contains_key(*property) {
+            continue;
+        }
+        if let Some(value) = value_at(&description, path) {
+            reported.insert((*property).to_string(), value.clone());
+        }
+    }
+    // "The current DynamoDB Streams configuration for the table", which the read reports only
+    // for a table whose stream is ON: a table it reports none for has no stream, which the
+    // API's own specification spells as the flag turned off — the same form a declaration
+    // asking for no stream reaches that service as ([`stream_specification`]).
+    reported.insert(
+        STREAM_SPECIFICATION_PROPERTY.to_string(),
+        declared_in(&description, STREAM_SPECIFICATION_PROPERTY)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ STREAM_ENABLED_MEMBER: false })),
+    );
+    // The settings that are reads of this service's own, for the properties the declaration
+    // carries. A table that is gone by the time one of them is asked is the same answer the
+    // read above gives for one.
+    let Some(settings) = settings::reported_configuration(
+        ctx,
+        region,
+        &resource.physical_resource_id,
+        &resource.properties,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    reported.extend(settings);
+    Ok(Some(Value::Object(reported)))
+}
+
+/// One value inside a description, at the path of member names `path` names, or `None` where
+/// the description carries no such value.
+///
+/// The one walk of a nested answer this arm has, shared with the settings half
+/// ([`settings`]), which reads each of its own answers the same way.
+pub(super) fn value_at<'v>(description: &'v Value, path: &[&str]) -> Option<&'v Value> {
+    let mut at = description;
+    for member in path {
+        at = declared_in(at, member)?;
+    }
+    Some(at)
 }
 
 /// The `TableStatus` values DynamoDB refuses a further change of the table in: "attempt to

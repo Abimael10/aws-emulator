@@ -1036,10 +1036,9 @@ impl Owner {
                 // Boxed for the reason [`Self::create`]'s arm records.
                 Box::pin(provisioner.actual_configuration(ctx, region, resource)).await?
             }
-            // A table reports no configuration of its own to compare yet: this arm reads
-            // nothing back for drift detection, so its configuration is unchecked rather
-            // than guessed at.
-            Self::DynamodbTable => return Ok(ActualConfiguration::Unchecked),
+            Self::DynamodbTable => {
+                dynamodb_table::actual_configuration(ctx, region, resource).await?
+            }
             // An embedded policy reports no configuration of its own to compare: the
             // document is read by the entity's own drift read, as a policy statement's is.
             Self::IamPolicy(_) => return Ok(ActualConfiguration::Unchecked),

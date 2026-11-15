@@ -45,8 +45,8 @@
 use serde_json::{Map, Value};
 
 use super::{
-    addressed, call_json_rpc, declared_in, Refusal, AWS_JSON_1_0, DYNAMODB_SIGNING_NAME,
-    DYNAMODB_TARGET_PREFIX, TABLE_NAME_PROPERTY,
+    addressed, call_json_rpc, declared_in, holds_no_table, value_at, Refusal, AWS_JSON_1_0,
+    DYNAMODB_SIGNING_NAME, DYNAMODB_TARGET_PREFIX, TABLE_NAME_PROPERTY,
 };
 
 /// The operations that apply these settings, as an awsJson `X-Amz-Target` names them.
@@ -117,6 +117,10 @@ pub(super) struct Setting {
     /// Every status that read reports for it — one per destination for the setting that is a
     /// list, one for each of the others.
     reported: fn(&Value) -> Vec<String>,
+    /// The setting as that read reports it IN FORCE, spelled the way the TEMPLATE declares
+    /// it — the actual side of a drift check over this property ([`reported`]). `None` where
+    /// the answer reports no such setting at all, which says nothing about it.
+    configuration: fn(&Value) -> Option<Value>,
     /// The statuses that read reports while a change to the setting is still being applied,
     /// which is what holds a created resource short of ready ([`settling`]). A setting whose
     /// status enum declares no such value is reported in force the moment its call answers.
@@ -130,6 +134,7 @@ pub(super) const SETTINGS: &[Setting] = &[
         change: time_to_live,
         describe: "DescribeTimeToLive",
         reported: time_to_live_status,
+        configuration: time_to_live_configuration,
         // `TimeToLiveStatus`'s two transient values
         // (`smithy_query(query="shape",shape="TimeToLiveStatus")`): "It can take up to one
         // hour for the change to fully process" — the `UpdateTimeToLive` doc — so the
@@ -141,6 +146,7 @@ pub(super) const SETTINGS: &[Setting] = &[
         change: point_in_time_recovery,
         describe: "DescribeContinuousBackups",
         reported: point_in_time_recovery_status,
+        configuration: point_in_time_recovery_configuration,
         // `PointInTimeRecoveryStatus` declares `ENABLED` and `DISABLED` only
         // (`smithy_query(query="shape",shape="PointInTimeRecoveryStatus")`): there is no
         // status this setting is reported in while a change to it is being applied.
@@ -151,6 +157,7 @@ pub(super) const SETTINGS: &[Setting] = &[
         change: contributor_insights,
         describe: "DescribeContributorInsights",
         reported: contributor_insights_status,
+        configuration: contributor_insights_configuration,
         // `ContributorInsightsStatus`'s transient values
         // (`smithy_query(query="shape",shape="ContributorInsightsStatus")`).
         settling: &["ENABLING", "DISABLING"],
@@ -160,6 +167,7 @@ pub(super) const SETTINGS: &[Setting] = &[
         change: kinesis_destination,
         describe: "DescribeKinesisStreamingDestination",
         reported: kinesis_destination_status,
+        configuration: kinesis_destination_configuration,
         // `DestinationStatus`'s transient values
         // (`smithy_query(query="shape",shape="DestinationStatus")`): a destination is
         // replicating in `ACTIVE`, and reports one of these while a change is in flight.
@@ -293,6 +301,150 @@ pub(super) async fn settling(
         }
     }
     None
+}
+
+/// Every one of these settings as DynamoDB reports it IN FORCE on `table_name`, keyed by the
+/// property `AWS::DynamoDB::Table` declares it as — the ACTUAL side of a drift check over the
+/// properties no member of `DescribeTable` carries.
+///
+/// Only the settings the DECLARATION carries are read: "only resource properties explicitly
+/// defined in the stack template are checked for drift", so a setting nothing declared is
+/// nothing this asks that service about — and a property no read reported is no evidence
+/// about the resource either way.
+///
+/// `Ok(None)` is that service answering that it no longer holds the table
+/// ([`holds_no_table`]), which is the same answer its own read gives for a resource that is
+/// gone. Every other refusal is reported as it came: an unanswered read establishes nothing,
+/// so the check it belongs to is the one that says so.
+pub(super) async fn reported_configuration(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    table_name: &str,
+    declared: &Value,
+) -> Result<Option<Map<String, Value>>, Refusal> {
+    let mut reported = Map::new();
+    for setting in SETTINGS {
+        if declared_in(declared, setting.property).is_none() {
+            continue;
+        }
+        let answered = match call_json_rpc(
+            ctx,
+            DYNAMODB_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{DYNAMODB_TARGET_PREFIX}.{}", setting.describe),
+            &addressed(table_name),
+        )
+        .await
+        {
+            Ok(answered) => answered,
+            Err(refusal) if holds_no_table(&refusal) => return Ok(None),
+            Err(refusal) => return Err(refusal),
+        };
+        if let Some(configuration) = (setting.configuration)(&answered) {
+            reported.insert(setting.property.to_string(), configuration);
+        }
+    }
+    Ok(Some(reported))
+}
+
+/// The statuses that say one of these settings is ON: the one it is reported in while it is
+/// in force, and the one it is reported in while that service is putting it there — the
+/// transient status of a setting being turned ON belongs to the setting being on.
+///
+/// Source: the status enums of the four reads
+/// (`smithy_query(query="shape",shape="TimeToLiveStatus")` and the three beside it), whose
+/// values are these two, their `DISABLING`/`DISABLED` counterparts, and the failure values a
+/// setting nothing is in force for is reported in.
+const SETTING_ENABLED: &str = "ENABLED";
+const SETTING_ENABLING: &str = "ENABLING";
+
+/// Whether a status one of these reads answers says the setting is on ([`SETTING_ENABLED`]).
+///
+/// This is the TEMPLATE's own spelling of these settings: each declares a FLAG where the
+/// read reports a status, so the status is rendered as the flag the declaration states.
+fn in_force(status: Option<&Value>) -> bool {
+    matches!(
+        status.and_then(Value::as_str),
+        Some(SETTING_ENABLED | SETTING_ENABLING)
+    )
+}
+
+/// `PointInTimeRecoverySpecification` as `DescribeContinuousBackups` reports it: the recovery
+/// status as the flag the template declares it in, beside the period it keeps backups for,
+/// which both sides spell `RecoveryPeriodInDays`.
+fn point_in_time_recovery_configuration(answered: &Value) -> Option<Value> {
+    let description = value_at(
+        answered,
+        &[
+            "ContinuousBackupsDescription",
+            "PointInTimeRecoveryDescription",
+        ],
+    )?;
+    let mut specification = Map::new();
+    specification.insert(
+        POINT_IN_TIME_RECOVERY_ENABLED_MEMBER.to_string(),
+        Value::Bool(in_force(description.get("PointInTimeRecoveryStatus"))),
+    );
+    if let Some(period) = member(Some(description), RECOVERY_PERIOD_MEMBER) {
+        specification.insert(RECOVERY_PERIOD_MEMBER.to_string(), period.clone());
+    }
+    Some(Value::Object(specification))
+}
+
+/// `ContributorInsightsSpecification` as `DescribeContributorInsights` reports it: the status
+/// as the flag the template declares, and the mode, which the template spells [`MODE_PROPERTY`]
+/// where the API spells it [`CONTRIBUTOR_INSIGHTS_MODE_MEMBER`].
+fn contributor_insights_configuration(answered: &Value) -> Option<Value> {
+    let status = answered.get("ContributorInsightsStatus")?;
+    let mut specification = Map::new();
+    specification.insert(
+        ENABLED_MEMBER.to_string(),
+        Value::Bool(in_force(Some(status))),
+    );
+    if let Some(mode) = member(Some(answered), CONTRIBUTOR_INSIGHTS_MODE_MEMBER) {
+        specification.insert(MODE_PROPERTY.to_string(), mode.clone());
+    }
+    Some(Value::Object(specification))
+}
+
+/// The statuses a Kinesis destination record is IN FORCE in: the one it replicates in, and
+/// the two it is reported in while a change to it is being applied.
+///
+/// Source: `DestinationStatus`'s values
+/// (`smithy_query(query="shape",shape="DestinationStatus")`) — these three, beside the two a
+/// withdrawn destination is reported in (`DISABLING`, `DISABLED`) and the one a destination
+/// that never came up is reported in (`ENABLE_FAILED`), none of which is a destination the
+/// table replicates to.
+const DESTINATION_IN_FORCE: &[&str] = &["ACTIVE", SETTING_ENABLING, "UPDATING"];
+
+/// `KinesisStreamSpecification` as `DescribeKinesisStreamingDestination` reports it: the
+/// destination the table is replicating its changes to, by the stream's ARN and the precision
+/// of the timestamp each replicated record carries — both spelled the same way on the two
+/// sides.
+///
+/// The read answers a RECORD PER DESTINATION, including the ones withdrawn again and the ones
+/// that never came up, while the type declares ONE destination: the one reported is the
+/// destination the table still replicates to ([`DESTINATION_IN_FORCE`]), and a table with none
+/// has nothing reported for the property.
+fn kinesis_destination_configuration(answered: &Value) -> Option<Value> {
+    let destination = answered
+        .get("KinesisDataStreamDestinations")?
+        .as_array()?
+        .iter()
+        .find(|destination| {
+            destination
+                .get("DestinationStatus")
+                .and_then(Value::as_str)
+                .is_some_and(|status| DESTINATION_IN_FORCE.contains(&status))
+        })?;
+    let mut specification = Map::new();
+    for member_name in [STREAM_ARN_MEMBER, PRECISION_MEMBER] {
+        if let Some(value) = member(Some(destination), member_name) {
+            specification.insert(member_name.to_string(), value.clone());
+        }
+    }
+    Some(Value::Object(specification))
 }
 
 /// `TimeToLiveSpecification`, applied by `UpdateTimeToLive`: that API "enables or disables
@@ -575,17 +727,33 @@ fn kinesis_destination_status(answered: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `TimeToLiveSpecification` as `DescribeTimeToLive` reports it: the status as the flag the
+/// template declares, beside the attribute the setting expires items by, which both sides
+/// spell `AttributeName`.
+///
+/// A setting the read reports OFF is reported as the flag alone, because that is all that
+/// service reports for one: nothing expires items on such a table, so it names no attribute.
+fn time_to_live_configuration(answered: &Value) -> Option<Value> {
+    let description = answered.get("TimeToLiveDescription")?;
+    let mut specification = Map::new();
+    specification.insert(
+        ENABLED_MEMBER.to_string(),
+        Value::Bool(in_force(description.get("TimeToLiveStatus"))),
+    );
+    if let Some(attribute) = member(Some(description), ATTRIBUTE_NAME_MEMBER) {
+        specification.insert(ATTRIBUTE_NAME_MEMBER.to_string(), attribute.clone());
+    }
+    Some(Value::Object(specification))
+}
+
 /// The text at `path` in an answer, as the one-element list [`Setting::reported`] answers
 /// for a setting a table carries one status for.
 fn reported_at(answered: &Value, path: &[&str]) -> Vec<String> {
-    let mut at = answered;
-    for member in path {
-        match at.get(member) {
-            Some(next) => at = next,
-            None => return Vec::new(),
-        }
-    }
-    at.as_str().map(str::to_string).into_iter().collect()
+    value_at(answered, path)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
@@ -884,6 +1052,133 @@ mod tests {
             assert_eq!(
                 reported, wanted,
                 "case {case:?}: expected the statuses {wanted:?}, got {reported:?}"
+            );
+        }
+    }
+
+    /// Each setting's read is rendered as the TEMPLATE spells the property, which is what
+    /// makes it comparable against the declaration: the status becomes the declared flag, and
+    /// a member the two sides spell differently takes the template's spelling.
+    ///
+    /// The rows differ along what the rule generalises over: WHICH setting, whether the read
+    /// reports it on, coming on or off, the members beside the flag, and a read that reports
+    /// no such setting at all.
+    #[test]
+    fn a_reported_setting_takes_the_spelling_the_template_declares_it_in() {
+        let rows: &[(&str, &str, Value, Option<Value>)] = &[
+            (
+                "time to live, on over an attribute",
+                TIME_TO_LIVE_PROPERTY,
+                serde_json::json!({"TimeToLiveDescription": {"TimeToLiveStatus": "ENABLED",
+                                                             "AttributeName": "expiresAt"}}),
+                Some(serde_json::json!({"Enabled": true, "AttributeName": "expiresAt"})),
+            ),
+            (
+                "time to live still coming on is on",
+                TIME_TO_LIVE_PROPERTY,
+                serde_json::json!({"TimeToLiveDescription": {"TimeToLiveStatus": "ENABLING",
+                                                             "AttributeName": "ttl"}}),
+                Some(serde_json::json!({"Enabled": true, "AttributeName": "ttl"})),
+            ),
+            (
+                "time to live off, reported over no attribute",
+                TIME_TO_LIVE_PROPERTY,
+                serde_json::json!({"TimeToLiveDescription": {"TimeToLiveStatus": "DISABLED"}}),
+                Some(serde_json::json!({"Enabled": false})),
+            ),
+            (
+                "continuous backups on, over a period",
+                POINT_IN_TIME_RECOVERY_PROPERTY,
+                serde_json::json!({"ContinuousBackupsDescription": {
+                    "ContinuousBackupsStatus": "ENABLED",
+                    "PointInTimeRecoveryDescription": {"PointInTimeRecoveryStatus": "ENABLED",
+                                                       "RecoveryPeriodInDays": 7},
+                }}),
+                Some(serde_json::json!({"PointInTimeRecoveryEnabled": true,
+                                        "RecoveryPeriodInDays": 7})),
+            ),
+            (
+                "continuous backups off",
+                POINT_IN_TIME_RECOVERY_PROPERTY,
+                serde_json::json!({"ContinuousBackupsDescription": {
+                    "ContinuousBackupsStatus": "ENABLED",
+                    "PointInTimeRecoveryDescription": {"PointInTimeRecoveryStatus": "DISABLED"},
+                }}),
+                Some(serde_json::json!({"PointInTimeRecoveryEnabled": false})),
+            ),
+            (
+                "contributor insights on, in the mode the API spells its own way",
+                CONTRIBUTOR_INSIGHTS_PROPERTY,
+                serde_json::json!({"ContributorInsightsStatus": "ENABLED",
+                                   "ContributorInsightsMode": "THROTTLED_KEYS"}),
+                Some(serde_json::json!({"Enabled": true, "Mode": "THROTTLED_KEYS"})),
+            ),
+            (
+                "contributor insights off",
+                CONTRIBUTOR_INSIGHTS_PROPERTY,
+                serde_json::json!({"ContributorInsightsStatus": "DISABLED"}),
+                Some(serde_json::json!({"Enabled": false})),
+            ),
+            (
+                "the destination the table still replicates to, not the withdrawn one",
+                KINESIS_STREAM_PROPERTY,
+                serde_json::json!({"KinesisDataStreamDestinations": [
+                    {"StreamArn": "arn:aws:kinesis:us-east-1:000000000000:stream/old",
+                     "DestinationStatus": "DISABLED"},
+                    {"StreamArn": "arn:aws:kinesis:us-east-1:000000000000:stream/new",
+                     "DestinationStatus": "ACTIVE",
+                     "ApproximateCreationDateTimePrecision": "MICROSECOND"},
+                ]}),
+                Some(serde_json::json!({
+                    "StreamArn": "arn:aws:kinesis:us-east-1:000000000000:stream/new",
+                    "ApproximateCreationDateTimePrecision": "MICROSECOND",
+                })),
+            ),
+            (
+                "a table replicating nowhere: no destination reported",
+                KINESIS_STREAM_PROPERTY,
+                serde_json::json!({"KinesisDataStreamDestinations": [
+                    {"StreamArn": "arn:aws:kinesis:us-east-1:000000000000:stream/old",
+                     "DestinationStatus": "DISABLED"},
+                ]}),
+                None,
+            ),
+            (
+                "a destination being withdrawn is not one the table replicates to",
+                KINESIS_STREAM_PROPERTY,
+                serde_json::json!({"KinesisDataStreamDestinations": [
+                    {"StreamArn": "arn:aws:kinesis:us-east-1:000000000000:stream/going",
+                     "DestinationStatus": "DISABLING"},
+                ]}),
+                None,
+            ),
+            (
+                "a destination that never came up is not one either",
+                KINESIS_STREAM_PROPERTY,
+                serde_json::json!({"KinesisDataStreamDestinations": [
+                    {"StreamArn": "arn:aws:kinesis:us-east-1:000000000000:stream/failed",
+                     "DestinationStatus": "ENABLE_FAILED"},
+                ]}),
+                None,
+            ),
+            (
+                "a read that reports nothing about the setting",
+                POINT_IN_TIME_RECOVERY_PROPERTY,
+                serde_json::json!({}),
+                None,
+            ),
+        ];
+        for (case, property, answered, expected) in rows {
+            let setting = SETTINGS
+                .iter()
+                .find(|setting| setting.property == *property)
+                .expect("the property is one of the settings");
+            let reported = (setting.configuration)(answered);
+            assert_eq!(
+                reported.as_ref(),
+                expected.as_ref(),
+                "case {case:?}: expected the setting to be reported as {expected:?}, got \
+                 {reported:?}"
             );
         }
     }
