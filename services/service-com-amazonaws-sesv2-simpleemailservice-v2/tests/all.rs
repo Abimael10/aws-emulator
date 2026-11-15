@@ -89,6 +89,8 @@ mod dedicated_ip_warmup_attributes;
 mod dedicated_ips;
 #[path = "all/email_address_insights.rs"]
 mod email_address_insights;
+#[path = "all/email_identity_attribute_write_refusal.rs"]
+mod email_identity_attribute_write_refusal;
 #[path = "all/email_identity_certificates.rs"]
 mod email_identity_certificates;
 #[path = "all/email_identity_configuration_set_association.rs"]

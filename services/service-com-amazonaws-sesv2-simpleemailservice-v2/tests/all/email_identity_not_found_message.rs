@@ -7,14 +7,21 @@
 //! service registered — so routing, label decoding, the handler and error serialization
 //! are all exercised.
 //!
-//! The rule these cases pin: an operation that resolves an email identity by name and
-//! does not find it is refused 404 `NotFoundException` with the sentence SES words for
+//! The rule these cases pin: an operation that ADDRESSES an email identity record by name
+//! and does not find it is refused 404 `NotFoundException` with the sentence SES words for
 //! THAT operation — `Email identity <NAME> does not exist.` on the identity reads and the
 //! certificate operations, which quote the name in angle brackets, and `Email identity
-//! NAME does not exist.` on `DeleteEmailIdentity` and the writes that hang an attribute
-//! or a policy off an identity, which do not. The only variable part of either sentence is
-//! the `EmailIdentity` the request spelled, so the two forms differ in exactly the
-//! brackets and nothing else.
+//! NAME does not exist.` on `DeleteEmailIdentity` and the policy create, which do not. The
+//! only variable part of either sentence is the `EmailIdentity` the request spelled, so the
+//! two forms differ in exactly the brackets and nothing else.
+//!
+//! The `PutEmailIdentity*Attributes` writes are the other half of the rule: there the
+//! identity is the write's INPUT — the identity SES would have to sign, forward or send
+//! for — so a name none of the account's identities answers to is refused 400
+//! `BadRequestException`, and not as a missing resource. The DKIM write words it in terms
+//! of the mechanism it configures — `Domain DOMAIN is not verified for DKIM signing.`,
+//! naming the domain the requested identity belongs to — and the others state it of the
+//! identity: `Identity NAME is invalid. Must be a verified email address or domain.`
 //!
 //! The tables below span what the rule generalises over: the kind and the spelling of the
 //! requested identity (an address, a domain, a subdomain, a mixed-case domain and an
@@ -132,10 +139,12 @@ impl Ses {
     }
 }
 
-/// One identity the account does not hold, and an address the certificate operations can
-/// name for it (they require one when the identity is a domain).
+/// One identity the account does not hold, the domain that identity belongs to (the whole
+/// value for a domain, the domain part of an address), and an address the certificate
+/// operations can name for it (they require one when the identity is a domain).
 struct Case {
     identity: &'static str,
+    identity_domain: &'static str,
     from_address: &'static str,
 }
 
@@ -145,22 +154,27 @@ struct Case {
 const CASES: &[Case] = &[
     Case {
         identity: "absent@example.com",
+        identity_domain: "example.com",
         from_address: "absent@example.com",
     },
     Case {
         identity: "absent.example.com",
+        identity_domain: "absent.example.com",
         from_address: "sender@absent.example.com",
     },
     Case {
         identity: "mail.absent.example.net",
+        identity_domain: "mail.absent.example.net",
         from_address: "sender@mail.absent.example.net",
     },
     Case {
         identity: "Absent.Example.ORG",
+        identity_domain: "Absent.Example.ORG",
         from_address: "sender@Absent.Example.ORG",
     },
     Case {
         identity: "absent+tag@example.net",
+        identity_domain: "example.net",
         from_address: "absent+tag@example.net",
     },
 ];
@@ -239,48 +253,12 @@ async fn quoting_refusals(ses: &Ses, case: &Case) -> Vec<(&'static str, Reply)> 
     ]
 }
 
-/// Every implemented operation that resolves an email identity and names the name it did
-/// not find unquoted, each answered once for `case`.
+/// Every implemented operation that addresses an email identity record and names the name
+/// it did not find unquoted, each answered once for `case`.
 async fn unquoting_refusals(ses: &Ses, case: &Case) -> Vec<(&'static str, Reply)> {
     let identity = case.identity;
     vec![
         ("DeleteEmailIdentity", ses.delete_identity(identity).await),
-        (
-            "PutEmailIdentityDkimAttributes",
-            ses.call(
-                "PUT",
-                &format!("/v2/email/identities/{identity}/dkim"),
-                Some(json!({"SigningEnabled": true})),
-            )
-            .await,
-        ),
-        (
-            "PutEmailIdentityFeedbackAttributes",
-            ses.call(
-                "PUT",
-                &format!("/v2/email/identities/{identity}/feedback"),
-                Some(json!({"EmailForwardingEnabled": true})),
-            )
-            .await,
-        ),
-        (
-            "PutEmailIdentityMailFromAttributes",
-            ses.call(
-                "PUT",
-                &format!("/v2/email/identities/{identity}/mail-from"),
-                Some(json!({"MailFromDomain": "mail.example.com"})),
-            )
-            .await,
-        ),
-        (
-            "PutEmailIdentityConfigurationSetAttributes",
-            ses.call(
-                "PUT",
-                &format!("/v2/email/identities/{identity}/configuration-set"),
-                Some(json!({})),
-            )
-            .await,
-        ),
         (
             "CreateEmailIdentityPolicy",
             ses.call(
@@ -291,6 +269,69 @@ async fn unquoting_refusals(ses: &Ses, case: &Case) -> Vec<(&'static str, Reply)
             .await,
         ),
     ]
+}
+
+/// Every implemented write that sets an attribute ON an email identity, each answered once
+/// for `case`, with the sentence that write words this refusal in: as
+/// (the operation's name, the reply, the message expected).
+///
+/// The identity is the input these validate, so each refuses a name none of the account's
+/// identities answers to as a bad request. The DKIM write states it in terms of the
+/// mechanism it configures, naming the DOMAIN whose mail it was asked to sign; the others,
+/// which configure no one mechanism of their own, state it of the identity.
+async fn attribute_write_refusals(ses: &Ses, case: &Case) -> Vec<(&'static str, Reply, String)> {
+    let identity = case.identity;
+    vec![
+        (
+            "PutEmailIdentityDkimAttributes",
+            ses.call(
+                "PUT",
+                &format!("/v2/email/identities/{identity}/dkim"),
+                Some(json!({"SigningEnabled": true})),
+            )
+            .await,
+            format!(
+                "Domain {} is not verified for DKIM signing.",
+                case.identity_domain
+            ),
+        ),
+        (
+            "PutEmailIdentityFeedbackAttributes",
+            ses.call(
+                "PUT",
+                &format!("/v2/email/identities/{identity}/feedback"),
+                Some(json!({"EmailForwardingEnabled": true})),
+            )
+            .await,
+            not_a_sending_identity(identity),
+        ),
+        (
+            "PutEmailIdentityMailFromAttributes",
+            ses.call(
+                "PUT",
+                &format!("/v2/email/identities/{identity}/mail-from"),
+                Some(json!({"MailFromDomain": "mail.example.com"})),
+            )
+            .await,
+            not_a_sending_identity(identity),
+        ),
+        (
+            "PutEmailIdentityConfigurationSetAttributes",
+            ses.call(
+                "PUT",
+                &format!("/v2/email/identities/{identity}/configuration-set"),
+                Some(json!({})),
+            )
+            .await,
+            not_a_sending_identity(identity),
+        ),
+    ]
+}
+
+/// The sentence the attribute writes answer for an identity none of the account's
+/// identities answers to.
+fn not_a_sending_identity(identity: &str) -> String {
+    format!("Identity {identity} is invalid. Must be a verified email address or domain.")
 }
 
 #[tokio::test]
@@ -341,6 +382,21 @@ async fn every_operation_refuses_a_missing_identity_with_its_own_sentence() {
                 !reply.message().contains('<') && !reply.message().contains('>'),
                 "case ({operation}, {identity}): the sentence must not quote the identity, \
                  got {:?}",
+                reply.message()
+            );
+        }
+        for (operation, reply, expected) in attribute_write_refusals(&ses, case).await {
+            assert_eq!(
+                (reply.status, reply.error_code().as_str()),
+                (400, "BadRequestException"),
+                "case ({operation}, {identity}): expected 400 BadRequestException, got {} {:?}",
+                reply.status,
+                reply.body
+            );
+            assert_eq!(
+                reply.message(),
+                expected,
+                "case ({operation}, {identity}): expected {expected:?}, got {:?}",
                 reply.message()
             );
         }

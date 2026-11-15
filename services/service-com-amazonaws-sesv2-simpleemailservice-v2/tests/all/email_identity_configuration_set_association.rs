@@ -11,10 +11,12 @@
 //! references exactly the configuration set named, whichever set it referenced before,
 //! and a request naming none leaves it referencing nothing — and every later read of
 //! that identity reports it; both halves of the association are resolved against the
-//! account's state first, so an identity the account does not hold and a configuration
-//! set it does not hold are each refused with a terminal 404 `NotFoundException` naming
-//! the missing one, a name outside `ConfigurationSetName`'s documented character and
-//! length rule with a 400 `BadRequestException`, and nothing is persisted by a refused
+//! account's state first, so a configuration set the account does not hold is refused
+//! with a terminal 404 `NotFoundException` naming it, an identity the account does not
+//! hold — the write's own input rather than a resource this call addresses — with a 400
+//! `BadRequestException` naming it, a set name outside `ConfigurationSetName`'s
+//! documented character and length rule with a 400 `BadRequestException`, and nothing is
+//! persisted by a refused
 //! call; and because what is stored is the name itself and not a key kept pointing at a
 //! live set, this call is the ONLY one that changes it — a name left behind by a deleted
 //! set is cleared by a request of this call carrying no name, and by nothing else.
@@ -409,20 +411,22 @@ async fn an_identity_the_account_does_not_hold_is_refused() {
             let case = format!("({identity:?}, {set:?})");
             let put = ses.put_association(identity, set.as_deref()).await;
             assert_eq!(
-                put.status, 404,
-                "case {case}: expected 404, got {} {}",
+                put.status, 400,
+                "case {case}: expected 400, got {} {}",
                 put.status,
                 put.message()
             );
             assert_eq!(
                 put.error_code(),
-                "NotFoundException",
-                "case {case}: expected NotFoundException, got {:?}",
+                "BadRequestException",
+                "case {case}: expected BadRequestException, got {:?}",
                 put.error_code()
             );
             assert_eq!(
                 put.message(),
-                format!("Email identity {identity} does not exist."),
+                format!(
+                    "Identity {identity} is invalid. Must be a verified email address or domain."
+                ),
                 "case {case}: expected the message to name the identity, got {:?}",
                 put.message()
             );

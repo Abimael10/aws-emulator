@@ -181,19 +181,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .identities
             .get_mut(&crate::state::identity_key(&input.email_identity))
         else {
-            return Err(
-                PutEmailIdentityMailFromAttributesErrorModeled::NotFoundException(
-                    NotFoundException {
-                        // The sentence the sibling `PutEmailIdentity*` writes answer,
-                        // so a client sees one wording whichever attribute of a
-                        // missing identity it tried to set.
-                        message: Some(crate::state::email_identity_not_found_unquoted(
-                            &input.email_identity,
-                        )),
-                    },
-                )
-                .into(),
-            );
+            // The identity is this write's INPUT — the identity whose mail SES would
+            // send with the custom MAIL FROM domain — and not a resource this call
+            // addresses, so a value that names none of the account's identities is
+            // refused as invalid input rather than as a missing resource. One wording
+            // for the whole attribute-write family, so a client sees the same sentence
+            // whichever attribute of an identity SES does not hold it tried to set.
+            return Err(bad_request(
+                crate::state::identity_is_not_a_sending_identity(&input.email_identity),
+            ));
         };
 
         match input.mail_from_domain.as_deref() {

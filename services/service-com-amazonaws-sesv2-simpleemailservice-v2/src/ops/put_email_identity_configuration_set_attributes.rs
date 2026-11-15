@@ -175,10 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .identities
             .get_mut(&crate::state::identity_key(&input.email_identity))
         else {
+            // The identity is this write's INPUT — the identity the configuration set
+            // would apply to — and not a resource this call addresses, so a value that
+            // names none of the account's identities is refused as invalid input
+            // rather than as a missing resource, like the sibling attribute writes.
+            // The configuration set, by contrast, IS a resource the request points at:
+            // a name the account holds no set under stays a `NotFoundException` below.
             return Err(
-                PutEmailIdentityConfigurationSetAttributesErrorModeled::NotFoundException(
-                    NotFoundException {
-                        message: Some(crate::state::email_identity_not_found_unquoted(
+                PutEmailIdentityConfigurationSetAttributesErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::identity_is_not_a_sending_identity(
                             &input.email_identity,
                         )),
                     },

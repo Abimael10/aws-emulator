@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The ONE JSON wire harness this crate's suites answer requests over: a router holding
-//! this service, one `restJson1` call, the reply as a client reads it, and the
-//! percent-encoding of a query-string component.
+//! this service, the engine behind it, one `restJson1` call, the reply as a client reads
+//! it, and the percent-encoding of a query-string component.
 //!
 //! Declared in `tests/all.rs` beside the suites, so each suite reaches it as
 //! `crate::json_wire`. Here rather than in one suite because every suite that drives this
@@ -85,6 +85,10 @@ pub struct Ses {
     /// The router every call is dispatched through, so a suite can mount a peer service
     /// beside this one.
     pub router: MultiServiceRouter,
+    /// The engine the service was built on, so a suite can read or hold the state the
+    /// handlers write — the clock-owed transitions a case must not race, above all —
+    /// without forking this harness to get at it.
+    pub engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Ses {
@@ -94,8 +98,8 @@ impl Ses {
         let mut router = MultiServiceRouter::new();
         // These suites exercise routing and handler behaviour, not SigV4.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
     }
 
     /// One call: `method` and `path` as a client addresses them, with `body` as the

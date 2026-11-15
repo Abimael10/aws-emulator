@@ -151,14 +151,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .identities
             .get_mut(&crate::state::identity_key(&input.email_identity))
         else {
-            return Err(PutEmailIdentityDkimAttributesErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::email_identity_not_found_unquoted(
-                        &input.email_identity,
-                    )),
-                },
-            )
-            .into());
+            // The identity is this write's INPUT — the identity SES would have to sign
+            // for — and not a resource this call addresses: a value that names none of
+            // the account's identities is therefore refused as invalid input, with the
+            // `BadRequestException` the model binds for "the input you provided is
+            // invalid", and never as a missing resource. `NotFoundException` stays the
+            // answer of the operations that address the identity record itself. The
+            // sentence names the domain whose mail SES was asked to sign.
+            return Err(
+                PutEmailIdentityDkimAttributesErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::domain_not_verified_for_dkim(
+                            &input.email_identity,
+                        )),
+                    },
+                )
+                .into(),
+            );
         };
 
         // "Sets the DKIM signing configuration for the identity": the request carries

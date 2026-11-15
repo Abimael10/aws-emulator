@@ -784,19 +784,19 @@ async fn an_identity_the_account_does_not_hold_is_refused() {
             .put_mail_from(identity, "mail.example.com", Some("REJECT_MESSAGE"))
             .await;
         assert_eq!(
-            put.status, 404,
-            "case {identity:?}: expected 404, got {} {:?}",
+            put.status, 400,
+            "case {identity:?}: expected 400, got {} {:?}",
             put.status, put.body
         );
         assert_eq!(
             put.error_code(),
-            "NotFoundException",
-            "case {identity:?}: expected NotFoundException, got {:?}",
+            "BadRequestException",
+            "case {identity:?}: expected BadRequestException, got {:?}",
             put.body
         );
         assert_eq!(
             put.message(),
-            format!("Email identity {identity} does not exist."),
+            format!("Identity {identity} is invalid. Must be a verified email address or domain."),
             "case {identity:?}: expected the message to name the identity, got {:?}",
             put.message()
         );

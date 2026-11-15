@@ -14,8 +14,9 @@
 //! it as `DkimAttributes$SigningEnabled`, while the rest of the DKIM configuration
 //! (the authentication status SES derives from DNS, the token set, the origin and
 //! the key lengths of the key pair in use) and the identity's other attributes are
-//! untouched; an identity the account does not hold is refused with a terminal 404
-//! `NotFoundException`. The tables below span what the rule generalises over: both
+//! untouched; an identity the account does not hold is refused with a terminal 400
+//! `BadRequestException` naming the domain SES was asked to sign for. The tables below
+//! span what the rule generalises over: both
 //! settings, every DKIM configuration an identity can be created with (Easy DKIM at
 //! either key length, Bring Your Own DKIM, and an address identity with no DKIM at
 //! all), each identity spelling, the orderings and repetitions of writes, the member
@@ -462,33 +463,35 @@ async fn an_identity_the_account_does_not_hold_is_refused() {
 
     // Each way the lookup misses: never created, created and then deleted, a local
     // part differing only in case (the local part is compared as supplied), and a
-    // domain that merely contains a stored one.
-    let missing: &[&str] = &[
-        "absent@example.com",
-        "absent.example.com",
-        "deleted@example.com",
-        "SENDER@example.com",
-        "sub.example.com",
+    // domain that merely contains a stored one. The sentence names the DOMAIN SES was
+    // asked to sign for, which is the whole value of a domain identity and the domain
+    // part of an address.
+    let missing: &[(&str, &str)] = &[
+        ("absent@example.com", "example.com"),
+        ("absent.example.com", "absent.example.com"),
+        ("deleted@example.com", "example.com"),
+        ("SENDER@example.com", "example.com"),
+        ("sub.example.com", "sub.example.com"),
     ];
 
-    for identity in missing {
+    for (identity, domain) in missing {
         for enabled in [false, true] {
             let put = ses.put_dkim(identity, enabled).await;
             assert_eq!(
-                put.status, 404,
-                "case ({identity:?}, {enabled:?}): expected 404, got {} {:?}",
+                put.status, 400,
+                "case ({identity:?}, {enabled:?}): expected 400, got {} {:?}",
                 put.status, put.body
             );
             assert_eq!(
                 put.error_code(),
-                "NotFoundException",
-                "case ({identity:?}, {enabled:?}): expected NotFoundException, got {:?}",
+                "BadRequestException",
+                "case ({identity:?}, {enabled:?}): expected BadRequestException, got {:?}",
                 put.body
             );
             assert_eq!(
                 put.message(),
-                format!("Email identity {identity} does not exist."),
-                "case ({identity:?}, {enabled:?}): expected the message to name the identity, got {:?}",
+                format!("Domain {domain} is not verified for DKIM signing."),
+                "case ({identity:?}, {enabled:?}): expected the message to name the domain, got {:?}",
                 put.message()
             );
         }

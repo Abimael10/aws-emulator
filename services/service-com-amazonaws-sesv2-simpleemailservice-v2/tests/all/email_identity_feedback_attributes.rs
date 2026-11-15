@@ -12,7 +12,7 @@
 //! stored flag afterwards is exactly the value supplied, whatever it was before and
 //! however often the same value is written — and every later read of that identity
 //! reports it, while the identity's other attributes are untouched; an identity the
-//! account does not hold is refused with a terminal 404 `NotFoundException`. The
+//! account does not hold is refused with a terminal 400 `BadRequestException`. The
 //! tables below span what the rule generalises over: both settings, each identity
 //! kind and spelling, the orderings and repetitions of writes, the member left out
 //! of the request, and each way the lookup can miss.
@@ -404,19 +404,21 @@ async fn an_identity_the_account_does_not_hold_is_refused() {
         for enabled in [false, true] {
             let put = ses.put_feedback(identity, enabled).await;
             assert_eq!(
-                put.status, 404,
-                "case ({identity:?}, {enabled:?}): expected 404, got {} {:?}",
+                put.status, 400,
+                "case ({identity:?}, {enabled:?}): expected 400, got {} {:?}",
                 put.status, put.body
             );
             assert_eq!(
                 put.error_code(),
-                "NotFoundException",
-                "case ({identity:?}, {enabled:?}): expected NotFoundException, got {:?}",
+                "BadRequestException",
+                "case ({identity:?}, {enabled:?}): expected BadRequestException, got {:?}",
                 put.body
             );
             assert_eq!(
                 put.message(),
-                format!("Email identity {identity} does not exist."),
+                format!(
+                    "Identity {identity} is invalid. Must be a verified email address or domain."
+                ),
                 "case ({identity:?}, {enabled:?}): expected the message to name the identity, got {:?}",
                 put.message()
             );

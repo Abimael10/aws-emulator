@@ -4362,12 +4362,54 @@ pub fn email_identity_not_found(identity: &str) -> String {
 /// The same sentence as [`email_identity_not_found`] without the angle brackets
 /// around the value: the fixed text `Email identity ` + ` does not exist.`, with the
 /// `EmailIdentity` the request spelled as its only variable part. `DeleteEmailIdentity`
-/// and the writes that hang attributes or a policy off an identity
-/// (`PutEmailIdentity*`, `CreateEmailIdentityPolicy`) are the operations recorded
-/// answering this form, stated once here so no two of them word the one condition
-/// differently.
+/// and `CreateEmailIdentityPolicy` — the operations that address the identity RECORD
+/// without quoting its name — are the ones recorded answering this form, stated once
+/// here so no two of them word the one condition differently.
+///
+/// The attribute writes (`PutEmailIdentity*Attributes`) do NOT answer it: they classify
+/// an identity they cannot resolve as invalid input, worded by
+/// [`identity_is_not_a_sending_identity`].
 pub fn email_identity_not_found_unquoted(identity: &str) -> String {
     format!("Email identity {identity} does not exist.")
+}
+
+/// How this service words `BadRequestException` for an `EmailIdentity` that an
+/// attribute write cannot resolve to one of the account's identities.
+///
+/// The `PutEmailIdentity*Attributes` writes set a property OF a sending identity, so
+/// the value they carry is an input SES validates — the identity it has to sign,
+/// forward or send for — rather than a resource the call addresses: a value naming
+/// none of the account's identities is refused as invalid input, with the fixed text
+/// `Identity ` + ` is invalid. Must be a verified email address or domain.` and the
+/// `EmailIdentity` the request spelled, unquoted, as its only variable part.
+///
+/// This is deliberately NOT [`email_identity_not_found_unquoted`]: that sentence, and
+/// the `NotFoundException` carrying it, belong to the operations that address the
+/// identity RECORD — the reads, the delete, and the policy and certificate operations
+/// that hang a child off it — which keep answering 404. The DKIM write states the same
+/// refusal in terms of the mechanism it configures ([`domain_not_verified_for_dkim`]);
+/// this is the sentence for the writes that configure no one mechanism of its own.
+pub fn identity_is_not_a_sending_identity(identity: &str) -> String {
+    format!("Identity {identity} is invalid. Must be a verified email address or domain.")
+}
+
+/// How this service words `BadRequestException` when `PutEmailIdentityDkimAttributes`
+/// is asked to set DKIM signing for an identity the account does not hold.
+///
+/// DKIM signs a DOMAIN's mail, so the sentence this refusal carries names the domain
+/// rather than the identity the request spelled: the fixed text is `Domain ` + ` is not
+/// verified for DKIM signing.`, and its only variable part is the domain the requested
+/// identity belongs to ([`identity_domain`]) — the whole value for a domain identity,
+/// and the domain part of an address. That is the sentence this surface is RECORDED
+/// answering for this refusal (quoted in the resolved report under
+/// `issues/things-that-now-work/`); the writes that configure no one mechanism of their
+/// own state the same refusal of the identity instead
+/// ([`identity_is_not_a_sending_identity`]).
+pub fn domain_not_verified_for_dkim(identity: &str) -> String {
+    format!(
+        "Domain {} is not verified for DKIM signing.",
+        identity_domain(identity)
+    )
 }
 
 /// How this service words `AlreadyExistsException` for a sending-authorization policy

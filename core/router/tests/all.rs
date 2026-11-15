@@ -7210,3 +7210,16 @@ mod events_lambda_target_permission_granted_after_the_rule;
 // above, written with `//!` past the first item (`E0753`, so no suite of this target
 // compiled) — are gone rather than re-typed: the rules live in the header above, and
 // everything else a landing has to say lives in `all/appended_notes.rs`.
+//! pair, keeping the list sorted: one pair per suite and NOTHING else, so a landing has
+//! A suite that is not declared here compiles nowhere and its tests never run. A suite
+//! left at the top level of `tests/` fails the build. Declare each suite exactly ONCE:
+//! this is one crate root, so a second `mod` for the same name is `E0428`. An inner doc
+//! comment is legal only BEFORE the first item, so THESE lines are the only place one
+//! may stand — past the first item `//!` is `E0753`, so a note further down this file
+//! is an ordinary `//` comment, and better still belongs in the suite it is about.
+//! Either error fails every suite in this target.
+//! Why a suite lives in this crate rather than in a service crate's own target belongs
+//! in that suite file's own header, where it stays with the suite it explains: a note
+//! repeated here drifts from it, and one note per suite buries the list this file is.
+//! (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` is what
+//! points it into `tests/all/`.

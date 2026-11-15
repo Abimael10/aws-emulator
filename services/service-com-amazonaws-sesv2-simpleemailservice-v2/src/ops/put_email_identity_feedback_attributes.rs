@@ -163,14 +163,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .identities
             .get_mut(&crate::state::identity_key(&input.email_identity))
         else {
-            return Err(PutEmailIdentityFeedbackAttributesErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::email_identity_not_found_unquoted(
-                        &input.email_identity,
-                    )),
-                },
-            )
-            .into());
+            // The identity is this write's INPUT — the identity SES would have to
+            // forward feedback for — and not a resource this call addresses, so a
+            // value that names none of the account's identities is refused as invalid
+            // input rather than as a missing resource. Same classification as the
+            // sibling attribute writes.
+            return Err(
+                PutEmailIdentityFeedbackAttributesErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::identity_is_not_a_sending_identity(
+                            &input.email_identity,
+                        )),
+                    },
+                )
+                .into(),
+            );
         };
 
         // "Sets the feedback forwarding configuration for the identity": the request
