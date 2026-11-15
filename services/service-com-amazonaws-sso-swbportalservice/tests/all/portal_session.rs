@@ -13,8 +13,8 @@
 //!   not assigned to is reported as absent;
 //! * role credentials are minted by the emulator, stored, and expire in the future;
 //! * `Logout` invalidates the session in state, so every later call is unauthorized;
-//! * an unusable token is 401, and an authenticated but unreadable request is 400, on
-//!   every operation.
+//! * an unusable token is 401, and an authenticated but unreadable request is 400
+//!   `InvalidRequestException`, on every operation.
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
@@ -888,15 +888,13 @@ enum Expect {
     Served,
     /// Refused with HTTP 400 and this error code.
     Refused(&'static str),
-    /// Refused with HTTP 400 by the codec, before any rule of this service applies, so
-    /// the code is the framework's `ValidationException` rather than a modeled one.
-    RefusedByTheCodec,
 }
 
 /// RULE: a request from an AUTHENTICATED caller that this service cannot read is 400
 /// `InvalidRequestException` — an absent required parameter, a `maxResults` outside the
-/// modeled 1..100 range, or a `nextToken` it did not issue. (A request presenting no
-/// usable session never gets this far: it is 401, whatever else it carries.)
+/// modeled 1..100 range, a `maxResults` no integer can be read from, or a `nextToken` it
+/// did not issue. (A request presenting no usable session never gets this far: it is 401,
+/// whatever else it carries.)
 #[tokio::test]
 async fn an_unreadable_request_is_an_invalid_request() {
     let portal = Portal::new();
@@ -911,9 +909,10 @@ async fn an_unreadable_request_is_an_invalid_request() {
         ("0", Expect::Refused("InvalidRequestException")),
         ("101", Expect::Refused("InvalidRequestException")),
         ("-1", Expect::Refused("InvalidRequestException")),
-        // Not an integer, so the request never becomes a value with a range to check:
-        // the codec refuses it (400) before any rule of this service's applies.
-        ("not-a-number", Expect::RefusedByTheCodec),
+        // Not an integer, so the request never becomes a value with a range to check —
+        // and a request this service cannot read is the same modelled refusal as one it
+        // read and would not serve (`unreadable_wire_value.rs` sweeps that class).
+        ("not-a-number", Expect::Refused("InvalidRequestException")),
     ];
     for (value, expect) in max_results {
         let response = portal
@@ -934,16 +933,8 @@ async fn an_unreadable_request_is_an_invalid_request() {
             Expect::Refused(code) => assert_eq!(
                 (response.status(), error_code(&response).as_str()),
                 (StatusCode::BAD_REQUEST, *code),
-                "case max_result={value:?}: outside the modeled range, expected 400 \
-                 {code}, got {} {:?}",
-                response.status(),
-                body_text(&response)
-            ),
-            Expect::RefusedByTheCodec => assert_eq!(
-                response.status(),
-                StatusCode::BAD_REQUEST,
-                "case max_result={value:?}: unreadable as an integer, expected 400, got \
-                 {} {:?}",
+                "case max_result={value:?}: a request this service will not read, expected \
+                 400 {code}, got {} {:?}",
                 response.status(),
                 body_text(&response)
             ),

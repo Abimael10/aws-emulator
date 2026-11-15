@@ -39,5 +39,7 @@ mod store_unreachable_refusal;
 mod sweep_independent_sign_in;
 #[path = "all/unauthorized_rejection.rs"]
 mod unauthorized_rejection;
+#[path = "all/unreadable_wire_value.rs"]
+mod unreadable_wire_value;
 #[path = "all/user_role_assignment.rs"]
 mod user_role_assignment;

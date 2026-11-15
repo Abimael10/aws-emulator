@@ -25,7 +25,9 @@
 //!   returns `None`, so every request resolves through the generated routing table.
 //!   Return `Some(op)` to serve one yourself. The portal answers its authentication
 //!   refusal here, because that refusal precedes reading anything else of the request
-//!   (see [`session_gate`]).
+//!   (see [`session_gate`]), and the refusal of a request it cannot READ at all, because
+//!   the framework gives a codec failure no structured form for the seam below to word
+//!   (see [`unreadable_request`]).
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -44,10 +46,28 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 mod session_gate;
+mod unreadable_request;
 
 use session_gate::{PresentedSession, SessionGate};
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
+use unreadable_request::UnreadableRequest;
+
+/// The error this service's model declares for a problem with the input to the request,
+/// and the one it words EVERY request it will not read with: an absent `@required`
+/// parameter, a value outside a declared constraint, and a value no value of the modelled
+/// member's type can be read from alike. A service-common error of all four bound
+/// operations, carrying the 400 the protocol gives such a refusal.
+///
+/// One constant for the whole service, so the three seams that state it — the two below
+/// and [`unreadable_request`] — cannot drift into naming different errors for one class of
+/// request.
+pub(super) const INVALID_REQUEST_CODE: &str = "InvalidRequestException";
+
+/// What this service states when it will not read a request and has nothing more specific
+/// to say about it: the framework's violations rendered no sentence, or a failing read
+/// named no member of the input.
+pub(super) const REQUEST_NOT_VALID_MESSAGE: &str = "the request is not valid";
 
 /// This service's modeled endpoint prefix (`portal.sso`), as `OPERATIONS.md` and the
 /// model's `awsService` trait give it. Used by [`EmulatedService::can_handle`] to claim
@@ -282,6 +302,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// session. Both seams below ask it, so the two cannot disagree (see
     /// [`session_gate`]).
     session_gate: SessionGate<Eng>,
+    /// The refusal this service answers a request it cannot READ with, on the same shared
+    /// engine: the framework gives a codec failure no structured form, so
+    /// [`Service::override_refusal`] is never consulted for one and the rule is stated
+    /// through the seam before the framework reads anything (see [`unreadable_request`]).
+    unreadable_request: UnreadableRequest<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -291,7 +316,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            session_gate: SessionGate::new(engine),
+            session_gate: SessionGate::new(Arc::clone(&engine)),
+            unreadable_request: UnreadableRequest::new(engine),
         }
     }
 }
@@ -377,8 +403,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // was never authenticated either, so neither is read. The gate words each of
         // them (see [`session_gate`]).
         self.entry.routing_table().get(routing_key)?;
-        (self.session_gate.presented_session(req) != PresentedSession::Usable)
-            .then_some(&self.session_gate as &dyn ErasedOperation)
+        if self.session_gate.presented_session(req) != PresentedSession::Usable {
+            return Some(&self.session_gate as &dyn ErasedOperation);
+        }
+        //
+        // The caller IS authenticated, so the request is read — and a request this service
+        // cannot read is refused with the error its model declares for a problem with the
+        // input, exactly as the seam below words the refusals the framework hands back
+        // structurally. It is answered here because a codec failure never becomes one of
+        // those: the framework renders it under an error shape this model does not declare,
+        // which a restJson1 SDK cannot resolve onto any modelled error (see
+        // [`unreadable_request`]). A request this service CAN read is not claimed, and goes
+        // on to the operation it named.
+        let protocol = self.entry.wire_protocol(req).protocol();
+        unreadable_request::refusal_for::<Eng>(routing_key, protocol, req)
+            .map(|_| &self.unreadable_request as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -392,11 +431,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // does one whose session could not be looked up at all: the gate in
         // `override_operation` above answers both first, so what is left to word here is
         // a request from an AUTHENTICATED caller that this service will not read.
+        //
+        // Nor does every such request reach it: the framework gives only an ABSENT
+        // required member and a value outside a declared constraint a structured form, so
+        // a value the codec could not read at all is worded by `override_operation` above
+        // instead (see [`unreadable_request`]) — with the SAME code, so the two seams
+        // answer one class of request one way.
         if let Refusal::Invalid(violations) = refusal {
             return Some(Refused {
-                code: "InvalidRequestException".to_string(),
+                code: INVALID_REQUEST_CODE.to_string(),
                 message: aws_smithy_schema_server::envelope(violations)
-                    .unwrap_or_else(|| "the request is not valid".to_string()),
+                    .unwrap_or_else(|| REQUEST_NOT_VALID_MESSAGE.to_string()),
             });
         }
         // The only other refusal class is the EMULATOR's own request authentication
@@ -462,7 +507,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         Some(self.entry.refusal_response(
             aws_smithy_schema_server::ProtocolError::Invalid(violations),
             Some(Refused {
-                code: "InvalidRequestException".to_string(),
+                code: INVALID_REQUEST_CODE.to_string(),
                 message,
             }),
             req,

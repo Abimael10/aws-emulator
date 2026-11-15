@@ -49,11 +49,9 @@ enum Expect {
     /// Inside every modelled rule, so the request is served.
     Served,
     /// This service's modelled refusal of a request it will not read: 400
-    /// `InvalidRequestException`.
+    /// `InvalidRequestException` — whether the value was read and broke a modelled rule or
+    /// could not be read at all (`unreadable_wire_value.rs` sweeps the second class).
     Invalid,
-    /// Refused 400 by the codec, before any rule of this service applies, so the code is
-    /// the framework's rather than a modelled one.
-    Unreadable,
 }
 
 /// The listings that bind the constrained member, with the query each needs to name a
@@ -98,12 +96,12 @@ fn queries() -> Vec<(String, String, Expect)> {
         (
             "a page bound that is no integer".to_string(),
             "max_result=not-a-number".to_string(),
-            Expect::Unreadable,
+            Expect::Invalid,
         ),
         (
             "a page bound past the modelled integer width".to_string(),
             format!("max_result={}", i64::from(i32::MAX) + 1),
-            Expect::Unreadable,
+            Expect::Invalid,
         ),
     ];
     // Each published bound (inside the range) and one past each of them, plus a negative
@@ -245,14 +243,6 @@ async fn an_authenticated_caller_earns_the_modelled_answer_for_the_same_value() 
                     (StatusCode::BAD_REQUEST, "InvalidRequestException"),
                     "case {case:?}: {uri:?} is a request this service will not read, \
                      expected 400 InvalidRequestException, got {} {:?}",
-                    response.status(),
-                    body_text(&response)
-                ),
-                Expect::Unreadable => assert_eq!(
-                    response.status(),
-                    StatusCode::BAD_REQUEST,
-                    "case {case:?}: {uri:?} is unreadable as an integer, expected 400, got \
-                     {} {:?}",
                     response.status(),
                     body_text(&response)
                 ),
