@@ -88,6 +88,25 @@
 // An inner attribute, like an inner doc comment, is legal only before the first item, so the
 // one this target needs stands here rather than in the list below.
 #![allow(clippy::doc_lazy_continuation)]
+// suite file under `tests/all/`, sorted by name, and no other line. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair in order; what that suite covers, and why it
+// drives the assembled router rather than one service crate, belongs in its OWN module
+// header, where it is read beside the test it explains.
+// EVERY comment in this file is an ordinary `//` one, this header included, and that is
+// deliberate: an inner doc comment, like an inner attribute, is legal only before the first
+// item, so one that lands past the declarations compiles no suite of this target at all. With
+// none anywhere in the file, no merge of two landings can put one past the first item.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of
+// this file, which the layout check refuses: the `#[path]` is what points each declaration
+// into `tests/all/`. A suite no `mod` here names is compiled nowhere and its tests never run,
+// and a second `mod` for one name fails every suite in this target.
+// `all/all_rs_is_a_canonical_declaration_list.rs`,
+// `all/declaration_roots_are_canonical_and_complete.rs`,
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` and
+// `all/every_suite_file_is_declared.rs` pin those rules, for this file and for every service
+// crate's `tests/all.rs`, so check there rather than leaving a note here;
+// `all/appended_header_notes.rs`, `all/appended_notes.rs`, `all/appended_notes_tail.rs` and
+// `all/appended_prose.rs` keep what the notes landings had appended to this file.
 #[path = "all/agent_registry_discovery_routes_probe.rs"]
 mod agent_registry_discovery_routes_probe;
 #[path = "all/agent_registry_signing_name_routing.rs"]

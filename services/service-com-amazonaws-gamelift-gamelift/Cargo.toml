@@ -12,6 +12,10 @@ engine = { workspace = true }
 # Amazon GameLift Servers-owned location a build's files are uploaded to is a bucket
 # provisioned in THAT store (`state::provision_build_upload_bucket`).
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The upload credentials this service vends are a SESSION, scoped to the one upload by a
+# session policy the token service holds and Amazon S3's authorizer reads
+# (`state::upload_session`).
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

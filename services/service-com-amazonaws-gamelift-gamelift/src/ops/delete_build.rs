@@ -212,16 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The upload credential this build was issued is "valid only for the build [it was]
         // issued for", so a credential whose build is gone can authorise nothing: it is
-        // withdrawn from the credential store rather than left signable.
+        // withdrawn — the session it belongs to and the material it signs with — rather than
+        // left signable ([`crate::state::upload_session::forget`]).
         if let Some(credential_id) = removed.upload_credential_id.as_deref() {
-            if let Err(error) = ctx.credential_store().delete(credential_id) {
-                ::tracing::warn!(
-                    operation = Self::NAME,
-                    reason = ?error,
-                    "the upload credential of a deleted build could not be withdrawn from the \
-                     credential store"
-                );
-            }
+            crate::state::upload_session::forget(
+                &*self.engine,
+                ctx.credential_store(),
+                credential_id,
+            );
         }
 
         Ok(DeleteBuildOutput)

@@ -207,7 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use ::emulator_server::aws_credentials::{AWS_SESSION, SECRET_ACCESS_KEY, SESSION_TOKEN};
         use crate::state::{
             BUILD_STATUS_INITIALIZED, DEFAULT_SERVER_SDK_VERSION, MAX_BUILDS_PER_ACCOUNT,
             WORKFLOW_DELAY,
@@ -292,47 +291,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The credential material comes from the emulator's credential store, the only thing
         // that creates credentials: the id, the secret and the session token are values a
-        // later signed request verifies against, never values this handler made up. It is
-        // minted BEFORE the build store is locked, so no other component's lock is taken
-        // while that guard is held; a request that is then refused withdraws the credential
-        // again, so a refusal leaves nothing signable behind.
+        // later signed request verifies against, never values this handler made up. What is
+        // vended is a session SCOPED to the upload of the location the build is handed — the
+        // upload is what the credentials are for, so it is all they may do
+        // ([`crate::state::upload_session::vend`]) — so it is vended once that location is
+        // settled, and with this service's guard given up (the lock order that module
+        // documents).
         let credentials = ctx.credential_store();
-        let minted = requested_location
-            .is_none()
-            .then(|| credentials.create(&AWS_SESSION));
-        let withdraw = |why: &'static str| {
-            let Some(minted) = minted.as_ref() else {
-                return;
-            };
-            // A credential no build kept is one nothing can be attributed to, so it is
-            // forgotten again rather than left signable. A failed withdrawal would leave an
-            // orphaned credential record, so say so rather than dropping the result.
-            if let Err(error) = credentials.delete(&minted.id) {
-                ::tracing::warn!(
-                    operation = Self::NAME,
-                    reason = ?error,
-                    why,
-                    "an unattributed build upload credential could not be withdrawn from the \
-                     credential store"
-                );
-            }
-        };
+        let vends_credentials = requested_location.is_none();
 
         let region = crate::state::request_region(ctx);
         // The location the response hands back has to REACH something, or the credentials
-        // minted with it could upload nowhere: the bucket behind a service-owned location is
+        // vended with it could upload nowhere: the bucket behind a service-owned location is
         // stood up as part of creating the build, in the one object store this emulator
-        // holds. Like the credential, it is claimed BEFORE the build store is locked, so no
-        // other component's lock is taken while that guard is held. Its name is the service's
+        // holds. It is claimed BEFORE the build store is locked, so no other component's
+        // lock is taken while that guard is held. Its name is the service's
         // build bucket for the Region this create was served in, so this records at most one
         // bucket per Region however many builds are created, and a name held by a bucket that
         // is not this service's refuses the create rather than vending an upload into it. A
         // caller that named its own bucket needs none of this: those files are already where
         // they belong.
-        if requested_location.is_none()
+        if vends_credentials
             && crate::state::provision_build_upload_bucket(&*self.engine, &region) != Some(true)
         {
-            withdraw("the upload location's object store could not be stood up");
             return Err(internal(
                 "the Amazon S3 location for the build upload could not be stood up",
             ));
@@ -347,12 +328,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|location| crate::state::build_files_present(&*self.engine, location));
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            withdraw("the service state is unavailable");
             return Err(internal("the GameLift emulator state is unavailable"));
         };
-        let mut state = state.lock();
         let now = ::std::time::SystemTime::now();
-        state.tick(now);
+        let mut held = state.lock();
+        held.tick(now);
 
         // A build record lives until `DeleteBuild` removes it, so the account's build quota
         // is what keeps the store bounded as well as what makes a modelled refusal
@@ -360,8 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ConflictException` is "the requested operation would cause a conflict with the
         // current state of a service resource associated with the request" — the account's
         // build collection being full is exactly such a state.
-        if state.builds.len() >= MAX_BUILDS_PER_ACCOUNT {
-            withdraw("the account's build quota is reached");
+        if held.builds.len() >= MAX_BUILDS_PER_ACCOUNT {
             return Err(CreateBuildErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
                     "The account already holds the maximum of {MAX_BUILDS_PER_ACCOUNT} builds; \
@@ -377,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another build already carries is NOT refused here.
         let build_id = format!(
             "build-{}",
-            crate::state::mint_uuid(&mut state.minted_ids, "build")
+            crate::state::mint_uuid(&mut held.minted_ids, "build")
         );
         let build_arn = crate::state::gamelift_arn(&region, &format!("build/{build_id}"));
 
@@ -399,29 +378,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // A credential without its secrets cannot sign the upload it was minted for, and
-        // the store never hands them back after the create, so no later call could supply
-        // them: the credential is withdrawn and the build is not recorded against it.
-        let upload_credentials = match minted.as_ref() {
-            Some(minted) => {
-                let (Some(secret_access_key), Some(session_token)) = (
-                    minted.secret(SECRET_ACCESS_KEY).map(str::to_string),
-                    minted.secret(SESSION_TOKEN).map(str::to_string),
-                ) else {
-                    withdraw("minted without the secrets an upload is signed with");
-                    return Err(internal(
-                        "the build upload credentials were minted without their secrets",
-                    ));
-                };
-                Some(AwsCredentials {
-                    access_key_id: Some(minted.id.clone()),
-                    secret_access_key: Some(secret_access_key),
-                    session_token: Some(session_token),
-                })
-            }
-            None => None,
-        };
-
         let record = crate::state::BuildRecord {
             build_id: build_id.clone(),
             build_arn,
@@ -440,24 +396,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clone()
                 .unwrap_or_else(|| DEFAULT_SERVER_SDK_VERSION.to_string()),
             creation_time: now,
-            storage_location,
+            storage_location: storage_location.clone(),
             ready_at,
-            upload_credential_id: minted.as_ref().map(|minted| minted.id.clone()),
+            // The upload credential is a session scoped to the location above, and vending
+            // one reaches another store — so it is vended with this guard given up and
+            // recorded on the build below.
+            upload_credential_id: None,
             tags,
             region,
         };
-        state.builds.insert(build_id.clone(), record);
+        held.builds.insert(build_id.clone(), record);
+        // The guard is released before the token service's store is reached, so the two
+        // locks are never held at once.
+        drop(held);
+
+        // "This operation creates a new build resource and also returns an Amazon S3
+        // location with temporary access credentials. Use the credentials to manually upload
+        // your build files to the specified Amazon S3 location": the credentials authorise
+        // the upload TO that location, and nothing else — so what is vended is a session
+        // capped to it. A build whose files are already in the caller's own bucket uploads
+        // nothing and is handed none.
+        let vended = if vends_credentials {
+            let vended = crate::state::upload_session::vend(
+                &*self.engine,
+                credentials,
+                now,
+                &build_id,
+                &storage_location,
+            );
+            let Some(vended) = vended else {
+                // A build nobody can upload to is not a created build, so the record goes
+                // with the refusal rather than being left with a location no credential
+                // reaches.
+                state.lock().builds.remove(&build_id);
+                return Err(internal(
+                    "the build upload credentials could not be scoped to the upload",
+                ));
+            };
+            Some(vended)
+        } else {
+            None
+        };
 
         // Report the STORED record, so this response and every later read of the same build
-        // can only agree.
-        let Some(stored) = state.builds.get(&build_id) else {
-            withdraw("the new build could not be read back");
+        // can only agree — with the credential this create vended recorded on it, since
+        // these credentials are "valid only for the build they were issued for".
+        let reported = {
+            let mut held = state.lock();
+            held.builds.get_mut(&build_id).map(|build| {
+                build.upload_credential_id = vended
+                    .as_ref()
+                    .map(|vended| vended.access_key_id.clone());
+                (build.to_modelled(), build.storage_location.clone())
+            })
+        };
+        let Some((build, reported_location)) = reported else {
+            // The build went away between the two reads, so nothing holds the credential
+            // this call vended: it is withdrawn rather than left signable.
+            if let Some(vended) = vended.as_ref() {
+                crate::state::upload_session::forget(
+                    &*self.engine,
+                    credentials,
+                    &vended.access_key_id,
+                );
+            }
             return Err(internal("the new build could not be read back"));
         };
         Ok(CreateBuildOutput {
-            build: Some(stored.to_modelled()),
-            storage_location: Some(stored.storage_location.clone()),
-            upload_credentials,
+            build: Some(build),
+            storage_location: Some(reported_location),
+            upload_credentials: vended.map(|vended| AwsCredentials {
+                access_key_id: Some(vended.access_key_id),
+                secret_access_key: Some(vended.secret_access_key),
+                session_token: Some(vended.session_token),
+            }),
         })
     }
 }

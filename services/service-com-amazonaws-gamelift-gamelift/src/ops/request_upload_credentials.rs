@@ -153,8 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use ::emulator_server::aws_credentials::{AWS_SESSION, SECRET_ACCESS_KEY, SESSION_TOKEN};
-
         let internal = |message: &str| -> Self::Error {
             RequestUploadCredentialsErrorModeled::InternalServiceException(
                 InternalServiceException {
@@ -163,38 +161,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into()
         };
-
-        // "If successful, a new set of credentials are returned": this operation's whole
-        // purpose is to MINT, so it writes where a reporting operation would not. The
-        // material comes from the emulator's credential store, the only thing that creates
-        // credentials, and is minted BEFORE the build store is locked, so no other
-        // component's lock is taken while that guard is held.
-        let credentials = ctx.credential_store();
-        let minted = credentials.create(&AWS_SESSION);
-        let forget = |id: &str, why: &'static str| {
-            if let Err(error) = credentials.delete(id) {
-                ::tracing::warn!(
-                    operation = Self::NAME,
-                    reason = ?error,
-                    why,
-                    "a build upload credential could not be withdrawn from the credential store"
-                );
-            }
-        };
-
-        let (Some(secret_access_key), Some(session_token)) = (
-            minted.secret(SECRET_ACCESS_KEY).map(str::to_string),
-            minted.secret(SESSION_TOKEN).map(str::to_string),
-        ) else {
-            forget(&minted.id, "minted without the secrets an upload is signed with");
-            return Err(internal(
-                "the build upload credentials were minted without their secrets",
-            ));
+        let not_found = || -> Self::Error {
+            RequestUploadCredentialsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::build_not_found_message(&input.build_id)),
+            })
+            .into()
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            forget(&minted.id, "the service state is unavailable");
             return Err(internal("the GameLift emulator state is unavailable"));
+        };
+        let credentials = ctx.credential_store();
+        let now = ::std::time::SystemTime::now();
+
+        // WHICH build the credentials are for, and the location its files belong at: the
+        // credentials are scoped to the upload of THAT location, so it is read before
+        // anything is minted. The guard is released before the credential is vended, so no
+        // other component's lock is taken while this service's guard is held (the lock order
+        // `crate::state::upload_session` documents).
+        let located = {
+            let mut state = state.lock();
+            state.tick(now);
+            let build_id = state.resolve_build_id(&input.build_id);
+            build_id.and_then(|build_id| {
+                state
+                    .builds
+                    .get(&build_id)
+                    .map(|build| (build_id, build.storage_location.clone()))
+            })
+        };
+        let Some((build_id, location)) = located else {
+            return Err(not_found());
+        };
+
+        // "If successful, a new set of credentials are returned": this operation's whole
+        // purpose is to MINT, so it writes where a reporting operation would not. What it
+        // mints is a session scoped to the upload of that location — the upload is what the
+        // credentials are for, so it is all they may do
+        // ([`crate::state::upload_session::vend`]).
+        let Some(vended) = crate::state::upload_session::vend(
+            &*self.engine,
+            credentials,
+            now,
+            &build_id,
+            &location,
+        ) else {
+            return Err(internal(
+                "the build upload credentials could not be scoped to the upload",
+            ));
         };
 
         // The credentials are "valid only for the build they were issued for", so they are
@@ -203,35 +217,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and a set that is not the build's current one is past its use.
         let issued = {
             let mut state = state.lock();
-            state.tick(::std::time::SystemTime::now());
-            let build_id = state.resolve_build_id(&input.build_id);
-            build_id
-                .and_then(|build_id| state.builds.get_mut(&build_id))
-                .map(|build| {
-                    let replaced = build.upload_credential_id.replace(minted.id.clone());
-                    (build.storage_location.clone(), replaced)
-                })
+            state.builds.get_mut(&build_id).map(|build| {
+                let replaced = build
+                    .upload_credential_id
+                    .replace(vended.access_key_id.clone());
+                (build.storage_location.clone(), replaced)
+            })
         };
         // The guard is released before the credential store is reached again, so the two
         // locks are never held at once.
         let Some((storage_location, replaced)) = issued else {
-            forget(&minted.id, "no stored build to issue credentials for");
-            return Err(RequestUploadCredentialsErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::build_not_found_message(&input.build_id)),
-                },
-            )
-            .into());
+            // The build went away between the two reads, so nothing holds these credentials:
+            // they are withdrawn rather than left signable.
+            crate::state::upload_session::forget(
+                &*self.engine,
+                credentials,
+                &vended.access_key_id,
+            );
+            return Err(not_found());
         };
         if let Some(replaced) = replaced {
-            forget(&replaced, "replaced by a fresher set for the same build");
+            crate::state::upload_session::forget(&*self.engine, credentials, &replaced);
         }
 
         Ok(RequestUploadCredentialsOutput {
             upload_credentials: Some(AwsCredentials {
-                access_key_id: Some(minted.id.clone()),
-                secret_access_key: Some(secret_access_key),
-                session_token: Some(session_token),
+                access_key_id: Some(vended.access_key_id),
+                secret_access_key: Some(vended.secret_access_key),
+                session_token: Some(vended.session_token),
             }),
             storage_location: Some(storage_location),
         })

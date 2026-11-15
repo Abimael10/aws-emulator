@@ -59,6 +59,15 @@ impl GameLift {
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
             Arc::clone(&engine),
         ));
+        // The token service on the same engine, for the same reason: the credentials this
+        // service vends for an upload are a SESSION it holds, so `sts:GetCallerIdentity` is
+        // what reports the principal those credentials speak for. It claims only requests
+        // scoped to `sts`.
+        router.register_service(
+            service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
         Self { router, engine }
     }
 
@@ -139,10 +148,25 @@ impl GameLift {
     /// the locations a build's files are read from and uploaded to. Answers the HTTP status
     /// and the response body.
     pub(crate) async fn s3(&self, method: &str, path: &str, body: &[u8]) -> (u16, Bytes) {
+        self.s3_as(S3_CALLER_KEY_ID, method, path, body).await
+    }
+
+    /// [`Self::s3`] signed with `access_key_id` rather than with [`S3_CALLER_KEY_ID`]: which
+    /// principal a request speaks for is read off the credential it presents, so this is how
+    /// a suite makes an object call as the holder of credentials an operation vended.
+    pub(crate) async fn s3_as(
+        &self,
+        access_key_id: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> (u16, Bytes) {
         // The credential scope's service field is what routes the request, so this one says
         // `s3` where the GameLift calls above say `gamelift`.
-        let credential =
-            format!("AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/s3/aws4_request, SignedHeaders=host, Signature=00");
+        let credential = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/s3/aws4_request, \
+             SignedHeaders=host, Signature=00"
+        );
         let request = http::Request::builder()
             .method(method)
             .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))
@@ -154,7 +178,41 @@ impl GameLift {
         let status = response.status().as_u16();
         (status, response.into_parts().1)
     }
+
+    /// One `sts:GetCallerIdentity` call signed with `access_key_id`, over the awsQuery wire
+    /// the token service speaks: who the emulator says that credential speaks for. Answers
+    /// the HTTP status and the response document as text.
+    pub(crate) async fn caller_identity(&self, access_key_id: &str) -> (u16, String) {
+        let credential = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/sts/aws4_request, \
+             SignedHeaders=host, Signature=00"
+        );
+        let body = format!("Action=GetCallerIdentity&Version={STS_API_VERSION}");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://sts.{REGION}.amazonaws.com/"))
+            .header("host", format!("sts.{REGION}.amazonaws.com"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("authorization", credential)
+            .body(Bytes::from(body))
+            .expect("build the token-service request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        (
+            status,
+            String::from_utf8_lossy(response.body().as_ref()).to_string(),
+        )
+    }
 }
+
+/// The access key id every object call of this harness signs with unless a suite names
+/// another: a key no store holds, which the emulator resolves to the account's own published
+/// credential.
+pub(crate) const S3_CALLER_KEY_ID: &str = "AKIDTEST";
+
+/// The version of the token service's API an awsQuery request names
+/// (`com.amazonaws.sts#AWSSecurityTokenServiceV20110615`).
+const STS_API_VERSION: &str = "2011-06-15";
 
 /// The `Message` member of a modelled error body. awsJson renders the member under its
 /// modelled name (`NotFoundException$Message`); the lower-case spelling is accepted too

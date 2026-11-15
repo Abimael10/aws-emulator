@@ -83,5 +83,7 @@ mod service_owned_upload_locations;
 mod state_roundtrip;
 #[path = "all/unknown_resource_lookups.rs"]
 mod unknown_resource_lookups;
+#[path = "all/upload_credential_scope.rs"]
+mod upload_credential_scope;
 #[path = "all/vpc_peering_authorizations.rs"]
 mod vpc_peering_authorizations;
