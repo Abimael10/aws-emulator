@@ -11165,6 +11165,7 @@ dependencies = [
  "service-com-amazonaws-apigatewayv2-apigatewayv2",
  "service-com-amazonaws-appconfig-amazonappconfig",
  "service-com-amazonaws-applicationautoscaling-anyscalefrontendservice",
+ "service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice",
  "service-com-amazonaws-autoscaling-autoscaling-2011-01-01",
  "service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda",
  "service-com-amazonaws-cloudfront-cloudfront2020-05-31",

@@ -40,6 +40,21 @@ pub const APPSYNC_RESOLVER: &str = "AWS::AppSync::Resolver";
 pub const APPSYNC_FUNCTION_CONFIGURATION: &str = "AWS::AppSync::FunctionConfiguration";
 pub const APPSYNC_API_KEY: &str = "AWS::AppSync::ApiKey";
 
+/// The `AWS::AppSync::*` types an EVENT API's estate is declared with — the API itself, whose
+/// endpoints carry published events, and the channel namespaces a publisher and a subscriber
+/// address on it — and the one that links a SOURCE API to a Merged API.
+pub const APPSYNC_API: &str = "AWS::AppSync::Api";
+pub const APPSYNC_CHANNEL_NAMESPACE: &str = "AWS::AppSync::ChannelNamespace";
+pub const APPSYNC_SOURCE_API_ASSOCIATION: &str = "AWS::AppSync::SourceApiAssociation";
+
+/// The property an association names the Merged API it links a source API INTO by, which is
+/// also the `@httpLabel` of every call AppSync publishes on one.
+pub const APPSYNC_MERGED_API_IDENTIFIER_PROPERTY: &str = "MergedApiIdentifier";
+
+/// The property an association names the SOURCE API it links by, which travels in the create's
+/// own body.
+pub const APPSYNC_SOURCE_API_IDENTIFIER_PROPERTY: &str = "SourceApiIdentifier";
+
 /// The ARN namespace (and endpoint prefix) AppSync mints its resources under — that model's
 /// `awsService.arnNamespace`.
 pub const APPSYNC_ARN_NAMESPACE: &str = "appsync";
@@ -73,6 +88,9 @@ pub(super) fn is_appsync_type(resource_type: &str) -> bool {
             | APPSYNC_RESOLVER
             | APPSYNC_FUNCTION_CONFIGURATION
             | APPSYNC_API_KEY
+            | APPSYNC_API
+            | APPSYNC_CHANNEL_NAMESPACE
+            | APPSYNC_SOURCE_API_ASSOCIATION
     )
 }
 
@@ -178,11 +196,93 @@ pub(super) fn appsync_return_values(
             attributes.insert("Arn".to_string(), arn);
             (key_id, attributes)
         }
-        // No other type reaches here: the one arm that calls this names exactly the six
+        // An Event API: `Ref` returns the `Api` ID, and `Fn::GetAtt` reads that id, the ARN
+        // AppSync built on it and the two DNS records the API is SERVED at — one per endpoint,
+        // which only the owning service can produce (it opens the sockets as the API is made).
+        APPSYNC_API => {
+            let api_id = stand_in_api_id(name);
+            attributes.insert("ApiArn".to_string(), api_arn(region, &api_id));
+            attributes.insert("ApiId".to_string(), api_id.clone());
+            for attribute in [DNS_HTTP_ATTRIBUTE, DNS_REALTIME_ATTRIBUTE] {
+                attributes.insert(
+                    attribute.to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (api_id, attributes)
+        }
+        // A channel namespace of an Event API: `Ref` returns the namespace's ARN, which is
+        // the only value that type publishes, built under the API its `ApiId` names and the
+        // path `GetChannelNamespace` addresses it at.
+        APPSYNC_CHANNEL_NAMESPACE => {
+            let arn = child_arn(
+                region,
+                properties,
+                scope,
+                budget,
+                &format!("channelNamespace/{name}"),
+            );
+            attributes.insert("ChannelNamespaceArn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // The link of a source API into a Merged API: AppSync generates the association's own
+        // id, `Ref` returns the ARN built on it under the Merged API that holds it, and
+        // `Fn::GetAtt` reads that pair beside the id and the ARN of each side of the link and
+        // the state the link is in — which only that service reports.
+        APPSYNC_SOURCE_API_ASSOCIATION => {
+            let association_id = stand_in_api_id(name);
+            let merged_api_id = api_id_in(&declared_text(
+                properties,
+                scope,
+                budget,
+                APPSYNC_MERGED_API_IDENTIFIER_PROPERTY,
+            ));
+            let source_api_id = api_id_in(&declared_text(
+                properties,
+                scope,
+                budget,
+                APPSYNC_SOURCE_API_IDENTIFIER_PROPERTY,
+            ));
+            let arn = ::emulator_server::emulator_arn(
+                APPSYNC_ARN_NAMESPACE,
+                region,
+                &format!("apis/{merged_api_id}/sourceApiAssociations/{association_id}"),
+            );
+            attributes.insert("AssociationArn".to_string(), arn.clone());
+            attributes.insert("AssociationId".to_string(), association_id);
+            attributes.insert("MergedApiArn".to_string(), api_arn(region, &merged_api_id));
+            attributes.insert("MergedApiId".to_string(), merged_api_id);
+            attributes.insert("SourceApiArn".to_string(), api_arn(region, &source_api_id));
+            attributes.insert(
+                "SourceApiAssociationStatus".to_string(),
+                service_assigned_document(name, "SourceApiAssociationStatus"),
+            );
+            attributes.insert("SourceApiId".to_string(), source_api_id);
+            (arn, attributes)
+        }
+        // No other type reaches here: the one arm that calls this names exactly the nine
         // above ([`is_appsync_type`]), and a type outside them keeps the physical name the
         // naming rules computed, as every type this catalogue does not carry does.
         _ => (name.to_string(), attributes),
     }
+}
+
+/// The attribute an Event API publishes its HTTP endpoint's DNS record as, and the one it
+/// publishes its real-time endpoint's as — each the `Dns` record of that endpoint, read off
+/// the map `Api$dns` carries them in (keyed `HTTP` and `REALTIME`).
+pub(crate) const DNS_HTTP_ATTRIBUTE: &str = "Dns.Http";
+pub(crate) const DNS_REALTIME_ATTRIBUTE: &str = "Dns.Realtime";
+
+/// The API id an `@httpLabel` of an AppSync call takes, read off either form an identifier is
+/// stated in: "In most cases, Merged APIs (especially in your account) only require the API ID
+/// value or ARN of the merged API" (`AssociateSourceGraphqlApi$mergedApiIdentifier`), so the
+/// id is the last segment of an ARN and the whole value otherwise.
+fn api_id_in(identifier: &str) -> String {
+    identifier
+        .rsplit('/')
+        .next()
+        .unwrap_or(identifier)
+        .to_string()
 }
 
 /// The NAMES of the attributes a resource of one of these types publishes — the other half
@@ -203,6 +303,17 @@ pub(super) fn published_attributes(resource_type: &str) -> &'static [&'static st
             &["DataSourceName", "FunctionArn", "FunctionId", "Name"]
         }
         APPSYNC_API_KEY => &["ApiKey", "ApiKeyId", "Arn"],
+        APPSYNC_API => &["ApiArn", "ApiId", DNS_HTTP_ATTRIBUTE, DNS_REALTIME_ATTRIBUTE],
+        APPSYNC_CHANNEL_NAMESPACE => &["ChannelNamespaceArn"],
+        APPSYNC_SOURCE_API_ASSOCIATION => &[
+            "AssociationArn",
+            "AssociationId",
+            "MergedApiArn",
+            "MergedApiId",
+            "SourceApiArn",
+            "SourceApiAssociationStatus",
+            "SourceApiId",
+        ],
         // A schema publishes no attribute of its own.
         _ => &[],
     }

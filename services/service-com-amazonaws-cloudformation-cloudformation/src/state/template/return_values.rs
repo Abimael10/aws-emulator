@@ -276,7 +276,10 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         | APPSYNC_DATA_SOURCE
         | APPSYNC_RESOLVER
         | APPSYNC_FUNCTION_CONFIGURATION
-        | APPSYNC_API_KEY => appsync::published_attributes(resource_type),
+        | APPSYNC_API_KEY
+        | APPSYNC_API
+        | APPSYNC_CHANNEL_NAMESPACE
+        | APPSYNC_SOURCE_API_ASSOCIATION => appsync::published_attributes(resource_type),
         APIGATEWAY_DEPLOYMENT => &["DeploymentId"],
         APIGATEWAY_API_KEY => &["APIKeyId"],
         APIGATEWAY_AUTHORIZER => &["AuthorizerId"],

@@ -2116,6 +2116,12 @@ fn identity_depends_on_another_resource(resource_type: &str) -> bool {
             | APPSYNC_RESOLVER
             | APPSYNC_FUNCTION_CONFIGURATION
             | APPSYNC_API_KEY
+            // A channel namespace of an Event API and the link of a source API into a Merged
+            // API are two more: a namespace's ARN nests inside the ARN of the `Api` its
+            // `ApiId` names, and an association's inside the ARN of the Merged API its
+            // `MergedApiIdentifier` names.
+            | APPSYNC_CHANNEL_NAMESPACE
+            | APPSYNC_SOURCE_API_ASSOCIATION
     )
 }
 

@@ -224,6 +224,15 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // AWS AppSync, for the `AWS::AppSync::Api`, its `::ChannelNamespace` and the
+    // `::SourceApiAssociation` a stack really creates there, so a suite that deploys an Event
+    // API or a Merged API's link reads every one of them back through that service's own wire,
+    // by the ids, ARNs and endpoints the stack publishes.
+    router.register_service(
+        service_com_amazonaws_appsync_awsdeepdishcontrolplaneservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     // AWS AppConfig, for the `AWS::AppConfig::Application`, `::Environment`,
     // `::ConfigurationProfile` and `::DeploymentStrategy` a stack really creates there, so a
     // suite that deploys a configuration estate reads every one of them back through that

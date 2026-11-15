@@ -201,6 +201,15 @@ impl Owner {
             Self::AppSyncDomainName(kind) => {
                 appsync_domain_names::create(ctx, region, kind, resource, propagated).await
             }
+            // An EVENT API and a channel namespace are both taggable: each type publishes a
+            // `Tags` property and its create takes that map, so the resource carries the tags
+            // CloudFormation gives it beside its own. An ASSOCIATION is not: it publishes no
+            // `Tags` property and `AssociateSourceGraphqlApi` takes none, so CloudFormation
+            // propagates no tag to one.
+            Self::AppSyncEventOrMergedApi(kind) => {
+                appsync_event_and_merged_apis::create(ctx, region, kind, resource, propagated)
+                    .await
+            }
         }
     }
 
@@ -326,6 +335,14 @@ impl Owner {
             Self::AppSyncDomainName(kind) => {
                 appsync_domain_names::readiness(ctx, region, kind, physical_resource_id).await
             }
+            // An Event API and a channel namespace exist as their creates answer; an
+            // ASSOCIATION comes up `MERGE_SCHEDULED`, the merge it started being what makes the
+            // Merged API serve the source API's schema, so that arm waits it out
+            // ([`appsync_event_and_merged_apis::readiness`]).
+            Self::AppSyncEventOrMergedApi(kind) => {
+                appsync_event_and_merged_apis::readiness(ctx, region, kind, physical_resource_id)
+                    .await
+            }
         }
     }
 
@@ -384,6 +401,19 @@ impl Owner {
             // answered with, and a mapping's identifier is the domain it was made on, so
             // there is nothing left to read once either resource is up.
             Self::AppSyncDomainName(_) => Ok(BTreeMap::new()),
+            // An Event API's id, ARN and endpoints, and a channel namespace's ARN, are the ones
+            // their own creates answered with; an ASSOCIATION publishes the STATE of the link,
+            // which the merge its create scheduled has since left behind, so that one is read
+            // again ([`appsync_event_and_merged_apis::ready_attributes`]).
+            Self::AppSyncEventOrMergedApi(kind) => {
+                appsync_event_and_merged_apis::ready_attributes(
+                    ctx,
+                    region,
+                    kind,
+                    physical_resource_id,
+                )
+                .await
+            }
             // A task-definition revision's `TaskDefinitionArn` is the one its own
             // registration answered with, so there is nothing left to read once it is up.
             Self::EcsTaskDefinition => Ok(BTreeMap::new()),
@@ -579,6 +609,14 @@ impl Owner {
             // carried with it — and `DisassociateApi` leaves the domain carrying none, so
             // there is nothing to wait for either.
             Self::AppSyncDomainName(_) => Ok(appsync_domain_names::removal()),
+            // `DeleteApi` and `DeleteChannelNamespace` each take the resource away as they
+            // answer; `DisassociateSourceGraphqlApi` SCHEDULES the association's deletion, so
+            // that arm asks until AppSync no longer holds the link
+            // ([`appsync_event_and_merged_apis::removal`]).
+            Self::AppSyncEventOrMergedApi(kind) => {
+                appsync_event_and_merged_apis::removal(ctx, region, kind, physical_resource_id)
+                    .await
+            }
         }
     }
 
@@ -744,6 +782,13 @@ impl Owner {
             Self::AppSyncDomainName(kind) => {
                 appsync_domain_names::update(ctx, region, kind, resource, declared).await
             }
+            // Each of these three is changed by the update call AppSync publishes for it, which
+            // takes what that call takes and no more; a declaration restating a value the call's
+            // own path binds names a different resource, which the deployment replaces
+            // ([`appsync_event_and_merged_apis::update`]).
+            Self::AppSyncEventOrMergedApi(kind) => {
+                appsync_event_and_merged_apis::update(ctx, region, kind, resource, declared).await
+            }
         }
     }
 
@@ -849,6 +894,10 @@ impl Owner {
             // Nor are the tags of a custom domain that already exists; a mapping is not
             // taggable at all.
             Self::AppSyncDomainName(_) => Ok(()),
+            // The tags of an Event API or a channel namespace that already exists are
+            // reconciled by no arm here yet ([`Provisioner::retag`]'s own default), and an
+            // association is not taggable at all, so nothing is asked about them.
+            Self::AppSyncEventOrMergedApi(_) => Ok(()),
         }
     }
 
@@ -1011,6 +1060,12 @@ impl Owner {
             Self::AppSyncDomainName(kind) => {
                 appsync_domain_names::delete(ctx, region, kind, resource).await
             }
+            // AppSync takes no snapshot of an Event API, a channel namespace or an association
+            // on the way out: there is no such call, so a `Snapshot` deletion policy on one of
+            // them deletes the resource with no snapshot invented for it.
+            Self::AppSyncEventOrMergedApi(kind) => {
+                appsync_event_and_merged_apis::delete(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -1144,6 +1199,10 @@ impl Owner {
             Self::AppSyncDomainName(kind) => {
                 appsync_domain_names::actual_configuration(ctx, region, kind, resource).await?
             }
+            Self::AppSyncEventOrMergedApi(kind) => {
+                appsync_event_and_merged_apis::actual_configuration(ctx, region, kind, resource)
+                    .await?
+            }
         };
         Ok(ActualConfiguration::read(reported))
     }
@@ -1195,6 +1254,8 @@ impl Owner {
             Self::ElasticLoadBalancing(_) => message.to_string(),
             // AppSync's does the same.
             Self::AppSyncDomainName(_) => message.to_string(),
+            // And so does its Event API and merged-API provider.
+            Self::AppSyncEventOrMergedApi(_) => message.to_string(),
         }
     }
 

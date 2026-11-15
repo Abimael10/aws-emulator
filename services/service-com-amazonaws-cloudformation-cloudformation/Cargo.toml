@@ -221,6 +221,13 @@ service-com-amazonaws-autoscaling-autoscaling-2011-01-01 = { workspace = true }
 # service mounted beside CloudFormation, or the create is refused and the stack fails — and
 # the ids the stack publishes are read back through that service's own wire.
 service-com-amazonaws-appconfig-amazonappconfig = { workspace = true }
+# AWS AppSync, for the `AWS::AppSync::Api`, the `AWS::AppSync::ChannelNamespace` and the
+# `AWS::AppSync::SourceApiAssociation` a stack really creates there
+# (`state::provisioning::appsync_event_and_merged_apis`): a suite that deploys one must have
+# its owning service mounted beside CloudFormation, or the create is refused and the stack
+# fails — and the ids, ARNs and endpoints the stack publishes are read back through that
+# service's own wire.
+service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice = { workspace = true }
 # Elastic Load Balancing v2, for the `AWS::ElasticLoadBalancingV2::LoadBalancer`,
 # `::TargetGroup`, `::Listener` and `::ListenerRule` a stack really creates there
 # (`state::provisioning::elastic_load_balancing`): a suite that deploys one must have its

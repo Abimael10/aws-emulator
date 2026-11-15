@@ -31,6 +31,8 @@ mod apigateway_vpc_link_resources;
 mod apigatewayv2_api_property_updates;
 #[path = "all/application_auto_scaling_resources.rs"]
 mod application_auto_scaling_resources;
+#[path = "all/appsync_event_and_merged_api_resources.rs"]
+mod appsync_event_and_merged_api_resources;
 #[path = "all/bedrock_knowledge_base_drift_and_replacement.rs"]
 mod bedrock_knowledge_base_drift_and_replacement;
 #[path = "all/bedrock_knowledge_base_identity.rs"]

@@ -209,6 +209,10 @@ pub(in crate::state) mod appsync_domain_names;
 /// the configuration profile that reads a configuration and the deployment strategy that
 /// rolls one out: created in AWS AppConfig itself ([`appconfig_resources`]).
 mod appconfig_resources;
+/// The three `AWS::AppSync::*` types a stack declares beyond a GraphQL API's own estate — an
+/// Event API, the channel namespaces events travel over on it, and the link of a source API
+/// into a Merged API: created in AWS AppSync itself ([`appsync_event_and_merged_apis`]).
+mod appsync_event_and_merged_apis;
 /// The six `AWS::AppSync::*` types a GraphQL API's estate is declared with — the API, its
 /// schema, its data sources, its resolvers, its pipeline functions and its API keys: created
 /// in AWS AppSync itself ([`appsync_resources`]).
@@ -1048,6 +1052,11 @@ pub(super) enum Owner {
     /// AppSync: the custom domain, and the mapping that makes a declared API answer on it.
     /// Which of them it is travels with the owner, as it does for the types above.
     AppSyncDomainName(appsync_domain_names::Kind),
+    /// One of the three `AWS::AppSync::*` types [`appsync_event_and_merged_apis`] creates in
+    /// AppSync beyond a GraphQL API's own estate: the Event API, a channel namespace of one,
+    /// and the link of a source API into a Merged API. Which of them it is travels with the
+    /// owner, as it does for the types above.
+    AppSyncEventOrMergedApi(appsync_event_and_merged_apis::Kind),
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -1136,6 +1145,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = appsync_domain_names::kind_of(resource_type) {
         return Some(Owner::AppSyncDomainName(kind));
+    }
+    if let Some(kind) = appsync_event_and_merged_apis::kind_of(resource_type) {
+        return Some(Owner::AppSyncEventOrMergedApi(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }

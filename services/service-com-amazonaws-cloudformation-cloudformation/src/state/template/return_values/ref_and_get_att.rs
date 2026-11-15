@@ -1833,7 +1833,8 @@ pub(crate) fn return_values(
             attributes.insert("KeyId".to_string(), id.clone());
             (id, attributes)
         }
-        // The six AWS AppSync types a GraphQL API's estate is declared with, whose return
+        // The nine AWS AppSync types a GraphQL API's estate, an Event API's and the link of a
+        // source API into a Merged API are declared with, whose return
         // values — the ARNs AppSync builds on the ids it mints, and the endpoints only that
         // service can report — are [`appsync`]'s.
         APPSYNC_GRAPHQL_API
@@ -1841,7 +1842,10 @@ pub(crate) fn return_values(
         | APPSYNC_DATA_SOURCE
         | APPSYNC_RESOLVER
         | APPSYNC_FUNCTION_CONFIGURATION
-        | APPSYNC_API_KEY => {
+        | APPSYNC_API_KEY
+        | APPSYNC_API
+        | APPSYNC_CHANNEL_NAMESPACE
+        | APPSYNC_SOURCE_API_ASSOCIATION => {
             appsync_return_values(resource_type, name, properties, scope, budget)
         }
         // "Ref returns the ARN of the cluster" for both kinds of Amazon MSK cluster, and

@@ -1287,3 +1287,5 @@ mod zz_probe_whole_emulator;
 // into `tests/all/`. Some of the files below are shared harnesses or probes rather than
 // suites; every one of them is declared, because a file no declaration names is compiled
 // nowhere.
+#[path = "all/cloudformation_provisions_appsync_event_and_merged_apis.rs"]
+mod cloudformation_provisions_appsync_event_and_merged_apis;

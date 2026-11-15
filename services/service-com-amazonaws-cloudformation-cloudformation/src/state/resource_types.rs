@@ -247,7 +247,9 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // Amazon CloudWatch Application Insights
     "AWS::ApplicationInsights::Application",
     // AWS AppSync
+    crate::state::template::APPSYNC_API,
     "AWS::AppSync::ApiKey",
+    crate::state::template::APPSYNC_CHANNEL_NAMESPACE,
     "AWS::AppSync::DataSource",
     crate::state::provisioning::appsync_domain_names::APPSYNC_DOMAIN_NAME,
     crate::state::provisioning::appsync_domain_names::APPSYNC_DOMAIN_NAME_API_ASSOCIATION,
@@ -255,6 +257,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::AppSync::GraphQLApi",
     "AWS::AppSync::GraphQLSchema",
     "AWS::AppSync::Resolver",
+    crate::state::template::APPSYNC_SOURCE_API_ASSOCIATION,
     // Amazon Athena
     "AWS::Athena::DataCatalog",
     "AWS::Athena::NamedQuery",
