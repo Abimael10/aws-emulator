@@ -50,7 +50,11 @@
 //! Formation audit metadata that does not change this operation's answer. Every other
 //! member IS acted on: `Expression`, `MaxResults` and `NextToken` as above;
 //! `AttributesToGet` projects each returned table (and its documented validation is
-//! enforced); `ResourceShareType` selects federated tables only, a stored table being
+//! enforced) — it names which attributes of the table DEFINITION come back, so what the
+//! catalog answers about the element it is serving (the catalog and database that hold the
+//! table, and the flags the catalog answers definitely) travels with every entry whatever
+//! the projection ([`Projection::apply`]); `ResourceShareType` selects federated
+//! tables only, a stored table being
 //! federated exactly when it carries a `FederatedTable`; and `TransactionId`,
 //! `QueryAsOfTime` and `IncludeStatusDetails` are REFUSED, because serving the latest
 //! unqualified state for a point-in-time, transactional or view-status read would be a
@@ -395,7 +399,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some([]) => {
                 return Err(GetTablesErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some("AttributesToGet does not accept an empty list".into()),
+                        message: Some(
+                            crate::service::ATTRIBUTES_TO_GET_CANNOT_BE_EMPTY.to_string(),
+                        ),
                         from_federation_source: None,
                     },
                 )
@@ -419,6 +425,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
                 let wanted: Vec<&str> = attributes.iter().map(String::as_str).collect();
+                // A list that does not name `NAME` asks for a projection the operation
+                // never serves — "[t]he request must include the NAME" — and the catalog
+                // refuses it with ONE fixed sentence that echoes nothing of the request
+                // (`crate::service::ATTRIBUTES_TO_GET_MUST_CONTAIN_NAME`).
+                if !wanted.contains(&"NAME") {
+                    return Err(GetTablesErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                crate::service::ATTRIBUTES_TO_GET_MUST_CONTAIN_NAME.to_string(),
+                            ),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                }
                 match wanted.as_slice() {
                     ["NAME"] => Projection::Name,
                     ["NAME", "TABLE_TYPE"] | ["TABLE_TYPE", "NAME"] => {
@@ -428,7 +449,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(GetTablesErrorModeled::InvalidInputException(
                             InvalidInputException {
                                 message: Some(format!(
-                                    "AttributesToGet must include NAME; the valid combinations \
+                                    "AttributesToGet names NAME, but the valid combinations \
                                      are NAME and NAME,TABLE_TYPE, not {wanted:?}"
                                 )),
                                 from_federation_source: None,

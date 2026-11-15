@@ -261,7 +261,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some([]) => {
                 return Err(GetTableErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some("AttributesToGet does not accept an empty list".into()),
+                        message: Some(
+                            crate::service::ATTRIBUTES_TO_GET_CANNOT_BE_EMPTY.to_string(),
+                        ),
                         from_federation_source: None,
                     },
                 )

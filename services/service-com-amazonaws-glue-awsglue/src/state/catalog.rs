@@ -1683,6 +1683,27 @@ impl TableEntry {
     }
 }
 
+/// The members of a returned `Database` the CATALOG answers about the element it is
+/// serving rather than taking from the client: the catalog that owns the database
+/// (`Database$CatalogId` and `Database$CatalogIdentifier`) and the id it assigned the
+/// database (`Database$DatabaseId`). `AttributesToGet` names ATTRIBUTES of the database
+/// definition, so a projected listing narrows that definition and never this attribution —
+/// the same rule the table listing's own projection follows
+/// (`crate::ops::get_databases::Projection`, `crate::ops::get_tables::Projection`).
+///
+/// `answered` is the whole `Database` as [`DatabaseEntry::to_database`] rebuilt it, so
+/// these members are never recomputed here and a projected entry can never disagree with
+/// the unprojected read of the same database. The returned `Database` carries ONLY them —
+/// its `Name` and the projected attributes are filled in by the caller.
+pub fn database_identity(answered: &Database) -> Database {
+    Database {
+        catalog_id: answered.catalog_id.clone(),
+        catalog_identifier: answered.catalog_identifier.clone(),
+        database_id: answered.database_id.clone(),
+        ..Database::default()
+    }
+}
+
 /// Project a stored `StorageDescriptor` the way the Data Catalog reports one.
 ///
 /// `StorageDescriptor$Columns` is "a list of the `Columns` in the table" and

@@ -36,6 +36,10 @@
 //! [`crate::service::ATTRIBUTE_NOT_VALID_TO_GET`]), so a value outside what the model
 //! admits for either earns the catalog's own `InvalidInputException` and its own sentence.
 //!
+//! `AttributesToGet` names which attributes of the database DEFINITION come back, so the
+//! identity the catalog itself wrote onto the database travels with every entry whatever
+//! the projection ([`crate::state::database_identity`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -136,17 +140,21 @@ enum Projection {
 
 impl Projection {
     /// Narrow a rebuilt `Database` to the members this projection asked for.
+    ///
+    /// `AttributesToGet` selects which attributes of the database DEFINITION to return;
+    /// the identity the catalog itself wrote onto the database travels with every entry
+    /// whatever the projection ([`crate::state::database_identity`]).
     fn apply(self, database: Database) -> Database {
         match self {
             Self::Full => database,
             Self::Name => Database {
-                name: database.name,
-                ..Database::default()
+                name: database.name.clone(),
+                ..crate::state::database_identity(&database)
             },
             Self::NameAndTargetDatabase => Database {
-                name: database.name,
-                target_database: database.target_database,
-                ..Database::default()
+                name: database.name.clone(),
+                target_database: database.target_database.clone(),
+                ..crate::state::database_identity(&database)
             },
         }
     }
@@ -278,7 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some([]) => {
                 return Err(GetDatabasesErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some("AttributesToGet does not accept an empty list".into()),
+                        message: Some(
+                            crate::service::ATTRIBUTES_TO_GET_CANNOT_BE_EMPTY.to_string(),
+                        ),
                         from_federation_source: None,
                     },
                 )
@@ -302,6 +312,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
                 let wanted: Vec<&str> = attributes.iter().map(String::as_str).collect();
+                // A list that does not name `NAME` asks for a projection the operation
+                // never serves — "[t]he request must include the NAME" — and the catalog
+                // refuses it with ONE fixed sentence that echoes nothing of the request,
+                // the same one every projected catalog listing answers such a list with
+                // (`crate::service::ATTRIBUTES_TO_GET_MUST_CONTAIN_NAME`).
+                if !wanted.contains(&"NAME") {
+                    return Err(GetDatabasesErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                crate::service::ATTRIBUTES_TO_GET_MUST_CONTAIN_NAME.to_string(),
+                            ),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                }
                 match wanted.as_slice() {
                     ["NAME"] => Projection::Name,
                     ["NAME", "TARGET_DATABASE"] | ["TARGET_DATABASE", "NAME"] => {
@@ -311,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(GetDatabasesErrorModeled::InvalidInputException(
                             InvalidInputException {
                                 message: Some(format!(
-                                    "AttributesToGet must include NAME; the valid combinations \
+                                    "AttributesToGet names NAME, but the valid combinations \
                                      are NAME and NAME,TARGET_DATABASE, not {wanted:?}"
                                 )),
                                 from_federation_source: None,

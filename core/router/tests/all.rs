@@ -1216,3 +1216,23 @@ mod zz_probe_whole_emulator;
 // EVERY comment in this file is an ordinary one, this header included, and that is
 // deliberate: with no inner doc comment anywhere, no merge of two landings can leave one
 // past the first item.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with one
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted: this file
+//! holds this header and those pairs and NOTHING else, so a landing has one place to
+//! insert and nothing to duplicate, re-word or mistype.
+//! A suite that is not declared here compiles nowhere and its tests never run; a suite left
+//! at the top level of `tests/` fails the build; and a suite declared twice is `E0428`,
+//! which compiles no suite of this target. `tests/all.rs` is a test-target CRATE ROOT, so a
+//! bare `mod <name>;` resolves to a SIBLING of this file, which the layout check refuses:
+//! the `#[path]` above each `mod` is what points it into `tests/all/`.
+//! THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT MAY STAND IN THIS FILE: past the
+//! first item one is `E0753` and compiles no suite of this target. Below, add a declaration
+//! — not a note about one. `all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules, for this file and for
+//! every service crate's `tests/all.rs`, so leave the rules to them.
+//! WHY a suite lives in this target rather than in one service crate's own — it drives more
+//! than one service over the assembled router — is stated in that suite's OWN module doc,
+//! where it is read beside the test it describes and stays correct when the suite moves.
+//! The notes concurrent landings had appended to the tail of this file live in
+//! `all/appended_notes.rs`: appended as inner doc comments they were `E0753`, and they had
+//! grown this root past the project's file-length ceiling.

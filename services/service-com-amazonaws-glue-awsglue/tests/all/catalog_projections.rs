@@ -16,7 +16,10 @@
 
 use serde_json::{json, Value};
 
-use crate::wire::{emulator, ok, ACCOUNT_ID, CALLER_PRINCIPAL, PRINCIPAL_PERMISSIONS_TAG};
+use crate::wire::{
+    call, emulator, error_code, error_message, ok, table_names, ACCOUNT_ID, CALLER_PRINCIPAL,
+    PRINCIPAL_PERMISSIONS_TAG,
+};
 
 /// `grants` as the catalog REPORTS them: every element carries the
 /// [`PRINCIPAL_PERMISSIONS_TAG`] discriminator, whatever the client sent.
@@ -488,5 +491,494 @@ async fn every_element_of_a_table_list_carries_the_full_projection() {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A projection narrows the definition, never the identity
+// ---------------------------------------------------------------------------
+
+/// The members a `Table` carries because the CATALOG answers them about the element it is
+/// serving, which every read of that table reports whatever projection the request asked
+/// for.
+///
+/// Source: `smithy_query shape=Table` on this crate's model — `CatalogId`
+/// (`CatalogIdString`, "the ID of the Data Catalog in which the table resides"),
+/// `DatabaseId` ("the opaque, catalog-assigned id of the database this table belongs to"),
+/// `DatabaseName` ("the name of the database where the table metadata resides") and the
+/// flags `IsRowFilteringEnabled` ("whether a row-level filter is in force on this table")
+/// and `IsMaterializedView` ("indicates a table is a `MaterializedView`").
+/// `IsMultiDialectView` is NOT among them: it states which dialects a view's query can be
+/// read in, i.e. part of the definition a projection narrows.
+const TABLE_IDENTITY_MEMBERS: &[&str] = &[
+    "CatalogId",
+    "DatabaseName",
+    "DatabaseId",
+    "IsRowFilteringEnabled",
+    "IsMaterializedView",
+];
+
+/// The members of a `Table` a client SENT — the definition a projection narrows. Source:
+/// the same `smithy_query shape=Table`, every member a `TableInput` can set plus the
+/// history members the create wrote (`VersionId`, `CreatedBy`, `CreateTime`).
+const TABLE_DEFINITION_MEMBERS: &[&str] = &[
+    "Owner",
+    "Description",
+    "Parameters",
+    "StorageDescriptor",
+    "CreateTime",
+    "UpdateTime",
+    "VersionId",
+    "CreatedBy",
+    "IsMultiDialectView",
+    "RLSProperties",
+];
+
+/// The sentence the catalog refuses an `AttributesToGet` that names no `NAME` with —
+/// entirely fixed text, echoing nothing of the request, so one wording answers every such
+/// list of either projected listing.
+const MUST_CONTAIN_NAME: &str = "AttributesToGet must contain NAME.";
+
+/// The sentence the catalog refuses an `AttributesToGet` supplied as the empty list with —
+/// again entirely fixed text, and spelled the way the catalog's own validator names the
+/// member.
+const CANNOT_BE_EMPTY: &str = "If provided, attributesToGet cannot be empty.";
+
+/// Create `database` with three fully populated tables and answer the id the catalog
+/// assigned the database.
+async fn database_with_tables(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    database: &str,
+) -> Value {
+    ok(
+        router,
+        "CreateDatabase",
+        &json!({ "DatabaseInput": { "Name": database } }),
+    )
+    .await;
+    for name in ["events_one", "events_two", "orders"] {
+        ok(
+            router,
+            "CreateTable",
+            &json!({
+                "DatabaseName": database,
+                "TableInput": {
+                    "Name": name,
+                    "TableType": "EXTERNAL_TABLE",
+                    "Owner": "data-eng",
+                    "Description": format!("{name} of {database}"),
+                    "Parameters": { "classification": "parquet" },
+                    "StorageDescriptor": {
+                        "Columns": [ { "Name": "id", "Type": "string" } ],
+                        "Location": format!("s3://bucket/{database}/{name}/")
+                    }
+                }
+            }),
+        )
+        .await;
+    }
+    let read = ok(router, "GetDatabase", &json!({ "Name": database })).await;
+    read["Database"]["DatabaseId"].clone()
+}
+
+/// One row of the projected-listing table: which listing to ask for, and what every entry
+/// of the page it answers must report.
+struct ProjectedPage<'a> {
+    case: &'a str,
+    /// The database listed, which every entry must be attributed to.
+    database: &'a str,
+    /// The id the catalog assigned that database, as its own read reports it.
+    database_id: &'a Value,
+    request: Value,
+    /// Whether the projection named `TABLE_TYPE`, the one definition attribute it may ask
+    /// for beside the name.
+    wants_table_type: bool,
+    /// The names the page must hold, in order.
+    expected_names: Vec<&'a str>,
+}
+
+/// A PROJECTED `GetTables` page reports, on every entry, the identity the catalog wrote
+/// onto that table — the catalog it resides in, the database that holds it (by name and by
+/// the id the catalog assigned it) and the flags the catalog answers definitely — while
+/// the definition members the projection did not name stay absent. `AttributesToGet`
+/// selects which attributes of the DEFINITION come back, not whether the entry can be
+/// attributed to a catalog and a database.
+///
+/// The rows differ along the projection asked for (`NAME`, and `NAME` with `TABLE_TYPE` in
+/// both orders), the database listed (so the identity expected differs row to row), how
+/// many entries the page holds, and whether the page was narrowed by `Expression` or by
+/// `MaxResults`.
+#[tokio::test]
+async fn a_projected_table_listing_reports_every_entrys_catalog_and_database_identity() {
+    let router = emulator();
+    let first = "projected_identity_db";
+    let second = "projected_identity_other_db";
+    let first_id = database_with_tables(&router, first).await;
+    let second_id = database_with_tables(&router, second).await;
+
+    let cases: Vec<ProjectedPage> = vec![
+        ProjectedPage {
+            case: "NAME alone",
+            database: first,
+            database_id: &first_id,
+            request: json!({ "DatabaseName": first, "AttributesToGet": [ "NAME" ] }),
+            wants_table_type: false,
+            expected_names: vec!["events_one", "events_two", "orders"],
+        },
+        ProjectedPage {
+            case: "NAME and TABLE_TYPE",
+            database: first,
+            database_id: &first_id,
+            request: json!({
+                "DatabaseName": first,
+                "AttributesToGet": [ "NAME", "TABLE_TYPE" ]
+            }),
+            wants_table_type: true,
+            expected_names: vec!["events_one", "events_two", "orders"],
+        },
+        ProjectedPage {
+            case: "TABLE_TYPE and NAME, the other order",
+            database: second,
+            database_id: &second_id,
+            request: json!({
+                "DatabaseName": second,
+                "AttributesToGet": [ "TABLE_TYPE", "NAME" ]
+            }),
+            wants_table_type: true,
+            expected_names: vec!["events_one", "events_two", "orders"],
+        },
+        ProjectedPage {
+            case: "NAME over a page narrowed by Expression",
+            database: second,
+            database_id: &second_id,
+            request: json!({
+                "DatabaseName": second,
+                "AttributesToGet": [ "NAME" ],
+                "Expression": "events*"
+            }),
+            wants_table_type: false,
+            expected_names: vec!["events_one", "events_two"],
+        },
+        ProjectedPage {
+            case: "NAME and TABLE_TYPE over a page narrowed by MaxResults",
+            database: first,
+            database_id: &first_id,
+            request: json!({
+                "DatabaseName": first,
+                "AttributesToGet": [ "NAME", "TABLE_TYPE" ],
+                "MaxResults": 2
+            }),
+            wants_table_type: true,
+            expected_names: vec!["events_one", "events_two"],
+        },
+        ProjectedPage {
+            case: "NAME over a single-entry page",
+            database: second,
+            database_id: &second_id,
+            request: json!({
+                "DatabaseName": second,
+                "AttributesToGet": [ "NAME" ],
+                "Expression": "orders"
+            }),
+            wants_table_type: false,
+            expected_names: vec!["orders"],
+        },
+    ];
+
+    for ProjectedPage {
+        case,
+        database,
+        database_id,
+        request,
+        wants_table_type,
+        expected_names,
+    } in &cases
+    {
+        let page = ok(&router, "GetTables", request).await;
+        assert_eq!(
+            table_names(&page),
+            expected_names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<String>>(),
+            "case {case}: expected the page to hold {expected_names:?}, got {page}"
+        );
+
+        for entry in page["TableList"]
+            .as_array()
+            .expect("TableList is a list")
+            .iter()
+        {
+            let name = entry["Name"].as_str().expect("Table.Name is a string");
+            let expected_identity = json!({
+                "CatalogId": ACCOUNT_ID,
+                "DatabaseName": database,
+                "DatabaseId": database_id,
+                "IsRowFilteringEnabled": false,
+                "IsMaterializedView": false,
+            });
+            for member in TABLE_IDENTITY_MEMBERS {
+                assert_eq!(
+                    entry[member], expected_identity[member],
+                    "case {case}: {name} must carry {member} {:?}, got {:?}",
+                    expected_identity[member], entry[member]
+                );
+            }
+            assert_eq!(
+                entry["TableType"],
+                if *wants_table_type {
+                    json!("EXTERNAL_TABLE")
+                } else {
+                    Value::Null
+                },
+                "case {case}: {name} reports TableType only when the projection names \
+                 TABLE_TYPE, got {:?}",
+                entry["TableType"]
+            );
+            for member in TABLE_DEFINITION_MEMBERS {
+                assert!(
+                    entry.get(member).is_none_or(Value::is_null),
+                    "case {case}: {name} must not project {member}, got {:?}",
+                    entry[member]
+                );
+            }
+
+            // The identity a projected entry reports is the identity the unprojected read
+            // of that same table reports: one stored attribution, read two ways.
+            let whole = ok(
+                &router,
+                "GetTable",
+                &json!({ "DatabaseName": database, "Name": name }),
+            )
+            .await;
+            for member in TABLE_IDENTITY_MEMBERS {
+                assert_eq!(
+                    entry[member], whole["Table"][member],
+                    "case {case}: {name}'s projected {member} must equal the whole read's, \
+                     got {:?} against {:?}",
+                    entry[member], whole["Table"][member]
+                );
+            }
+        }
+    }
+}
+
+/// A PROJECTED `GetDatabases` page reports, on every entry, the catalog that owns the
+/// database and the id the catalog assigned it — the same rule one level up — while the
+/// definition members the projection did not name stay absent.
+///
+/// The rows differ along the projection asked for (`NAME`, and `NAME` with
+/// `TARGET_DATABASE` in both orders) and whether the page was narrowed by `MaxResults`.
+#[tokio::test]
+async fn a_projected_database_listing_reports_every_entrys_catalog_identity() {
+    let router = emulator();
+    let mut expected_ids: Vec<(String, Value)> = Vec::new();
+    for database in ["projected_db_one", "projected_db_two"] {
+        ok(
+            &router,
+            "CreateDatabase",
+            &json!({
+                "DatabaseInput": {
+                    "Name": database,
+                    "Description": format!("{database} description"),
+                    "LocationUri": format!("s3://bucket/{database}/"),
+                    "Parameters": { "owner": "data-eng" }
+                }
+            }),
+        )
+        .await;
+        let read = ok(&router, "GetDatabase", &json!({ "Name": database })).await;
+        expected_ids.push((
+            database.to_string(),
+            read["Database"]["DatabaseId"].clone(),
+        ));
+    }
+
+    // (case, the request, how many entries the page holds)
+    let cases: Vec<(&str, Value, usize)> = vec![
+        ("NAME alone", json!({ "AttributesToGet": [ "NAME" ] }), 2),
+        (
+            "NAME and TARGET_DATABASE",
+            json!({ "AttributesToGet": [ "NAME", "TARGET_DATABASE" ] }),
+            2,
+        ),
+        (
+            "TARGET_DATABASE and NAME, the other order",
+            json!({ "AttributesToGet": [ "TARGET_DATABASE", "NAME" ] }),
+            2,
+        ),
+        (
+            "NAME over a page narrowed by MaxResults",
+            json!({ "AttributesToGet": [ "NAME" ], "MaxResults": 1 }),
+            1,
+        ),
+    ];
+
+    for (case, request, expected_len) in &cases {
+        let page = ok(&router, "GetDatabases", request).await;
+        let listed = page["DatabaseList"]
+            .as_array()
+            .expect("DatabaseList is a list")
+            .clone();
+        assert_eq!(
+            listed.len(),
+            *expected_len,
+            "case {case}: expected {expected_len} entry/entries, got {page}"
+        );
+        for entry in &listed {
+            let name = entry["Name"]
+                .as_str()
+                .expect("Database.Name is a string")
+                .to_string();
+            let expected_id = expected_ids
+                .iter()
+                .find(|(database, _)| *database == name)
+                .map(|(_, id)| id.clone())
+                .unwrap_or_else(|| panic!("case {case}: {name} is not a database this test made"));
+            assert_eq!(
+                entry["CatalogId"],
+                json!(ACCOUNT_ID),
+                "case {case}: {name} must carry CatalogId {ACCOUNT_ID}, got {:?}",
+                entry["CatalogId"]
+            );
+            assert_eq!(
+                entry["DatabaseId"], expected_id,
+                "case {case}: {name} must carry DatabaseId {expected_id:?}, got {:?}",
+                entry["DatabaseId"]
+            );
+            for member in [
+                "Description",
+                "LocationUri",
+                "Parameters",
+                "CreateTime",
+                "CreateTableDefaultPermissions",
+            ] {
+                assert!(
+                    entry.get(member).is_none_or(Value::is_null),
+                    "case {case}: {name} must not project {member}, got {:?}",
+                    entry[member]
+                );
+            }
+        }
+    }
+}
+
+/// An `AttributesToGet` that names no `NAME` asks for a projection neither listing serves
+/// — "[t]he request must include the `NAME`" — and the empty list is one the member
+/// "doesn't accept": each is refused with ONE fixed sentence that echoes nothing of the
+/// request, so every reader of the catalog answers it the same way.
+///
+/// The rows differ along the operation refused, the list sent (one attribute, several, and
+/// in both orders, over every value of each attribute enum —
+/// `smithy_query shape=TableAttributes,DatabaseAttributes`: `NAME`, `TABLE_TYPE`,
+/// `DEFAULT`, `LATEST_ICEBERG_METADATA` for tables and `NAME`, `TARGET_DATABASE` for
+/// databases — other than `NAME` itself) and the rule broken.
+#[tokio::test]
+async fn an_attributes_to_get_the_catalog_refuses_carries_the_catalogs_sentence() {
+    let router = emulator();
+    ok(
+        &router,
+        "CreateDatabase",
+        &json!({ "DatabaseInput": { "Name": "name_required_db" } }),
+    )
+    .await;
+    ok(
+        &router,
+        "CreateTable",
+        &json!({
+            "DatabaseName": "name_required_db",
+            "TableInput": { "Name": "events", "TableType": "EXTERNAL_TABLE" }
+        }),
+    )
+    .await;
+
+    // (case, operation, request, the message expected)
+    let cases: Vec<(&str, &str, Value, &str)> = vec![
+        (
+            "GetTables with TABLE_TYPE alone",
+            "GetTables",
+            json!({ "DatabaseName": "name_required_db", "AttributesToGet": [ "TABLE_TYPE" ] }),
+            MUST_CONTAIN_NAME,
+        ),
+        (
+            "GetTables with DEFAULT alone",
+            "GetTables",
+            json!({ "DatabaseName": "name_required_db", "AttributesToGet": [ "DEFAULT" ] }),
+            MUST_CONTAIN_NAME,
+        ),
+        (
+            "GetTables with LATEST_ICEBERG_METADATA alone",
+            "GetTables",
+            json!({
+                "DatabaseName": "name_required_db",
+                "AttributesToGet": [ "LATEST_ICEBERG_METADATA" ]
+            }),
+            MUST_CONTAIN_NAME,
+        ),
+        (
+            "GetTables with two attributes, neither of them NAME",
+            "GetTables",
+            json!({
+                "DatabaseName": "name_required_db",
+                "AttributesToGet": [ "DEFAULT", "TABLE_TYPE" ]
+            }),
+            MUST_CONTAIN_NAME,
+        ),
+        (
+            "GetTables with the same two in the other order",
+            "GetTables",
+            json!({
+                "DatabaseName": "name_required_db",
+                "AttributesToGet": [ "TABLE_TYPE", "DEFAULT" ]
+            }),
+            MUST_CONTAIN_NAME,
+        ),
+        (
+            "GetDatabases with TARGET_DATABASE alone",
+            "GetDatabases",
+            json!({ "AttributesToGet": [ "TARGET_DATABASE" ] }),
+            MUST_CONTAIN_NAME,
+        ),
+        (
+            "GetTables with an empty AttributesToGet",
+            "GetTables",
+            json!({ "DatabaseName": "name_required_db", "AttributesToGet": [] }),
+            CANNOT_BE_EMPTY,
+        ),
+        (
+            "GetDatabases with an empty AttributesToGet",
+            "GetDatabases",
+            json!({ "AttributesToGet": [] }),
+            CANNOT_BE_EMPTY,
+        ),
+        (
+            "GetTable with an empty AttributesToGet",
+            "GetTable",
+            json!({
+                "DatabaseName": "name_required_db",
+                "Name": "events",
+                "AttributesToGet": []
+            }),
+            CANNOT_BE_EMPTY,
+        ),
+    ];
+
+    for (case, operation, body, expected_message) in &cases {
+        let (status, answer) = call(&router, operation, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected HTTP 400, got {status} with {answer}"
+        );
+        assert!(
+            error_code(&answer).contains("InvalidInputException"),
+            "case {case}: expected InvalidInputException, got {}",
+            error_code(&answer)
+        );
+        assert_eq!(
+            &error_message(&answer),
+            expected_message,
+            "case {case}: expected the message {expected_message:?}, got {:?}",
+            error_message(&answer)
+        );
     }
 }

@@ -296,9 +296,17 @@ async fn attributes_to_get_narrows_each_element_to_the_members_it_names() {
     )
     .await;
 
-    // (case, AttributesToGet, the members a linked element carries, the members a plain
-    // element carries). Source: `DatabaseAttributes`, whose values are exactly `NAME` and
-    // `TARGET_DATABASE`; the request "must include the NAME".
+    // The members the catalog itself writes onto every database it returns: a projection
+    // narrows the DEFINITION the client submitted, so these travel with every element
+    // whatever `AttributesToGet` names. Source: `smithy_query shape=Database` —
+    // `CatalogId`, `CatalogIdentifier` ("the Data Catalog writes this member onto every
+    // database it returns") and `DatabaseId` (the id the catalog assigned it).
+    const CATALOG_WRITTEN: &[&str] = &["CatalogId", "CatalogIdentifier", "DatabaseId"];
+
+    // (case, AttributesToGet, the attributes a linked element carries, the attributes a
+    // plain element carries — each beside `CATALOG_WRITTEN`). Source:
+    // `DatabaseAttributes`, whose values are exactly `NAME` and `TARGET_DATABASE`; the
+    // request "must include the NAME".
     let rows: Vec<(&str, Value, Vec<&str>, Vec<&str>)> = vec![
         ("NAME alone", json!(["NAME"]), vec!["Name"], vec!["Name"]),
         (
@@ -333,8 +341,12 @@ async fn attributes_to_get_narrows_each_element_to_the_members_it_names() {
         );
         for (element, expected) in elements.iter().zip([linked_members, plain_members]) {
             let expected: Vec<String> = {
-                let mut names: Vec<String> =
-                    expected.iter().map(|name| name.to_string()).collect();
+                let mut names: Vec<String> = expected
+                    .iter()
+                    .copied()
+                    .chain(CATALOG_WRITTEN.iter().copied())
+                    .map(|name| name.to_string())
+                    .collect();
                 names.sort();
                 names
             };

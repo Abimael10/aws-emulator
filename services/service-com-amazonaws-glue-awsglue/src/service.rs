@@ -372,6 +372,22 @@ pub fn resource_share_type_not_valid(submitted: &str) -> String {
 /// nor the set it had to come from, so one wording answers every such entry.
 pub const ATTRIBUTE_NOT_VALID_TO_GET: &str = "Attribute name is not a valid attribute to get.";
 
+/// The sentence the catalog refuses an `AttributesToGet` that does not name `NAME` with.
+///
+/// RECORDED constant, and the whole message: it names neither the attributes the request
+/// sent nor the combinations the operation admits, so ONE wording answers every such list.
+/// Every projected listing of a catalog resource shares it, because `NAME` is the
+/// attribute each of them documents as required ("The request must include the `NAME`").
+pub const ATTRIBUTES_TO_GET_MUST_CONTAIN_NAME: &str = "AttributesToGet must contain NAME.";
+
+/// The sentence the catalog refuses an `AttributesToGet` supplied as the empty list with —
+/// the list the member "doesn't accept".
+///
+/// RECORDED constant, and the whole message: it echoes nothing of the request, and names
+/// the member the way the catalog's own validator spells it, so one wording answers the
+/// empty list of every projected read.
+pub const ATTRIBUTES_TO_GET_CANNOT_BE_EMPTY: &str = "If provided, attributesToGet cannot be empty.";
+
 /// Whether `attributes` carries an entry that is no member of `admitted` — the
 /// generated, model-derived value set of the enum the list's member targets
 /// (`crate::ops::types::TABLE_ATTRIBUTES_VALUES` and its siblings), so a value added to
