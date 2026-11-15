@@ -45,7 +45,12 @@ fn unknown_id(seed: u64) -> String {
 
 /// `UpdateProfile` over the wire: `PUT /domains/{DomainName}/profiles`, with the id of
 /// the profile being updated put into the body the row supplied.
-async fn update(emulator: &Emulator, domain: &str, profile_id: &str, patch: Value) -> (u16, Value) {
+pub(crate) async fn update(
+    emulator: &Emulator,
+    domain: &str,
+    profile_id: &str,
+    patch: Value,
+) -> (u16, Value) {
     let mut body = patch;
     body.as_object_mut()
         .expect("an object request body")
@@ -57,7 +62,7 @@ async fn update(emulator: &Emulator, domain: &str, profile_id: &str, patch: Valu
 
 /// The profile `BatchGetProfile` reports for `id`, or `None` when it reports the id as an
 /// error instead.
-async fn read_profile(emulator: &Emulator, domain: &str, id: &str) -> Option<Value> {
+pub(crate) async fn read_profile(emulator: &Emulator, domain: &str, id: &str) -> Option<Value> {
     let (status, body) = emulator
         .post(
             &format!("/domains/{domain}/batch-get-profiles"),

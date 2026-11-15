@@ -1864,3 +1864,13 @@ mod zz_probe_whole_emulator;
 // `all/appended_prose.rs` keep the notes earlier landings had appended to this file.
 // The lint allowed below is for the suite files this root compiles: a wrapped paragraph in a
 // module header is then a note rather than a build failure. An inner attribute, like an inner
+// Put a new suite at `tests/all/<name>.rs` and insert its pair in sorted position. What a
+// a note about this file belongs in `all/appended_notes.rs`, declared below like any other
+// suite.
+// Every comment in this file is an ordinary one, this header included, and that is
+// deliberate: a doc comment for the module it stands in is legal only before the first
+// item, so one appended past the declarations is `E0753` and compiles no suite of this
+// target — and with none anywhere in the file, no merge of two landings can leave one
+// there. A second pair for one name is `E0428`, and a suite file no pair names compiles
+// nowhere. Five suites pin all of that rather than restating it here:
+// `all/every_suite_file_is_declared.rs`.

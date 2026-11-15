@@ -51,6 +51,8 @@ mod profile_string_alternatives;
 mod recommender_schemas;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/search_after_profile_write.rs"]
+mod search_after_profile_write;
 #[path = "all/search_key_resolution.rs"]
 mod search_key_resolution;
 #[path = "all/state_roundtrip.rs"]
