@@ -23,12 +23,6 @@
 // the account-visible inventory — who may create a volume from it and the Marketplace codes it
 // is billed through — plus what it refuses. Declared beside `prefix_lists` for the reason the
 // note above gives: the sorted neighbourhood and the tail of this file are where every new ec2
-// `ModifyIpamPool`: the members a modification writes onto a stored IPAM pool and the ones it
-// leaves alone, the allocation tag rules it adds and removes, and what it refuses. Declared
-// FIRST for the reason the note above gives: the sorted neighbourhood and the tail of this
-// file are where every new ec2 suite inserts its lines.
-#[path = "all/modify_ipam_pool.rs"]
-mod modify_ipam_pool;
 #[path = "all/snapshot_attributes.rs"]
 mod snapshot_attributes;
 // Which resource ids a tagging call resolves, over the taggable resource kinds beside the
@@ -1474,15 +1468,6 @@ mod vpc_network_lifecycle;
 // unanswered request, the overlapping-range failure, and the ids, filters and pages.
 #[path = "all/vpc_peering_connections.rs"]
 mod vpc_peering_connections;
-// What `AcceptVpcPeeringConnection` answers: the peering request the store holds written into
-// `active` with no expiry left, read back through `DescribeVpcPeeringConnections` with both
-// sides' address space — beside the connection already accepted it answers unchanged, and the
-// states, the accepter's account and Region, the ids and the dry run it refuses without
-// answering the request. Declared beside the suite of the create it answers, inside the
-// long-settled block, rather than in the tail every landing appends to: two squash merges of
-// this fix lost the tail to another suite's move and left a duplicate `mod`.
-#[path = "all/accept_vpc_peering_connection.rs"]
-mod accept_vpc_peering_connection;
 #[path = "all/vpc_resources_blocking_encryption_enforcement.rs"]
 mod vpc_resources_blocking_encryption_enforcement;
 #[path = "all/vpn_connection_device_types.rs"]
@@ -2408,7 +2393,6 @@ mod id_screening_verdicts;
 // The instance metadata service one instance's guest reads itself from: the published
 // categories, the signed identity document its agents register the machine with, the IMDSv2
 // token form, and what it publishes nothing for. Declared at the tail of this file, which is
-// where every new ec2 suite lands.
 #[path = "all/instance_guest_metadata_service.rs"]
 mod instance_guest_metadata_service;
 #[path = "all/taggable_resource_kinds.rs"]
@@ -2425,14 +2409,6 @@ mod parameter_refusal_codes;
 // ones with it, the second delete and the dry run it refuses without writing anything. Declared at
 #[path = "all/delete_ipam.rs"]
 mod delete_ipam;
-// What `PurchaseReservedInstancesOffering` buys: the Reserved Instance it stores out of the
-// terms the offering its id carries was published with, the `payment-pending` or `queued`
-// state it waits in with the clock owing it `active`, the round trip back through
-// `DescribeReservedInstances` — and the offering-id form, the dry-run verdict, the count and
-// the limit price it refuses without buying anything. Declared at the tail of this file,
-// which is where every new ec2 suite lands.
-#[path = "all/purchase_reserved_instances_offering.rs"]
-mod purchase_reserved_instances_offering;
 // What `DeleteTransitGatewayMeteringPolicyEntry` records: the entry the metering policy the
 // request names holds at the rule number it names taken OUT of the store and reported in the
 // state its catalog gives one a delete has removed, with every other member exactly as it was
@@ -2451,5 +2427,39 @@ mod egress_only_internet_gateways;
 // of two other compute families — and the whole member set each of them carries. Declared
 #[path = "all/published_network_optimized_compute_catalog_rows.rs"]
 mod published_network_optimized_compute_catalog_rows;
+// What `DeleteVpcEndpointServiceConfigurations` removes: every endpoint service configuration the
+// ids it resolves name, with the connections to each service, beside the ids it reports in
+// `Unsuccessful` with their own cause — a service a connection is still attached to among them —
+// and the dry run it refuses without removing anything. Declared at the tail of this file, which
+#[path = "all/delete_vpc_endpoint_service_configurations.rs"]
+mod delete_vpc_endpoint_service_configurations;
+// What `ModifyVpcEndpointServiceConfiguration` writes onto one stored endpoint service
+// configuration — the load balancers behind it, its acceptance, address types, Regions and
+// private DNS name — what it refuses, and that a `ServiceId` naming no service of the account is
+// refused as unresolvable. Declared beside the delete above, whose round trip it closes.
+#[path = "all/modify_vpc_endpoint_service_configuration.rs"]
+mod modify_vpc_endpoint_service_configuration;
+// `ModifyIpamPool`: the members a modification writes onto a stored IPAM pool and the ones it
+// leaves alone, the allocation tag rules it adds and removes, and what it refuses. Declared
+// FIRST for the reason the note above gives: the sorted neighbourhood and the tail of this
+// file are where every new ec2 suite inserts its lines.
+#[path = "all/modify_ipam_pool.rs"]
+mod modify_ipam_pool;
+// What `AcceptVpcPeeringConnection` answers: the peering request the store holds written into
+// `active` with no expiry left, read back through `DescribeVpcPeeringConnections` with both
+// sides' address space — beside the connection already accepted it answers unchanged, and the
+// states, the accepter's account and Region, the ids and the dry run it refuses without
+// answering the request. Declared beside the suite of the create it answers, inside the
+// long-settled block, rather than in the tail every landing appends to: two squash merges of
+// this fix lost the tail to another suite's move and left a duplicate `mod`.
+#[path = "all/accept_vpc_peering_connection.rs"]
+mod accept_vpc_peering_connection;
+// What `PurchaseReservedInstancesOffering` buys: the Reserved Instance it stores out of the
+// terms the offering its id carries was published with, the `payment-pending` or `queued`
+// state it waits in with the clock owing it `active`, the round trip back through
+// `DescribeReservedInstances` — and the offering-id form, the dry-run verdict, the count and
+// the limit price it refuses without buying anything. Declared at the tail of this file,
+#[path = "all/purchase_reserved_instances_offering.rs"]
+mod purchase_reserved_instances_offering;
 #[path = "all/provision_ipam_pool_cidr.rs"]
 mod provision_ipam_pool_cidr;

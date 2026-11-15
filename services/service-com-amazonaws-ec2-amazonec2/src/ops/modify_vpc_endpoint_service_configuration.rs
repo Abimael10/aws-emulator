@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVpcEndpointServiceConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVpcEndpointServiceConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: modifies the stored endpoint service configuration the request's `ServiceId`
+//! resolves — the load balancers behind it, whether a connection to it must be accepted, the
+//! address types and the Regions it is offered from, and the private DNS name assigned to it —
+//! and answers `Return=true`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVpcEndpointServiceConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The service is RESOLVED before `DryRun` is read, as it is for every operation this one
+//! service is the subject of: a dry run naming a `ServiceId` the account holds no service for is
+//! told so rather than that the request would have succeeded.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +156,370 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVpcEndpointServiceConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVpcEndpointServiceConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVpcEndpointServiceConfiguration"))
+        use crate::state;
+
+        // The service id's form first: an id that is not a VPC endpoint service id at all is
+        // refused as malformed, so "not an id of this kind" never reads as "no such service"
+        // and is never answered by the DryRun arm below either.
+        let service_id = input.service_id.as_str();
+        state::require_well_formed_id(
+            state::VPC_ENDPOINT_SERVICE_ID_PREFIX,
+            service_id,
+            state::INVALID_VPC_ENDPOINT_SERVICE_ID_MALFORMED,
+        )?;
+
+        // Every list the request carries, deduplicated (naming one value twice asks for it
+        // once) and bounded before any per-entry work is done: each targets `ValueStringList`,
+        // on which the model publishes no bound at all.
+        let lists = RequestedChanges {
+            add_network: deduplicated(input.add_network_load_balancer_arns.as_deref()),
+            remove_network: deduplicated(input.remove_network_load_balancer_arns.as_deref()),
+            add_gateway: deduplicated(input.add_gateway_load_balancer_arns.as_deref()),
+            remove_gateway: deduplicated(input.remove_gateway_load_balancer_arns.as_deref()),
+            add_address_types: deduplicated(input.add_supported_ip_address_types.as_deref()),
+            remove_address_types: deduplicated(
+                input.remove_supported_ip_address_types.as_deref(),
+            ),
+            add_regions: deduplicated(input.add_supported_regions.as_deref()),
+            remove_regions: deduplicated(input.remove_supported_regions.as_deref()),
+        };
+        for (member, values) in lists.named() {
+            if values.len() > state::MAX_RESOURCE_IDS {
+                return Err(state::invalid_parameter_value(format!(
+                    "{member} carries {supplied} values, above the maximum of {maximum}",
+                    supplied = values.len(),
+                    maximum = state::MAX_RESOURCE_IDS,
+                )));
+            }
+        }
+
+        // "The Amazon Resource Names (ARNs) of Network Load Balancers to add to the service
+        // configuration" and the three members beside it: a value that is not a load balancer's
+        // ARN names no load balancer, whether it is being put behind the service or taken from
+        // behind it.
+        for (member, arns) in [
+            ("AddNetworkLoadBalancerArn", &lists.add_network),
+            ("RemoveNetworkLoadBalancerArn", &lists.remove_network),
+            ("AddGatewayLoadBalancerArn", &lists.add_gateway),
+            ("RemoveGatewayLoadBalancerArn", &lists.remove_gateway),
+        ] {
+            if let Some(malformed) = arns
+                .iter()
+                .find(|arn| !state::load_balancer_arn_is_well_formed(arn))
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({malformed}) for parameter {member} is invalid. \
+                     This is not the ARN of a load balancer."
+                )));
+            }
+        }
+
+        // "The IP address types to add to the service configuration": the types a service can
+        // be reached over are the pair `SupportedIpAddressTypes` publishes ("the possible values
+        // are ipv4 and ipv6"), so a value outside it names no address type.
+        for (member, address_types) in [
+            ("AddSupportedIpAddressType", &lists.add_address_types),
+            ("RemoveSupportedIpAddressType", &lists.remove_address_types),
+        ] {
+            if let Some(unknown) = address_types.iter().find(|address_type| {
+                *address_type != state::IP_ADDRESS_TYPE_IPV4
+                    && *address_type != state::IP_ADDRESS_TYPE_IPV6
+            }) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({unknown}) for parameter {member} is invalid. \
+                     The possible values are {ipv4} and {ipv6}.",
+                    ipv4 = state::IP_ADDRESS_TYPE_IPV4,
+                    ipv6 = state::IP_ADDRESS_TYPE_IPV6,
+                )));
+            }
+        }
+
+        // "The supported Regions to add to the service configuration": a value that names no
+        // Region of the Region catalog names no consumers either.
+        for (member, regions) in [
+            ("AddSupportedRegion", &lists.add_regions),
+            ("RemoveSupportedRegion", &lists.remove_regions),
+        ] {
+            if let Some(unknown) = regions
+                .iter()
+                .find(|region| !state::is_catalog_region(region))
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({unknown}) for parameter {member} is invalid. \
+                     This is not a Region name."
+                )));
+            }
+        }
+
+        // "(Interface endpoint configuration) The private DNS name to assign to the endpoint
+        // service" and "(Interface endpoint configuration) Removes the private DNS name of the
+        // endpoint service": one call either assigns a name or removes the one assigned, never
+        // both, and a value that is not a domain name at all is refused rather than stored as a
+        // name consumers would resolve.
+        let removes_private_dns_name = input.remove_private_dns_name.unwrap_or(false);
+        let assigned_private_dns_name = input
+            .private_dns_name
+            .as_deref()
+            .filter(|name| !name.is_empty());
+        if removes_private_dns_name && assigned_private_dns_name.is_some() {
+            return Err(state::invalid_parameter_combination(
+                "PrivateDnsName and RemovePrivateDnsName cannot both be specified",
+            ));
+        }
+        if let Some(name) = assigned_private_dns_name {
+            if !state::domain_name_is_well_formed(name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({name}) for parameter privateDnsName is invalid. \
+                     This is not a domain name."
+                )));
+            }
+        }
+
+        let services = state::require_service_state(&*self.engine)?;
+        let mut store = services.lock();
+
+        // "Modifies the attributes of the SPECIFIED VPC endpoint service configuration": the
+        // whole call is about that one service, so a `ServiceId` naming none of the account's
+        // own is refused outright rather than reported as a modification that changed nothing.
+        let Some(stored) = store.vpc_endpoint_services.get(service_id).cloned() else {
+            return Err(state::invalid_vpc_endpoint_service_id_not_found(service_id));
+        };
+
+        // The load balancers behind the service after this call: what it stands behind now,
+        // less what the request takes away, plus what it adds.
+        let network_load_balancer_arns = after_changes(
+            stored.network_load_balancer_arns.as_deref().unwrap_or_default(),
+            &lists.add_network,
+            &lists.remove_network,
+        );
+        let gateway_load_balancer_arns = after_changes(
+            stored.gateway_load_balancer_arns.as_deref().unwrap_or_default(),
+            &lists.add_gateway,
+            &lists.remove_gateway,
+        );
+        // Which kind of load balancer is behind the service is what decides the kind of
+        // endpoint a consumer reaches it through (`CreateVpcEndpointServiceConfiguration`:
+        // "a Network Load Balancer. Service consumers connect to your service using an
+        // interface endpoint. A Gateway Load Balancer. Service consumers connect to your
+        // service using a Gateway Load Balancer endpoint"), and the endpoints to this service
+        // already exist — so a modification may change WHICH load balancers of that kind serve
+        // it, but may not leave it with none and may not put the other kind behind it.
+        let interface = match (
+            network_load_balancer_arns.is_empty(),
+            gateway_load_balancer_arns.is_empty(),
+        ) {
+            (true, true) => {
+                return Err(state::invalid_parameter_value(
+                    "You must specify either NetworkLoadBalancerArn or \
+                     GatewayLoadBalancerArn",
+                ))
+            }
+            (false, false) => {
+                return Err(state::invalid_parameter_combination(
+                    "NetworkLoadBalancerArn and GatewayLoadBalancerArn cannot both be \
+                     specified for one endpoint service",
+                ))
+            }
+            (false, true) => true,
+            (true, false) => false,
+        };
+        // A Gateway Load Balancer endpoint resolves no name — it is reached as a route target —
+        // so the member is refused for a service behind one rather than stored where nothing
+        // would use it.
+        if assigned_private_dns_name.is_some() && !interface {
+            return Err(state::invalid_parameter_combination(
+                "PrivateDnsName cannot be specified for a service behind a Gateway Load \
+                 Balancer",
+            ));
+        }
+
+        let supported_ip_address_types = after_changes(
+            stored.supported_ip_address_types.as_deref().unwrap_or_default(),
+            &lists.add_address_types,
+            &lists.remove_address_types,
+        );
+        // "The supported Regions", each reported in the state the service is in there: a Region
+        // the service already offers keeps the state it is in, and one this call adds is offered
+        // in the state the service itself is in.
+        let offered_regions: Vec<String> = after_changes(
+            &stored
+                .supported_regions
+                .iter()
+                .flatten()
+                .filter_map(|supported| supported.region.clone())
+                .collect::<Vec<String>>(),
+            &lists.add_regions,
+            &lists.remove_regions,
+        );
+        let supported_regions: Vec<SupportedRegionDetail> = offered_regions
+            .iter()
+            .map(|region| SupportedRegionDetail {
+                region: Some(region.clone()),
+                service_state: stored
+                    .supported_regions
+                    .iter()
+                    .flatten()
+                    .find(|supported| supported.region.as_deref() == Some(region.as_str()))
+                    .and_then(|supported| supported.service_state.clone())
+                    .or_else(|| Some(state::SERVICE_STATE_AVAILABLE.to_string())),
+            })
+            .collect();
+        // The Region the service is HOSTED in is the one its stored name carries, which is
+        // where it was created; a stored record carrying no such name falls back to the Region
+        // this request was signed for.
+        let hosted_region = stored
+            .service_name
+            .as_deref()
+            .and_then(state::parse_endpoint_service_name)
+            .map(|parsed| parsed.region)
+            .unwrap_or_else(|| state::request_region(ctx.parts()));
+
+        // What the modified record would retain beyond what it retains now, and what it would
+        // give back: the caller-chosen ARNs, Regions and private DNS name. Both sides are read
+        // through the ONE definition of that charge, and the charge describes the record as it
+        // will be WRITTEN — a request that names no `PrivateDnsName` leaves the name the record
+        // already carries, so those bytes are charged again rather than only refunded. The names
+        // derived from the service's own id are untouched by this call, so they are charged
+        // neither way.
+        let retained_private_dns_name = if removes_private_dns_name {
+            None
+        } else {
+            assigned_private_dns_name.or(stored.private_dns_name.as_deref())
+        };
+        let charge = state::vpc_endpoint_service_caller_supplied_bytes(
+            &network_load_balancer_arns,
+            &gateway_load_balancer_arns,
+            &offered_regions,
+            retained_private_dns_name,
+        );
+        let refund = state::vpc_endpoint_service_caller_supplied_bytes(
+            stored.network_load_balancer_arns.as_deref().unwrap_or_default(),
+            stored.gateway_load_balancer_arns.as_deref().unwrap_or_default(),
+            &stored
+                .supported_regions
+                .iter()
+                .flatten()
+                .filter_map(|supported| supported.region.clone())
+                .collect::<Vec<String>>(),
+            stored.private_dns_name.as_deref(),
+        );
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store this modification's {charge} bytes",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // Every parameter has been read and the service resolved, and nothing has been written
+        // yet: "If you have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`), so a request that WOULD have worked stops here, and one that would have
+        // been refused was refused above with its own reason.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let Some(configuration) = store.vpc_endpoint_services.get_mut(service_id) else {
+            return Err(state::internal_error(
+                "the VPC endpoint service configuration being modified could not be read back",
+            ));
+        };
+        configuration.network_load_balancer_arns = Some(network_load_balancer_arns);
+        configuration.gateway_load_balancer_arns = Some(gateway_load_balancer_arns);
+        configuration.supported_ip_address_types = Some(supported_ip_address_types);
+        configuration.supported_regions = Some(supported_regions);
+        // "Indicates whether consumers can access the service from a Region other than the
+        // Region where the service is hosted" (`RemoteAccessEnabled`) — true exactly when the
+        // service is now offered from such a Region.
+        configuration.remote_access_enabled = Some(
+            offered_regions
+                .iter()
+                .any(|region| *region != hosted_region),
+        );
+        // "Indicates whether requests to create an endpoint to the service must be accepted"
+        // (`AcceptanceRequired`): a request that did not carry the member asks for no change.
+        if let Some(acceptance_required) = input.acceptance_required {
+            configuration.acceptance_required = Some(acceptance_required);
+        }
+        // "If you set or modify the private DNS name, you must prove that you own the private
+        // DNS domain name": a name this call ASSIGNS starts unverified, with the record whose
+        // publication is that proof, and one it removes takes the record with it. A request
+        // naming the name the service already carries proves nothing new, so the verification
+        // it is already under stands.
+        if removes_private_dns_name {
+            configuration.private_dns_name = None;
+            configuration.private_dns_name_configuration = None;
+        } else if let Some(name) = assigned_private_dns_name {
+            if configuration.private_dns_name.as_deref() != Some(name) {
+                configuration.private_dns_name = Some(name.to_string());
+                configuration.private_dns_name_configuration =
+                    Some(state::private_dns_name_verification(service_id, name));
+            }
+        }
+        store.release_stored_bytes(refund);
+        store.add_stored_bytes(charge);
+
+        // "Returns true if the request succeeds; otherwise, it returns an error" (`Return`).
+        Ok(ModifyVpcEndpointServiceConfigurationOutput {
+            r#return: Some(true),
+        })
     }
 }
+
+/// The lists one request carries, each already deduplicated — held together so the bound every
+/// caller-chosen list is held to is asked about each of them in one place.
+struct RequestedChanges {
+    add_network: Vec<String>,
+    remove_network: Vec<String>,
+    add_gateway: Vec<String>,
+    remove_gateway: Vec<String>,
+    add_address_types: Vec<String>,
+    remove_address_types: Vec<String>,
+    add_regions: Vec<String>,
+    remove_regions: Vec<String>,
+}
+
+impl RequestedChanges {
+    /// Each list beside the member name a refusal about its length names.
+    fn named(&self) -> [(&'static str, &Vec<String>); 8] {
+        [
+            ("AddNetworkLoadBalancerArn", &self.add_network),
+            ("RemoveNetworkLoadBalancerArn", &self.remove_network),
+            ("AddGatewayLoadBalancerArn", &self.add_gateway),
+            ("RemoveGatewayLoadBalancerArn", &self.remove_gateway),
+            ("AddSupportedIpAddressType", &self.add_address_types),
+            ("RemoveSupportedIpAddressType", &self.remove_address_types),
+            ("AddSupportedRegion", &self.add_regions),
+            ("RemoveSupportedRegion", &self.remove_regions),
+        ]
+    }
+}
+
+/// One list of the request, deduplicated: naming one value twice asks for it once, which is what
+/// keeps a repeat from being stored twice or removed twice.
+fn deduplicated(values: Option<&[String]>) -> Vec<String> {
+    crate::state::deduplicate_ids(values.unwrap_or_default())
+}
+
+/// `held` after a modification took `removals` away and put `additions` in — the one reading of
+/// an `Add…`/`Remove…` pair in this operation, so every member the request can change is changed
+/// the same way.
+///
+/// Removals are applied first, so a value the request both removes and adds is one it asks to
+/// hold; the order of what was already held is kept, with anything added following it, which is
+/// the order a describe then reports.
+fn after_changes(held: &[String], additions: &[String], removals: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = held
+        .iter()
+        .filter(|value| !removals.contains(value))
+        .cloned()
+        .collect();
+    for addition in additions {
+        if !kept.contains(addition) {
+            kept.push(addition.clone());
+        }
+    }
+    kept
+}
+

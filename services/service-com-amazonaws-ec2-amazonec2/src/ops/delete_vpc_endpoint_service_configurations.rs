@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpcEndpointServiceConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpcEndpointServiceConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes every endpoint service configuration of the account that the request's
+//! `ServiceIds` resolve, taking the connections to each service with it, and reports each id it
+//! could NOT delete in `Unsuccessful` with that cause's own code and sentence. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpcEndpointServiceConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A service a connection is still attached to is one of those: "before you can delete an
+//! endpoint service configuration, you must reject any Available or PendingAcceptance interface
+//! endpoint connections that are attached to the service", so such a service is reported rather
+//! than deleted and the account keeps offering it until its connections are rejected.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +137,213 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpcEndpointServiceConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpcEndpointServiceConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpcEndpointServiceConfigurations"))
+        // `ctx` carries request metadata only; this operation reads none of it — a service
+        // configuration is named by id, and this store holds the account's configurations as
+        // one set, whichever regional endpoint the request was signed for. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // Naming one service twice asks for it once, which is what keeps the second mention
+        // from being reported as an id that does not exist after the first removed it.
+        let requested = state::deduplicate_ids(&input.service_ids);
+        // The work this call does is one removal per id named, so the number of ids one
+        // request may carry is bounded before any of that work is done — the bound every list
+        // of resource ids in this crate is held to. The member targets
+        // `VpcEndpointServiceIdList`, on which the model publishes no bound at all.
+        if requested.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "ServiceIds carries {supplied} ids, above the maximum of {maximum}",
+                supplied = requested.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A connection whose own move has fallen due is already `available`, so whether a
+        // service still has one attached is asked of the state its connections ACTUALLY are
+        // in.
+        store.materialize_due_transitions();
+
+        // The connections of every service, indexed in ONE walk of the connection store
+        // before any id is judged: the per-id questions below are then lookups, so the work
+        // this call does is the number of connections PLUS the number of ids rather than
+        // their product.
+        let mut connections = connections_by_service(&store);
+
+        // Each service is judged on its own and reported in `Unsuccessful` when it cannot be
+        // deleted — "information about the service configurations that were not deleted, if
+        // applicable" — so one bad id does not refuse the services beside it. The cause
+        // carried is the code this service answers that same cause with elsewhere, so a
+        // client reads one code per cause whether it comes back as an error or as an
+        // unsuccessful item.
+        let mut unsuccessful: Vec<UnsuccessfulItem> = Vec::new();
+        let mut deletable: Vec<String> = Vec::new();
+        for service_id in &requested {
+            let refusal = if !state::prefixed_id_is_well_formed(
+                state::VPC_ENDPOINT_SERVICE_ID_PREFIX,
+                service_id,
+            ) {
+                Some((
+                    state::INVALID_VPC_ENDPOINT_SERVICE_ID_MALFORMED,
+                    state::invalid_id_message(service_id),
+                ))
+            } else if !store.vpc_endpoint_services.contains_key(service_id) {
+                Some((
+                    state::INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND,
+                    state::id_not_found_message(state::VPC_ENDPOINT_SERVICE_ID_KIND, service_id),
+                ))
+            } else {
+                // "Before you can delete an endpoint service configuration, you must reject
+                // any Available or PendingAcceptance interface endpoint connections that are
+                // attached to the service": such a service is left standing, and the state
+                // of the connection the owner has still to act on is what the report names.
+                connections
+                    .get(service_id)
+                    .and_then(|service_connections| {
+                        service_connections
+                            .iter()
+                            .map(|connection| connection.vpc_endpoint_state.as_str())
+                            .find(|attached| CONNECTION_STATES_STILL_ATTACHED.contains(attached))
+                    })
+                    .map(|attached| {
+                        (
+                            state::EXISTING_VPC_ENDPOINT_CONNECTIONS,
+                            format!(
+                                "The VpcEndpointService '{service_id}' has an endpoint \
+                                 connection in state '{attached}' attached to it. Reject the \
+                                 connection before deleting the service configuration."
+                            ),
+                        )
+                    })
+            };
+            match refusal {
+                Some((code, message)) => unsuccessful.push(UnsuccessfulItem {
+                    resource_id: Some(service_id.clone()),
+                    error: Some(UnsuccessfulItemError {
+                        code: Some(code.to_string()),
+                        message: Some(message),
+                    }),
+                }),
+                None => deletable.push(service_id.clone()),
+            }
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        for service_id in deletable {
+            let attached = connections.remove(&service_id).unwrap_or_default();
+            remove_endpoint_service(&mut store, &service_id, &attached);
+        }
+
+        Ok(DeleteVpcEndpointServiceConfigurationsOutput {
+            unsuccessful: Some(unsuccessful),
+        })
     }
+}
+
+/// The states an endpoint connection the SERVICE OWNER has still to reject sits in — the two
+/// `DeleteVpcEndpointServiceConfigurations` names ("you must reject any Available or
+/// PendingAcceptance interface endpoint connections that are attached to the service"), plus
+/// the `pending` an acceptance already granted leaves behind, which the clock owes `available`
+/// ([`crate::state::ComAmazonawsEc2Amazonec2State::vpc_endpoint_connection_moves`]) and so is
+/// that same attached connection a moment early.
+///
+/// Every other state of [`crate::state::VPC_ENDPOINT_STATE_VALUES`] is one the owner or the
+/// consumer has already acted on — `rejected`, `deleting`, `deleted`, `failed` — so there is
+/// nothing left to reject and the configuration can go.
+const CONNECTION_STATES_STILL_ATTACHED: [&str; 3] = [
+    crate::state::VPC_ENDPOINT_STATE_PENDING_ACCEPTANCE,
+    crate::state::VPC_ENDPOINT_STATE_PENDING,
+    crate::state::VPC_ENDPOINT_STATE_AVAILABLE,
+];
+
+/// The stored connections of every service that has one, by `ServiceId`, in ONE walk of the
+/// connection store.
+///
+/// Built before any requested id is judged, so neither the per-id question "has this service a
+/// connection still attached?" nor the removal below walks that store again: the cost of a call
+/// is the number of connections plus the number of ids, rather than their product. A connection
+/// carrying no `ServiceId` belongs to no service of the account and is left where it is.
+fn connections_by_service(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+) -> ::std::collections::BTreeMap<String, Vec<AttachedConnection>> {
+    let mut by_service: ::std::collections::BTreeMap<String, Vec<AttachedConnection>> =
+        ::std::collections::BTreeMap::new();
+    for connection in store.vpc_endpoint_connections.values() {
+        if let Some(service_id) = connection.service_id.clone() {
+            by_service.entry(service_id).or_default().push(AttachedConnection {
+                vpc_endpoint_id: connection.vpc_endpoint_id.clone().unwrap_or_default(),
+                vpc_endpoint_state: connection.vpc_endpoint_state.clone().unwrap_or_default(),
+            });
+        }
+    }
+    by_service
+}
+
+/// One connection to a service, as this operation asks about it: the endpoint it is keyed by
+/// and the state it is in.
+struct AttachedConnection {
+    vpc_endpoint_id: String,
+    vpc_endpoint_state: String,
+}
+
+/// Remove ONE stored endpoint service configuration with everything that cannot outlive it —
+/// `attached` being the connections to it, as [`connections_by_service`] indexed them.
+///
+/// The connections to the service go with it: a stored connection is a connection "to your VPC
+/// endpoint services" (`DescribeVpcEndpointConnections`), so one naming a service the account
+/// no longer offers would be reported as a connection to nothing. Every connection still
+/// attached has been rejected by the time a service gets here — a service with one is reported
+/// instead of deleted — so what goes is what the owner or the consumer already acted on. A
+/// `ClientToken` left naming a service this store no longer holds would replay into a dangling
+/// id, so it goes too.
+///
+/// The caller-chosen bytes those records retained go back to the store's budget on exactly the
+/// terms they were taken on: the record overhead and tags
+/// [`crate::state::ComAmazonawsEc2Amazonec2State::insert_vpc_endpoint_service`] charged, the
+/// load balancer ARNs, private DNS name, Regions and client token the create added, the names
+/// it derived from the id it minted, and each connection's own
+/// [`crate::state::vpc_endpoint_connection_payload_bytes`].
+fn remove_endpoint_service(
+    store: &mut crate::state::ComAmazonawsEc2Amazonec2State,
+    service_id: &str,
+    attached: &[AttachedConnection],
+) {
+    use crate::state;
+
+    let Some(configuration) = store.vpc_endpoint_services.remove(service_id) else {
+        return;
+    };
+    for vpc_endpoint_id in attached
+        .iter()
+        .map(|connection| connection.vpc_endpoint_id.clone())
+    {
+        if let Some(connection) = store.vpc_endpoint_connections.remove(&vpc_endpoint_id) {
+            store.release_stored_bytes(state::vpc_endpoint_connection_payload_bytes(&connection));
+        }
+        // The move the clock still owed that connection is owed no longer: the connection
+        // went with the service.
+        store.vpc_endpoint_connection_moves.remove(&vpc_endpoint_id);
+    }
+    let tokens: Vec<String> = store
+        .vpc_endpoint_service_client_tokens
+        .iter()
+        .filter(|(_, minted)| minted.as_str() == service_id)
+        .map(|(token, _)| token.clone())
+        .collect();
+    for token in tokens {
+        store.vpc_endpoint_service_client_tokens.remove(&token);
+        store.release_stored_bytes(token.len());
+    }
+
+    // The one definition of what storing this configuration charged, so the delete gives back
+    // exactly that and no path can drift from the create and the modify.
+    store.release_stored_bytes(state::vpc_endpoint_service_payload_bytes(&configuration));
 }

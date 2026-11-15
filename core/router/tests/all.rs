@@ -1517,3 +1517,16 @@ mod zz_probe_whole_emulator;
 // The lint allowed here is for the suite files this root compiles: a wrapped paragraph in one of
 // their module headers is a note rather than a build failure. An inner attribute, like an inner
 // doc comment, is legal only before the first item, so it stands here rather than in the list.
+// One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted
+// by name, and no other line — so two branches landing at once insert two lines in two
+// places and have no prose to duplicate, re-word or mistype. A file no `mod` names is
+// compiled nowhere and its tests never run; a suite left at the top level of `tests/` fails
+// the build; a second `mod` for one name is `E0428`; and an inner doc comment past the first
+// item is `E0753`. Each of the last two fails every suite in this target, which is why EVERY
+// comment in this file is an ordinary `//` one, this header included: with no `//!` anywhere,
+// (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each declaration
+// is what points it into `tests/all/`.
+// What a suite covers, and why it belongs to this cross-service target rather than to one
+// service crate's own, is stated in that suite's own module doc, where it is read beside the
+// test it explains; the notes earlier landings appended to the tail of this file live in
+// `all/appended_notes.rs`.

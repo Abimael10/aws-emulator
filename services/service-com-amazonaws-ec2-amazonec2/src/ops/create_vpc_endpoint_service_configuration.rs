@@ -385,14 +385,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // What this request would retain beyond the record and its tags (what
         // `insert_vpc_endpoint_service` charges): the caller-chosen ARNs, private DNS name,
-        // Regions and client token, and the names derived from the id the insert mints.
-        let caller_supplied_bytes = caller_supplied_payload_bytes(
+        // Regions and client token, and the names derived from the id the insert mints. The
+        // first group goes through the ONE definition of that charge, which
+        // `modify_vpc_endpoint_service_configuration` and
+        // `delete_vpc_endpoint_service_configurations` read too, so a record's cost is decided
+        // in one place; the client token is held beside the record and charged with it here.
+        let caller_supplied_bytes = state::vpc_endpoint_service_caller_supplied_bytes(
             &network_load_balancer_arns,
             &gateway_load_balancer_arns,
-            private_dns_name,
             &supported_regions,
-            input.client_token.as_deref(),
-        );
+            private_dns_name,
+        )
+        .saturating_add(input.client_token.as_deref().map_or(0, str::len));
         let payload_bytes = caller_supplied_bytes
             .saturating_add(state::STORED_RECORD_OVERHEAD_BYTES)
             .saturating_add(state::tag_list_bytes(&tags))
@@ -523,27 +527,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_token: input.client_token.clone(),
         })
     }
-}
-
-/// The caller-chosen bytes one stored service configuration holds beyond the record and its tags:
-/// the load balancer ARNs behind it, the private DNS name assigned to it, the Regions it is
-/// offered from, and the client token that minted it.
-///
-/// Charged against the store's byte budget by the create, so a request cannot retain unbounded
-/// caller-supplied data under a record ceiling that only counts records.
-fn caller_supplied_payload_bytes(
-    network_load_balancer_arns: &[String],
-    gateway_load_balancer_arns: &[String],
-    private_dns_name: Option<&str>,
-    supported_regions: &[String],
-    client_token: Option<&str>,
-) -> usize {
-    let total = |values: &[String]| -> usize { values.iter().map(String::len).sum() };
-    total(network_load_balancer_arns)
-        .saturating_add(total(gateway_load_balancer_arns))
-        .saturating_add(total(supported_regions))
-        .saturating_add(private_dns_name.map_or(0, str::len))
-        .saturating_add(client_token.map_or(0, str::len))
 }
 
 /// An upper bound on the bytes of the names derived from the minted `ServiceId` — the service's

@@ -139,6 +139,75 @@ pub fn dns_entry_list_bytes(entries: &[DnsEntry]) -> usize {
 }
 
 // =============================================================================
+// VPC endpoint service configurations
+// =============================================================================
+
+/// The caller-chosen bytes one stored endpoint service CONFIGURATION retains beyond the record,
+/// its tags and the names derived from its minted id: the load balancer ARNs behind it, the
+/// Regions it is offered from, and the private DNS name assigned to it.
+///
+/// The ONE definition of that charge, the way [`vpc_endpoint_connection_payload_bytes`] is for a
+/// connection: `CreateVpcEndpointServiceConfiguration` charges exactly it for a new
+/// configuration, `ModifyVpcEndpointServiceConfiguration` refunds what the record held and
+/// charges what it will hold through it, and
+/// `DeleteVpcEndpointServiceConfigurations` gives it back inside
+/// [`vpc_endpoint_service_payload_bytes`] — so the three cannot drift apart and no repeated
+/// modification can leave the budget holding less than the store does.
+pub fn vpc_endpoint_service_caller_supplied_bytes(
+    network_load_balancer_arns: &[String],
+    gateway_load_balancer_arns: &[String],
+    supported_regions: &[String],
+    private_dns_name: Option<&str>,
+) -> usize {
+    let total = |values: &[String]| -> usize { values.iter().map(String::len).sum() };
+    total(network_load_balancer_arns)
+        .saturating_add(total(gateway_load_balancer_arns))
+        .saturating_add(total(supported_regions))
+        .saturating_add(private_dns_name.map_or(0, str::len))
+}
+
+/// The WHOLE charge one stored endpoint service configuration carries, read off the record: the
+/// record overhead and tags
+/// [`ComAmazonawsEc2Amazonec2State::insert_vpc_endpoint_service`] charges, the caller-chosen
+/// bytes of [`vpc_endpoint_service_caller_supplied_bytes`], and the names the create derived
+/// from the id it minted — the service's own name and its base endpoint DNS names.
+///
+/// What a removal path gives back, so a configuration that is deleted releases exactly what
+/// storing it took. The `ClientToken` that minted it is NOT part of it: that string is held
+/// beside the record, in
+/// [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_service_client_tokens`], and is charged and
+/// released with that entry.
+pub fn vpc_endpoint_service_payload_bytes(configuration: &ServiceConfiguration) -> usize {
+    let total = |values: Option<&Vec<String>>| -> usize {
+        values.into_iter().flatten().map(String::len).sum()
+    };
+    let regions: Vec<String> = configuration
+        .supported_regions
+        .iter()
+        .flatten()
+        .filter_map(|supported| supported.region.clone())
+        .collect();
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(tag_list_bytes(
+            configuration.tags.as_deref().unwrap_or_default(),
+        ))
+        .saturating_add(vpc_endpoint_service_caller_supplied_bytes(
+            configuration
+                .network_load_balancer_arns
+                .as_deref()
+                .unwrap_or_default(),
+            configuration
+                .gateway_load_balancer_arns
+                .as_deref()
+                .unwrap_or_default(),
+            &regions,
+            configuration.private_dns_name.as_deref(),
+        ))
+        .saturating_add(configuration.service_name.as_deref().unwrap_or_default().len())
+        .saturating_add(total(configuration.base_endpoint_dns_names.as_ref()))
+}
+
+// =============================================================================
 // VPC endpoint associations
 // =============================================================================
 
@@ -2438,18 +2507,35 @@ pub const INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND: &str =
 pub const INVALID_VPC_ENDPOINT_SERVICE_ID_MALFORMED: &str =
     "InvalidVpcEndpointServiceId.Malformed";
 
+/// How a report of a `ServiceId` this account holds no endpoint service for NAMES the
+/// resource: the shape's own name with `Id` spelt as one word, the way AWS names it, rather
+/// than in the prose an operation might reach for.
+///
+/// Shared by the refusal below and by the BULK delete that reports the same cause PER ITEM in
+/// `Unsuccessful` ([`id_not_found_message`]), so an unknown service id reads the same whether
+/// the call is refused for it or carries the cause inside its answer.
+pub const VPC_ENDPOINT_SERVICE_ID_KIND: &str = "VpcEndpointService Id";
+
+/// `ExistingVpcEndpointConnections` (HTTP 400): the account still holds an endpoint connection
+/// to the endpoint service a delete names.
+///
+/// "Before you can delete an endpoint service configuration, you must reject any Available or
+/// PendingAcceptance interface endpoint connections that are attached to the service"
+/// (`DeleteVpcEndpointServiceConfigurations`), so a service one is still attached to is NOT
+/// deleted and is reported with this cause instead.
+pub const EXISTING_VPC_ENDPOINT_CONNECTIONS: &str = "ExistingVpcEndpointConnections";
+
 /// Refuse a well-formed VPC endpoint service id this account holds no endpoint service for:
 /// HTTP 400 [`INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND`].
 ///
-/// The resource is named the way AWS names it in this refusal — `The VpcEndpointService Id
-/// '<id>' does not exist`, the shape's own name with `Id` spelt as one word — rather than in
-/// the prose an operation might reach for, with the id from the REQUEST. The ONE place this
+/// The resource is named the way AWS names it in this refusal
+/// ([`VPC_ENDPOINT_SERVICE_ID_KIND`]), with the id from the REQUEST. The ONE place this
 /// refusal is built, so every operation that resolves a `ServiceId` answers an unknown one
 /// identically.
 pub fn invalid_vpc_endpoint_service_id_not_found<E>(service_id: &str) -> Scaffolded<E> {
     id_not_found(
         INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND,
-        "VpcEndpointService Id",
+        VPC_ENDPOINT_SERVICE_ID_KIND,
         service_id,
     )
 }
@@ -2510,7 +2596,17 @@ pub fn require_well_formed_id<E>(
 /// Refuse a request that named a resource id this account holds no resource for: HTTP 400
 /// with `code`, which is that resource's own `Invalid<Kind>.NotFound`.
 pub fn id_not_found<E>(code: &'static str, kind: &str, id: &str) -> Scaffolded<E> {
-    Scaffolded::service_error(code, 400, format!("The {kind} '{id}' does not exist"))
+    Scaffolded::service_error(code, 400, id_not_found_message(kind, id))
+}
+
+/// The sentence [`id_not_found`] carries, on its own: the fixed `The `, ` '` and `' does not
+/// exist` around the resource kind and the id the REQUEST named.
+///
+/// Separate from the refusal because a BULK operation reports this same cause PER ITEM, in an
+/// `Unsuccessful` entry rather than as the call's error — the code and the sentence travel
+/// inside a 200 there — and the two must not word one cause two ways.
+pub fn id_not_found_message(kind: &str, id: &str) -> String {
+    format!("The {kind} '{id}' does not exist")
 }
 
 /// What the owner of an attached resource decided about a transit gateway attachment.
