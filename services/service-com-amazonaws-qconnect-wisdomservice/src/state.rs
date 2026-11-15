@@ -24,6 +24,11 @@ pub use message_templates::*;
 mod message_template_versions;
 pub use message_template_versions::*;
 
+/// Rendering a message template: the variable placeholders its content names and the
+/// attribute values a render resolves them from.
+mod message_template_render;
+pub use message_template_render::*;
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
 
@@ -2399,33 +2404,11 @@ pub struct QuickResponse {
 /// attribute and is ignored, so no key this emulator cannot read off the content is ever
 /// claimed.
 ///
-/// One linear pass, no recursion, and nothing retained but the keys found: the input is
-/// the stored content, whose own `@length` (`QuickResponseContent`, 1..4000) bounds how
-/// much there is to walk.
+/// Read off the content by [`text_attribute_keys`], which is the one place this service
+/// decides what a placeholder is: the keys a quick response reports and the placeholders a
+/// render substitutes therefore cannot disagree.
 fn content_attribute_keys(content: &str) -> Vec<String> {
-    const OPEN: &str = "{{";
-    const CLOSE: &str = "}}";
-
-    let mut keys: Vec<String> = Vec::new();
-    let mut rest = content;
-    while let Some(open) = rest.find(OPEN) {
-        rest = &rest[open + OPEN.len()..];
-        let Some(close) = rest.find(CLOSE) else {
-            break;
-        };
-        // A placeholder the content opens again before closing the first one names only
-        // what the LAST opener began, so an unclosed `{{` swallows no key.
-        let span = &rest[..close];
-        let key = match span.rfind(OPEN) {
-            Some(reopened) => span[reopened + OPEN.len()..].trim(),
-            None => span.trim(),
-        };
-        if !key.is_empty() && !keys.iter().any(|held| held == key) {
-            keys.push(key.to_string());
-        }
-        rest = &rest[close + CLOSE.len()..];
-    }
-    keys
+    text_attribute_keys(content)
 }
 
 impl QuickResponse {

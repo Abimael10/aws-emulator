@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RenderMessageTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RenderMessageTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RenderMessageTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +82,24 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> RenderMessageTemplateError {
+    RenderMessageTemplateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400).
+fn validation(message: String) -> RenderMessageTemplateError {
+    RenderMessageTemplateErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +171,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RenderMessageTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RenderMessageTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RenderMessageTemplate"))
+        // A render REPORTS: it answers out of the stored template and the attributes the
+        // request carried, and writes nothing, so two renders of one template answer alike
+        // and neither changes what a later caller reads.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("RenderMessageTemplate")
+        })?;
+        let store = state.lock();
+
+        // A message template is reachable only through the knowledge base it was created
+        // under, so the parent is resolved first and a knowledge base this account does
+        // not hold is reported as the resource that is missing.
+        let Some(knowledge_base) = store.knowledge_base(&input.knowledge_base_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+                &input.knowledge_base_id,
+            ));
+        };
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+
+        // The label names the template and, optionally, ONE version of it; a label that
+        // carries no qualifier addresses `$LATEST`, the working copy, exactly as a read of
+        // the template does.
+        let (message_template_id, qualifier) =
+            crate::state::resolve_qualified_id(&input.message_template_id);
+        let qualifier = qualifier.unwrap_or(crate::state::VERSION_QUALIFIER_LATEST);
+
+        let Some(message_template) = store.message_template(&knowledge_base_id, message_template_id)
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND,
+                &input.message_template_id,
+            ));
+        };
+
+        // Which copy of the template is rendered: the working copy for `$LATEST`, and
+        // otherwise the SNAPSHOT published under the version the qualifier names — a
+        // number names the version published under it and `$ACTIVE_VERSION` the activated
+        // one, so a qualifier naming a version this template has not published names
+        // nothing and a qualifier that names neither a version nor the working copy is
+        // refused.
+        let rendered_template = match crate::state::addressed_version(qualifier) {
+            Some(crate::state::AddressedVersion::Latest) => message_template,
+            Some(crate::state::AddressedVersion::Published) => {
+                let published = if qualifier == crate::state::VERSION_QUALIFIER_ACTIVE {
+                    store.active_message_template_version(message_template_id)
+                } else {
+                    qualifier.parse::<i64>().ok().and_then(|version_number| {
+                        store.message_template_version(message_template_id, version_number)
+                    })
+                };
+                let Some(published) = published else {
+                    return Err(not_found(
+                        crate::state::MESSAGE_MESSAGE_TEMPLATE_VERSION_NOT_FOUND,
+                        &input.message_template_id,
+                    ));
+                };
+                &published.snapshot
+            }
+            None => {
+                return Err(validation(crate::state::message_invalid_version_qualifier(
+                    qualifier,
+                )))
+            }
+        }
+        // The substitution below runs over a COPY of the record and the store is released
+        // first: one caller's render then neither blocks another caller's request nor can
+        // observe a later write part-way through.
+        .clone();
+        drop(store);
+
+        // The content with every variable the request's attributes fill substituted, and
+        // the template's own `defaultAttributes` filling the rest; a variable neither
+        // fills keeps its placeholder and its key is reported back. A render whose
+        // substitutions would run past the store's rendered-content ceiling is refused
+        // rather than answered, so a short request cannot ask for an unbounded response.
+        let rendered =
+            crate::state::render_message_template(&rendered_template, &input.attributes)
+                .map_err(validation)?;
+
+        Ok(RenderMessageTemplateOutput {
+            content: rendered.content,
+            // The source configuration and the attachments are the rendered copy's own:
+            // a render substitutes variables into the content, it does not change anything
+            // else the template holds.
+            source_configuration_summary: rendered_template.source_configuration_summary(),
+            attributes_not_interpolated: Some(rendered.attributes_not_interpolated),
+            attachments: (!rendered_template.attachments.is_empty())
+                .then(|| rendered_template.attachments.clone()),
+        })
     }
 }
