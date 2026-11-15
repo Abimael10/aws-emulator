@@ -512,6 +512,36 @@ pub fn parse_filter_pattern(pattern: &str) -> Result<::serde_json::Value, String
     ::service_common::event_pattern::parse(pattern)
 }
 
+/// The member a filter configuration that selects nothing is missing, as a
+/// refusal names it.
+pub const FILTERS_MEMBER: &str = "Filters";
+
+/// Why `configuration` is not a filter configuration a subscriber can carry, or
+/// `None` when it is one.
+///
+/// `FilterConfiguration` states the contract: "On CreateSubscriber, Filters is
+/// required and must contain at least one Filter with a non-empty Pattern …
+/// Any non-empty shape (including `{Language:X}` without Filters) must contain a
+/// valid Filters list — same contract as CreateSubscriber". So a configuration
+/// that names no `Filters` at all selects nothing for the lifetime of the
+/// subscriber and is a request parameter that is not valid, rather than a
+/// subscriber that silently takes every event. A pattern that is not one this
+/// service can evaluate is the same fault for the same reason.
+///
+/// The `Some` is the whole `Message` of the refusal, which is why it names the
+/// member the request got wrong.
+pub fn filter_configuration_fault(configuration: &FilterConfiguration) -> Option<String> {
+    let filters = configuration.filters.as_deref().unwrap_or_default();
+    if filters.is_empty() {
+        return Some(format!("{FILTERS_MEMBER} is required"));
+    }
+    filters.iter().find_map(|filter| {
+        parse_filter_pattern(&filter.pattern)
+            .err()
+            .map(|reason| format!("FilterConfiguration.{FILTERS_MEMBER}: {reason}"))
+    })
+}
+
 /// What this subscriber's target is handed for `event`, or `None` when the
 /// subscriber's `Transformer` names a transformation this slice does not perform
 /// — in which case nothing is delivered rather than a document the transformer

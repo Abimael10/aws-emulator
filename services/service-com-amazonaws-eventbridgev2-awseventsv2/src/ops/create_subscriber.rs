@@ -296,24 +296,23 @@ fn create(
         input.point_in_time_configuration.as_ref(),
     );
 
-    // Every filter is stored only if it is a pattern this service can
-    // evaluate: `FilterConfiguration$Language` declares one language,
-    // `EVENT_BRIDGE_PATTERN`, and a text that is not a pattern of that
-    // language would select nothing for the lifetime of the subscriber.
-    for filter in input
+    // A filter configuration is stored only if it is one this service can
+    // evaluate: `FilterConfiguration` makes `Filters` required on a create and
+    // `FilterConfiguration$Language` declares one language,
+    // `EVENT_BRIDGE_PATTERN`, so a configuration naming no filters, or a text
+    // that is not a pattern of that language, would select nothing for the
+    // lifetime of the subscriber.
+    if let Some(reason) = input
         .filter_configuration
         .as_ref()
-        .and_then(|configuration| configuration.filters.as_deref())
-        .unwrap_or_default()
+        .and_then(crate::state::filter_configuration_fault)
     {
-        if let Err(reason) = crate::state::parse_filter_pattern(&filter.pattern) {
-            return Err(CreateSubscriberErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!("FilterConfiguration.Filters: {reason}")),
-                },
-            )
-            .into());
-        }
+        return Err(CreateSubscriberErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(reason),
+            },
+        )
+        .into());
     }
 
     // A retry carrying the same ClientToken replays the subscriber that

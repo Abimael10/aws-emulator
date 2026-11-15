@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/collision_wording_and_detail_json.rs"]
 mod collision_wording_and_detail_json;
+#[path = "all/create_subscriber_contract.rs"]
+mod create_subscriber_contract;
 #[path = "all/event_bus_lifecycle.rs"]
 mod event_bus_lifecycle;
 #[path = "all/event_bus_read_projection.rs"]

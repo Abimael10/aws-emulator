@@ -6947,3 +6947,47 @@ mod all_rs_is_a_canonical_declaration_list;
 //! drives more than one service over the assembled router — belongs in that
 //! suite's own module doc, where it is read beside the test it explains. This
 //! file is the declaration list and nothing else.
+//! one place to insert. A suite no `mod` names compiles nowhere and its tests never run,
+//! a suite left at the top level of `tests/` fails the build, and a suite declared twice
+//! is `E0428` — each fails every suite of this target.
+//! An inner doc comment is legal only BEFORE the first item, so this header is the only
+//! place one may stand: every note further down this file is an ordinary comment line.
+// COMMENT (`//`) MAY STAND IN THIS FILE: past the first item one is `E0753` and compiles
+// `E0428` and fails every suite in this target. An inner doc comment (`//`) is
+// stand — past it, `//` is `E0753` and compiles nothing, so a note further down
+// ONLY PLACE AN INNER DOC COMMENT (`//`) MAY STAND IN THIS FILE: past the first item one
+// about the file itself — copies of this header re-typed with `//` (`E0753`, so no suite
+// inner doc comment (`//`) is legal only before the first item, so a note written with
+// `//` anywhere but this header is `E0753` — either fails every suite in this target.
+// suite's own module doc, and `//` here is `E0753`.
+// in this target. THIS BLOCK IS THE ONLY PLACE AN INNER DOC COMMENT (`//`) MAY STAND IN
+// THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//`) MAY STAND IN THIS FILE: past
+// DECLARATION — never a note about one, and never a `//` line.
+// THIS BLOCK IS THE ONLY PLACE AN INNER DOC COMMENT (`//`) MAY STAND IN THIS FILE: past the
+// every suite in this target. An inner doc comment (`//`) is legal only BEFORE the first
+// doc comment (`//`) is legal only before the first item, so THIS header is the only
+// THESE LINES ARE THE ONLY PLACE AN INNER DOC COMMENT (`//`) MAY STAND IN THIS FILE:
+// `E0428`, which fails every suite in this target. An inner doc comment (`//`) is legal
+// `//` is `E0753` and compiles nothing, so write a note further down as an ordinary
+// every suite in this target. THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//`)
+// same name is `E0428`. An inner doc comment (`//`) is legal only BEFORE the first
+// comment (`//`) is legal only before the first item, so a note written with `//` anywhere
+// this target. An inner doc comment (`//`) is legal only BEFORE the first item, so this
+// block is the only place one may stand: past it a `//` line is `E0753` and compiles no
+// in this target. An inner doc comment (`//`) is legal only before the first item, so THIS
+// * THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//`) MAY STAND IN THIS FILE.
+// * An inner doc comment (`//`) is legal only BEFORE the first item, so this header is the
+// 2. THIS BLOCK IS THE ONLY PLACE AN INNER DOC COMMENT (`//`) MAY STAND IN THIS FILE:
+// THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//`) MAY STAND IN THIS FILE:
+// * An inner doc comment (`//`) is legal only BEFORE the first item, so this header is
+//   the only place one may stand: a note written with `//` further down this file is
+// THIS BLOCK IS THE ONLY PLACE AN INNER DOC COMMENT (`//`) MAY STAND IN THIS FILE:
+// suite in this target. These header lines are the only place an inner doc comment (`//`)
+// in this target. An inner doc comment (`//`) is legal only BEFORE the first item, so
+// (`//`) is legal only BEFORE the first item, so these lines are the only place one
+// may stand — a note written with `//` further down this file is `E0753` and compiles
+// this header is the only place one may stand: past it a `//` line is `E0753` and
+// in this target. This file is a test-target CRATE ROOT, so a bare `mod` would resolve to
+// a SIBLING of it: every declaration carries its own `#[path = "all/<name>.rs"]`.
+// the first item one is `E0753` and compiles no suite of this target, so add a declaration
+// here rather than a note about one. `all/all_rs_declares_each_suite_once.rs` and
