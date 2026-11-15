@@ -93,6 +93,10 @@ const UPDATE_STACK: &str = "UpdateStack";
 const DELETE_STACK: &str = "DeleteStack";
 const DESCRIBE_STACKS: &str = "DescribeStacks";
 
+/// The member every call on a stack names it by, which is also the one a read is SCOPED by
+/// ([`super::progress_probe`]).
+const STACK_NAME: &str = "StackName";
+
 /// How deep a chain of nested stacks one deployment may reach: CloudFormation's own
 /// documented maximum nesting depth. A child past it is refused, so the work one request sets
 /// off is bounded by a stated number rather than by what the machine survives — and a template
@@ -103,13 +107,17 @@ const MAX_NESTING_DEPTH: usize = 5;
 /// has already reached through, outermost first: one short digest per reference
 /// ([`reference_digest`]).
 ///
+/// `pub(super)` because it also says WHOSE call a request is: a request carrying it is one
+/// this service's own provisioning made, which is what makes a progress scope on it one to
+/// honour ([`super::progress_probe::Scope::of`]).
+///
 /// The chain travels with the CALL because that is where the relation is — each level is a
 /// request of its own — and it carries digests rather than the references themselves, so no
 /// caller-supplied text reaches a header value. A request that arrives with a chain of its own
 /// can only make this provider refuse EARLIER (a longer chain, or a reference it claims is
 /// already in flight): there is no value of the header that raises the depth this provider
 /// will go to, so nothing a caller sends can widen what one request deploys.
-const CHAIN_HEADER: &str = "x-emulator-cloudformation-nested-stack-chain";
+pub(super) const CHAIN_HEADER: &str = "x-emulator-cloudformation-nested-stack-chain";
 
 /// How long one call on the child's behalf may take before the resource is failed for it.
 ///
@@ -315,7 +323,16 @@ async fn called_carrying(
     parameters: &[(String, String)],
     chain: &[String],
 ) -> Result<String, Refusal> {
-    let headers = vec![(CHAIN_HEADER, chain.join(","))];
+    let mut headers = vec![(CHAIN_HEADER, chain.join(","))];
+    // A read of the child is made from INSIDE the pass that is advancing the stacks of this
+    // Region, so it names the stack it is about: the pass that serves it then advances THAT
+    // stack — which is what lets one client call settle a whole hierarchy — rather than the
+    // Region again, once per level of nesting ([`super::progress_probe`]).
+    if action == DESCRIBE_STACKS {
+        if let Some((_, stack)) = parameters.iter().find(|(name, _)| name == STACK_NAME) {
+            headers.extend(super::progress_probe::probe_header(stack));
+        }
+    }
     match ::tokio::time::timeout(
         CALL_CEILING,
         call_query_carrying(

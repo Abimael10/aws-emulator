@@ -269,6 +269,9 @@ pub(super) mod logs_resources;
 /// `AWS::CloudFormation::Stack`: the NESTED STACK a stack declares, created in
 /// CloudFormation itself ([`nested_stack`]).
 mod nested_stack;
+/// Whether the request being served is a read THIS service made while provisioning, and which
+/// stack it is about — what keeps one client call to one pass per stack ([`progress_probe`]).
+mod progress_probe;
 /// `AWS::S3::Bucket`: the halves of that type's provider the catalogue cannot carry — how a
 /// changed declaration reaches a bucket that exists, and how the provider words a refusal.
 mod s3_bucket;
@@ -1186,6 +1189,11 @@ pub async fn advance_stabilisations_in(
     state: &::engine::ServiceState<super::ComAmazonawsCloudformationCloudformationState>,
     region: &str,
 ) {
+    // WHICH stacks this pass is for: every stack of the Region for a client's own call, and
+    // the ONE stack being read for a read THIS service made while provisioning a nested stack
+    // — so a hierarchy settles from the bottom up inside one call, without each level asking
+    // about every other level ([`progress_probe`]).
+    let scope = progress_probe::Scope::of(ctx);
     // How this emulator is reached, kept for the work a provider's answer owes once it lands
     // out of band ([`super::provider_driver`]): the answer arrives at a plane that is not a
     // handler, so the handle a handler has is what that plane publishes the next request
@@ -1212,7 +1220,7 @@ pub async fn advance_stabilisations_in(
         store
             .stacks
             .iter()
-            .filter(|stack| stack.region == region)
+            .filter(|stack| stack.region == region && scope.covers(stack))
             .filter_map(|stack| {
                 let open = stack.open_stabilisations();
                 if open.is_empty() {
@@ -1516,7 +1524,7 @@ pub async fn advance_stabilisations_in(
     // BOXED: that pass runs the deployment walk again ([`reconcile`]), which is the deepest
     // work a READ of this service performs, so its whole state is held off this function's
     // own future rather than on the stack of the request that asked.
-    Box::pin(deferred::resume(ctx, state, region)).await;
+    Box::pin(deferred::resume(ctx, state, region, &scope)).await;
     // ...and the resources a TEARDOWN in flight left alone because something that depends on
     // them was still being removed: asked about now that those removals have answered
     // ([`outstanding_teardown`]), which is what finishes the teardown.

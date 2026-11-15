@@ -339,6 +339,8 @@ mod malformed_policy_document_rollback;
 mod management_event_recording;
 #[path = "all/minted_identity_across_updates.rs"]
 mod minted_identity_across_updates;
+#[path = "all/nested_platform_stack_outputs.rs"]
+mod nested_platform_stack_outputs;
 #[path = "all/nested_resource_outputs.rs"]
 mod nested_resource_outputs;
 #[path = "all/nested_stack_output_attributes.rs"]

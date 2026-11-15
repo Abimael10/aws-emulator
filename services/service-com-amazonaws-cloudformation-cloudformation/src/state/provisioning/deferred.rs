@@ -46,8 +46,12 @@
 //! bounded by the resources a template may declare
 //! ([`crate::state::template::MAX_RESOURCES_PER_TEMPLATE`]), which is the same walk a
 //! single-pass deployment makes. The waits themselves are bounded with the operation that
-//! opened them ([`crate::state::stabilising`]). A wait that never unblocks runs out on the
-//! same window every other wait of a creation does.
+//! opened them ([`crate::state::stabilising`]), and a WITHHELD one is bounded by the wait it
+//! is waiting FOR: while the resources its declaration reads are still in flight, its own
+//! window is not checked ([`resumption_of`]), because nothing has been asked of any owning
+//! service for it — so the chain is bounded by one window per level, and a level nothing will
+//! ever unblock ends when the wait above it runs out on the same window every other wait of a
+//! creation does.
 
 use super::*;
 
@@ -72,10 +76,15 @@ struct Resumption {
 /// Read under one lock, performed with it released and recorded under a second, exactly as
 /// [`super::advance_stabilisations`] — which drives this — performs every other call a
 /// stack's own progress owes.
+///
+/// `scope` is the pass's own ([`super::progress_probe::Scope`]): a read this service made
+/// while provisioning resumes the stack it is reading, and a client's call every stack of the
+/// Region.
 pub(super) async fn resume(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     state: &::engine::ServiceState<super::super::ComAmazonawsCloudformationCloudformationState>,
     region: &str,
+    scope: &super::progress_probe::Scope,
 ) {
     // One pass per LEVEL of a withheld chain, for as long as a pass still creates something:
     // see the module docs for why the cascade is not left to the next call, and for what
@@ -84,7 +93,7 @@ pub(super) async fn resume(
         // BOXED, for the reason the walk's own provider calls are ([`reconcile`]): a pass runs
         // the whole deployment walk, so its state is held off this function's future rather
         // than on the stack of the read that resumed it.
-        if !Box::pin(resume_pass(ctx, state, region)).await {
+        if !Box::pin(resume_pass(ctx, state, region, scope)).await {
             return;
         }
     }
@@ -96,6 +105,7 @@ async fn resume_pass(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     state: &::engine::ServiceState<super::super::ComAmazonawsCloudformationCloudformationState>,
     region: &str,
+    scope: &super::progress_probe::Scope,
 ) -> bool {
     let resumptions: Vec<Resumption> = {
         let mut store = state.lock();
@@ -103,7 +113,7 @@ async fn resume_pass(
         store
             .stacks
             .iter_mut()
-            .filter(|stack| stack.region == region)
+            .filter(|stack| stack.region == region && scope.covers(stack))
             .filter_map(|stack| resumption_of(stack, now))
             .collect()
     };
@@ -227,6 +237,18 @@ fn resumption_of(
     let mut expired: Vec<(super::super::stabilising::StabilisationBarrier, String)> = Vec::new();
     let mut resumable: Vec<super::super::stabilising::StabilisationBarrier> = Vec::new();
     for barrier in withheld {
+        // A resource that is still waiting for what its declaration READS has had nothing
+        // asked of anybody for it — no create was made, so there is no answer whose window
+        // could run out ([`super::advance_stabilisations_in`] puts no question for a
+        // `Deferred` wait). What bounds it is the wait held for the resource it is waiting
+        // FOR, which has a window of its own and fails the whole operation when that runs
+        // out. So its turn is not charged to it: a chain of withheld resources is bounded by
+        // one window PER LEVEL, exactly as the levels of a nested deployment are, rather than
+        // by one window for the whole chain — which would fail the deepest level for having
+        // waited for the levels above it.
+        if awaits_a_dependency(&barrier.logical_id, &dependencies, &waiting) {
+            continue;
+        }
         if barrier.has_expired(now) {
             let reason = barrier.not_stabilised_reason(&barrier.reported_state);
             expired.push((barrier, reason));
@@ -238,9 +260,7 @@ fn resumption_of(
         if barrier.resumed_at.is_some() {
             continue;
         }
-        if !awaits_a_dependency(&barrier.logical_id, &dependencies, &waiting) {
-            resumable.push(barrier);
-        }
+        resumable.push(barrier);
     }
     if resumable.is_empty() && expired.is_empty() {
         return None;

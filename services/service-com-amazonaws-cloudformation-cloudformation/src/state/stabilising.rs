@@ -251,8 +251,10 @@ impl StabilisationBarrier {
             // serves traffic in.
             Awaited::Ready | Awaited::Updated => CREATE_STABILISATION_WINDOW,
             // A creation that has not started yet is held for the same window a started one
-            // is: what it waits for is the wait of the resource it depends on, which runs
-            // for no longer than that itself.
+            // is — but that window is not CHECKED while the resource is still waiting for
+            // what its declaration reads, since nothing has been asked of anybody for it
+            // ([`super::provisioning::deferred`] is the one reader of this for such a wait,
+            // and is where that rule lives).
             Awaited::Deferred => CREATE_STABILISATION_WINDOW,
             Awaited::Gone => REMOVAL_STABILISATION_WINDOW,
         };
