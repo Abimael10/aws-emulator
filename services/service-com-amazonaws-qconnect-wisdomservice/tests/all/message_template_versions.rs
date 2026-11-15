@@ -1461,6 +1461,208 @@ async fn a_publish_past_the_version_ceiling_is_refused() {
     );
 }
 
+/// The rule: both of the publish's labels are documented as naming the resource by "either
+/// the ID or the ARN"
+/// (`smithy_query(query="operation",operation="CreateMessageTemplateVersion")`:
+/// `knowledgeBaseId` is a `UuidOrArn`, `messageTemplateId` a
+/// `UuidOrArnOrEitherWithQualifier`, each "Can be either the ID or the ARN"), so every form
+/// of a label resolves to the SAME stored resource: the publish numbers versions of one
+/// template whichever form addressed it, answers with the resolved id rather than the label
+/// it was given, finds the version it already published for an unchanged working copy, and
+/// applies the checksum precondition to the same working copy.
+#[tokio::test]
+async fn a_publish_resolves_its_labels_in_either_the_id_or_the_arn_form() {
+    let emulator = Emulator::new();
+    let knowledge_base_id = knowledge_base(&emulator, "publish-label-forms").await;
+    let message_template_id = message_template(
+        &emulator,
+        &knowledge_base_id,
+        "addressed either way",
+        "SMS",
+        sms_content("addressed either way"),
+    )
+    .await;
+
+    let knowledge_base_arn = wisdom_arn(
+        "aws",
+        REGION,
+        engine::EMULATOR_ACCOUNT_ID,
+        &format!("knowledge-base/{knowledge_base_id}"),
+    );
+    let message_template_arn = wisdom_arn(
+        "aws",
+        REGION,
+        engine::EMULATOR_ACCOUNT_ID,
+        &format!("message-template/{knowledge_base_id}/{message_template_id}"),
+    );
+
+    // The rows differ along the FORM of each label: the four combinations of the two forms
+    // the model admits for the two labels, so the rule is asserted over the whole set
+    // rather than the bare-id pair a recording used.
+    let rows = [
+        (
+            "both labels as ids",
+            knowledge_base_id.clone(),
+            message_template_id.clone(),
+        ),
+        (
+            "the knowledge base as an ARN",
+            knowledge_base_arn.clone(),
+            message_template_id.clone(),
+        ),
+        (
+            "the template as an ARN",
+            knowledge_base_id.clone(),
+            message_template_arn.clone(),
+        ),
+        (
+            "both labels as ARNs",
+            knowledge_base_arn.clone(),
+            message_template_arn.clone(),
+        ),
+    ];
+
+    // The first row publishes the template's first version; every row after it addresses the
+    // same template, whose working copy did not change, so each answers with that version
+    // and numbers no second one.
+    for (case, knowledge_base_label, message_template_label) in &rows {
+        let reply = publish(
+            &emulator,
+            knowledge_base_label,
+            message_template_label,
+            None,
+        )
+        .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected HTTP 200, got HTTP {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            integer(&reply, "/messageTemplate/versionNumber"),
+            Some(VERSION_MIN),
+            "case {case:?}: every form addresses the one template, whose unchanged working copy \
+             is already published as version {VERSION_MIN}, got {:?}",
+            integer(&reply, "/messageTemplate/versionNumber")
+        );
+        assert_eq!(
+            reply.string("/messageTemplate/messageTemplateId"),
+            message_template_id,
+            "case {case:?}: the answer reports the resolved id, not the label it was given, got \
+             {:?}",
+            reply.string("/messageTemplate/messageTemplateId")
+        );
+        assert_eq!(
+            reply.string("/messageTemplate/messageTemplateArn"),
+            expected_version_arn(
+                &knowledge_base_id,
+                &message_template_id,
+                &VERSION_MIN.to_string()
+            ),
+            "case {case:?}: the answer reports the published version's ARN, got {:?}",
+            reply.string("/messageTemplate/messageTemplateArn")
+        );
+        let listing = list_versions(&emulator, &knowledge_base_id, &message_template_id, "").await;
+        assert_eq!(
+            listed_versions(&listing),
+            vec![VERSION_MIN],
+            "case {case:?}: no second version was numbered, got {:?}",
+            listed_versions(&listing)
+        );
+    }
+
+    // The checksum precondition is read against the same working copy whichever form
+    // addressed it: one that is not its checksum is refused and publishes nothing.
+    for (case, knowledge_base_label, message_template_label) in &rows {
+        let refused = publish(
+            &emulator,
+            knowledge_base_label,
+            message_template_label,
+            Some(&"0".repeat(64)),
+        )
+        .await;
+        assert_eq!(
+            refused.status, 409,
+            "case {case:?}: a checksum that is not the working copy's expects HTTP 409, got HTTP \
+             {} with body {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_type, "ConflictException",
+            "case {case:?}: expected error type ConflictException, got {:?}",
+            refused.error_type
+        );
+        let listing = list_versions(&emulator, &knowledge_base_id, &message_template_id, "").await;
+        assert_eq!(
+            listed_versions(&listing),
+            vec![VERSION_MIN],
+            "case {case:?}: the refused publish numbers nothing, got {:?}",
+            listed_versions(&listing)
+        );
+    }
+
+    // Numbering is per TEMPLATE, not per label form: each row changes the working copy and
+    // publishes it, so the versions run on from the previous row's, and the version each row
+    // published reads back through the ARN form of the label with its own qualifier.
+    let mut expected_version = VERSION_MIN;
+    for (case, knowledge_base_label, message_template_label) in &rows {
+        let changed = update(
+            &emulator,
+            &knowledge_base_id,
+            &message_template_id,
+            json!({ "content": sms_content(&format!("changed for {case}")) }),
+        )
+        .await;
+        assert_eq!(
+            changed.status, 200,
+            "case {case:?}: the working copy must change before the next publish, got HTTP {} \
+             with body {}",
+            changed.status, changed.body
+        );
+        expected_version += 1;
+        let published = publish(
+            &emulator,
+            knowledge_base_label,
+            message_template_label,
+            None,
+        )
+        .await;
+        assert_eq!(
+            integer(&published, "/messageTemplate/versionNumber"),
+            Some(expected_version),
+            "case {case:?}: a changed working copy is numbered one above the template's previous \
+             version, expected {expected_version}, got {:?}",
+            integer(&published, "/messageTemplate/versionNumber")
+        );
+        let read_back = read(
+            &emulator,
+            &knowledge_base_arn,
+            &format!("{message_template_arn}:{expected_version}"),
+        )
+        .await;
+        assert_eq!(
+            read_back.status, 200,
+            "case {case:?}: the published version must read back through the ARN form of the \
+             label, got HTTP {} with body {}",
+            read_back.status, read_back.body
+        );
+        assert_eq!(
+            read_back.string("/messageTemplate/messageTemplateContentSha256"),
+            published.string("/messageTemplate/messageTemplateContentSha256"),
+            "case {case:?}: the read of the version reports what the publish wrote, got {:?}",
+            read_back.string("/messageTemplate/messageTemplateContentSha256")
+        );
+    }
+    let listing = list_versions(&emulator, &knowledge_base_arn, &message_template_arn, "").await;
+    assert_eq!(
+        listed_versions(&listing),
+        (VERSION_MIN..=expected_version).collect::<Vec<i64>>(),
+        "case \"every form published in turn\": the listing reports one run of versions for the \
+         one template, got {:?}",
+        listed_versions(&listing)
+    );
+}
+
 /// The rule: a version exists only inside the template that published it, which exists only
 /// inside its knowledge base — so deleting the knowledge base takes the versions with it.
 #[tokio::test]
