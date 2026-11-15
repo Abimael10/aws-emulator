@@ -47,7 +47,7 @@ pub(crate) fn tests_dir() -> PathBuf {
 /// A `mod` that does not start in column one is nested inside an item and belongs to
 /// another namespace; a line whose code is empty — a commented-out declaration — declares
 /// nothing.
-fn declaration_name(line: &str) -> Option<&str> {
+pub(crate) fn declaration_name(line: &str) -> Option<&str> {
     if line.starts_with(char::is_whitespace) {
         return None;
     }

@@ -1466,3 +1466,6 @@ mod sts_session_context_keys;
 // crate's own, so check there rather than leaving a note here.
 // An inner attribute, like an inner doc comment, is legal only before the first item, so it
 // stands here rather than in the list below.
+// `all/declaration_roots_end_with_their_last_declaration.rs` and
+#[path = "all/declaration_roots_end_with_their_last_declaration.rs"]
+mod declaration_roots_end_with_their_last_declaration;

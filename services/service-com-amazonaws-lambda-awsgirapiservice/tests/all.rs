@@ -640,11 +640,3 @@ mod invocation_environment_reuse;
 // The isolation half of the execution-environment suites (see the file's own module doc).
 #[path = "all/zzprobe.rs"]
 mod zzprobe;
-// `invocation_run_capacity`, `layer_region_scope` and `update_window_outlasts_its_call`
-// each stood here a second time: concurrent changes appended an entry for a suite the
-// sorted span above already declares, which is a redefinition (`E0428`) and
-// `clippy::duplicate_mod` besides, so this target did not compile. The duplicate lines are
-// gone and the first declaration of each stands. Add a NEW suite in the sorted span its
-// name belongs to, and check it is not declared already before appending it here.
-// `function_url_reported_members` was appended here and now stands in the sorted span above,
-// where its name belongs, so nothing is declared twice.

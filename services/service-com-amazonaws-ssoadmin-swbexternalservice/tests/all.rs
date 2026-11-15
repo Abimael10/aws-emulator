@@ -259,7 +259,3 @@ mod unknown_instance_message;
 mod validation_message_wording;
 #[path = "all/withdrawn_assignment_copy_in_place.rs"]
 mod withdrawn_assignment_copy_in_place;
-// Every declaration stands in the one run above, beside its own name: that is what keeps a
-// suite about to be declared twice visible as a repeated name, since a second `mod` item
-// for a file already declared is a redefinition that stops this whole target compiling. A
-// new suite goes into that run, never into a tail at the end of this file.
