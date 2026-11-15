@@ -4,16 +4,19 @@
 //! with `X-Amz-Target: AWSCognitoIdentityProviderService.GetUserAuthFactors`).
 //!
 //! The rule under test: the operation reports, for the user its `AccessToken` was
-//! issued to, the MFA settings that user holds and the `AuthFactorType` values that
-//! user can authenticate with in a choice-based (`USER_AUTH`) sign-in — a factor the
-//! pool admits as a first authentication factor and the user holds what it needs
-//! for (a password, a verified address a one-time password is delivered to, a
-//! registered passkey), or a factor the user has activated as an MFA factor. A
-//! factor neither half offers is not reported, the reported list is in the order
-//! the model declares `AuthFactorType`'s values in rather than the order the pool
-//! lists them in, and the whole answer is computed from the STORED pool and the
-//! STORED user, so asking twice answers the same and asking changes nothing a
-//! later caller sees.
+//! issued to, the MFA settings that user holds and every `AuthFactorType` value
+//! that user is CONFIGURED for in a choice-based (`USER_AUTH`) sign-in — a factor
+//! the user holds what presenting it needs (a stored password, an address a
+//! one-time password is addressed to whether or not the user has proven it, a
+//! registered passkey), or a factor the user has activated as an MFA factor. What
+//! the POOL admits as a first authentication factor does not narrow that report,
+//! and a factor the user is set up for neither way is not reported. The reported
+//! list is in the order the model declares `AuthFactorType`'s values in rather
+//! than the order the pool lists them in, and the whole answer is computed from
+//! the STORED pool and the STORED user, so asking twice answers the same and
+//! asking changes nothing a later caller sees. This is the SAME derivation the
+//! administrative `AdminGetUserAuthFactors` reports
+//! ([`super::admin_get_user_auth_factors`]), so the two reads agree.
 //!
 //! The pools, app clients, users and access tokens are all real: they come from
 //! `CreateUserPool`, `CreateUserPoolClient`, `AdminCreateUser`,
@@ -345,14 +348,14 @@ struct Case {
     settings: &'static [&'static str],
 }
 
-/// The rows differ along WHICH factors the pool admits and in which order it
-/// lists them, HOW MANY of them the user is set up for, WHAT the user holds (a
-/// verified address, an unverified one, none at all, no passkey), whether passkey
-/// MFA is enabled at the pool level, and whether the factor is offered as a first
-/// factor or activated as an MFA factor.
+/// The rows differ along WHAT the user holds (a verified address, an unverified
+/// one, none at all, no passkey), WHICH factors the pool admits as first ones and
+/// in which order it lists them, whether passkey MFA is enabled at the pool level,
+/// and whether the factor is one the user is configured for or one it activated as
+/// an MFA factor.
 const CASES: &[Case] = &[
     Case {
-        case: "a pool that configures no sign-in policy offers the password factor alone",
+        case: "a user holding a password and nothing else is configured for that factor alone",
         first_auth_factors: &[],
         attributes: &[],
         activate_sms_mfa: false,
@@ -370,16 +373,17 @@ const CASES: &[Case] = &[
         settings: &[],
     },
     Case {
-        case: "an unverified email is no address a one-time password is delivered to",
+        case: "an email address the user has not proven is an address a one-time password is \
+               addressed to all the same",
         first_auth_factors: &[PASSWORD, EMAIL_OTP],
         attributes: &[("email", "grace@example.com")],
         activate_sms_mfa: false,
         passkey_mfa: None,
-        configured: &[PASSWORD],
+        configured: &[PASSWORD, EMAIL_OTP],
         settings: &[],
     },
     Case {
-        case: "a user holding no email at all is not offered that factor either",
+        case: "a user holding no email at all is configured for no email factor",
         first_auth_factors: &[PASSWORD, EMAIL_OTP],
         attributes: &[],
         activate_sms_mfa: false,
@@ -400,8 +404,8 @@ const CASES: &[Case] = &[
         settings: &[],
     },
     Case {
-        case: "a factor the pool does not admit is not offered though the user holds what it \
-               needs",
+        case: "a factor the pool admits as no first authentication factor is reported for the \
+               user that is configured for it",
         first_auth_factors: &[],
         attributes: &[
             ("email", "edsger@example.com"),
@@ -411,7 +415,7 @@ const CASES: &[Case] = &[
         ],
         activate_sms_mfa: false,
         passkey_mfa: None,
-        configured: &[PASSWORD],
+        configured: &[PASSWORD, EMAIL_OTP, SMS_OTP],
         settings: &[],
     },
     Case {
@@ -420,7 +424,7 @@ const CASES: &[Case] = &[
         attributes: &[("email", "alan@example.com"), ("email_verified", "true")],
         activate_sms_mfa: false,
         passkey_mfa: None,
-        configured: &[PASSWORD],
+        configured: &[PASSWORD, EMAIL_OTP],
         settings: &[],
     },
     Case {
@@ -434,7 +438,8 @@ const CASES: &[Case] = &[
         settings: &[],
     },
     Case {
-        case: "passkeys configured as a single factor are no MFA factor of the pool at all",
+        case: "a pool that configures passkeys as a single authentication factor reports no \
+               passkey factor for a user that registered none",
         first_auth_factors: &[PASSWORD],
         attributes: &[],
         activate_sms_mfa: false,
@@ -453,7 +458,7 @@ const CASES: &[Case] = &[
         settings: &[],
     },
     Case {
-        case: "every admitted factor the user is set up for is reported, in the order the model \
+        case: "every factor the user is configured for is reported, in the order the model \
                declares them and not the order the pool lists them",
         first_auth_factors: &[SMS_OTP, EMAIL_OTP, PASSWORD],
         attributes: &[
@@ -572,7 +577,7 @@ async fn get_user_auth_factors_is_a_pure_read_of_the_stored_user() {
     assert_eq!(
         first.configured,
         vec![PASSWORD.to_string(), EMAIL_OTP.to_string()],
-        "case \"both admitted factors are reported\": got {:?}",
+        "case \"every factor the user is configured for is reported\": got {:?}",
         first.configured
     );
 

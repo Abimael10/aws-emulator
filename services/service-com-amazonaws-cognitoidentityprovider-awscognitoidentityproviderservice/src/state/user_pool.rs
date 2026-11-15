@@ -1253,17 +1253,25 @@ impl UserPool {
             .is_some_and(|factors| factors.iter().any(|allowed| allowed == factor))
     }
 
-    /// The `AuthFactorType` values `user` can authenticate with in a choice-based
+    /// The `AuthFactorType` values `user` is CONFIGURED for in a choice-based
     /// (`USER_AUTH`) sign-in of this pool, in [`AUTH_FACTOR_ORDER`].
     ///
-    /// A factor is available to the user when this pool offers it as a first
-    /// authentication factor and the user holds what that factor needs
-    /// ([`UserPool::offers_first_auth_factor`]), or when the user has it available
-    /// as an MFA factor ([`UserPool::offers_mfa_auth_factor`]) — "EMAIL_OTP,
-    /// SMS_OTP, and WEB_AUTHN can be used as either a first authentication factor
-    /// or an MFA factor" (`ConfiguredUserAuthFactors` in this service's model). A
-    /// factor neither half offers is not one the user can sign in with, so it is
-    /// not reported.
+    /// A factor is reported when the USER is set up to present it as a first
+    /// authentication factor ([`User::configures_auth_factor`]) or has it
+    /// available as an MFA factor ([`UserPool::offers_mfa_auth_factor`]) —
+    /// "EMAIL_OTP, SMS_OTP, and WEB_AUTHN can be used as either a first
+    /// authentication factor or an MFA factor" (`ConfiguredUserAuthFactors` in
+    /// this service's model). A factor the user is set up for neither way is not
+    /// one it has configured at all, so it is not reported.
+    ///
+    /// What the POOL admits as a first authentication factor
+    /// (`SignInPolicyType.AllowedFirstAuthFactors`,
+    /// [`UserPool::allows_first_auth_factor`]) does not narrow the report: this
+    /// member reports the factors configured FOR THE USER, and the sign-in policy
+    /// is read where a factor is actually presented. The passkey factor is the one
+    /// the USER itself holds a switch over, so a user that deactivated passkey MFA
+    /// is reported without it whatever this pool's passkey configuration says
+    /// ([`User::configures_auth_factor`]).
     ///
     /// A PURE read, computed from the stored pool and the stored user.
     pub fn configured_user_auth_factors(&self, user: &User) -> Vec<String> {
@@ -1271,33 +1279,10 @@ impl UserPool {
             .iter()
             .copied()
             .filter(|factor| {
-                self.offers_first_auth_factor(user, factor)
-                    || self.offers_mfa_auth_factor(user, factor)
+                user.configures_auth_factor(factor) || self.offers_mfa_auth_factor(user, factor)
             })
             .map(str::to_string)
             .collect()
-    }
-
-    /// Whether `user` can present `factor` as the FIRST authentication factor of a
-    /// choice-based sign-in of this pool.
-    ///
-    /// The pool has to admit the factor ([`UserPool::allows_first_auth_factor`])
-    /// AND the user has to hold what presenting it needs: a stored password, a
-    /// verified address a one-time password can be delivered to, or a registered
-    /// passkey. `SOFTWARE_TOKEN` "can only be used as an MFA factor"
-    /// (`ConfiguredUserAuthFactors` in this service's model), so no sign-in policy
-    /// entry makes it a first factor.
-    pub fn offers_first_auth_factor(&self, user: &User, factor: &str) -> bool {
-        if !self.allows_first_auth_factor(factor) {
-            return false;
-        }
-        match factor {
-            PASSWORD_AUTH_FACTOR => user.password.is_some(),
-            EMAIL_OTP_AUTH_FACTOR => user.verified_destination_of("email").is_some(),
-            SMS_OTP_AUTH_FACTOR => user.verified_destination_of("phone_number").is_some(),
-            WEB_AUTHN_AUTH_FACTOR => !user.web_authn_credentials.is_empty(),
-            _ => false,
-        }
     }
 
     /// Whether `user` can present `factor` as an MFA factor of a choice-based

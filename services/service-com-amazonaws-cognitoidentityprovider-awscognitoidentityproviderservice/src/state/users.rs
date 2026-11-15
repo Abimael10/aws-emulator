@@ -343,6 +343,41 @@ impl User {
             .any(|setting| mfa_auth_factor_of(setting.as_str()) == Some(factor))
     }
 
+    /// Whether this user is SET UP to present `factor` as a first authentication
+    /// factor of a choice-based (`USER_AUTH`) sign-in.
+    ///
+    /// Each factor is presented with something the user has to hold first: the
+    /// password factor with a stored password, a one-time-password factor with an
+    /// address the code can be addressed to ([`User::destination_of`]), and the
+    /// passkey factor with a registered passkey. `SOFTWARE_TOKEN` "can only be
+    /// used as an MFA factor" (`ConfiguredUserAuthFactors` in this service's
+    /// model), so nothing the user configures makes it a first factor; it is
+    /// reported only while activated as an MFA factor
+    /// ([`User::activates_mfa_auth_factor`]).
+    ///
+    /// This is what the USER is configured for, not what a sign-in attempt would
+    /// be allowed to do with it: whether the pool ADMITS the factor as a first one
+    /// (`SignInPolicyType.AllowedFirstAuthFactors`,
+    /// [`UserPool::allows_first_auth_factor`]) and whether the address has been
+    /// proven ([`User::verified_destination_of`]) are read where the factor is
+    /// actually presented, not here. The one switch the USER holds over a factor
+    /// it has configured is passkey MFA — `WebAuthnMfaSettings.Enabled`
+    /// "specifies whether passkey MFA is activated for a user" (this service's
+    /// model) — so a user that deactivated it has switched its registered passkey
+    /// off ([`User::activates_passkey_mfa`]) and no passkey factor is reported for
+    /// it.
+    pub fn configures_auth_factor(&self, factor: &str) -> bool {
+        match factor {
+            PASSWORD_AUTH_FACTOR => self.password.is_some(),
+            EMAIL_OTP_AUTH_FACTOR => self.destination_of("email").is_some(),
+            SMS_OTP_AUTH_FACTOR => self.destination_of("phone_number").is_some(),
+            WEB_AUTHN_AUTH_FACTOR => {
+                !self.web_authn_credentials.is_empty() && self.activates_passkey_mfa()
+            }
+            _ => false,
+        }
+    }
+
     /// Whether this user holds the delivery configuration the
     /// `UserMFASettingList` setting `setting` is delivered with.
     ///

@@ -7,15 +7,19 @@
 //! The rule under test: an administrative read of a user's authentication options
 //! reports, for the STORED user that the request's `UserPoolId` and `Username`
 //! resolve to, the MFA settings that user holds — the activated factors and the
-//! preferred one — and the `AuthFactorType` values that user can authenticate with
-//! in a choice-based (`USER_AUTH`) sign-in: a factor the pool admits as a first
-//! authentication factor and the user holds what it needs for (a password, a
-//! verified address a one-time password is delivered to, a registered passkey), or
-//! a factor the user has activated as an MFA factor. A factor neither half offers
-//! is not reported, the reported list is in the order the model declares
-//! `AuthFactorType`'s values in rather than the order the pool lists them in, and
-//! the whole answer is computed from the STORED pool and the STORED user, so
-//! asking twice answers the same and asking changes nothing a later caller sees.
+//! preferred one — and every `AuthFactorType` value that user is CONFIGURED for in
+//! a choice-based (`USER_AUTH`) sign-in: a factor the user holds what presenting it
+//! needs (a stored password, an address a one-time password is addressed to
+//! whether or not the user has proven it, a registered passkey), or a factor the
+//! user has activated as an MFA factor. What the POOL admits as a first
+//! authentication factor does not narrow that report — the sign-in policy is read
+//! where a factor is actually presented — while `SOFTWARE_TOKEN`, an MFA factor
+//! only, is reported just for the user that activated it. A factor the user is set
+//! up for neither way is not reported, the reported list is in the order the model
+//! declares `AuthFactorType`'s values in rather than the order the pool lists them
+//! in, and the whole answer is computed from the STORED pool and the STORED user,
+//! so asking twice answers the same and asking changes nothing a later caller
+//! sees.
 //!
 //! A request naming a pool that does not exist is refused as
 //! `ResourceNotFoundException`, and one naming no user of an existing pool as
@@ -327,10 +331,13 @@ struct Case {
 /// The attribute sets the rows draw on.
 const VERIFIED_EMAIL: &[(&str, &str)] = &[("email", "ada@example.com"), ("email_verified", "true")];
 const UNVERIFIED_EMAIL: &[(&str, &str)] = &[("email", "grace@example.com")];
+const REFUSED_EMAIL: &[(&str, &str)] =
+    &[("email", "katherine@example.com"), ("email_verified", "false")];
 const VERIFIED_PHONE: &[(&str, &str)] = &[
     ("phone_number", "+15550100001"),
     ("phone_number_verified", "true"),
 ];
+const UNVERIFIED_PHONE: &[(&str, &str)] = &[("phone_number", "+15550100003")];
 const VERIFIED_BOTH: &[(&str, &str)] = &[
     ("email", "barbara@example.com"),
     ("email_verified", "true"),
@@ -354,15 +361,15 @@ const BASE: Case = Case {
     preferred: None,
 };
 
-/// The rows differ along WHICH factors the pool admits and in which order it
-/// lists them, HOW MANY of them the user is set up for, WHAT the user holds (a
-/// verified address, an unverified one, none at all, a registered authenticator
-/// or passkey, or none), whether passkey MFA is enabled at the pool level, and
-/// whether a factor is offered as a first factor or activated as an MFA factor —
-/// with or without being the preferred one.
+/// The rows differ along WHAT the user holds (a verified address, an unverified
+/// one, one it refused, none at all, a registered authenticator or passkey, or
+/// none), WHICH factors the pool admits as first ones and in which order it lists
+/// them, whether passkey MFA is enabled at the pool level, and whether a factor is
+/// one the user is configured for or one it activated as an MFA factor — with or
+/// without being the preferred one.
 const CASES: &[Case] = &[
     Case {
-        case: "a pool that configures no sign-in policy offers the password factor alone",
+        case: "a user holding a password and nothing else is configured for that factor alone",
         ..BASE
     },
     Case {
@@ -373,14 +380,21 @@ const CASES: &[Case] = &[
         ..BASE
     },
     Case {
-        case: "an unverified email is no address a one-time password is delivered to",
+        case: "an email address the user has not proven is an address a one-time password is \
+               addressed to all the same",
         first_auth_factors: &[PASSWORD, EMAIL_OTP],
         attributes: UNVERIFIED_EMAIL,
-        configured: &[PASSWORD],
+        configured: &[PASSWORD, EMAIL_OTP],
         ..BASE
     },
     Case {
-        case: "a user holding no email at all is not offered that factor either",
+        case: "an email address carrying the unverified flag is configured for that factor too",
+        attributes: REFUSED_EMAIL,
+        configured: &[PASSWORD, EMAIL_OTP],
+        ..BASE
+    },
+    Case {
+        case: "a user holding no email at all is configured for no email factor",
         first_auth_factors: &[PASSWORD, EMAIL_OTP],
         configured: &[PASSWORD],
         ..BASE
@@ -393,16 +407,21 @@ const CASES: &[Case] = &[
         ..BASE
     },
     Case {
-        case: "a factor the pool does not admit is not offered though the user holds what it \
-               needs",
+        case: "an unproven phone number is likewise a number a one-time password is addressed to",
+        attributes: UNVERIFIED_PHONE,
+        configured: &[PASSWORD, SMS_OTP],
+        ..BASE
+    },
+    Case {
+        case: "a factor the pool admits as no first authentication factor is reported for the \
+               user that is configured for it",
         attributes: VERIFIED_BOTH,
-        configured: &[PASSWORD],
+        configured: &[PASSWORD, EMAIL_OTP, SMS_OTP],
         ..BASE
     },
     Case {
         case: "the passkey factor needs a registered passkey, which this user has none of",
         first_auth_factors: &[PASSWORD, WEB_AUTHN],
-        attributes: VERIFIED_EMAIL,
         configured: &[PASSWORD],
         ..BASE
     },
@@ -429,10 +448,11 @@ const CASES: &[Case] = &[
         ..BASE
     },
     Case {
-        case: "passkeys configured as a single factor are no MFA factor of the pool at all",
+        case: "a passkey the pool configures as a single authentication factor is still one the \
+               user that registered it can present",
         passkey_registered: true,
         passkey_mfa: Some(PASSKEY_SINGLE_FACTOR),
-        configured: &[PASSWORD],
+        configured: &[PASSWORD, WEB_AUTHN],
         ..BASE
     },
     Case {
@@ -443,7 +463,14 @@ const CASES: &[Case] = &[
         ..BASE
     },
     Case {
-        case: "every admitted factor the user is set up for is reported, in the order the model \
+        case: "a registered authenticator the user has activated no MFA factor for reports no \
+               software token factor",
+        software_token_registered: true,
+        configured: &[PASSWORD],
+        ..BASE
+    },
+    Case {
+        case: "every factor the user is configured for is reported, in the order the model \
                declares them and not the order the pool lists them",
         first_auth_factors: &[SMS_OTP, EMAIL_OTP, PASSWORD],
         attributes: VERIFIED_BOTH,
@@ -492,16 +519,16 @@ const CASES: &[Case] = &[
         ..BASE
     },
     Case {
-        case: "a deactivated factor is reported as neither an activated setting nor an auth \
-               factor",
+        case: "a deactivated factor leaves no activated setting, though the number it is \
+               delivered to is still a configured factor",
         attributes: VERIFIED_PHONE,
         sms: Some((false, false)),
-        configured: &[PASSWORD],
+        configured: &[PASSWORD, SMS_OTP],
         ..BASE
     },
     Case {
-        case: "all five auth factors at once: the pool admits four of them and the fifth is \
-               activated as an MFA factor",
+        case: "all five auth factors at once: the user is configured for four of them and the \
+               fifth is activated as an MFA factor",
         first_auth_factors: &[PASSWORD, EMAIL_OTP, SMS_OTP, WEB_AUTHN],
         attributes: VERIFIED_BOTH,
         software_token_registered: true,
@@ -690,8 +717,12 @@ async fn admin_get_user_auth_factors_resolves_every_way_a_request_names_one_user
         );
         assert_eq!(
             reported.configured,
-            vec![PASSWORD.to_string(), EMAIL_OTP.to_string()],
-            "case {row:?}: expected both admitted factors, got {reported:?}"
+            vec![
+                PASSWORD.to_string(),
+                EMAIL_OTP.to_string(),
+                SMS_OTP.to_string()
+            ],
+            "case {row:?}: expected every configured factor, got {reported:?}"
         );
     }
 }
@@ -712,7 +743,7 @@ async fn admin_get_user_auth_factors_is_a_pure_read_of_the_stored_user() {
     assert_eq!(
         first.configured,
         vec![PASSWORD.to_string(), SMS_OTP.to_string()],
-        "case \"both admitted factors are reported\": got {first:?}"
+        "case \"every factor the user is configured for is reported\": got {first:?}"
     );
 
     // Asking again answers the same, and the user the first call read is
