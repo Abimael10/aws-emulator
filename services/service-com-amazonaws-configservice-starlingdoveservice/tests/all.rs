@@ -247,3 +247,7 @@ mod recorded_relationship_graph_matches_its_counter;
 mod config_rule_evaluator_permission;
 #[path = "all/recorded_queue_across_every_read_surface.rs"]
 mod recorded_queue_across_every_read_surface;
+#[path = "all/configuration_item_relationships_are_reported.rs"]
+mod configuration_item_relationships_are_reported;
+#[path = "all/change_triggered_queue_rule_admission.rs"]
+mod change_triggered_queue_rule_admission;

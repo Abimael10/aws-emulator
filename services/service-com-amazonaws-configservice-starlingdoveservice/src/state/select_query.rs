@@ -289,7 +289,12 @@ impl SelectQuery {
                     }
                 }
                 Field::Property(path) => {
-                    if let Some(value) = value_at(document, path).first() {
+                    // The member is reported AS THE ITEM HOLDS IT ([`member_at`]), so a
+                    // selected list stays a list: a resource with no related resource
+                    // answers the empty list rather than dropping the member, and one
+                    // with several answers all of them. The flattening [`value_at`] does
+                    // belongs to a CONDITION on a list member, not to projecting it.
+                    if let Some(value) = member_at(document, path).first() {
                         insert_at(&mut result, path, (*value).clone());
                     }
                 }
@@ -509,12 +514,35 @@ impl Comparison {
     }
 }
 
-/// The values of `document` at `path`: the member reached by following the path, and —
-/// where the path passes through a list — the member of each element of that list.
+/// The values a CONDITION on `path` is about: the member [`member_at`] reaches, with a
+/// list it ends at standing for its own elements, so a condition on a list member is a
+/// condition on any element of it.
 ///
 /// An absent member yields no value at all, which is what makes `IS NULL` and the
-/// absence of a property the same question.
+/// absence of a property the same question — and so does the EMPTY list, which has no
+/// element for a condition to hold of.
 fn value_at<'a>(document: &'a Value, path: &[String]) -> Vec<&'a Value> {
+    // A list reached by the whole path stands for its own elements, so a condition on
+    // it is a condition on any element.
+    let mut values: Vec<&Value> = Vec::new();
+    for value in member_at(document, path) {
+        match value {
+            Value::Array(items) => values.extend(items.iter()),
+            other => values.push(other),
+        }
+    }
+    values
+}
+
+/// The MEMBER of `document` at `path`, as the document holds it: the member reached by
+/// following the path and — where the path passes THROUGH a list — that member of each
+/// element of that list.
+///
+/// The member a path ends at is answered whatever kind it is, so a list member is answered
+/// as the list it is: that is what a query SELECTING it reports, down to the empty list a
+/// resource with nothing related carries. An absent member yields no value at all, which is
+/// what makes a member the item does not have the one case a projection leaves out.
+fn member_at<'a>(document: &'a Value, path: &[String]) -> Vec<&'a Value> {
     let mut current: Vec<&Value> = vec![document];
     for member in path {
         let mut next: Vec<&Value> = Vec::new();
@@ -533,16 +561,7 @@ fn value_at<'a>(document: &'a Value, path: &[String]) -> Vec<&'a Value> {
         }
         current = next;
     }
-    // A list reached by the whole path stands for its own elements, so a condition on
-    // it is a condition on any element.
-    let mut values: Vec<&Value> = Vec::new();
-    for value in current {
-        match value {
-            Value::Array(items) => values.extend(items.iter()),
-            other => values.push(other),
-        }
-    }
-    values
+    current
 }
 
 /// Place `value` in `result` under `path`, creating the intermediate objects a nested
