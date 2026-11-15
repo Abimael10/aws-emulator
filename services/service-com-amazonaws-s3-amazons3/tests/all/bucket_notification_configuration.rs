@@ -53,10 +53,19 @@ const QUEUE_ARN: &str = "arn:aws:sqs:us-east-1:123456789012:object-events";
 const LAMBDA_ARN: &str = "arn:aws:lambda:us-east-1:123456789012:function:object-events";
 
 /// The `<Message>` S3 sends for an `Events` entry that is not one of the published `Event`
-/// values, and the one it sends for a container whose rules cannot both be in force — each
-/// FIXED text, so the code being the same for every notification refusal leaves the message
-/// to say which rule was broken.
+/// values, the one it sends for a key-name filter rule whose `Name` is no `FilterRuleName`,
+/// and the one it sends for a container whose rules cannot both be in force — each FIXED
+/// text, so the code being the same for every notification refusal leaves the message to say
+/// which rule was broken.
 const UNSUPPORTED_EVENT: &str = "The event is not supported for notifications";
+const INVALID_FILTER_RULE_NAME: &str = "filter rule name must be either prefix or suffix";
+/// The `<Message>` S3 sends for a destination reference it cannot read as an ARN of the
+/// service that destination lives in — also FIXED text, the member and the value travelling
+/// in the `<ArgumentName>` / `<ArgumentValue>` pair beside it.
+const UNPARSEABLE_DESTINATION: &str = "The ARN could not be parsed";
+/// The `<Message>` S3 sends for a container two of whose configurations carry the same `Id`
+/// — FIXED text too, the id travelling in the `<ArgumentValue>` beside it.
+const DUPLICATE_ID: &str = "Same ID used for multiple configurations. IDs must be unique.";
 const AMBIGUOUS: &str = "Configuration is ambiguously defined. Cannot have overlapping \
                          suffixes in two rules if the prefixes are overlapping for the same \
                          event type.";
@@ -644,6 +653,28 @@ async fn a_filter_rule_reads_back_under_its_canonical_name() {
             vec!["Prefix", "Suffix"],
         ),
         (
+            // The name S3 reports a STORED rule under: a client that reads a configuration
+            // back and puts it again sends this spelling, which S3 accepts.
+            "the capitalised spelling a read reports",
+            vec![("Prefix", "CategoryB/")],
+            vec!["Prefix"],
+        ),
+        (
+            "the capitalised spelling of both kinds",
+            vec![("Suffix", ".tsv"), ("Prefix", "CategoryB/")],
+            vec!["Suffix", "Prefix"],
+        ),
+        (
+            "a name in upper case",
+            vec![("PREFIX", "CategoryC/")],
+            vec!["Prefix"],
+        ),
+        (
+            "a name in mixed case",
+            vec![("sUfFiX", ".parquet")],
+            vec!["Suffix"],
+        ),
+        (
             "a filter carrying no rule at all",
             vec![],
             vec![],
@@ -813,13 +844,15 @@ async fn a_refused_notification_configuration_changes_nothing() {
             MALFORMED_XML,
         ),
         (
+            // The rule NAME is read case-insensitively, so a name outside the published
+            // vocabulary in EVERY case is what this row carries.
             "a filter rule name outside FilterRuleName",
             vec![
                 Configuration::new(Destination::Queue, &["s3:ObjectCreated:Put"])
-                    .with_filter_rules(&[("Prefix", "logs/")]),
+                    .with_filter_rules(&[("Prefixes", "logs/")]),
             ],
-            "MalformedXML",
-            MALFORMED_XML,
+            "InvalidArgument",
+            INVALID_FILTER_RULE_NAME,
         ),
         (
             "two suffix rules in one filter",
@@ -880,8 +913,8 @@ async fn a_refused_notification_configuration_changes_nothing() {
                 Configuration::new(Destination::LambdaFunction, &["s3:ObjectCreated:Put"])
                     .with_filter_rules(&[("prefix", "ok/"), ("extension", ".json")]),
             ],
-            "MalformedXML",
-            MALFORMED_XML,
+            "InvalidArgument",
+            INVALID_FILTER_RULE_NAME,
         ),
         (
             "one id used by two configurations of the same kind",
@@ -891,7 +924,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_id("twice"),
             ],
             "InvalidArgument",
-            "Configuration ID twice is not unique",
+            DUPLICATE_ID,
         ),
         (
             "one id used by configurations of two different kinds",
@@ -901,7 +934,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_id("shared"),
             ],
             "InvalidArgument",
-            "Configuration ID shared is not unique",
+            DUPLICATE_ID,
         ),
         (
             "a queue ARN carried in a topic configuration",
@@ -910,7 +943,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_arn(QUEUE_ARN),
             ],
             "InvalidArgument",
-            "",
+            UNPARSEABLE_DESTINATION,
         ),
         (
             "a topic ARN carried in a Lambda configuration",
@@ -919,7 +952,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_arn(TOPIC_ARN),
             ],
             "InvalidArgument",
-            "",
+            UNPARSEABLE_DESTINATION,
         ),
         (
             "a destination that is not an ARN at all",
@@ -928,7 +961,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_arn("object-events"),
             ],
             "InvalidArgument",
-            "",
+            UNPARSEABLE_DESTINATION,
         ),
         (
             "an ARN missing its resource field",
@@ -937,7 +970,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_arn("arn:aws:sqs:us-east-1:123456789012:"),
             ],
             "InvalidArgument",
-            "",
+            UNPARSEABLE_DESTINATION,
         ),
         (
             "one configuration past the bound",
@@ -973,7 +1006,6 @@ async fn a_refused_notification_configuration_changes_nothing() {
                 refused.error_message()
             );
         }
-
         // "The PUT notification is an atomic operation … Amazon S3 will not add the
         // configuration to your bucket": the stored configuration is untouched.
         assert_reports(&router, bucket, case, &stored, true).await;

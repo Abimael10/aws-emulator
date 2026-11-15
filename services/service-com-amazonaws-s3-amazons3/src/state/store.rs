@@ -1352,11 +1352,12 @@ impl ComAmazonawsS3Amazons3State {
 
     /// An opaque rule identifier no rule of this configuration carries.
     ///
-    /// S3's own assigned identifiers are opaque strings, so this is derived the way
-    /// [`Self::mint_notification_configuration_id`] derives a notification id: the MD5
-    /// digest of the store's monotonic counter, rendered as hex. Uniqueness comes from the
-    /// counter, not from the digest, and an identifier a request named itself (`taken`) is
-    /// stepped over rather than reused.
+    /// S3's own assigned identifiers are opaque strings: the MD5 digest of the store's
+    /// monotonic counter, rendered as hex. Uniqueness comes from the counter, not from the
+    /// digest, and an identifier a request named itself (`taken`) is stepped over rather than
+    /// reused. (A NOTIFICATION configuration's assigned id is a different SHAPE, which
+    /// [`Self::mint_notification_configuration_id`] states; a lifecycle rule's is not
+    /// recorded in that form.)
     pub(super) fn mint_lifecycle_rule_id(&mut self, taken: &BTreeSet<String>) -> String {
         loop {
             self.minted_lifecycle_rule_ids += 1;
@@ -1370,19 +1371,31 @@ impl ComAmazonawsS3Amazons3State {
         }
     }
 
-    /// An opaque configuration id no configuration in this store carries.
+    /// An opaque configuration id no configuration in this store carries, in the SHAPE S3's
+    /// own assigned ids are recorded in: the base64 of a UUID's text, 48 base64 characters
+    /// whose decoding is the hyphenated `8-4-4-4-12` form (recorded behaviour — a read of a
+    /// configuration that named no `Id` reports one of those).
     ///
-    /// S3's own assigned ids are opaque strings, so this is the MD5 digest of the counter
-    /// above rendered as hex — the digest helper this module already uses for an object's
-    /// ETag. Uniqueness comes from the counter, not from the digest, and an id a request
-    /// named itself (`taken`) is stepped over rather than reused.
+    /// The layout of both halves comes from a crate rather than from anything spelled here:
+    /// the UUID from [`::service_common::uuid_from_random_bytes`], the shared rendering of 16
+    /// opaque bytes as one, and the encoding from the SDK's own base64. The BYTES behind it
+    /// are this store's: the SHA-256 digest of the monotonic counter above, so uniqueness
+    /// comes from the counter rather than from the digest, and an id a request named itself
+    /// (`taken`) is stepped over rather than reused.
     pub(super) fn mint_notification_configuration_id(&mut self, taken: &BTreeSet<String>) -> String {
+        use ::sha2::Digest as _;
+
         loop {
             self.minted_notification_configuration_ids += 1;
-            let mut digest = Md5::new();
+            let mut digest = ::sha2::Sha256::new();
             digest.update(b"s3-notification-configuration-id:");
             digest.update(self.minted_notification_configuration_ids.to_be_bytes());
-            let id = hex::encode(digest.finalize());
+            let drawn = digest.finalize();
+            let mut bytes = [0_u8; 16];
+            bytes.copy_from_slice(&drawn[..16]);
+            let id = ::aws_smithy_types::base64::encode(
+                ::service_common::uuid_from_random_bytes(bytes).as_bytes(),
+            );
             if !taken.contains(&id) {
                 return id;
             }

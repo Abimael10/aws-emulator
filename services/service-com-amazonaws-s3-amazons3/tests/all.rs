@@ -251,6 +251,8 @@ mod multipart_upload_resume_position;
 mod not_modified_version_headers;
 #[path = "all/notification_destination_validation.rs"]
 mod notification_destination_validation;
+#[path = "all/notification_document_vocabulary.rs"]
+mod notification_document_vocabulary;
 #[path = "all/notification_filter_delivery.rs"]
 mod notification_filter_delivery;
 #[path = "all/notification_wildcard_event_overlap.rs"]

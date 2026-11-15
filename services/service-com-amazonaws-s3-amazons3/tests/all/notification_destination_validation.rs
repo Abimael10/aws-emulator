@@ -155,14 +155,19 @@ struct Named {
 /// The detail a refusal carries for a destination the service that owns it does not hold —
 /// one per destination kind, since only the kind varies in the sentence.
 const QUEUE_ABSENT: &str = "The destination queue does not exist";
-const FUNCTION_ABSENT: &str = "The destination Lambda function does not exist";
 
 /// The detail it carries for a destination that IS there and whose resource policy does not
 /// let Amazon S3 publish this bucket's notifications to it.
 const QUEUE_UNPERMITTED: &str = "Permissions on the destination queue do not allow S3 to \
                                  publish notifications from this bucket";
-const FUNCTION_UNPERMITTED: &str = "Permissions on the destination Lambda function do not \
-                                    allow S3 to publish notifications from this bucket";
+
+/// The detail it carries for a LAMBDA destination, whichever way that destination failed:
+/// S3 makes ONE check for a function — that "the Lambda function permissions grant Amazon S3
+/// permission to invoke the function from the Amazon S3 bucket" — and a function that is not
+/// there grants that no more than one whose policy does not, so both read the same. The
+/// FUNCTION the reference named follows it, in brackets ([`refused_pair`] writes the whole
+/// sentence).
+const FUNCTION_UNAUTHORIZED: &str = "Not authorized to invoke function";
 
 /// One row of the table.
 struct Row {
@@ -306,7 +311,7 @@ fn rows() -> Vec<Row> {
                 name: "ungranted-function",
                 existing: Existing::Yes,
                 grant: Grant::None,
-                rejected: Some(FUNCTION_UNPERMITTED),
+                rejected: Some(FUNCTION_UNAUTHORIZED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -318,7 +323,7 @@ fn rows() -> Vec<Row> {
                 name: "other-bucket-function",
                 existing: Existing::Yes,
                 grant: Grant::OtherBucket,
-                rejected: Some(FUNCTION_UNPERMITTED),
+                rejected: Some(FUNCTION_UNAUTHORIZED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -330,7 +335,7 @@ fn rows() -> Vec<Row> {
                 name: "other-principal-function",
                 existing: Existing::Yes,
                 grant: Grant::OtherPrincipal,
-                rejected: Some(FUNCTION_UNPERMITTED),
+                rejected: Some(FUNCTION_UNAUTHORIZED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -342,7 +347,7 @@ fn rows() -> Vec<Row> {
                 name: "other-action-function",
                 existing: Existing::Yes,
                 grant: Grant::OtherAction,
-                rejected: Some(FUNCTION_UNPERMITTED),
+                rejected: Some(FUNCTION_UNAUTHORIZED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -354,7 +359,7 @@ fn rows() -> Vec<Row> {
                 name: "other-account-function",
                 existing: Existing::Yes,
                 grant: Grant::OtherAccount,
-                rejected: Some(FUNCTION_UNPERMITTED),
+                rejected: Some(FUNCTION_UNAUTHORIZED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -378,7 +383,7 @@ fn rows() -> Vec<Row> {
                 name: "absent-function",
                 existing: Existing::No,
                 grant: Grant::None,
-                rejected: Some(FUNCTION_ABSENT),
+                rejected: Some(FUNCTION_UNAUTHORIZED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -419,7 +424,7 @@ fn rows() -> Vec<Row> {
                     name: "mixed-kinds-ungranted-function",
                     existing: Existing::Yes,
                     grant: Grant::None,
-                    rejected: Some(FUNCTION_UNPERMITTED),
+                    rejected: Some(FUNCTION_UNAUTHORIZED),
                 },
             ],
             skip_validation: false,
@@ -506,6 +511,22 @@ fn rows() -> Vec<Row> {
             expected_status: 200,
         },
     ]
+}
+
+/// The `<ArgumentName{n}>` / `<ArgumentValue{n}>` pair the refusal of a container has to
+/// carry for the destination `named`, or `None` for one that validates.
+///
+/// A queue is NAMED by the ARN the request carried and the value is the reason it failed. A
+/// LAMBDA destination is named by the pair S3 reads that member as — the function and the
+/// qualifier, `null` where the reference names none, the `CloudFunction` member admitting one
+/// after the function name — and its reason names the function it could not invoke.
+fn refused_pair(named: &Named) -> Option<(String, String)> {
+    let detail = named.rejected?;
+    let arn = destination_arn(named);
+    Some(match named.kind {
+        Kind::Queue => (arn, detail.to_string()),
+        Kind::Function => (format!("{arn}, null"), format!("{detail} [{arn}]")),
+    })
 }
 
 /// The ARN the destination `named` is addressed by: the forms AWS publishes for each
@@ -919,11 +940,7 @@ async fn a_configuration_is_recorded_only_once_every_destination_it_names_resolv
             let expected: Vec<(String, String)> = row
                 .destinations
                 .iter()
-                .filter_map(|named| {
-                    named
-                        .rejected
-                        .map(|detail| (destination_arn(named), detail.to_string()))
-                })
+                .filter_map(refused_pair)
                 .collect();
             let refused: Vec<(String, String)> = (1..=expected.len())
                 .map(|position| {

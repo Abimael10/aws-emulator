@@ -86,6 +86,14 @@
 //! anything the document spells, and it changes what the codec reads only for a
 //! configuration that is refused, so no accepted request is affected by it.
 //!
+//! The NOTIFICATION document is withheld the same way and for the same reason
+//! (`crate::state::notification_document_rejection`): the two values Amazon S3 judges in it
+//! itself — an `Events` entry and a key-name filter rule's `Name` — are refused as the
+//! ARGUMENT they are, in a document that names the field and echoes the value, which only the
+//! operation's envelope can carry. And a rule name spelled in another CASE is folded onto the
+//! published spelling ([`filter_rule_names_folded`]) rather than withheld, because S3 accepts
+//! it: it is the spelling a reader of a stored configuration gets back.
+//!
 //! ## The TEXT of an element: what the codec trims, and what a boolean may be spelled
 //!
 //! Two more things the codec reads differently from the schema S3 publishes, both about an
@@ -798,6 +806,57 @@ const WEBSITE_CONFIGURATION_MEMBER: &str = "WebsiteConfiguration";
 /// stores anything from. `PutBucketWebsite` reads the document the request actually carried
 /// (`request_document`) and refuses it from that, so nothing is read from this stand-in.
 const EMPTY_WEBSITE_CONFIGURATION: &[u8] = b"<WebsiteConfiguration></WebsiteConfiguration>";
+
+/// Whether the input's XML document payload is a `NotificationConfiguration` — the one
+/// document whose events and filter rule names Amazon S3 judges itself, so the two rewrites
+/// below are scoped to it by the member the codec would bind rather than by anything the
+/// document happens to spell.
+fn carries_notification_document(input_schema: &Schema) -> bool {
+    input_schema
+        .members()
+        .iter()
+        .find(|member| is_xml_document_payload(member))
+        .and_then(|payload| payload.member_name())
+        == Some(NOTIFICATION_CONFIGURATION_MEMBER)
+}
+
+/// The input member `PutBucketNotificationConfiguration` binds its document as
+/// (`smithy_query(query="operation",operation="PutBucketNotificationConfiguration")` reports
+/// `NotificationConfiguration` as the `@httpPayload`).
+const NOTIFICATION_CONFIGURATION_MEMBER: &str = "NotificationConfiguration";
+
+/// The notification document handed to the codec in place of one whose vocabulary Amazon S3
+/// refuses: the container with no member in it, which is also the document that turns
+/// notifications off — and nothing is read from it, because
+/// `PutBucketNotificationConfiguration` refuses such a request from the bytes it actually
+/// carried ([`request_document`]) before it reads the configuration at all.
+const EMPTY_NOTIFICATION_CONFIGURATION: &[u8] =
+    b"<NotificationConfiguration></NotificationConfiguration>";
+
+/// The element a key-name filter rule's name is carried in — the member's own declared name,
+/// which restXml writes it under — as the fold below matches it.
+///
+/// Matching by name is safe here because the fold runs only for the NOTIFICATION document
+/// ([`carries_notification_document`]), whose only `<Name>` is a filter rule's.
+const FILTER_RULE_NAME_ELEMENT: &str = "Name";
+
+/// `document` with every key-name filter rule `Name` folded onto the spelling
+/// `FilterRuleName` publishes, or `None` when every rule already names one (in which case
+/// nothing is rewritten and the original bytes are used).
+///
+/// Only the CASE of a name changes, and only for a name that IS a published one in some case
+/// ([`crate::state::published_filter_rule_name`]): S3 reads the rule name case-insensitively —
+/// a stored rule is reported under the capitalised spelling, so a client that reads a
+/// configuration back and puts it again sends that one — while the model's enum lists the
+/// lower-case wire tokens alone. A name published in no case at all is left exactly as it
+/// arrived; such a document is withheld from the codec whole, for the operation to refuse.
+fn filter_rule_names_folded(document: &[u8]) -> Option<Vec<u8>> {
+    fold_element_text(document, &[FILTER_RULE_NAME_ELEMENT], &|raw| {
+        let spelled = ::std::str::from_utf8(raw).ok()?;
+        let published = crate::state::published_filter_rule_name(spelled.trim())?;
+        (published != spelled).then(|| published.to_string())
+    })
+}
 
 /// The violation to refuse `request` with when its body is an XML DOCUMENT in which a member
 /// the model declares a UNION does not carry EXACTLY ONE member, or `None` when every union
@@ -3225,6 +3284,26 @@ impl ServerProtocol for UnwrappedXmlRestXml {
             // See [`rejected_location_constraint`].
             if rejected_location_constraint(input_schema).is_some() {
                 normalized = Some(EMPTY_CREATE_BUCKET_CONFIGURATION.to_vec());
+            }
+            // And a SEVENTH, for the two values of a NOTIFICATION document that Amazon S3
+            // judges itself. A document naming an event or a filter rule name the published
+            // vocabulary does not carry is withheld from the codec whole — replaced by
+            // [`EMPTY_NOTIFICATION_CONFIGURATION`] — so
+            // `PutBucketNotificationConfiguration` answers the refusal S3 publishes for it,
+            // which names the field in a member of its own, rather than the boundary
+            // reporting the document as one that does not validate. Judged on the body AS IT
+            // ARRIVED, which is the same bytes the handler reads it from
+            // ([`request_document`]), so the two cannot disagree about which documents that
+            // operation is the one to refuse. Otherwise a rule name spelled in another case
+            // is folded onto the published spelling, which S3 accepts
+            // ([`filter_rule_names_folded`]).
+            if carries_notification_document(input_schema) {
+                let current: &[u8] = normalized.as_deref().unwrap_or(body);
+                if crate::state::notification_document_rejection(body).is_some() {
+                    normalized = Some(EMPTY_NOTIFICATION_CONFIGURATION.to_vec());
+                } else if let Some(document) = filter_rule_names_folded(current) {
+                    normalized = Some(document);
+                }
             }
             if let Some(document) = normalized {
                 let uri = request.uri();

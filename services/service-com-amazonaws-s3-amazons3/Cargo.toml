@@ -74,6 +74,11 @@ base64 = "0.22"
 # And verifying the signature of that policy is the SigV4 key derivation, which is a chain
 # of HMAC-SHA256 over the secret of the credential the form named.
 hmac = "0.12"
+# The ARN pattern S3 publishes for a Lambda notification destination is a REGULAR
+# EXPRESSION, quoted verbatim in the refusal of a value that does not satisfy it
+# (`state::CLOUD_FUNCTION_ARN_PATTERN`), so the pattern as published is also what judges a
+# value rather than a second hand-written reading of it.
+regex = "1.13"
 # The AWS SDKs for the four destinations a bucket's event notification configuration
 # publishes to, driven over the in-process callback (`OperationContext::callback`): an
 # object event becomes a `PutEvents` onto the default event bus, a `SendMessage`, a

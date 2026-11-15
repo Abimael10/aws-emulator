@@ -93,11 +93,23 @@ impl LifecycleCase {
 }
 
 /// An instant `ago` before now, as the epoch seconds the protocol serialises a
-/// timestamp as — the shared harness's clock reader, so this suite adds no
-/// second one.
+/// timestamp as, at the precision that protocol CARRIES: the model's timestamps
+/// are "accurate to milliseconds", so the sub-millisecond part of the host
+/// clock's reading is dropped here rather than sent and then expected back. An
+/// instant stated more precisely than the wire can carry is not the instant that
+/// comes back, so a comparison of the two would be about the clock's nanoseconds
+/// rather than about the selection the hold was created with.
+///
+/// Read through the shared harness's clock reader, so this suite adds no second
+/// one.
 fn seconds_ago(ago: Duration) -> f64 {
-    epoch_seconds(SystemTime::now() - ago)
+    let seconds = epoch_seconds(SystemTime::now() - ago);
+    (seconds * MILLISECONDS_PER_SECOND).trunc() / MILLISECONDS_PER_SECOND
 }
+
+/// How many milliseconds one second carries — the unit the model's timestamps
+/// are accurate to, which [`seconds_ago`] states its instants in.
+const MILLISECONDS_PER_SECOND: f64 = 1_000.0;
 
 /// The rows of the table, spanning the selection forms a hold over every vault
 /// can take plus the named-vault control, and the reason forms a cancellation

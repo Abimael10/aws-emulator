@@ -18995,6 +18995,7 @@ dependencies = [
  "multer",
  "percent-encoding",
  "quick-xml",
+ "regex",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-eventbridge-awsevents",

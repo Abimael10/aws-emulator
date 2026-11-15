@@ -25,6 +25,7 @@
 //! ([`UploadedPart`]), each addressable by its own part number.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
 use md5::{Digest, Md5};
@@ -2166,9 +2167,15 @@ pub fn canonical_filter_rule_name(name: &str) -> Option<&'static str> {
         .map(|(_, canonical)| *canonical)
 }
 
-/// The WIRE value of a filter rule kind, as the sentence refusing a second rule of that
-/// kind spells it, or `None` for a value that is no `FilterRuleName`.
-fn filter_rule_kind(name: &str) -> Option<&'static str> {
+/// The WIRE value of a filter rule kind — the spelling `FilterRuleName` publishes, which is
+/// what a request carries and what the codec binds — or `None` for a value that is no
+/// `FilterRuleName` in any case.
+///
+/// `pub(crate)`: it is also what the wire layer folds a rule name spelled in another case
+/// onto before the codec reads the document, and what the document walk
+/// ([`notification_document_rejection`]) judges a name by, so one reading of the set serves
+/// the request, the store and the refusal alike.
+pub(crate) fn published_filter_rule_name(name: &str) -> Option<&'static str> {
     FILTER_RULE_NAME_SPELLINGS
         .iter()
         .find(|(wire, _)| wire.eq_ignore_ascii_case(name))
@@ -2223,6 +2230,25 @@ impl NotificationDestination {
         }
     }
 
+    /// The ARN PATTERN this destination's member publishes, or `None` for a member S3
+    /// publishes none for.
+    ///
+    /// The `CloudFunction` of a Lambda destination is the one: a value that is an ARN and does
+    /// not satisfy [`CLOUD_FUNCTION_ARN_PATTERN`] is refused by QUOTING that pattern
+    /// ([`NotificationConfigurationRejection::DestinationArnPattern`]), which is recorded
+    /// behaviour — the S3 model puts no `@pattern` on any of the three ARN members
+    /// (`smithy_query(query="shape",shape="LambdaFunctionArn,QueueArn,TopicArn")` reports a
+    /// plain string for each). The other two answer `None` rather than a pattern of this
+    /// crate's own invention: a refusal quoting a constraint has to quote the constraint the
+    /// service really publishes, and a value that is no ARN of the member's service is already
+    /// refused for that ([`NotificationConfigurationRejection::InvalidDestinationArn`]).
+    pub fn arn_pattern(self) -> Option<&'static str> {
+        match self {
+            Self::Topic | Self::Queue => None,
+            Self::LambdaFunction => Some(CLOUD_FUNCTION_ARN_PATTERN),
+        }
+    }
+
     /// What the destination IS, as the per-destination detail of a validation refusal names
     /// it — the noun S3's own sentence for that destination kind uses (see
     /// [`destination_permissions_detail`]).
@@ -2257,6 +2283,68 @@ pub fn destination_absent_detail(destination: NotificationDestination) -> String
     format!("The destination {} does not exist", destination.noun())
 }
 
+/// The per-destination detail S3 carries for a LAMBDA destination it may not publish to,
+/// whichever way that destination failed.
+///
+/// One sentence for both, because for a Lambda destination S3 makes ONE check: "in the case
+/// of Lambda destinations, Amazon S3 verifies that the Lambda function permissions grant
+/// Amazon S3 permission to invoke the function from the Amazon S3 bucket"
+/// (`PutBucketNotificationConfiguration`'s own documentation). A function that is not there
+/// grants no such permission either, so what S3 reports in both cases is that it is not
+/// authorized to invoke that function — the queue and the topic, whose existence and whose
+/// policy are two separate questions, keep the two sentences above.
+///
+/// The one variable part is the FUNCTION, which comes from the request.
+pub fn function_invoke_detail(function_arn: &str) -> String {
+    format!("Not authorized to invoke function [{function_arn}]")
+}
+
+/// How a destination-validation refusal NAMES one destination in its `<ArgumentName{n}>`.
+///
+/// A queue and a topic are named by the ARN the request carried. A LAMBDA destination is named
+/// by the PAIR S3 reads that member as — the function and the qualifier — separated by `, `,
+/// with [`ABSENT_QUALIFIER`] where the reference names no version or alias: the `CloudFunction`
+/// member admits a qualifier after the function name
+/// ([`CLOUD_FUNCTION_ARN_PATTERN`]), and the refusal reports both halves of what it read.
+///
+/// Both halves come from the request's own value; nothing is invented here.
+pub fn refused_destination_name(destination: NotificationDestination, arn: &str) -> String {
+    if destination != NotificationDestination::LambdaFunction {
+        return arn.to_string();
+    }
+    let (function, qualifier) = function_and_qualifier(arn);
+    format!("{function}, {}", qualifier.unwrap_or(ABSENT_QUALIFIER))
+}
+
+/// What [`refused_destination_name`] writes for a Lambda reference that names no qualifier:
+/// the absent half of the pair, spelled the way S3's document spells an absent one.
+pub const ABSENT_QUALIFIER: &str = "null";
+
+/// A `CloudFunction` reference split into the FUNCTION it names and the QUALIFIER after it,
+/// which is `None` for a reference that names none.
+///
+/// The qualifier is the one optional trailing segment of the resource part
+/// ([`CLOUD_FUNCTION_ARN_PATTERN`] admits exactly one), read through the shared ARN parse so
+/// this crate does not split an ARN its own way; a value that is no ARN at all is the whole
+/// function half, there being nothing to split.
+fn function_and_qualifier(arn: &str) -> (&str, Option<&str>) {
+    let Some(parsed) = ::service_common::arn::parse(arn) else {
+        return (arn, None);
+    };
+    // `function:<name>` is two segments; a third is the qualifier.
+    let mut segments = parsed.resource.split(':');
+    let (Some(_), Some(_), Some(qualifier)) = (segments.next(), segments.next(), segments.next())
+    else {
+        return (arn, None);
+    };
+    (
+        arn.strip_suffix(qualifier)
+            .and_then(|function| function.strip_suffix(':'))
+            .unwrap_or(arn),
+        Some(qualifier),
+    )
+}
+
 /// One object key name filtering rule of a configuration's `Filter`.
 ///
 /// Both members are optional in the model (`smithy_query(query="shape",shape="FilterRule")`),
@@ -2278,7 +2366,7 @@ impl NotificationFilterRule {
     /// held in answers the same kind, so a filter cannot carry one kind twice under two
     /// spellings.
     pub fn kind(&self) -> Option<&'static str> {
-        filter_rule_kind(self.name.as_deref()?)
+        published_filter_rule_name(self.name.as_deref()?)
     }
 
     /// The value this rule filters by, empty when it named none — which filters on
@@ -2399,12 +2487,11 @@ impl BucketNotificationConfiguration {
 /// it was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotificationConfigurationRejection {
-    /// An event outside [`EVENT_VALUES`]. The sentence S3 sends for this is FIXED text,
-    /// so neither member is interpolated into it; they are what the refusal is logged with.
+    /// An event outside [`EVENT_VALUES`]. The sentence S3 sends for this is FIXED text, so
+    /// the value is not interpolated into it: it travels in the `<ArgumentValue>` beside the
+    /// pair's `Event` ([`NotificationConfigurationRejection::argument`]).
     UnsupportedEvent {
-        /// The member the configuration arrived on.
-        member: &'static str,
-        /// The value that is not a published event.
+        /// The value that is not a published event, as the request spelled it.
         event: String,
     },
     /// A configuration naming no event at all: `Events` is a REQUIRED member of each
@@ -2448,13 +2535,30 @@ pub enum NotificationConfigurationRejection {
         /// The id that is used twice.
         id: String,
     },
-    /// A destination ARN that is not an ARN of the service that destination lives in.
+    /// A destination reference S3 cannot read as an ARN of the service that destination
+    /// lives in: the member requires one, so a value that does not parse as such an ARN —
+    /// a bare resource name, a truncated ARN, an ARN of another service — names no
+    /// destination at all. The sentence is FIXED text and the member and the value travel
+    /// in the `<ArgumentName>` / `<ArgumentValue>` pair beside it
+    /// ([`NotificationConfigurationRejection::argument`]).
     InvalidDestinationArn {
         /// The member the ARN arrived on (`Topic`, `Queue` or `CloudFunction`).
         member: &'static str,
         /// The service field such an ARN has to name.
         service: &'static str,
-        /// The value that is not such an ARN.
+        /// The value that is not such an ARN, as the request spelled it.
+        arn: String,
+    },
+    /// A destination reference that IS an ARN and does not satisfy the pattern the member it
+    /// arrived on publishes ([`NotificationDestination::arn_pattern`]): the refusal QUOTES
+    /// that pattern, so what the caller is told to satisfy is the constraint itself.
+    DestinationArnPattern {
+        /// The member the ARN arrived on (`CloudFunction` is the one that publishes a
+        /// pattern).
+        member: &'static str,
+        /// The pattern the value does not satisfy, as the member publishes it.
+        pattern: &'static str,
+        /// The value that does not satisfy it, as the request spelled it.
         arn: String,
     },
     /// More configurations than [`MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`].
@@ -2472,11 +2576,8 @@ impl std::fmt::Display for NotificationConfigurationRejection {
                 f,
                 "A {member} configuration must specify at least one event"
             ),
-            Self::InvalidFilterRuleName { name } => write!(
-                f,
-                "filter rule name must be either prefix or suffix, got {name}"
-            ),
-            Self::DuplicateFilterRuleKind { kind } => {
+            Self::InvalidFilterRuleName { .. } => f.write_str(INVALID_FILTER_RULE_NAME_MESSAGE),
+            Self::DuplicateFilterRuleKind { kind, .. } => {
                 write!(f, "Cannot specify more than one {kind} rule in a filter.")
             }
             Self::AmbiguousConfiguration => f.write_str(
@@ -2487,17 +2588,11 @@ impl std::fmt::Display for NotificationConfigurationRejection {
                 "Configurations overlap. Configurations on the same bucket cannot share a \
                  common event type.",
             ),
-            Self::DuplicateConfigurationId { id } => {
-                write!(f, "Configuration ID {id} is not unique")
+            Self::DuplicateConfigurationId { .. } => f.write_str(DUPLICATE_CONFIGURATION_ID_MESSAGE),
+            Self::InvalidDestinationArn { .. } => f.write_str(UNPARSEABLE_DESTINATION_MESSAGE),
+            Self::DestinationArnPattern { pattern, .. } => {
+                write!(f, "{UNSATISFIED_ARN_CONSTRAINT_MESSAGE}{pattern}")
             }
-            Self::InvalidDestinationArn {
-                member,
-                service,
-                arn,
-            } => write!(
-                f,
-                "The {member} ARN {arn} is not a valid {service} ARN"
-            ),
             Self::TooManyConfigurations { count } => write!(
                 f,
                 "A notification configuration may carry at most \
@@ -2513,19 +2608,42 @@ impl NotificationConfigurationRejection {
     /// refusal whose document names no argument.
     ///
     /// S3's `InvalidArgument` document carries an `<ArgumentName>` / `<ArgumentValue>` pair
-    /// beside its code and message (Amazon S3 API Reference, *Error responses*), and for a
-    /// document whose configurations share an event type the field it names is the `Event`,
-    /// carrying the two values the pair overlaps in: that class's sentence is the same for
-    /// every document in it, so the pair is the whole of what says which events to change.
+    /// beside its code and message (Amazon S3 API Reference, *Error responses*). Each class's
+    /// sentence is the same for every document in it, so the pair is the whole of what says
+    /// which part of the document to change, and the field it names is the one the class is
+    /// ABOUT:
     ///
-    /// Every other rejection answers `None` — the ambiguous-filters class included: the
-    /// message is what states the rule each of them broke, and naming a field S3 is not known
-    /// to name in those documents would invent one.
+    /// * a document whose configurations share an event type names the `Event`, carrying the
+    ///   two values the pair overlaps in;
+    /// * an `Events` entry outside the published set names the `Event` and echoes the value as
+    ///   sent;
+    /// * a document the key-name filter rules leave ambiguous, and a rule whose `Name` is no
+    ///   `FilterRuleName`, name the `FilterRule` — the rules being what the caller has to
+    ///   change — the second echoing the name as sent, the first naming no value, there being
+    ///   no single rule the ambiguity is in;
+    /// * a destination reference that is no ARN of its service names the MEMBER it arrived on
+    ///   (`Topic`, `Queue`, `CloudFunction`) and echoes the value as sent.
+    ///
+    /// Every other rejection answers `None`: the message is what states the rule each of them
+    /// broke, and naming a field S3 is not known to name in those documents would invent one.
     #[must_use]
     pub fn argument(&self) -> Option<(&'static str, Option<&str>)> {
         match self {
             Self::OverlappingEventTypes { events } => {
                 Some((EVENT_ARGUMENT, Some(events.as_str())))
+            }
+            Self::UnsupportedEvent { event, .. } => Some((EVENT_ARGUMENT, Some(event.as_str()))),
+            Self::AmbiguousConfiguration => Some((FILTER_RULE_ARGUMENT, None)),
+            Self::InvalidFilterRuleName { name } => {
+                Some((FILTER_RULE_ARGUMENT, Some(name.as_str())))
+            }
+            Self::InvalidDestinationArn { member, arn, .. } => Some((member, Some(arn.as_str()))),
+            Self::DestinationArnPattern { member, arn, .. } => {
+                Some((member, Some(arn.as_str())))
+            }
+            Self::DuplicateFilterRuleKind { .. } => Some((FILTER_RULE_ARGUMENT, None)),
+            Self::DuplicateConfigurationId { id } => {
+                Some((CONFIGURATION_ID_ARGUMENT, Some(id.as_str())))
             }
             _ => None,
         }
@@ -2535,6 +2653,19 @@ impl NotificationConfigurationRejection {
 /// The request field a document whose configurations share an event type is reported about:
 /// the `Event` they overlap in, as the API publishes that member.
 const EVENT_ARGUMENT: &str = "Event";
+
+/// The request field a refusal about the KEY-NAME FILTER RULES of a document is reported
+/// about: the `FilterRule` the caller has to change, as the API publishes that member
+/// (`smithy_query(query="shape",shape="S3KeyFilter")` reports `FilterRules` as a list of
+/// `FilterRule`).
+///
+/// The three refusals about those rules name it: a document the rules leave ambiguous, a rule
+/// whose `Name` is no `FilterRuleName`, and a filter carrying two rules of one kind.
+const FILTER_RULE_ARGUMENT: &str = "FilterRule";
+
+/// The request field a refusal about a configuration's `Id` is reported about, as
+/// `NotificationId`'s own member is published.
+const CONFIGURATION_ID_ARGUMENT: &str = "Id";
 
 impl std::error::Error for NotificationConfigurationRejection {}
 
@@ -2596,6 +2727,81 @@ pub fn is_arn_of(
 /// bare resource part — the form every notification destination takes.
 fn is_arn_of_service(arn: &str, service: &str) -> bool {
     is_arn_of(arn, service, ArnField::Present, ArnField::Present, "")
+}
+
+/// The ARN form a `CloudFunction` notification destination has to be in, as the refusal of a
+/// value that is not QUOTES it (recorded behaviour: S3 answers such a value "The ARN failed to
+/// satisfy constraint: Member must satisfy regular expression pattern: <this>").
+///
+/// It says more than "an ARN of Lambda" does: the account field is exactly twelve digits, the
+/// resource is a `function:` followed by a function name of at most 64 characters from the
+/// name alphabet, and the one thing that may follow it is a QUALIFIER — the version or alias
+/// a destination may name. Nothing else about a Lambda ARN is admitted.
+///
+/// Published as the pattern itself rather than as a reading of it, so the sentence a caller
+/// is told to satisfy and the judgement made on the value are the same text
+/// ([`matches_arn_pattern`] applies it).
+pub const CLOUD_FUNCTION_ARN_PATTERN: &str = "^arn:aws[\\p{Alpha}\\-]*:lambda:[\\p{Alnum}\\-]+:\
+                                              [\\p{Digit}]{12}:function:[\\p{Alnum}\\-_]{1,64}\
+                                              (:[\\p{Alnum}\\-_]+)?$";
+
+/// Every ARN pattern a destination member publishes, compiled once.
+///
+/// A pattern is compiled on first use and kept for the process: a request path must not build
+/// a regular expression per value it judges. A pattern this crate's own regular-expression
+/// engine cannot compile would leave the value unjudged rather than taking the serving process
+/// down — `tests` pins that every published pattern does compile, so that arm is unreachable.
+static COMPILED_ARN_PATTERNS: LazyLock<Vec<(&'static str, Option<::regex::Regex>)>> =
+    LazyLock::new(|| {
+        [CLOUD_FUNCTION_ARN_PATTERN]
+            .into_iter()
+            .map(|pattern| {
+                (
+                    pattern,
+                    ::regex::Regex::new(&in_the_engines_spelling(pattern)).ok(),
+                )
+            })
+            .collect()
+    });
+
+/// Each POSIX character class the published patterns name, as AWS writes it and as this
+/// crate's regular-expression engine spells the SAME class.
+///
+/// AWS publishes its patterns in Java's syntax, where `\p{Alnum}` and its siblings are the
+/// POSIX classes (Java, `java.util.regex.Pattern`, *POSIX character classes (US-ASCII
+/// only)*); the `regex` crate spells those classes `[[:alnum:]]` and knows no Unicode property
+/// of that name (the `regex` crate's own *ASCII character classes*). Both are the same
+/// US-ASCII set, so this is a spelling difference and nothing more — which is why the pattern
+/// a refusal QUOTES stays the published one and only the text handed to the engine is
+/// rewritten.
+const PUBLISHED_POSIX_CLASSES: [(&str, &str); 3] = [
+    ("\\p{Alnum}", "[:alnum:]"),
+    ("\\p{Alpha}", "[:alpha:]"),
+    ("\\p{Digit}", "[:digit:]"),
+];
+
+/// `pattern` as this crate's regular-expression engine spells it: the published text with
+/// each POSIX class re-spelled ([`PUBLISHED_POSIX_CLASSES`]) and nothing else touched.
+fn in_the_engines_spelling(pattern: &str) -> String {
+    PUBLISHED_POSIX_CLASSES
+        .iter()
+        .fold(pattern.to_string(), |rewritten, (published, engine)| {
+            rewritten.replace(published, engine)
+        })
+}
+
+/// Whether `value` satisfies `pattern`, one of the published destination ARN patterns
+/// ([`NotificationDestination::arn_pattern`]).
+///
+/// A pattern the engine could not compile judges nothing, so a value is kept rather than
+/// refused by a constraint this process cannot apply.
+#[must_use]
+pub fn matches_arn_pattern(pattern: &str, value: &str) -> bool {
+    COMPILED_ARN_PATTERNS
+        .iter()
+        .find(|(published, _)| *published == pattern)
+        .and_then(|(_, compiled)| compiled.as_ref())
+        .is_none_or(|compiled| compiled.is_match(value))
 }
 
 /// Whether `value` is the ARN of an S3 bucket: `arn:<partition>:s3:::<name>`.
@@ -2732,13 +2938,26 @@ pub fn validate_notification_configuration(
             });
         }
 
+        // And then against the member's own published ARN FORM, where it publishes one: an
+        // ARN of the right service can still be an ARN of something that is not a
+        // destination, or carry a field in a shape the member does not admit, and S3 answers
+        // that by quoting the pattern rather than by saying the value is no ARN.
+        if let Some(pattern) = destination.arn_pattern() {
+            if !matches_arn_pattern(pattern, &target.arn) {
+                return Err(NotificationConfigurationRejection::DestinationArnPattern {
+                    member,
+                    pattern,
+                    arn: target.arn.clone(),
+                });
+            }
+        }
+
         if target.events.is_empty() {
             return Err(NotificationConfigurationRejection::NoEvents { member });
         }
         for event in &target.events {
             if !EVENT_VALUES.contains(&event.as_str()) {
                 return Err(NotificationConfigurationRejection::UnsupportedEvent {
-                    member,
                     event: event.clone(),
                 });
             }
@@ -2778,19 +2997,38 @@ pub fn validate_notification_configuration(
         }
     }
 
-    // And the document as a WHOLE: no two of its configurations may both be matched by one
-    // object event. WHICH field the conflict is in decides what S3 answers:
+    // And the document as a WHOLE: no two of the RULES it describes may be reached by one
+    // object event. A rule is one `Events` entry under one configuration's key filter, so the
+    // pairs are both the ones across two configurations and the ones INSIDE a single
+    // configuration's `Events` list — two entries of one list share that configuration's
+    // filter, so nothing tells them apart at all. WHICH field such a conflict is in decides
+    // what S3 answers:
     //
-    // * two configurations that name the SAME event value are told apart by their key
-    //   filters alone — "overlapping prefixes and suffixes are not supported"
-    //   ([`filters_overlap`] is that half of the rule) — so a pair whose filters overlap too
-    //   leaves the document ambiguous;
-    // * two that do NOT name the same value and still share an event — one names the
-    //   `s3:<Type>:*` form and the other an event of that type — overlap in the EVENT, and
-    //   that is what S3 reports.
+    // * two rules that name the SAME event value are distinguished by their key filters alone
+    //   — "cannot have overlapping suffixes in two rules if the prefixes are overlapping for
+    //   the same event type" ([`filters_overlap`] is that half of the rule) — so a pair whose
+    //   prefixes are disjoint, or whose suffixes are, is kept, and one whose filters overlap
+    //   leaves the document AMBIGUOUS;
+    // * two that do NOT name the same value and are still both notified of one event — one
+    //   names the `s3:<Type>:*` form, which "stands for every event of that type", and the
+    //   other an event of that type — overlap in the EVENT, which is the field S3 reports.
     //
-    // The check is over every pair across all three lists, since which destination a
-    // configuration publishes to does not make two rules distinguish an object.
+    // Two rules naming two DIFFERENT events of one type (a delete beside a delete marker, a
+    // tag write beside a tag removal) are notified of no event in common and are both kept,
+    // which is what lets one bucket fan the details of a type out to destinations of their
+    // own.
+    //
+    // The walk inside one configuration comes first, so a list that overlaps itself is
+    // reported for the entries that do rather than for whichever other configuration it also
+    // meets.
+    for (_, target) in configuration.targets() {
+        if let Some(events) = self_overlapping_events(target) {
+            return Err(NotificationConfigurationRejection::OverlappingEventTypes { events });
+        }
+    }
+
+    // The pairs ACROSS configurations, over every pair across all three lists, since which
+    // destination a configuration publishes to does not make two rules distinguish an object.
     //
     // Each configuration's events are read ONCE, into the two bit sets [`named_mask`] and
     // [`event_mask`] encode them as, so the pair walk below costs two ANDs per pair: the walk
@@ -2818,6 +3056,51 @@ pub fn validate_notification_configuration(
     }
 
     Ok(())
+}
+
+/// The two `Event` values ONE configuration's own `Events` list overlaps in, as the refusal's
+/// `<ArgumentValue>` carries them — in the order the list named them, separated by `, ` — or
+/// `None` for a list whose entries are notified of no event in common.
+///
+/// A configuration's entries all share that configuration's key filter, so two entries that
+/// are both notified of one event are told apart by nothing: a list naming a type's wildcard
+/// beside an event of that type asks for one object event to be published twice through one
+/// rule. Two entries naming the SAME value are the same rule written twice and name no second
+/// rule to conflict with, so only DIFFERENT values are compared.
+///
+/// Bounded by the published vocabulary rather than by the length of the list: the values are
+/// deduplicated first ([`EVENT_VALUES`] is closed, so at most that many distinct ones survive)
+/// and the pair walk is over what is left, so a request carrying an arbitrarily long `Events`
+/// list costs one pass over it plus a walk over the vocabulary.
+fn self_overlapping_events(target: &NotificationTarget) -> Option<String> {
+    let mut seen = 0_u64;
+    let mut distinct: Vec<&str> = Vec::new();
+    for event in &target.events {
+        let named = named_bit(event);
+        if named & seen != 0 {
+            continue;
+        }
+        seen |= named;
+        distinct.push(event.as_str());
+    }
+    for (position, one) in distinct.iter().enumerate() {
+        for other in &distinct[position + 1..] {
+            if value_mask(one) & value_mask(other) != 0 {
+                return Some(format!("{one}, {other}"));
+            }
+        }
+    }
+    None
+}
+
+/// The bit ONE `Event` value is named by: its own position in the published catalog, and no
+/// bit at all for a value the catalog does not publish — which the validation above has
+/// already refused.
+fn named_bit(event: &str) -> u64 {
+    EVENT_VALUES
+        .iter()
+        .position(|published| *published == event)
+        .map_or(0, |index| 1 << index)
 }
 
 /// The two `Event` values two configurations overlap in, as the refusal's `<ArgumentValue>`
@@ -2884,9 +3167,8 @@ fn named_mask(target: &NotificationTarget) -> u64 {
 /// configuration names covers the event itself, and the `s3:<Type>:*` form "stands for every
 /// event of that type" ([`notifications::event_matches`], the one reading of that rule in
 /// this crate). So a configuration naming the wildcard of a type and another naming one
-/// event of that type both match that event, and the pair is ambiguous for the same reason
-/// two configurations naming the same value are: an object event would be published to both
-/// and S3 could not say which rule it matched.
+/// event of that type are both notified of that event, which is what makes the pair one S3
+/// refuses — while two configurations naming two different events of one type share none.
 fn event_mask(target: &NotificationTarget) -> u64 {
     target
         .events
@@ -4299,6 +4581,9 @@ mod configuration_tokens;
 mod inline_tagging;
 // What a bucket's stored lifecycle configuration is, and which ones S3 admits.
 mod lifecycle;
+// The vocabulary a notification document names — its events and its filter rule names — as
+// Amazon S3 rather than the published schema judges it.
+mod notification_document;
 // One stored object version.
 mod object;
 // The server-side encryption headers a READ of an object may not carry.
@@ -4327,6 +4612,7 @@ pub use bucket::*;
 pub use configuration_tokens::*;
 pub use inline_tagging::*;
 pub use lifecycle::*;
+pub use notification_document::*;
 pub use object::*;
 pub use read_encryption_headers::*;
 pub use refusals::*;

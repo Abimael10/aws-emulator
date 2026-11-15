@@ -1079,7 +1079,10 @@ pub async fn unvalidated_destinations(
             }
         };
         if let Some(rejection) = rejected {
-            unvalidated.push((target.arn.clone(), rejection.detail(destination)));
+            unvalidated.push((
+                super::refused_destination_name(destination, &target.arn),
+                rejection.detail(destination, &target.arn),
+            ));
         }
     }
     unvalidated
@@ -1101,7 +1104,14 @@ enum DestinationRejection {
 
 impl DestinationRejection {
     /// The detail S3's refusal carries for this destination kind.
-    fn detail(self, destination: super::NotificationDestination) -> String {
+    ///
+    /// A LAMBDA destination reads the same for either rejection
+    /// ([`super::function_invoke_detail`] says why), and names the function the reference
+    /// pointed at; a queue and a topic are told apart by WHICH of the two questions failed.
+    fn detail(self, destination: super::NotificationDestination, arn: &str) -> String {
+        if destination == super::NotificationDestination::LambdaFunction {
+            return super::function_invoke_detail(arn);
+        }
         match self {
             Self::Absent => super::destination_absent_detail(destination),
             Self::Unpermitted => super::destination_permissions_detail(destination),

@@ -6,12 +6,17 @@
 //! single object event, and S3 refuses the whole document rather than storing a
 //! configuration whose delivery nothing could decide.
 //!
-//! The rule under test: **two destination configurations of one `NotificationConfiguration`
-//! may not both be matched by a single object event — an `Events` entry covers the event
-//! value itself and, in the `s3:<Type>:*` form, every published event of that type, and two
-//! configurations are both kept only when their events are disjoint or their key-name
-//! filters are — and a document that breaks it is refused whole with HTTP 400
-//! `InvalidArgument` and leaves the bucket's stored configuration exactly as it was.**
+//! The rule under test: **no two of the RULES a `NotificationConfiguration` describes may
+//! both be matched by a single object event — a rule being one `Events` entry under one
+//! configuration's key filter, and an entry covering the event value itself and, in the
+//! `s3:<Type>:*` form, every published event of that type — and a document that breaks it is
+//! refused whole with HTTP 400 `InvalidArgument`, leaving the bucket's stored configuration
+//! exactly as it was.**
+//!
+//! Two rules are both kept only when their events are disjoint or their key-name filters are;
+//! two entries of ONE configuration's list share that configuration's filter, so nothing
+//! tells them apart and a list naming a type's wildcard beside an event of that type is
+//! refused by itself.
 //!
 //! WHICH sentence it is refused with follows from why the two cannot both be in force: a
 //! pair that names one event value between them is told apart by key filters alone, so a
@@ -77,8 +82,11 @@ const INVALID_ARGUMENT: &str = "InvalidArgument";
 /// IN. S3's `InvalidArgument` document carries an `<ArgumentName>`/`<ArgumentValue>` pair
 /// beside its code and message (Amazon S3 API Reference, *Error responses*), and that class's
 /// sentence says nothing about which events overlapped — so the pair is the whole of what a
-/// client reads to find that out. The ambiguous-filters class names no argument.
+/// client reads to find that out. The ambiguous-filters class names the `FilterRule`, the
+/// rules being what the caller has to change, and no value: there is no single rule the
+/// ambiguity is in.
 const EVENT_ARGUMENT: &str = "Event";
+const FILTER_RULE_ARGUMENT: &str = "FilterRule";
 
 /// What a refused document's `InvalidArgument` document must carry.
 #[derive(Debug, Clone, Copy)]
@@ -107,7 +115,7 @@ impl Refused {
     fn filters() -> Self {
         Self {
             message: AMBIGUOUS,
-            argument: None,
+            argument: Some(FILTER_RULE_ARGUMENT),
             value: None,
         }
     }
@@ -353,6 +361,58 @@ async fn a_wildcard_event_and_an_event_of_its_type_cannot_both_be_configured() {
             None,
         ),
         (
+            // Two DIFFERENT events of one type are notified of nothing in common, so one
+            // bucket may fan the details of a type out to destinations of their own — even
+            // with no filter at all.
+            "two different events of one type, neither filtering",
+            vec![
+                Configuration::first(&["s3:ObjectRemoved:Delete"]),
+                Configuration::second(&["s3:ObjectRemoved:DeleteMarkerCreated"]),
+            ],
+            None,
+        ),
+        (
+            // ONE configuration whose own list overlaps itself: both entries carry that
+            // configuration's filter, so nothing tells the two rules apart.
+            "one configuration naming a wildcard beside an event of its type",
+            vec![Configuration::first(&[
+                "s3:ObjectCreated:*",
+                "s3:ObjectCreated:Put",
+            ])],
+            Some(Refused::events("s3:ObjectCreated:*", "s3:ObjectCreated:Put")),
+        ),
+        (
+            "one filtering configuration naming an event of a type beside that wildcard",
+            vec![
+                Configuration::first(&["s3:ObjectTagging:Delete", "s3:ObjectTagging:*"])
+                    .filtering(&[("prefix", "self/"), ("suffix", ".json")]),
+            ],
+            Some(Refused::events(
+                "s3:ObjectTagging:Delete",
+                "s3:ObjectTagging:*",
+            )),
+        ),
+        (
+            // The same list with the wildcard's own type left out: two details of one type
+            // in one list are notified of nothing in common, so the list is applied.
+            "one configuration naming two different events of one type",
+            vec![Configuration::first(&[
+                "s3:ObjectTagging:Put",
+                "s3:ObjectTagging:Delete",
+            ])],
+            None,
+        ),
+        (
+            // One value written twice is one rule written twice, which conflicts with
+            // nothing.
+            "one configuration naming one event twice",
+            vec![Configuration::first(&[
+                "s3:ObjectCreated:Put",
+                "s3:ObjectCreated:Put",
+            ])],
+            None,
+        ),
+        (
             // The wildcard spans ONE type: an event of another type is a different event,
             // whatever the filters say.
             "a wildcard and an event of another type on one prefix",
@@ -566,6 +626,31 @@ async fn every_published_wildcard_conflicts_with_every_event_of_its_own_type() {
                  with {:?}",
                 distinguished.status,
                 String::from_utf8_lossy(&distinguished.body)
+            );
+
+            // ...while the same two values in ONE configuration's own list are refused
+            // however that configuration filters: both entries carry its filter, so nothing
+            // tells the two rules apart.
+            let in_one_list = put_notification(
+                &router,
+                &bucket,
+                &[Configuration::first(&[wildcard, event]).filtering(&[("prefix", "wild/")])],
+            )
+            .await;
+            assert_eq!(
+                in_one_list.status,
+                400,
+                "case {case:?}: one configuration naming both must be refused, got {} with \
+                 {:?}",
+                in_one_list.status,
+                String::from_utf8_lossy(&in_one_list.body)
+            );
+            assert_eq!(
+                in_one_list.element("ArgumentValue"),
+                Some(format!("{wildcard}, {event}")),
+                "case {case:?}: expected the refusal to name the pair {wildcard}, {event}, \
+                 got {:?}",
+                String::from_utf8_lossy(&in_one_list.body)
             );
         }
     }

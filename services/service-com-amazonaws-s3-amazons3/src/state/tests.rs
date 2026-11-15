@@ -136,10 +136,10 @@ fn every_published_filter_rule_name_has_a_canonical_spelling() {
             canonical_filter_rule_name(canonical)
         );
         assert_eq!(
-            filter_rule_kind(canonical),
+            published_filter_rule_name(canonical),
             Some(*published),
             "case {published:?}: the canonical spelling must name the wire kind, got {:?}",
-            filter_rule_kind(canonical)
+            published_filter_rule_name(canonical)
         );
     }
     assert_eq!(
@@ -317,6 +317,124 @@ fn a_caller_write_into_a_published_bucket_counts_against_the_whole_store_budgets
         "with the caller's object gone the caller half is empty again, got {}",
         store.caller_retained_bytes()
     );
+}
+
+#[test]
+fn every_published_destination_arn_pattern_judges_the_forms_it_admits() {
+    // Every destination kind, with the pattern its member publishes — `None` for the two S3
+    // publishes none for, which is what keeps a refusal from quoting a constraint this crate
+    // invented.
+    for destination in [
+        NotificationDestination::Topic,
+        NotificationDestination::Queue,
+        NotificationDestination::LambdaFunction,
+    ] {
+        let Some(pattern) = destination.arn_pattern() else {
+            continue;
+        };
+        let engine_spelling = in_the_engines_spelling(pattern);
+        assert!(
+            ::regex::Regex::new(&engine_spelling).is_ok(),
+            "case {destination:?}: a published ARN pattern must compile, got \
+             {engine_spelling:?}: {:?}",
+            ::regex::Regex::new(&engine_spelling).err()
+        );
+    }
+
+    // (case, the value, whether the CloudFunction pattern admits it). The rows differ along
+    // what the pattern constrains: the partition, the Region field, the width of the account
+    // id, the `function:` resource kind, the alphabet and length of the function name, and
+    // the one optional qualifier it admits.
+    let at_the_bound = format!(
+        "arn:aws:lambda:us-east-1:123456789012:function:{}",
+        "f".repeat(64)
+    );
+    let past_the_bound = format!(
+        "arn:aws:lambda:us-east-1:123456789012:function:{}",
+        "f".repeat(65)
+    );
+    let rows: Vec<(&str, &str, bool)> = vec![
+        (
+            "a function ARN",
+            "arn:aws:lambda:us-east-1:123456789012:function:object-events",
+            true,
+        ),
+        (
+            "a function ARN in another partition",
+            "arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:object-events",
+            true,
+        ),
+        (
+            "a function ARN naming a version",
+            "arn:aws:lambda:eu-west-1:123456789012:function:object-events:7",
+            true,
+        ),
+        (
+            "a function ARN naming an alias",
+            "arn:aws:lambda:eu-west-1:123456789012:function:object-events:live",
+            true,
+        ),
+        (
+            "a function name with an underscore",
+            "arn:aws:lambda:eu-west-1:123456789012:function:object_events-1",
+            true,
+        ),
+        (
+            "a function name of 64 characters",
+            &at_the_bound,
+            true,
+        ),
+        (
+            "a function name one character past the bound",
+            &past_the_bound,
+            false,
+        ),
+        (
+            "an account id narrower than twelve digits",
+            "arn:aws:lambda:us-east-1:12345678901:function:object-events",
+            false,
+        ),
+        (
+            "an account id that is not digits",
+            "arn:aws:lambda:us-east-1:12345678901a:function:object-events",
+            false,
+        ),
+        (
+            "a resource that does not name the function kind",
+            "arn:aws:lambda:us-east-1:123456789012:object-events",
+            false,
+        ),
+        (
+            "a layer ARN",
+            "arn:aws:lambda:us-east-1:123456789012:layer:object-events",
+            false,
+        ),
+        (
+            "two qualifiers",
+            "arn:aws:lambda:us-east-1:123456789012:function:object-events:live:7",
+            false,
+        ),
+        (
+            "an empty Region field",
+            "arn:aws:lambda::123456789012:function:object-events",
+            false,
+        ),
+        (
+            "a topic ARN",
+            "arn:aws:sns:us-east-1:123456789012:object-events",
+            false,
+        ),
+        ("no ARN at all", "object-events", false),
+    ];
+
+    for (case, value, admitted) in rows {
+        let actual = matches_arn_pattern(CLOUD_FUNCTION_ARN_PATTERN, value);
+        assert_eq!(
+            actual, admitted,
+            "case {case:?} ({value}): expected the published pattern to admit it == \
+             {admitted}, got {actual}"
+        );
+    }
 }
 
 #[test]
@@ -510,7 +628,7 @@ fn a_notification_configuration_is_validated_against_the_published_sets() {
                 prefixed_queue_target("twice", "one/", &["s3:ObjectCreated:Put"]),
                 prefixed_queue_target("twice", "two/", &["s3:ObjectCreated:Post"]),
             ]),
-            Some("not unique"),
+            Some("IDs must be unique"),
         ),
         (
             "an SQS ARN where a topic ARN belongs",
@@ -518,7 +636,7 @@ fn a_notification_configuration_is_validated_against_the_published_sets() {
                 topic_configurations: vec![queue_target(None, &["s3:ObjectCreated:Put"])],
                 ..BucketNotificationConfiguration::default()
             },
-            Some("not a valid sns ARN"),
+            Some("could not be parsed"),
         ),
         (
             // Each on a prefix of its own, because two configurations of one event

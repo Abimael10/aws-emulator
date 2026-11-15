@@ -1104,6 +1104,45 @@ pub const UNABLE_TO_VALIDATE_DESTINATIONS_MESSAGE: &str =
 /// [`NotificationConfigurationRejection::UnsupportedEvent`], which guards the store.
 pub const UNSUPPORTED_EVENT_MESSAGE: &str = "The event is not supported for notifications";
 
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a key-name filter rule whose
+/// `Name` is no `FilterRuleName` at all.
+///
+/// FIXED text — the name that is not one is not interpolated into it; it travels in the
+/// `<ArgumentValue>` beside the pair's `FilterRule`
+/// ([`NotificationConfigurationRejection::argument`]) — and the sentence states the rule the
+/// value broke: a rule filters on the prefix or on the suffix of a key and on nothing else.
+pub const INVALID_FILTER_RULE_NAME_MESSAGE: &str =
+    "filter rule name must be either prefix or suffix";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a notification destination
+/// reference it cannot read as an ARN of the service that destination lives in.
+///
+/// Also FIXED text: WHICH member carried the value, and the value itself, travel in the
+/// `<ArgumentName>` / `<ArgumentValue>` pair beside it
+/// ([`NotificationConfigurationRejection::argument`]), so nothing about the request is
+/// interpolated into the sentence.
+pub const UNPARSEABLE_DESTINATION_MESSAGE: &str = "The ARN could not be parsed";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a container two of whose
+/// configurations carry the same `Id` ("an optional unique identifier for configurations in a
+/// notification configuration", `NotificationId`).
+///
+/// FIXED text: the id that is used twice is not interpolated into it; it travels in the
+/// `<ArgumentValue>` beside the pair's `Id`
+/// ([`NotificationConfigurationRejection::argument`]).
+pub const DUPLICATE_CONFIGURATION_ID_MESSAGE: &str =
+    "Same ID used for multiple configurations. IDs must be unique.";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a notification destination
+/// reference that IS an ARN and does not satisfy the pattern its member publishes, up to the
+/// pattern itself — the whole sentence is this text followed by that pattern
+/// ([`NotificationConfigurationRejection::DestinationArnPattern`]).
+///
+/// The value is not in the sentence: it travels in the `<ArgumentValue>` beside the member's
+/// name, the way every other refusal of one destination reference carries it.
+pub const UNSATISFIED_ARN_CONSTRAINT_MESSAGE: &str =
+    "The ARN failed to satisfy constraint: Member must satisfy regular expression pattern: ";
+
 /// The code S3 answers a request whose content is not one it can carry out as given:
 /// "InvalidRequest", HTTP 400 (Amazon S3 "Error responses", list of error codes).
 ///
