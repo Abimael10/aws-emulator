@@ -2600,3 +2600,5 @@ mod autoscaling_plans_delete_withdraws_its_registration;
 // indentation `clippy::doc_lazy_continuation` asks of a doc list item, and the header below
 // still carries some of them; the lint is allowed here so such a paragraph is a note rather
 // than a build failure.
+// here, in the header where every comment of this file now stands, so the wrapping of a
+// header line is never what fails the build.

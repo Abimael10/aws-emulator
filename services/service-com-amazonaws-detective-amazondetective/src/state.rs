@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::ops::types::shared_types::investigations_errors::ResourceNotFoundException as InvestigationsResourceNotFoundException;
 use crate::ops::types::{
     DatasourcePackageIngestDetail, Graph as GraphDetail, InvestigationDetail, MemberDetail,
     MembershipDatasources, ResourceNotFoundException, TimestampForCollection, UnprocessedAccount,
@@ -940,9 +941,9 @@ pub fn graph_not_found_unstated() -> ResourceNotFoundException {
 
 /// The refusal the investigation operations answer a behavior graph this service does
 /// not hold with: the same modelled 404, carrying that surface's own
-/// [`INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE`].
-pub fn investigation_graph_not_found() -> ResourceNotFoundException {
-    ResourceNotFoundException {
+/// [`INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE`] under that surface's own wire key.
+pub fn investigation_graph_not_found() -> InvestigationsResourceNotFoundException {
+    InvestigationsResourceNotFoundException {
         message: Some(INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE.to_string()),
     }
 }

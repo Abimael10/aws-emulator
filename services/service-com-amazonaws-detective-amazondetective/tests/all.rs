@@ -21,6 +21,8 @@ mod client_error_bodies;
 mod datasource_package_ingest;
 #[path = "all/datasource_package_reporting.rs"]
 mod datasource_package_reporting;
+#[path = "all/investigation_error_message_key.rs"]
+mod investigation_error_message_key;
 #[path = "all/investigation_state_transitions.rs"]
 mod investigation_state_transitions;
 #[path = "all/list_investigations.rs"]

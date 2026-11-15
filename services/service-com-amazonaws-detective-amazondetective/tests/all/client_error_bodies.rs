@@ -6,13 +6,17 @@
 //! The rules under test, each asserted over a SET of inputs rather than the one input a
 //! recording happened to carry:
 //!
-//! 1. Every client-error body of this service carries its explanatory text under the wire
-//!    key `message` — whatever the error shape, the status and the operation, and whether
-//!    the refusal came from a handler, from the boundary walk or from an operation that is
-//!    still a stub — and never under the capitalised spelling the model happens to give
-//!    the member. A client reads that one key as the exception's user-facing text. The one
+//! 1. Every client-error body of this service's BEHAVIOR-GRAPH surface — its graph,
+//!    membership, invitation, data-source and tag operations, which is every operation
+//!    except the five bound under `/investigations/` — carries its explanatory text under
+//!    the wire key `message`: whatever the error shape, the status and the operation, and
+//!    whether the refusal came from a handler, from the boundary walk or from an operation
+//!    that is still a stub, and never under the capitalised spelling the model gives the
+//!    member. A client reads that one key as the exception's user-facing text. The one
 //!    refusal that states no text at all (the DELETE of a graph that is already gone)
-//!    carries no message member under either spelling.
+//!    carries no message member under either spelling. The other surface keys the same
+//!    member as the model spells it; `investigation_error_message_key` owns that table and
+//!    the contrast between the two.
 //! 2. A constraint violation of the ELEMENTS of a list member is stated with one clause
 //!    naming the shape that declares the list and the list member, then the constraint
 //!    class: `<InputShape>.<Member> members did not match the pattern.` It echoes neither
@@ -55,7 +59,7 @@ const TAG_RESOURCE_URI: &str = "/tags";
 
 /// The capitalised spelling the model gives the message member
 /// (`smithy_query(query="shape",shape="ResourceNotFoundException")` reports
-/// `{"Message": …}`) and which no body of this service serves.
+/// `{"Message": …}`) and which no body of the surface under test here serves.
 const MODEL_MESSAGE_MEMBER: &str = "Message";
 
 /// A `GraphArn` that satisfies the modelled pattern and that nothing was ever stored

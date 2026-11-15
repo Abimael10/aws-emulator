@@ -7,8 +7,11 @@
 //! modules, and `types/mod.rs` re-exports them all.
 //!
 //! Every ERROR shape of this service is written out rather than expanded from the model,
-//! for the one difference [`ERROR_MESSAGE_WIRE_KEY`] states: the wire key its explanatory
-//! text travels under. [`error_shape`] emits the rest of what the expansion emits, so the
+//! for the one difference [`GRAPH_ERROR_MESSAGE_WIRE_KEY`] and
+//! [`INVESTIGATIONS_ERROR_MESSAGE_WIRE_KEY`] state: the wire key its explanatory text
+//! travels under, which this service's two surfaces spell differently.
+//! [`error_shape`] emits the rest of what the expansion emits — and emits it once per
+//! surface from the one definition ([`investigations_errors`] holds the second) — so the
 //! shapes cannot drift from each other.
 #![allow(unused_imports)]
 
@@ -20,28 +23,41 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-detective-amazondetecti
 // the generator emits.
 const NAMESPACE: &str = "com.amazonaws.detective";
 
-/// The wire key every error body of this service carries its explanatory text under.
+/// The wire key the behavior-graph surface of this service keys its explanatory text
+/// under: every operation of this service EXCEPT the five bound under `/investigations/`.
 ///
 /// The model spells that member `Message`
 /// (`smithy_query(query="shape",shape="ResourceNotFoundException")` reports
 /// `{"Message": {"target": "ErrorMessage"}}`), and the JSON codecs key a member by its
 /// `@jsonName` or else by its member name — neither of which this model makes lowercase,
 /// so a model-derived error shape puts `Message` on the wire. Every recorded refusal of
-/// this service keys the text `message`, which is the key an SDK surfaces as the
-/// exception's user-facing text: keyed otherwise, a client raises the modelled error with
-/// an EMPTY message and nothing can be told from it. The key is therefore this service's
-/// choice rather than the model's spelling, and it is written exactly once, here, so no
-/// error shape of this service can drift from the others.
-const ERROR_MESSAGE_WIRE_KEY: &str = "message";
+/// the graph, membership, invitation and tag operations keys the text `message` instead,
+/// which is the key an SDK surfaces as the exception's user-facing text: keyed otherwise,
+/// a client raises the modelled error with an EMPTY message and nothing can be told from
+/// it. For that surface the key is therefore the service's choice rather than the model's
+/// spelling, and it is written exactly once, here, so no error shape of that surface can
+/// drift from the others.
+const GRAPH_ERROR_MESSAGE_WIRE_KEY: &str = "message";
 
-/// The `Message` member of the error shape `$shape`, keyed on the wire as
-/// [`ERROR_MESSAGE_WIRE_KEY`].
+/// The wire key the `/investigations/` surface keys the same text under: the member name
+/// the model spells, unchanged.
+///
+/// Recorded behaviour: a refusal of an operation bound under this service's
+/// `/investigations/` URIs carries its text under `Message`, while the surface above keys
+/// the same member lowercase. The two surfaces already differ in the SENTENCE they word
+/// one condition with — an unresolvable behavior graph, see
+/// [`crate::state::INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE`] — and the key is the second
+/// thing each of them owns. See [`investigations_errors`] for the shapes that carry it.
+const INVESTIGATIONS_ERROR_MESSAGE_WIRE_KEY: &str = "Message";
+
+/// The `Message` member of the error shape `$shape`, keyed on the wire as `$key` — one of
+/// the two wire keys above, whichever the surface answering the error uses.
 ///
 /// The member's shape id and the member it names keep the MODEL's spelling; only the wire
-/// key is this service's — carried both as the member name (which the awsJson codecs read)
+/// key is the surface's — carried both as the member name (which the awsJson codecs read)
 /// and as `@jsonName` (which restJson1 prefers), so the one key reaches either codec.
 macro_rules! error_message_member {
-    ($shape:literal) => {
+    ($shape:literal, $key:expr) => {
         ::aws_smithy_schema::Schema::new_member(
             ::aws_smithy_schema::ShapeId::from_static(
                 concat!("com.amazonaws.detective#", $shape, "$Message"),
@@ -49,10 +65,10 @@ macro_rules! error_message_member {
                 "Message",
             ),
             ::aws_smithy_schema::ShapeType::String,
-            ERROR_MESSAGE_WIRE_KEY,
+            $key,
             0,
         )
-        .with_json_name(ERROR_MESSAGE_WIRE_KEY)
+        .with_json_name($key)
     };
 }
 
@@ -76,24 +92,35 @@ macro_rules! error_string_member {
 }
 
 /// One error shape of this service, written out rather than expanded from the model for
-/// the one difference [`ERROR_MESSAGE_WIRE_KEY`] states.
+/// the one difference the two wire keys above state.
 ///
 /// Everything here mirrors what `#[smithy_macros::smithy(shape = …)]` emits for an
-/// `@error` structure: one member static per member (index = position in the model's
-/// member list), the `SCHEMA_<SHAPE>` static each operation's generated error enum
-/// references by name, `shape_name` (the wire `__type`, the model's shape name
+/// `@error` structure: the struct itself, one member static per member (index = position
+/// in the model's member list), the `SCHEMA_<SHAPE>` static each operation's generated
+/// error enum references by name, `shape_name` (the wire `__type`, the model's shape name
 /// unchanged), `Display`, `Error` and `SerializableStruct`. `@xmlName` is absent exactly
 /// as it is from that expansion for a member the model spells `Message`, and nothing would
 /// read it: this service's protocol is restJson1.
+///
+/// One shape is emitted once per SURFACE that answers it — the parent module for the
+/// behavior-graph surface, [`investigations_errors`] for the `/investigations/` one — from
+/// this one definition, so two surfaces' spellings of a shape cannot drift in anything but
+/// `$key`, the wire key its explanatory text travels under.
 ///
 /// `$extra` names each member beyond the message: its static, its Rust field, the member
 /// as the model spells it, and its index.
 macro_rules! error_shape {
     (
-        $ty:ident, $shape:literal, $schema:ident, $message:ident
+        $ty:ident, $shape:literal, $schema:ident, $message:ident, $key:expr
         $(, ($extra:ident, $field:ident, $member:literal, $index:literal))*
     ) => {
-        static $message: ::aws_smithy_schema::Schema = error_message_member!($shape);
+        #[derive(Debug, Clone, Default)]
+        pub struct $ty {
+            pub message: ::std::option::Option<::std::string::String>,
+            $(pub $field: ::std::option::Option<::std::string::String>,)*
+        }
+
+        static $message: ::aws_smithy_schema::Schema = error_message_member!($shape, $key);
         $(
             static $extra: ::aws_smithy_schema::Schema =
                 error_string_member!($shape, $member, $index);
@@ -148,20 +175,12 @@ macro_rules! error_shape {
     };
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct AccessDeniedException {
-    pub message: Option<String>,
-    pub error_code: Option<String>,
-    pub error_code_reason: Option<String>,
-    pub sub_error_code: Option<String>,
-    pub sub_error_code_reason: Option<String>,
-}
-
 error_shape!(
     AccessDeniedException,
     "AccessDeniedException",
     SCHEMA_ACCESS_DENIED_EXCEPTION,
     ACCESS_DENIED_EXCEPTION_M_MESSAGE,
+    GRAPH_ERROR_MESSAGE_WIRE_KEY,
     (
         ACCESS_DENIED_EXCEPTION_M_ERROR_CODE,
         error_code,
@@ -188,54 +207,36 @@ error_shape!(
     )
 );
 
-#[derive(Debug, Clone, Default)]
-pub struct ConflictException {
-    pub message: Option<String>,
-}
-
 error_shape!(
     ConflictException,
     "ConflictException",
     SCHEMA_CONFLICT_EXCEPTION,
-    CONFLICT_EXCEPTION_M_MESSAGE
+    CONFLICT_EXCEPTION_M_MESSAGE,
+    GRAPH_ERROR_MESSAGE_WIRE_KEY
 );
-
-#[derive(Debug, Clone, Default)]
-pub struct InternalServerException {
-    pub message: Option<String>,
-}
 
 error_shape!(
     InternalServerException,
     "InternalServerException",
     SCHEMA_INTERNAL_SERVER_EXCEPTION,
-    INTERNAL_SERVER_EXCEPTION_M_MESSAGE
+    INTERNAL_SERVER_EXCEPTION_M_MESSAGE,
+    GRAPH_ERROR_MESSAGE_WIRE_KEY
 );
-
-#[derive(Debug, Clone, Default)]
-pub struct ResourceNotFoundException {
-    pub message: Option<String>,
-}
 
 error_shape!(
     ResourceNotFoundException,
     "ResourceNotFoundException",
     SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
-    RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE
+    RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE,
+    GRAPH_ERROR_MESSAGE_WIRE_KEY
 );
-
-#[derive(Debug, Clone, Default)]
-pub struct ValidationException {
-    pub message: Option<String>,
-    pub error_code: Option<String>,
-    pub error_code_reason: Option<String>,
-}
 
 error_shape!(
     ValidationException,
     "ValidationException",
     SCHEMA_VALIDATION_EXCEPTION,
     VALIDATION_EXCEPTION_M_MESSAGE,
+    GRAPH_ERROR_MESSAGE_WIRE_KEY,
     (VALIDATION_EXCEPTION_M_ERROR_CODE, error_code, "ErrorCode", 1),
     (
         VALIDATION_EXCEPTION_M_ERROR_CODE_REASON,
@@ -244,6 +245,97 @@ error_shape!(
         2
     )
 );
+
+/// The error shapes the `/investigations/` surface of this service answers with, keyed on
+/// the wire the way that surface keys them
+/// ([`INVESTIGATIONS_ERROR_MESSAGE_WIRE_KEY`]).
+///
+/// Each shape here is the SAME modelled shape as its namesake in the parent module — one
+/// Smithy shape id, one wire `__type`, the same members, the same status — emitted from
+/// the one [`error_shape`] definition, and differs from it in nothing but the key its
+/// `Message` member travels under. An operation of this surface imports these by name,
+/// which shadows the parent module's glob, so its handler names no key at all.
+///
+/// The set is exactly what an operation of this surface can answer with: the errors those
+/// five operations declare (`ResourceNotFoundException`, `TooManyRequestsException`,
+/// `ValidationException` — `smithy_query(query="digest")`) plus this service's two
+/// service-common ones (`AccessDeniedException`, `InternalServerException`). No operation
+/// of this surface declares `ConflictException` or `ServiceQuotaExceededException`, so
+/// neither is spelled here.
+pub mod investigations_errors {
+    use super::*;
+
+    error_shape!(
+        AccessDeniedException,
+        "AccessDeniedException",
+        SCHEMA_ACCESS_DENIED_EXCEPTION,
+        ACCESS_DENIED_EXCEPTION_M_MESSAGE,
+        INVESTIGATIONS_ERROR_MESSAGE_WIRE_KEY,
+        (
+            ACCESS_DENIED_EXCEPTION_M_ERROR_CODE,
+            error_code,
+            "ErrorCode",
+            1
+        ),
+        (
+            ACCESS_DENIED_EXCEPTION_M_ERROR_CODE_REASON,
+            error_code_reason,
+            "ErrorCodeReason",
+            2
+        ),
+        (
+            ACCESS_DENIED_EXCEPTION_M_SUB_ERROR_CODE,
+            sub_error_code,
+            "SubErrorCode",
+            3
+        ),
+        (
+            ACCESS_DENIED_EXCEPTION_M_SUB_ERROR_CODE_REASON,
+            sub_error_code_reason,
+            "SubErrorCodeReason",
+            4
+        )
+    );
+
+    error_shape!(
+        InternalServerException,
+        "InternalServerException",
+        SCHEMA_INTERNAL_SERVER_EXCEPTION,
+        INTERNAL_SERVER_EXCEPTION_M_MESSAGE,
+        INVESTIGATIONS_ERROR_MESSAGE_WIRE_KEY
+    );
+
+    error_shape!(
+        ResourceNotFoundException,
+        "ResourceNotFoundException",
+        SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+        RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE,
+        INVESTIGATIONS_ERROR_MESSAGE_WIRE_KEY
+    );
+
+    error_shape!(
+        TooManyRequestsException,
+        "TooManyRequestsException",
+        SCHEMA_TOO_MANY_REQUESTS_EXCEPTION,
+        TOO_MANY_REQUESTS_EXCEPTION_M_MESSAGE,
+        INVESTIGATIONS_ERROR_MESSAGE_WIRE_KEY
+    );
+
+    error_shape!(
+        ValidationException,
+        "ValidationException",
+        SCHEMA_VALIDATION_EXCEPTION,
+        VALIDATION_EXCEPTION_M_MESSAGE,
+        INVESTIGATIONS_ERROR_MESSAGE_WIRE_KEY,
+        (VALIDATION_EXCEPTION_M_ERROR_CODE, error_code, "ErrorCode", 1),
+        (
+            VALIDATION_EXCEPTION_M_ERROR_CODE_REASON,
+            error_code_reason,
+            "ErrorCodeReason",
+            2
+        )
+    );
+}
 
 #[smithy_macros::smithy(shape = "com.amazonaws.detective#MembershipDatasources")]
 #[derive(Debug, Clone, Default)]
@@ -270,7 +362,10 @@ pub struct ServiceQuotaExceededException {
 }
 
 static SERVICE_QUOTA_EXCEEDED_EXCEPTION_M_MESSAGE: ::aws_smithy_schema::Schema =
-    error_message_member!("ServiceQuotaExceededException");
+    error_message_member!(
+        "ServiceQuotaExceededException",
+        GRAPH_ERROR_MESSAGE_WIRE_KEY
+    );
 
 /// `Resources`, whose target is a list of strings ("The type of resource that has
 /// exceeded the service quota").
@@ -763,16 +858,12 @@ impl ::aws_smithy_schema_server::DeserializableStruct for TimestampForCollection
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct TooManyRequestsException {
-    pub message: Option<String>,
-}
-
 error_shape!(
     TooManyRequestsException,
     "TooManyRequestsException",
     SCHEMA_TOO_MANY_REQUESTS_EXCEPTION,
-    TOO_MANY_REQUESTS_EXCEPTION_M_MESSAGE
+    TOO_MANY_REQUESTS_EXCEPTION_M_MESSAGE,
+    GRAPH_ERROR_MESSAGE_WIRE_KEY
 );
 
 /// The values `DatasourcePackage` accepts on the wire.

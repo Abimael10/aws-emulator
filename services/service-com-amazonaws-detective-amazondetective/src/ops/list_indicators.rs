@@ -100,6 +100,18 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// This operation is bound under `/investigations/`, and that surface of this service keys
+// an error body's explanatory text under the member name the model spells, while the
+// behavior-graph surface the glob above serves keys the same member lowercase. Naming the
+// shapes explicitly shadows that glob, so every refusal this operation answers carries its
+// text under its own surface's key. See `super::types::shared_types::investigations_errors`.
+use super::types::investigations_errors::{
+    AccessDeniedException, InternalServerException, ResourceNotFoundException,
+    TooManyRequestsException, ValidationException, SCHEMA_ACCESS_DENIED_EXCEPTION,
+    SCHEMA_INTERNAL_SERVER_EXCEPTION, SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+    SCHEMA_TOO_MANY_REQUESTS_EXCEPTION, SCHEMA_VALIDATION_EXCEPTION,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
