@@ -90,8 +90,6 @@
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
-// and for every service crate's `tests/all.rs`, so check there rather than leaving a note
-// here.
 // The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
 // asks of a doc list item; the lint is allowed here so a header line is a header line rather
 // than a build failure. An inner attribute, like an inner doc comment, is legal only before
@@ -1349,15 +1347,6 @@ mod zz_opensearch_fgac_probe;
 mod zz_probe;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
-// note about THIS file belongs in `all/appended_notes.rs`. The suites
-// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
-// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
-// `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
-// The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
-// asks of a doc list item; the lint is allowed here so a header line is a header line rather
-// than a build failure. An inner attribute, like an inner doc comment, is legal only before
-// the first item, so it stands here rather than in the list below.
 // Single integration-test target for the router: a DECLARATION LIST, and nothing else.
 // per suite file under `tests/all/`, sorted by name, and no other line — no prose between
 // the pairs, no blank line, and nothing after the last pair. Put a new suite at

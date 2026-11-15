@@ -39,9 +39,11 @@
 //! rules say nothing about.
 //!
 //! This suite OWNS the deployment-listing harness (the router, the deployment calls and
-//! the body readers); the sibling suite
-//! `tests/all/deployment_listing_is_a_pure_report.rs` drives the same front door through
-//! it, so a `ListDeployments` request is built and read exactly one way across this crate.
+//! the body readers); the sibling suites
+//! `tests/all/deployment_listing_is_a_pure_report.rs` and
+//! `tests/all/required_request_members.rs` drive the same front door through it, so a
+//! `ListDeployments` request — and a tagging one — is built and read exactly one way across
+//! this crate.
 
 use std::sync::Arc;
 
@@ -128,7 +130,7 @@ async fn call(
 }
 
 /// The status and body alone, for a call whose framing is not what the row is about.
-async fn send(router: &MultiServiceRouter, method: &str, path: &str, body: Vec<u8>) -> (u16, Value) {
+pub async fn send(router: &MultiServiceRouter, method: &str, path: &str, body: Vec<u8>) -> (u16, Value) {
     let (status, _, value) = call(router, method, path, body).await;
     (status, value)
 }
@@ -172,7 +174,7 @@ fn version_arn(name: &str, version: &str) -> String {
 }
 
 /// The deployment ARN of `deployment_id`.
-fn deployment_arn(deployment_id: &str) -> String {
+pub fn deployment_arn(deployment_id: &str) -> String {
     format!("arn:aws:greengrass:{REGION}:{ACCOUNT}:deployments:{deployment_id}")
 }
 
@@ -267,7 +269,7 @@ fn recipe(name: &str, version: &str) -> String {
 }
 
 /// Publish `name`@`version` and answer its component-version ARN.
-async fn create_component(router: &MultiServiceRouter, name: &str, version: &str) -> String {
+pub async fn create_component(router: &MultiServiceRouter, name: &str, version: &str) -> String {
     let (status, body) = post(
         router,
         "/greengrass/v2/createComponentVersion",
@@ -282,7 +284,7 @@ async fn create_component(router: &MultiServiceRouter, name: &str, version: &str
 }
 
 /// A tag map as a JSON object.
-fn tag_object(tags: &[(&str, &str)]) -> Value {
+pub fn tag_object(tags: &[(&str, &str)]) -> Value {
     let mut map = Map::new();
     for (key, value) in tags {
         map.insert((*key).to_string(), Value::String((*value).to_string()));
@@ -291,7 +293,7 @@ fn tag_object(tags: &[(&str, &str)]) -> Value {
 }
 
 /// `TagResource` on `arn`, with the framing of its answer.
-async fn tag(
+pub async fn tag(
     router: &MultiServiceRouter,
     arn: &str,
     tags: &[(&str, &str)],
@@ -323,7 +325,7 @@ async fn untag(
 }
 
 /// `ListTagsForResource` on `arn`: the reader a removal has to be visible in.
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+pub async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
     get(router, &format!("/tags/{}", encoded_label(arn))).await
 }
 

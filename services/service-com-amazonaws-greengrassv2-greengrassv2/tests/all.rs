@@ -43,6 +43,8 @@ mod deployment_listing_is_a_pure_report;
 mod identity_authorization;
 #[path = "all/not_found_refusal_class_per_route.rs"]
 mod not_found_refusal_class_per_route;
+#[path = "all/required_request_members.rs"]
+mod required_request_members;
 #[path = "all/resource_tag_writes.rs"]
 mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]

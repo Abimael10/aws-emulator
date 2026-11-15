@@ -48,13 +48,21 @@
 //! [`service_common::no_content_responses::without_content`], which owns that framing for
 //! every service that needs it — and it is applied at the one place every response of this
 //! service passes through rather than per operation.
+//!
+//! `override_operation` is taken too, for the requests the model's routing key cannot name:
+//! the framework's route lookup withholds a route whose `@required` header or query bindings
+//! the request does not carry, and a request that leaves such a member out addresses an
+//! operation this service HAS. See [`EmulatedService::addressed_operation`], and
+//! [`untag_without_keys`] for the one of those requests that is SERVED rather than refused.
+
+mod untag_without_keys;
 
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
 use service_common::no_content_responses::without_content;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Operation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -65,6 +73,36 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The route each modelled operation binds, read off that operation's own input schema:
+    /// what [`EmulatedService::addressed_operation`] resolves a request the framework's own
+    /// route lookup named NO operation for.
+    modelled_routes: Vec<ModelledRoute>,
+    /// `UntagResource` as the one route of this service whose `@required` query parameter
+    /// carries a LIST, and so travels as nothing at all when the client's list is empty:
+    /// [`untag_without_keys`] says why that request is served rather than refused.
+    untag_without_keys: untag_without_keys::UntagWithoutKeys<Eng>,
+}
+
+/// One modelled operation and the `@http` route its input schema binds.
+///
+/// Neither the method nor the URI pattern is written here: both are the schema's own and are
+/// read through it, so this table cannot disagree with the model.
+struct ModelledRoute {
+    /// The operation's modelled name — the routing key the generated table files it under.
+    operation: &'static str,
+    /// Its input schema, which carries the `@http` method and URI pattern.
+    input_schema: &'static Schema,
+}
+
+/// Record one [`ModelledRoute`] per `crate::ops::<module>::<Operation>` named, taking each
+/// one's name and route from its own `impl Operation` rather than spelling either here.
+macro_rules! modelled_routes {
+    ($($module:ident :: $operation:ident),+ $(,)?) => {
+        vec![$(ModelledRoute {
+            operation: <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+            input_schema: <crate::ops::$module::$operation<Eng> as Operation>::INPUT_SCHEMA,
+        }),+]
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -73,8 +111,81 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            untag_without_keys: untag_without_keys::UntagWithoutKeys::new(Arc::clone(&engine)),
             entry: crate::ServiceDefinition::new(engine),
+            // EVERY operation this model binds a route for, so the rule below is stated
+            // once over the whole surface rather than for the one operation that needs it
+            // today: an operation whose input declares no `@required` header or query
+            // member simply never has its route withheld, and the framework's own lookup
+            // resolves it before this table is consulted.
+            // `every_modelled_operation_is_listed_as_a_route` pins the list against the
+            // model.
+            modelled_routes: modelled_routes!(
+                associate_service_role_to_account::AssociateServiceRoleToAccount,
+                batch_associate_client_device_with_core_device::BatchAssociateClientDeviceWithCoreDevice,
+                batch_disassociate_client_device_from_core_device::BatchDisassociateClientDeviceFromCoreDevice,
+                cancel_deployment::CancelDeployment,
+                create_component_version::CreateComponentVersion,
+                create_deployment::CreateDeployment,
+                delete_component::DeleteComponent,
+                delete_core_device::DeleteCoreDevice,
+                delete_deployment::DeleteDeployment,
+                describe_component::DescribeComponent,
+                disassociate_service_role_from_account::DisassociateServiceRoleFromAccount,
+                get_component::GetComponent,
+                get_component_version_artifact::GetComponentVersionArtifact,
+                get_connectivity_info::GetConnectivityInfo,
+                get_core_device::GetCoreDevice,
+                get_deployment::GetDeployment,
+                get_service_role_for_account::GetServiceRoleForAccount,
+                list_client_devices_associated_with_core_device::ListClientDevicesAssociatedWithCoreDevice,
+                list_component_versions::ListComponentVersions,
+                list_components::ListComponents,
+                list_core_devices::ListCoreDevices,
+                list_deployments::ListDeployments,
+                list_effective_deployments::ListEffectiveDeployments,
+                list_installed_components::ListInstalledComponents,
+                list_tags_for_resource::ListTagsForResource,
+                resolve_component_candidates::ResolveComponentCandidates,
+                tag_resource::TagResource,
+                untag_resource::UntagResource,
+                update_connectivity_info::UpdateConnectivityInfo,
+            ),
         }
+    }
+
+    /// The operation whose modelled route `req` addresses, for a request the framework's own
+    /// route lookup named NO operation for.
+    ///
+    /// WHY a second lookup: that lookup REJECTS a route whose `@required` header or query
+    /// bindings the request does not carry, which is how a model that binds several
+    /// operations to one method and URI template tells them apart by the shape of the
+    /// request. This model binds each of its routes to exactly ONE operation
+    /// (`smithy_query(query="digest")`), so for this service the rejection turns an
+    /// INCOMPLETE request into a request for an operation that does not exist — a 501 for a
+    /// route the service serves. The operation the request addressed is resolved here
+    /// instead, and answers the request itself: it refuses the member the request left out
+    /// through that member's own modelled constraints, or — where the absence IS the value,
+    /// as it is for a repeated query parameter carrying an empty list — serves it
+    /// ([`untag_without_keys`]).
+    ///
+    /// Each candidate's method and URI pattern are the ones its own input schema carries,
+    /// matched by `service_common::addresses_modeled_http_route`; a request TWO of them could
+    /// claim resolves to neither, leaving the framework's own answer in place, since choosing
+    /// between them is what the bindings the request omitted are for. An operation whose
+    /// input declares no member at all carries no `@http` binding on its input schema and so
+    /// is never resolved here — nor does it need to be, since it has no `@required` binding
+    /// for a request to leave out.
+    fn addressed_operation(
+        &self,
+        req: &aws_smithy_runtime_api::http::Request,
+    ) -> Option<&'static str> {
+        let mut matching = self
+            .modelled_routes
+            .iter()
+            .filter(|route| service_common::addresses_modeled_http_route(req, route.input_schema));
+        let addressed = matching.next()?;
+        matching.next().is_none().then_some(addressed.operation)
     }
 }
 
@@ -206,12 +317,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: a request the protocol resolves a routing key for is left to the
+        // generated routing table, which is what `None` here means.
+        //
+        // A request the protocol names NO key for is given one more chance, on the route its
+        // method and URI address ([`Self::addressed_operation`]): a `@required` header or
+        // query member a request leaves out is a request for an operation this service HAS,
+        // not one it does not have. The operation served is the one the generated table
+        // holds for that name — so it reads and writes the one store and answers in the one
+        // envelope — and it refuses the member the request left out through that member's
+        // own modelled constraints.
+        //
+        // `UntagResource` is the one exception, because `tagKeys` is the one `@required`
+        // query member of this model that carries a LIST, and a list of no entries is sent
+        // as no parameter at all: that request named every key it meant to and is served.
+        // See [`untag_without_keys`].
+        if self.entry.protocol().routing_key(req).is_ok() {
+            return None;
+        }
+        let addressed = self.addressed_operation(req)?;
+        if addressed == untag_without_keys::OPERATION {
+            return Some(&self.untag_without_keys);
+        }
+        self.entry.routing_table().get(addressed)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -262,5 +390,113 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The half of the rule above that needs no request: that the route table this file
+    //! holds spans the model's whole surface, so the fallback lookup can resolve any
+    //! operation whose route the framework withholds — not only the one that needs it today.
+
+    use super::*;
+
+    /// This service's Smithy model, as it ships beside this crate. Read at test time rather
+    /// than embedded: it is JSON that no non-test build needs.
+    const MODEL_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-greengrassv2-greengrassv2.json"
+    );
+
+    /// How many operations this model declares, as a second, independent statement of this
+    /// service's surface: a model that grows or shrinks fails here rather than quietly
+    /// leaving the new operation out of the table.
+    const MODELLED_OPERATIONS: usize = 29;
+
+    /// RULE applied to the whole surface: every operation the model declares is listed as a
+    /// [`ModelledRoute`], under the same key the generated routing table is keyed by — and
+    /// every operation whose route that lookup can WITHHOLD (one declaring a `@required`
+    /// member bound to the query string or to a header) has the `@http` method and URI on its
+    /// input schema that [`EmulatedService::addressed_operation`] matches a request against.
+    ///
+    /// The names come from the MODEL rather than from a second hand-written list, so an
+    /// operation added to the model and not to `modelled_routes!` fails here instead of
+    /// silently answering `501` for an incomplete request.
+    #[test]
+    fn every_modelled_operation_is_listed_as_a_route() {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let shapes = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes");
+        let operations: Vec<(&str, &serde_json::Value)> = shapes
+            .iter()
+            .filter(|(_, shape)| shape["type"] == "operation")
+            .filter_map(|(id, shape)| Some((id.rsplit('#').next()?, shape)))
+            .collect();
+        assert_eq!(
+            operations.len(),
+            MODELLED_OPERATIONS,
+            "case \"the model's surface\": expected this service's {MODELLED_OPERATIONS} \
+             operations, got {}",
+            operations.len()
+        );
+
+        /// Whether `operation`'s input declares a `@required` member bound to the query
+        /// string or to a header — the members whose absence makes the framework's route
+        /// lookup withhold this operation's route.
+        fn binds_a_required_parameter(
+            shapes: &serde_json::Map<String, serde_json::Value>,
+            operation: &serde_json::Value,
+        ) -> bool {
+            let input = operation["input"]["target"].as_str().unwrap_or_default();
+            let Some(members) = shapes
+                .get(input)
+                .and_then(|shape| shape["members"].as_object())
+            else {
+                return false;
+            };
+            members.values().any(|member| {
+                let traits = &member["traits"];
+                traits.get("smithy.api#required").is_some()
+                    && (traits.get("smithy.api#httpQuery").is_some()
+                        || traits.get("smithy.api#httpHeader").is_some())
+            })
+        }
+
+        let service = EmulatedService::new(Arc::new(engine::InMemoryEngine::new()));
+        assert_eq!(
+            service.modelled_routes.len(),
+            MODELLED_OPERATIONS,
+            "case \"the route table's size\": expected one route per modelled operation, got {}",
+            service.modelled_routes.len()
+        );
+        for (operation, shape) in operations {
+            let route = service
+                .modelled_routes
+                .iter()
+                .find(|route| route.operation == operation);
+            assert!(
+                route.is_some(),
+                "case {operation:?}: every modelled operation is listed in modelled_routes!; \
+                 this one is missing, so an incomplete request for it is answered as a route \
+                 this service does not have"
+            );
+            if binds_a_required_parameter(shapes, shape) {
+                assert!(
+                    route.is_some_and(|route| route.input_schema.http().is_some()),
+                    "case {operation:?}: its route can be withheld for a parameter the request \
+                     left out, so its input schema must carry the `@http` method and URI the \
+                     fallback lookup matches on, and this one carries none"
+                );
+            }
+            assert!(
+                service.entry.routing_table().get(operation).is_some(),
+                "case {operation:?}: the generated table keys an operation by its shape name; \
+                 this one resolved to nothing, so the table's key spelling is wrong"
+            );
+        }
     }
 }

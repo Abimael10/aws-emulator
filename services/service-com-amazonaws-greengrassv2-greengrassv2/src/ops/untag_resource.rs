@@ -241,7 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Removing a key the resource does not carry is not a failure: the request asks
         // for a tag set the resource already has, so the removal is idempotent and a
-        // repeated call changes nothing.
+        // repeated call changes nothing. Naming NO key is the same statement about the
+        // empty set, and reaches this handler with an empty `tag_keys`: `tagKeys` travels
+        // as a repeated query parameter, so a client's empty list is no parameter at all
+        // (`crate::service::untag_without_keys`).
         let mut removed = 0_usize;
         for key in &input.tag_keys {
             if stored.remove(key).is_some() {
