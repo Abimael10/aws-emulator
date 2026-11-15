@@ -37,7 +37,6 @@
 //! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 //! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the first two for
 //! this file and for every service crate's `tests/all.rs`.
-// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
 // declaration into `tests/all/`.
 #[path = "all/agent_registry_signing_name_routing.rs"]
@@ -1332,7 +1331,6 @@ mod lambda_in_function_assumed_role_session;
 // Single integration-test target for the router: below this header the file holds one
 // `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no
 // other line.
-//
 // Add a suite by putting it at `tests/all/<name>.rs` and inserting its pair into the
 // sorted list — nothing beside it. What a suite covers, and why it lives in this target
 // rather than in a service crate's own, belongs in that suite's own module header, where
@@ -1346,3 +1344,18 @@ mod lambda_in_function_assumed_role_session;
 // can leave a doc comment past the first item.
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling
 // of this file, which the layout check refuses: the `#[path]` is what points each
+//! This file is a canonical DECLARATION LIST: a header, then one
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
+//! line. Put a new suite at `tests/all/<name>.rs` and insert its pair in order; what a
+//! suite covers, and why it belongs to this cross-service target, stands in that suite's own
+//! module header, and a note about THIS file belongs in `all/appended_notes.rs`, declared
+//! below like any other module and holding comments alone.
+//! left at the top level of `tests/` fails the build. Declare each suite exactly ONCE: this
+//! is one crate root, so a second `mod` for the same name is `E0428`, and an inner doc
+//! comment (`//!`) is legal only BEFORE the first item, so THESE lines are the only place
+//! one may stand — `//!` past the first declaration below is `E0753`. Either one fails every
+//! suite in this target.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those rules.
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
+//! (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points each
+//! declaration into `tests/all/`.

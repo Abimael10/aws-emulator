@@ -516,10 +516,12 @@ async fn get_domain_reports_what_create_domain_persisted() {
 }
 
 /// `SearchProfiles` finds a profile under every predefined key the profile's own
-/// attributes populate, and returns an empty page for a key or value nothing is indexed
-/// under. The key list is the one `SearchProfiles$KeyName` documents; the rows cover the
-/// five a profile's attributes can populate, a predefined key only an ingested profile
-/// OBJECT can populate (`_orderId`), and a key the service does not define at all.
+/// attributes populate, and returns an empty page for a value nothing is indexed under.
+/// The key list is the one `SearchProfiles$KeyName` documents; the rows cover the five a
+/// profile's attributes can populate and a predefined key only an ingested profile OBJECT
+/// can populate (`_orderId`), which the service defines in every domain and so answers an
+/// empty page for. A key the service does not define at all is a REFUSAL rather than an
+/// empty page, which `search_key_resolution.rs` pins.
 #[tokio::test]
 async fn search_profiles_resolves_every_standard_key_from_the_index() {
     let emulator = Emulator::new();
@@ -569,7 +571,6 @@ async fn search_profiles_resolves_every_standard_key_from_the_index() {
         ("_phone", "+15559999999".to_string(), false),
         ("_fullName", "Grace Hopper".to_string(), false),
         ("_orderId", "order-1".to_string(), false),
-        ("_notAServiceKey", "anything".to_string(), false),
     ];
 
     for (key_name, value, expect_match) in cases {

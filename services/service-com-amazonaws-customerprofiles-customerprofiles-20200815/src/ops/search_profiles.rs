@@ -228,6 +228,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
+            // A search key names a key DEFINED in the domain — one the service predefines,
+            // one the domain's own object types declare, or one associated with a profile
+            // of the domain — so a name that is not one of those (a profile FIELD name, for
+            // instance) is a resource the domain does not hold, not a key nothing is
+            // indexed under: it is refused before anything is looked up, and an undefined
+            // key is therefore never answered as an empty page. The rule holds for the
+            // required `KeyName` and for every `AdditionalSearchKeys` entry alike.
+            if let Some((key_name, _)) = search_keys
+                .iter()
+                .find(|(key_name, _)| !domain.defines_search_key(key_name))
+            {
+                return Err(SearchProfilesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("KeyName {key_name} is not defined in the domain")),
+                    },
+                )
+                .into());
+            }
+
             // A key matches a profile when the profile is indexed under that key for
             // ANY of the key's values. `AND` keeps the profiles every key matches, `OR`
             // those at least one matches; "The OR relationship is the default behavior
@@ -318,9 +337,12 @@ fn unavailable() -> SearchProfilesError {
 /// A profile is reachable through exactly the pairs its domain has it indexed under
 /// (`own_keys`, from `Domain::profile_index_keys`): the standard keys its own attributes
 /// populate, plus every key value `AddProfileKey` associated with it. The keys that found
-/// it are therefore the requested pairs that appear in that set. Computed once per profile
-/// ON THE PAGE, and the page is bounded by `MaxResults` while the requested pairs are
-/// bounded by the model's own `AdditionalSearchKeys` maximum and [`VALUES_PER_SEARCH_KEY`].
+/// it are therefore the requested pairs that appear in that set, compared — and REPORTED —
+/// in the key's canonical form (`crate::state::indexed_key_value`), which is the form the
+/// domain stores: `FoundByItems` names the value the profile is indexed under, not the one
+/// the request happened to be written with. Computed once per profile ON THE PAGE, and the
+/// page is bounded by `MaxResults` while the requested pairs are bounded by the model's own
+/// `AdditionalSearchKeys` maximum and [`VALUES_PER_SEARCH_KEY`].
 fn found_by_items(
     search_keys: &[(String, Vec<String>)],
     own_keys: &[(String, String)],
@@ -334,8 +356,8 @@ fn found_by_items(
         .filter_map(|(key_name, values)| {
             let matched: Vec<String> = values
                 .iter()
-                .filter(|value| own.contains(&(key_name.as_str(), value.as_str())))
-                .cloned()
+                .map(|value| crate::state::indexed_key_value(key_name, value))
+                .filter(|stored| own.contains(&(key_name.as_str(), stored.as_str())))
                 .collect();
             (!matched.is_empty()).then(|| FoundByKeyValue {
                 key_name: Some(key_name.clone()),

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or replaces the tags of the Customer Profiles resource an ARN names, so every
+//! later read of that resource's tags answers from what this operation wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +141,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        // `resourceArn` is checked here rather than at the boundary (see `skip_validation`
+        // on `TagResourceInput`); `tags`' own modelled bound was applied there.
+        if let Some(message) = crate::state::resource_arn_violation(&input.resource_arn) {
+            return Err(bad_request(message));
+        }
+        // A tag key is the one half of a tag map the boundary's constraint walk does not
+        // validate, so the model's own bounds on it are applied here.
+        if let Some(message) = crate::state::first_tag_key_violation("tags", Some(&input.tags)) {
+            return Err(bad_request(message));
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let mut store = state.lock();
+        let Some(held) = crate::state::resource_tags_mut(&mut store, &input.resource_arn) else {
+            return Err(not_found());
+        };
+
+        // "If you specify a new tag key, this tag is appended to the list of tags
+        // associated with the resource. If you specify a tag key that is already
+        // associated with the resource, the new tag value that you specify replaces the
+        // previous value for that tag" — so the request's entries are merged into the
+        // stored map rather than replacing it.
+        let mut tags = held.clone().unwrap_or_default();
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+        // "You can associate as many as 50 tags with a resource": one request carries at
+        // most that many (`TagMap`'s modelled maximum, applied at the boundary), and a
+        // request that would leave the resource carrying more is refused with nothing
+        // written, so repeated calls cannot grow one resource past the limit. The BOUND is
+        // the model's; the SENTENCE is this emulator's own, worded like the other store-cap
+        // refusals of this crate (`AddProfileKey`, `CreateProfile`) because no recording of
+        // this service's tag-limit refusal states its wording — a recording of one is what
+        // would correct it.
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(bad_request(format!(
+                "The maximum number of tags for resource {} has been reached: {}",
+                input.resource_arn,
+                crate::state::MAX_TAGS_PER_RESOURCE
+            )));
+        }
+        *held = Some(tags);
+
+        // The modelled output carries no members.
+        Ok(TagResourceOutput {})
     }
+}
+
+/// The request is invalid — HTTP 400, the error code a client branches on.
+fn bad_request(message: String) -> TagResourceError {
+    TagResourceErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The ARN names no resource this emulator holds. The tagging surface reports that in its
+/// own shape and words, which the model does not list for this operation
+/// (`crate::scaffolded`).
+fn not_found() -> TagResourceError {
+    crate::scaffolded::Scaffolded::not_found(crate::state::TAGGED_RESOURCE_NOT_FOUND)
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> TagResourceError {
+    TagResourceErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }

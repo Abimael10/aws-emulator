@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-customerprofiles-customerprofiles-20200815.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.customerprofiles#TagResourceRequest")]
+// `skip_validation` names `resourceArn`, whose published `@pattern`
+// (`^arn:[a-z0-9]{1,10}:profile$`) closes with a whole-value anchor right after the
+// service segment, so it admits no ARN that continues into a region, an account and a
+// resource — which is every ARN of a resource this service holds. Enforced as published it
+// refuses the whole tagging surface. `crate::state::resource_arn_violation` is what checks
+// the member instead: the modelled `@length` plus the expression this model publishes for
+// one of its ARNs (`Arn`). `tags` keeps its modelled bound at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.customerprofiles#TagResourceRequest",
+    skip_validation = ["resourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct TagResourceInput {
     pub resource_arn: String,

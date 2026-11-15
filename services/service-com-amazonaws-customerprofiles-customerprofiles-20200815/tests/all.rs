@@ -19,12 +19,16 @@ mod batch_put_profile_object;
 mod calculated_attribute_definitions;
 #[path = "all/calculated_attribute_readiness.rs"]
 mod calculated_attribute_readiness;
+#[path = "all/create_domain_duplicate_name.rs"]
+mod create_domain_duplicate_name;
 #[path = "all/delete_calculated_attribute_definition.rs"]
 mod delete_calculated_attribute_definition;
 #[path = "all/delete_profile_object_type.rs"]
 mod delete_profile_object_type;
 #[path = "all/domain_profile_lifecycle.rs"]
 mod domain_profile_lifecycle;
+#[path = "all/domain_stats.rs"]
+mod domain_stats;
 #[path = "all/merge_profiles.rs"]
 mod merge_profiles;
 #[path = "all/modelled_refusal_envelope.rs"]
@@ -45,6 +49,10 @@ mod profile_objects;
 mod profile_string_alternatives;
 #[path = "all/recommender_schemas.rs"]
 mod recommender_schemas;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
+#[path = "all/search_key_resolution.rs"]
+mod search_key_resolution;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_domain.rs"]

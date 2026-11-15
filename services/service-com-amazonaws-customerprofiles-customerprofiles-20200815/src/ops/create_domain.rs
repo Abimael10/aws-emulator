@@ -216,12 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.domains.contains_key(&input.domain_name) {
             // The domain name is the domain's identity, so a second create of the same
             // name is not a create. `BadRequestException` ("The input you provided is
-            // invalid") is the only client error this operation models for it.
+            // invalid") is the only client error this operation models for it, and the
+            // sentence it carries is the service's own: the fixed text `Domain ` /
+            // ` already exists`, whose one variable part is the `DomainName` the request
+            // carried, and nothing further.
             return Err(CreateDomainErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "Domain {} already exists; use UpdateDomain to change it",
-                    input.domain_name
-                )),
+                message: Some(format!("Domain {} already exists", input.domain_name)),
             })
             .into());
         }

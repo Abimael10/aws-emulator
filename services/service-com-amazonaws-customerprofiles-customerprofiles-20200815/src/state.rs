@@ -18,9 +18,18 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Address, AttributeDetails, Conditions, CreateCalculatedAttributeDefinitionInput,
-    DataStoreResponse, Filter, MatchingRequest, MatchingResponse, ObjectTypeField, ObjectTypeKey,
-    Profile, Readiness, RecommenderSchemaField, ResultsSummary, RuleBasedMatchingRequest,
-    RuleBasedMatchingResponse,
+    DataStoreResponse, DomainStats, Filter, MatchingRequest, MatchingResponse, ObjectTypeField,
+    ObjectTypeKey, Profile, Readiness, RecommenderSchemaField, ResultsSummary,
+    RuleBasedMatchingRequest, RuleBasedMatchingResponse,
+};
+
+/// The resources the tagging operations address by ARN, and the `resourceArn` check the
+/// published `@pattern` for that member cannot make.
+pub mod tagged_resources;
+
+pub use tagged_resources::{
+    reported_resource_tags, resource_arn_violation, resource_tags_mut, MAX_TAGS_PER_RESOURCE,
+    TAGGED_RESOURCE_NOT_FOUND,
 };
 
 /// How long after the call that configures it the asynchronous work a domain kicks off
@@ -213,6 +222,77 @@ pub const KEY_EMAIL: &str = "_email";
 pub const KEY_PHONE: &str = "_phone";
 /// Predefined `SearchProfiles` key naming a profile by its full name.
 pub const KEY_FULL_NAME: &str = "_fullName";
+
+/// Every predefined search key the service defines, as `SearchProfiles$KeyName` lists
+/// them: "The predefined keys you can use to search include: _account, _profileId,
+/// _assetId, _caseId, _orderId, _fullName, _phone, _email, _ctrContactId, _marketoLeadId,
+/// _salesforceAccountId, _salesforceContactId, _salesforceAssetId, _zendeskUserId,
+/// _zendeskExternalId, _zendeskTicketId, _serviceNowSystemId, _serviceNowIncidentId,
+/// _segmentUserId, _shopifyCustomerId, _shopifyOrderId."
+///
+/// A key of this list is defined in EVERY domain, whether or not anything is indexed under
+/// it yet; see [`Domain::defines_search_key`].
+pub const PREDEFINED_SEARCH_KEYS: [&str; 21] = [
+    KEY_ACCOUNT,
+    KEY_PROFILE_ID,
+    "_assetId",
+    "_caseId",
+    "_orderId",
+    KEY_FULL_NAME,
+    KEY_PHONE,
+    KEY_EMAIL,
+    "_ctrContactId",
+    "_marketoLeadId",
+    "_salesforceAccountId",
+    "_salesforceContactId",
+    "_salesforceAssetId",
+    "_zendeskUserId",
+    "_zendeskExternalId",
+    "_zendeskTicketId",
+    "_serviceNowSystemId",
+    "_serviceNowIncidentId",
+    "_segmentUserId",
+    "_shopifyCustomerId",
+    "_shopifyOrderId",
+];
+
+/// How many objects one profile may carry per profile it is METERED as.
+/// `DomainStats$MeteringProfileCount` documents it: "The number of profiles that you are
+/// currently paying for in the domain. If you have more than 100 objects associated with a
+/// single profile, that profile counts as two profiles. If you have more than 200 objects,
+/// that profile counts as three, and so on." The threshold is MORE THAN this many, so a
+/// profile carrying exactly this many objects is still metered as one.
+pub const OBJECTS_PER_METERED_PROFILE: usize = 100;
+
+/// One value as the index holds it under `key_name`: the CANONICAL form of that key's
+/// values.
+///
+/// A predefined key that names a class of value folds the differences callers write that
+/// class in, so a search finds a profile whichever form it was written in: `_fullName` is
+/// compared without regard to case, and `_phone` without the punctuation a number is
+/// grouped with (`+1 555-0100` and `15550100` are one number). Every other key — a
+/// predefined identifier such as `_account` or `_profileId`, and a key an object type
+/// declares — is an opaque identifier and is indexed exactly as written, so it matches only
+/// that value.
+///
+/// Applied wherever a value enters the index and wherever one probes it, so the stored form
+/// is what a search matches and what `FoundByItems` reports. A fold that would leave nothing
+/// to index by keeps the value as written: a value is indexed under itself rather than under
+/// the empty string.
+pub fn indexed_key_value(key_name: &str, value: &str) -> String {
+    match key_name {
+        KEY_FULL_NAME => value.to_lowercase(),
+        KEY_PHONE => {
+            let digits: String = value.chars().filter(char::is_ascii_digit).collect();
+            if digits.is_empty() {
+                value.to_string()
+            } else {
+                digits
+            }
+        }
+        _ => value.to_string(),
+    }
+}
 
 /// Per-service state for com-amazonaws-customerprofiles-customerprofiles-20200815. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -843,8 +923,10 @@ impl Domain {
     /// pair so a search finds the profile through it.
     ///
     /// A value the profile already carries under that key associates nothing further: the
-    /// key holds a SET of values. Applied in place, value by value, so one caller's
-    /// association never replaces another's.
+    /// key holds a SET of values, compared in the key's canonical form
+    /// ([`indexed_key_value`]), which is the form the pair is stored and indexed in.
+    /// Applied in place, value by value, so one caller's association never replaces
+    /// another's.
     ///
     /// Nothing is written when the profile would be left carrying more than
     /// [`MAX_KEY_VALUES_PER_PROFILE`] key values; the number it would then carry comes
@@ -855,13 +937,17 @@ impl Domain {
         key_name: &str,
         values: &[String],
     ) -> Result<(), usize> {
+        let canonical: Vec<String> = values
+            .iter()
+            .map(|value| indexed_key_value(key_name, value))
+            .collect();
         {
             let held = self.profile_keys.get(profile_id);
             let held_count: usize = held
                 .map(|keys| keys.values().map(BTreeSet::len).sum())
                 .unwrap_or_default();
             let under_key = held.and_then(|keys| keys.get(key_name));
-            let fresh: BTreeSet<&str> = values
+            let fresh: BTreeSet<&str> = canonical
                 .iter()
                 .map(String::as_str)
                 .filter(|value| !under_key.is_some_and(|held| held.contains(*value)))
@@ -871,14 +957,14 @@ impl Domain {
                 return Err(resulting);
             }
         }
-        for value in values {
+        for value in canonical {
             self.profile_keys
                 .entry(profile_id.to_string())
                 .or_default()
                 .entry(key_name.to_string())
                 .or_default()
                 .insert(value.clone());
-            self.index_key(profile_id, key_name.to_string(), value.clone());
+            self.index_key(profile_id, key_name.to_string(), value);
         }
         Ok(())
     }
@@ -910,16 +996,96 @@ impl Domain {
     /// The ids of the profiles indexed under `key_name` for ANY of `values` — the
     /// "key-value(s) pair" one `SearchProfiles` search key describes. Ascending by id,
     /// so a page boundary is reproducible.
+    ///
+    /// Each value probes the index in the key's canonical form
+    /// ([`indexed_key_value`]), which is the form the index holds, so a caller finds a
+    /// profile whichever form of the value it searched by.
     pub fn lookup(&self, key_name: &str, values: &[String]) -> BTreeSet<String> {
         let Some(by_value) = self.key_index.get(key_name) else {
             return BTreeSet::new();
         };
         values
             .iter()
-            .filter_map(|value| by_value.get(value.as_str()))
+            .filter_map(|value| by_value.get(&indexed_key_value(key_name, value)))
             .flatten()
             .cloned()
             .collect()
+    }
+
+    /// Whether `key_name` is a search key DEFINED in this domain — the keys
+    /// `SearchProfiles` resolves a request against.
+    ///
+    /// A key is defined when the SERVICE defines it ([`PREDEFINED_SEARCH_KEYS`], defined in
+    /// every domain), when one of the domain's own object types declares it (the key names
+    /// of a type's `Keys` map, "a list of unique keys that can be used to map data to the
+    /// profile"), or when the domain has it associated with one of its profiles
+    /// (`AddProfileKey`, "a searchable identifier of a customer profile"). A profile FIELD
+    /// name is none of those.
+    pub fn defines_search_key(&self, key_name: &str) -> bool {
+        PREDEFINED_SEARCH_KEYS.contains(&key_name)
+            || self.object_types.values().any(|object_type| {
+                object_type
+                    .keys
+                    .as_ref()
+                    .is_some_and(|keys| keys.contains_key(key_name))
+            })
+            || self
+                .profile_keys
+                .values()
+                .any(|keys| keys.contains_key(key_name))
+    }
+
+    /// This domain's `Stats` as of `now`: "usage-specific statistics about the domain",
+    /// every one of them counted off the data the domain itself holds.
+    ///
+    /// `ProfileCount` is the profiles the domain holds. Each of those profiles is held as
+    /// one object of the standard profile model, so `ObjectCount` ("The total number of
+    /// objects in domain") counts every profile once beside every object ingested under one
+    /// of the domain's object types whose retention has not run out, and `TotalSize` ("The
+    /// total size, in bytes, of all objects in the domain") adds up the bytes those same
+    /// objects are stored as. `MeteringProfileCount` is the metered view of the profile
+    /// count: a profile counts once more for each whole
+    /// [`OBJECTS_PER_METERED_PROFILE`] objects associated with it beyond the first.
+    pub fn stats(&self, now: SystemTime) -> DomainStats {
+        let live: Vec<&StoredProfileObject> = self
+            .profile_objects
+            .values()
+            .filter(|stored| {
+                !stored.is_expired(self.object_expiration_days(&stored.object_type_name), now)
+            })
+            .collect();
+        let mut objects_per_profile: HashMap<&str, usize> = HashMap::new();
+        for stored in &live {
+            *objects_per_profile
+                .entry(stored.profile_id.as_str())
+                .or_default() += 1;
+        }
+        let metered: usize = self
+            .profiles
+            .keys()
+            .map(|profile_id| {
+                let held = objects_per_profile
+                    .get(profile_id.as_str())
+                    .copied()
+                    .unwrap_or_default();
+                // One profile, plus one more for each whole hundred objects it carries
+                // BEYOND the first: "MORE THAN 100 objects" is what counts a profile
+                // twice, so a profile carrying exactly a hundred is still one.
+                1 + held.saturating_sub(1) / OBJECTS_PER_METERED_PROFILE
+            })
+            .sum();
+        let total_size: usize = self
+            .profiles
+            .values()
+            .map(|stored| stored_profile_size(&stored.profile))
+            .chain(live.iter().map(|stored| stored.object.len()))
+            .sum();
+        DomainStats {
+            profile_count: as_count(self.profiles.len()),
+            metering_profile_count: as_count(metered),
+            object_count: as_count(self.profiles.len() + live.len()),
+            total_size: as_count(total_size),
+        }
     }
 
     /// How long an object ingested under `object_type_name` is kept, in days: the object
@@ -1128,7 +1294,10 @@ pub fn standard_search_keys(profile: &Profile) -> Vec<(String, String)> {
         .into_iter()
         .filter_map(|(name, value)| {
             let value = value?;
-            (!value.is_empty()).then(|| (name.to_string(), value.to_string()))
+            // Indexed in the key's own canonical form, so a search by the key finds the
+            // profile whichever form the value was written in and `FoundByItems` reports
+            // the form the domain holds.
+            (!value.is_empty()).then(|| (name.to_string(), indexed_key_value(name, value)))
         })
         .collect();
     keys.sort();
@@ -1149,6 +1318,84 @@ fn full_name(profile: &Profile) -> Option<String> {
     .filter(|part| !part.is_empty())
     .collect();
     (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// A count or a size as `DomainStats` reports it: every member of that shape is a `long`,
+/// so a count past what one can hold is reported at its maximum rather than wrapping.
+fn as_count(counted: usize) -> i64 {
+    i64::try_from(counted).unwrap_or(i64::MAX)
+}
+
+/// The bytes one stored profile occupies: the data the profile carries, which is what the
+/// domain holds for the object the profile IS.
+///
+/// Every text the record holds counts — the profile's own members, the members of each of
+/// its four addresses, and both halves of every entry of its `Attributes` map. `ProfileId`
+/// is the record's identity rather than data it carries, and `FoundByItems` is never
+/// stored, so neither contributes.
+fn stored_profile_size(profile: &Profile) -> usize {
+    let own = [
+        profile.account_number.as_deref(),
+        profile.additional_information.as_deref(),
+        profile.party_type.as_deref(),
+        profile.business_name.as_deref(),
+        profile.first_name.as_deref(),
+        profile.middle_name.as_deref(),
+        profile.last_name.as_deref(),
+        profile.birth_date.as_deref(),
+        profile.gender.as_deref(),
+        profile.phone_number.as_deref(),
+        profile.mobile_phone_number.as_deref(),
+        profile.home_phone_number.as_deref(),
+        profile.business_phone_number.as_deref(),
+        profile.email_address.as_deref(),
+        profile.personal_email_address.as_deref(),
+        profile.business_email_address.as_deref(),
+        profile.party_type_string.as_deref(),
+        profile.gender_string.as_deref(),
+        profile.profile_type.as_deref(),
+    ];
+    let addresses = [
+        &profile.address,
+        &profile.shipping_address,
+        &profile.mailing_address,
+        &profile.billing_address,
+    ];
+    let attributes: usize = profile
+        .attributes
+        .iter()
+        .flatten()
+        .map(|(name, value)| name.len() + value.len())
+        .sum();
+    own.into_iter().flatten().map(str::len).sum::<usize>()
+        + addresses
+            .into_iter()
+            .map(|address| stored_address_size(address.as_ref()))
+            .sum::<usize>()
+        + attributes
+}
+
+/// The bytes one of a profile's addresses occupies: the texts its members carry.
+fn stored_address_size(address: Option<&Address>) -> usize {
+    let Some(address) = address else {
+        return 0;
+    };
+    [
+        address.address1.as_deref(),
+        address.address2.as_deref(),
+        address.address3.as_deref(),
+        address.address4.as_deref(),
+        address.city.as_deref(),
+        address.county.as_deref(),
+        address.state.as_deref(),
+        address.province.as_deref(),
+        address.country.as_deref(),
+        address.postal_code.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::len)
+    .sum()
 }
 
 // ---------------------------------------------------------------------------

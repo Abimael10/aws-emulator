@@ -185,19 +185,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             default_expiration_days: Some(domain.default_expiration_days),
             default_encryption_key: domain.default_encryption_key.clone(),
             dead_letter_queue_url: domain.dead_letter_queue_url.clone(),
-            // Every statistic is counted off this domain's own stored data.
-            // `ObjectCount` ("The total number of objects in domain") and `TotalSize`
-            // ("The total size, in bytes, of all objects in the domain") are zero
-            // because no operation that ingests a profile OBJECT is implemented yet, so
-            // the domain holds none. `MeteringProfileCount` counts a profile twice only
-            // once it carries more than 100 objects, which none can here, so it equals
-            // `ProfileCount`.
-            stats: Some(DomainStats {
-                profile_count: domain.profiles.len() as i64,
-                metering_profile_count: domain.profiles.len() as i64,
-                object_count: 0,
-                total_size: 0,
-            }),
+            // Every statistic is counted off this domain's own stored data
+            // (`crate::state::Domain::stats`): the profiles it holds, the objects it
+            // holds — each profile is one, beside every object ingested under one of its
+            // object types — and the bytes those objects are stored as.
+            stats: Some(domain.stats(now)),
             matching: domain.matching_response(),
             rule_based_matching: domain.rule_based_matching_response(now),
             data_store: domain.data_store_response(now),

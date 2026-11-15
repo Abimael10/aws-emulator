@@ -73,6 +73,42 @@ async fn found_ids(emulator: &Emulator, domain: &str, key_name: &str, value: &st
     item_ids(&search(emulator, domain, key_name, value).await)
 }
 
+/// Assert that the domain holds NOTHING under one (key name, value) pair no call ever
+/// associated a value under.
+///
+/// Such a key is not DEFINED in the domain — nothing predefines it, no object type declares
+/// it and no profile carries it — so `SearchProfiles` refuses it rather than answering an
+/// empty page (`tests/all/search_key_resolution.rs` pins that rule). The refusal is what
+/// shows a refused `AddProfileKey` wrote nothing: had it written, the key would be defined
+/// and the search would be served.
+async fn nothing_is_held_under(
+    emulator: &Emulator,
+    case: &str,
+    domain: &str,
+    key_name: &str,
+    value: &str,
+) {
+    let (status, body) = emulator
+        .search(
+            domain,
+            json!({ "KeyName": key_name, "Values": [value] }),
+            "",
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body)),
+        (404, "ResourceNotFoundException"),
+        "case {case:?}: expected {key_name:?} to be held by nothing in {domain}, got \
+         {status} {body:?}"
+    );
+    assert_eq!(
+        error_message(&body),
+        format!("KeyName {key_name} is not defined in the domain"),
+        "case {case:?}: expected the undefined-key refusal, got {:?}",
+        error_message(&body)
+    );
+}
+
 /// The `FoundByItems` the search reported for `profile_id`, as (key name, values) pairs.
 async fn found_by(
     emulator: &Emulator,
@@ -475,13 +511,7 @@ async fn a_key_for_an_absent_domain_or_profile_is_not_found() {
         );
     }
     for (case, domain) in [("refusedom", "refusedom"), ("otherdom", "otherdom")] {
-        assert!(
-            found_ids(&emulator, domain, "RefusedKey", "r-1")
-                .await
-                .is_empty(),
-            "case {case:?}: expected a refused request to have written nothing, got {:?}",
-            found_ids(&emulator, domain, "RefusedKey", "r-1").await
-        );
+        nothing_is_held_under(&emulator, case, domain, "RefusedKey", "r-1").await;
     }
 }
 
@@ -516,13 +546,7 @@ async fn a_profile_carries_at_most_the_capped_number_of_key_values() {
         "case over the cap: expected the refusal to name the profile and the limit, got {:?}",
         error_message(&body)
     );
-    assert!(
-        found_ids(&emulator, "capdom", "CapKey", "v-0")
-            .await
-            .is_empty(),
-        "case over the cap: expected nothing written, got {:?}",
-        found_ids(&emulator, "capdom", "CapKey", "v-0").await
-    );
+    nothing_is_held_under(&emulator, "over the cap", "capdom", "CapKey", "v-0").await;
 
     // Exactly the cap: served, and every value it carried is findable.
     let filled = emulator
