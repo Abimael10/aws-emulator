@@ -17,8 +17,9 @@
 //! block states is the status the emulator answers on the wire, so a block that states
 //! nothing cannot agree with it.
 //!
-//! The modelled statuses the catalogue below carries come from
-//! `smithy_query(query="shape",shape="InternalServerException,InvalidParameterException,ResourceConflictException,ResourceNotFoundException,ServiceQuotaExceededException,ThrottlingException,UnauthorizedException")`.
+//! The modelled status of an error shape comes from the shipped model, read by
+//! [`super::modelled_refusal_statuses::modelled_status`]: a documented status is checked
+//! against it, so a bullet cannot state a status the model does not give the shape.
 //!
 //! Each suite in this crate carries its own request harness, so this one does too.
 
@@ -31,19 +32,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// Every error shape this service models, with the HTTP status its `@httpError` trait
-/// gives it (see the `smithy_query` call in this module's docs). A documented status
-/// is checked against this catalogue, so a bullet cannot state a status the model
-/// does not give the shape.
-const MODELLED_ERROR_STATUS: [(&str, u16); 7] = [
-    ("InternalServerException", 500),
-    ("InvalidParameterException", 400),
-    ("ResourceConflictException", 409),
-    ("ResourceNotFoundException", 404),
-    ("ServiceQuotaExceededException", 402),
-    ("ThrottlingException", 429),
-    ("UnauthorizedException", 401),
-];
+use crate::modelled_refusal_statuses::modelled_status;
 
 /// The phrase a bullet carries to say the shape is not one the model declares for this
 /// operation but one the handler widens in.
@@ -186,13 +175,6 @@ fn widened_errors(source: &str) -> BTreeSet<String> {
         }
     }
     widened
-}
-
-fn modelled_status(name: &str) -> Option<u16> {
-    MODELLED_ERROR_STATUS
-        .iter()
-        .find(|(shape, _)| *shape == name)
-        .map(|(_, status)| *status)
 }
 
 /// Every status an operation module's `## Errors` block states is the status the model

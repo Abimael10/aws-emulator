@@ -71,6 +71,9 @@ mod invalid_parameter_refusals;
 #[path = "all/metadata_flags.rs"]
 mod metadata_flags;
 
+#[path = "all/modelled_refusal_statuses.rs"]
+mod modelled_refusal_statuses;
+
 #[path = "all/page_token_collection_scope.rs"]
 mod page_token_collection_scope;
 
@@ -85,6 +88,9 @@ mod provider_tokens;
 
 #[path = "all/read_and_delete_scope_classes.rs"]
 mod read_and_delete_scope_classes;
+
+#[path = "all/refresh_token_declared_statuses.rs"]
+mod refresh_token_declared_statuses;
 
 #[path = "all/resource_error_messages.rs"]
 mod resource_error_messages;

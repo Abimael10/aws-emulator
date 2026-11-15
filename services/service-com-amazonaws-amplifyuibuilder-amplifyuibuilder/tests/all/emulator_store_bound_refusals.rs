@@ -27,8 +27,9 @@
 //! none) and anything the request supplied (the sentence is the only machine-readable name
 //! the class has on an untyped refusal, so it quotes the bound and nothing per-caller).
 //!
-//! The declared statuses in the table below come from
-//! `smithy_query(query="operation",operation="PutMetadataFlag,RefreshToken,ExchangeCodeForToken,StartCodegenJob,CreateComponent")`.
+//! The statuses each operation DECLARES are read off the shipped model by
+//! [`super::modelled_refusal_statuses::declared_statuses`], so a row cannot expect a status
+//! the model does not give its operation.
 //!
 //! Each suite in this crate carries its own request harness, so this one does too.
 
@@ -42,6 +43,8 @@ use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::state::{
 };
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::modelled_refusal_statuses::declared_statuses;
 
 /// A SigV4 credential scope naming this service: it is what routes a request here.
 const SIGNED_FOR_AMPLIFYUIBUILDER: &str = "AWS4-HMAC-SHA256 \
@@ -80,13 +83,12 @@ enum Bounded {
     Component,
 }
 
-/// One bound: the operation whose request reaches it, the statuses that operation's model
-/// declares, the status the rule predicts for the refusal, and how many records the store
-/// holds once it is at the bound.
+/// One bound: the operation whose request reaches it, the status the rule predicts for the
+/// refusal, and how many records the store holds once it is at the bound. The statuses that
+/// operation's model declares are read off the model by `declared_statuses(site.operation)`.
 struct Site {
     operation: &'static str,
     store: Bounded,
-    declared: &'static [u16],
     refusal: u16,
     bound: usize,
 }
@@ -95,35 +97,30 @@ const SITES: [Site; 5] = [
     Site {
         operation: "PutMetadataFlag",
         store: Bounded::Metadata,
-        declared: &[400, 401],
         refusal: 400,
         bound: METADATA_ENVIRONMENT_QUOTA,
     },
     Site {
         operation: "RefreshToken",
         store: Bounded::TokenRefresh,
-        declared: &[400],
         refusal: 400,
         bound: PROVIDER_TOKEN_SESSION_QUOTA,
     },
     Site {
         operation: "ExchangeCodeForToken",
         store: Bounded::TokenExchange,
-        declared: &[400],
         refusal: 400,
         bound: PROVIDER_TOKEN_SESSION_QUOTA,
     },
     Site {
         operation: "StartCodegenJob",
         store: Bounded::CodegenJob,
-        declared: &[400, 429, 500],
         refusal: 429,
         bound: CODEGEN_JOB_QUOTA,
     },
     Site {
         operation: "CreateComponent",
         store: Bounded::Component,
-        declared: &[400, 402, 409, 500],
         refusal: 402,
         bound: COMPONENT_QUOTA,
     },
@@ -415,13 +412,13 @@ async fn still_admitted_at_bound(
 #[tokio::test]
 async fn an_emulator_store_bound_is_refused_with_a_status_the_operation_declares() {
     for site in &SITES {
+        let declared = declared_statuses(site.operation);
         assert!(
-            site.declared.contains(&site.refusal),
+            declared.contains(&site.refusal),
             "case {:?}: the status the rule predicts must be one the operation's model \
-             declares, got {} outside {:?}",
+             declares, got {} outside {declared:?}",
             site.operation,
-            site.refusal,
-            site.declared
+            site.refusal
         );
 
         let router = emulator();
@@ -453,9 +450,9 @@ async fn an_emulator_store_bound_is_refused_with_a_status_the_operation_declares
                 site.refusal, answer.status, answer.body
             );
             assert!(
-                site.declared.contains(&answer.status),
-                "case {case:?}: expected a status the operation's model declares ({:?}), got {}",
-                site.declared,
+                declared.contains(&answer.status),
+                "case {case:?}: expected a status the operation's model declares ({declared:?}), \
+                 got {}",
                 answer.status
             );
             assert!(
