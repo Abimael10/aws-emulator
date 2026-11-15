@@ -17,7 +17,12 @@
 //! execution.
 //!
 //! Nothing here invents an outcome: the status an action reaches is the one its worker
-//! reported, and the only call that moves a job is one from the worker holding it.
+//! reported, and the only call that moves a job is one from the worker holding it. What
+//! the worker says ALONGSIDE the outcome is its report about that action execution too —
+//! the summary, the external id of the run that did the work and how far along it is, and
+//! for a failure the type and message it failed with — so each is recorded where the
+//! service reports it from ([`record_reported_details`]) instead of being dropped in
+//! favour of what the dispatch recorded.
 //!
 //! # What a job will not take
 //!
@@ -207,9 +212,13 @@ pub fn acknowledge(
 /// "future jobs use this token to identify the running instance of the action", and "when
 /// the action is complete, no continuation token should be supplied" — so the JOB goes
 /// back to waiting (carrying that token, for the worker's next report) and the action
-/// stays `InProgress`. Without one the action itself succeeds, with the summary and the
-/// output variables the worker reported, and the next advance rolls that up into the
-/// stage and the execution.
+/// stays `InProgress`. Without one the action itself succeeds, with the output variables
+/// the worker reported. Either way the `executionDetails` the result states are recorded
+/// on the action execution ([`record_reported_details`]) and the `currentRevision` it
+/// states is filed as the action's: both are what the worker says about the work it has
+/// done, so they are reported for a run still in progress as well as for one the result
+/// completed. The output variables are the exception — they are what the action
+/// PUBLISHED, so a run that has not finished publishing them records none.
 pub fn record_success(
     state: &mut State,
     job_id: &str,
@@ -251,6 +260,7 @@ pub fn record_success(
         execution_details.as_ref(),
         output_variables.as_ref(),
     );
+    let mut still_running = false;
     let (execution_id, stage, action, pipeline_name, stage_name, action_name) = {
         let job = job_mut(state, job_id, super::job_result_not_found_message)?;
         if job.status != JOB_STATUS_IN_PROGRESS {
@@ -263,6 +273,14 @@ pub fn record_success(
                 JOB_STATUS_SUCCEEDED,
             )));
         }
+        let target = (
+            job.pipeline_execution_id.clone(),
+            job.stage,
+            job.action,
+            job.pipeline_name.clone(),
+            job.stage_name.clone(),
+            job.action_name.clone(),
+        );
         if let Some(token) = continuation_token {
             // The action continues on the SAME job: it goes back to waiting, carrying the
             // token, so the worker's next poll is handed the continuing work rather than
@@ -271,23 +289,20 @@ pub fn record_success(
             job.release();
             job.continuation_token = Some(token);
             job.last_status_change = now;
-            return Ok(());
+            still_running = true;
+        } else {
+            job.status = JOB_STATUS_SUCCEEDED.to_string();
+            job.reported_result = Some(reported);
+            job.last_status_change = now;
         }
-        job.status = JOB_STATUS_SUCCEEDED.to_string();
-        job.reported_result = Some(reported);
-        job.last_status_change = now;
-        (
-            job.pipeline_execution_id.clone(),
-            job.stage,
-            job.action,
-            job.pipeline_name.clone(),
-            job.stage_name.clone(),
-            job.action_name.clone(),
-        )
+        target
     };
 
     // What the worker reported as the revision it worked on, filed where
-    // `GetPipelineState` reports an action's current revision from.
+    // `GetPipelineState` reports an action's current revision from. A result that only
+    // states progress reports it too: `currentRevision` is "the ID of the current revision
+    // of the artifact successfully worked on by the job", which is a fact about the work
+    // done so far rather than about the job ending.
     if let Some(revision) = current_revision {
         state.action_revisions.insert(
             (pipeline_name, stage_name, action_name),
@@ -299,6 +314,29 @@ pub fn record_success(
                     .unwrap_or_else(|| super::to_date_time(now)),
             },
         );
+    }
+
+    // A result that only states PROGRESS settles nothing: the action keeps its
+    // `InProgress` status and its outcome is still the worker's to report. What the
+    // worker said about the work so far is nonetheless its report about THIS action
+    // execution, so it is recorded where the service reports it from — nothing else
+    // about the run moves, the status included, so its `lastStatusChange` stands. The
+    // output variables are not recorded for it: they are what the action PUBLISHED, and
+    // the action has not finished publishing.
+    if still_running {
+        if let Some(details) = &execution_details {
+            if let Some(record) = state.executions.get_mut(&execution_id) {
+                if let Some(run) = record
+                    .stages
+                    .get_mut(stage)
+                    .and_then(|stage| stage.actions.get_mut(action))
+                {
+                    record_reported_details(run, details);
+                }
+                record.last_update_time = now;
+            }
+        }
+        return Ok(());
     }
 
     // The namespace the action publishes its output variables under is the DECLARED
@@ -329,9 +367,9 @@ pub fn record_success(
         )));
     };
     run.status = Some(ACTION_SUCCEEDED.to_string());
-    run.summary = execution_details
-        .as_ref()
-        .and_then(|details| details.summary.clone());
+    if let Some(details) = &execution_details {
+        record_reported_details(run, details);
+    }
     run.claimed = None;
     run.last_status_change = now;
     record.last_update_time = now;
@@ -362,8 +400,10 @@ pub fn record_success(
 }
 
 /// Record a worker's failure for `job_id`: the job and the ACTION it reports on both
-/// fail, carrying the `failureDetails` the worker gave, and the next advance fails the
-/// action's stage and the execution with it.
+/// fail, carrying the `failureDetails` the worker gave — its `type` and `message` as the
+/// action's error details and summary, and the `externalExecutionId` it named as the
+/// action execution's external id — and the next advance fails the action's stage and the
+/// execution with it.
 pub fn record_failure(
     state: &mut State,
     job_id: &str,
@@ -409,10 +449,46 @@ pub fn record_failure(
     // `FailureDetails$type` is the `FailureType` the worker chose for this failure, so it
     // is reported as the action's error code rather than replaced by one of ours.
     run.error = Some((failure.r#type.clone(), failure.message.clone()));
+    // `FailureDetails$externalExecutionId` is "the external ID of the run of the action
+    // that failed", which is exactly what the action execution reports as its provider's
+    // external id: a worker that named the run it failed in is reported with THAT id
+    // rather than with the one the dispatch recorded.
+    if let Some(external_id) = &failure.external_execution_id {
+        run.external_execution_id = Some(external_id.clone());
+    }
     run.claimed = None;
     run.last_status_change = now;
     record.last_update_time = now;
     Ok(())
+}
+
+/// Record on the action execution `run` what a worker's result STATED about the work it
+/// performed.
+///
+/// `ExecutionDetails` is "the details of the actions taken and results produced on an
+/// artifact as it passes through stages in the pipeline", and the action execution is
+/// where each of its members is reported back: `summary` as the provider's summary for
+/// the action execution (`ActionExecutionResult$externalExecutionSummary`, and
+/// `ActionExecution$summary` beside it), `externalExecutionId` — "the system-generated
+/// unique ID of this action used to identify this job worker in any external systems" —
+/// as `ActionExecutionResult$externalExecutionId`, "the action provider's external ID for
+/// the action execution", and `percentComplete` as `ActionExecution$percentComplete`.
+/// Nothing here is computed: each value is the one the worker gave.
+///
+/// Only what the report STATES is written. A member the worker left out asks for no
+/// change, so what the run already carries about the work — the summary and the external
+/// id whatever started that work recorded, and the figure an earlier progress report gave
+/// — stands rather than being erased by a result that said nothing about it.
+fn record_reported_details(run: &mut super::ActionRun, details: &ExecutionDetails) {
+    if let Some(summary) = &details.summary {
+        run.summary = Some(summary.clone());
+    }
+    if let Some(external_id) = &details.external_execution_id {
+        run.external_execution_id = Some(external_id.clone());
+    }
+    if let Some(percent) = details.percent_complete {
+        run.percent_complete = Some(percent);
+    }
 }
 
 /// The job queued under `job_id`, or the refusal a call naming no job answers, worded

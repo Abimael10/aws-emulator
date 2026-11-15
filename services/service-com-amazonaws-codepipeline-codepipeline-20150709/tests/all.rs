@@ -99,6 +99,8 @@ mod probe;
 mod published_action_type_detail;
 #[path = "all/refusal_statements.rs"]
 mod refusal_statements;
+#[path = "all/reported_job_result_details.rs"]
+mod reported_job_result_details;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/rollback_stage.rs"]

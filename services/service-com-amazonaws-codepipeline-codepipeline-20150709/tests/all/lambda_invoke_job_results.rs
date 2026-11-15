@@ -16,6 +16,10 @@
 //!   re-encoding, because a variable's value is an opaque string — whether or not the
 //!   action declares a `namespace`, which only scopes the `#{namespace.key}` references
 //!   the execution's LATER actions resolve;
+//! * a function that reports its job FAILED fails the action with what it reported: the
+//!   `failureDetails` it supplied are the action execution's `errorDetails`, its
+//!   `externalExecutionSummary` and the external id of the run that failed, so the
+//!   operator can see in the pipeline WHAT failed;
 //! * so an execution parked on such an action holds one of its pipeline's
 //!   concurrent-execution slots, which is what makes the documented ceiling of 50 active
 //!   executions per pipeline reachable in `PARALLEL` mode: the start past it is refused
@@ -83,6 +87,41 @@ def lambda_handler(event, context):
         jobId=job["id"], outputVariables=json.loads(declared)
     )
     return {"reported": job["id"]}
+"#;
+
+/// The handler of the function the failure rows invoke: its work raises, and the except
+/// branch reports the job FAILED with the type its action's `UserParameters` name, the
+/// message the raise carried and the run that failed — `context.aws_request_id`, the id of
+/// the invocation that did the work.
+///
+/// This is the shape AWS documents for a launcher: do the work in a `try`, report success
+/// for the job, and report `failureDetails` from the `except` branch so the operator can
+/// see in the pipeline WHAT failed.
+const FAILING_HANDLER: &str = r#"
+import json
+
+import boto3
+
+PIPELINE = boto3.client("codepipeline")
+
+
+def lambda_handler(event, context):
+    job = event["CodePipeline.job"]
+    declared = json.loads(
+        job["data"]["actionConfiguration"]["configuration"]["UserParameters"]
+    )
+    try:
+        raise RuntimeError(declared["message"])
+    except Exception as error:
+        PIPELINE.put_job_failure_result(
+            jobId=job["id"],
+            failureDetails={
+                "type": declared["type"],
+                "message": str(error),
+                "externalExecutionId": context.aws_request_id,
+            },
+        )
+        return {"reported": "failure"}
 "#;
 
 /// The handler of the function the ceiling rows invoke: it reports NOTHING, which is the
@@ -742,4 +781,112 @@ async fn invoke_actions_fill_a_parallel_pipelines_execution_slots() {
         "case {case:?}: exactly one execution beyond the accepted ones — the run the \
          pipeline's creation started — is reported, got {unaccounted}"
     );
+}
+
+/// RULE: a function that reports its job FAILED fails the action with what it reported —
+/// the `failureDetails` it supplied are the action execution's `errorDetails`, its
+/// `externalExecutionSummary` and the external id of the run that failed — and the
+/// execution fails with it.
+///
+/// The rows differ along what the rule generalises over: the modelled `FailureType` the
+/// function chose and the message its own work failed with.
+#[tokio::test]
+async fn a_reported_job_failure_is_the_actions_failure_and_says_what_failed() {
+    // (case, the FailureType the function reports, the message its work failed with) —
+    // the types are the model's (`smithy_query query="shape" shape="FailureType"` ->
+    // JobFailed, ConfigurationError, PermissionError, RevisionOutOfSync,
+    // RevisionUnavailable, SystemUnavailable).
+    let rows: Vec<(&str, &str, &str)> = vec![
+        (
+            "the work the launcher does raised",
+            "JobFailed",
+            "the run of the job this action launches could not be started",
+        ),
+        (
+            "the launcher found its own action misconfigured",
+            "ConfigurationError",
+            "UserParameters names no job for this action to launch",
+        ),
+        (
+            "the launcher may not pass the role the run needs",
+            "PermissionError",
+            "this action's role may not pass the role the run needs",
+        ),
+    ];
+
+    let emulator = Emulator::new();
+    let bucket = "failing-reporter";
+    emulator.bucket(bucket).await;
+    emulator
+        .put_object(bucket, "source.zip", b"the application bytes")
+        .await;
+    emulator.function("launcher", FAILING_HANDLER).await;
+
+    for (index, (case, failure_type, message)) in rows.into_iter().enumerate() {
+        let pipeline = format!("reported-failure-{index}");
+        let parameters = json!({"type": failure_type, "message": message}).to_string();
+        emulator
+            .cp_ok(
+                "CreatePipeline",
+                &declaration(&pipeline, bucket, "launcher", &parameters, None, None),
+            )
+            .await;
+
+        let execution = invoke_stage_execution(&emulator, case, &pipeline).await;
+        let detail = terminal_invoke_action(&emulator, case, &pipeline, &execution).await;
+        assert_eq!(
+            detail["status"],
+            json!("Failed"),
+            "case {case:?}: the action takes the failure its function reported, got {detail}"
+        );
+        let reported = &detail["output"]["executionResult"];
+        assert_eq!(
+            (
+                reported["errorDetails"]["code"].clone(),
+                reported["errorDetails"]["message"].clone(),
+                reported["externalExecutionSummary"].clone(),
+            ),
+            (json!(failure_type), json!(message), json!(message)),
+            "case {case:?}: the action says what failed, got {detail}"
+        );
+        // The run that failed is the one the FUNCTION named — its own invocation, read
+        // off its context — not the dispatch the engine recorded before it ran. A Lambda
+        // request id is a uuid, so that is the shape the reported id takes.
+        let external = reported["externalExecutionId"].as_str().unwrap_or_default();
+        let uuid_shaped = external.len() == 36
+            && external.char_indices().all(|(position, character)| {
+                if matches!(position, 8 | 13 | 18 | 23) {
+                    character == '-'
+                } else {
+                    character.is_ascii_hexdigit()
+                }
+            });
+        assert!(
+            uuid_shaped && external != "launcher",
+            "case {case:?}: expected the run the function reported as having failed, got \
+             {external:?} in {detail}"
+        );
+
+        let deadline = Instant::now() + WAIT;
+        let settled = loop {
+            let status = summaries(&emulator, &pipeline)
+                .await
+                .iter()
+                .find(|summary| summary["pipelineExecutionId"] == json!(execution))
+                .map(|summary| summary["status"].as_str().unwrap_or_default().to_string())
+                .unwrap_or_default();
+            if matches!(status.as_str(), "Failed" | "Succeeded" | "Stopped") {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: the execution never finished, last {status:?}"
+            );
+            tokio::time::sleep(LOOK).await;
+        };
+        assert_eq!(
+            settled, "Failed",
+            "case {case:?}: the execution fails with the action its function failed"
+        );
+    }
 }

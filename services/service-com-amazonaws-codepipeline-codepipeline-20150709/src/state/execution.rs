@@ -319,6 +319,14 @@ pub struct ActionRun {
     /// when the work was performed by one: the commit a source action resolved, the
     /// function an invoke action ran. `None` while nothing external has run.
     pub external_execution_id: Option<String>,
+    /// How far along the work is, as the worker performing it last REPORTED
+    /// (`ExecutionDetails$percentComplete`, "the percentage of work completed on the
+    /// action"), or `None` while nobody has reported a figure.
+    ///
+    /// It is reported, never computed: `ActionExecution$percentComplete` is a statement
+    /// about work this service did not perform, so the only figure it carries is the one
+    /// the worker gave for the job it holds.
+    pub percent_complete: Option<i32>,
     /// The run this action is WAITING FOR in the service that performs its work, when
     /// that work is a job of another service rather than something one call does: the
     /// build a `CodeBuild` action started. `None` for every action whose work finishes
@@ -358,7 +366,7 @@ impl ActionRun {
                 last_updated_by: self.last_updated_by.clone(),
                 external_execution_id: self.external_execution_id.clone(),
                 external_execution_url: None,
-                percent_complete: None,
+                percent_complete: self.percent_complete,
                 error_details: self.error.as_ref().map(|(code, message)| ErrorDetails {
                     code: Some(code.clone()),
                     message: Some(message.clone()),
@@ -493,6 +501,7 @@ impl StageRun {
             action.token = None;
             action.external_execution_id = None;
             action.external_run = None;
+            action.percent_complete = None;
             // The new attempt has not started yet: it is the engine that starts it, and
             // the instant it starts is this attempt's own start time.
             action.start_time = None;
@@ -625,6 +634,7 @@ fn plan_action(action: &ActionDeclaration, now: SystemTime) -> ActionRun {
         start_time: None,
         external_execution_id: None,
         external_run: None,
+        percent_complete: None,
         output_variables: BTreeMap::new(),
     }
 }
