@@ -33,6 +33,8 @@ mod invalid_input_refusals;
 mod list_namespaces;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/list_tables_row_wire_forms.rs"]
+mod list_tables_row_wire_forms;
 #[path = "all/list_tables_summary_members.rs"]
 mod list_tables_summary_members;
 #[path = "all/maintenance_request_refusals.rs"]
