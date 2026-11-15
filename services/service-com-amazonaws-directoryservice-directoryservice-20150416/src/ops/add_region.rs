@@ -254,9 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.vpc_settings.subnet_ids,
         )
         .await;
-        if let Some(defect) =
-            crate::state::single_zone_defect(&subnet_networks, &input.vpc_settings.subnet_ids)
-        {
+        if let Some(defect) = crate::state::placement_defect(
+            &subnet_networks,
+            &input.vpc_settings.subnet_ids,
+            &input.vpc_settings.vpc_id,
+        ) {
             return Err(
                 AddRegionErrorModeled::ClientException(crate::state::refusal(defect)).into(),
             );

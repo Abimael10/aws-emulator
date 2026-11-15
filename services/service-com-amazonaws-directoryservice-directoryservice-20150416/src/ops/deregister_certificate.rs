@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterCertificate
+//! Takes one registration out of the directory's certificate inventory.
+//!
+//! The CERTIFICATE is the subject, so it is what an absence is reported about: a
+//! `CertificateId` no registration of the account answers to is refused with
+//! `CertificateDoesNotExistException` whatever the directory the request named is, and
+//! `DirectoryDoesNotExistException` is reported only for a certificate the account does
+//! hold under another directory. The resolution is the one `DescribeCertificate` makes
+//! ([`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::resolve_certificate`]),
+//! so an idempotent "remove it if it is there" client and a read are told the same thing
+//! about one pair of identifiers. A directory that is STORED but not in service cannot
+//! serve the write from that stage at all, which is reported ahead of either.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -125,20 +137,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.advance_clock(now);
 
-        // The registration hangs off the directory the request names, so an id naming no
-        // stored directory is refused and changes nothing.
-        let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
-            DeregisterCertificateErrorModeled::DirectoryDoesNotExistException(
-                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
-            )
-        })?;
-
         // Deleting a certificate from the system changes the directory's own security
         // configuration, exactly as registering one does, so it needs a directory that is
         // in service: one still being built by the transition its create owes is
-        // unavailable. The diagnostic is this service's shared one for a directory a call
-        // cannot reach: the requested id and nothing about the stage it is in.
-        if directory.stage != crate::state::STAGE_ACTIVE {
+        // unavailable, and no certificate of it can be reached from that stage at all. The
+        // diagnostic is this service's shared one for a directory a call cannot reach: the
+        // requested id and nothing about the stage it is in.
+        if store
+            .directories
+            .get(&input.directory_id)
+            .is_some_and(|directory| directory.stage != crate::state::STAGE_ACTIVE)
+        {
             return Err(
                 DeregisterCertificateErrorModeled::DirectoryUnavailableException(
                     crate::state::refusal(crate::state::directory_unavailable(
@@ -149,19 +158,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The lookup is within the directory the request names, so a certificate id of
-        // another directory is as absent as one nothing registered — the same resolution
-        // `DescribeCertificate` makes, worded by the same shared diagnostic.
-        let certificate = directory
-            .certificates
-            .get(&input.certificate_id)
-            .ok_or_else(|| {
-                DeregisterCertificateErrorModeled::CertificateDoesNotExistException(
-                    crate::state::refusal(crate::state::no_such_certificate(
-                        &input.certificate_id,
-                        &input.directory_id,
-                    )),
-                )
+        // The CERTIFICATE is the subject of this call, so it is what the refusal is about:
+        // an id no registration of the account answers to is reported as the certificate
+        // that is not in the system, and the directory-level absence only for one the
+        // account does hold under another directory. The SAME resolution
+        // `DescribeCertificate` makes
+        // ([`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::resolve_certificate`]),
+        // so an idempotent "remove it if it is there" client and a read cannot be told two
+        // different things about one pair of identifiers.
+        let certificate = store
+            .resolve_certificate(&input.directory_id, &input.certificate_id)
+            .map_err(|absence| match absence {
+                crate::state::CertificateAbsence::NoSuchCertificate => {
+                    DeregisterCertificateErrorModeled::CertificateDoesNotExistException(
+                        crate::state::refusal(crate::state::no_such_certificate(
+                            &input.certificate_id,
+                            &input.directory_id,
+                        )),
+                    )
+                }
+                crate::state::CertificateAbsence::NoSuchDirectory => {
+                    DeregisterCertificateErrorModeled::DirectoryDoesNotExistException(
+                        crate::state::refusal(crate::state::no_such_directory(
+                            &input.directory_id,
+                        )),
+                    )
+                }
             })?;
 
         // A certificate that secures the directory's LDAP calls cannot be taken out from
@@ -169,8 +191,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ClientLDAPS` are what serves it, which is the modelled refusal for exactly
         // that failure. A certificate performing client certificate authentication serves
         // no LDAP security connection, so the switch does not hold it.
+        let ldaps_in_force = store
+            .directories
+            .get(&input.directory_id)
+            .is_some_and(crate::state::Directory::ldaps_security_in_force);
         if certificate.certificate_type == crate::state::CERTIFICATE_TYPE_CLIENT_LDAPS
-            && directory.ldaps_security_in_force()
+            && ldaps_in_force
         {
             return Err(DeregisterCertificateErrorModeled::CertificateInUseException(
                 crate::state::refusal(crate::state::CERTIFICATE_IN_USE),

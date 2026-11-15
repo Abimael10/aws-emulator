@@ -161,13 +161,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TrustIds`' own documentation: "If this member is null, all trust relationships
         // that belong to the current account are returned. An empty list results in an
         // InvalidParameterException being thrown." — so an EMPTY list is a refusal here,
-        // unlike `DescribeSnapshots$SnapshotIds`, where it is an unfiltered listing.
+        // unlike `DescribeSnapshots$SnapshotIds`, where it is an unfiltered listing. The
+        // sentence is the one every empty filter of this service is refused with
+        // ([`crate::state::empty_filter_list`]).
         if let Some(requested) = input.trust_ids.as_ref() {
             if requested.is_empty() {
-                return Err(invalid_parameter(
-                    "TrustIds must name at least one trust relationship when it is present"
-                        .to_string(),
-                ));
+                return Err(invalid_parameter(crate::state::empty_filter_list(
+                    "TrustIds", "TrustId",
+                )));
             }
             // Nothing caller-sized reaches the store, or the store LOCK, unchecked: the
             // filter is bounded here — before anything is allocated from it and before

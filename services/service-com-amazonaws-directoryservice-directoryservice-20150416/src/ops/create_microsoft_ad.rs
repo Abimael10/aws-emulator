@@ -232,6 +232,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(defect.to_string()));
         }
 
+        // The `ShortName` is the NetBIOS name of the Windows domain this create makes, so
+        // it has to satisfy Directory Service's own short-name rule — which is narrower
+        // than the modelled `DirectoryShortName` expression the boundary applies (see
+        // [`crate::state::short_name_defect`]). Checked before anything is resolved or
+        // stored, so a refused short name creates no directory.
+        if let Some(defect) = crate::state::short_name_defect(input.short_name.as_deref()) {
+            return Err(invalid_parameter(defect));
+        }
+
         // A directory's servers are placed in two subnets in two different Availability
         // Zones, so a settings block naming fewer than two distinct subnets cannot carry
         // them. Checked before anything is minted or inserted, so a refused call stores
@@ -254,14 +263,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The other half of that rule: two DIFFERENT subnets still have to be in two
-        // different zones, which only the service that owns subnets can answer. WHERE the
-        // directory's servers go is resolved once, here, and the answer serves both the
-        // refusal and the record below: a pair EC2 reports in ONE zone is refused as the
-        // resource-semantics failure it is (`ClientException`), which is a different class
-        // to the validation refusal a MALFORMED subnet id gets — and nothing is refused
-        // where EC2 could not be asked. Asked BEFORE the store lock is taken, so no guard
-        // is held across the hop.
+        // The other halves of that rule, both facts about the account's NETWORK: the subnets
+        // have to be subnets OF the VPC the placement names, and two DIFFERENT subnets still
+        // have to be in two different zones — which only the service that owns subnets can
+        // answer. WHERE the directory's servers go is resolved once, here, and the answer
+        // serves both the refusal and the record below: a pick EC2 reports in another VPC or
+        // in ONE zone is refused as the resource-semantics failure it is (`ClientException`),
+        // which is a different class to the validation refusal a MALFORMED subnet id gets —
+        // and nothing is refused where EC2 could not be asked. Asked BEFORE the store lock is
+        // taken, so no guard is held across the hop.
         let subnet_networks =
             crate::state::resolve_subnet_networks(ctx, &region, &input.vpc_settings.subnet_ids)
                 .await;
@@ -269,9 +279,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owner reports it — the network the security group this create provisions for them
         // has to be in. Read before the placement is moved into the record below.
         let placement_vpc = crate::state::placement_vpc_id(&subnet_networks);
-        if let Some(defect) =
-            crate::state::single_zone_defect(&subnet_networks, &input.vpc_settings.subnet_ids)
-        {
+        if let Some(defect) = crate::state::placement_defect(
+            &subnet_networks,
+            &input.vpc_settings.subnet_ids,
+            &input.vpc_settings.vpc_id,
+        ) {
             return Err(
                 CreateMicrosoftADErrorModeled::ClientException(crate::state::refusal(defect))
                     .into(),

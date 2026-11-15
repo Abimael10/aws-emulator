@@ -268,10 +268,11 @@ async fn a_directory_placed_in_a_vpc_reports_the_security_group_ec2_holds_for_it
     for (index, (case, kind, subnets)) in rows.iter().enumerate() {
         let name = format!("sg{index}.example.com");
         let placement = kind.placement();
-        // Every row names the VPC the account really holds — the one `ec2:CreateVpc` minted —
-        // whatever subnets it places the servers in, so a row placed in the account's default
-        // subnets names a DIFFERENT VPC from the one those subnets are in.
-        let directory_id = create_in(router, *kind, &name, &network.vpc, subnets, case).await;
+        // Every row names the VPC its own chosen subnets sit in, as EC2 reports it: a
+        // directory's servers are placed in subnets OF the VPC the create names, so a row
+        // placed in the account's default subnets names the default VPC and one placed in
+        // the client's own names the VPC `ec2:CreateVpc` minted.
+        let directory_id = create_in(router, *kind, &name, &subnets[0].vpc, subnets, case).await;
 
         // The group is part of the network the create provisions, so it is reported from the
         // create on, before the build the directory owes has finished.
@@ -317,7 +318,7 @@ async fn a_directory_placed_in_a_vpc_reports_the_security_group_ec2_holds_for_it
         // only the group is resolved against the network the servers are really on.
         assert_eq!(
             described[placement]["VpcId"],
-            json!(network.vpc),
+            json!(&subnets[0].vpc),
             "case {case:?}: expected the requested VpcId to be echoed, got {described}"
         );
 

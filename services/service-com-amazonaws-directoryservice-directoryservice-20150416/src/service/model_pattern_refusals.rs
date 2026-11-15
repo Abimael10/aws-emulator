@@ -263,10 +263,12 @@ fn unseen_pattern_violations(
 /// both ends — and a clause states the second, because that is what a caller has to satisfy:
 ///
 /// * an expression the model wraps in a matched `^`…`$` pair already describes the whole
-///   value, and is quoted AS THE MODEL DECLARES IT, anchors and all. That is the rendering
-///   every other clause of this service carries ([`super::stated_violation`]) and the one its
-///   recorded refusals of such a member quote, so a clause built here reads like one the
-///   boundary built.
+///   value, and is quoted as this service PUBLISHES it ([`super::published_patterns`]):
+///   as the model declares it, anchors and all, for almost every shape of this model, and
+///   without the closing anchor for the few whose recorded refusal ends where the grammar
+///   ends. That is the rendering every other clause of this service carries
+///   ([`super::stated_violation`]), so a clause built here reads like one the boundary
+///   built.
 /// * an expression the model anchors at ONE end only leaves the other end OPEN — any run of
 ///   characters may precede or follow the match — and the clause spells that end out, which
 ///   is what the recorded Directory Service refusal of the administrator `Password` quotes
@@ -279,7 +281,7 @@ fn unseen_pattern_violations(
 /// and the CHECK above still runs the model's own text whatever this quotes.
 fn stated_pattern(pattern: &str) -> String {
     if ::service_common::validation::unanchored(pattern) != pattern {
-        return pattern.to_string();
+        return super::published_patterns::published_pattern(pattern);
     }
     ::service_common::validation::whole_value_expression(pattern)
 }

@@ -148,11 +148,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `TopicNames`' own documentation: "If this member is null, all associations
         // for the specified Directory ID are returned. An empty list results in an
-        // InvalidParameterException being thrown."
+        // InvalidParameterException being thrown." The sentence is the one every empty
+        // filter of this service is refused with ([`crate::state::empty_filter_list`]).
         if input.topic_names.as_ref().is_some_and(Vec::is_empty) {
-            return Err(invalid_parameter(
-                "TopicNames must not be an empty list".to_string(),
-            ));
+            return Err(invalid_parameter(crate::state::empty_filter_list(
+                "TopicNames",
+                "TopicName",
+            )));
         }
 
         // Nothing caller-sized reaches the store, or the store LOCK, unchecked: the

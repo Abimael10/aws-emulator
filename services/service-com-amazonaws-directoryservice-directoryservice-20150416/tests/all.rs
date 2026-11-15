@@ -25,6 +25,8 @@ mod aws_worded_diagnostics;
 mod ca_enrollment_policy;
 #[path = "all/certificate_absence_message.rs"]
 mod certificate_absence_message;
+#[path = "all/certificate_absence_outranks_the_directory.rs"]
+mod certificate_absence_outranks_the_directory;
 #[path = "all/certificate_deregistration.rs"]
 mod certificate_deregistration;
 #[path = "all/certificate_functions.rs"]
@@ -79,6 +81,8 @@ mod directory_security_group;
 mod directory_server_interfaces;
 #[path = "all/directory_settings.rs"]
 mod directory_settings;
+#[path = "all/directory_short_name_rule.rs"]
+mod directory_short_name_rule;
 #[path = "all/directory_unsharing.rs"]
 mod directory_unsharing;
 #[path = "all/directory_update_reads.rs"]
@@ -95,6 +99,8 @@ mod event_topic_deregistration;
 mod event_topics;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/invalid_directory_id_report.rs"]
+mod invalid_directory_id_report;
 #[path = "all/ip_route_removal.rs"]
 mod ip_route_removal;
 #[path = "all/ip_route_update_serialization.rs"]
@@ -109,12 +115,18 @@ mod log_subscription_forwarding;
 mod log_subscriptions;
 #[path = "all/microsoft_ad.rs"]
 mod microsoft_ad;
+#[path = "all/nested_element_set_presence.rs"]
+mod nested_element_set_presence;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
 #[path = "all/pattern_constraint_refusals.rs"]
 mod pattern_constraint_refusals;
+#[path = "all/placement_vpc_membership.rs"]
+mod placement_vpc_membership;
 #[path = "all/polled_lifecycles.rs"]
 mod polled_lifecycles;
+#[path = "all/published_pattern_text.rs"]
+mod published_pattern_text;
 #[path = "all/refusal_clause_order_and_subject_precedence.rs"]
 mod refusal_clause_order_and_subject_precedence;
 #[path = "all/refusal_classification_rules.rs"]

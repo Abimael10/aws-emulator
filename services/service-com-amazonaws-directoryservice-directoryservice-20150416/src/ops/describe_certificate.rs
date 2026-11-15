@@ -9,12 +9,15 @@
 //! out of `Registering` — so a read reports what was owed at that instant whether or not
 //! anybody called.
 //!
-//! A registration lives on the directory it was made for, so both ids are resolved: an
-//! id naming no stored directory is refused with `DirectoryDoesNotExistException`, and a
-//! certificate id that directory holds no registration for with
-//! `CertificateDoesNotExistException` — which is also what another directory's
-//! certificate id is, since a registration is not visible through a directory it was not
-//! made for.
+//! A registration lives on the directory it was made for, so both ids are resolved — and
+//! the CERTIFICATE is the subject, so it is what an absence is reported about: a
+//! `CertificateId` no registration of the account answers to is refused with
+//! `CertificateDoesNotExistException` whatever the directory the request named is, and
+//! `DirectoryDoesNotExistException` is reported only for a certificate the account does
+//! hold under another directory. Another directory's certificate id is itself an absent
+//! certificate, since a registration is not visible through a directory it was not made
+//! for. The resolution is shared with `DeregisterCertificate`
+//! ([`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::resolve_certificate`]).
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -140,24 +143,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.advance_clock(::std::time::SystemTime::now());
 
-        let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
-            DescribeCertificateErrorModeled::DirectoryDoesNotExistException(
-                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
-            )
-        })?;
-
-        // The lookup is within the directory the request names, so a certificate id of
-        // another directory is as absent as one nothing registered.
-        let certificate = directory
-            .certificates
-            .get(&input.certificate_id)
-            .ok_or_else(|| {
-                DescribeCertificateErrorModeled::CertificateDoesNotExistException(
-                    crate::state::refusal(crate::state::no_such_certificate(
-                        &input.certificate_id,
-                        &input.directory_id,
-                    )),
-                )
+        // The CERTIFICATE is the subject of this read, so it is what the refusal is about:
+        // an id no registration of the account answers to is reported as the certificate
+        // that is not in the system, and the directory-level absence only for one the
+        // account does hold under another directory. ONE resolution, shared with
+        // `DeregisterCertificate` ([`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::resolve_certificate`]),
+        // so a read and a removal cannot be told two different things about one pair of
+        // identifiers.
+        let certificate = store
+            .resolve_certificate(&input.directory_id, &input.certificate_id)
+            .map_err(|absence| match absence {
+                crate::state::CertificateAbsence::NoSuchCertificate => {
+                    DescribeCertificateErrorModeled::CertificateDoesNotExistException(
+                        crate::state::refusal(crate::state::no_such_certificate(
+                            &input.certificate_id,
+                            &input.directory_id,
+                        )),
+                    )
+                }
+                crate::state::CertificateAbsence::NoSuchDirectory => {
+                    DescribeCertificateErrorModeled::DirectoryDoesNotExistException(
+                        crate::state::refusal(crate::state::no_such_directory(
+                            &input.directory_id,
+                        )),
+                    )
+                }
             })?;
 
         Ok(DescribeCertificateOutput {

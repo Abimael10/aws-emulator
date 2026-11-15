@@ -485,7 +485,12 @@ async fn a_deleted_id_filters_to_an_empty_page_while_an_unknown_one_is_refused()
         .await;
         deleted.push(id);
     }
-    tokio::time::sleep(crate::harness::PAST_THE_TEARDOWN).await;
+    // ...and the teardown each delete owes is WAITED OUT by polling for the condition these
+    // rows are about — the account holding no record for the id at all — rather than for a
+    // span of time.
+    for id in &deleted {
+        crate::harness::poll_until_absent(&router, id, case).await;
+    }
     let kept = create_directory(&router, minimal_create("kept.example.com"), case).await;
 
     // Well-formed ids (`^d-[0-9a-f]{10}$`) this account never had, varied along their
@@ -588,7 +593,7 @@ async fn a_deleted_id_filters_to_an_empty_page_while_an_unknown_one_is_refused()
         assert_eq!(
             message,
             with_request_id(
-                &format!("Invalid directory ID(s): {}.", named.join(",")),
+                &format!("Invalid directory ID(s): {}.", named.join(", ")),
                 &request_id
             ),
             "case {row:?}: expected only the ids this account never had to be named, got \
@@ -634,21 +639,34 @@ struct ElementCase {
     quoted: &'static str,
     /// The element shape's whole declared constraint set, as the clause nests it.
     requirements: &'static str,
+    /// Whether the nested set closes with the requirement that the MEMBER be carried: the
+    /// model declares this one `@required` or gives it a `@default`.
+    carried: bool,
 }
 
 /// The whole message a request breaking ONE list member's element constraint is refused
 /// with: the framework's envelope, the entries that member has to have fixed, and the element
 /// shape's set nested at the list member.
-fn one_element_error(quoted: &str, path: &str, requirements: &str) -> String {
+///
+/// `carried` says whether the nested set closes with the requirement that the MEMBER be
+/// there: it does for a member the model never leaves optional, and not for one a request
+/// may omit.
+fn one_element_error(quoted: &str, path: &str, requirements: &str, carried: bool) -> String {
+    let nested = if carried {
+        format!("{requirements}, {ENTRY_PRESENT}")
+    } else {
+        requirements.to_string()
+    };
     format!(
         "1 validation error detected: Value '[{quoted}]' at '{path}' failed to satisfy \
-         constraint: Member must satisfy constraint: [{requirements}, {ENTRY_PRESENT}]"
+         constraint: Member must satisfy constraint: [{nested}]"
     )
 }
 
-/// The requirement the nested set CLOSES with: no list of this model is `@sparse`, so an
-/// entry has to be there as well as satisfy its element shape, and the clause states that
-/// beside the constraints the shape declares.
+/// The requirement the nested set CLOSES with, for a collection member the model never
+/// leaves optional — one it declares `@required`, and one carrying a `@default`, which a
+/// request cannot submit as null either. A member a request may omit altogether states the
+/// element shape's constraints alone.
 const ENTRY_PRESENT: &str = "Member must not be null";
 
 /// The `@pattern` each element shape under test declares, read off the model
@@ -690,6 +708,8 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "dnsIpAddrs",
             quoted: "999.999.999.999",
             requirements: IP_ADDR_PATTERN,
+            // `CreateConditionalForwarderRequest$DnsIpAddrs` carries a `@default` of `[]`.
+            carried: true,
         },
         ElementCase {
             case: "a bad DNS address after a good one",
@@ -702,6 +722,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "dnsIpAddrs",
             quoted: "not-an-address",
             requirements: IP_ADDR_PATTERN,
+            carried: true,
         },
         ElementCase {
             case: "two bad DNS addresses around a good one",
@@ -714,6 +735,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "dnsIpAddrs",
             quoted: "256.0.0.1, 10.0.0",
             requirements: IP_ADDR_PATTERN,
+            carried: true,
         },
         ElementCase {
             case: "a directory id of the wrong form in a filter",
@@ -722,6 +744,10 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "directoryIds",
             quoted: "not-a-directory",
             requirements: DIRECTORY_ID_PATTERN,
+            // `DescribeDirectoriesRequest$DirectoryIds` is a member the model leaves
+            // optional — a listing may omit the filter altogether — so its clause states
+            // the element expression alone.
+            carried: false,
         },
         ElementCase {
             case: "a domain controller id of the wrong form",
@@ -733,6 +759,8 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "domainControllerIds",
             quoted: "d-0000000000",
             requirements: DOMAIN_CONTROLLER_ID_PATTERN,
+            // `DescribeDomainControllersRequest$DomainControllerIds` is optional too.
+            carried: false,
         },
         ElementCase {
             case: "an address block with no prefix length",
@@ -744,6 +772,8 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "cidrIps",
             quoted: "198.51.100.0",
             requirements: CIDR_IP_PATTERN,
+            // `RemoveIpRoutesRequest$CidrIps` carries a `@default` of `[]`.
+            carried: true,
         },
         ElementCase {
             case: "a tag key outside its character class",
@@ -759,6 +789,8 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             requirements: "Member must have length less than or equal to 128, Member must \
                            have length greater than or equal to 1, Member must satisfy \
                            regular expression pattern: ",
+            // `RemoveTagsFromResourceRequest$TagKeys` is `@required`.
+            carried: true,
         },
         // A list INSIDE a structure the request nests is stated at its own dotted member
         // path, the same way, with no element position in it either.
@@ -776,6 +808,8 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "vpcSettings.subnetIds",
             quoted: "subnet-not-hex",
             requirements: SUBNET_ID_PATTERN,
+            // `DirectoryVpcSettings$SubnetIds` is `@required`.
+            carried: true,
         },
         ElementCase {
             case: "a DNS address of the wrong form inside an AD Connector's settings",
@@ -794,6 +828,8 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
             path: "connectSettings.customerDnsIps",
             quoted: "999.1.1.1",
             requirements: IP_ADDR_PATTERN,
+            // `DirectoryConnectSettings$CustomerDnsIps` carries a `@default` of `[]`.
+            carried: true,
         },
     ];
 
@@ -819,7 +855,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
         let message = parsed["message"].as_str().unwrap_or_default();
         assert_eq!(
             message,
-            one_element_error(row.quoted, row.path, &requirements),
+            one_element_error(row.quoted, row.path, &requirements, row.carried),
             "case {:?}: expected the clause stated at the list member, got {message:?}",
             row.case
         );

@@ -26,8 +26,8 @@
 //! what is this service's own is the ORDER its own validator lists an enum's value set in
 //! ([`super::stated_enum_values`] states the same order for a clause about a plain member),
 //! which entries the clause quotes ([`offending_entries`]), and that the nested set closes
-//! with the requirement that an entry be PRESENT
-//! ([`element_set_in_the_services_own_order`]).
+//! with the requirement that the MEMBER be carried where the model never leaves it optional
+//! ([`element_set_in_the_services_own_order`] over [`super::stated_element_sets`]).
 //!
 //! WHY THE ENTRIES AND NOT THE WHOLE LIST. The services that state this clause do not agree
 //! on its value half — `cloudformation`'s copy of this rule quotes the whole list as
@@ -239,24 +239,25 @@ fn offending_entries(violations: &[Violation]) -> HashMap<String, String> {
 
 /// The requirement a clause stated at `collection` nests: the element shape's whole declared
 /// constraint set, with an enum's value set listed in the order this SERVICE lists it
-/// ([`super::stated_enum_values`]), closing with the requirement that an entry be PRESENT.
+/// ([`super::stated_enum_values`]), closing with the requirement that the MEMBER be carried
+/// where the model never leaves it optional ([`super::stated_element_sets`]).
 ///
 /// The constraints themselves are the ones the shared reading of the schema produces
 /// ([`element_constraint_set`]) — the model's, constraint for constraint — and what this
 /// service adds to them is the ORDER an enum's values are listed in and the closing
-/// not-null requirement every entry of a list that is not `@sparse` carries. A collection
-/// the operation's input
+/// not-null requirement a member the model always carries brings with it. A collection the
+/// operation's input
 /// declares ITSELF is looked up by its whole path; one inside a structure that input nests is
 /// looked up by its OWN member name on the structures this service nests ([`NESTED_SHAPES`]),
 /// since that is the schema codegen attached its element constraints to. `None` where no
 /// handed-over shape declares a constraint on that member's elements, which leaves the clause
 /// the framework's own.
 ///
-/// A `@pattern` inside the NESTED set keeps the expression the model declares, anchors and
-/// all — the same way the per-member clause quotes one ([`super::stated_violation`]), which is
-/// what the recorded element clause this module was built on (the one-entry `DnsIpAddrs`
-/// refusal the module header quotes, pinned row by row in
-/// `tests/all/refusal_classification_rules.rs`) shows.
+/// A `@pattern` inside the NESTED set keeps the expression this service publishes for that
+/// shape — the same rendering a per-member clause quotes ([`super::stated_violation`]),
+/// which for every shape a recorded element clause of this service covers (the one-entry
+/// `DnsIpAddrs` refusal the module header quotes, pinned row by row in
+/// `tests/all/refusal_classification_rules.rs`) is the model's text, anchors and all.
 fn element_set_in_the_services_own_order(
     input_schema: &'static Schema,
     collection: &str,
@@ -277,14 +278,17 @@ fn element_set_in_the_services_own_order(
             requirement(kind)
         })
         .collect();
-    // ...and, last, that an element be PRESENT at all. A Smithy list admits a null entry
-    // only where it is declared `@sparse`, which no list of this model is, so every entry
-    // of every such member has to be there as well as satisfy its shape — and the set a
-    // clause nests states that requirement beside the ones the element shape declares,
-    // whichever of them the request broke. The sentence is the framework's own for an
-    // absent member ([`requirement`]), so one wording serves both the clause about a
-    // member nothing filled and this nested requirement.
-    requirements.push(requirement(ViolationKind::MissingRequiredMember));
+    // ...and, last, that the member be CARRIED at all, for a member the model never leaves
+    // optional — one it declares `@required`, and one carrying a `@default`, which a request
+    // cannot submit as null either. A member a request may omit altogether states the
+    // element shape's constraints alone. Which of the two a member is read off this
+    // service's own model ([`super::stated_element_sets`]), so the clause follows the
+    // declaration rather than the operation a refusal came from. The sentence is the
+    // framework's own for an absent member ([`requirement`]), so one wording serves both the
+    // clause about a member nothing filled and this nested requirement.
+    if super::stated_element_sets::requires_the_member(collection) {
+        requirements.push(requirement(ViolationKind::MissingRequiredMember));
+    }
     Some(element_set_requirement(&requirements))
 }
 

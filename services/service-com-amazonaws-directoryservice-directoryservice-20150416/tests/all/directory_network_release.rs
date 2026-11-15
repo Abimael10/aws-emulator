@@ -224,7 +224,9 @@ async fn the_security_group_a_create_provisioned_leaves_with_the_directory() {
     let mut provisioned: Vec<Provisioned> = Vec::with_capacity(rows.len());
     for (index, (case, kind, subnets)) in rows.iter().enumerate() {
         let name = format!("release{index}.example.com");
-        let directory_id = create_in(router, *kind, &name, &network.vpc, subnets, case).await;
+        // The VPC a row names is the VPC its own subnets sit in, as EC2 reports it: a
+        // directory's servers are placed in subnets OF the VPC the create names.
+        let directory_id = create_in(router, *kind, &name, &subnets[0].vpc, subnets, case).await;
         let placement = kind.placement();
         let described = described_if_held(router, &directory_id, case)
             .await

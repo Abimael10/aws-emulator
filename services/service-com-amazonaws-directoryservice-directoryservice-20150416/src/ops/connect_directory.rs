@@ -190,6 +190,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so it is bound here only to be dropped, and never reaches the store.
         let _ = input.password;
 
+        // The `ShortName` is the NetBIOS name of the Windows domain this connector serves,
+        // so it has to satisfy Directory Service's own short-name rule — which is narrower
+        // than the modelled `DirectoryShortName` expression the boundary applies (see
+        // [`crate::state::short_name_defect`]). Checked before anything is resolved or
+        // stored, so a refused short name connects no directory.
+        if let Some(defect) = crate::state::short_name_defect(input.short_name.as_deref()) {
+            return Err(invalid_parameter(defect));
+        }
+
         // An AD Connector's servers are placed one per subnet, in two Availability Zones,
         // so a settings block naming fewer than two distinct subnets cannot carry them.
         // Checked before anything is minted or inserted, so a refused call stores nothing.
@@ -231,14 +240,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // has to be in. Read before the placement is moved into the record below.
         let placement_vpc = crate::state::placement_vpc_id(&subnet_networks);
 
-        // Two DIFFERENT subnets still have to be in two different zones, which only that
-        // service can answer: a pair EC2 reports in ONE zone is refused as the
+        // The subnets have to be subnets OF the VPC the placement names, and two DIFFERENT
+        // subnets still have to be in two different zones — which only that service can
+        // answer: a pick EC2 reports in another VPC or in ONE zone is refused as the
         // resource-semantics failure it is (`ClientException`), a different class to the
         // validation refusal a MALFORMED subnet id gets — and nothing is refused where EC2
         // could not be asked.
-        if let Some(defect) = crate::state::single_zone_defect(
+        if let Some(defect) = crate::state::placement_defect(
             &subnet_networks,
             &input.connect_settings.subnet_ids,
+            &input.connect_settings.vpc_id,
         ) {
             return Err(
                 ConnectDirectoryErrorModeled::ClientException(crate::state::refusal(defect))

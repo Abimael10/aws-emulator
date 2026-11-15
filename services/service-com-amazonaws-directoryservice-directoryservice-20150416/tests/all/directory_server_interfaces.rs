@@ -329,7 +329,9 @@ async fn a_directory_placed_in_a_vpc_holds_one_interface_per_subnet_in_ec2() {
     let mut every_interface: BTreeSet<String> = BTreeSet::new();
     for (index, (case, kind, subnets)) in rows.iter().enumerate() {
         let name = format!("eni{index}.example.com");
-        let directory_id = create_in(router, *kind, &name, &network.vpc, subnets, case).await;
+        // The VPC a row names is the VPC its own subnets sit in, as EC2 reports it: a
+        // directory's servers are placed in subnets OF the VPC the create names.
+        let directory_id = create_in(router, *kind, &name, &subnets[0].vpc, subnets, case).await;
 
         // One interface per chosen subnet, each in its OWN subnet: the count and the set of
         // subnets together are what rule out two interfaces sharing one subnet.

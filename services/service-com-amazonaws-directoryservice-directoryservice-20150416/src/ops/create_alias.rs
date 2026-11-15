@@ -297,7 +297,7 @@ fn alias_pattern_violation(alias: &str) -> Option<String> {
     }
     ::aws_smithy_schema_server::envelope(&[::smithy_server_runtime::Violation {
         path: ::aws_smithy_schema_server::constraints::path::member(ALIAS_MEMBER),
-        kind: ::smithy_server_runtime::ViolationKind::Pattern(stated_alias_pattern().to_string()),
+        kind: ::smithy_server_runtime::ViolationKind::Pattern(stated_alias_pattern()),
         // The whole value, not an elision: `Alias` carries `@length` max 62, which the
         // boundary validator enforces before this handler runs, so the echo is bounded
         // by the model rather than by the request.
@@ -345,17 +345,19 @@ fn alias_matches(alias: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
-/// [`ALIAS_PATTERN`] as a refusal STATES it: the expression without the whole-value end
-/// anchor.
+/// [`ALIAS_PATTERN`] as a refusal STATES it: the expression this service PUBLISHES for
+/// `AliasName`, which is that text without the whole-value end anchor.
 ///
 /// A `@pattern` is quoted in a validation clause as the expression a value has to
 /// satisfy, and the `^`/`$` a model writes around it are how Smithy turns a find into a
 /// whole-string match rather than part of the character grammar (the rule
 /// `services/common/src/validation.rs` documents and renders for the services that share
-/// it). Which end anchors a service drops is part of its validation-message dialect, and
-/// a recorded Directory Service refusal of a malformed alias quotes this pattern with its
-/// leading `^` and WITHOUT the trailing `$`. Derived from the one pattern constant, so
-/// the text a clause quotes cannot drift from the expression the check runs.
-fn stated_alias_pattern() -> &'static str {
-    ALIAS_PATTERN.strip_suffix('$').unwrap_or(ALIAS_PATTERN)
+/// it). Which end anchors a service drops for which shape is part of its
+/// validation-message dialect, and this service keeps that dialect in ONE place
+/// ([`crate::service::published_patterns`]) so the clause this handler words and the
+/// clauses the request layer words cannot quote one shape two ways. The expression handed
+/// over is the one pattern constant the check above runs, so the text a clause quotes
+/// cannot drift from it.
+fn stated_alias_pattern() -> String {
+    crate::service::published_patterns::published_pattern(ALIAS_PATTERN)
 }

@@ -155,6 +155,9 @@ pub(crate) struct AccountSubnet {
     /// come out of. `pub(crate)` because the sibling suites assert against the block the
     /// OWNER reports rather than reading it a second time.
     pub(crate) cidr: String,
+    /// The VPC EC2 reports the subnet in — the VPC a placement naming it has to be made in,
+    /// since a directory's servers sit in subnets OF the VPC the create names.
+    pub(crate) vpc: String,
     zone: String,
 }
 
@@ -254,6 +257,7 @@ pub(crate) async fn network() -> Network {
             Some(AccountSubnet {
                 id: subnet.subnet_id()?.to_string(),
                 cidr: subnet.cidr_block()?.to_string(),
+                vpc: subnet.vpc_id()?.to_string(),
                 zone: subnet.availability_zone()?.to_string(),
             })
         })
@@ -310,6 +314,10 @@ async fn reported(ec2: &::aws_sdk_ec2::Client, subnet_id: &str) -> AccountSubnet
         cidr: subnet
             .cidr_block()
             .unwrap_or_else(|| panic!("EC2 must report a block for {subnet_id}"))
+            .to_string(),
+        vpc: subnet
+            .vpc_id()
+            .unwrap_or_else(|| panic!("EC2 must report a VPC for {subnet_id}"))
             .to_string(),
         zone: subnet
             .availability_zone()
@@ -436,8 +444,12 @@ async fn a_microsoft_ad_serves_one_dns_address_per_chosen_subnet_inside_its_bloc
 
     for (index, (case, subnets)) in rows.iter().enumerate() {
         let name = format!("dns{index}.example.com");
+        // The VPC a row names is the VPC its own subnets sit in, as EC2 reports it: a
+        // directory's servers are placed in subnets OF the VPC the create names.
+        let placement_vpc = subnets[0].vpc.clone();
         let directory_id =
-            create_microsoft_ad(router, microsoft_ad_in(&name, &network.vpc, subnets), case).await;
+            create_microsoft_ad(router, microsoft_ad_in(&name, &placement_vpc, subnets), case)
+                .await;
         // The servers a create places come up on the clock, so the description is read once
         // the directory reports itself in service rather than after a fixed wait.
         in_service(router, &directory_id, case).await;
@@ -549,7 +561,8 @@ async fn a_simple_ad_serves_one_dns_address_per_chosen_subnet_inside_its_block()
             "Password": PASSWORD,
             "Size": "Small",
             "VpcSettings": {
-                "VpcId": &network.vpc,
+                // The VPC a row names is the VPC its own subnets sit in, as EC2 reports it.
+                "VpcId": &subnets[0].vpc,
                 "SubnetIds": subnets.iter().map(|subnet| subnet.id.clone()).collect::<Vec<_>>(),
             }
         });

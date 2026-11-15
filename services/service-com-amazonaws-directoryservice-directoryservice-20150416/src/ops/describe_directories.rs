@@ -175,11 +175,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DirectoryIds`' own documentation: "If this member is null, all directories
         // that belong to the current account are returned. An empty list results in an
-        // InvalidParameterException being thrown."
+        // InvalidParameterException being thrown." The sentence is the one every empty
+        // filter of this service is refused with ([`crate::state::empty_filter_list`]),
+        // naming the member and the shape its entries carry as the model spells them.
         if input.directory_ids.as_ref().is_some_and(Vec::is_empty) {
-            return Err(invalid_parameter(
-                "DirectoryIds must not be an empty list".to_string(),
-            ));
+            return Err(invalid_parameter(crate::state::empty_filter_list(
+                "DirectoryIds",
+                "DirectoryId",
+            )));
         }
 
         // Nothing caller-sized reaches the store, or the store LOCK, unchecked: the

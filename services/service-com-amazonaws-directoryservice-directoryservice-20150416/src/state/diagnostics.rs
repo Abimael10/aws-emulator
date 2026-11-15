@@ -33,19 +33,33 @@ pub fn invalid_directory_id(directory_id: &str) -> String {
     format!("Invalid directory ID: {directory_id}.")
 }
 
+/// The `InvalidParameterException` message a reporting operation whose FILTER arrived as an
+/// EMPTY list is refused with.
+///
+/// Those filters are the members whose own documentation makes an empty list an
+/// `InvalidParameterException` — `DescribeDirectories$DirectoryIds`,
+/// `DescribeEventTopics$TopicNames` and `DescribeTrusts$TrustIds`, each of which reads "An
+/// empty list results in an InvalidParameterException being thrown" — and Directory Service
+/// words all of them one way: that the member, IF the request specifies it, has to carry at
+/// least one of the things it is a list of. `member` is that member as the model spells it
+/// and `element` the shape its entries carry, so the sentence names what the caller has to
+/// put in the request. [`refusal`] appends the request id, once.
+pub fn empty_filter_list(member: &str, element: &str) -> String {
+    format!("If specified, {member} must have at least one {element}.")
+}
+
 /// The same report for an operation whose filter is a LIST of directory ids
 /// (`DescribeDirectories$DirectoryIds`): every id the store could not resolve, in the
-/// order the filter is scanned, separated by a BARE comma, under the plural spelling of
-/// the member the ids arrived in. [`refusal`] appends the request id, once.
+/// order the filter is scanned, separated the way AWS separates the values of one member
+/// it quotes back — a comma and a space — under the plural spelling of the member the ids
+/// arrived in. [`refusal`] appends the request id, once.
 ///
-/// The separator carries no space, so a client that splits the message on `,` to recover
-/// which ids were rejected gets the ids themselves, and the order is the filter's rather
-/// than a sorted one, so the nth name answers the nth id the request sent that the store
-/// could not resolve.
+/// The order is the filter's rather than a sorted one, so the nth name answers the nth id
+/// the request sent that the store could not resolve.
 pub fn invalid_directory_ids(directory_ids: &[String]) -> String {
     format!(
         "Invalid directory ID(s): {ids}.",
-        ids = directory_ids.join(",")
+        ids = directory_ids.join(", ")
     )
 }
 

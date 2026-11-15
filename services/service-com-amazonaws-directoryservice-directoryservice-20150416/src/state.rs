@@ -85,11 +85,19 @@ mod account_credentials;
 /// toggles record and the wording each of their refusals is stated with. Re-exported
 /// below, so the three operations that reach it do so as `crate::state::<name>`.
 pub mod ca_enrollment_policy;
+/// Resolving the certificate a certificate read or deregistration names, and which of the
+/// two modelled absences that resolution reports. Re-exported below, so both operations
+/// reach one decision as `crate::state::<name>`.
+mod certificate_lookup;
 /// The teardown `DeleteDirectory` starts, and the clock that finishes it. Re-exported
 /// below, so its stages are reached as `crate::state::<name>` like every other stage.
 mod directory_deletion;
 pub mod directory_network;
 pub mod directory_servers;
+/// The NetBIOS short-name rule a create's `ShortName` has to satisfy, and the sentence a
+/// create that breaks it is refused with. Re-exported below, so every create that names a
+/// short name reaches one decision as `crate::state::<name>`.
+pub mod directory_short_name;
 pub mod directory_updates;
 pub mod ec2_network_interfaces;
 pub mod ec2_security_groups;
@@ -105,12 +113,14 @@ pub use ca_enrollment_policy::{
     CA_ENROLLMENT_POLICY_ABSENT, CA_ENROLLMENT_POLICY_DISABLED, CA_ENROLLMENT_POLICY_DISABLING,
     CA_ENROLLMENT_POLICY_EXISTS, CA_ENROLLMENT_POLICY_IN_PROGRESS, CA_ENROLLMENT_POLICY_SUCCESS,
 };
+pub use certificate_lookup::CertificateAbsence;
 pub use diagnostics::*;
 pub use directory_deletion::{STAGE_DELETED, STAGE_DELETING};
 pub use directory_updates::UpdateActivityRecord;
 
 pub use directory_network::{address_after, server_address, SubnetNetwork};
 pub use directory_servers::{os_version_of, MICROSOFT_AD_OS_VERSION};
+pub use directory_short_name::{invalid_short_name, short_name_defect};
 pub use ec2_network_interfaces::{
     provision_server_interfaces, release_server_interfaces, ServerInterface,
 };
@@ -118,7 +128,7 @@ pub use ec2_security_groups::{
     placement_vpc_id, provision_controllers_group, release_controllers_group,
 };
 pub use ec2_subnets::{resolve_subnet_networks, vpc_absence};
-pub use subnet_zones::single_zone_defect;
+pub use subnet_zones::placement_defect;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};

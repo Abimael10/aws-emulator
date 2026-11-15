@@ -17,7 +17,8 @@
 //!   placement rule that a directory's servers sit in two subnets in two Availability Zones
 //!   (every create that places servers in a VPC);
 //! * a refusal that reports the VALUES of a list filter names them in the order the filter
-//!   sent them, separated by a bare comma, so splitting the message on `,` recovers the ids
+//!   sent them, separated the way AWS separates the values of one member it quotes back — a
+//!   comma and a space — so splitting the message on that separator recovers the ids
 //!   the caller has to fix (`DescribeDirectories`);
 //! * `DirectoryDescription$AccessUrl` is the HOST the directory's alias names — no scheme,
 //!   no path — whichever create made the directory and whether or not an alias was
@@ -266,17 +267,18 @@ async fn the_subnet_pair_rule_is_stated_identically_by_every_placement() {
 }
 
 /// RULE: an operation whose filter is a LIST of directory ids reports every id it could not
-/// resolve, in the order the filter sent them, separated by a bare comma — so a client that
-/// splits the message on `,` recovers exactly the ids it has to fix.
+/// resolve, in the order the filter sent them, separated the way AWS separates the values of
+/// one member it quotes back — a comma and a space — so a client that splits the message on
+/// that separator recovers exactly the ids it has to fix.
 #[tokio::test]
-async fn unresolvable_filter_ids_are_named_in_filter_order_with_bare_commas() {
+async fn unresolvable_filter_ids_are_named_in_filter_order() {
     let router = service();
 
     // One stored directory, so a row mixing a resolvable id with absent ones reports only
-    // the absent ones.
+    // the absent ones. The filter resolves the record from the create on, so nothing here
+    // waits for the stage chain that create owes.
     let stored = create_directory(&router, minimal_create("stored.example.com"), "the stored one")
         .await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
 
     // Rows differing in count, order and whether a resolvable id or a repeat is mixed in.
     let rows: Vec<(&str, Vec<String>, Vec<&str>)> = vec![
@@ -338,24 +340,24 @@ async fn unresolvable_filter_ids_are_named_in_filter_order_with_bare_commas() {
             "case {case:?}: expected the modelled filter-value refusal, got {parsed}"
         );
         let (message, request_id) = refusal(&parsed, case);
-        let named = expected.join(",");
+        let named = expected.join(", ");
         assert_eq!(
             message,
             with_request_id(&format!("Invalid directory ID(s): {named}."), &request_id),
             "case {case:?}: expected the unresolved ids in filter order, got {message:?}"
         );
         // What a client does with the message: split the list on the separator and get the
-        // ids back, with nothing to trim.
+        // ids back.
         let recovered: Vec<&str> = message
             .split_once("Invalid directory ID(s): ")
             .map(|(_, rest)| rest)
             .and_then(|rest| rest.split_once('.'))
-            .map(|(ids, _)| ids.split(',').collect())
+            .map(|(ids, _)| ids.split(", ").collect())
             .unwrap_or_default();
         assert_eq!(
             recovered, *expected,
-            "case {case:?}: expected the ids to be recoverable by splitting on a comma, \
-             got {recovered:?}"
+            "case {case:?}: expected the ids to be recoverable by splitting on the \
+             separator, got {recovered:?}"
         );
     }
 

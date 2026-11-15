@@ -14,5 +14,10 @@
 //! `all_rs_is_a_canonical_declaration_list.rs` reports and which fails every suite of this
 //! target. They are dropped here for the same reason as the first run.
 //!
+//! A THIRD run had grown back the same way, again as ordinary comments below the last
+//! declaration, and two landings had left their own declaration pair inside it rather than in
+//! the sorted list. The pairs were moved into the places their names sort to and the prose was
+//! dropped, for the same reason as the two runs before it.
+//!
 //! The module stays declared because it is a file under `tests/all/`, which this crate's
 //! build script requires a declaration for.
