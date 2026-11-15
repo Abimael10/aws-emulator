@@ -263,6 +263,8 @@ mod published_instance_type_value_set;
 mod published_package_catalog;
 #[path = "all/reference_catalogs.rs"]
 mod reference_catalogs;
+#[path = "all/required_query_refusal.rs"]
+mod required_query_refusal;
 #[path = "all/reserved_instance_offerings.rs"]
 mod reserved_instance_offerings;
 #[path = "all/reserved_instances.rs"]
