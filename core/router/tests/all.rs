@@ -1,5 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: the CANONICAL DECLARATION LIST of every
+// cross-service suite under `tests/all/`, and nothing else.
+//
+// Put a new suite at `tests/all/<name>.rs` and insert ONE `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair into the sorted list below, in the one place its name sorts to. The list
+// holds those pairs and no other line — no prose between them, and NOTHING after the last one
+// — so two branches landing at once insert two lines in two places and have nothing to
+// duplicate, re-word or mistype.
+//
+// EVERY comment in this file is an ORDINARY `//` one, this header included: a doc comment of
+// the enclosing module is legal only ahead of the first item, so one left below the list
+// compiles no suite of this target at all, and with none anywhere in the file there is no such
+// line to copy. A suite file no `mod` names is compiled nowhere, a name declared twice compiles
+// neither copy, and a suite left at the top level of `tests/` fails the build. This file is a
+// test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of it, which the layout
+// check refuses: the `#[path]` above each `mod` is what points it into `tests/all/`.
+//
+// Suites of this target pin all of that rather than restate it:
 // Single integration-test target for the router: the canonical DECLARATION LIST of every
 // cross-service suite under `tests/all/`, and nothing else.
 //
@@ -23,14 +41,17 @@
 // note about THIS file belongs in `all/appended_notes.rs`. The suites
 // `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
-// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
-// `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
-// and for every service crate's `tests/all.rs`, so check there rather than leaving a note
-// here.
-// The header paragraphs above wrap without the indentation `clippy::doc_lazy_continuation`
-// asks of a doc list item; the lint is allowed here so a header line is a header line rather
-// than a build failure. An inner attribute, like an inner doc comment, is legal only before
-// the first item, so it stands here rather than in the list below.
+// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs`,
+// `all/declaration_roots_are_canonical_and_complete.rs` and
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs`, for this file and
+// for every service crate's own `tests/all.rs`. What a suite covers belongs in that suite's own
+// module header, and a note about THIS file in `all/appended_notes.rs`, declared below like any
+// other file.
+//
+// The paragraphs above wrap without the indentation `clippy::doc_lazy_continuation` asks of a
+// doc list item; the lint is allowed here so a header line is a header line rather than a build
+// failure. An inner attribute, like an inner doc comment, is legal only before the first item,
+// so it stands here rather than in the list.
 #![allow(clippy::doc_lazy_continuation)]
 #[path = "all/agent_registry_signing_name_routing.rs"]
 mod agent_registry_signing_name_routing;

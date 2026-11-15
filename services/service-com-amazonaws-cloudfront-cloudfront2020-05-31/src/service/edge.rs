@@ -50,7 +50,14 @@
 //!    through the emulator this service is running within — over the scheme that origin's
 //!    own `OriginProtocolPolicy` names ([`origin_uri`]) and as the distribution's own origin
 //!    access control says that origin is to be addressed (see below);
-//! 8. and whatever the answer turns out to be — the origin's, the cache's, or a page
+//! 9. a viewer that asked for part of the object is answered that part of it and no more:
+//!    the edge evaluates the `Range` it sent against the representation it is about to serve,
+//!    whether the cache held it or the origin has just produced it, so a satisfiable window is
+//!    answered `206` with those bytes alone and a range that selects nothing is refused `416`
+//!    carrying none of them ([`byte_range`]). The origin is therefore always asked for the
+//!    COMPLETE representation ([`HEADERS_NEVER_FORWARDED`] holds the viewer's `Range`), so one
+//!    viewer's window is never what the cache ends up holding for the object;
+//! 10. and whatever the answer turns out to be — the origin's, the cache's, or a page
 //!    CloudFront generated itself — the header groups of the behaviour's
 //!    `ResponseHeadersPolicyId` are applied to it: the CORS headers for a viewer whose
 //!    `Origin` the policy grants, the security and custom headers it configures, and the
@@ -136,6 +143,9 @@
 /// The STANDARD LOGGING v2 access-log record one served viewer request produces, and the
 /// CloudWatch Logs log groups the account's vended-log deliveries carry it into.
 pub mod access_logs;
+/// WHICH part of the object a viewer asking for a byte range is answered with: the window it
+/// selected, or the refusal of a range that selects none of it.
+pub mod byte_range;
 /// The content encodings the edge compresses an answer with, and the bytes they produce.
 pub mod compression;
 /// WHICH headers, cookies and query strings the behaviour's policies key on and forward.
@@ -316,12 +326,17 @@ const METHOD_NOT_ALLOWED_DETAIL: &str =
 /// edge's value and never a viewer's — a header a viewer sent under that name describes a
 /// request the edge did not serve. The whole `CloudFront-*` family is dropped for that same
 /// reason, through [`generated_headers::is_generated`].
-const HEADERS_NEVER_FORWARDED: [&str; 12] = [
+///
+/// The viewer's `Range` is here for a third reason: the edge evaluates a byte range ITSELF,
+/// against the whole representation it holds ([`byte_range`]), so the origin is asked for that
+/// whole representation and every window of it can be served from one cached object.
+const HEADERS_NEVER_FORWARDED: [&str; 13] = [
     "authorization",
     "connection",
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
+    byte_range::RANGE,
     "te",
     "trailer",
     "transfer-encoding",
@@ -1249,6 +1264,18 @@ pub async fn serve<Eng: Send + Sync + 'static>(
             }
         },
     };
+    // The viewer's byte RANGE, evaluated by the edge over the representation it is about to
+    // serve — the entry its cache held, or the answer the origin has just produced: the window
+    // the viewer selected is answered with those bytes alone, and a range that selects none of
+    // the object is refused rather than widened into the whole object ([`byte_range`]). Only an
+    // answer that IS the object has a window to take, so a page CloudFront generated itself is
+    // left as it is.
+    if matches!(
+        served_from,
+        edge_metrics::ServedFrom::Origin | edge_metrics::ServedFrom::EdgeCache
+    ) {
+        byte_range::apply(req.headers().get(byte_range::RANGE), &method, &mut response);
+    }
     // The header groups of the response headers policy the matched behaviour attaches, put on
     // the answer CloudFront is about to serve — whoever produced it, since the policy is the
     // distribution's statement about the RESPONSE rather than about the origin

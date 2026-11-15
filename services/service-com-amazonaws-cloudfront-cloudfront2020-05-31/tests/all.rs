@@ -152,6 +152,8 @@ mod edge_geo_restriction;
 mod edge_lambda_url_origin;
 #[path = "all/edge_origin_response_headers.rs"]
 mod edge_origin_response_headers;
+#[path = "all/edge_range_requests.rs"]
+mod edge_range_requests;
 #[path = "all/edge_realtime_logs.rs"]
 mod edge_realtime_logs;
 #[path = "all/edge_request_metrics.rs"]

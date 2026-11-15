@@ -318,6 +318,10 @@ pub mod authentication_refusal;
 /// the same report differently.
 pub mod batch_item_failures;
 pub mod bedrock;
+/// The ONE reading of an HTTP `Range` request header — the span it selects of a
+/// representation, the refusal of one it cannot satisfy, and the header to ignore — for every
+/// service that serves part of bytes it holds.
+pub mod byte_range;
 /// The ONE definition of the IAM principal this emulator's own long-term credential speaks
 /// for: the user STS reports as the caller and IAM holds among the account's users, so the
 /// two cannot disagree about who the caller is.

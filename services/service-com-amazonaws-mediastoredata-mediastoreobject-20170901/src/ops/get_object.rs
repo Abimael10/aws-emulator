@@ -254,42 +254,26 @@ impl ByteSpan {
     /// The span a `Range` header selects from an object of `total` bytes, or `None`
     /// when no byte of the object satisfies it.
     ///
-    /// The modelled `RangePattern` (`^bytes=(?:\d+\-\d*|\d*\-\d+)$`) admits the three
-    /// RFC 9110 byte-range forms, read here with RFC 9110 §14.1.2 semantics: `first-last`
-    /// (clamped to the last byte), `first-` (to the end of the object), and `-suffix`
-    /// (the final `suffix` bytes). A first byte at or past the end, an inverted span, a
-    /// zero-length suffix, and an empty object satisfy nothing.
+    /// WHAT a `Range` header asks of a representation of a given size is HTTP's rule, read
+    /// once for the whole tree ([`::service_common::byte_range`]). The modelled
+    /// `RangePattern` (`^bytes=(?:\d+\-\d*|\d*\-\d+)$`) admits the three RFC 9110 byte-range
+    /// forms that reading covers: `first-last` (clamped to the last byte), `first-` (to the
+    /// end of the object), and `-suffix` (the final `suffix` bytes).
+    ///
+    /// This service answers one modelled error for every header its pattern admits and no
+    /// byte of the object satisfies, so both of that reading's non-span outcomes — a range
+    /// the object cannot satisfy, and a header HTTP would have served whole — are `None`
+    /// here, which the caller reports as `RequestedRangeNotSatisfiableException`.
     fn resolve(range: &str, total: u64) -> Option<Self> {
-        let (start, end) = range.strip_prefix("bytes=")?.split_once('-')?;
-        if total == 0 {
-            return None;
+        let total = usize::try_from(total).ok()?;
+        match ::service_common::byte_range::requested_range(range, total) {
+            ::service_common::byte_range::RangeRequest::Span(span) => Some(Self {
+                first: u64::try_from(span.first()).ok()?,
+                last: u64::try_from(span.last()).ok()?,
+            }),
+            ::service_common::byte_range::RangeRequest::Unsatisfiable
+            | ::service_common::byte_range::RangeRequest::Ignored => None,
         }
-        let span = match (start.is_empty(), end.is_empty()) {
-            // `-suffix`: the last `suffix` bytes, clamped to the whole object.
-            (true, false) => {
-                let suffix = end.parse::<u64>().ok()?;
-                if suffix == 0 {
-                    return None;
-                }
-                Self {
-                    first: total.saturating_sub(suffix),
-                    last: total - 1,
-                }
-            }
-            // `first-`: from `first` to the end of the object.
-            (false, true) => Self {
-                first: start.parse::<u64>().ok()?,
-                last: total - 1,
-            },
-            // `first-last`: `last` past the end means to the end of the object.
-            (false, false) => Self {
-                first: start.parse::<u64>().ok()?,
-                last: end.parse::<u64>().ok()?.min(total - 1),
-            },
-            // `bytes=-` names no bytes; the modelled pattern already refuses it.
-            (true, true) => return None,
-        };
-        (span.first <= span.last && span.first < total).then_some(span)
     }
 
     /// The `Content-Range` header value for this span of an object of `total` bytes,
@@ -322,6 +306,8 @@ mod tests {
             ("bytes=100-200", 16, None),
             ("bytes=-0", 16, None),
             ("bytes=0-4", 0, None),
+            ("bytes=9-4", 16, None),
+            ("bytes=0-4,8-9", 16, None),
         ];
         for (range, total, expected) in cases {
             let actual = ByteSpan::resolve(range, *total).map(|s| (s.first, s.last));

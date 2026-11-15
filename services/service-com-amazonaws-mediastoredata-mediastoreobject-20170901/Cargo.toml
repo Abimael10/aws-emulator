@@ -25,6 +25,9 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex: the modelled SHA256Hash/ETag rendering and the opaque ListItems NextToken.
 hex = { workspace = true }
+# `service-common` carries the tree's ONE reading of an HTTP `Range` header, which this
+# service's object read resolves a byte span through (`service_common::byte_range`).
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

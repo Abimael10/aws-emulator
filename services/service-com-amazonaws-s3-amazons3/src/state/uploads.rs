@@ -1123,137 +1123,17 @@ impl ObjectPartRecord {
     }
 }
 
-/// One span of an object's bytes: the first and last byte INCLUSIVE, the way HTTP's
-/// `Content-Range` and `Range` both state a span.
+/// One span of an object's bytes, what a `Range` header asks of an object of a given size,
+/// and the reading that decides between them: HTTP's own rule, read once for the whole tree
+/// ([`::service_common::byte_range`]) so this service and every other that serves a ranged
+/// read answer the same span, the same refusal and the same ignored header.
 ///
-/// Non-empty by construction ([`ByteSpan::new`]), because an empty span is not a span HTTP
-/// can state: `Content-Range` names a first and a last byte, so a response can only report
-/// one that holds at least one byte.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ByteSpan {
-    /// The first byte of the span, counted from zero.
-    pub(super) first: usize,
-    /// The LAST byte of the span, inclusive.
-    pub(super) last: usize,
-}
-
-impl ByteSpan {
-    /// The span from `first` to `last` inclusive, or `None` when that is no span at all
-    /// (`last` before `first`).
-    pub fn new(first: usize, last: usize) -> Option<Self> {
-        (first <= last).then_some(Self { first, last })
-    }
-
-    /// The first byte of the span.
-    pub fn first(self) -> usize {
-        self.first
-    }
-
-    /// The last byte of the span, inclusive.
-    pub fn last(self) -> usize {
-        self.last
-    }
-
-    /// How many bytes the span holds — what `Content-Length` reports for a response carrying
-    /// it, since "Content-Length is the length of the body actually being returned".
-    pub fn len(self) -> usize {
-        self.last - self.first + 1
-    }
-
-    /// Never empty: see [`ByteSpan`].
-    pub fn is_empty(self) -> bool {
-        false
-    }
-
-    /// Those bytes of `body`, clamped to what it holds so a span can never read past it.
-    pub fn slice(self, body: &[u8]) -> Vec<u8> {
-        let first = self.first.min(body.len());
-        let end = (self.last + 1).min(body.len());
-        body[first..end].to_vec()
-    }
-
-    /// The `Content-Range` header value for this span of a representation of `total` bytes:
-    /// `bytes <first>-<last>/<total>`, the one form RFC 9110 (HTTP Semantics, "Content-Range")
-    /// defines for a `bytes` range.
-    pub fn content_range(self, total: usize) -> String {
-        format!("bytes {}-{}/{}", self.first, self.last, total)
-    }
-}
-
-/// What a `Range` header asks of a representation of a given size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RangeRequest {
-    /// The header asks for exactly this span.
-    Span(ByteSpan),
-    /// The header is well formed but asks for bytes the representation does not have, which
-    /// is the one range condition HTTP answers with a refusal ([`INVALID_RANGE_CODE`]).
-    Unsatisfiable,
-    /// The header asks for nothing this emulator can answer as a single range — a form the
-    /// `bytes` unit does not define, or several ranges at once, which "Amazon S3 doesn't
-    /// support retrieving multiple ranges of data per `GET` request"
-    /// (`GetObjectRequest$Range`). RFC 9110 lets a server "ignore a Range header field",
-    /// which is what S3 does: the whole representation is served.
-    Ignored,
-}
-
-/// What the `Range` header `header` asks of a representation of `total` bytes.
-///
-/// The `bytes` unit's three forms, from RFC 9110's "Range" grammar: `bytes=<first>-<last>`,
-/// `bytes=<first>-` (to the end) and `bytes=-<suffix>` (the last `<suffix>` bytes). A
-/// `<last>` past the end is clamped to it, because the span is "the remaining bytes of the
-/// representation" in that case, and a suffix longer than the representation selects the
-/// whole of it.
-///
-/// One place for the rule, so every reader that serves a ranged request ([`Object`]'s own
-/// readers) answers the same span, the same refusal and the same ignored header.
-pub fn requested_range(header: &str, total: usize) -> RangeRequest {
-    let Some(set) = header.trim().strip_prefix("bytes=") else {
-        // Another unit entirely: "An origin server MUST ignore a Range header field that
-        // contains a range unit it does not understand" (RFC 9110).
-        return RangeRequest::Ignored;
-    };
-    let mut spans = set.split(',');
-    let (Some(single), None) = (spans.next(), spans.next()) else {
-        return RangeRequest::Ignored;
-    };
-    let Some((first, last)) = single.trim().split_once('-') else {
-        return RangeRequest::Ignored;
-    };
-    let (first, last) = (first.trim(), last.trim());
-    match (first.parse::<usize>(), last.parse::<usize>()) {
-        // `bytes=-<suffix>`: the last `suffix` bytes. A zero-length suffix selects nothing,
-        // which is unsatisfiable, and so is any suffix of an empty representation.
-        (Err(_), Ok(suffix)) if first.is_empty() => {
-            if suffix == 0 || total == 0 {
-                return RangeRequest::Unsatisfiable;
-            }
-            let first = total.saturating_sub(suffix);
-            ByteSpan::new(first, total - 1).map_or(RangeRequest::Unsatisfiable, RangeRequest::Span)
-        }
-        // `bytes=<first>-` : from `first` to the end of the representation.
-        (Ok(first), Err(_)) if last.is_empty() => {
-            if first >= total {
-                return RangeRequest::Unsatisfiable;
-            }
-            ByteSpan::new(first, total - 1).map_or(RangeRequest::Unsatisfiable, RangeRequest::Span)
-        }
-        // `bytes=<first>-<last>` : the span, with `last` clamped to the final byte. A
-        // `<last>` BEFORE `<first>` makes the spec "syntactically invalid" (RFC 9110's
-        // `byte-range-spec` grammar), which is a header to ignore rather than a range to
-        // refuse: the refusal is for a valid range the representation cannot satisfy.
-        (Ok(first), Ok(last)) => {
-            if last < first {
-                return RangeRequest::Ignored;
-            }
-            if first >= total {
-                return RangeRequest::Unsatisfiable;
-            }
-            ByteSpan::new(first, last.min(total - 1))
-                .map_or(RangeRequest::Unsatisfiable, RangeRequest::Span)
-        }
-        _ => RangeRequest::Ignored,
-    }
-}
+/// What is S3's OWN about a ranged read stays here: the refusal it answers an unsatisfiable
+/// range with ([`INVALID_RANGE_CODE`] and the two constants under it) and the unit it
+/// advertises ([`ACCEPT_RANGES_BYTES`]). "Amazon S3 doesn't support retrieving multiple ranges
+/// of data per `GET` request" (`GetObjectRequest$Range`), which is one of the headers that
+/// shared reading ignores, so the whole object is served for it.
+pub use ::service_common::byte_range::{requested_range, ByteSpan, RangeRequest};
 
 /// The code S3 answers a read whose `Range` asks for bytes the object does not have:
 /// `InvalidRange`, HTTP 416 — not a shape in this model, so it travels through the
