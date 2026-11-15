@@ -19,6 +19,10 @@
 //! status, and a `StopExecution` while the task is parked, with and without an `error`
 //! and `cause`).
 //!
+//! The stop is scoped to the run the task SUBMITTED: a run of the same job that no
+//! execution owns is left to its own outcome, and a stop the service refuses never
+//! crosses the service boundary at all.
+//!
 //! Nothing here asserts a value this emulator invented: the job run id comes off the
 //! submission event, every expectation about the run is read through `GetJobRun`, and
 //! the cause the task fails with is Glue's own report of that run, whose
@@ -1012,6 +1016,362 @@ async fn stopping_a_parked_execution_stops_the_glue_job_run_it_started() {
                 .iter()
                 .any(|event| event == "TaskSucceeded" || event == "TaskFailed"),
             "case {case:?}: a stopped task has neither succeeded nor failed, got {types:?}"
+        );
+    }
+}
+
+/// The `JobRunState` a submitted stop brings a run to rest in, and the state a run a stop
+/// has been submitted for passes through on the way (`JobRunState`, as
+/// `smithy_query(query="shape",shape="JobRunState",model_path="services/service-com-amazonaws-glue-awsglue/smithy-model/com-amazonaws-glue-awsglue.json")`
+/// lists them).
+const STOPPED: &str = "STOPPED";
+/// See [`STOPPED`].
+const STOPPING: &str = "STOPPING";
+
+/// The published maxima of what a stop may carry: `StopExecution` takes `error`
+/// (`SensitiveError`, `@length` 0..256) and `cause` (`SensitiveCause`, `@length`
+/// 0..32768) —
+/// `smithy_query(query="operation",operation="StopExecution",model_path="services/service-com-amazonaws-sfn-awsstepfunctions/smithy-model/com-amazonaws-sfn-awsstepfunctions.json")`.
+const MAX_STOP_ERROR_CHARS: usize = 256;
+/// See [`MAX_STOP_ERROR_CHARS`].
+const MAX_STOP_CAUSE_CHARS: usize = 32768;
+
+/// One row of the propagation table: what the task asked for, and what the stop carries.
+struct StopPropagationCase {
+    case: &'static str,
+    /// The revision of the pattern the `Resource` asks for.
+    suffix: &'static str,
+    /// Whether the job's name reaches `StartJobRun` through a payload template taken from
+    /// the execution's input rather than as a literal member of the state's `Parameters`.
+    from_input: bool,
+    /// The `error` and `cause` the stop carries, which the aborted execution must report
+    /// back exactly.
+    error: Option<String>,
+    cause: Option<String>,
+}
+
+/// Create the Glue job `name`, admitting the two runs a row keeps in flight at once, and
+/// answer its name.
+///
+/// A job takes no further run than "the maximum number of concurrent runs allowed for the
+/// job" (`ExecutionProperty$MaxConcurrentRuns`), and a row runs the one its task submits
+/// beside one no execution owns.
+async fn create_job_for_two_runs(router: &MultiServiceRouter, name: &str) -> String {
+    let created = glue(
+        router,
+        "CreateJob",
+        &json!({
+            "Name": name,
+            "Role": format!("arn:aws:iam::{ACCOUNT}:role/GlueJobRole"),
+            "Command": {
+                "Name": "pythonshell",
+                "ScriptLocation": format!("s3://sim2real-sfn-glue/{name}.py")
+            },
+            "ExecutionProperty": { "MaxConcurrentRuns": 2 }
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.get("Name").and_then(Value::as_str),
+        Some(name),
+        "setup: CreateJob must answer with the name it stored, got {created:?}"
+    );
+    name.to_string()
+}
+
+/// Start one run of `job_name` through Glue's own API — a run no execution owns — and
+/// answer the `JobRunId` it was minted under.
+async fn start_bystander_run(router: &MultiServiceRouter, job_name: &str) -> String {
+    let started = glue(router, "StartJobRun", &json!({ "JobName": job_name })).await;
+    string("setup", &started, "JobRunId")
+}
+
+/// `StopExecution`, answering the status and body it came back with, so a row can assert a
+/// refusal as well as a stop. A member the row names none of is not sent at all.
+async fn stop_execution(
+    router: &MultiServiceRouter,
+    execution_arn: &str,
+    error: Option<&str>,
+    cause: Option<&str>,
+) -> (u16, Value) {
+    let mut request = json!({ "executionArn": execution_arn });
+    let members = request.as_object_mut().expect("the request is an object");
+    if let Some(error) = error {
+        members.insert("error".to_string(), json!(error));
+    }
+    if let Some(cause) = cause {
+        members.insert("cause".to_string(), json!(cause));
+    }
+    call(
+        router,
+        "states",
+        "AWSStepFunctions",
+        "1.0",
+        "StopExecution",
+        &request,
+    )
+    .await
+}
+
+/// The runs Glue holds for `job_name`, as `GetJobRuns` reports them.
+async fn job_runs(router: &MultiServiceRouter, job_name: &str) -> Vec<Value> {
+    let answered = glue(router, "GetJobRuns", &json!({ "JobName": job_name })).await;
+    answered
+        .get("JobRuns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The `JobRunState` of `run`, as text.
+fn run_state(run: &Value) -> String {
+    run.get("JobRunState")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The `__type` discriminator of an awsJson error body, without its namespace.
+fn refusal_type(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or("<no __type>")
+        .rsplit(['#', ':'])
+        .next()
+        .unwrap_or("<no __type>")
+        .to_string()
+}
+
+/// Stopping an execution parked at a Glue job run stops THE RUN ITS TASK SUBMITTED — and
+/// no other run of that job — and leaves the execution `ABORTED` carrying back exactly the
+/// `error` and `cause` the caller passed.
+///
+/// `stopping_a_parked_execution_stops_the_glue_job_run_it_started` pins the propagation for
+/// one shape of task; these rows vary what the rule generalises over — the revision of the
+/// pattern the `Resource` asks for, how the document the state builds names the job, and
+/// what the stop carries (a short error and cause, both at their published maxima, and
+/// multi-byte text) — and each row runs a second run of the SAME job beside the task's own,
+/// started through Glue's own API and owned by no execution. The stopping call the
+/// integration names addresses the run the submission reported, so that second run is left
+/// to its own outcome: a stop is scoped to the job run the task started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_reaches_the_submitted_run_alone_and_carries_the_callers_words_back() {
+    let rows = [
+        StopPropagationCase {
+            case: "a stop naming an error and a cause, the pattern's first revision",
+            suffix: ".sync",
+            from_input: false,
+            error: Some("sim2real.Stop".to_string()),
+            cause: Some("stop while parked".to_string()),
+        },
+        StopPropagationCase {
+            case: "both members at their published maxima, through the second revision \
+                   with the job named from the execution's input",
+            suffix: ".sync:2",
+            from_input: true,
+            error: Some("e".repeat(MAX_STOP_ERROR_CHARS)),
+            cause: Some("c".repeat(MAX_STOP_CAUSE_CHARS)),
+        },
+        StopPropagationCase {
+            case: "a stop whose words are multi-byte text and a JSON document",
+            suffix: ".sync",
+            from_input: false,
+            error: Some("sim2réal.Arrêt".to_string()),
+            cause: Some(json!({ "raison": "arrêté", "note": "ünicode" }).to_string()),
+        },
+    ];
+
+    let router = build_router();
+    for (index, row) in rows.iter().enumerate() {
+        let job_name = create_job_for_two_runs(&router, &format!("sfn-glue-scoped-{index}")).await;
+        // A run of the SAME job that no execution owns, in flight beside the task's own.
+        let bystander = start_bystander_run(&router, &job_name).await;
+        let parameters = match row.from_input {
+            true => json!({ "JobName.$": "$.job" }),
+            false => json!({ "JobName": job_name }),
+        };
+        let machine = create_machine(
+            &router,
+            &format!("sfn-glue-scoped-machine-{index}"),
+            &definition(row.suffix, parameters),
+        )
+        .await;
+        let started = sfn(
+            &router,
+            "StartExecution",
+            &json!({
+                "stateMachineArn": machine,
+                "name": format!("scoped-{index}"),
+                "input": json!({ "job": job_name }).to_string()
+            }),
+        )
+        .await;
+        let execution_arn = string(row.case, &started, "executionArn");
+        let run_id = submitted_job_run(&router, row.case, &execution_arn).await;
+        assert_ne!(
+            run_id, bystander,
+            "case {:?}: the task must submit a run of its own, got {run_id}",
+            row.case
+        );
+
+        let (status, stopped) = stop_execution(
+            &router,
+            &execution_arn,
+            row.error.as_deref(),
+            row.cause.as_deref(),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected the stop to be served, got {status} with {stopped:?}",
+            row.case
+        );
+        assert!(
+            stopped.get("stopDate").is_some(),
+            "case {:?}: expected a stopDate, got {stopped:?}",
+            row.case
+        );
+
+        // (a) the run the task submitted was stopped, through Glue's own stopping call;
+        let run = settled_job_run(&router, row.case, &job_name, &run_id).await;
+        assert_eq!(
+            run_state(&run),
+            STOPPED,
+            "case {:?}: expected the submitted run stopped with the execution, got {run:?}",
+            row.case
+        );
+        // (b) and no other run of that job was: the one beside it ran to its own end.
+        let other = settled_job_run(&router, row.case, &job_name, &bystander).await;
+        assert_ne!(
+            run_state(&other),
+            STOPPED,
+            "case {:?}: a run no execution owns is not stopped with one, got {other:?}",
+            row.case
+        );
+        let stopped_runs: Vec<String> = job_runs(&router, &job_name)
+            .await
+            .iter()
+            .filter(|run| {
+                let state = run_state(run);
+                state == STOPPED || state == STOPPING
+            })
+            .filter_map(|run| run.get("Id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        assert_eq!(
+            stopped_runs,
+            vec![run_id.clone()],
+            "case {:?}: expected the submitted run to be the only one stopped, got \
+             {stopped_runs:?}",
+            row.case
+        );
+        // (c) the execution reports the words the caller passed, byte for byte;
+        let after = described(&router, &execution_arn).await;
+        assert_eq!(
+            after.get("status").and_then(Value::as_str),
+            Some("ABORTED"),
+            "case {:?}: expected ABORTED, got {after:?}",
+            row.case
+        );
+        assert_eq!(
+            after.get("error").and_then(Value::as_str),
+            row.error.as_deref(),
+            "case {:?}: expected the error the caller passed, got {:?}",
+            row.case,
+            after.get("error")
+        );
+        assert_eq!(
+            after.get("cause").and_then(Value::as_str),
+            row.cause.as_deref(),
+            "case {:?}: expected the cause the caller passed, got {:?}",
+            row.case,
+            after.get("cause")
+        );
+        // (d) and the history ends on the abort, with no outcome claimed for the task.
+        let types = history_types(&router, &execution_arn).await;
+        assert_eq!(
+            types.last().map(String::as_str),
+            Some("ExecutionAborted"),
+            "case {:?}: expected the history to end on ExecutionAborted, got {types:?}",
+            row.case
+        );
+        assert!(
+            types.iter().any(|event| event == "TaskSubmitted"),
+            "case {:?}: expected the submission of the job run in {types:?}",
+            row.case
+        );
+        assert!(
+            !types
+                .iter()
+                .any(|event| event == "TaskSucceeded" || event == "TaskFailed"),
+            "case {:?}: a stopped task has neither succeeded nor failed, got {types:?}",
+            row.case
+        );
+    }
+}
+
+/// A stop the service REFUSES propagates NOTHING: the job run the task submitted is left to
+/// its own outcome and the execution is not aborted.
+///
+/// The rows sit one character past each published bound of what a stop may carry — the pair
+/// the table above stops AT — so each is a request `StopExecution` answers with its modelled
+/// `ValidationException` rather than a stop to cross the service boundary with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_stop_leaves_the_submitted_run_and_the_execution_alone() {
+    let rows: [(&str, Option<String>, Option<String>); 2] = [
+        (
+            "an error one character past its published maximum",
+            Some("e".repeat(MAX_STOP_ERROR_CHARS + 1)),
+            None,
+        ),
+        (
+            "a cause one character past its published maximum",
+            None,
+            Some("c".repeat(MAX_STOP_CAUSE_CHARS + 1)),
+        ),
+    ];
+
+    let router = build_router();
+    for (index, (case, error, cause)) in rows.iter().enumerate() {
+        let job_name = create_job(&router, &format!("sfn-glue-refused-{index}")).await;
+        let machine = create_machine(
+            &router,
+            &format!("sfn-glue-refused-machine-{index}"),
+            &definition(".sync", json!({ "JobName": job_name })),
+        )
+        .await;
+        let started = sfn(
+            &router,
+            "StartExecution",
+            &json!({ "stateMachineArn": machine, "name": format!("refused-{index}") }),
+        )
+        .await;
+        let execution_arn = string(case, &started, "executionArn");
+        let run_id = submitted_job_run(&router, case, &execution_arn).await;
+
+        let (status, body) =
+            stop_execution(&router, &execution_arn, error.as_deref(), cause.as_deref()).await;
+        assert_eq!(
+            (status, refusal_type(&body).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected the stop refused, got {status} with {body:?}"
+        );
+
+        // Nothing crossed the service boundary: the run reached the state its OWN work
+        // decided, and the execution the outcome that run gave its task.
+        let run = settled_job_run(&router, case, &job_name, &run_id).await;
+        let state = run_state(&run);
+        assert!(
+            state != STOPPED && state != STOPPING,
+            "case {case:?}: a refused stop stops no job run, got {state} in {run:?}"
+        );
+        let settled = settled_execution(&router, case, &execution_arn).await;
+        assert_eq!(
+            (
+                settled.get("status").and_then(Value::as_str),
+                settled.get("error").and_then(Value::as_str)
+            ),
+            (Some("FAILED"), Some(TASK_FAILED)),
+            "case {case:?}: expected the task's own outcome rather than an abort, got {settled:?}"
         );
     }
 }
