@@ -137,6 +137,8 @@ mod merged_api_association_topology;
 mod merged_api_disassociation;
 #[path = "all/plane_dependency_refusals.rs"]
 mod plane_dependency_refusals;
+#[path = "all/rds_introspection_failure_diagnosis.rs"]
+mod rds_introspection_failure_diagnosis;
 #[path = "all/resolver_definition_pairing.rs"]
 mod resolver_definition_pairing;
 #[path = "all/resolvers.rs"]

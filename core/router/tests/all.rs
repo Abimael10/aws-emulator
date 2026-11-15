@@ -4916,3 +4916,9 @@ mod appended_notes;
 //! a SIBLING of it: every declaration carries its own `#[path = "all/<name>.rs"]`.
 //! the first item one is `E0753` and compiles no suite of this target, so add a declaration
 //! here rather than a note about one. `all/all_rs_declares_each_suite_once.rs` and
+//! declaration — not a note about one, and never a copy of these lines.
+//! leaving a note anywhere in this file.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of
+// this file, which the layout check refuses; the `#[path]` is what points each module
+// into `tests/all/`. What a suite covers, and why it lives in this cross-service target
+// rather than in one service crate, belongs in that suite's own module doc.

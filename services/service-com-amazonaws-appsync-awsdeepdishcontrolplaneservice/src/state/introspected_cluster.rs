@@ -13,6 +13,12 @@
 //! preconditions, and whatever it refuses the call with becomes the reason the
 //! introspection failed ("the exact error that was generated during the operation").
 //!
+//! The cluster ITSELF is resolved first, with the control plane that owns it: a
+//! `resourceArn` naming no cluster resolves nothing about a database, so the introspection
+//! reports the cluster it could not find rather than whatever a data plane makes of an ARN
+//! that addresses nothing. Only a cluster that control plane holds goes on to the schema
+//! read.
+//!
 //! What is read, for every table of that database:
 //!
 //! * its COLUMNS, from the `columnMetadata` the Data API describes a result set with —
@@ -47,6 +53,13 @@ pub async fn introspect(
     // field, so nothing else can arrive in the authority this endpoint is addressed by.
     let region = super::arn_region(&config.resource_arn)
         .map_or_else(|| super::request_region(ctx), str::to_string);
+    // The cluster belongs to the RDS control plane, so whether there IS one is asked of
+    // that service before any statement runs: a configuration that names no cluster has
+    // nothing to introspect, and that is the condition the introspection reports — never a
+    // fact about a data plane that was never reached.
+    if names_no_cluster(ctx, &region, &config.resource_arn).await {
+        return IntrospectionOutcome::Failed(CLUSTER_NOT_FOUND_DETAIL.to_string());
+    }
     let reader = SchemaReader {
         client: data_api(ctx, &region),
         config: config.clone(),
@@ -55,6 +68,88 @@ pub async fn introspect(
         Ok(models) => IntrospectionOutcome::Introspected(models),
         Err(detail) => IntrospectionOutcome::Failed(detail),
     }
+}
+
+/// What an introspection reports for a `resourceArn` the control plane holds no cluster
+/// for: the whole sentence is fixed text, which names the member the caller has to correct
+/// without quoting back what it carried.
+///
+/// A cluster that is not there is a DIFFERENT condition from a cluster that is there and
+/// serves no Data API (the owning service's own endpoint-not-enabled refusal, passed
+/// through below), which is the separation a caller branches its remedy on: an ARN to
+/// correct, against a cluster setting to turn on.
+pub const CLUSTER_NOT_FOUND_DETAIL: &str = "RDS cluster was not found for supplied resource arn.";
+
+/// Whether the Amazon RDS control plane ANSWERED that it holds no cluster of
+/// `resource_arn`.
+///
+/// `DescribeDBClusters` takes "the user-supplied DB cluster identifier or the Amazon
+/// Resource Name (ARN) of the DB cluster" and answers `DBClusterNotFoundFault` for one
+/// that "doesn't refer to an existing DB cluster", which is exactly this question; an
+/// answer carrying no cluster at all says the same thing.
+///
+/// A control plane that could NOT be asked — an emulator assembled without it — leaves the
+/// question undecided, and an undecided question settles nothing: the schema read goes
+/// ahead, and whatever answers it is the introspection's outcome.
+async fn names_no_cluster(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource_arn: &str,
+) -> bool {
+    use ::aws_sdk_rds::error::ProvideErrorMetadata;
+
+    let answer = rds(ctx, region)
+        .describe_db_clusters()
+        .db_cluster_identifier(resource_arn)
+        .send()
+        .await;
+    match answer {
+        Ok(answer) => answer.db_clusters().is_empty(),
+        Err(error) => {
+            if error.as_service_error().is_some_and(
+                ::aws_sdk_rds::operation::describe_db_clusters::DescribeDBClustersError::is_db_cluster_not_found_fault,
+            ) {
+                return true;
+            }
+            if !error
+                .code()
+                .is_some_and(|code| TRANSPORT_REFUSALS.contains(&code))
+            {
+                // Visible at default verbosity: an introspection that went on because the
+                // cluster's owner could not be asked reads exactly like one that went on
+                // because the owner holds the cluster, so the degraded path says so rather
+                // than passing quietly.
+                ::tracing::warn!(
+                    %region,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "the cluster a data source introspection names could not be resolved"
+                );
+            }
+            false
+        }
+    }
+}
+
+/// The Amazon RDS client a cluster is resolved through, configured exactly as the Data API
+/// client is and for the same reasons ([`data_api`]).
+fn rds(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_rds::Client {
+    let config = ::aws_sdk_rds::Config::builder()
+        .behavior_version(::aws_sdk_rds::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_rds::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://rds.{region}.amazonaws.com"))
+        .retry_config(::aws_sdk_rds::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_rds::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_rds::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_rds::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_rds::Client::from_conf(config)
 }
 
 /// The Data API statement that lists what the database holds: a table of its own is a

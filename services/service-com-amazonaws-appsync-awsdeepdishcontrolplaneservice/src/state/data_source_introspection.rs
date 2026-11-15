@@ -61,11 +61,11 @@ pub const INTROSPECTION_NOT_FOUND_MESSAGE: &str =
 /// The text a `BadRequestException` (HTTP 400) carries for a call that names no data
 /// source to introspect at all.
 ///
-/// Worded after this service's other missing-configuration sentence
-/// ([`super::missing_data_source_config_message`]), with the subject this member's own doc
-/// names ("the rdsDataApiConfig object data", "the metadata required to introspect the RDS
-/// cluster").
-pub const MISSING_RDS_DATA_API_CONFIG_MESSAGE: &str = "Missing RDS Data API config";
+/// AppSync's own sentence for the condition, the whole of it fixed text: it states the
+/// general absence of a configuration rather than naming one configuration member, because
+/// an introspection is OF a data source and a call carrying none named nothing to
+/// introspect, whichever configuration shape the caller meant to send.
+pub const NO_DATA_SOURCE_CONFIG_MESSAGE: &str = "No data source config defined.";
 
 /// The `kind` of a field whose type is a primitive: "`Scalar`: Indicates the value is a
 /// primitive type (scalar)" (`DataSourceIntrospectionModelFieldType$kind`).

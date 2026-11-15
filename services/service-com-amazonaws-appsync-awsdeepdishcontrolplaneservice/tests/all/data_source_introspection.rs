@@ -603,7 +603,12 @@ async fn an_introspection_the_data_api_will_not_serve_settles_to_failed() {
         (
             "a cluster that was never created",
             rds_config(&absent, &secret, DATABASE),
-            absent.clone(),
+            // A cluster that is not there is reported as the cluster not being there: the
+            // owning control plane is asked before any schema read, and the sentence it
+            // settles the introspection with quotes nothing of the request. The
+            // separation from a cluster that IS there and serves no Data API is asserted
+            // over its own table in `rds_introspection_failure_diagnosis`.
+            state::CLUSTER_NOT_FOUND_DETAIL.to_string(),
         ),
         (
             "a cluster whose Data API endpoint is off",

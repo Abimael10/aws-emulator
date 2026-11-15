@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 StartDataSourceIntrospectionErrorModeled::BadRequestException(
                     BadRequestException {
                         message: Some(
-                            crate::state::MISSING_RDS_DATA_API_CONFIG_MESSAGE.to_string(),
+                            crate::state::NO_DATA_SOURCE_CONFIG_MESSAGE.to_string(),
                         ),
                         ..Default::default()
                     },

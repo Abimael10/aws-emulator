@@ -107,6 +107,11 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # callback — rather than reconstructed here, and an emulator assembled without the Data API
 # is told apart from a cluster that holds no table.
 aws-sdk-rdsdata = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The Amazon RDS control plane, which OWNS the cluster an introspection's
+# `rdsDataApiConfig` names: whether there is such a cluster at all is its fact, so the
+# introspection resolves the cluster with `DescribeDBClusters` before it reads any schema
+# (`src/state/introspected_cluster.rs`), over the same in-process transport.
+aws-sdk-rds = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # Reads the column list of an index out of the `CREATE INDEX` statement the introspected
 # database's schema holds, with the same maintained SQL parser (and PostgreSQL dialect) the
 # Data API itself parses statements with, rather than by scanning the text here.
@@ -146,10 +151,9 @@ service-com-amazonaws-rdsdata-rdsdataservice = { workspace = true }
 service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }
-# The clients those two control planes are driven through in that suite: RDS speaks
-# awsQuery and Secrets Manager restJson1, so a case creates its cluster and its secret with
-# the SDK rather than by hand-rolling either wire form.
-aws-sdk-rds = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The client Secrets Manager is driven through in that suite (it speaks restJson1), so a
+# case creates its secret with the SDK rather than by hand-rolling that wire form; the RDS
+# control plane a case creates its cluster through is already this crate's own dependency.
 aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # Mints the real self-signed certificate the custom-domain certificate suite imports into
 # Certificate Manager, so a case's expectation rests on a certificate whose subject
