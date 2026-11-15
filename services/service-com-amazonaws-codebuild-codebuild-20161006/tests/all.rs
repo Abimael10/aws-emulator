@@ -73,6 +73,8 @@ mod list_sandboxes_for_project_paging;
 mod list_shared_projects;
 #[path = "all/list_shared_report_groups.rs"]
 mod list_shared_report_groups;
+#[path = "all/malformed_input_refusals.rs"]
+mod malformed_input_refusals;
 #[path = "all/name_character_refusals.rs"]
 mod name_character_refusals;
 #[path = "all/project_arn_addressing.rs"]

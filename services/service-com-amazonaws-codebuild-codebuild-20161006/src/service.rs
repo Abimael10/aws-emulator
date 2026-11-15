@@ -20,9 +20,11 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — the seam a service has BEFORE dispatch. EDITED HERE: it
+//!   serves no request the generated routing table would not serve, but it answers a
+//!   body this service cannot read into the modelled input shape itself
+//!   ([`unreadable_body`]), and serves every other request through the layer that keeps
+//!   the operation it named in scope for the run ([`served_operation`]).
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -48,6 +50,14 @@ use std::sync::Arc;
 
 /// How this service words a request the framework refused before any handler ran.
 mod refusal;
+
+/// Which operation is serving the request, for the refusal wording that is a fact about
+/// the operation rather than about the constraint alone.
+mod served_operation;
+
+/// How a body this service cannot READ into the modelled input shape is refused — the
+/// deserialization layer, which answers before the constraint layer above.
+mod unreadable_body;
 
 /// The `com-amazonaws-codebuild-codebuild-20161006` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -91,11 +101,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // NEITHER arm below is a re-route: both answer for the operation the model's own
+        // routing key names, and a key the model does not name resolves to `None` here
+        // exactly as it does in the generated table, so the router's routing-error path is
+        // unchanged.
+        //
+        // A body this service cannot READ into the modelled input shape is refused FIRST,
+        // because deserialization precedes every later layer: the framework would otherwise
+        // report a codec failure as a constraint violation, which is a different error class
+        // and a different remediation for the caller ([`unreadable_body`]).
+        if unreadable_body::refuses(self.definition(), req) {
+            return Some(&unreadable_body::UNREADABLE_BODY);
+        }
+        // Every other request is served exactly as the generated table serves it, with the
+        // operation it named in scope for the run — which is what lets [`refusal`] state a
+        // sentence that depends on WHICH operation's member was refused
+        // ([`served_operation`]).
+        if ::service_common::restated_refusal::routes(self.definition(), req) {
+            return Some(&served_operation::SERVED_OPERATION_LAYER);
+        }
         None
     }
 
@@ -215,5 +239,79 @@ const INPUT_SCHEMAS: &[&Schema] = &[
     crate::ops::types::UPDATE_REPORT_GROUP_INPUT_SCHEMA,
     crate::ops::types::UPDATE_WEBHOOK_INPUT_SCHEMA,
 ];
+
+/// How the model names the INPUT shape of an operation: the operation's own name with this
+/// suffix, which is what [`input_schema`] resolves a routing key through.
+const INPUT_SHAPE_SUFFIX: &str = "Input";
+
+/// The input schema of the operation `operation` names, or `None` when this service serves
+/// no operation by that name.
+///
+/// Resolved off the schemas themselves ([`INPUT_SCHEMAS`]) rather than from a table written
+/// here, so every operation this service serves is reachable by the name its routing key
+/// carries — including the ones whose handlers are still scaffolded — and an operation added
+/// to the model needs no edit here. The name of a routing key and the name of its input shape
+/// are both the model's: `BatchGetProjects` is served by `BatchGetProjectsInput`.
+fn input_schema(operation: &str) -> Option<&'static Schema> {
+    let shape = format!("{operation}{INPUT_SHAPE_SUFFIX}");
+    INPUT_SCHEMAS
+        .iter()
+        .copied()
+        .find(|input| input.shape_id().shape_name() == shape)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: a routing key resolves to the input shape the model gives that operation, and a
+    /// name no operation of this service carries resolves to nothing.
+    ///
+    /// The rows span a batch read, a create, an update and a listing — and, as the negative
+    /// side, an input SHAPE name (which is not a routing key) and a name this model does not
+    /// declare at all.
+    #[test]
+    fn every_routing_key_resolves_to_its_modelled_input() {
+        for operation in [
+            "BatchGetProjects",
+            "BatchGetBuilds",
+            "CreateProject",
+            "UpdateProject",
+            "ListProjects",
+        ] {
+            let resolved = input_schema(operation);
+            assert_eq!(
+                resolved.map(|input| input.shape_id().shape_name()),
+                Some(format!("{operation}{INPUT_SHAPE_SUFFIX}")).as_deref(),
+                "case {operation:?}: expected the modelled input shape, got {:?}",
+                resolved.map(|input| input.shape_id().shape_name())
+            );
+        }
+        for unknown in ["BatchGetProjectsInput", "NoSuchOperation", ""] {
+            assert!(
+                input_schema(unknown).is_none(),
+                "case {unknown:?}: expected no input shape, got one"
+            );
+        }
+    }
+
+    /// Every input this service validates a request against is reachable by the operation
+    /// name its routing key carries: a model whose input shape is named otherwise would
+    /// silently take the deserialization layer out of the path for that operation.
+    #[test]
+    fn every_input_is_reachable_by_its_operation_name() {
+        for input in INPUT_SCHEMAS {
+            let shape = input.shape_id().shape_name();
+            let operation = shape
+                .strip_suffix(INPUT_SHAPE_SUFFIX)
+                .unwrap_or_else(|| panic!("case {shape}: expected an input shape name"));
+            assert_eq!(
+                input_schema(operation).map(|resolved| resolved.shape_id().shape_name()),
+                Some(shape),
+                "case {shape}: expected to resolve from {operation:?}"
+            );
+        }
+    }
+}
 
 

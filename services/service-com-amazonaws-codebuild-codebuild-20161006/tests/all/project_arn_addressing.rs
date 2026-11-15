@@ -23,6 +23,7 @@
 //! include ones no recording cites.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_codebuild_codebuild_20161006::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::project_build_lifecycle::{call, create_project, emulator, error_type, REGION};
@@ -263,11 +264,16 @@ async fn an_identifier_that_is_no_project_arn_of_this_account_resolves_to_nothin
 
     // Values that name no project this account holds, each still of the caller's own
     // Region and account where it has those fields at all — so none of them is refused on
-    // a field, and each is answered from the store.
-    let rows: Vec<(&str, String)> = vec![
+    // a field. The third column is whether the BATCH READ answers it from the store: it
+    // does for a value that carries a project NAME (its own, or the resource name of a
+    // project ARN of this service), and refuses the ones that carry none, because an ARN
+    // that is no project ARN of this service is the NAME it is and an ARN's separators are
+    // not a project name's characters (`name_character_refusals`).
+    let rows: Vec<(&str, String, bool)> = vec![
         (
             "an ARN of another partition",
             project_arn_in("aws-us-gov", REGION, engine::EMULATOR_ACCOUNT_ID, HELD_PROJECT),
+            true,
         ),
         (
             "an ARN of another resource kind",
@@ -275,6 +281,7 @@ async fn an_identifier_that_is_no_project_arn_of_this_account_resolves_to_nothin
                 "arn:aws:codebuild:{REGION}:{}:report-group/{HELD_PROJECT}",
                 engine::EMULATOR_ACCOUNT_ID
             ),
+            false,
         ),
         (
             "an ARN of another service",
@@ -282,36 +289,61 @@ async fn an_identifier_that_is_no_project_arn_of_this_account_resolves_to_nothin
                 "arn:aws:codepipeline:{REGION}:{}:{HELD_PROJECT}",
                 engine::EMULATOR_ACCOUNT_ID
             ),
+            false,
         ),
         (
             "an ARN no project is held under",
             project_arn(REGION, "never-created"),
+            true,
         ),
-        ("a name no project is held under", "never-created".to_string()),
+        (
+            "a name no project is held under",
+            "never-created".to_string(),
+            true,
+        ),
     ];
 
-    for (case, identifier) in rows {
-        // The batch read reports it in its absent half, exactly as sent.
+    for (case, identifier, answered_from_the_store) in rows {
         let (status, body) = call(
             &router,
             "BatchGetProjects",
             json!({"names": [identifier.clone()]}),
         )
         .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: BatchGetProjects expected 200, got {status} with {body}"
-        );
-        assert_eq!(
-            body["projectsNotFound"],
-            json!([identifier.clone()]),
-            "case {case:?}: expected the identifier reported absent as sent, got {body}"
-        );
-        assert_eq!(
-            body["projects"],
-            json!([]),
-            "case {case:?}: nothing resolves, got {body}"
-        );
+        if answered_from_the_store {
+            // The batch read reports it in its absent half, exactly as sent.
+            assert_eq!(
+                status, 200,
+                "case {case:?}: BatchGetProjects expected 200, got {status} with {body}"
+            );
+            assert_eq!(
+                body["projectsNotFound"],
+                json!([identifier.clone()]),
+                "case {case:?}: expected the identifier reported absent as sent, got {body}"
+            );
+            assert_eq!(
+                body["projects"],
+                json!([]),
+                "case {case:?}: nothing resolves, got {body}"
+            );
+        } else {
+            // The batch read refuses the name such a value carries, in the one sentence
+            // CodeBuild states for a name it cannot be written with.
+            assert_eq!(
+                status, 400,
+                "case {case:?}: BatchGetProjects expected 400, got {status} with {body}"
+            );
+            assert_eq!(
+                error_type(&body),
+                "InvalidInputException",
+                "case {case:?}: a value that is no project name is an input error, got {body}"
+            );
+            assert_eq!(
+                message(&body),
+                state::INVALID_PROJECT_NAME_MESSAGE,
+                "case {case:?}: expected CodeBuild's invalid-name sentence, got {body}"
+            );
+        }
 
         // A per-project listing refuses it as a project it does not hold, quoting the ARN
         // the identifier names — ONCE: an identifier that is already an ARN is never

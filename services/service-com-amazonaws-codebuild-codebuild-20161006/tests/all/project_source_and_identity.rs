@@ -197,10 +197,12 @@ struct IdentifierRow {
 /// this account is reported in `projectsNotFound` exactly as the request sent it.
 ///
 /// The rows span the identifier forms: the name, the project's own ARN, a mix of the two
-/// in one request, the same project named twice, an ARN of another resource type, and a
-/// name no project is held under. An ARN of another Region or another account is NOT a
-/// not-found result at all but a refusal, so those rows live in `project_arn_addressing`
-/// instead: an ARN's fields are read before anything is looked up.
+/// in one request, the same project named twice, and a name no project is held under. Two
+/// forms are NOT a not-found result at all but a refusal, so they live elsewhere: an ARN of
+/// another Region or another account is refused on that field before anything is looked up
+/// (`project_arn_addressing`), and an ARN that is no project ARN of this service carries no
+/// project name, so the value is held to the character rule every project name obeys
+/// (`name_character_refusals`).
 #[tokio::test]
 async fn a_project_resolves_by_name_or_by_its_own_arn() {
     let router = emulator();
@@ -240,12 +242,6 @@ async fn a_project_resolves_by_name_or_by_its_own_arn() {
             names: vec![first_arn.clone(), "ident-first".to_string()],
             resolved: vec!["ident-first"],
             absent: vec![],
-        },
-        IdentifierRow {
-            case: "an ARN of another resource type",
-            names: vec![expected_arn("report-group/ident-first")],
-            resolved: vec![],
-            absent: vec![expected_arn("report-group/ident-first")],
         },
         IdentifierRow {
             case: "a name no project is held under",

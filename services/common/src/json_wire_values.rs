@@ -120,6 +120,65 @@ pub fn member_by_wire_name<'a>(schema: &'a Schema, key: &str) -> Option<&'a Sche
     })
 }
 
+/// Whether a JSON value can be READ into a member the model types as `target` — the
+/// question that separates a value the codec never turned into a value at all from one that
+/// was read and then broke a rule the model declares.
+///
+/// The classes are the Smithy ones: a number reads into a numeric shape, a string into a
+/// string-shaped one (an enumerated type IS a string shape, and a blob's base64 text is a
+/// string on the wire), an array into a list, an object into a map, a structure or a union,
+/// and anything at all into a `document`. A timestamp reads from either a number or a
+/// string, because `@timestampFormat` decides which. An integral shape reads only a whole
+/// number its width holds: a fraction, or a value past that width, is no more readable than
+/// a string. JSON `null` is ABSENCE rather than a type error — an absent member the model
+/// requires is the constraint layer's refusal, not the codec's.
+///
+/// Here beside the two halves above because a request layer that refuses an unreadable
+/// value has to decide WHETHER the value is readable before it can say what it could not be
+/// read as, and two services must not answer that question two ways.
+#[must_use]
+pub fn reads_as(target: ShapeType, value: &Value) -> bool {
+    if matches!(target, ShapeType::Document) {
+        return true;
+    }
+    match value {
+        Value::Null => true,
+        Value::Bool(_) => matches!(target, ShapeType::Boolean),
+        Value::Number(number) => match target {
+            ShapeType::Byte => fits_integral(number, i8::MIN.into(), i8::MAX.into()),
+            ShapeType::Short => fits_integral(number, i16::MIN.into(), i16::MAX.into()),
+            ShapeType::Integer => fits_integral(number, i32::MIN.into(), i32::MAX.into()),
+            ShapeType::Long | ShapeType::BigInteger => fits_integral(number, i64::MIN, i64::MAX),
+            ShapeType::Float
+            | ShapeType::Double
+            | ShapeType::BigDecimal
+            | ShapeType::Timestamp => true,
+            _ => false,
+        },
+        Value::String(_) => matches!(
+            target,
+            ShapeType::String
+                | ShapeType::Blob
+                | ShapeType::Timestamp
+                | ShapeType::BigInteger
+                | ShapeType::BigDecimal
+        ),
+        Value::Array(_) => matches!(target, ShapeType::List),
+        Value::Object(_) => matches!(
+            target,
+            ShapeType::Map | ShapeType::Structure | ShapeType::Union
+        ),
+    }
+}
+
+/// Whether `number` is a whole number the inclusive range `min..=max` holds — the range of
+/// the integral shape it is being read into.
+fn fits_integral(number: &serde_json::Number, min: i64, max: i64) -> bool {
+    number
+        .as_i64()
+        .is_some_and(|held| (min..=max).contains(&held))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +270,57 @@ mod tests {
             assert_eq!(
                 carried, expected,
                 "case {value}: expected the text {expected:?}, got {carried:?}"
+            );
+        }
+    }
+
+    /// RULE: a value reads into a member exactly when its JSON class is one that member's
+    /// modelled type is read from — with `null` reading into every member, because absence
+    /// is the constraint layer's business rather than the codec's.
+    ///
+    /// The rows span every modelled kind a member can be against the classes that do and do
+    /// not read into it, including the integral width and whole-number clauses.
+    #[test]
+    fn a_value_reads_only_into_a_member_its_class_fits() {
+        // (case, the value, the modelled type of the member, whether it reads)
+        let cases = [
+            ("a list into a list", json!(["a"]), ShapeType::List, true),
+            ("a string into a list", json!("a"), ShapeType::List, false),
+            ("an object into a map", json!({"k": "v"}), ShapeType::Map, true),
+            (
+                "an object into a structure",
+                json!({"k": "v"}),
+                ShapeType::Structure,
+                true,
+            ),
+            ("a list into a structure", json!([1]), ShapeType::Structure, false),
+            ("a string into a string", json!("a"), ShapeType::String, true),
+            ("a number into a string", json!(7), ShapeType::String, false),
+            ("base64 text into a blob", json!("YQ=="), ShapeType::Blob, true),
+            ("a flag into a boolean", json!(true), ShapeType::Boolean, true),
+            ("a string into a boolean", json!("true"), ShapeType::Boolean, false),
+            ("a whole number into an integer", json!(7), ShapeType::Integer, true),
+            ("a fraction into an integer", json!(7.5), ShapeType::Integer, false),
+            (
+                "a number past an integer's width",
+                json!(i64::from(i32::MAX) + 1),
+                ShapeType::Integer,
+                false,
+            ),
+            ("a fraction into a double", json!(7.5), ShapeType::Double, true),
+            ("an epoch into a timestamp", json!(7), ShapeType::Timestamp, true),
+            ("text into a timestamp", json!("2026-01-01T00:00:00Z"), ShapeType::Timestamp, true),
+            ("a list into a timestamp", json!([7]), ShapeType::Timestamp, false),
+            ("a list into a document", json!([7]), ShapeType::Document, true),
+            ("null into a list", json!(null), ShapeType::List, true),
+            ("null into an integer", json!(null), ShapeType::Integer, true),
+        ];
+        for (case, value, target, reads) in cases {
+            assert_eq!(
+                reads_as(target, &value),
+                reads,
+                "case {case:?}: expected reads_as({target:?}) = {reads}, got {}",
+                reads_as(target, &value)
             );
         }
     }

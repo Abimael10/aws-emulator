@@ -180,7 +180,9 @@ async fn a_project_name_member_of_another_operation_states_the_same_sentence() {
 /// RULE: `BatchGetProjects` holds a name to the same character rule and answers the
 /// IDENTICAL refusal — a value that cannot be a project name is not a project this
 /// account happens not to hold, so it is refused rather than reported under
-/// `projectsNotFound`.
+/// `projectsNotFound`. The member takes "the names or ARNs of the build projects", so the
+/// name the rule is about is the one the value NAMES: the resource name of a project ARN
+/// of this service, and the value itself for everything else.
 #[tokio::test]
 async fn batch_get_projects_refuses_a_name_that_is_not_a_project_name() {
     let router = emulator();
@@ -212,9 +214,43 @@ async fn batch_get_projects_refuses_a_name_that_is_not_a_project_name() {
         "a mixed request: expected 400, got {status} with {body}"
     );
 
+    // A value that is an ARN but NOT a project ARN of this service carries no project name
+    // through an ARN at all, so it is the NAME it is — and an ARN's own separators are not
+    // a project name's characters, so it is refused with the same sentence rather than
+    // reported absent. The rows span the shapes such a value takes: another service's ARN,
+    // another resource kind of this service, and a project ARN whose resource name is
+    // empty.
+    let unwritable_arns = [
+        ("an ARN of another service", "arn:aws:s3:::bucket/key".to_string()),
+        (
+            "an ARN of another resource kind of this service",
+            state::report_group_arn(REGION, "no-such-group"),
+        ),
+        (
+            "a project ARN carrying no resource name",
+            state::project_arn(REGION, ""),
+        ),
+    ];
+    for (case, identifier) in &unwritable_arns {
+        let (status, body) = call(
+            &router,
+            "BatchGetProjects",
+            json!({"names": [identifier.clone()]}),
+        )
+        .await;
+        assert_name_sentence(
+            case,
+            status,
+            &body,
+            state::INVALID_PROJECT_NAME_MESSAGE,
+            identifier,
+        );
+    }
+
     // The opposite class: values that CAN name a project — including the ARN form the
-    // member documents, whose own separators are not project-name characters — stay
-    // answered from the store, reported under `projectsNotFound` exactly as sent.
+    // member documents, whose own separators are not project-name characters because the
+    // name it carries is its resource name — stay answered from the store, reported under
+    // `projectsNotFound` exactly as sent.
     let accepted = [
         ("a name nothing was created under", "no-such-project".to_string()),
         ("a one-character name", "a".to_string()),
@@ -226,10 +262,6 @@ async fn batch_get_projects_refuses_a_name_that_is_not_a_project_name() {
         (
             "a project ARN nothing was created under",
             state::project_arn(REGION, "no-such-project"),
-        ),
-        (
-            "an ARN of another service",
-            "arn:aws:s3:::bucket/key".to_string(),
         ),
     ];
     for (case, identifier) in accepted {

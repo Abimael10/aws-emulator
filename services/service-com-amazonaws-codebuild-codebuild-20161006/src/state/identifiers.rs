@@ -16,7 +16,7 @@
 //! answered from the store (an empty listing, or an entry in the not-found half of a
 //! batch read).
 
-use super::{is_arn, resource_from_arn};
+use super::{is_arn, project_name_from_arn, resource_from_arn};
 
 /// The characters a RESOURCE NAME of this service is written with, from the `@pattern`
 /// the model puts on each of them — `FleetName`
@@ -81,13 +81,21 @@ pub const INVALID_PROJECT_NAME_MESSAGE: &str =
 /// message the modelled `InvalidInputException` carries — or `None` when it can.
 ///
 /// `BatchGetProjectsInput$names` takes "the names or ARNs of the build projects", so an
-/// identifier is one of two things: an ARN, whose own fields are checked by the resolver
-/// that looks it up
-/// ([`super::ComAmazonawsCodebuildCodebuild20161006State::project_by_identifier`]), or a
-/// project NAME, which has to be written with the characters a project name is written
-/// with ([`is_supported_name_character`]). A name carrying anything else is no project
-/// name, so there is nothing to look up and the request is refused rather than answered
-/// with a not-found entry that would read as "this account holds no such project".
+/// identifier names a project through one of two things: this service's own project ARN,
+/// which names it through the ARN's RESOURCE NAME, or a project NAME itself. Either way
+/// the name has to be written with the characters a project name is written with
+/// ([`is_supported_name_character`]) — the ARN's own punctuation is not part of the name
+/// it carries, and a name that cannot be written as one is no more a project name for
+/// arriving inside an ARN. A name carrying anything else is no project name, so there is
+/// nothing to look up and the request is refused rather than answered with a not-found
+/// entry that would read as "this account holds no such project".
+///
+/// A value that is an ARN of something ELSE — another service, another resource kind of
+/// this one, a project ARN carrying no resource name — names a project through no ARN, so
+/// it is the NAME it is, punctuation and all, and an ARN's separators are not characters a
+/// project name is written with. That is the reading `super::ProjectReference` already
+/// takes of such a value (it resolves on the value itself), so the two agree on what the
+/// name is; this rule decides whether that name can be one at all.
 ///
 /// The BATCH READ is the one project-addressing operation that applies this, because it
 /// is the one whose refusal is recorded; the operations that RESOLVE a project by name to
@@ -106,10 +114,8 @@ pub const INVALID_PROJECT_NAME_MESSAGE: &str =
 /// character set but not those simply names no project this account holds, which is the
 /// store's answer.
 pub fn project_identifier_violation(identifier: &str) -> Option<&'static str> {
-    if is_arn(identifier) {
-        return None;
-    }
-    (!identifier.chars().all(is_supported_name_character)).then_some(INVALID_PROJECT_NAME_MESSAGE)
+    let name = project_name_from_arn(identifier).unwrap_or(identifier);
+    (!name.chars().all(is_supported_name_character)).then_some(INVALID_PROJECT_NAME_MESSAGE)
 }
 
 /// What CodeBuild states as the reason a value handed to a sandbox-addressing operation

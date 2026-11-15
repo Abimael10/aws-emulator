@@ -5238,3 +5238,12 @@ mod appended_notes;
 // this header is the only place one may stand: past it a `//!` line is `E0753` and
 // compiles no suite of this target, so a note further down must be an ordinary `//`
 // comment. `all/all_rs_declares_each_suite_once.rs` and
+//! at the top level of `tests/` fails the build; and a suite declared twice is `E0428`, which
+//! fails every suite in this target. These header lines are the ONLY place an inner doc
+//! comment (`//!`) may stand: past the first item one is `E0753` and compiles no suite of
+//! this target, so a note further down this file must be an ordinary `//` comment — better
+//! still, no note at all. `all/all_rs_declares_each_suite_once.rs` and
+//! file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points
+// place to insert and nothing to keep consistent. A suite no `mod` names compiles nowhere
+// and its tests never run; a suite left at the top level of `tests/` fails the build; and a
+// suite declared twice is `E0428`, which fails every suite in this target.

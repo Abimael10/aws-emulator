@@ -11,9 +11,15 @@
 //! envelope that names the member and the constraint it failed.
 //!
 //! One module so that the choice is made in one place for every operation of the
-//! service: a refusal carries no operation name, so each sentence below is keyed to the
-//! rule that was broken — the member path the model gives it and the constraint trait the
-//! model puts on it — never to one operation or one recorded request.
+//! service: each sentence below is keyed to the rule that was broken — the member path the
+//! model gives it and the constraint trait the model puts on it — never to one recorded
+//! request. One rule needs the OPERATION as well, because the member path alone does not
+//! identify the member: a list of identifiers left empty is refused with a sentence naming
+//! the kind of identifier the list holds, and two inputs carry a list of different kinds
+//! under one member name. The framework hands this seam no request, so which operation is
+//! being served is read from the scope the service opens around the walk
+//! ([`super::served_operation`]), and the sentence is keyed to the MEMBER of that
+//! operation's input — still the model, never one request.
 
 use aws_smithy_schema::{Schema, ShapeType};
 use aws_smithy_schema_server::constraints::{LengthTrait, PatternTrait, RangeTrait};
@@ -54,11 +60,21 @@ fn codebuild_sentence(violation: &Violation) -> Option<String> {
         ViolationKind::EnumValue(_) if is_sort_order(violation) => {
             Some(INVALID_SORT_ORDER_MESSAGE.to_string())
         }
-        // An empty input list of build ids.
-        ViolationKind::MinLength(_)
-            if collection_size(violation).is_some() && path == BUILD_ID_LIST_PATH =>
-        {
-            Some(EMPTY_BUILD_ID_LIST_MESSAGE.to_string())
+        // A sort KEY outside its enum: CodeBuild names the member and quotes the value
+        // back, which is the one sentence that serves every criterion a request may ask to
+        // be sorted by.
+        ViolationKind::EnumValue(_) if path == SORT_KEY_PATH => violation
+            .value
+            .as_deref()
+            .map(|submitted| invalid_sort_key_message(&path, submitted)),
+        // An input list of resource identifiers the request left EMPTY, or omitted
+        // altogether: both are a request that names nothing to act on, which CodeBuild
+        // states in one sentence naming the KIND of identifier the list holds. A project
+        // NAME that is itself empty is the sibling rule: an identifier of no resource.
+        ViolationKind::MissingRequiredMember | ViolationKind::MinLength(_) => {
+            empty_identifier_list_sentence(violation, &path)
+                .or_else(|| empty_project_name_sentence(violation, &path))
+                .map(str::to_string)
         }
         // An input list of resource identifiers longer than the model lets a request
         // carry.
@@ -210,13 +226,15 @@ fn pattern_of(member: &Schema) -> Option<&'static str> {
         .map(|pattern| pattern.regex)
 }
 
+/// The `@length` the model attaches to `member`, if it bounds its length at all.
+fn length_of(member: &Schema) -> Option<LengthTrait> {
+    let carried = member.traits()?.get(&LengthTrait::TRAIT_ID)?;
+    carried.as_any().downcast_ref::<LengthTrait>().copied()
+}
+
 /// The maximum the model's `@length` allows `member` to be, if it bounds it above.
 fn max_length_of(member: &Schema) -> Option<i64> {
-    let carried = member.traits()?.get(&LengthTrait::TRAIT_ID)?;
-    carried
-        .as_any()
-        .downcast_ref::<LengthTrait>()
-        .and_then(|length| length.max)
+    length_of(member)?.max
 }
 
 /// The name the model gives the member that carries a resource's own name on the
@@ -259,15 +277,144 @@ const INVALID_SORT_ORDER_MESSAGE: &str = "Invalid sort order specified";
 /// Recorded behaviour — the model states no message for the error.
 const EMPTY_BUILD_ID_LIST_MESSAGE: &str = "The input build ID list cannot be empty.";
 
-/// The validation path of the input member that carries a list of BUILD ids.
+/// What CodeBuild states as the reason a batch request names no project to act on, worded
+/// the same way and for the same reason as [`EMPTY_BUILD_ID_LIST_MESSAGE`]: fixed text
+/// naming the KIND of list, with nothing of the request interpolated. Recorded behaviour.
+const EMPTY_PROJECT_NAME_LIST_MESSAGE: &str = "The input project name list cannot be empty.";
+
+/// The sentence CodeBuild states for an input list of resource identifiers a request left
+/// empty or omitted, keyed by the INPUT SHAPE the list belongs to and the member that
+/// carries it — the two halves of that member's own shape id
+/// (`com.amazonaws.codebuild#BatchGetProjectsInput$names`).
 ///
-/// `BatchGetBuildsInput$ids` and `BatchDeleteBuildsInput$ids` both target `BuildIds`,
-/// the one list of this service's inputs that is `@length(min: 1)` and holds build ids,
-/// so an empty-list violation at this path is a request that named no build. The
-/// sibling `ids` members that hold other identifiers cannot reach the sentence above:
-/// `BatchGetBuildBatchesInput$ids` is `@length(min: 0)` and `BatchGetSandboxesInput$ids`
-/// carries no `@length` at all, so neither has a minimum to violate.
-const BUILD_ID_LIST_PATH: &str = "ids";
+/// Keyed to the member rather than to the member's NAME, because the name alone does not
+/// say what kind of identifier the list holds: `names` is a list of project names on one
+/// operation and of fleet names on another, and a member schema carries its target's kind
+/// but not its target's name (`super::served_operation` says how the input in hand is
+/// known). Each entry is a list the model bounds below at one
+/// (`smithy_query(query="shape",shape="BuildIds,ProjectNames")`, both `@length(min: 1)`),
+/// which `every_stated_empty_list_is_a_list_the_model_bounds_below` pins — so an entry
+/// cannot claim a sentence for a list the model lets a request leave empty.
+///
+/// The lists whose sentence is NOT recorded — the fleet names, the report and report-group
+/// ARNs, the command-execution ids — keep the shared constraint envelope naming the member
+/// and the constraint it failed: CodeBuild words those refusals somewhere, but not in words
+/// this emulator has seen, and a sentence guessed for one list is a sentence no client
+/// matches.
+const EMPTY_IDENTIFIER_LIST_SENTENCES: [(&str, &str, &str); 3] = [
+    (
+        "BatchDeleteBuildsInput",
+        BUILD_ID_LIST_MEMBER,
+        EMPTY_BUILD_ID_LIST_MESSAGE,
+    ),
+    (
+        "BatchGetBuildsInput",
+        BUILD_ID_LIST_MEMBER,
+        EMPTY_BUILD_ID_LIST_MESSAGE,
+    ),
+    (
+        "BatchGetProjectsInput",
+        "names",
+        EMPTY_PROJECT_NAME_LIST_MESSAGE,
+    ),
+];
+
+/// The name the model gives the member that carries a list of BUILD ids, on both operations
+/// that take one (`BatchGetBuilds` and `BatchDeleteBuilds`, each targeting `BuildIds`).
+const BUILD_ID_LIST_MEMBER: &str = "ids";
+
+/// What CodeBuild states as the reason a value handed to it where a project NAME belongs is
+/// empty, carried by the modelled `InvalidInputException`.
+///
+/// Fixed text that names the KIND of value that was empty rather than the member path or the
+/// bound it broke, so the sentence is the same wherever a request carries an empty project
+/// name. Recorded behaviour — the model states no message for the error.
+const EMPTY_PROJECT_NAME_MESSAGE: &str = "Project name cannot be empty";
+
+/// The members of this service's inputs that carry a project NAME inside a LIST, keyed as
+/// [`EMPTY_IDENTIFIER_LIST_SENTENCES`] is: the input shape and the validation path of the
+/// member, which for a list's element is the list member followed by the collection step
+/// (`names.member`).
+///
+/// One entry, because `ProjectNames` is the one list of this service's inputs that holds
+/// project names; the sibling `FleetNames` holds fleet names, and the element sentence for
+/// those is not recorded, so an empty fleet name keeps the shared constraint envelope. The
+/// single-project identifier member needs no entry: every operation that addresses ONE
+/// project by a plain-string identifier names it [`PROJECT_IDENTIFIER_PATH`], which names a
+/// project name on every input that declares it.
+const PROJECT_NAME_LIST_MEMBERS: [(&str, &str); 1] = [("BatchGetProjectsInput", "names.member")];
+
+/// The sentence CodeBuild states for a project NAME the request carried as the empty string.
+///
+/// `None` for every other violation, which keeps the shared constraint envelope: a value that
+/// is short rather than empty, a COLLECTION (whose rendered value is its element count, which
+/// is the sibling rule above), a member that carries no project name, and the project's own
+/// name on the operations that create or change one — `CreateProject$name` carries the model's
+/// own `@pattern` and `@length(min: 2)`, whose refusals are stated by the rules keyed to those
+/// traits, and nothing records this sentence for them.
+fn empty_project_name_sentence(violation: &Violation, path: &str) -> Option<&'static str> {
+    if !matches!(violation.kind, ViolationKind::MinLength(_))
+        || violation.value.as_deref() != Some("")
+    {
+        return None;
+    }
+    if path == PROJECT_IDENTIFIER_PATH {
+        return Some(EMPTY_PROJECT_NAME_MESSAGE);
+    }
+    let input = super::served_operation::served_input()?;
+    let shape = input.shape_id().shape_name();
+    PROJECT_NAME_LIST_MEMBERS
+        .iter()
+        .any(|(input_shape, member)| *input_shape == shape && *member == path)
+        .then_some(EMPTY_PROJECT_NAME_MESSAGE)
+}
+
+/// The sentence CodeBuild states for the identifier list at `path` of the input being
+/// served, when that list is one it refuses empty in its own words.
+///
+/// `None` for every other violation, which keeps the shared constraint envelope: a
+/// violation of another kind, a list of identifiers whose sentence is not recorded, a
+/// member of another input, and — outside a served request — any violation at all, since
+/// which input the path names is then unknown.
+fn empty_identifier_list_sentence(violation: &Violation, path: &str) -> Option<&'static str> {
+    match &violation.kind {
+        // Omitted, or sent as JSON `null`: the deserializer reports the member absent.
+        ViolationKind::MissingRequiredMember => {}
+        // Sent as a list with nothing in it. The element count is what tells a COLLECTION
+        // apart from a string the model bounds below ([`collection_size`]), and zero is what
+        // makes the request one that names nothing — a list shorter than a minimum above one
+        // is not an empty list and keeps the envelope.
+        ViolationKind::MinLength(_) if collection_size(violation) == Some(0) => {}
+        _ => return None,
+    }
+    let input = super::served_operation::served_input()?;
+    let shape = input.shape_id().shape_name();
+    EMPTY_IDENTIFIER_LIST_SENTENCES
+        .iter()
+        .find(|(input_shape, member, _)| *input_shape == shape && *member == path)
+        .map(|(_, _, stated)| *stated)
+}
+
+/// What CodeBuild states as the reason a listing was asked to sort by a criterion it does
+/// not define, carried by the modelled `InvalidInputException`.
+///
+/// The prefix is fixed and names the MEMBER the value arrived on; the trailing token is that
+/// value, taken from the request exactly as sent — so a wrong-case spelling of a modelled
+/// value is quoted back as the caller wrote it. Recorded behaviour — the model states no
+/// message for the error.
+fn invalid_sort_key_message(member: &str, submitted: &str) -> String {
+    format!("Invalid {member} type specified: {submitted}")
+}
+
+/// The validation path of the input member that names the criterion a listing is sorted BY.
+///
+/// Every operation of this service that takes one names it `sortBy` — the project, fleet,
+/// report-group and shared-resource listings, and the code-coverage report read — each
+/// targeting an enumerated type of its own. The sentence above names the member rather than
+/// the type or the permitted set, so one rule covers all of them; the sibling `sortOrder`,
+/// which names the DIRECTION rather than the criterion, has a fixed sentence of its own
+/// ([`INVALID_SORT_ORDER_MESSAGE`]).
+const SORT_KEY_PATH: &str = "sortBy";
 
 /// The validation paths of the input members that carry a list of RESOURCE IDENTIFIERS —
 /// the lists CodeBuild's over-long-list sentence calls an "input resource list".
@@ -504,3 +651,96 @@ fn member_path_of(path: &str) -> String {
 /// The segment a validation path puts between a collection and its element, as
 /// `aws_smithy_schema_server::constraints::path` spells it.
 const COLLECTION_STEP: &str = "member";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: every list this service refuses empty in CodeBuild's own words is a list the
+    /// MODEL declares and bounds below at one — so an entry cannot claim that sentence for a
+    /// member that is not a list, or for one a request may legally leave empty.
+    #[test]
+    fn every_stated_empty_list_is_a_list_the_model_bounds_below() {
+        for (shape, member_name, stated) in EMPTY_IDENTIFIER_LIST_SENTENCES {
+            let input = super::super::INPUT_SCHEMAS
+                .iter()
+                .copied()
+                .find(|input| input.shape_id().shape_name() == shape)
+                .unwrap_or_else(|| panic!("case {shape}: this service validates no such input"));
+            let member = input
+                .members()
+                .iter()
+                .copied()
+                .find(|member| member.member_name() == Some(member_name))
+                .unwrap_or_else(|| {
+                    panic!("case {shape}${member_name}: the input declares no such member")
+                });
+            assert_eq!(
+                member.shape_type(),
+                ShapeType::List,
+                "case {shape}${member_name}: expected a list, got {:?}",
+                member.shape_type()
+            );
+            assert_eq!(
+                length_of(member).and_then(|length| length.min),
+                Some(1),
+                "case {shape}${member_name}: expected a list the model bounds below at one, \
+                 got {:?}",
+                length_of(member).and_then(|length| length.min)
+            );
+            assert!(
+                stated.ends_with("list cannot be empty."),
+                "case {shape}${member_name}: expected the empty-list sentence, got {stated:?}"
+            );
+        }
+    }
+
+    /// RULE: every list whose ELEMENT carries a project name is a list the model declares on
+    /// that input — so an entry cannot claim the empty-name sentence for a member that is not
+    /// a list of this service's inputs.
+    #[test]
+    fn every_project_name_list_member_is_a_list_of_that_input() {
+        for (shape, path) in PROJECT_NAME_LIST_MEMBERS {
+            let element_step = format!(".{COLLECTION_STEP}");
+            let list = path.strip_suffix(&element_step).unwrap_or_else(|| {
+                panic!("case {shape}/{path}: expected the path of a list's element")
+            });
+            let input = super::super::INPUT_SCHEMAS
+                .iter()
+                .copied()
+                .find(|input| input.shape_id().shape_name() == shape)
+                .unwrap_or_else(|| panic!("case {shape}: this service validates no such input"));
+            let member = input
+                .members()
+                .iter()
+                .copied()
+                .find(|member| member.member_name() == Some(list))
+                .unwrap_or_else(|| {
+                    panic!("case {shape}${list}: the input declares no such member")
+                });
+            assert_eq!(
+                member.shape_type(),
+                ShapeType::List,
+                "case {shape}${list}: expected a list, got {:?}",
+                member.shape_type()
+            );
+        }
+    }
+
+    /// RULE: the sort-key sentence names the member the value arrived on and quotes the value
+    /// exactly as the request wrote it.
+    ///
+    /// The rows span the forms an unmodelled value takes: a modelled value in the wrong case,
+    /// a token of the right shape, the empty string and one carrying a space.
+    #[test]
+    fn the_sort_key_sentence_names_the_member_and_quotes_the_value() {
+        for submitted in ["name", "BOGUS", "", "NAME "] {
+            let stated = invalid_sort_key_message(SORT_KEY_PATH, submitted);
+            assert_eq!(
+                stated,
+                format!("Invalid sortBy type specified: {submitted}"),
+                "case {submitted:?}: expected CodeBuild's sort-key sentence, got {stated:?}"
+            );
+        }
+    }
+}
