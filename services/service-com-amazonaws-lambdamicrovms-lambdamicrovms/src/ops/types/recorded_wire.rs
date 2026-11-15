@@ -30,7 +30,7 @@
 //!   `GetMicrovmImageVersionOutput`, `MicrovmImageVersionSummary` and
 //!   `UpdateMicrovmImageVersionResponse` declare the version's build inputs, `state`,
 //!   `status`, `stateReason`, `createdAt`, `updatedAt` and `tags` and no such member
-//!   (`smithy_query(query="shape",shape="GetMicrovmImageVersionOutput,MicrovmImageVersionSummary",model_path="services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/smithy-model/com-amazonaws-lambdamicrovms-lambdamicrovms.json")`).
+//!   (`smithy_query(query="shape",shape="GetMicrovmImageVersionOutput,MicrovmImageVersionSummary,UpdateMicrovmImageVersionResponse",model_path="services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/smithy-model/com-amazonaws-lambdamicrovms-lambdamicrovms.json")`).
 //!   Every response reporting a version carries it, so the three paths that report one
 //!   cannot disagree about a version's settlement.
 //!

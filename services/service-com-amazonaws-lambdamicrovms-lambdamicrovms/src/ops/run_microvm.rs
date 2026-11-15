@@ -382,12 +382,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     started_at,
                     terminated_at: None,
                     state_reason: None,
-                    ingress_network_connectors: input
-                        .ingress_network_connectors
-                        .unwrap_or_default(),
-                    egress_network_connectors: input
-                        .egress_network_connectors
-                        .unwrap_or_default(),
+                    // The network paths this MicroVM actually has: the connectors the
+                    // request named, or the AWS-managed ones a MicroVM that names none
+                    // is attached to (`crate::state::resolve_network_connectors`) — so a
+                    // client reading the MicroVM back learns what it is attached to
+                    // rather than nothing.
+                    ingress_network_connectors:
+                        crate::state::resolve_ingress_network_connectors(
+                            &region,
+                            input.ingress_network_connectors,
+                        ),
+                    egress_network_connectors: crate::state::resolve_egress_network_connectors(
+                        &region,
+                        input.egress_network_connectors,
+                    ),
                     link_local_address,
                     // "The MicroVM starts in PENDING state and transitions to RUNNING
                     // once provisioning completes."

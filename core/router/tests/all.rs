@@ -1289,3 +1289,9 @@ mod zz_probe_whole_emulator;
 //! and for every service crate's `tests/all.rs`, so leave the rules there rather than
 //! restating them here.
 //! this file, which the layout check refuses: the `#[path]` attribute is what points each
+//! pair, keeping the list sorted: one pair per suite file and nothing else, so a landing
+//! has one place to insert and nothing to keep consistent.
+//! every suite in this target. THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`)
+//! MAY STAND IN THIS FILE: past the first item one is `E0753` and compiles no suite of
+//! this target, so what goes below is a declaration, never a note about one.
+//! it into `tests/all/`.

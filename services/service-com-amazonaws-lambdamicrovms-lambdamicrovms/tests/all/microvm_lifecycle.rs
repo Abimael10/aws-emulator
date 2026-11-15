@@ -24,6 +24,66 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// HAS become due, so only an over-long wait is safe.
 pub(crate) const PAST_THE_SPAN: Duration = Duration::from_millis(2_500);
 
+/// How long [`poll_until`] keeps looking before it gives up. Generous against every
+/// clock-owed span of this service (each is 500 ms), because what it bounds is only how
+/// long a loaded host may take to get there — the case asserts the CONDITION, never the
+/// time it took.
+const POLL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long [`poll_until`] waits between looks: short enough that a case gets through a
+/// 500 ms span promptly, long enough not to spin.
+const BETWEEN_LOOKS: Duration = Duration::from_millis(25);
+
+/// Look again until `holds` answers true, and fail once [`POLL_DEADLINE`] has passed.
+///
+/// The poll loop the control-plane suites of this crate share (the two data-plane suites
+/// drive a MicroVM's own endpoint and keep their own): what a case waits for is a
+/// CONDITION the emulator reaches on its own clock — a MicroVM that reports `RUNNING`, a
+/// build that has settled — never a duration the case measures, so a slow or loaded host
+/// only makes it look again. `what` names the condition in the failure.
+pub(crate) async fn poll_until<F, Fut>(case: &str, what: &str, holds: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        if holds().await {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: {what} never became true inside the deadline"
+        );
+        tokio::time::sleep(BETWEEN_LOOKS).await;
+    }
+}
+
+/// Look at the MicroVM `identifier` names until `GetMicrovm` reports it in `state` —
+/// the state the call that started its transition owes it — through [`poll_until`].
+pub(crate) async fn poll_until_microvm_state(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+    state: &str,
+) {
+    poll_until(
+        case,
+        &format!("the MicroVM {identifier} reports {state}"),
+        || async {
+            let (status, got) = call(
+                router,
+                "GET",
+                &format!("/2025-09-09/microvms/{}", as_uri_value(identifier)),
+                None,
+            )
+            .await;
+            status == 200 && got["state"].as_str() == Some(state)
+        },
+    )
+    .await;
+}
+
 /// Comfortably longer than the 1-second `maximumDurationInSeconds` the expiry suite asks
 /// for, for the same reason as [`PAST_THE_SPAN`].
 const PAST_THE_MAXIMUM_DURATION: Duration = Duration::from_millis(3_000);
@@ -739,7 +799,7 @@ async fn terminate_is_observable_and_idempotent() {
 
     let (_, run) = run_microvm(&router, json!({"imageIdentifier": "terminable"})).await;
     let microvm_id = run["microvmId"].as_str().unwrap_or_default().to_string();
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    poll_until_microvm_state(&router, "terminate", &microvm_id, "RUNNING").await;
 
     let (status, body) = call(
         &router,
@@ -771,8 +831,8 @@ async fn terminate_is_observable_and_idempotent() {
     );
     assert_eq!(
         ending["stateReason"].as_str(),
-        Some("Client.UserInitiatedTermination"),
-        "expected the caller-initiated termination reason, got {:?}",
+        Some("Success."),
+        "expected the reason a clean customer-requested termination reports, got {:?}",
         ending["stateReason"]
     );
 
@@ -803,7 +863,7 @@ async fn terminate_is_observable_and_idempotent() {
         after["stateReason"]
     );
 
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    poll_until_microvm_state(&router, "terminate", &microvm_id, "TERMINATED").await;
     let (_, terminated) = call(
         &router,
         "GET",

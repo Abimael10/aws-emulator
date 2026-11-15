@@ -104,6 +104,16 @@ pub const IMAGE_DELETE_SPAN: Duration = Duration::from_millis(500);
 /// AWS behaviour rather than modelled.
 pub const DEFAULT_EGRESS_NETWORK_CONNECTOR: &str = "INTERNET_EGRESS";
 
+/// The AWS-managed network connector a MicroVM gets when the request names no
+/// `ingressNetworkConnectors`: the HTTPS path a client reaches the MicroVM's own
+/// endpoint over.
+///
+/// `RunMicrovmResponse$endpoint` is "the HTTPS endpoint URL for communicating with the
+/// MicroVM", so every MicroVM is reachable over an ingress path; which managed connector
+/// carries it is recorded AWS behaviour rather than modelled, as the egress default
+/// ([`DEFAULT_EGRESS_NETWORK_CONNECTOR`]) is.
+pub const DEFAULT_INGRESS_NETWORK_CONNECTOR: &str = "HTTP_INGRESS";
+
 /// The `maximumDurationInSeconds` a MicroVM gets when the caller names none.
 ///
 /// `RunMicrovmRequest$maximumDurationInSeconds` is documented as "The maximum
@@ -216,10 +226,15 @@ pub fn too_many_tags_message() -> String {
     format!("a resource may carry at most {MAX_TAGS_PER_RESOURCE} tags")
 }
 
-/// `stateReason` the service records for a caller-requested termination.
+/// `stateReason` the service records for a termination the CUSTOMER asked for.
 ///
-/// `NonBlankString` has pattern `^[^\s]+$`, so the reason is a single token.
-pub const TERMINATION_REASON: &str = "Client.UserInitiatedTermination";
+/// A termination a caller requested and the service carried out completed cleanly, so
+/// the reason it reports is the outcome of that work rather than a diagnosis — recorded
+/// AWS behaviour, whole fixed text. A reason that diagnoses a failure, or a termination
+/// the platform initiated ([`EXPIRY_REASON`]), is a different value.
+///
+/// `NonBlankString` has pattern `^[^\s]+$`, so the reason carries no whitespace.
+pub const TERMINATION_REASON: &str = "Success.";
 
 /// `stateReason` the service records when a MicroVM outlives its
 /// `maximumDurationInSeconds` — documented as "The maximum duration in seconds that
@@ -735,27 +750,47 @@ pub const DEFAULT_MINIMUM_MEMORY_IN_MIB: i32 = 2048;
 /// service's own namespace, named for the image. The prefix is recorded AWS behaviour.
 pub const DEFAULT_LOG_GROUP_PREFIX: &str = "/aws/lambda-microvms";
 
-/// The `egressNetworkConnectors` a build request's own list resolves to: the
-/// connectors it asked for, or the AWS-managed egress connector in `region` when it
-/// asked for none.
+/// The network connectors a request's own list resolves to: the connectors it asked
+/// for, or the AWS-MANAGED connector `managed_default` of `region` when it asked for
+/// none.
 ///
-/// `egressNetworkConnectors` are "the list of egress network connectors available to
-/// the MicroVM at runtime", so an accepted version records the connectors the MicroVM
-/// will actually have rather than nothing — see
-/// [`DEFAULT_EGRESS_NETWORK_CONNECTOR`]. The resolution is the one every operation
-/// that mints a version performs, so the versions a create and an update persist
-/// cannot disagree about it.
+/// A connector list is "the list of … network connectors configured for the MicroVM",
+/// i.e. the network paths the resource actually has — so a record is persisted with the
+/// connectors it is attached to rather than with nothing: a request naming none is
+/// attached to the AWS-managed connector of that direction, which is what a client then
+/// reads back. This is the ONE resolution every operation that persists a connector list
+/// performs, so what a create, an update and a launch record cannot disagree about it.
+pub fn resolve_network_connectors(
+    region: &str,
+    requested: Option<Vec<String>>,
+    managed_default: &str,
+) -> Vec<String> {
+    match requested {
+        Some(connectors) if !connectors.is_empty() => connectors,
+        _ => vec![managed_network_connector_arn(region, managed_default)],
+    }
+}
+
+/// The `egressNetworkConnectors` a request's own list resolves to
+/// ([`resolve_network_connectors`]): the connectors it asked for, or the AWS-managed
+/// egress connector in `region` when it asked for none
+/// ([`DEFAULT_EGRESS_NETWORK_CONNECTOR`]).
 pub fn resolve_egress_network_connectors(
     region: &str,
     requested: Option<Vec<String>>,
 ) -> Vec<String> {
-    match requested {
-        Some(connectors) if !connectors.is_empty() => connectors,
-        _ => vec![managed_network_connector_arn(
-            region,
-            DEFAULT_EGRESS_NETWORK_CONNECTOR,
-        )],
-    }
+    resolve_network_connectors(region, requested, DEFAULT_EGRESS_NETWORK_CONNECTOR)
+}
+
+/// The `ingressNetworkConnectors` a request's own list resolves to
+/// ([`resolve_network_connectors`]): the connectors it asked for, or the AWS-managed
+/// ingress connector in `region` when it asked for none
+/// ([`DEFAULT_INGRESS_NETWORK_CONNECTOR`]).
+pub fn resolve_ingress_network_connectors(
+    region: &str,
+    requested: Option<Vec<String>>,
+) -> Vec<String> {
+    resolve_network_connectors(region, requested, DEFAULT_INGRESS_NETWORK_CONNECTOR)
 }
 
 /// The `cpuConfigurations` a build request's own list resolves to: the configurations
@@ -1483,10 +1518,13 @@ pub struct IdempotencyRecord {
 /// [`regions::RegionalStore`] per region and every lookup is scoped to the region the
 /// request was signed for ([`request_region`]) — see the [`regions`] module.
 ///
-/// Every map here is bounded: each region's `images` by [`MAX_MICROVM_IMAGES`], its
-/// `microvms` by [`MAX_ACTIVE_MICROVMS`] plus the [`TERMINATED_MICROVM_RETENTION`]
-/// reclaim, and its `idempotency` by [`MAX_IDEMPOTENCY_RECORDS`] and
-/// [`IDEMPOTENCY_RETENTION`].
+/// Every map here is bounded: the `regions` partitions themselves by [`MAX_REGIONS`]
+/// (the partition key is the caller's own credential-scope region, so a write that would
+/// open one past the cap stores nothing, and a partition left holding no records is
+/// dropped by [`Self::materialize_due`]), and within each region its `images` by
+/// [`MAX_MICROVM_IMAGES`], its `microvms` by [`MAX_ACTIVE_MICROVMS`] plus the
+/// [`TERMINATED_MICROVM_RETENTION`] reclaim, and its `idempotency` by
+/// [`MAX_IDEMPOTENCY_RECORDS`] and [`IDEMPOTENCY_RETENTION`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// The records of each region, keyed by the region they were created in. A region
@@ -1578,10 +1616,17 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// own; the authentication tokens are held once for the whole store, because the
     /// address they authenticate at is a MicroVM's own rather than a regional endpoint
     /// of this service.
+    ///
+    /// A region whose records the clock has all reclaimed holds nothing, and a region
+    /// holding nothing is indistinguishable from one nothing was ever created in — so the
+    /// partition itself goes with them, which is what keeps the one dimension of the
+    /// store the CALLER keys from accumulating empty partitions for the life of the
+    /// process.
     pub fn materialize_due(&mut self, now: Instant) {
         for regional in self.regions.values_mut() {
             regional.materialize_due(now);
         }
+        self.regions.retain(|_, regional| !regional.is_empty());
         self.expire_auth_tokens(now);
     }
 }

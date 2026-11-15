@@ -32,8 +32,8 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::microvm_lifecycle::{
-    as_uri_value, call_in_region, emulator, emulator_with_engine, image_body, ACCOUNT,
-    PAST_THE_SPAN, REGION,
+    as_uri_value, call_in_region, emulator, emulator_with_engine, image_body, poll_until, ACCOUNT,
+    REGION,
 };
 
 /// The regions that must answer nothing for a record minted in [`REGION`]: another
@@ -45,6 +45,29 @@ const FOREIGN_REGIONS: &[&str] = &["us-east-1", "eu-central-1", "ap-southeast-2"
 /// The ARN this service mints for the image `name` in `region`.
 fn image_arn_in(region: &str, name: &str) -> String {
     format!("arn:aws:lambda:{region}:{ACCOUNT}:microvm-image:{name}")
+}
+
+/// Look at the image `name` in [`REGION`] until its build has SETTLED with an active
+/// version — the condition a launch from it needs — through the poll loop the
+/// control-plane suites share ([`poll_until`]), so no case here waits a fixed time for a
+/// move the clock owes.
+async fn poll_until_image_is_active(router: &MultiServiceRouter, name: &str) {
+    poll_until(
+        REGION,
+        &format!("the image {name} settles with an active version"),
+        || async {
+            let (status, read) = call_in_region(
+                router,
+                REGION,
+                "GET",
+                &format!("/2025-09-09/microvm-images/{name}"),
+                None,
+            )
+            .await;
+            status == 200 && read["latestActiveImageVersion"].is_string()
+        },
+    )
+    .await;
 }
 
 /// `POST /2025-09-09/microvm-images`, signed for `region`.
@@ -121,23 +144,17 @@ async fn an_image_is_addressable_only_through_the_region_that_minted_it() {
         "the create must mint the ARN of the region it was signed for, got {created}"
     );
     // The build is clock-owed, so this waits for the CONDITION the rows below read about —
-    // the image's creation having settled in the region that minted it — by looking again
-    // until a generous deadline passes, rather than for a fixed time.
-    {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
+    // the image's creation having settled in the region that minted it — through the poll
+    // loop the control-plane suites share, rather than for a fixed time.
+    poll_until(
+        REGION,
+        &format!("the image {name} settles on {IMAGE_STATE_CREATED}"),
+        || async {
             let (status, read) = get_image(&router, REGION, name).await;
-            assert_eq!(status, 200, "read the image {name}: got {status} {read}");
-            if read["state"].as_str() == Some(IMAGE_STATE_CREATED) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the image {name} never settled on {IMAGE_STATE_CREATED}: last read {read}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
+            status == 200 && read["state"].as_str() == Some(IMAGE_STATE_CREATED)
+        },
+    )
+    .await;
 
     for region in FOREIGN_REGIONS {
         // Rows differ in WHICH call asks about the identifier: the image's own read, the
@@ -365,29 +382,9 @@ async fn an_authentication_token_grants_access_only_in_the_region_that_minted_it
     let (status, created) = create_image(&router, REGION, name, json!({})).await;
     assert_eq!(status, 201, "create in {REGION}: got {status} {created}");
     // The build is clock-owed, so this waits for the CONDITION the launch below needs —
-    // an active version to launch from — rather than for a fixed time.
-    {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            let (status, read) = call_in_region(
-                &router,
-                REGION,
-                "GET",
-                &format!("/2025-09-09/microvm-images/{name}"),
-                None,
-            )
-            .await;
-            assert_eq!(status, 200, "read the image {name}: got {status} {read}");
-            if read["latestActiveImageVersion"].is_string() {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the image {name} never settled with an active version: last read {read}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    }
+    // an active version to launch from — rather than for a fixed time, through the poll
+    // loop the control-plane suites share.
+    poll_until_image_is_active(&router, name).await;
 
     let (status, run) = call_in_region(
         &router,
@@ -504,7 +501,7 @@ async fn a_microvm_is_addressable_only_through_the_region_that_ran_it() {
     let name = "regional-runtime";
     let (status, created) = create_image(&router, REGION, name, json!({})).await;
     assert_eq!(status, 201, "create in {REGION}: got {status} {created}");
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    poll_until_image_is_active(&router, name).await;
 
     let (status, run) = call_in_region(
         &router,

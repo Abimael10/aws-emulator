@@ -51,6 +51,16 @@ pub struct RegionalStore {
     pub idempotency: BTreeMap<String, IdempotencyRecord>,
 }
 
+impl RegionalStore {
+    /// Whether this region holds no RECORD a read can return — no image, no MicroVM and no
+    /// idempotency record left, which is what a region nothing was ever created in holds,
+    /// so the two are indistinguishable to every read. The ARN indexes are lookups into
+    /// those records rather than records of their own, so they are not consulted.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.images.is_empty() && self.microvms.is_empty() && self.idempotency.is_empty()
+    }
+}
+
 impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// The records `region` holds, or `None` when nothing was ever created there.
     ///
@@ -61,12 +71,20 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     }
 
     /// The records `region` holds, for mutation — created empty on the first write that
-    /// region takes.
+    /// region takes, and `None` when opening it would take the store past
+    /// [`MAX_REGIONS`].
     ///
-    /// A write that would open a region this store holds none is refused BEFORE it gets
-    /// here, so the partitions stay bounded; see [`Self::would_open_region`].
-    pub fn in_region_mut(&mut self, region: &str) -> &mut RegionalStore {
-        self.regions.entry(region.to_string()).or_default()
+    /// The partition key is a value the CALLER chooses (the region of the request's own
+    /// credential scope), so this is the one dimension of the store a caller could
+    /// otherwise grow without bound: the cap is enforced HERE, where the partition would
+    /// be opened, so no write path can bypass it. An operation that can open one checks
+    /// [`Self::would_open_region`] first and answers its modelled quota refusal
+    /// ([`too_many_regions_message`]) rather than reaching this.
+    pub fn in_region_mut(&mut self, region: &str) -> Option<&mut RegionalStore> {
+        if self.would_open_region(region) {
+            return None;
+        }
+        Some(self.regions.entry(region.to_string()).or_default())
     }
 
     /// Whether storing a record for `region` would open a partition this store does not
@@ -101,8 +119,18 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     }
 
     /// Persist `image` in `region`, with the ARN index that resolves its identifier.
+    ///
+    /// Stores nothing when `region` would open a partition past [`MAX_REGIONS`]
+    /// ([`Self::in_region_mut`]). The create that calls this checks
+    /// [`Self::would_open_region`] first and answers the modelled quota refusal
+    /// ([`too_many_regions_message`]) for exactly that condition, so this arm is the
+    /// store's own guarantee rather than the refusal a caller sees: it keeps the cap true
+    /// however the record is reached, and the caller reads the record back and answers its
+    /// modelled error rather than reporting a create the store did not take.
     pub fn insert_image(&mut self, region: &str, image: MicrovmImage) {
-        let regional = self.in_region_mut(region);
+        let Some(regional) = self.in_region_mut(region) else {
+            return;
+        };
         regional
             .arn_index
             .insert(image.image_arn.clone(), image.name.clone());
@@ -263,9 +291,17 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             .flat_map(|regional| regional.microvms.values())
     }
 
-    /// Persist `vm` in `region`, with the ARN index that resolves its identifier.
+    /// Persist `vm` in `region`, with the ARN index that resolves its identifier. Stores
+    /// nothing for a region past [`MAX_REGIONS`], exactly as [`Self::insert_image`].
+    ///
+    /// A launch cannot be the call that opens a partition: it runs a MicroVM from an image
+    /// of the region the request was signed for, so that region already holds a record by
+    /// the time this is reached. The arm is the same store-side guarantee as the image
+    /// path's.
     pub fn insert_microvm(&mut self, region: &str, vm: Microvm) {
-        let regional = self.in_region_mut(region);
+        let Some(regional) = self.in_region_mut(region) else {
+            return;
+        };
         regional
             .microvm_arn_index
             .insert(vm.microvm_arn.clone(), vm.microvm_id.clone());
@@ -293,6 +329,12 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
 
     /// Record what `client_token` minted on `operation` in `region`, evicting the record
     /// closest to expiry when that region is at [`MAX_IDEMPOTENCY_RECORDS`].
+    ///
+    /// A token is recorded only after the resource it minted was stored, so the partition
+    /// exists by the time this is reached and the [`MAX_REGIONS`] arm below is the same
+    /// store-side guarantee as [`Self::insert_image`]'s: it records nothing for a region
+    /// the store does not hold, which leaves a replay of that token to mint again rather
+    /// than resolving to a resource that was never stored.
     pub fn record_minted(
         &mut self,
         region: &str,
@@ -302,7 +344,9 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         now: Instant,
     ) {
         let key = idempotency_key(operation, client_token);
-        let regional = self.in_region_mut(region);
+        let Some(regional) = self.in_region_mut(region) else {
+            return;
+        };
         if !regional.idempotency.contains_key(&key)
             && regional.idempotency.len() >= MAX_IDEMPOTENCY_RECORDS
         {

@@ -61,6 +61,8 @@ mod microvm_guest_data_plane;
 mod microvm_image_and_instance_paths;
 #[path = "all/microvm_lifecycle.rs"]
 mod microvm_lifecycle;
+#[path = "all/microvm_network_attachment.rs"]
+mod microvm_network_attachment;
 #[path = "all/microvm_runtime_path.rs"]
 mod microvm_runtime_path;
 #[path = "all/microvm_suspend_resume.rs"]
@@ -75,5 +77,7 @@ mod resource_tag_removal;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/version_state_time_bucket_key.rs"]
+mod version_state_time_bucket_key;
 #[path = "all/version_state_time_bucket.rs"]
 mod version_state_time_bucket;
