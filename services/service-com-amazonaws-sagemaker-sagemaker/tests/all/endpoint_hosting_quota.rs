@@ -44,7 +44,7 @@ fn config_body(name: &str, model: &str, instance_type: &str, instances: i64) -> 
 /// How SageMaker words a request past an account quota it publishes, as
 /// `state::account_quota_exceeded` states it for the endpoint-usage quota of
 /// `instance_type`.
-fn over_quota(instance_type: &str, limit: i64, in_use: i64, delta: i64) -> String {
+pub(crate) fn over_quota(instance_type: &str, limit: i64, in_use: i64, delta: i64) -> String {
     format!(
         "The account-level service limit '{instance_type} for endpoint usage' is {limit} \
          Instances, with current utilization of {in_use} Instances and a request delta of \

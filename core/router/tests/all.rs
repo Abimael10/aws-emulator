@@ -1811,3 +1811,6 @@ mod zz_probe_whole_emulator;
 // The suites that check the rules above rather than restating them:
 // `all/declaration_roots_are_canonical_and_complete.rs` — for this file and for every
 // service crate's `tests/all.rs`.
+// `all/appended_notes.rs` and `all/appended_notes_tail.rs`. The `all_rs_*` suites,
+// `all/declaration_roots_are_canonical_and_complete.rs` pin every rule above, for this file
+// and for every service crate's `tests/all.rs`, so check there rather than leaving a note

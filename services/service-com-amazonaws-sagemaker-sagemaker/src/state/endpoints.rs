@@ -42,6 +42,12 @@ pub struct EndpointConfig {
 /// deployed). It is what the per-instance-type hosting quota counts against
 /// ([`ComAmazonawsSagemakerSagemakerState::endpoint_instances_in_use`]), so deleting the
 /// endpoint releases exactly what creating it took.
+///
+/// `pending_update` is the deployment `UpdateEndpoint` asked for and the clock has not
+/// completed yet; while it is set the endpoint still reports the configuration that is
+/// serving, and the new one is what [`Endpoint::settle_status`] swaps in when the
+/// deployment falls due. `last_deployment_config` is the deployment configuration of the
+/// most recent deployment the endpoint was given one for.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub name: String,
@@ -60,6 +66,141 @@ pub struct Endpoint {
     pub last_modified_time: SystemTime,
     pub in_service_at: SystemTime,
     pub instance_usage: BTreeMap<String, i64>,
+    pub pending_update: Option<EndpointUpdate>,
+    pub last_deployment_config: Option<DeploymentConfig>,
+}
+
+/// The deployment an `UpdateEndpoint` started and the clock has not completed yet: the
+/// configuration being deployed, snapshotted the way a create snapshots the one it
+/// deploys, plus the instants the deployment started and is owed complete.
+///
+/// The variants are the NEW configuration's, with the properties the request asked to
+/// retain already folded in ([`retained_variants`]), so settling the deployment is a
+/// swap and needs nothing of the request again.
+#[derive(Debug, Clone)]
+pub struct EndpointUpdate {
+    pub config_name: String,
+    pub production_variants: Vec<ProductionVariant>,
+    pub shadow_production_variants: Option<Vec<ProductionVariant>>,
+    pub data_capture_config: Option<DataCaptureConfig>,
+    pub async_inference_config: Option<AsyncInferenceConfig>,
+    pub explainer_config: Option<ExplainerConfig>,
+    pub metrics_config: Option<MetricsConfig>,
+    pub started_at: SystemTime,
+    pub in_service_at: SystemTime,
+}
+
+impl EndpointUpdate {
+    /// Every variant the deployment stands up: the production ones and the shadow ones,
+    /// which run on the same fleet's capacity.
+    pub fn variants(&self) -> impl Iterator<Item = &ProductionVariant> {
+        self.production_variants
+            .iter()
+            .chain(self.shadow_production_variants.iter().flatten())
+    }
+
+    /// How many instances of each ML instance type this deployment takes; see
+    /// [`instance_demand`].
+    pub fn instance_demand(&self) -> BTreeMap<String, i64> {
+        instance_demand(self.variants())
+    }
+}
+
+/// Which variant properties an update RETAINS from the fleet that is serving, rather than
+/// taking from the configuration being deployed.
+///
+/// `VariantPropertyType`'s two members that name a retained property are the instance
+/// count and the variant weight (its third, `DataCaptureConfig`, the model documents as
+/// "Not currently supported", and an endpoint retains no capture settings across a
+/// deployment — so naming it excludes nothing).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetainedProperties {
+    pub instance_count: bool,
+    pub weight: bool,
+}
+
+/// `VariantPropertyType`'s member naming the variant instance count
+/// (`smithy_query(query="shape",shape="VariantPropertyType")`).
+pub const VARIANT_PROPERTY_DESIRED_INSTANCE_COUNT: &str = "DesiredInstanceCount";
+
+/// `VariantPropertyType`'s member naming the variant weight.
+pub const VARIANT_PROPERTY_DESIRED_WEIGHT: &str = "DesiredWeight";
+
+/// What an update retains, from the request's `RetainAllVariantProperties` and the
+/// property types it excluded from that retention.
+///
+/// Nothing is retained unless the request asked for all variant properties to be retained
+/// (the model documents the default as `false`), and a property type the request listed as
+/// excluded is taken from the new configuration after all — which is what
+/// `ExcludeRetainedVariantProperties` is documented to override.
+pub fn retained_properties(retain_all: bool, excluded: &[&str]) -> RetainedProperties {
+    RetainedProperties {
+        instance_count: retain_all
+            && !excluded.contains(&VARIANT_PROPERTY_DESIRED_INSTANCE_COUNT),
+        weight: retain_all && !excluded.contains(&VARIANT_PROPERTY_DESIRED_WEIGHT),
+    }
+}
+
+/// The variants a deployment will run: the configuration's own, with each property
+/// `retained` names taken from the variant of the same name that is serving now.
+///
+/// A variant the serving fleet does not carry has nothing to retain, so it is deployed
+/// exactly as the configuration declares it.
+pub fn retained_variants(
+    config_variants: &[ProductionVariant],
+    serving: &[ProductionVariantSummary],
+    retained: RetainedProperties,
+) -> Vec<ProductionVariant> {
+    config_variants
+        .iter()
+        .map(|variant| {
+            let mut deployed = variant.clone();
+            let Some(current) = serving
+                .iter()
+                .find(|summary| summary.variant_name == variant.variant_name)
+            else {
+                return deployed;
+            };
+            if retained.instance_count && current.current_instance_count.is_some() {
+                deployed.initial_instance_count = current.current_instance_count;
+            }
+            if retained.weight && current.current_weight.is_some() {
+                deployed.initial_variant_weight = current.current_weight;
+            }
+            deployed
+        })
+        .collect()
+}
+
+/// The variant summaries an endpoint reports, derived from the configuration's stored
+/// `ProductionVariant`s.
+///
+/// `CurrentWeight`/`DesiredWeight` come from `InitialVariantWeight`, whose model doc
+/// says "If unspecified, it defaults to 1.0"; the instance counts come from
+/// `InitialInstanceCount`, and a serverless variant reports its serverless config
+/// instead of a count.
+///
+/// Stated once here because an endpoint takes its summaries from a configuration both
+/// when it is created from one and when a deployment swaps one in.
+pub fn variant_summaries(variants: &[ProductionVariant]) -> Vec<ProductionVariantSummary> {
+    variants
+        .iter()
+        .map(|variant| ProductionVariantSummary {
+            variant_name: variant.variant_name.clone(),
+            deployed_images: None,
+            current_weight: Some(variant.initial_variant_weight.unwrap_or(1.0)),
+            desired_weight: Some(variant.initial_variant_weight.unwrap_or(1.0)),
+            current_instance_count: variant.initial_instance_count,
+            desired_instance_count: variant.initial_instance_count,
+            instance_pools: None,
+            variant_status: None,
+            current_serverless_config: variant.serverless_config.clone(),
+            desired_serverless_config: variant.serverless_config.clone(),
+            managed_instance_scaling: variant.managed_instance_scaling.clone(),
+            routing_config: variant.routing_config.clone(),
+            capacity_reservation_config: None,
+        })
+        .collect()
 }
 
 /// The unit the per-instance-type hosting quotas are counted in: what their limit, the
@@ -155,10 +296,32 @@ pub fn instance_demand<'variants>(
         let Some(instance_type) = variant.instance_type.as_deref() else {
             continue;
         };
-        let count = i64::from(variant.initial_instance_count.unwrap_or(1)).max(1);
-        *demand.entry(instance_type.to_string()).or_default() += count;
+        *demand.entry(instance_type.to_string()).or_default() += variant_instance_count(variant);
     }
     demand
+}
+
+/// How many instances of its own type one variant runs: its `InitialInstanceCount`, and at
+/// least one, because a variant that names an instance type runs an instance of it.
+///
+/// The one normalisation both readings of a variant's capacity share, so what a quota
+/// counts for a type ([`instances_of_type`]) cannot disagree with what the whole demand
+/// ([`instance_demand`]) adds up.
+fn variant_instance_count(variant: &ProductionVariant) -> i64 {
+    i64::from(variant.initial_instance_count.unwrap_or(1)).max(1)
+}
+
+/// How many instances of `instance_type` `variants` ask for: [`instance_demand`]'s reading
+/// of ONE type, without building the map of every type.
+pub fn instances_of_type<'variants>(
+    variants: impl IntoIterator<Item = &'variants ProductionVariant>,
+    instance_type: &str,
+) -> i64 {
+    variants
+        .into_iter()
+        .filter(|variant| variant.instance_type.as_deref() == Some(instance_type))
+        .map(variant_instance_count)
+        .sum()
 }
 
 /// Materialise the `Creating` -> `InService` transition the clock already owes a
@@ -185,17 +348,116 @@ pub(super) fn settle_creating(
 }
 
 impl Endpoint {
-    /// Materialise the `Creating` -> `InService` transition the clock already owes; see
-    /// [`settle_creating`].
+    /// Materialise the transition the clock already owes this endpoint: the
+    /// `Creating` -> `InService` one of a create (see [`settle_creating`]), or the
+    /// `Updating` -> `InService` one of a deployment, which swaps the configuration being
+    /// deployed in for the one that was serving.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        settle_creating(
+        if settle_creating(
             &mut self.status,
             &mut self.last_modified_time,
             self.in_service_at,
             now,
-        )
+        ) {
+            return true;
+        }
+        self.settle_update(now)
+    }
+
+    /// The deployment of `config` this endpoint WOULD run, retaining the variant
+    /// properties `retained` names from the fleet that is serving now.
+    ///
+    /// Computes and changes nothing, so a caller can read what the deployment would take
+    /// — its [`EndpointUpdate::instance_demand`] — and refuse it before anything is
+    /// stored. The configuration is SNAPSHOTTED into the result, the way a create
+    /// snapshots the one it deploys: a later `CreateEndpointConfig` does not change what
+    /// this deployment stands up.
+    pub fn planned_update(
+        &self,
+        config: &EndpointConfig,
+        retained: RetainedProperties,
+        now: SystemTime,
+    ) -> EndpointUpdate {
+        EndpointUpdate {
+            config_name: config.name.clone(),
+            production_variants: retained_variants(
+                &config.production_variants,
+                &self.production_variants,
+                retained,
+            ),
+            shadow_production_variants: config.shadow_production_variants.as_deref().map(
+                |variants| retained_variants(variants, &self.shadow_production_variants, retained),
+            ),
+            data_capture_config: config.data_capture_config.clone(),
+            async_inference_config: config.async_inference_config.clone(),
+            explainer_config: config.explainer_config.clone(),
+            metrics_config: config.metrics_config.clone(),
+            started_at: now,
+            in_service_at: now + ENDPOINT_UPDATED_AFTER,
+        }
+    }
+
+    /// Start `update`: the endpoint goes `Updating` and keeps reporting the configuration
+    /// that is serving until the deployment is owed complete, which is
+    /// [`ENDPOINT_UPDATED_AFTER`] after the call that asked for it.
+    pub fn begin_update(&mut self, update: EndpointUpdate) {
+        self.status = STATUS_UPDATING.to_string();
+        self.last_modified_time = update.started_at;
+        self.pending_update = Some(update);
+    }
+
+    /// Materialise the deployment the clock already owes: the new fleet is serving, the
+    /// old one is gone, and the endpoint reports the configuration that was deployed.
+    ///
+    /// The same single write a reporting operation may make as [`settle_creating`]: the
+    /// deployment was due at its stored instant whether or not anybody called, and
+    /// `last_modified_time` moves to that instant rather than to "now", so the value is
+    /// stable across later reads.
+    fn settle_update(&mut self, now: SystemTime) -> bool {
+        let Some(update) = self
+            .pending_update
+            .take_if(|update| now >= update.in_service_at)
+        else {
+            return false;
+        };
+        self.instance_usage = update.instance_demand();
+        self.production_variants = variant_summaries(&update.production_variants);
+        self.shadow_production_variants = update
+            .shadow_production_variants
+            .as_deref()
+            .map(variant_summaries)
+            .unwrap_or_default();
+        self.config_name = update.config_name;
+        self.data_capture_config = update.data_capture_config;
+        self.async_inference_config = update.async_inference_config;
+        self.explainer_config = update.explainer_config;
+        self.metrics_config = update.metrics_config;
+        self.status = STATUS_IN_SERVICE.to_string();
+        self.last_modified_time = update.in_service_at;
+        true
+    }
+
+    /// How many instances of `instance_type` this endpoint holds: the fleet that is
+    /// serving, plus the one a deployment in flight is standing up — SageMaker keeps the
+    /// old fleet until the new one is serving, so an endpoint part-way through a
+    /// deployment holds both.
+    pub fn instances_of(&self, instance_type: &str) -> i64 {
+        let serving = self.instance_usage.get(instance_type).copied().unwrap_or(0);
+        let deploying = self
+            .pending_update
+            .as_ref()
+            .map(|update| instances_of_type(update.variants(), instance_type))
+            .unwrap_or(0);
+        serving + deploying
     }
 }
+
+/// How long after `UpdateEndpoint` the clock owes the `Updating` -> `InService`
+/// transition, on the same terms as [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that
+/// describes the endpoint straight after asking for the deployment still observes
+/// `Updating` with the old configuration serving, and one that waits observes `InService`
+/// with the new one. The span itself is that one value, so the two cannot drift apart.
+pub const ENDPOINT_UPDATED_AFTER: Duration = ENDPOINT_IN_SERVICE_AFTER;
 
 /// How long after `CreateInferenceComponent` the clock owes that component the
 /// `Creating` -> `InService` transition, on the same terms as

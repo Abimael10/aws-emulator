@@ -77,6 +77,8 @@ mod default_lineage_group_identity;
 mod delete_and_stop_preconditions;
 #[path = "all/endpoint_config_deletion.rs"]
 mod endpoint_config_deletion;
+#[path = "all/endpoint_config_deployment.rs"]
+mod endpoint_config_deployment;
 #[path = "all/endpoint_hosting_quota.rs"]
 mod endpoint_hosting_quota;
 #[path = "all/execution_role_admission.rs"]

@@ -77,7 +77,8 @@ use crate::ops::types::{
     AsyncInferenceConfig, AutoMLComputeConfig, AutoMLDataSplitConfig, AutoMLJobChannel,
     AutoMLJobObjective, AutoMLOutputDataConfig, AutoMLProblemTypeConfig, AutoMLSecurityConfig,
     Autotune, BatchDataCaptureConfig, CodeEditorAppImageConfig, ContainerDefinition,
-    DataCaptureConfig, DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig,
+    DataCaptureConfig, DataProcessing, DeploymentConfig, DriftCheckBaselines, ExperimentConfig,
+    ExplainerConfig,
     GitConfig, HyperParameterTrainingJobDefinition, HyperParameterTuningJobConfig,
     HyperParameterTuningJobWarmStartConfig, IamIdentity, InferenceExecutionConfig,
     InferenceSpecification, JupyterLabAppImageConfig, KernelGatewayImageConfig,
@@ -774,6 +775,10 @@ pub const AUTO_MODEL_REGISTRATION_DISABLED: &str = "AutoModelRegistrationDisable
 pub const STATUS_CREATING: &str = "Creating";
 /// See [`STATUS_CREATING`].
 pub const STATUS_IN_SERVICE: &str = "InService";
+/// `EndpointStatus`'s member an endpoint carries between the call that asked for a new
+/// deployment and the instant that deployment is owed complete. See
+/// [`Endpoint::begin_update`].
+pub const STATUS_UPDATING: &str = "Updating";
 /// `ClusterStatus`'s member a cluster carries between the call that asked for its
 /// deletion and the instant the deletion completes. See [`Cluster::begin_deletion`].
 pub const STATUS_DELETING: &str = "Deleting";
@@ -2778,11 +2783,12 @@ impl ComAmazonawsSagemakerSagemakerState {
     ///
     /// Read off the endpoints themselves rather than off the configurations they name, so
     /// what an endpoint holds is what it was created with and a deleted endpoint uses
-    /// nothing.
+    /// nothing. An endpoint part-way through a deployment holds BOTH fleets, because the
+    /// new one is stood up while the old one keeps serving ([`Endpoint::instances_of`]).
     pub fn endpoint_instances_in_use(&self, instance_type: &str) -> i64 {
         self.endpoints
             .values()
-            .filter_map(|endpoint| endpoint.instance_usage.get(instance_type))
+            .map(|endpoint| endpoint.instances_of(instance_type))
             .sum()
     }
 

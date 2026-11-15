@@ -162,34 +162,6 @@ impl<Eng> CreateEndpoint<Eng> {
     }
 }
 
-/// The variant summaries an endpoint reports, derived from the configuration's stored
-/// `ProductionVariant`s.
-///
-/// `CurrentWeight`/`DesiredWeight` come from `InitialVariantWeight`, whose model doc
-/// says "If unspecified, it defaults to 1.0"; the instance counts come from
-/// `InitialInstanceCount`, and a serverless variant reports its serverless config
-/// instead of a count.
-fn variant_summaries(variants: &[ProductionVariant]) -> Vec<ProductionVariantSummary> {
-    variants
-        .iter()
-        .map(|variant| ProductionVariantSummary {
-            variant_name: variant.variant_name.clone(),
-            deployed_images: None,
-            current_weight: Some(variant.initial_variant_weight.unwrap_or(1.0)),
-            desired_weight: Some(variant.initial_variant_weight.unwrap_or(1.0)),
-            current_instance_count: variant.initial_instance_count,
-            desired_instance_count: variant.initial_instance_count,
-            instance_pools: None,
-            variant_status: None,
-            current_serverless_config: variant.serverless_config.clone(),
-            desired_serverless_config: variant.serverless_config.clone(),
-            managed_instance_scaling: variant.managed_instance_scaling.clone(),
-            routing_config: variant.routing_config.clone(),
-            capacity_reservation_config: None,
-        })
-        .collect()
-}
-
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateEndpoint<Eng>
 {
@@ -262,11 +234,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The endpoint snapshots the configuration it was created from, the way the real
         // service does: a later CreateEndpointConfig does not retroactively change it.
-        let production_variants = variant_summaries(&config.production_variants);
+        let production_variants = crate::state::variant_summaries(&config.production_variants);
         let shadow_production_variants = config
             .shadow_production_variants
             .as_deref()
-            .map(variant_summaries)
+            .map(crate::state::variant_summaries)
             .unwrap_or_default();
         let data_capture_config = config.data_capture_config.clone();
         let async_inference_config = config.async_inference_config.clone();
@@ -293,6 +265,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 last_modified_time: now,
                 in_service_at: now + crate::state::ENDPOINT_IN_SERVICE_AFTER,
                 instance_usage: demand,
+                // Nothing is being deployed over this endpoint and it was given no
+                // deployment configuration: a create takes none.
+                pending_update: None,
+                last_deployment_config: None,
             },
         );
         drop(store);

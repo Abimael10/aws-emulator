@@ -148,6 +148,54 @@ impl<Eng> DescribeEndpoint<Eng> {
     }
 }
 
+/// The summary of a deployment in flight: the configuration being deployed, the instant
+/// the deployment started, and one pending summary per variant it is standing up.
+///
+/// `PendingDeploymentSummary`'s two variant lists are `len 1..`, so a deployment with no
+/// shadow variants omits that member rather than reporting an empty list.
+fn pending_summary(update: &crate::state::EndpointUpdate) -> PendingDeploymentSummary {
+    PendingDeploymentSummary {
+        endpoint_config_name: update.config_name.clone(),
+        production_variants: (!update.production_variants.is_empty())
+            .then(|| pending_variant_summaries(&update.production_variants)),
+        start_time: Some(crate::state::timestamp(update.started_at)),
+        shadow_production_variants: update
+            .shadow_production_variants
+            .as_deref()
+            .filter(|variants| !variants.is_empty())
+            .map(pending_variant_summaries),
+    }
+}
+
+/// The pending summaries of the variants a deployment is standing up.
+///
+/// The `Desired*` members are what the deployment asked for — taken from the
+/// configuration being deployed, with `DesiredWeight` defaulting the way
+/// `InitialVariantWeight` documents ("If unspecified, it defaults to 1.0"). The
+/// `Current*` members are what of this deployment's fleet is already serving, and while
+/// the deployment is in flight that is nothing, so they are not reported.
+fn pending_variant_summaries(variants: &[ProductionVariant]) -> Vec<PendingProductionVariantSummary> {
+    variants
+        .iter()
+        .map(|variant| PendingProductionVariantSummary {
+            variant_name: variant.variant_name.clone(),
+            deployed_images: None,
+            current_weight: None,
+            desired_weight: Some(variant.initial_variant_weight.unwrap_or(1.0)),
+            current_instance_count: None,
+            desired_instance_count: variant.initial_instance_count,
+            instance_type: variant.instance_type.clone(),
+            instance_pools: None,
+            accelerator_type: variant.accelerator_type.clone(),
+            variant_status: None,
+            current_serverless_config: None,
+            desired_serverless_config: variant.serverless_config.clone(),
+            managed_instance_scaling: variant.managed_instance_scaling.clone(),
+            routing_config: variant.routing_config.clone(),
+        })
+        .collect()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for DescribeEndpoint<Eng>
 {
@@ -210,12 +258,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             failure_reason: endpoint.failure_reason.clone(),
             creation_time: crate::state::timestamp(endpoint.creation_time),
             last_modified_time: crate::state::timestamp(endpoint.last_modified_time),
-            // This emulator runs no blue/green deployment and has no in-flight update, so
-            // there is nothing to report for either: the real service omits both on a
-            // settled endpoint.
-            last_deployment_config: None,
+            // The deployment configuration of the most recent deployment this endpoint was
+            // given one for; an endpoint no update has deployed carries none.
+            last_deployment_config: endpoint.last_deployment_config.clone(),
             async_inference_config: endpoint.async_inference_config.clone(),
-            pending_deployment_summary: None,
+            // The summary of the deployment in flight, which the model documents as
+            // reported only while one is: a settled endpoint carries none.
+            pending_deployment_summary: endpoint.pending_update.as_ref().map(pending_summary),
             explainer_config: endpoint.explainer_config.clone(),
             // The shadow variants the stored configuration carried, summarised at create
             // time. The list is `len 1..`, so an endpoint with none omits the member.

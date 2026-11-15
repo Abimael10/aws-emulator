@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: deploys the endpoint configuration the request names to the endpoint it
+//! names — the endpoint goes `Updating` and keeps serving the configuration it already
+//! has until the clock owes the deployment complete, then reports the new one — and
+//! refuses an unknown endpoint, an unknown configuration, an endpoint that is not
+//! `InService` and a deployment past the account's hosting quota. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +165,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEndpoint"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Every refusal of the endpoint this call addresses words the same fact the same
+        // way, whichever of the lookups below did not resolve it.
+        let endpoint_missing = || {
+            crate::scaffolded::Scaffolded::validation(crate::state::could_not_find(
+                crate::state::ENDPOINT_KIND_LABEL,
+                &input.endpoint_name,
+            ))
+        };
+
+        // The endpoint being deployed to is resolved first: it is the resource this call
+        // changes. A transition the clock already owed it is materialised here — it was
+        // due at its stored instant whether or not anybody called — so a caller that
+        // waited for its last deployment is not refused for one that has finished.
+        let endpoint = store
+            .endpoints
+            .get_mut(&input.endpoint_name)
+            .ok_or_else(endpoint_missing)?;
+        endpoint.settle_status(now);
+        let endpoint_arn = endpoint.arn.clone();
+
+        // An endpoint that is not serving is part-way through a change of its own, and a
+        // deployment cannot be started over that one. The sentence names the endpoint by
+        // the ARN a successful call would have answered with, as the sibling refusal of an
+        // endpoint that already exists does.
+        if endpoint.status != crate::state::STATUS_IN_SERVICE {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot update in-progress endpoint \"{endpoint_arn}\"."
+            )));
+        }
+
+        // The configuration being deployed has to exist, and it is SNAPSHOTTED into the
+        // deployment rather than referenced, so a later create under the same name cannot
+        // change what this deployment stands up.
+        let Some(config) = store.endpoint_configs.get(&input.endpoint_config_name).cloned() else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_find(
+                    crate::state::ENDPOINT_CONFIG_KIND_LABEL,
+                    &input.endpoint_config_name,
+                ),
+            ));
+        };
+
+        // `RetainAllVariantProperties` keeps the instance count and weight the serving
+        // fleet is running, and `ExcludeRetainedVariantProperties` names the property
+        // types to take from the new configuration anyway.
+        let excluded: Vec<&str> = input
+            .exclude_retained_variant_properties
+            .iter()
+            .flatten()
+            .map(|property| property.variant_property_type.as_str())
+            .collect();
+        let retained = crate::state::retained_properties(
+            input.retain_all_variant_properties.unwrap_or(false),
+            &excluded,
+        );
+        let planned = store
+            .endpoints
+            .get(&input.endpoint_name)
+            .ok_or_else(endpoint_missing)?
+            .planned_update(&config, retained, now);
+
+        // The new fleet is stood up while the old one keeps serving, so its instances are
+        // taken on top of what the account already hosts. Past a per-instance-type hosting
+        // quota the deployment is refused with the limit failure this operation models,
+        // and nothing is started: the request is evaluated before anything is stored.
+        let demand = planned.instance_demand();
+        if let Some(message) = store.hosting_quota_exceeded(&demand) {
+            return Err(UpdateEndpointErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        let endpoint = store
+            .endpoints
+            .get_mut(&input.endpoint_name)
+            .ok_or_else(endpoint_missing)?;
+        // `RetainDeploymentConfig` reuses the last deployment configuration, so the one the
+        // endpoint already carries is left alone; otherwise this deployment's own
+        // configuration — which may be none — becomes the most recent one.
+        if !input.retain_deployment_config.unwrap_or(false) {
+            endpoint.last_deployment_config = input.deployment_config.clone();
+        }
+        endpoint.begin_update(planned);
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &endpoint_arn, ctx);
+        Ok(UpdateEndpointOutput { endpoint_arn })
     }
 }
