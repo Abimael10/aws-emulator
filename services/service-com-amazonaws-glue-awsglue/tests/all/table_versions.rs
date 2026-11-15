@@ -103,10 +103,13 @@ pub(crate) async fn get_table(router: &MultiServiceRouter, database: &str) -> Va
 /// those. `Retention` is the one member of `com.amazonaws.glue#TableInput` that is a
 /// plain (non-nullable) integer (source: `smithy_query shape=TableInput`), so a
 /// definition that carries no retention reads back as the zero it defaults to rather
-/// than as nothing.
+/// than as nothing. `Parameters` is the table's own key-value property map, part of the
+/// definition the catalog holds, so a definition that declares no property reads back as
+/// the EMPTY map rather than as nothing.
 fn absence_reads_as(member: &str) -> Value {
     match member {
         "Retention" => json!(0),
+        "Parameters" => json!({}),
         _ => Value::Null,
     }
 }
@@ -129,11 +132,19 @@ fn assert_definition_is(case: &str, submitted: &Value, history: &[Value], got: &
             }
             let read_back = got.get(member).unwrap_or(&Value::Null);
             let absent = absence_reads_as(member);
-            assert!(
-                read_back.is_null() || read_back == &absent,
-                "case {case}: member {member} is absent from the definition this version was \
-                 written with, so this version must report {absent}; got {read_back}"
-            );
+            if absent.is_null() {
+                assert!(
+                    read_back.is_null(),
+                    "case {case}: member {member} is absent from the definition this version \
+                     was written with, so this version must report nothing; got {read_back}"
+                );
+            } else {
+                assert_eq!(
+                    read_back, &absent,
+                    "case {case}: member {member} is absent from the definition this version \
+                     was written with, so this version must report {absent}; got {read_back}"
+                );
+            }
         }
     }
 }

@@ -9,9 +9,13 @@
 //! beside the server-set `DatabaseName`, `CatalogId`, `CreateTime`, `UpdateTime` and
 //! `VersionId`. The members the catalog itself determines are answered definitely
 //! rather than omitted: `IsMultiDialectView`, `IsMaterializedView` and
-//! `IsRegisteredWithLakeFormation` as explicit booleans, and
+//! `IsRegisteredWithLakeFormation` as explicit booleans,
 //! `StorageDescriptor.SortColumns` as an empty list for a table that defines no sort
-//! order (see `crate::state::to_storage_descriptor`). A target this read cannot resolve
+//! order, and the key-value property maps of the definition — `Parameters`,
+//! `StorageDescriptor.Parameters` and `StorageDescriptor.SerdeInfo.Parameters` — as empty
+//! maps where the definition declares no property (see
+//! `crate::state::to_storage_descriptor` and `crate::state::to_definition_parameters`). A
+//! target this read cannot resolve
 //! is `EntityNotFoundException` carrying this read's ONE constant
 //! (`crate::state::messages::TABLE_ENTITY_NOT_FOUND`), whichever step of the address
 //! resolved to nothing — the database the request names or the table inside it — so the

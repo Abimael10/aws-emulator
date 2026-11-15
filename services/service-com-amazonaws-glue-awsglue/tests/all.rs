@@ -161,6 +161,8 @@ mod data_quality_ruleset_updates;
 mod data_quality_rulesets;
 #[path = "all/database_listing.rs"]
 mod database_listing;
+#[path = "all/definition_parameter_maps.rs"]
+mod definition_parameter_maps;
 #[path = "all/delete_partition.rs"]
 mod delete_partition;
 #[path = "all/derived_resource_identities.rs"]

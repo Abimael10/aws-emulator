@@ -1162,7 +1162,10 @@ impl PartitionEntry {
             // ([`to_storage_descriptor`]), so a partition and its table report a
             // descriptor the same way.
             storage_descriptor: self.storage_descriptor.as_ref().map(to_storage_descriptor),
-            parameters: self.parameters.clone(),
+            // Reported the way a table's own properties are
+            // ([`to_definition_parameters`]): a partition is a definition the catalog
+            // holds, so the properties it declares none of are an empty set.
+            parameters: to_definition_parameters(self.parameters.as_ref()),
             last_analyzed_time: self.last_analyzed_time,
             catalog_id: Some(table.catalog_id.clone()),
         }
@@ -1640,7 +1643,9 @@ impl TableEntry {
             view_original_text: self.view_original_text.clone(),
             view_expanded_text: self.view_expanded_text.clone(),
             table_type: self.table_type.clone(),
-            parameters: self.parameters.clone(),
+            // The table's own key-value properties, reported the way the catalog reports
+            // the properties of any definition it holds ([`to_definition_parameters`]).
+            parameters: to_definition_parameters(self.parameters.as_ref()),
             created_by: self.created_by.clone(),
             is_registered_with_lake_formation: false,
             target_table: self.target_table.clone(),
@@ -1685,13 +1690,50 @@ impl TableEntry {
 /// table" — both are part of the definition the catalog holds, so a descriptor that lists
 /// no column and defines no sort order has an EMPTY list of each rather than an unknown
 /// one, and the catalog reports `[]`. A client that iterates either then loops zero times
-/// instead of having to handle an absent member. Every other member is reported exactly as
-/// it was stored: a member the client never sent is one the catalog does not determine, so
-/// it stays absent.
+/// instead of having to handle an absent member. The same holds for the two key-value
+/// PROPERTY maps of a stored descriptor — `StorageDescriptor$Parameters` "the
+/// user-supplied properties in key-value form" and `SerDeInfo$Parameters` — which are
+/// reported through [`to_definition_parameters`].
+///
+/// A SerDe is projected only when the descriptor stores one: the catalog determines the
+/// properties OF a SerDe it holds, not whether the descriptor has one. Every other member
+/// is reported exactly as it was stored: a member the client never sent is one the catalog
+/// does not determine, so it stays absent — a stored `Column`'s own `Parameters` map
+/// included, since the catalog holds columns as the definition listed them.
 pub fn to_storage_descriptor(stored: &StorageDescriptor) -> StorageDescriptor {
     StorageDescriptor {
         columns: Some(stored.columns.clone().unwrap_or_default()),
         sort_columns: Some(stored.sort_columns.clone().unwrap_or_default()),
+        parameters: to_definition_parameters(stored.parameters.as_ref()),
+        serde_info: stored.serde_info.as_ref().map(to_serde_info),
         ..stored.clone()
     }
+}
+
+/// Project a stored `SerDeInfo` the way the Data Catalog reports one: its
+/// serialization/deserialization properties are part of the definition the catalog holds,
+/// so they are reported as a map ([`to_definition_parameters`]) and its name and
+/// serialization library exactly as they were stored.
+pub fn to_serde_info(stored: &SerDeInfo) -> SerDeInfo {
+    SerDeInfo {
+        parameters: to_definition_parameters(stored.parameters.as_ref()),
+        ..stored.clone()
+    }
+}
+
+/// The `Parameters` map of a stored definition, as the Data Catalog reports it: the
+/// properties that were stored, and an EMPTY map for a definition that carries none.
+///
+/// The key-value properties of a table, of a partition and of the storage a definition
+/// describes are part of the definition the catalog holds — "these key-value pairs define
+/// properties associated with the table" (`Table$Parameters`), the partition parameters
+/// (`Partition$Parameters`), "the user-supplied properties in key-value form"
+/// (`StorageDescriptor$Parameters`) — so a definition that declares no property has an
+/// empty set of them rather than an unknown one, exactly as a descriptor that lists no
+/// column has an empty column list. Reporting `{}` lets a client read or merge the map
+/// without telling "no properties" apart from "member not returned".
+pub fn to_definition_parameters(
+    stored: Option<&HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    Some(stored.cloned().unwrap_or_default())
 }

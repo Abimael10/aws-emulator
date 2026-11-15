@@ -31,8 +31,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::error_messages::assert_refusal;
 use crate::partitions::{
-    batch_create, generation, instant, partition_errors, seed_table, stored, values_of,
-    without_instants, SETTABLE_MEMBERS,
+    assert_member_cleared, batch_create, generation, instant, partition_errors, seed_table, stored,
+    values_of, without_instants, SETTABLE_MEMBERS,
 };
 use crate::wire::{assert_echoed, emulator, ok, ACCOUNT_ID, ERROR_DETAIL_TAG};
 
@@ -157,12 +157,7 @@ async fn batch_updated_partitions_are_read_back_from_the_store() {
                 if input.get(member).is_some() {
                     continue;
                 }
-                assert!(
-                    partition.get(member).is_none_or(Value::is_null),
-                    "case {case}: partition {values:?} must not report {member}, which the \
-                     update omitted, got {:?}",
-                    partition.get(member)
-                );
+                assert_member_cleared(case, &values, member, &partition);
             }
 
             // The address and the attribution are the create's, and so is `CreationTime`:

@@ -90,7 +90,17 @@ async fn get_database(router: &MultiServiceRouter, name: &str) -> Value {
 ///
 /// A member the client cannot set (`Name`, and the server-set members) is not part of
 /// this check.
-fn assert_omitted_members_are_cleared(case: &str, created: &Value, updated: &Value, got: &Value) {
+///
+/// `empty_when_cleared` names the members this entity's read projection reports
+/// DEFINITELY — a collection the catalog holds as part of the definition, which reads
+/// back as the empty collection once a write cleared it rather than as an absent member.
+fn assert_omitted_members_are_cleared(
+    case: &str,
+    created: &Value,
+    updated: &Value,
+    got: &Value,
+    empty_when_cleared: &[&str],
+) {
     for member in created
         .as_object()
         .expect("the created input is a structure")
@@ -100,11 +110,20 @@ fn assert_omitted_members_are_cleared(case: &str, created: &Value, updated: &Val
             continue;
         }
         let read_back = got.get(member).unwrap_or(&Value::Null);
-        assert!(
-            read_back.is_null(),
-            "case {case}: member {member} is absent from the submitted input, so the update \
-             must have cleared it; got {read_back:?}"
-        );
+        if empty_when_cleared.contains(&member.as_str()) {
+            assert_eq!(
+                read_back,
+                &json!({}),
+                "case {case}: member {member} is absent from the submitted input, so the \
+                 update must have cleared it and the read report it empty; got {read_back:?}"
+            );
+        } else {
+            assert!(
+                read_back.is_null(),
+                "case {case}: member {member} is absent from the submitted input, so the update \
+                 must have cleared it; got {read_back:?}"
+            );
+        }
     }
 }
 
@@ -468,7 +487,10 @@ async fn update_table_writes_the_submitted_definition() {
 
         let after = get_table(&router, "mutable_db", &stored_name).await;
         assert_echoed(case, &with_folded_name(submitted), &after);
-        assert_omitted_members_are_cleared(case, created, submitted, &after);
+        // A table's `Parameters` is part of the definition the catalog holds, so an
+        // update that omits it leaves the table declaring no property — reported as the
+        // empty map, not as an absent member.
+        assert_omitted_members_are_cleared(case, created, submitted, &after, &["Parameters"]);
         assert!(
             version_id(&after) > version_id(&before),
             "case {case}: the update makes a new version of the table; expected a VersionId \
@@ -642,7 +664,7 @@ async fn update_database_writes_the_submitted_definition() {
 
         let after = get_database(&router, &stored_name).await;
         assert_echoed(case, &with_folded_name(submitted), &after);
-        assert_omitted_members_are_cleared(case, created, submitted, &after);
+        assert_omitted_members_are_cleared(case, created, submitted, &after, &[]);
         assert_eq!(
             after["CreateTime"], before["CreateTime"],
             "case {case}: CreateTime is server-set at create and must not move on an update, \
