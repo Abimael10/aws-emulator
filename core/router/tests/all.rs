@@ -7495,3 +7495,7 @@ mod events_lambda_target_permission_granted_after_the_rule;
 //! what points the declaration into `tests/all/`.
 //! What a suite covers, and why it lives in this cross-service target rather than in one
 //! the test it describes.
+//! which compiles no suite of this target. An inner doc comment documents the module it is
+//! written in, so the language accepts it only ahead of the first item: THIS HEADER IS THE
+//! ONLY PLACE ONE MAY STAND IN THIS FILE, and one written further down is `E0753` and
+//! compiles nothing. A note below must be an ordinary `//` comment — better still, add a

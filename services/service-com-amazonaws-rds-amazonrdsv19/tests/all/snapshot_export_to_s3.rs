@@ -18,6 +18,11 @@
 //!   approximate and integer types keep their own Parquet types.
 //! * Each refusal of an export carries the status, the code and the SENTENCE Amazon RDS
 //!   words that error class in, with the request's own values in its variable parts.
+//! * Whether an export is ACCEPTED is decided by whether the destination bucket and the
+//!   encryption key the request names resolve: a request refused for either records no task
+//!   and writes no object, and the same request with that one parameter replaced by a
+//!   resolvable one is accepted and walks to the terminal `COMPLETE` with the export's
+//!   objects under its own prefix.
 //! * Every condition that leaves the key named by `KmsKeyId` unable to encrypt the export —
 //!   a key KMS holds nothing under, a key it holds disabled, and a key whose own policy
 //!   withholds either of the two KMS operations the export performs on it — is answered with
@@ -41,7 +46,7 @@ use service_com_amazonaws_rds_amazonrdsv19::state as st;
 use smithy_server_runtime::MultiServiceRouter;
 use tokio::time::sleep;
 
-use crate::db_instances::{call, expect_error, expect_ok, subtrees, text, REGION};
+use crate::db_instances::{call, expect_error, expect_ok, subtrees, text, texts, REGION};
 use crate::rds_s3_integration::{create_bucket, emulator, kms, put_object_policy, role, s3};
 
 /// The canonical account id every generated emulator presents.
@@ -411,19 +416,35 @@ async fn available_cluster_snapshot(
     format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster-snapshot:{snapshot}")
 }
 
-/// Start one export, as a client starts it.
+/// Start one export, as a client starts it — against the destination's own bucket and key.
 async fn start_export(
     destination: &Destination,
     identifier: &str,
     source_arn: &str,
     prefix: Option<&str>,
 ) -> (u16, String) {
+    let bucket = destination.bucket.clone();
+    let key_id = destination.key_id.clone();
+    start_export_naming(destination, identifier, source_arn, prefix, &bucket, &key_id).await
+}
+
+/// The same call with the destination the request NAMES spelled out, so one row may name a
+/// bucket or a key other than the destination's own and change nothing else about the
+/// request.
+async fn start_export_naming(
+    destination: &Destination,
+    identifier: &str,
+    source_arn: &str,
+    prefix: Option<&str>,
+    bucket: &str,
+    key_id: &str,
+) -> (u16, String) {
     let mut request: Vec<(&str, String)> = params![
         "ExportTaskIdentifier" => identifier,
         "SourceArn" => source_arn,
-        "S3BucketName" => destination.bucket,
+        "S3BucketName" => bucket,
         "IamRoleArn" => destination.role_arn,
-        "KmsKeyId" => destination.key_id,
+        "KmsKeyId" => key_id,
     ]
     .to_vec();
     if let Some(prefix) = prefix {
@@ -1216,5 +1237,292 @@ async fn created_key(
             .arn()
             .unwrap_or_else(|| panic!("case {case:?}: the created key reports its ARN"))
             .to_string(),
+    }
+}
+
+/// What leaves ONE resource the request names unusable for the export, and nothing else about
+/// the request: the pair of calls a row makes differ in this parameter alone.
+enum Unresolvable {
+    /// The request names a destination bucket this Region's object store holds nothing under;
+    /// this is that name.
+    Bucket(&'static str),
+    /// The request names a key KMS holds nothing under; this is the reference it carries.
+    AbsentKey(&'static str),
+    /// KMS holds the key, enabled, and its own policy denies the export's role this KMS
+    /// action — one of the two the key's member lists.
+    KeyDenying(&'static str),
+    /// KMS holds the key, disabled.
+    DisabledKey,
+}
+
+/// One row of the refused-then-accepted table: what is unresolvable about the first call, the
+/// `S3Prefix` both calls carry, and the refusal the first is answered with.
+struct PairedRow {
+    case: &'static str,
+    unresolvable: Unresolvable,
+    /// `S3Prefix`, given or omitted — both calls of the pair carry the same one.
+    prefix: Option<&'static str>,
+    code: &'static str,
+}
+
+/// Rule: whether an export is accepted is decided by whether the request's destination bucket
+/// and encryption key RESOLVE — a bucket the Region's object store holds nothing under, or a
+/// key KMS cannot encrypt under, is refused synchronously (HTTP 400) with that condition's own
+/// modelled fault and sentence, records no export task and writes no object; the same request
+/// with that one parameter replaced by a resolvable one is accepted, reports `STARTING` with
+/// the destination it was given echoed back, and its task then reaches the terminal `COMPLETE`
+/// with all of its progress and the export's objects under its own prefix.
+///
+/// Each row makes the SAME request twice under the same `ExportTaskIdentifier` and the same
+/// `S3Prefix`, changing only the one parameter that could not be resolved — so the accept is
+/// the control for its own refusal, and it also establishes that the refusal recorded nothing:
+/// an identifier a task had been recorded under would be refused `ExportTaskAlreadyExistsFault`
+/// instead.
+///
+/// The rows span which parameter is unresolvable (the destination bucket, the key), the forms
+/// that takes for a key (KMS holds nothing under the reference, holds it disabled, holds it
+/// with a policy denying each of the two actions the export performs on it) and an `S3Prefix`
+/// given and omitted.
+///
+/// The accepted half is asserted here rather than left to the suites that own the terminal
+/// status and the object layout, because it is the CONTROL of its own refusal: what the rule
+/// says is that the one parameter decided the outcome, which neither half shows alone.
+#[tokio::test]
+async fn an_export_refused_for_an_unresolvable_destination_is_accepted_once_it_resolves() {
+    let destination = destination("emu-paired-bucket", "emu-paired-role").await;
+    let instance = "emu-paired-instance";
+    available_instance(&destination, "the paired exports' source", instance).await;
+    seed(&instance_database(&destination, instance), SEEDED);
+    let source_arn = available_snapshot(
+        &destination,
+        "the paired exports' source",
+        instance,
+        "emu-paired-snapshot",
+    )
+    .await;
+
+    let rows = [
+        PairedRow {
+            case: "a destination bucket Amazon S3 holds nothing under",
+            unresolvable: Unresolvable::Bucket("emu-paired-no-such-bucket"),
+            prefix: None,
+            code: "InvalidS3BucketFault",
+        },
+        PairedRow {
+            case: "a key reference KMS holds nothing under",
+            unresolvable: Unresolvable::AbsentKey("33333333-4444-5555-6666-777777777777"),
+            prefix: Some("nightly/exports"),
+            code: "KMSKeyNotAccessibleFault",
+        },
+        PairedRow {
+            case: "a key whose policy denies the export role kms:CreateGrant",
+            unresolvable: Unresolvable::KeyDenying("kms:CreateGrant"),
+            prefix: Some("create-grant-denied"),
+            code: "KMSKeyNotAccessibleFault",
+        },
+        PairedRow {
+            case: "a key whose policy denies the export role kms:DescribeKey",
+            unresolvable: Unresolvable::KeyDenying("kms:DescribeKey"),
+            prefix: Some("deep/nested/describe-key-denied"),
+            code: "KMSKeyNotAccessibleFault",
+        },
+        PairedRow {
+            case: "a key KMS holds disabled",
+            unresolvable: Unresolvable::DisabledKey,
+            prefix: Some("disabled-key-attempt"),
+            code: "KMSKeyNotAccessibleFault",
+        },
+    ];
+
+    // What each accepted export has to end up as, polled once every row has started its own:
+    // `(case, identifier, the prefix the export wrote under)`.
+    let mut accepted: Vec<(&str, String, String)> = Vec::new();
+
+    for (index, row) in rows.iter().enumerate() {
+        // The one parameter that cannot be resolved, and the sentence the refusal carries for
+        // it: fixed text, with the value the request named as its only variable part.
+        let (bucket, key_id, expected_message) = match &row.unresolvable {
+            Unresolvable::Bucket(bucket) => (
+                (*bucket).to_string(),
+                destination.key_id.clone(),
+                format!(
+                    "The S3 bucket {bucket} isn't valid. Either it isn't located in the \
+                     current AWS Region or it doesn't exist."
+                ),
+            ),
+            Unresolvable::AbsentKey(reference) => (
+                destination.bucket.clone(),
+                (*reference).to_string(),
+                format!("The KMS key {reference} doesn't exist or is disabled."),
+            ),
+            Unresolvable::KeyDenying(action) => {
+                let key = created_key(
+                    &destination.router,
+                    row.case,
+                    Some(key_policy_denying(&destination.role_arn, action)),
+                )
+                .await
+                .id;
+                let message = format!("The KMS key {key} doesn't exist or is disabled.");
+                (destination.bucket.clone(), key, message)
+            }
+            Unresolvable::DisabledKey => {
+                let key = created_key(&destination.router, row.case, None).await.id;
+                kms(&destination.router)
+                    .disable_key()
+                    .key_id(&key)
+                    .send()
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "case {:?}: the emulated KMS disables the key: {error}",
+                            row.case
+                        )
+                    });
+                let message = format!("The KMS key {key} doesn't exist or is disabled.");
+                (destination.bucket.clone(), key, message)
+            }
+        };
+
+        let identifier = format!("emu-paired-export-{index}");
+        let export_prefix = st::export_prefix(row.prefix, &identifier);
+
+        // The request as it stands: refused, with the fault and the sentence of the condition
+        // that stopped it.
+        let refused = expect_error(
+            row.case,
+            start_export_naming(
+                &destination,
+                &identifier,
+                &source_arn,
+                row.prefix,
+                &bucket,
+                &key_id,
+            )
+            .await,
+            400,
+            row.code,
+        );
+        let message = text(&refused, "Message");
+        assert_eq!(
+            message, expected_message,
+            "case {:?}: expected the refusal sentence {expected_message:?}, got {message:?}",
+            row.case
+        );
+
+        // Nothing of the refused request was recorded: no task of that identifier is reported.
+        let listed = expect_ok(
+            row.case,
+            call(
+                &destination.router,
+                "DescribeExportTasks",
+                &params!["MaxRecords" => 100],
+            )
+            .await,
+        );
+        let reported = texts(&listed, "ExportTaskIdentifier");
+        assert!(
+            !reported.contains(&identifier),
+            "case {:?}: a refused export records no task, got {reported:?}",
+            row.case
+        );
+        // And nothing of it was written to the destination it would have written to.
+        let keys = listed_keys(&destination, &export_prefix).await;
+        assert!(
+            keys.is_empty(),
+            "case {:?}: a refused export writes no object under {export_prefix}, got {keys:?}",
+            row.case
+        );
+
+        // The SAME request, with the one unresolvable parameter replaced: accepted.
+        let started = expect_ok(
+            row.case,
+            start_export(&destination, &identifier, &source_arn, row.prefix).await,
+        );
+        for (member, expected) in [
+            ("Status", "STARTING".to_string()),
+            ("ExportTaskIdentifier", identifier.clone()),
+            ("SourceArn", source_arn.clone()),
+            ("S3Bucket", destination.bucket.clone()),
+            ("IamRoleArn", destination.role_arn.clone()),
+            ("KmsKeyId", destination.key_id.clone()),
+            // `ExportTask$PercentProgress` and `ExportTask$Status` as the model publishes
+            // them, written out here rather than read from this crate's own constants.
+            ("PercentProgress", "0".to_string()),
+        ] {
+            let answered = text(&started, member);
+            assert_eq!(
+                answered, expected,
+                "case {:?}: expected {member} {expected:?} on the accepted export, got \
+                 {answered:?} in {started}",
+                row.case
+            );
+        }
+        match row.prefix {
+            Some(prefix) => assert_eq!(
+                text(&started, "S3Prefix"),
+                prefix,
+                "case {:?}: an accepted export echoes the S3Prefix it was given, got {started}",
+                row.case
+            ),
+            None => assert!(
+                subtrees(&started, "S3Prefix").is_empty(),
+                "case {:?}: an export given no S3Prefix reports none, got {started}",
+                row.case
+            ),
+        }
+        accepted.push((row.case, identifier, export_prefix));
+    }
+
+    // Every accepted export walks to its terminal status, and that status is COMPLETE with all
+    // of its progress reported and the instant it ended.
+    for (case, identifier, export_prefix) in &accepted {
+        let request = params!["ExportTaskIdentifier" => identifier];
+        let described = poll_until(
+            case,
+            &format!("the export task {identifier} reaching a terminal status"),
+            || call(&destination.router, "DescribeExportTasks", &request),
+            // The statuses an export does not leave on its own, as `ExportTask$Status`
+            // publishes them: the poll settles on whichever one it ends in, and the
+            // assertions below are what decide that it is the right one.
+            |body| ["COMPLETE", "FAILED", "CANCELED"].contains(&text(body, "Status").as_str()),
+        )
+        .await;
+        for (member, expected) in [
+            ("Status", "COMPLETE".to_string()),
+            ("PercentProgress", "100".to_string()),
+        ] {
+            let answered = text(&described, member);
+            assert_eq!(
+                answered, expected,
+                "case {case:?}: expected {member} {expected:?} on the finished export, got \
+                 {answered:?} in {described}"
+            );
+        }
+        assert!(
+            !texts(&described, "TaskEndTime").is_empty(),
+            "case {case:?}: a finished export reports when it ended, got {described}"
+        );
+
+        // And the bucket holds the export: one Parquet object per table of the source, and the
+        // two JSON files an export leaves beside them.
+        let keys = listed_keys(&destination, export_prefix).await;
+        for table in SEEDED {
+            let table_prefix = format!("{export_prefix}{DATABASE}/{DATABASE}.{}/", table.table);
+            assert!(
+                keys.iter()
+                    .any(|key| key.starts_with(&table_prefix) && key.ends_with(".gz.parquet")),
+                "case {case:?}: expected a Parquet object under {table_prefix}, got {keys:?}"
+            );
+        }
+        for expected in [
+            st::tables_info_key(export_prefix, identifier, SEEDED.len()),
+            st::export_info_key(export_prefix, identifier),
+        ] {
+            assert!(
+                keys.contains(&expected),
+                "case {case:?}: expected the export's {expected} among {keys:?}"
+            );
+        }
     }
 }
