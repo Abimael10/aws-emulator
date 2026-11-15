@@ -45,6 +45,16 @@ pub(super) fn invalid_policy_document(detail: &str) -> PolicyFault {
     PolicyFault::Invalid(format!("{INVALID_POLICY_DOCUMENT_CLAUSE}: {detail}"))
 }
 
+/// How a document naming a principal that is no identity of this account is refused: the
+/// document clause above, over the sentence the policy language's own validation words that
+/// defect in — the offending value, under the principal type it was named with, is the only
+/// thing substituted.
+pub(super) fn invalid_principal_in_policy(named: &str) -> PolicyFault {
+    invalid_policy_document(&format!(
+        "Invalid principal in policy: \"{IDENTITY_PRINCIPAL_TYPE}\":\"{named}\""
+    ))
+}
+
 /// The service every action of a DynamoDB resource-based policy belongs to: a policy
 /// attached to a DynamoDB resource governs DynamoDB actions, so an action of another
 /// service could never be decided by it.
@@ -149,6 +159,14 @@ impl AttachedPolicy {
         canonical_elements(&mut canonical);
         default_version(&mut canonical);
         let document = canonical.to_string();
+        // WHO the document grants to has to be resolvable for the grant to be saved at all:
+        // the principal is held by the named identity's unique id, so a value naming an
+        // identity of this account that the account does not hold names nobody and the
+        // document is refused rather than stored as a grant to no one
+        // ([`unresolvable_principal`]).
+        if let Some(unresolvable) = unresolvable_principal(&document, identities) {
+            return Err(invalid_principal_in_policy(&unresolvable));
+        }
         // WHAT this policy holds each identity principal by: "AWS transforms the ARN to the
         // underlying unique principal ID when you save the policy", so the resolution
         // happens HERE, once, over the document as it is stored — through the same walk a

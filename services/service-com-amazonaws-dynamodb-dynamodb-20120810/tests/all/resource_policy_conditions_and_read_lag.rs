@@ -209,8 +209,12 @@ async fn the_stored_document_is_the_one_the_request_stated() {
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Deny",
-                    "NotPrincipal": {"AWS": ["arn:aws:iam::000000000000:role/a",
-                                             "arn:aws:iam::000000000000:role/b"]},
+                    // Roles of ANOTHER account: a principal has to be one the account can
+                    // resolve, and an entity of another account is admitted whether or not
+                    // this account's IAM holds a record under that name, so the row is about
+                    // the FORM the elements are stored in and nothing else.
+                    "NotPrincipal": {"AWS": ["arn:aws:iam::210987654321:role/a",
+                                             "arn:aws:iam::210987654321:role/b"]},
                     "NotAction": ["dynamodb:GetItem", "dynamodb:Query"],
                     "NotResource": [arn, format!("{arn}/index/by-rank")],
                     "Condition": {
@@ -224,8 +228,8 @@ async fn the_stored_document_is_the_one_the_request_stated() {
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Deny",
-                    "NotPrincipal": {"AWS": ["arn:aws:iam::000000000000:role/a",
-                                             "arn:aws:iam::000000000000:role/b"]},
+                    "NotPrincipal": {"AWS": ["arn:aws:iam::210987654321:role/a",
+                                             "arn:aws:iam::210987654321:role/b"]},
                     "NotAction": ["dynamodb:GetItem", "dynamodb:Query"],
                     "NotResource": [arn, format!("{arn}/index/by-rank")],
                     "Condition": {

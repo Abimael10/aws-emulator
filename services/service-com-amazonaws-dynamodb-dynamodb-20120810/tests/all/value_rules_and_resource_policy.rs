@@ -32,6 +32,11 @@ const TABLE_ARN_PREFIX: &str = "arn:aws:dynamodb:us-east-1:000000000000:table/";
 /// The account id every generated emulator presents.
 const ACCOUNT_ID: &str = "000000000000";
 
+/// ANOTHER account than the one this emulator serves: a policy may name one of its
+/// identities, which this account's IAM is not the one to hold, so such a value names ONE
+/// identity that is not this caller without the account having to hold a record for it.
+const OTHER_ACCOUNT_ID: &str = "210987654321";
+
 /// The ARN of one of this emulator's tables.
 fn table_arn(name: &str) -> String {
     format!("{TABLE_ARN_PREFIX}{name}")
@@ -526,7 +531,7 @@ async fn a_resource_policy_decides_whether_the_data_plane_serves_the_request() {
             case: "an identity-specific principal",
             statement: json!({
                 "Effect": "Deny",
-                "Principal": {"AWS": format!("arn:aws:iam::{ACCOUNT_ID}:role/someone-else")},
+                "Principal": {"AWS": format!("arn:aws:iam::{OTHER_ACCOUNT_ID}:role/someone-else")},
                 "Action": "dynamodb:GetItem",
                 "Resource": arn,
             }),
@@ -558,7 +563,7 @@ async fn a_resource_policy_decides_whether_the_data_plane_serves_the_request() {
                 "Effect": "Deny",
                 // A principal element given as a LIST, which the grammar admits beside
                 // the single string: it names this caller among others.
-                "Principal": {"AWS": ["*", format!("arn:aws:iam::{ACCOUNT_ID}:role/other")]},
+                "Principal": {"AWS": ["*", format!("arn:aws:iam::{OTHER_ACCOUNT_ID}:role/other")]},
                 "Action": ["dynamodb:Query", "dynamodb:GetItem"],
                 "Resource": arn,
             }),
@@ -627,7 +632,7 @@ async fn a_resource_policy_decides_whether_the_data_plane_serves_the_request() {
             case: "NotPrincipal naming another identity",
             statement: json!({
                 "Effect": "Deny",
-                "NotPrincipal": {"AWS": format!("arn:aws:iam::{ACCOUNT_ID}:role/someone-else")},
+                "NotPrincipal": {"AWS": format!("arn:aws:iam::{OTHER_ACCOUNT_ID}:role/someone-else")},
                 "Action": "dynamodb:GetItem",
                 "Resource": arn,
             }),

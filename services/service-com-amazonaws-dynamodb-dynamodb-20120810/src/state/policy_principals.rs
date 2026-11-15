@@ -61,6 +61,12 @@ pub struct PrincipalIdentities {
     arn_by_unique_id: BTreeMap<String, String>,
     /// ARN -> the unique id of the identity carrying that ARN now.
     unique_id_by_arn: BTreeMap<String, String>,
+    /// Whether this directory was READ at all, which is what makes an ARN it does not carry
+    /// an identity the account does not hold rather than one nothing here could resolve: an
+    /// account whose IAM holds no user and no role still has a readable directory, while an
+    /// engine carrying no IAM store has none, and a refusal has to be grounded in what IAM
+    /// holds ([`unresolvable_principal`]).
+    readable: bool,
 }
 
 impl PrincipalIdentities {
@@ -95,6 +101,7 @@ pub fn request_principal_identities<Eng: Send + Sync + 'static>(
     let Some(iam) = sts_state::iam_state(engine) else {
         return identities;
     };
+    identities.readable = true;
     let held = iam.lock();
     for (unique_id, arn) in identity_records(&held) {
         identities
@@ -166,6 +173,74 @@ pub(super) fn stored_principal_ids(
         },
     );
     stored.into_inner()
+}
+
+/// The first `AWS` principal of `document` that names an identity of this account the account
+/// does not hold, or `None` when every value it names is one a grant can be saved for.
+///
+/// A resource-based policy's principal is resolved when the policy is SAVED — "AWS transforms
+/// the ARN to the underlying unique principal ID when you save the policy" — so an ARN naming
+/// an identity of this account that IAM does not hold is a grant to nobody, and the document is
+/// refused rather than stored. It is the same reading S3's bucket-policy surface makes of the
+/// principals it is handed, over this account's own IAM records.
+///
+/// Two kinds of value fail, and nothing else does:
+///
+/// * an IAM USER or ROLE of this account that the account does not hold — the two IAM entities
+///   a resource policy grants to by name, each read under its own entity type
+///   ([`::service_common::iam_role::user_name`], [`::service_common::iam_role::role_name`]);
+/// * an IAM GROUP, whatever the account holds under that name: "you cannot identify a user
+///   group as a `Principal` in a policy (such as a resource-based policy) because groups relate
+///   to permissions, not authentication" (the IAM user guide's *IAM identities*), so a group is
+///   never a principal to resolve.
+///
+/// Everything else resolves: the `*` wildcard, an account by its id or its root, a service,
+/// federated or canonical-user principal, an assumed-role session, and an entity of ANOTHER
+/// account, whose identities this account's IAM is not the one to hold. So is every value when
+/// the engine carries no IAM store at all ([`PrincipalIdentities`] is then unreadable): a
+/// refusal has to be grounded in what IAM holds.
+///
+/// Walked over the SAME element the holding above is collected from, so what a document is
+/// refused for and what it would have been held by cannot disagree.
+#[must_use]
+pub(super) fn unresolvable_principal(
+    document: &str,
+    identities: &PrincipalIdentities,
+) -> Option<String> {
+    if !identities.readable {
+        return None;
+    }
+    let unresolvable = ::std::cell::RefCell::new(None::<String>);
+    // The walk REPORTS the values; it writes none, so what it hands back is `document` itself
+    // and is dropped.
+    let _unwritten = ::service_common::iam_policy_rendering::rewritten_values(
+        document,
+        &::service_common::iam_policy_rendering::ElementValues {
+            element: IDENTITY_PRINCIPAL_TYPE,
+            written_as: &|value| {
+                let mut first = unresolvable.borrow_mut();
+                if first.is_none() && names_no_identity(value, identities) {
+                    *first = Some(value.to_string());
+                }
+                None
+            },
+        },
+    );
+    unresolvable.into_inner()
+}
+
+/// Whether one `AWS` principal value names an identity of this account that the account does
+/// not hold, which is what [`unresolvable_principal`] reports the first of.
+fn names_no_identity(value: &str, identities: &PrincipalIdentities) -> bool {
+    if ::service_common::iam_role::group_name(value).is_some() {
+        return true;
+    }
+    if ::service_common::iam_role::user_name(value).is_some()
+        || ::service_common::iam_role::role_name(value).is_some()
+    {
+        return identities.unique_id_of(value).is_none();
+    }
+    false
 }
 
 /// `document` as a READ of the policy reports it: every principal the resource holds by a

@@ -16,7 +16,9 @@
 //! The rows differ along what the rule generalises over: WHICH identity the principal names
 //! (an IAM user, an IAM role), the form the principal element is written in (one value, two
 //! values in a list, several principal types at once, a statement's `NotPrincipal`), and WHAT
-//! happens to the identity afterwards (deleted, renamed, left alone, never held at all).
+//! happens to the identity afterwards (deleted, renamed, left alone). A document naming an
+//! identity the account has NEVER held is refused by the attach itself, which is the rule
+//! `resource_policy_principal_admission` pins.
 //!
 //! Driven over the wire through one `MultiServiceRouter` serving DynamoDB beside IAM on ONE
 //! shared engine — the identities a policy names live in IAM's own store, so the users and
@@ -261,14 +263,6 @@ fn rows() -> Vec<Row> {
                     json!({"AWS": held.user("rbp-excepted-user").unique_id}),
                 )
             },
-        },
-        Row {
-            case: "a principal naming a user of this account that IAM never held",
-            users: &[],
-            roles: &[],
-            document: |held| allow(held, json!({"AWS": held.user_arn_of("rbp-never-made")})),
-            change: Change::Nothing,
-            expected: |held| allow(held, json!({"AWS": held.user_arn_of("rbp-never-made")})),
         },
     ]
 }
