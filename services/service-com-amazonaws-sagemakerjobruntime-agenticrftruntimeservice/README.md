@@ -141,7 +141,10 @@ a call rather than serving it:
   `state::serve_rollout_trajectory`).
 
 A value that misses the modelled constraints never gets that far: it is refused
-`400 ValidationException` by the front door (`Input arn … is malformed`). Whatever a
+`400 ValidationException` by the front door (`Input arn … is malformed`). A request
+that misses SEVERAL constraints at once is told about every one of them — the clauses
+are counted and joined into the one carrying member, and this service's own wording
+replaces the ARN clause alone. Whatever a
 refusal says, it has to fit the member that carries it — every error shape of this
 model declares one `Message` member targeting `FailureReason`, `@length` max 1024 — so
 no single value a clause quotes passes that maximum less one clause's own prose

@@ -16,6 +16,9 @@ mod harness;
 #[path = "all/enum_refusal_echo_is_bounded.rs"]
 mod enum_refusal_echo_is_bounded;
 
+#[path = "all/every_broken_constraint_is_reported.rs"]
+mod every_broken_constraint_is_reported;
+
 #[path = "all/iam_authorization.rs"]
 mod iam_authorization;
 

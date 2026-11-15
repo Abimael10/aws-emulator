@@ -59,7 +59,6 @@
 pub mod authorization;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
-use aws_smithy_schema_server::constraints;
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Operation, OperationContext,
     OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
@@ -183,6 +182,16 @@ fn nameable_value(violation: &Violation) -> Option<&str> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// The value a clause of the ONE class this service words itself can NAME: an ARN-valued
+/// member holding something that is not an ARN ([`is_malformed_arn`]), with a value a
+/// sentence can show ([`nameable_value`]). `None` for every other violation, which keeps
+/// the framework's own clause.
+fn nameable_malformed_arn(violation: &Violation) -> Option<&str> {
+    is_malformed_arn(violation)
+        .then(|| nameable_value(violation))
+        .flatten()
+}
+
 /// The sentence this service refuses `violations` with, or `None` when there is nothing
 /// to refuse.
 ///
@@ -196,35 +205,57 @@ fn nameable_value(violation: &Violation) -> Option<&str> {
 /// a regular-expression clause: a caller cannot act on the pattern source, and the ARN
 /// is the thing it got wrong.
 ///
+/// The substitution is CLAUSE-level: a request that broke other modelled constraints too is
+/// told about every one of them, in the one sentence that counts them ([`worded`]) — only
+/// the ARN clause's own wording is this service's, and what a caller is told about its other
+/// members cannot depend on whether the ARN clause carried a value. The whole sentence is
+/// this service's wording only when the malformed ARN is the ONLY thing refused, where there
+/// is no other clause to count.
+///
 /// It is also where the MEMBER that has to hold this sentence bounds it
 /// ([`LARGEST_MESSAGE_BYTES`]): the ONE renderer both refusal paths of this service reach,
 /// so the bound cannot hold on one path and not the other, and the only part of a sentence
 /// that is the caller's to size — the values its clauses quote — is held to what the prose
 /// leaves ([`held_within_the_message_maximum`]). A sentence already inside the maximum is
-/// returned exactly as the framework worded it.
+/// returned exactly as it was worded.
 pub(crate) fn refusal_message(violations: &[Violation]) -> Option<String> {
-    // This service's own wording stands in for the framework's clauses only where it tells
-    // the caller MORE than they do, which is the value it names: a violation carrying no
+    // This service's own wording stands in for the framework's clause only where it tells
+    // the caller MORE than it does, which is the value it names: a violation carrying no
     // value a sentence can show ([`nameable_value`]) would be reported as
-    // "Input arn  is malformed", which states neither the value nor the requirement and
-    // discards every other clause the walk collected for the same member, so the
-    // framework's own clauses are kept for it instead.
-    let malformed_arn = violations
+    // "Input arn  is malformed", which states neither the value nor the requirement, so the
+    // framework's own clause is kept for it instead.
+    if let [only] = violations {
+        if let Some(value) = nameable_malformed_arn(only) {
+            // One clause, one value: its room is the whole member less this wording's prose.
+            let room = LARGEST_MESSAGE_BYTES.saturating_sub(malformed_arn_prose_bytes());
+            return Some(malformed_arn_message(
+                &service_common::validation::echo_held_to(value, room),
+            ));
+        }
+    }
+    let sentence = worded(violations)?;
+    if sentence.len() <= LARGEST_MESSAGE_BYTES {
+        return Some(sentence);
+    }
+    held_within_the_message_maximum(violations, &sentence).or(Some(sentence))
+}
+
+/// `violations` as ONE sentence: the clauses this service words itself, the framework's
+/// clause for every other violation, and the shared renderer's own envelope around them —
+/// which counts the clauses and joins them, so this service cannot re-spell `1 validation
+/// error detected: ` or the separator between two clauses
+/// ([`service_common::validation_message::envelope_over`]).
+fn worded(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations
         .iter()
-        .filter(|violation| is_malformed_arn(violation))
-        .find_map(nameable_value);
-    if let Some(value) = malformed_arn {
-        // One clause, one value: its room is the whole member less this wording's prose.
-        let room = LARGEST_MESSAGE_BYTES.saturating_sub(malformed_arn_prose_bytes());
-        return Some(malformed_arn_message(
-            &service_common::validation::echo_held_to(value, room),
-        ));
-    }
-    let rendered = constraints::envelope(violations)?;
-    if rendered.len() <= LARGEST_MESSAGE_BYTES {
-        return Some(rendered);
-    }
-    held_within_the_message_maximum(violations, &rendered).or(Some(rendered))
+        .map(|violation| match nameable_malformed_arn(violation) {
+            // This service's own wording stands in for the framework's clause, and for
+            // nothing else in the sentence: every other clause reaches it as worded.
+            Some(value) => malformed_arn_message(value),
+            None => violation.message(),
+        })
+        .collect();
+    service_common::validation_message::envelope_over(&clauses)
 }
 
 /// `violations` worded again with every quoted value held to its share of what the carrying
@@ -232,8 +263,8 @@ pub(crate) fn refusal_message(violations: &[Violation]) -> Option<String> {
 ///
 /// Why a share rather than a per-clause ceiling: the clauses of one refusal are joined into
 /// ONE `Message`, so what they may quote is bounded TOGETHER — a ceiling that fits one
-/// clause fits two of them twice over. The prose is read off the sentence the framework just
-/// worded (its length less the echoes interpolated into it), so no count of clause text is
+/// clause fits two of them twice over. The prose is read off the sentence just worded (its
+/// length less the echoes interpolated into it), so no count of clause text is
 /// kept by hand, and what is left is handed out shortest echo first: a clause that needs
 /// less than an equal share leaves the rest to the clauses that quote more, so the sentence
 /// states as much of each value as the member admits.
@@ -242,8 +273,11 @@ pub(crate) fn refusal_message(violations: &[Violation]) -> Option<String> {
 /// ([`service_common::validation::echo_held_to`]), so every clause still reports how much
 /// was sent. Where the clauses' own prose alone fills the member — which takes more clauses
 /// than this model's four input members can break at once — there is nothing caller-sized
-/// left to hold, and the framework's own wording stands rather than a sentence with clauses
-/// missing from it.
+/// left to hold, and the unheld sentence stands rather than one with clauses missing from
+/// it.
+///
+/// The held clauses are worded through the same renderer as the unheld ones ([`worded`]), so
+/// a clause this service words itself is not lost by holding the value it quotes.
 fn held_within_the_message_maximum(
     violations: &[Violation],
     rendered: &str,
@@ -289,7 +323,7 @@ fn held_within_the_message_maximum(
             sensitive: violation.sensitive,
         })
         .collect();
-    constraints::envelope(&held)
+    worded(&held)
 }
 
 /// The names that identify THIS service to the router: its SigV4 signing name — shared
@@ -563,8 +597,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
 #[cfg(test)]
 mod tests {
+    use aws_smithy_schema_server::constraints;
+
     use super::{
-        constraints, refusal_message, Violation, ViolationKind, ARN_MEMBER_PATH,
+        refusal_message, Violation, ViolationKind, ARN_MEMBER_PATH,
         LARGEST_CLAUSE_PROSE_BYTES, LARGEST_MESSAGE_BYTES, LARGEST_QUOTED_VALUE_BYTES,
     };
 
@@ -794,5 +830,100 @@ mod tests {
             "case \"the empty value's length clause\": expected the refusal to state {clause:?}, \
              got {message:?}"
         );
+    }
+
+    /// Every constrained member of this model's inputs, each breaking one constraint, with
+    /// the job-ARN `@pattern` first — the four clauses a request to this service can break
+    /// at once (`JobArn` pattern and length, `TrajectoryId` length, `Status` value set;
+    /// `ClientToken`, `Rewards` and the inference `Body` declare no constraint to break).
+    fn every_member_broken(value: &str) -> Vec<Violation> {
+        let clause = |path: &str, kind: ViolationKind| Violation {
+            path: path.to_string(),
+            kind,
+            value: Some(value.to_string()),
+            sensitive: false,
+        };
+        vec![
+            clause(
+                ARN_MEMBER_PATH,
+                ViolationKind::Pattern(JOB_ARN_PATTERN.to_string()),
+            ),
+            clause(LONGEST_MEMBER_PATH, ViolationKind::MaxLength(256)),
+            clause(
+                "status",
+                ViolationKind::EnumValue(vec!["ready".to_string(), "failed".to_string()]),
+            ),
+            clause(ARN_MEMBER_PATH, ViolationKind::MaxLength(256)),
+        ]
+    }
+    /// The requirement a clause states, which a held value leaves untouched.
+    fn requirement_of(violation: &Violation) -> String {
+        let clause = violation.message();
+        let at = clause
+            .find("constraint: ")
+            .expect("a clause stating the requirement it refused");
+        clause[at..].to_string()
+    }
+
+    /// RULE: a refusal states a clause for EVERY violation it was given — counted and
+    /// joined into the one sentence the carrying member holds — so the wording this service
+    /// states for one class stands in for that CLAUSE and leaves the others as they were.
+    ///
+    /// Rows differ along what the rule generalises over: how many clauses the sentence
+    /// states (two, three, and the four this model's members can break at once), and how
+    /// much they quote — values the member can hold whole, and values it cannot, which the
+    /// sentence holds to their share.
+    #[test]
+    fn every_clause_survives_the_malformed_arn_wording() {
+        for clauses in [2_usize, 3, 4] {
+            for (sized, value) in [
+                ("a value the member holds whole", "v".repeat(24)),
+                ("the per-value ceiling", "v".repeat(LARGEST_QUOTED_VALUE_BYTES)),
+                (
+                    "a value the walk already shortened",
+                    service_common::validation::quoted_echo_up_to(
+                        &"v".repeat(1024 * 1024),
+                        LARGEST_QUOTED_VALUE_BYTES,
+                    )
+                    .into_owned(),
+                ),
+            ] {
+                let case = &format!("{clauses} clauses, each quoting {sized}");
+                let violations = &every_member_broken(&value)[..clauses];
+                let message = refusal_message(violations)
+                    .unwrap_or_else(|| panic!("case {case:?}: expected a refusal sentence"));
+                assert!(
+                    message.starts_with(&format!("{clauses} validation errors detected: ")),
+                    "case {case:?}: expected all {clauses} clauses in one envelope, got {:?}",
+                    message.chars().take(120).collect::<String>()
+                );
+                assert!(
+                    message.contains("Input arn "),
+                    "case {case:?}: expected the ARN clause in this service's own wording, got \
+                     {message:?}"
+                );
+                assert!(
+                    !message.contains("regular expression pattern"),
+                    "case {case:?}: expected the ARN clause NOT to state the pattern it stands \
+                     in for, got {message:?}"
+                );
+                // Every OTHER clause keeps the requirement the framework worded for it,
+                // whether or not the value it quotes had to be held.
+                for violation in &violations[1..] {
+                    let requirement = requirement_of(violation);
+                    assert!(
+                        message.contains(&requirement),
+                        "case {case:?}: expected the refusal to state {requirement:?}, got \
+                         {message:?}"
+                    );
+                }
+                assert!(
+                    message.len() <= LARGEST_MESSAGE_BYTES,
+                    "case {case:?}: expected a refusal within the {LARGEST_MESSAGE_BYTES} byte \
+                     maximum the carrying member declares, got {} bytes",
+                    message.len()
+                );
+            }
+        }
     }
 }

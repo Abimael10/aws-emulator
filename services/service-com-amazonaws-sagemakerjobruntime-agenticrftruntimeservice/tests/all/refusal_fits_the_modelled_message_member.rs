@@ -384,9 +384,15 @@ async fn a_refused_trajectory_id_fits_the_carrying_member() {
     }
 }
 
+/// `JobArn`'s own modelled `@length` maximum
+/// (`smithy_query(query="shape",shape="JobArn")`): a value past it breaks that constraint as
+/// well as the job-ARN `@pattern`, so the refusal states a clause for each.
+const JOB_ARN_MAX: usize = 256;
+
 /// RULE: this service's own wording of a value that is not an ARN at all is held to the same
 /// ceiling, because the value reaches it off the same violation — so the malformed-ARN
-/// sentence fits the carrying member for a header value of any size.
+/// sentence fits the carrying member for a header value of any size, beside whatever other
+/// clause the same value broke.
 #[tokio::test]
 async fn a_malformed_job_arn_fits_the_carrying_member() {
     // Rows differ along the value's size relative to the ceiling and along its shape: a
@@ -399,9 +405,12 @@ async fn a_malformed_job_arn_fits_the_carrying_member() {
             Echo::Whole,
         ),
         (
+            // Past `JobArn`'s own 256 maximum as well, so the sentence states two clauses
+            // quoting the same value and what each may quote is their SHARE of the member
+            // rather than the per-value ceiling.
             "a value at the stated ceiling",
             format!("not-an-arn-{}", "z".repeat(LARGEST_QUOTED_VALUE_BYTES - 11)),
-            Echo::Whole,
+            Echo::Marked,
         ),
         (
             "one byte past the ceiling",
@@ -432,10 +441,29 @@ async fn a_malformed_job_arn_fits_the_carrying_member() {
             let reply = call(&router, path, &bad_arn, Some("traj-1"), "ready").await;
             let message = refusal_within_the_member(case, &reply);
             assert!(
-                message.starts_with("Input arn ") && message.ends_with(" is malformed"),
+                message.contains("Input arn ") && message.ends_with(" is malformed"),
                 "case {case:?}: expected the malformed-ARN wording, got {:?}",
                 message.chars().take(160).collect::<String>()
             );
+            // A value past `JobArn`'s own maximum breaks that constraint too, and one
+            // refusal states every constraint the request broke: the length clause is
+            // counted beside the malformed-ARN one. A shorter value breaks the pattern
+            // alone, and the wording is the whole sentence.
+            if bad_arn.len() > JOB_ARN_MAX {
+                assert!(
+                    message.starts_with("2 validation errors detected: ")
+                        && message
+                            .contains(&format!("at 'jobArn' failed to satisfy constraint: Member must have length less than or equal to {JOB_ARN_MAX}")),
+                    "case {case:?}: expected the length clause counted beside it, got {:?}",
+                    message.chars().take(200).collect::<String>()
+                );
+            } else {
+                assert!(
+                    message.starts_with("Input arn "),
+                    "case {case:?}: expected the wording to be the whole sentence, got {:?}",
+                    message.chars().take(160).collect::<String>()
+                );
+            }
             assert_echo(case, &message, &bad_arn, echo);
         }
     }

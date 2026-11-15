@@ -299,18 +299,33 @@ async fn every_constraint_class_echoes_the_submitted_value() {
 
     // The job-ARN `@pattern`, which this service words as a malformed ARN naming the
     // value it was given. Rows differ along the value's size, and the long one also
-    // breaches `JobArn`'s own 256 maximum — the ARN wording still states the whole value.
-    for (case, bad_arn) in [
-        ("a short value that is not an ARN", "nope".to_string()),
+    // breaches `JobArn`'s own 256 maximum — one refusal states every constraint the
+    // request broke, so that row is answered both clauses, each echoing the whole value.
+    for (case, bad_arn, expected) in [
+        (
+            "a short value that is not an ARN",
+            "nope".to_string(),
+            None,
+        ),
         (
             "a 300-character value that is not an ARN",
             format!("not-an-arn-{}", "z".repeat(289)),
+            Some("Member must have length less than or equal to 256"),
         ),
         (
             "an ARN-shaped value with a bad account id",
             "arn:aws:sagemaker:us-east-1:12345:job/AgentRFT/run-1".to_string(),
+            None,
         ),
     ] {
+        // The length clause the walk collects first, when the value breaks that bound too.
+        let message = match expected {
+            None => format!("Input arn {bad_arn} is malformed"),
+            Some(requirement) => format!(
+                "2 validation errors detected: Value '{bad_arn}' at 'jobArn' failed to satisfy \
+                 constraint: {requirement}; Input arn {bad_arn} is malformed"
+            ),
+        };
         for op in [
             Op::Sample,
             Op::SampleWithResponseStream,
@@ -319,11 +334,7 @@ async fn every_constraint_class_echoes_the_submitted_value() {
         ] {
             let router = mounted_service_with_job();
             let reply = call(&router, op, &bad_arn, "traj-1", "ready").await;
-            assert_refused(
-                &format!("{case} on {op:?}"),
-                &reply,
-                &format!("Input arn {bad_arn} is malformed"),
-            );
+            assert_refused(&format!("{case} on {op:?}"), &reply, &message);
         }
     }
 }
