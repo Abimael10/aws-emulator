@@ -29,6 +29,8 @@ mod rollout_percentage_splits_sessions;
 mod session_requires_a_deployment;
 #[path = "all/sibling_applications_do_not_cross_deliver.rs"]
 mod sibling_applications_do_not_cross_deliver;
+#[path = "all/sibling_environments_survive_a_deletion.rs"]
+mod sibling_environments_survive_a_deletion;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stop_mid_rollout_withdraws_the_release.rs"]

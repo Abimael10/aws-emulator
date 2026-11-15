@@ -2133,3 +2133,10 @@ mod s3_notification_lambda_invoke_grant_gates_delivery;
 // The note paragraphs concurrent landings had appended to this file wrapped without the
 // indentation `clippy::doc_lazy_continuation` asks of a doc list item; the lint is allowed
 // here so a re-appended note is a note rather than a build failure.
+// cross-service suites.
+// so two branches landing at once insert two lines in two places and have no prose to
+// duplicate, re-word or mistype. Put a new suite at `tests/all/<name>.rs` and insert its
+// pair in sorted position.
+// to a SIBLING of this file, which the layout check refuses: the `#[path]` above each `mod` is
+// what points it into `tests/all/`.
+// test it explains; the notes earlier landings appended to this file live in
