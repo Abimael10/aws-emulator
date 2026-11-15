@@ -86,10 +86,36 @@ fn expected_global_timeout(heartbeat_timeout: i32) -> i32 {
     (heartbeat_timeout * 100).min(MAX_GLOBAL_TIMEOUT)
 }
 
-/// A catalog as a refusal states it: the entries comma-separated inside brackets, the shape
-/// an admissible value set is stated in on the wire.
-fn stated(catalog: &[&str]) -> String {
-    format!("[{}]", catalog.join(", "))
+/// The whole message a request naming a value outside the set a lifecycle-hook member
+/// admits is refused with: the member as the model names it, the admissible values in
+/// the order the service publishes them, and no part of the request.
+///
+/// Spelled out here rather than taken from the crate, so the assertion does not take the
+/// handler's own word for the sentence.
+pub(crate) fn outside_value_set(member: &str, catalog: &[&str]) -> String {
+    format!("'{member}' must be one of: {}", catalog.join(", "))
+}
+
+/// The whole message a call naming a lifecycle hook this service holds none of is
+/// refused with: both identifiers the request addressed it by, quoted.
+pub(crate) fn absent_hook_message(hook_name: &str, group_name: &str) -> String {
+    format!("No Lifecycle Hook found with name '{hook_name}' for group '{group_name}'")
+}
+
+/// The whole message a `HeartbeatTimeout` outside the documented range is refused with:
+/// the member and both published bounds, with no part of the request in it.
+pub(crate) fn heartbeat_range_message() -> String {
+    format!(
+        "HeartbeatTimeout must be between {MIN_HEARTBEAT_TIMEOUT} and {MAX_HEARTBEAT_TIMEOUT} \
+         seconds"
+    )
+}
+
+/// The whole message `PutLifecycleHook` refuses a group the account does not hold with:
+/// the absent-group prefix this service opens every such refusal with, and the detail
+/// form this operation serves — that no such group exists, naming the one asked for.
+pub(crate) fn absent_group_message(name: &str) -> String {
+    format!("AutoScalingGroup name not found - No such Auto Scaling group: {name}")
 }
 
 /// One hook as `DescribeLifecycleHooks` reports it. Every member is kept as the wire
@@ -165,7 +191,7 @@ pub(crate) async fn put_hook(
 }
 
 /// Post one `DeleteLifecycleHook`, and answer its status, wire error code and message.
-async fn delete_hook(
+pub(crate) async fn delete_hook(
     router: &MultiServiceRouter,
     group: &str,
     hook: &str,
@@ -185,7 +211,7 @@ async fn delete_hook(
 
 /// Post one `DescribeLifecycleHooks`, filtering for `names` when any are given, and
 /// answer its status, wire error code and message.
-async fn describe_result(
+pub(crate) async fn describe_result(
     router: &MultiServiceRouter,
     group: &str,
     names: &[&str],
@@ -679,30 +705,25 @@ struct RefusedRow {
 /// is unchanged.
 #[tokio::test]
 async fn a_put_carrying_a_value_outside_its_rule_is_refused_and_writes_nothing() {
-    let constraint_sentence = |value: i32, constraint: &str| {
-        format!(
-            "1 validation error detected: Value '{value}' at 'heartbeatTimeout' failed to \
-             satisfy constraint: {constraint}"
-        )
-    };
+    let heartbeat_range_sentence = heartbeat_range_message();
     let rows = [
         RefusedRow {
             case: "a transition of neither published kind",
             members: vec![p("LifecycleTransition", "autoscaling:EC2_INSTANCE_REBOOTING")],
-            message: format!(
-                "The LifecycleTransition value autoscaling:EC2_INSTANCE_REBOOTING is not valid: \
-                 it must be one of {}",
-                stated(&TRANSITIONS)
-            ),
+            message: outside_value_set("LifecycleTransition", &TRANSITIONS),
         },
         RefusedRow {
             case: "a transition spelled without its namespace",
             members: vec![p("LifecycleTransition", "EC2_INSTANCE_LAUNCHING")],
-            message: format!(
-                "The LifecycleTransition value EC2_INSTANCE_LAUNCHING is not valid: it must be \
-                 one of {}",
-                stated(&TRANSITIONS)
-            ),
+            message: outside_value_set("LifecycleTransition", &TRANSITIONS),
+        },
+        RefusedRow {
+            case: "a transition spelled in the wrong case",
+            members: vec![p(
+                "LifecycleTransition",
+                "autoscaling:ec2_instance_launching",
+            )],
+            message: outside_value_set("LifecycleTransition", &TRANSITIONS),
         },
         RefusedRow {
             case: "a default result of neither published value",
@@ -710,10 +731,7 @@ async fn a_put_carrying_a_value_outside_its_rule_is_refused_and_writes_nothing()
                 p("LifecycleTransition", TRANSITIONS[0]),
                 p("DefaultResult", "PROCEED"),
             ],
-            message: format!(
-                "The DefaultResult value PROCEED is not valid: it must be one of {}",
-                stated(&RESULTS)
-            ),
+            message: outside_value_set("DefaultResult", &RESULTS),
         },
         RefusedRow {
             case: "a default result in the wrong case",
@@ -721,10 +739,7 @@ async fn a_put_carrying_a_value_outside_its_rule_is_refused_and_writes_nothing()
                 p("LifecycleTransition", TRANSITIONS[0]),
                 p("DefaultResult", "continue"),
             ],
-            message: format!(
-                "The DefaultResult value continue is not valid: it must be one of {}",
-                stated(&RESULTS)
-            ),
+            message: outside_value_set("DefaultResult", &RESULTS),
         },
         RefusedRow {
             case: "a heartbeat timeout one second below the published minimum",
@@ -732,12 +747,7 @@ async fn a_put_carrying_a_value_outside_its_rule_is_refused_and_writes_nothing()
                 p("LifecycleTransition", TRANSITIONS[0]),
                 p("HeartbeatTimeout", (MIN_HEARTBEAT_TIMEOUT - 1).to_string()),
             ],
-            message: constraint_sentence(
-                MIN_HEARTBEAT_TIMEOUT - 1,
-                &format!(
-                    "Member must have value greater than or equal to {MIN_HEARTBEAT_TIMEOUT}"
-                ),
-            ),
+            message: heartbeat_range_sentence.clone(),
         },
         RefusedRow {
             case: "a heartbeat timeout one second above the published maximum",
@@ -745,10 +755,7 @@ async fn a_put_carrying_a_value_outside_its_rule_is_refused_and_writes_nothing()
                 p("LifecycleTransition", TRANSITIONS[0]),
                 p("HeartbeatTimeout", (MAX_HEARTBEAT_TIMEOUT + 1).to_string()),
             ],
-            message: constraint_sentence(
-                MAX_HEARTBEAT_TIMEOUT + 1,
-                &format!("Member must have value less than or equal to {MAX_HEARTBEAT_TIMEOUT}"),
-            ),
+            message: heartbeat_range_sentence.clone(),
         },
         RefusedRow {
             case: "a heartbeat timeout of zero",
@@ -756,12 +763,7 @@ async fn a_put_carrying_a_value_outside_its_rule_is_refused_and_writes_nothing()
                 p("LifecycleTransition", TRANSITIONS[0]),
                 p("HeartbeatTimeout", "0"),
             ],
-            message: constraint_sentence(
-                0,
-                &format!(
-                    "Member must have value greater than or equal to {MIN_HEARTBEAT_TIMEOUT}"
-                ),
-            ),
+            message: heartbeat_range_sentence.clone(),
         },
     ];
 
@@ -950,7 +952,7 @@ async fn a_read_reports_the_hooks_it_filters_for() {
     }
 }
 
-/// The delete removes exactly the hook it names, is a success for a name the group does
+/// The delete removes exactly the hook it names, is refused for a name the group does
 /// not hold, and frees the name for a later create.
 #[tokio::test]
 async fn a_delete_removes_exactly_the_hook_it_names() {
@@ -990,14 +992,23 @@ async fn a_delete_removes_exactly_the_hook_it_names() {
         "only the hook the delete named is gone, got {remaining:?}"
     );
 
-    // Deleting it again, and deleting a name the group never held, are successes that
-    // remove nothing.
+    // Deleting it again, and deleting a name the group never held, name no hook to
+    // delete: each is refused, and the hooks the group does hold are untouched.
     for hook in ["hook-a", "hook-never-stored"] {
         let (status, code, message) = delete_hook(&router, "asg-delete", hook).await;
         assert_eq!(
-            status, 200,
-            "case {hook:?}: deleting a hook the group does not hold is a success, got {status} \
-             with {code:?} {message:?}"
+            status, 400,
+            "case {hook:?}: deleting a hook the group does not hold must be refused, got \
+             {status} with {code:?} {message:?}"
+        );
+        assert_eq!(
+            code, "ValidationError",
+            "case {hook:?}: expected the ValidationError code, got {code:?} {message:?}"
+        );
+        let expected = absent_hook_message(hook, "asg-delete");
+        assert_eq!(
+            message, expected,
+            "case {hook:?}: expected the message {expected:?}, got {message:?}"
         );
     }
     assert_eq!(
@@ -1143,11 +1154,7 @@ async fn a_group_created_with_hook_specifications_reports_them() {
         "ValidationError",
         "expected the ValidationError code, got {body:?}"
     );
-    let expected = format!(
-        "The LifecycleTransition value autoscaling:EC2_INSTANCE_REBOOTING is not valid: it must \
-         be one of {}",
-        stated(&TRANSITIONS)
-    );
+    let expected = outside_value_set("LifecycleTransition", &TRANSITIONS);
     assert_eq!(
         xml_unescape(&tag_value(&body, "Message")),
         expected,
@@ -1155,15 +1162,16 @@ async fn a_group_created_with_hook_specifications_reports_them() {
     );
     let (status, _, message) = describe_result(&router, "asg-spec-bad", &[]).await;
     assert_eq!(
-        status, 400,
-        "the refused create stored no group, so the read of it is refused too, got {status} \
-         with {message:?}"
+        status, 200,
+        "the refused create stored no group, and the read of a name no group answers to \
+         reports no hooks rather than being refused, got {status} with {message:?}"
     );
 }
 
-/// A hook-scoped call naming a group the account does not hold: the WRITES answer the
-/// fixed sentence whose detail field is unfilled, like every other group-scoped write of
-/// this service, and the READ names the group it could not find.
+/// A hook-scoped call naming a group the account does not hold: the PUT states that no
+/// such group exists, naming the one the request asked for, the DELETE reports the hook
+/// it could not find (naming the hook and the group it was addressed to), and the READ
+/// reports no hooks at all.
 #[tokio::test]
 async fn a_call_against_an_absent_group_is_refused() {
     let router = router_with(new_engine());
@@ -1185,9 +1193,10 @@ async fn a_call_against_an_absent_group_is_refused() {
             code, "ValidationError",
             "case {absent:?}: expected the ValidationError code, got {code:?} {message:?}"
         );
+        let expected = absent_group_message(absent);
         assert_eq!(
-            message, "AutoScalingGroup name not found - null",
-            "case {absent:?}: expected the no-detail absent-group sentence, got {message:?}"
+            message, expected,
+            "case {absent:?}: expected the message {expected:?}, got {message:?}"
         );
 
         let (status, code, message) = delete_hook(&router, absent, "hook").await;
@@ -1195,24 +1204,22 @@ async fn a_call_against_an_absent_group_is_refused() {
             status, 400,
             "case {absent:?}: the delete must be refused, got {status} with {code:?} {message:?}"
         );
+        let expected = absent_hook_message("hook", absent);
         assert_eq!(
-            message, "AutoScalingGroup name not found - null",
-            "case {absent:?}: expected the no-detail absent-group sentence, got {message:?}"
+            message, expected,
+            "case {absent:?}: expected the message {expected:?}, got {message:?}"
         );
 
         let (status, code, message) = describe_result(&router, absent, &[]).await;
         assert_eq!(
-            status, 400,
-            "case {absent:?}: the read must be refused, got {status} with {code:?} {message:?}"
+            status, 200,
+            "case {absent:?}: the read reports no hooks rather than refusing, got {status} \
+             with {code:?} {message:?}"
         );
-        assert_eq!(
-            code, "ValidationError",
-            "case {absent:?}: expected the ValidationError code, got {code:?} {message:?}"
-        );
-        let expected = format!("AutoScalingGroup name not found - AutoScalingGroup {absent} not found");
-        assert_eq!(
-            message, expected,
-            "case {absent:?}: expected the message {expected:?}, got {message:?}"
+        let hooks = described_hooks(&router, absent, &[]).await;
+        assert!(
+            hooks.is_empty(),
+            "case {absent:?}: expected no hooks for a name no group answers to, got {hooks:?}"
         );
     }
 

@@ -69,6 +69,8 @@ mod launch_template_security_group_vpc;
 mod launch_template_specifications;
 #[path = "all/legacy_target_group_detach.rs"]
 mod legacy_target_group_detach;
+#[path = "all/lifecycle_hook_and_notification_refusals.rs"]
+mod lifecycle_hook_and_notification_refusals;
 #[path = "all/lifecycle_hooks.rs"]
 mod lifecycle_hooks;
 #[path = "all/load_balancer_target_registration.rs"]

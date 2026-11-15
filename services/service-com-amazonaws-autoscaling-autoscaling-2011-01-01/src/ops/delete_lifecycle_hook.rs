@@ -6,8 +6,10 @@
 //! reader (`DescribeLifecycleHooks`) no longer reports it and a later
 //! `PutLifecycleHook` under that name CREATES a hook rather than updating one.
 //!
-//! Deleting a hook the group does not hold is a success that removes nothing: the
-//! request asks for a hook of that name not to be there, and it is not.
+//! The call is addressed at ONE hook of one group ("deletes the specified lifecycle
+//! hook"), so a name pair this service holds no hook for specifies none: the request is
+//! refused, naming the hook and the group it was addressed to, rather than answered as a
+//! success that removed nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -153,25 +155,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
 
-        // A hook belongs to a group, so a name no group answers to is refused with the
-        // wording this service's group-scoped WRITE paths answer with.
-        let Some(group) = state.groups.get_mut(&group_name) else {
+        // The call is addressed at ONE hook of one group, so a pair this service holds no
+        // hook for names no hook to delete: the refusal reports the missing HOOK, naming
+        // both identifiers the request addressed it by, whether the group holds no hook of
+        // that name or no group answers to the name at all.
+        let removed = state
+            .groups
+            .get_mut(&group_name)
+            .is_some_and(|group| group.delete_lifecycle_hook(&hook_name));
+        if !removed {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                crate::state::absent_lifecycle_hook_message(&hook_name, &group_name),
             ));
-        };
-
-        let removed = group.delete_lifecycle_hook(&hook_name);
+        }
 
         crate::state::audit(
             ctx.parts(),
             "DeleteLifecycleHook",
             &format!("{group_name}/{hook_name}"),
-            if removed {
-                "lifecycle hook deleted"
-            } else {
-                "no lifecycle hook of that name to delete"
-            },
+            "lifecycle hook deleted",
         );
         Ok(DeleteLifecycleHookOutput {})
     }

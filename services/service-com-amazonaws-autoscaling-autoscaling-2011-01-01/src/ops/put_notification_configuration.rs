@@ -197,11 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // A notification configuration belongs to a group, so a name no group answers
             // to is refused with the wording this service's group-scoped WRITE paths answer
-            // with: the detail field after the dash is left unfilled, so no part of the
-            // request appears in it.
+            // with, in the detail form this operation serves: the name the request asked
+            // for, which is what tells a caller configuring several groups which call
+            // failed.
             let Some(group) = state.groups.get_mut(&group_name) else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                    crate::state::absent_group_message_as_name(&group_name),
                 ));
             };
 

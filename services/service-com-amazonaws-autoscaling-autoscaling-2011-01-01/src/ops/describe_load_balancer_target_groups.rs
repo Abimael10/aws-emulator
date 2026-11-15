@@ -184,43 +184,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let group_name = input.auto_scaling_group_name;
-        // The page this read resumes at, from the token a previous one issued: a token this
-        // service never issued names no page, which is this operation's own modelled
-        // `InvalidNextToken`. The token itself is kept so a later refusal names the one the
-        // caller actually submitted.
-        let (offset, token) = match input.next_token.clone() {
-            None => (0, String::new()),
-            Some(token) => match crate::state::decode_next_token(&token) {
-                Some(offset) => (offset, token),
-                None => {
-                    return Err(
-                        DescribeLoadBalancerTargetGroupsErrorModeled::InvalidNextToken(
-                            InvalidNextToken {
-                                message: Some(crate::state::invalid_next_token_message(&token)),
-                            },
-                        )
-                        .into(),
-                    );
-                }
-            },
-        };
-        // "The maximum number of items to return with this call. The default value is 100 and
-        // the maximum value is 100" (`DescribeLoadBalancerTargetGroupsRequest$MaxRecords`):
-        // the member carries no modelled range, so a page size outside it is refused here
-        // rather than quietly reshaped.
-        if let Some(max_records) = crate::state::max_records_out_of_range(input.max_records) {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::max_records_violation_message(max_records),
-            ));
-        }
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
 
+        // The group is resolved BEFORE the rest of the request is read: this read reports
+        // the target groups of the group it names, so a name no group answers to is
+        // refused for the group whatever else the request carries, in the detail form this
+        // read serves — the group could not be found under the name the request quoted.
         let Some(group) = state.groups.get(&group_name) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_group_message(&group_name),
+                crate::state::absent_group_message_as_not_findable(&group_name),
             ));
         };
 
@@ -242,18 +217,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state: Some(attachment_state.to_string()),
             })
             .collect();
+
+        // The page this read resumes at, from the token a previous one issued: a token this
+        // read did not issue is a bad VALUE for the member that carried it, which this read
+        // answers the service-common `ValidationError` for, naming the member and the value
+        // submitted for it. The token itself is kept so a later refusal names the one the
+        // caller actually submitted.
+        let (offset, token) = match input.next_token.clone() {
+            None => (0, String::new()),
+            Some(token) => match crate::state::decode_next_token(&token) {
+                Some(offset) => (offset, token),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::next_token_value_violation_message(&token),
+                    ));
+                }
+            },
+        };
+        // "The maximum number of items to return with this call. The default value is 100 and
+        // the maximum value is 100" (`DescribeLoadBalancerTargetGroupsRequest$MaxRecords`):
+        // the member carries no modelled range, so a page size outside it is refused here
+        // rather than quietly reshaped.
+        if let Some(max_records) = crate::state::max_records_out_of_range(input.max_records) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::max_records_violation_message(max_records),
+            ));
+        }
+
         // A token this service issued always points inside the list it was issued for; one
         // that points past the end was not issued for this list. Only a decoded token
         // reaches a non-zero offset, so `token` is the one submitted.
         if offset > 0 && offset >= reported.len() {
-            return Err(
-                DescribeLoadBalancerTargetGroupsErrorModeled::InvalidNextToken(
-                    InvalidNextToken {
-                        message: Some(crate::state::invalid_next_token_message(&token)),
-                    },
-                )
-                .into(),
-            );
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::next_token_value_violation_message(&token),
+            ));
         }
         let (load_balancer_target_groups, next_token) = crate::state::page(
             &reported,

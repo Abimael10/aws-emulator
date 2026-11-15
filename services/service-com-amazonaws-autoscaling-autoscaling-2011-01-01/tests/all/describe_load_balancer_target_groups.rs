@@ -709,8 +709,8 @@ fn refusal_rows(stored_group: &'static str) -> Vec<RefusalRow> {
             extra: Vec::new(),
             status: 400,
             code: "ValidationError",
-            message: "AutoScalingGroup name not found - AutoScalingGroup \
-                      asg-that-does-not-exist not found"
+            message: "AutoScalingGroup name not found - Could not find Auto Scaling group \
+                      named 'asg-that-does-not-exist'"
                 .to_string(),
         },
         RefusalRow {
@@ -738,16 +738,16 @@ fn refusal_rows(stored_group: &'static str) -> Vec<RefusalRow> {
             group: "stored",
             extra: vec![p("NextToken", "not-a-token")],
             status: 400,
-            code: "InvalidNextToken",
-            message: "The token 'not-a-token' was invalid".to_string(),
+            code: "ValidationError",
+            message: "NextToken: not-a-token".to_string(),
         },
         RefusalRow {
             case: "a token naming a page past the attachments the group holds",
             group: "stored",
             extra: vec![p("NextToken", "next-9")],
             status: 400,
-            code: "InvalidNextToken",
-            message: "The token 'next-9' was invalid".to_string(),
+            code: "ValidationError",
+            message: "NextToken: next-9".to_string(),
         },
     ]
     .into_iter()

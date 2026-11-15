@@ -171,7 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         DescribeNotificationConfigurationsErrorModeled::InvalidNextToken(
                             InvalidNextToken {
-                                message: Some(crate::state::invalid_next_token_message(&token)),
+                                message: Some(
+                                    crate::state::invalid_next_token_message_in_present_tense(
+                                        &token,
+                                    ),
+                                ),
                             },
                         )
                         .into(),
@@ -225,7 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeNotificationConfigurationsErrorModeled::InvalidNextToken(
                     InvalidNextToken {
-                        message: Some(crate::state::invalid_next_token_message(&token)),
+                        message: Some(
+                            crate::state::invalid_next_token_message_in_present_tense(&token),
+                        ),
                     },
                 )
                 .into(),

@@ -64,6 +64,17 @@ pub const GLOBAL_TIMEOUT_HEARTBEATS: i32 = 100;
 /// default value is ABANDON."
 pub const DEFAULT_LIFECYCLE_ACTION_RESULT: &str = "ABANDON";
 
+/// The vendors a lifecycle hook's notification target may be a resource of.
+///
+/// The model documents the member as the ARN of a target "that Amazon EC2 Auto Scaling
+/// uses to notify you when an instance is in a wait state for the lifecycle hook. You
+/// can specify either an Amazon SNS topic or an Amazon SQS queue"
+/// (`smithy_query(query="doc",shape="PutLifecycleHookType",member="NotificationTargetARN")`),
+/// so the target is a resource of a service Amazon EC2 Auto Scaling publishes a
+/// notification to, and the vendor field of the ARN is what says which. The refusal
+/// below states this set, so a caller is told which vendors it may choose from.
+pub const NOTIFICATION_TARGET_VENDORS: &[&str] = &["sqs", "sns", "lambda"];
+
 /// The results a lifecycle hook may default to, from the same documentation: "Valid
 /// values: CONTINUE | ABANDON".
 pub const LIFECYCLE_ACTION_RESULTS: &[&str] = &["CONTINUE", DEFAULT_LIFECYCLE_ACTION_RESULT];
@@ -121,15 +132,20 @@ pub struct LifecycleHookPut {
 pub enum LifecycleHookRefusal {
     /// The request creates a hook but names no transition for it to act on.
     TransitionMissing,
-    /// The transition the request names is not one a hook can be created for; carries
-    /// what it named.
-    UnknownTransition(String),
-    /// The default result the request names is not one a hook can take; carries what it
-    /// named.
-    UnknownResult(String),
-    /// The heartbeat timeout the request names is outside the documented range; carries
-    /// what it named.
-    HeartbeatOutOfRange(i32),
+    /// The transition the request names is not one a hook can be created for. The
+    /// refusal states the member and the admissible transitions, so what the request
+    /// named is not carried.
+    UnknownTransition,
+    /// The default result the request names is not one a hook can take. Stated the same
+    /// way, so what the request named is not carried either.
+    UnknownResult,
+    /// The notification target the request names is a resource of a vendor this service
+    /// does not publish notifications to; carries that vendor, which the refusal reports.
+    UnsupportedNotificationTargetVendor(String),
+    /// The heartbeat timeout the request names is outside the documented range. The
+    /// refusal states the member and both documented bounds, so what the request named is
+    /// not carried.
+    HeartbeatOutOfRange,
     /// The group already holds [`MAX_LIFECYCLE_HOOKS_PER_GROUP`] hooks and this request
     /// would create one more.
     LimitExceeded,
@@ -145,9 +161,12 @@ impl LifecycleHookRefusal {
     pub fn message(&self, hook_name: &str) -> String {
         match self {
             Self::TransitionMissing => transition_missing_message(hook_name),
-            Self::UnknownTransition(transition) => unknown_transition_message(transition),
-            Self::UnknownResult(result) => unknown_result_message(result),
-            Self::HeartbeatOutOfRange(timeout) => heartbeat_timeout_violation_message(*timeout),
+            Self::UnknownTransition => unknown_transition_message(),
+            Self::UnknownResult => unknown_result_message(),
+            Self::UnsupportedNotificationTargetVendor(vendor) => {
+                unsupported_notification_target_message(vendor)
+            }
+            Self::HeartbeatOutOfRange => heartbeat_timeout_violation_message(),
             Self::LimitExceeded => too_many_hooks_message(hook_name),
         }
     }
@@ -192,23 +211,7 @@ pub fn put_lifecycle_hook(
     name: &str,
     put: &LifecycleHookPut,
 ) -> Result<(), LifecycleHookRefusal> {
-    if let Some(transition) = put.lifecycle_transition.as_deref() {
-        if !super::LIFECYCLE_HOOK_TYPES.contains(&transition) {
-            return Err(LifecycleHookRefusal::UnknownTransition(
-                transition.to_string(),
-            ));
-        }
-    }
-    if let Some(result) = put.default_result.as_deref() {
-        if !LIFECYCLE_ACTION_RESULTS.contains(&result) {
-            return Err(LifecycleHookRefusal::UnknownResult(result.to_string()));
-        }
-    }
-    if let Some(timeout) = put.heartbeat_timeout {
-        if !(MIN_HEARTBEAT_TIMEOUT..=MAX_HEARTBEAT_TIMEOUT).contains(&timeout) {
-            return Err(LifecycleHookRefusal::HeartbeatOutOfRange(timeout));
-        }
-    }
+    validate_lifecycle_hook_members(put)?;
 
     match hooks.get_mut(name) {
         // An UPDATE: every member the request omits keeps the value the hook already
@@ -266,42 +269,125 @@ pub fn put_lifecycle_hook(
     }
 }
 
-/// A catalog as a refusal states it, through the one spelling this service states every
-/// admissible value set in ([`super::stated_value_set`]).
-fn stated_catalog(values: &[&str]) -> String {
-    super::stated_value_set(values.iter().copied())
+/// The values a request carries for ONE hook, checked against the rules that are about
+/// the REQUEST rather than about the hook the group holds: the transition and the
+/// default result against their documented value sets, the notification target against
+/// the vendors this service publishes to, and the heartbeat timeout against its
+/// documented range.
+///
+/// Separate from [`put_lifecycle_hook`] because a request's own values are checked
+/// BEFORE the resources it names are resolved, so an operation that resolves the group
+/// first still refuses an unusable value with the value's own refusal; the upsert calls
+/// it too, so a writer that has the group in hand (the group create's hook
+/// specifications) cannot skip a rule.
+pub fn validate_lifecycle_hook_members(
+    put: &LifecycleHookPut,
+) -> Result<(), LifecycleHookRefusal> {
+    if let Some(transition) = put.lifecycle_transition.as_deref() {
+        if !super::LIFECYCLE_HOOK_TYPES.contains(&transition) {
+            return Err(LifecycleHookRefusal::UnknownTransition);
+        }
+    }
+    if let Some(result) = put.default_result.as_deref() {
+        if !LIFECYCLE_ACTION_RESULTS.contains(&result) {
+            return Err(LifecycleHookRefusal::UnknownResult);
+        }
+    }
+    if let Some(vendor) = unsupported_notification_target_vendor(
+        put.notification_target_arn.as_deref().unwrap_or_default(),
+    ) {
+        return Err(LifecycleHookRefusal::UnsupportedNotificationTargetVendor(
+            vendor.to_string(),
+        ));
+    }
+    if let Some(timeout) = put.heartbeat_timeout {
+        if !(MIN_HEARTBEAT_TIMEOUT..=MAX_HEARTBEAT_TIMEOUT).contains(&timeout) {
+            return Err(LifecycleHookRefusal::HeartbeatOutOfRange);
+        }
+    }
+    Ok(())
+}
+
+/// The vendor of `target` when it is a resource of a vendor this service cannot notify,
+/// and `None` when the target is one it can.
+///
+/// The empty target names no resource at all — it is how a request CLEARS a stored one —
+/// and a value this service cannot read an ARN's vendor field out of
+/// ([`::service_common::arn::vendor`]) names no vendor to report, so neither is refused
+/// here.
+pub fn unsupported_notification_target_vendor(target: &str) -> Option<&str> {
+    ::service_common::arn::vendor(target)
+        .filter(|vendor| !NOTIFICATION_TARGET_VENDORS.contains(vendor))
+}
+
+/// The message a request naming a member value outside the set that member admits is
+/// refused with: the member as the MODEL names it, the admissible values in the order
+/// the service publishes them, and no part of the request — the sentence states what
+/// the member admits, which is the same whatever the request carried.
+///
+/// THE ONE SHAPE for every lifecycle-hook member whose value set this service checks
+/// itself, because the model types those members as plain strings
+/// (`smithy_query(query="shape",shape="LifecycleTransition,LifecycleActionResult")`) and
+/// so carries no enumeration for the boundary validator to refuse them against.
+fn outside_value_set_message(member: &str, values: &[&str]) -> String {
+    format!(
+        "'{member}' must be one of: {}",
+        super::joined_values(values.iter().map(::std::string::ToString::to_string))
+    )
 }
 
 /// The message a request naming a transition no lifecycle hook can be created for is
-/// refused with, in the shape this service refuses every value outside one of its own
-/// catalogs: the member as the model names it, the value from the request, and the
-/// catalog the caller has to choose from.
-pub fn unknown_transition_message(transition: &str) -> String {
-    format!(
-        "The LifecycleTransition value {transition} is not valid: it must be one of {}",
-        stated_catalog(super::LIFECYCLE_HOOK_TYPES)
-    )
+/// refused with.
+pub fn unknown_transition_message() -> String {
+    outside_value_set_message("LifecycleTransition", super::LIFECYCLE_HOOK_TYPES)
 }
 
 /// The message a request naming a default result outside the documented pair is refused
 /// with, in the same shape.
-pub fn unknown_result_message(result: &str) -> String {
+pub fn unknown_result_message() -> String {
+    outside_value_set_message("DefaultResult", LIFECYCLE_ACTION_RESULTS)
+}
+
+/// The message a request whose notification target is a resource of a vendor this
+/// service does not publish to is refused with.
+///
+/// Three sentences of fixed text around ONE variable part — the vendor field of the ARN
+/// the request submitted: the member as the model names it, the vendor that cannot be
+/// notified, and the vendors that can ([`NOTIFICATION_TARGET_VENDORS`]).
+pub fn unsupported_notification_target_message(vendor: &str) -> String {
     format!(
-        "The DefaultResult value {result} is not valid: it must be one of {}",
-        stated_catalog(LIFECYCLE_ACTION_RESULTS)
+        "The value in 'NotificationTargetARN' is invalid. The specified vendor '{vendor}' is not \
+         valid. Supported vendors: {}",
+        super::joined_values(
+            NOTIFICATION_TARGET_VENDORS
+                .iter()
+                .map(::std::string::ToString::to_string)
+        )
     )
 }
 
+/// The message a call addressed at a lifecycle hook this service holds none of is
+/// refused with: the hook is a named child of a group, so the sentence names BOTH
+/// identifiers the request addressed it by, and it is the same whether the group holds
+/// no hook of that name or no group answers to the name at all — either way there is no
+/// such hook.
+///
+/// Two variable parts, both quoted and both taken from the request: the hook's name and
+/// the group's. The rest, punctuation included, is fixed text.
+pub fn absent_lifecycle_hook_message(hook_name: &str, group_name: &str) -> String {
+    format!("No Lifecycle Hook found with name '{hook_name}' for group '{group_name}'")
+}
+
 /// The message a request whose `HeartbeatTimeout` is outside the documented range is
-/// refused with: the standard sentence this service states for a member value outside
-/// its bounds, naming the member as the wire names it and the bound the value missed.
-pub fn heartbeat_timeout_violation_message(timeout: i32) -> String {
-    let constraint = if timeout < MIN_HEARTBEAT_TIMEOUT {
-        format!("Member must have value greater than or equal to {MIN_HEARTBEAT_TIMEOUT}")
-    } else {
-        format!("Member must have value less than or equal to {MAX_HEARTBEAT_TIMEOUT}")
-    };
-    super::constraint_violation_message(timeout, "heartbeatTimeout", &constraint)
+/// refused with: the member as the model names it and the range it has to be inside,
+/// both bounds from the model's own documentation ("The range is from 30 to 7200
+/// seconds"). Fixed text — the sentence states what the member admits, so no part of the
+/// request appears in it.
+pub fn heartbeat_timeout_violation_message() -> String {
+    format!(
+        "HeartbeatTimeout must be between {MIN_HEARTBEAT_TIMEOUT} and {MAX_HEARTBEAT_TIMEOUT} \
+         seconds"
+    )
 }
 
 /// The message a request that would create a hook past

@@ -517,14 +517,14 @@ const REFUSALS: &[Refusal] = &[
     Refusal {
         case: "a NextToken this service never issued",
         params: &[("NextToken", "not-a-token")],
-        code: "InvalidNextToken",
-        contains: "not-a-token",
+        code: "ValidationError",
+        contains: "NextToken: not-a-token",
     },
     Refusal {
         case: "a NextToken that points past the end of the selection",
         params: &[("NextToken", "next-99")],
-        code: "InvalidNextToken",
-        contains: "next-99",
+        code: "ValidationError",
+        contains: "NextToken: next-99",
     },
 ];
 

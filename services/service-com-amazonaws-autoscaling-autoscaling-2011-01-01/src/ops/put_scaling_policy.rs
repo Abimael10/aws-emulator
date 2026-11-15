@@ -263,7 +263,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "refused: no such group",
             );
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                crate::state::absent_group_message_as_group_not_found(
+                    &key.auto_scaling_group_name,
+                ),
             ));
         };
         let region = group.region.clone();

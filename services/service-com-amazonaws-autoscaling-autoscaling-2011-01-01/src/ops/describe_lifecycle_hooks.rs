@@ -7,6 +7,10 @@
 //! (`PutLifecycleHook`, a group created with lifecycle hook specifications) stored is
 //! what this reads back, and a hook `DeleteLifecycleHook` removed is gone.
 //!
+//! The answer is the hooks REGISTERED for the name the request carries, so a name no
+//! group answers to reports an empty `LifecycleHooks` list: the operation models no
+//! client error, so this read refuses nothing a caller can ask it.
+//!
 //! Reporting only: it takes the store lock to project the group's collection and
 //! materialises only what the clock already made due, like every other read here.
 //!
@@ -162,17 +166,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
 
-        // A group-scoped READ of this service names the group it could not find, which
-        // is what tells a caller the hooks are missing because the group is.
-        let Some(group) = state.groups.get(&group_name) else {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_group_message(&group_name),
-            ));
-        };
-
-        let lifecycle_hooks = group
-            .lifecycle_hooks
-            .iter()
+        // The read reports the hooks REGISTERED for the name it was given, and a name no
+        // group answers to has none registered: the operation models no client error at
+        // all (`smithy_query(query="operation",operation="DescribeLifecycleHooks")` lists
+        // only the server-side `ResourceContentionFault`), so an unknown group selects
+        // nothing rather than refusing the read.
+        let lifecycle_hooks = state
+            .groups
+            .get(&group_name)
+            .into_iter()
+            .flat_map(|group| group.lifecycle_hooks.iter())
             .filter(|(name, _)| wanted.is_empty() || wanted.contains(name))
             .map(|(name, stored)| hook_view(&group_name, name, stored))
             .collect();

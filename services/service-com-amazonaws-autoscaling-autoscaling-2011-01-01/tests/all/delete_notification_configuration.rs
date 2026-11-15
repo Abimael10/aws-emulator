@@ -35,14 +35,14 @@ use crate::support::{borrowed, new_engine, p, query, router_with, tag_value, tag
 /// catalog `DescribeAutoScalingNotificationTypes` publishes, documented on
 /// `NotificationConfiguration$NotificationType`
 /// (`smithy_query(query="doc", shape="NotificationConfiguration", member="NotificationType")`).
-const TEST_NOTIFICATION: &str = "autoscaling:TEST_NOTIFICATION";
+pub(crate) const TEST_NOTIFICATION: &str = "autoscaling:TEST_NOTIFICATION";
 const INSTANCE_LAUNCH: &str = "autoscaling:EC2_INSTANCE_LAUNCH";
 const INSTANCE_TERMINATE: &str = "autoscaling:EC2_INSTANCE_TERMINATE";
 const INSTANCE_LAUNCH_ERROR: &str = "autoscaling:EC2_INSTANCE_LAUNCH_ERROR";
 
 /// An Amazon SNS topic ARN of the Region these tests sign for, as a `TopicARN` member
 /// carries one.
-fn topic_arn(name: &str) -> String {
+pub(crate) fn topic_arn(name: &str) -> String {
     format!(
         "arn:aws:sns:{}:{}:{name}",
         crate::support::REGION,
@@ -52,7 +52,7 @@ fn topic_arn(name: &str) -> String {
 
 /// Configure `group` to notify `topic_arn` about `events`, and assert the write was
 /// served.
-async fn put_configuration(
+pub(crate) async fn put_configuration(
     router: &MultiServiceRouter,
     case: &str,
     group: &str,
@@ -81,7 +81,7 @@ async fn put_configuration(
 
 /// Post one `DeleteNotificationConfiguration` and answer its status, wire error code and
 /// message.
-async fn delete_configuration(
+pub(crate) async fn delete_configuration(
     router: &MultiServiceRouter,
     group: &str,
     topic_arn: &str,
@@ -101,7 +101,7 @@ async fn delete_configuration(
 
 /// Every `(topic, event type)` pair `group` is configured with right now, as
 /// `DescribeNotificationConfigurations` reports them.
-async fn configured(
+pub(crate) async fn configured(
     router: &MultiServiceRouter,
     case: &str,
     group: &str,

@@ -1034,7 +1034,10 @@ async fn a_put_naming_no_stored_group_is_refused() {
     let router = router();
     create_group(&router, "asg-present").await;
 
-    const ABSENT_GROUP_MESSAGE: &str = "AutoScalingGroup name not found - null";
+    // This operation's own absent-group sentence: one statement about the group, naming
+    // the one the request asked for. Spelled out here so the assertion does not take the
+    // handler's own word for it.
+    let absent_group_message = |name: &str| format!("Group {name} not found");
 
     // The names differ in length, case, character set and spelling, and the member sets
     // include ones that would themselves be refused if the group existed: the group is
@@ -1056,9 +1059,10 @@ async fn a_put_naming_no_stored_group_is_refused() {
                 code, "ValidationError",
                 "case {case}: expected the ValidationError code, got {code:?}"
             );
+            let expected = absent_group_message(name);
             assert_eq!(
-                message, ABSENT_GROUP_MESSAGE,
-                "case {case}: expected the message {ABSENT_GROUP_MESSAGE:?}, got {message:?}"
+                message, expected,
+                "case {case}: expected the message {expected:?}, got {message:?}"
             );
         }
     }

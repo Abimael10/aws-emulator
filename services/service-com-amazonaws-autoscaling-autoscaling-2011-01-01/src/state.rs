@@ -104,11 +104,12 @@ pub mod lifecycle_events;
 pub mod lifecycle_hooks;
 
 pub use lifecycle_hooks::{
-    heartbeat_timeout_violation_message, put_lifecycle_hook, too_many_hooks_message,
-    transition_missing_message, unknown_result_message, unknown_transition_message,
-    LifecycleHookPut, LifecycleHookRefusal, LifecycleHooks, StoredLifecycleHook,
-    DEFAULT_HEARTBEAT_TIMEOUT, DEFAULT_LIFECYCLE_ACTION_RESULT, LIFECYCLE_ACTION_RESULTS,
-    MAX_LIFECYCLE_HOOKS_PER_GROUP,
+    absent_lifecycle_hook_message, heartbeat_timeout_violation_message, put_lifecycle_hook,
+    too_many_hooks_message, transition_missing_message, unknown_result_message,
+    unknown_transition_message, unsupported_notification_target_message,
+    validate_lifecycle_hook_members, LifecycleHookPut, LifecycleHookRefusal, LifecycleHooks,
+    StoredLifecycleHook, DEFAULT_HEARTBEAT_TIMEOUT, DEFAULT_LIFECYCLE_ACTION_RESULT,
+    LIFECYCLE_ACTION_RESULTS, MAX_LIFECYCLE_HOOKS_PER_GROUP, NOTIFICATION_TARGET_VENDORS,
 };
 
 /// The warm pool of a group: the pre-initialized instances `PutWarmPool` has the group
@@ -2894,6 +2895,35 @@ pub fn absent_group_message_as_no_such_group(name: &str) -> String {
     format!("{ABSENT_GROUP_PREFIX}No such Auto Scaling group: {name}")
 }
 
+/// The absent-group refusal whose detail field is the asked-for name ALONE, the detail
+/// form `PutNotificationConfiguration` serves.
+///
+/// The name is the only part taken from the request; the prefix is the fixed text every
+/// absent-group refusal of this service opens with.
+pub fn absent_group_message_as_name(name: &str) -> String {
+    format!("{ABSENT_GROUP_PREFIX}{name}")
+}
+
+/// The absent-group refusal whose detail states that the group could not be FOUND under
+/// the name asked for, quoted — the detail form `DescribeLoadBalancerTargetGroups`
+/// serves.
+///
+/// The name is the only part taken from the request; the rest, punctuation included, is
+/// fixed text.
+pub fn absent_group_message_as_not_findable(name: &str) -> String {
+    format!("{ABSENT_GROUP_PREFIX}Could not find Auto Scaling group named '{name}'")
+}
+
+/// The refusal `PutScalingPolicy` answers a group the account does not hold with: ONE
+/// sentence about the group, naming it, and NOT built on [`ABSENT_GROUP_PREFIX`] at all.
+///
+/// Separate from the forms above because this refusal is the whole message rather than a
+/// detail behind that prefix: the name is its only variable part, and the rest,
+/// punctuation included, is fixed text.
+pub fn absent_group_message_as_group_not_found(name: &str) -> String {
+    format!("Group {name} not found")
+}
+
 /// The absent-group refusal whose detail field the operation leaves unfilled, so it
 /// travels as the literal token `null`: the whole message is fixed text and no part of
 /// the request appears in it.
@@ -3004,12 +3034,33 @@ pub fn decode_next_token(token: &str) -> Option<usize> {
 
 /// The message a paginated read refuses an unusable `NextToken` with.
 ///
-/// The REQUIREMENT here is that the refusal quotes the token the caller sent —
-/// that is the only thing the caller can act on, since the token it is holding is
-/// not one this service will resume from. The surrounding wording is an example,
-/// not something the model or a recording pins down.
+/// The refusal quotes the token the caller sent — that is the only thing the caller can
+/// act on, since the token it is holding is not one this service will resume from. The
+/// quoted token is the only variable part; the rest is fixed text, as the recorded
+/// refusals of the reads that serve this sentence state it.
 pub fn invalid_next_token_message(token: &str) -> String {
     format!("The token '{token}' was invalid")
+}
+
+/// The same sentence in the PRESENT tense, the form `DescribeNotificationConfigurations`
+/// serves: the sentence is about the token the caller is holding now.
+///
+/// Separate from [`invalid_next_token_message`] because the sentence is each read's own —
+/// the reads above answer the past-tense form and `DescribePolicies` names the member by
+/// its role ([`invalid_pagination_token_message`]) — so one read's wording is not the
+/// others' to change.
+pub fn invalid_next_token_message_in_present_tense(token: &str) -> String {
+    format!("The token '{token}' is invalid")
+}
+
+/// The refusal the reads that treat an unusable `NextToken` as a bad member VALUE answer:
+/// the member as the model names it, and the value the request submitted for it.
+///
+/// Those reads answer the service-common `ValidationError` rather than the modelled
+/// `InvalidNextToken`, so this is the whole message and the token is its only variable
+/// part.
+pub fn next_token_value_violation_message(token: &str) -> String {
+    format!("NextToken: {token}")
 }
 
 /// The message `DescribePolicies` refuses an unusable `NextToken` with: the sentence that

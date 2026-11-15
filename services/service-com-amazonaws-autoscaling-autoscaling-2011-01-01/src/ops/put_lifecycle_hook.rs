@@ -15,7 +15,11 @@
 //! `LifecycleTransition` is required only then.
 //!
 //! Every rule is checked before the first member is written, so a refused request
-//! leaves the group's hooks exactly as they were.
+//! leaves the group's hooks exactly as they were, and the rules about the values the
+//! REQUEST carries — the transition and default result against their documented value
+//! sets, the `NotificationTargetARN` against the vendors this service can notify, the
+//! heartbeat timeout against its documented range — are checked before the group the
+//! request names is resolved.
 //!
 //! ## Shape of an operation
 //!
@@ -217,16 +221,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             default_result: input.default_result,
         };
 
+        // The values the REQUEST carries are checked before the group it names is
+        // resolved, so a member the service cannot accept is refused with that member's
+        // own sentence whether or not a group answers to the name.
+        crate::state::validate_lifecycle_hook_members(&put).map_err(|refusal| {
+            crate::scaffolded::Scaffolded::validation_error(refusal.message(&hook_name))
+        })?;
+
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
 
-        // A hook belongs to a group, so a name no group answers to is refused with the
-        // wording this service's group-scoped WRITE paths answer with: the detail field
-        // after the dash is left unfilled, so no part of the request appears in it.
+        // A hook belongs to a group, so a name no group answers to is refused in the
+        // detail form this operation serves: the detail states that no such group
+        // exists, naming the one the request asked for.
         let Some(group) = state.groups.get_mut(&group_name) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                crate::state::absent_group_message_as_no_such_group(&group_name),
             ));
         };
 

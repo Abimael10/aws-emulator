@@ -164,16 +164,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The requested cursor: the offset it decodes to, and the token itself, kept so a
-        // later refusal can name the token the caller actually submitted.
+        // later refusal can name the token the caller actually submitted. A token this
+        // read did not issue is a bad VALUE for the member that carried it, which this
+        // read answers the service-common `ValidationError` for, naming the member and
+        // the value submitted for it.
         let (offset, token) = match input.next_token.clone() {
             None => (0, String::new()),
             Some(token) => match crate::state::decode_next_token(&token) {
                 Some(offset) => (offset, token),
                 None => {
-                    return Err(DescribeTagsErrorModeled::InvalidNextToken(InvalidNextToken {
-                        message: Some(crate::state::invalid_next_token_message(&token)),
-                    })
-                    .into())
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::next_token_value_violation_message(&token),
+                    ))
                 }
             },
         };
@@ -238,10 +240,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that points past the end was not issued for this list. Only a decoded token
         // reaches a non-zero offset, so `token` is the one submitted.
         if offset > 0 && offset >= matching.len() {
-            return Err(DescribeTagsErrorModeled::InvalidNextToken(InvalidNextToken {
-                message: Some(crate::state::invalid_next_token_message(&token)),
-            })
-            .into());
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::next_token_value_violation_message(&token),
+            ));
         }
         let (tags, next_token) = crate::state::page(&matching, offset, input.max_records);
 
