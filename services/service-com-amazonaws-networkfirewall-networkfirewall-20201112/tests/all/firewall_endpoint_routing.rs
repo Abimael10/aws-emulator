@@ -19,7 +19,7 @@
 //! The tests are tables: each row is one input in the class the rule covers, and every
 //! assertion names its row and the actual value.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -30,6 +30,24 @@ use crate::harness::{string_at, Harness};
 /// (`smithy_query(query="shape",shape="VpcEndpointType")` on the EC2 model: one of `Gateway`,
 /// `GatewayLoadBalancer`, `Interface`, `Resource`, `ServiceNetwork`, `Tunnel`).
 const GATEWAY_LOAD_BALANCER: &str = "GatewayLoadBalancer";
+
+/// The `State` an endpoint that is in service is REPORTED in: "`vpc-endpoint-state` - The
+/// state of the endpoint (`pendingAcceptance` | `pending` | `available` | `deleting` |
+/// `deleted` | `rejected` | `failed`)" (`DescribeVpcEndpointsRequest$Filters` of the EC2
+/// model), the filter whose values are the values `VpcEndpoint$State` carries.
+const ENDPOINT_STATE_AVAILABLE: &str = "available";
+
+/// EC2's own answer for a VPC endpoint id it holds no endpoint for, which is what a describe
+/// naming one is REFUSED with rather than given an absent row.
+const ENDPOINT_NOT_FOUND: &str = "InvalidVpcEndpointId.NotFound";
+
+/// A VPC endpoint id of the form EC2 mints (`vpce-` and 17 hexadecimal digits) that nothing
+/// in this emulator ever minted.
+const NEVER_MINTED: &str = "vpce-00000000000000000";
+
+/// The destination of a route that steers every address through a firewall endpoint, which is
+/// what naming the endpoint in a route table is for.
+const EVERY_DESTINATION: &str = "0.0.0.0/0";
 
 /// How long a test waits for a CONDITION the clock owes before giving up. Far above the
 /// firewall's own provisioning span, because what each wait below loops on is the state the
@@ -641,4 +659,416 @@ async fn a_firewall_endpoint_lives_as_long_as_its_attachment() {
         "case {case:?}: expected the deleted firewall's endpoints to be gone, EC2 holds \
          {held:?}"
     );
+}
+
+/// What Amazon EC2 reports for the endpoints `endpoint_ids` NAMES, as
+/// `(type, vpc id, state, subnet ids)` keyed by endpoint id.
+///
+/// The endpoints are NAMED rather than selected with a filter, because that is the
+/// cross-service read a client does with the ids it took off `SyncStates`: an id EC2 holds no
+/// endpoint for is a refusal of the whole call and not an absent row, so this read is what
+/// proves every published id resolves.
+async fn endpoints_by_id(
+    ec2: &::aws_sdk_ec2::Client,
+    case: &str,
+    endpoint_ids: &[String],
+) -> BTreeMap<String, (String, String, String, Vec<String>)> {
+    let described = ec2
+        .describe_vpc_endpoints()
+        .set_vpc_endpoint_ids(Some(endpoint_ids.to_vec()))
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: EC2 must report the endpoints {endpoint_ids:?}: {error:?}")
+        });
+    described
+        .vpc_endpoints()
+        .iter()
+        .map(|endpoint| {
+            (
+                endpoint.vpc_endpoint_id().unwrap_or_default().to_string(),
+                (
+                    endpoint.vpc_endpoint_type().map_or_else(
+                        || "<no type>".to_string(),
+                        |endpoint_type| endpoint_type.as_str().to_string(),
+                    ),
+                    endpoint.vpc_id().unwrap_or_default().to_string(),
+                    endpoint.state().map_or_else(
+                        || "<no state>".to_string(),
+                        |state| state.as_str().to_string(),
+                    ),
+                    endpoint.subnet_ids().to_vec(),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// The error code EC2 answers a describe NAMING `endpoint_id` with, or `None` when it reported
+/// the endpoint instead.
+async fn refusal_naming(
+    ec2: &::aws_sdk_ec2::Client,
+    case: &str,
+    endpoint_id: &str,
+) -> Option<String> {
+    let answer = ec2
+        .describe_vpc_endpoints()
+        .vpc_endpoint_ids(endpoint_id.to_string())
+        .send()
+        .await;
+    match answer {
+        Ok(reported) => {
+            assert!(
+                !reported.vpc_endpoints().is_empty(),
+                "case {case:?}: a describe naming {endpoint_id} answered no endpoint and no \
+                 refusal: {reported:?}"
+            );
+            None
+        }
+        Err(error) => Some(
+            ::aws_sdk_ec2::error::ProvideErrorMetadata::code(&error)
+                .unwrap_or("<no code>")
+                .to_string(),
+        ),
+    }
+}
+
+/// The route tables whose routes target `endpoint_id`, as the `route.gateway-id` filter selects
+/// them ("`route.gateway-id` - The ID of a gateway specified in a route in the table",
+/// `DescribeRouteTablesRequest$Filters`) — the read that finds what routes through a firewall
+/// endpoint.
+async fn tables_routing_to(
+    ec2: &::aws_sdk_ec2::Client,
+    case: &str,
+    endpoint_id: &str,
+) -> Vec<String> {
+    let by_target = ::aws_sdk_ec2::types::Filter::builder()
+        .name("route.gateway-id")
+        .values(endpoint_id.to_string())
+        .build();
+    let described = ec2
+        .describe_route_tables()
+        .filters(by_target)
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "case {case:?}: EC2 must report the tables routing to {endpoint_id}: {error:?}"
+            )
+        });
+    described
+        .route_tables()
+        .iter()
+        .filter_map(::aws_sdk_ec2::types::RouteTable::route_table_id)
+        .map(str::to_string)
+        .collect()
+}
+
+/// RULE: every endpoint id a READY firewall publishes in
+/// `FirewallStatus.SyncStates[*].Attachment.EndpointId` resolves in Amazon EC2 when NAMED —
+/// `DescribeVpcEndpoints(VpcEndpointIds=…)` answers one `GatewayLoadBalancer` endpoint per id,
+/// in the firewall's own VPC and `available` — and that id is the handle the VPC's route tables
+/// name the endpoint by, so `route.gateway-id` selects no table before a route names it and
+/// exactly the table that does afterwards.
+///
+/// The table spans the number of subnets a firewall is placed in, which is what the endpoint
+/// count generalises over ("Network Firewall creates a firewall endpoint in each subnet",
+/// `CreateFirewallRequest$SubnetMappings`), each row in its own VPC with its own ranges. This
+/// is the read the cross-service client does, which the suite above makes with a `vpc-id`
+/// FILTER instead: a filter answers an absent row for an id nothing holds, naming the id
+/// refuses the call.
+#[tokio::test]
+async fn a_ready_firewalls_published_endpoint_ids_resolve_in_ec2_when_named() {
+    struct Case {
+        name: &'static str,
+        vpc_cidr: &'static str,
+        subnet_cidrs: &'static [&'static str],
+    }
+    let cases = [
+        Case {
+            name: "one-zone",
+            vpc_cidr: "10.51.0.0/16",
+            subnet_cidrs: &["10.51.1.0/24"],
+        },
+        Case {
+            name: "two-zones",
+            vpc_cidr: "10.52.0.0/16",
+            subnet_cidrs: &["10.52.1.0/24", "10.52.2.0/24"],
+        },
+        Case {
+            name: "three-zones",
+            vpc_cidr: "10.53.0.0/16",
+            subnet_cidrs: &["10.53.1.0/24", "10.53.2.0/24", "10.53.3.0/24"],
+        },
+    ];
+
+    for case in cases {
+        let harness = Harness::with_ec2();
+        let ec2 = harness.ec2();
+        let network = create_network(&ec2, case.name, case.vpc_cidr, case.subnet_cidrs).await;
+
+        let (status, created) =
+            create_firewall(&harness, case.name, &network.vpc_id, &network.subnet_ids).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected the firewall to be created, got HTTP {status} with \
+             {created:?}",
+            name = case.name
+        );
+        let described = ready_firewall(&harness, case.name, case.name).await;
+        let reported = attachments(&described);
+        assert_eq!(
+            reported.len(),
+            case.subnet_cidrs.len(),
+            "case {name:?}: expected one attachment per subnet, got {reported:?}",
+            name = case.name
+        );
+        let endpoint_ids: Vec<String> = reported
+            .iter()
+            .map(|(_, endpoint_id)| endpoint_id.clone())
+            .collect();
+        let distinct: BTreeSet<&String> = endpoint_ids.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            endpoint_ids.len(),
+            "case {name:?}: expected one distinct endpoint per subnet, got {endpoint_ids:?}",
+            name = case.name
+        );
+
+        // Naming every published id answers one endpoint per id, each of the routable type, in
+        // the firewall's VPC, in service, and in its own attachment's subnet.
+        let resolved = endpoints_by_id(&ec2, case.name, &endpoint_ids).await;
+        assert_eq!(
+            resolved.len(),
+            endpoint_ids.len(),
+            "case {name:?}: expected EC2 to report every one of {endpoint_ids:?}, got \
+             {resolved:?}",
+            name = case.name
+        );
+        for (subnet_id, endpoint_id) in &reported {
+            let found = resolved.get(endpoint_id).unwrap_or_else(|| {
+                panic!(
+                    "case {name:?}: expected EC2 to report {endpoint_id}, it reported \
+                     {resolved:?}",
+                    name = case.name
+                )
+            });
+            assert_eq!(
+                (found.0.as_str(), found.1.as_str(), found.2.as_str()),
+                (
+                    GATEWAY_LOAD_BALANCER,
+                    network.vpc_id.as_str(),
+                    ENDPOINT_STATE_AVAILABLE
+                ),
+                "case {name:?}: expected {endpoint_id} to be a {GATEWAY_LOAD_BALANCER} \
+                 endpoint in {vpc} and {ENDPOINT_STATE_AVAILABLE}, got {found:?}",
+                name = case.name,
+                vpc = network.vpc_id
+            );
+            assert_eq!(
+                found.3,
+                vec![subnet_id.clone()],
+                "case {name:?}: expected {endpoint_id} to be in {subnet_id}, got {found:?}",
+                name = case.name
+            );
+        }
+
+        // Nothing routes to any of them yet, which is what makes the filter's answer below
+        // evidence of the route and not of the endpoint merely existing.
+        for endpoint_id in &endpoint_ids {
+            let tables = tables_routing_to(&ec2, case.name, endpoint_id).await;
+            assert!(
+                tables.is_empty(),
+                "case {name:?}: expected no table to route to {endpoint_id} before any route \
+                 names it, got {tables:?}",
+                name = case.name
+            );
+        }
+
+        // One route names the FIRST endpoint, and the filter then selects exactly the table
+        // that names it — and still nothing for the firewall's other endpoints.
+        let named = &endpoint_ids[0];
+        let routed = ec2
+            .create_route()
+            .route_table_id(&network.route_table_id)
+            .destination_cidr_block(EVERY_DESTINATION)
+            .vpc_endpoint_id(named)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case {name:?}: EC2 must route {EVERY_DESTINATION} through {named}: \
+                     {error:?}",
+                    name = case.name
+                )
+            });
+        assert_eq!(
+            routed.r#return(),
+            Some(true),
+            "case {name:?}: expected CreateRoute to answer return=true for {named}, got \
+             {routed:?}",
+            name = case.name
+        );
+        let target = route_target(&ec2, case.name, &network.route_table_id, EVERY_DESTINATION).await;
+        assert_eq!(
+            target.as_deref(),
+            Some(named.as_str()),
+            "case {name:?}: expected the route to {EVERY_DESTINATION} to target {named}, got \
+             {target:?}",
+            name = case.name
+        );
+        let routing = tables_routing_to(&ec2, case.name, named).await;
+        assert_eq!(
+            routing,
+            vec![network.route_table_id.clone()],
+            "case {name:?}: expected the route.gateway-id filter to select exactly the table \
+             that names {named}, got {routing:?}",
+            name = case.name
+        );
+        for endpoint_id in &endpoint_ids[1..] {
+            let tables = tables_routing_to(&ec2, case.name, endpoint_id).await;
+            assert!(
+                tables.is_empty(),
+                "case {name:?}: expected no table to route to {endpoint_id}, which no route \
+                 names, got {tables:?}",
+                name = case.name
+            );
+        }
+    }
+}
+
+/// RULE (the other side of the one above): a published id resolves because EC2 HOLDS that
+/// endpoint, so an id EC2 holds none for is refused by the same named read — a firewall
+/// publishing an id is not what makes a describe answer.
+///
+/// The table spans the ways EC2 comes to hold no endpoint for a `vpce-` id: one nothing ever
+/// minted, one whose subnet was disassociated, and one whose firewall was deleted. Each row
+/// also names an id that must STILL resolve wherever the firewall still carries that
+/// attachment, so a row cannot pass by EC2 having forgotten everything.
+#[tokio::test]
+async fn an_endpoint_id_ec2_holds_no_endpoint_for_is_refused_by_the_same_read() {
+    /// Why EC2 holds no endpoint for the id the row probes.
+    enum Unheld {
+        /// A form-valid id nothing in this emulator minted.
+        NeverMinted,
+        /// The endpoint of a subnet the firewall was disassociated from.
+        Disassociated,
+        /// The endpoints of a firewall that was deleted.
+        FirewallDeleted,
+    }
+    struct Case {
+        name: &'static str,
+        vpc_cidr: &'static str,
+        subnet_cidrs: &'static [&'static str],
+        unheld: Unheld,
+    }
+    let cases = [
+        Case {
+            name: "never-minted",
+            vpc_cidr: "10.61.0.0/16",
+            subnet_cidrs: &["10.61.1.0/24", "10.61.2.0/24"],
+            unheld: Unheld::NeverMinted,
+        },
+        Case {
+            name: "disassociated",
+            vpc_cidr: "10.62.0.0/16",
+            subnet_cidrs: &["10.62.1.0/24", "10.62.2.0/24"],
+            unheld: Unheld::Disassociated,
+        },
+        Case {
+            name: "firewall-deleted",
+            vpc_cidr: "10.63.0.0/16",
+            subnet_cidrs: &["10.63.1.0/24", "10.63.2.0/24"],
+            unheld: Unheld::FirewallDeleted,
+        },
+    ];
+
+    for case in cases {
+        let harness = Harness::with_ec2();
+        let ec2 = harness.ec2();
+        let network = create_network(&ec2, case.name, case.vpc_cidr, case.subnet_cidrs).await;
+        let firewall = format!("{}-fw", case.name);
+
+        let (status, created) =
+            create_firewall(&harness, &firewall, &network.vpc_id, &network.subnet_ids).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected the firewall to be created, got HTTP {status} with \
+             {created:?}",
+            name = case.name
+        );
+        let described = ready_firewall(&harness, case.name, &firewall).await;
+        let published = attachments(&described);
+        let endpoint_of = |subnet_id: &str| -> String {
+            published
+                .iter()
+                .find(|(subnet, _)| subnet == subnet_id)
+                .map(|(_, endpoint_id)| endpoint_id.clone())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {name:?}: expected an attachment in {subnet_id}, got {published:?}",
+                        name = case.name
+                    )
+                })
+        };
+
+        // The id this row probes, and the one that must still resolve beside it.
+        let (probed, still_held): (String, Option<String>) = match case.unheld {
+            Unheld::NeverMinted => (
+                NEVER_MINTED.to_string(),
+                Some(endpoint_of(&network.subnet_ids[0])),
+            ),
+            Unheld::Disassociated => {
+                let going = endpoint_of(&network.subnet_ids[1]);
+                harness
+                    .ok(
+                        "DisassociateSubnets",
+                        &json!({
+                            "FirewallName": firewall,
+                            "SubnetIds": [network.subnet_ids[1]],
+                        }),
+                    )
+                    .await;
+                (going, Some(endpoint_of(&network.subnet_ids[0])))
+            }
+            Unheld::FirewallDeleted => {
+                let going = endpoint_of(&network.subnet_ids[0]);
+                harness
+                    .ok("DeleteFirewall", &json!({ "FirewallName": firewall }))
+                    .await;
+                (going, None)
+            }
+        };
+
+        let refused = refusal_naming(&ec2, case.name, &probed).await;
+        assert_eq!(
+            refused.as_deref(),
+            Some(ENDPOINT_NOT_FOUND),
+            "case {name:?}: expected EC2 to refuse a describe naming {probed} with \
+             {ENDPOINT_NOT_FOUND}, got {refused:?}",
+            name = case.name
+        );
+        if let Some(held) = still_held {
+            let resolved = endpoints_by_id(&ec2, case.name, std::slice::from_ref(&held)).await;
+            let found = resolved.get(&held).unwrap_or_else(|| {
+                panic!(
+                    "case {name:?}: expected EC2 to still report {held}, it reported \
+                     {resolved:?}",
+                    name = case.name
+                )
+            });
+            assert_eq!(
+                (found.0.as_str(), found.1.as_str(), found.2.as_str()),
+                (
+                    GATEWAY_LOAD_BALANCER,
+                    network.vpc_id.as_str(),
+                    ENDPOINT_STATE_AVAILABLE
+                ),
+                "case {name:?}: expected {held} to still be a {GATEWAY_LOAD_BALANCER} endpoint \
+                 in {vpc} and {ENDPOINT_STATE_AVAILABLE}, got {found:?}",
+                name = case.name,
+                vpc = network.vpc_id
+            );
+        }
+    }
 }
