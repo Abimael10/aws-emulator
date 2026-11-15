@@ -435,6 +435,17 @@ impl DbClusterRecord {
         }
     }
 
+    /// Whether this cluster is in a state a new Aurora Limitless Database DB shard group
+    /// can be provisioned on: its status is one of
+    /// [`SHARD_GROUP_CLUSTER_STATUSES`] — the shard group goes into the cluster, so the
+    /// cluster has to be up or coming up — and every other status refuses the create
+    /// ([`shard_group_cluster_state_message`]). A cluster whose delete has been accepted is
+    /// in none of them, whichever status the delete left it reporting
+    /// ([`Self::is_deleting`]).
+    pub fn can_take_a_shard_group(&self) -> bool {
+        SHARD_GROUP_CLUSTER_STATUSES.contains(&self.status.as_str()) && !self.is_deleting()
+    }
+
     /// Accept a delete: the cluster reports `deleting` from now on, and the clock owes
     /// its removal from the store [`STATUS_TRANSITION_DELAY`] from now, after which every
     /// read of the identifier is a `DBClusterNotFoundFault`. Nothing sleeps: the due

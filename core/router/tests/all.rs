@@ -1921,7 +1921,6 @@ mod cloudformation_cloudfront_published_edge_address;
 // `all/every_suite_file_is_declared.rs` rather than restated here.
 // Single integration-test target for the router: the CANONICAL DECLARATION LIST of its
 // cross-service suites, and nothing else.
-//
 // `tests/all/<name>.rs` and insert its pair into the sorted list — nothing beside it, so two
 // branches landing at once insert two lines in two places and have no prose to duplicate,
 // re-word or mistype.
@@ -1935,7 +1934,6 @@ mod cloudformation_cloudfront_published_edge_address;
 // compiles nowhere and its tests never run, and a suite declared twice is `E0428` — each
 // fails every suite in this target, which is why five suites pin the shape above rather than
 // restating it here: `all/all_rs_carries_no_inner_doc_comment.rs`,
-// `all/all_rs_declares_each_suite_once.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`.
 // WHAT a suite covers, and WHY it belongs to this cross-service target rather than to one
 // service crate's own, is stated in that suite's own module doc, where it is read beside the
@@ -2002,7 +2000,6 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // Put a new suite at `tests/all/<name>.rs` and insert its pair into the sorted list; what it
 // covers, and why it drives the assembled router rather than one service crate, belongs in
 // that suite's own module header, and a note about THIS file belongs in
-// `all/appended_notes.rs`.
 // deliberate: an inner doc comment (`//` followed by `!`) and an inner attribute are legal
 // only BEFORE the first item, so one that lands past the declarations is `E0753` and compiles
 // no suite of this target — which is what repeated landings appending re-typed copies of this
@@ -2113,7 +2110,6 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // anywhere in the file, no merge of two landings can put one past the first item.
 // `all/appended_notes.rs`, and three suites check the rules above rather than restating
 // them: `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 // `all/all_rs_is_a_canonical_declaration_list.rs`.
 // Single integration-test target for the router: the canonical declaration list.
 // This file is the license line, this header, and then one
@@ -2130,11 +2126,6 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // `all/every_suite_file_is_declared.rs` pin the shape above. Every comment here is an
 // ordinary `//` one, this header included, so no merge of two landings can leave a doc
 // comment past the first item.
-// Single integration-test target for the router.
-// This file is a CANONICAL DECLARATION LIST: this header, then one
-// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
-// line. Two branches landing at once then insert two lines in two places and have no prose
-// to duplicate, re-word or mistype — which is what had happened here: the tail of this file
 // had grown thousands of re-typed copies of its header, hundreds of them written as inner
 // doc comments past the first item (`E0753`), so no suite of this target compiled at all.
 // EVERY comment in this file is an ORDINARY one, this block included, and that is
@@ -2288,11 +2279,9 @@ mod cloudformation_provisions_glue_table_optimizers;
 // comment in this file is an ordinary `//` one, this header included: with no `//` anywhere,
 // This file is a CANONICAL DECLARATION LIST: its module doc, then one
 // had grown thousands of re-typed copies of this header, hundreds of them written as inner
-// `all/all_rs_is_a_canonical_declaration_list.rs` pins the shape, and
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` pin the two rules a landing
 // breaks: a module declared twice is `E0428`, and an inner doc comment past the first item
 // is `E0753`. Both fail every suite in this target, so put a new suite at
-// `tests/all/<name>.rs`, insert its pair into the sorted list below, and leave what it
 // covers to that suite's own module doc.
 // `//` in the file at all, no merge of two landings can leave one past the first item.
 // deliberate: an inner doc comment (`//`) is legal only before the first item, so one that
@@ -2305,8 +2294,6 @@ mod cloudformation_provisions_glue_table_optimizers;
 // doc comment past the first item is `E0753`. Each of those fails every suite in this
 // target, so THIS HEADER IS THE ONLY PLACE A `//` LINE MAY STAND IN THIS FILE, and what
 // goes below it is a declaration — never a note about one, and never a copy of this header.
-// The `#[path]` attribute is what points each declaration into `tests/all/`: this file is a
-// test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of it, which the
 // layout check refuses.
 // service crate's own, is stated in that suite's OWN module doc, where it is read beside the
 // test it explains and stays correct when the test changes.
@@ -2441,3 +2428,18 @@ mod cloudformation_provisions_glue_table_optimizers;
 // any other suite. `all/all_rs_is_a_canonical_declaration_list.rs`,
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of it, for this file and
 // for every service crate's `tests/all.rs`, so check there rather than leaving a note here.
+// suite under `tests/all/`, sorted by name, and no other line. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair into the sorted list; what that suite covers, and
+// why it drives the assembled router rather than one service crate, belongs in the suite's own
+// the declarations compiles no suite of this target at all. With none in the file, a landing
+// that appends to the end cannot leave one past the first item.
+// A suite no `mod` here names is compiled nowhere and its tests never run; a suite left at the
+// top level of `tests/` fails the build; and a second `mod` for one name is `E0428`, which
+// `mod` would resolve to a sibling of this file, which the layout check refuses: the `#[path]`
+// is what points each declaration into `tests/all/`.
+// `all/every_suite_file_is_declared.rs` check those rules, for this root and for every service
+// crate's own, so a note about any of them belongs there rather than here.
+#[path = "all/appended_header_notes.rs"]
+mod appended_header_notes;
+#[path = "all/appended_prose.rs"]
+mod appended_prose;

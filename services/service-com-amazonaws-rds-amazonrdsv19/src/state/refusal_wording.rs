@@ -223,6 +223,33 @@ pub fn check_backup_retention_period(
     ))
 }
 
+/// The DB cluster statuses a new Aurora Limitless Database DB shard group can be
+/// provisioned on: the cluster is up, or it is still being provisioned and the shard group
+/// comes up with it.
+///
+/// Aurora puts the shards of a Limitless Database cluster INTO that cluster, so there has
+/// to be a cluster to put them in: a cluster that is stopping, stopped, rebooting, failing
+/// over, taking a modification or on its way out is not one a shard group can be added to,
+/// which is what [`shard_group_cluster_state_message`] states. The two members of the set
+/// are the statuses that refusal names, in the order it names them.
+pub const SHARD_GROUP_CLUSTER_STATUSES: [&str; 2] =
+    [DB_CLUSTER_STATUS_AVAILABLE, DB_CLUSTER_STATUS_CREATING];
+
+/// What `CreateDBShardGroup` refuses a DB cluster whose status is none of
+/// [`SHARD_GROUP_CLUSTER_STATUSES`] with.
+///
+/// Amazon RDS words this one as two sentences — what it could not do, and the state the DB
+/// cluster is not in — naming the statuses a create needs in upper case and taking the
+/// cluster identifier from the call. Nothing else of the request or the store is in it: the
+/// status the cluster IS in is what a describe of that cluster reports, not part of this
+/// sentence.
+pub fn shard_group_cluster_state_message(db_cluster_identifier: &str) -> String {
+    format!(
+        "You can't create the DB shard group. The DB cluster {db_cluster_identifier} isn't \
+         in the AVAILABLE or CREATING state."
+    )
+}
+
 /// What a request naming an `EngineMode` the resolved engine VERSION does not run is
 /// refused with.
 ///

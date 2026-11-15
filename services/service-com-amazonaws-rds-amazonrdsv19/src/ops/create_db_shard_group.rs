@@ -259,17 +259,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let db_cluster_identifier = cluster.identifier.clone();
-        // A cluster on its way out cannot take a new shard group: a delete "can't be
-        // canceled or reverted after it begins", so the cluster is not in a state this
-        // operation can act on, which is the modelled `InvalidDBClusterStateFault`. Every
-        // other status accepts it — a provisioning status this emulator's clock has yet to
-        // settle included, as the other operations that reference a cluster do.
-        if cluster.is_deleting() {
+        // The shard groups of an Aurora Limitless Database cluster are provisioned INTO
+        // that cluster, so the cluster has to be one a shard group can be put in: only a
+        // cluster that is up, or one still being created that the shard group comes up with,
+        // can take it ([`crate::state::SHARD_GROUP_CLUSTER_STATUSES`]). Every other status —
+        // stopping, stopped, rebooting, failing over, taking a modification, or on its way
+        // out — is the modelled `InvalidDBClusterStateFault`, and nothing is stored for it,
+        // so a following `DescribeDBShardGroups` of the identifier is the not-found fault.
+        if !cluster.can_take_a_shard_group() {
             return Err(CreateDBShardGroupErrorModeled::InvalidDBClusterStateFault(
                 InvalidDBClusterStateFault {
-                    message: Some(format!(
-                        "DB cluster {db_cluster_identifier} is being deleted, so no DB shard \
-                         group can be created for it"
+                    message: Some(crate::state::shard_group_cluster_state_message(
+                        &db_cluster_identifier,
                     )),
                 },
             )
