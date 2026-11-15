@@ -2025,3 +2025,14 @@ mod zz_probe_whole_emulator;
 // `all/appended_notes.rs`, declared below like any other suite.
 // module header is a note rather than a build failure. An inner attribute, like an inner doc
 // comment, is legal only before the first item, so it stands here rather than in the list.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair in its sorted position.
+// EVERY comment here is an ordinary `//` one, this header included, and that is deliberate:
+// an inner doc comment is legal only before the first item, so one that lands past the
+// declarations is `E0753` and compiles no suite of this target — and with no `//!` anywhere
+// in the file, no merge of two landings can leave one there.
+// what points the declaration into `tests/all/`. Declare each suite exactly ONCE — a second
+// `mod` for one name is `E0428` and fails every suite in this target too.
+// belongs in that suite's own module header, beside the test it explains; a note about THIS
+// file belongs in `all/appended_notes.rs`, declared below like any other suite. The rules
+// above are pinned by the `all/all_rs_*`, `all/declaration_roots_are_canonical_and_complete.rs`
+// and `all/every_suite_file_is_declared.rs` suites, so check there rather than leaving a note

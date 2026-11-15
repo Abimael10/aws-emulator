@@ -28,12 +28,13 @@
 //! The processors applied here are the ones whose output is fixed by their own configuration
 //! and the event's content: the configurable parsers that structure a message (`parseJSON`,
 //! `parseKeyValue`, `csv`), the vended parsers whose log type's record layout is PUBLISHED
-//! (`parseVPC`, which reads the VPC flow log record held in [`super::log_transformer`]), and
-//! the mutate processors that move, rewrite and retype the fields a parser produced. The
-//! remaining kinds each need a published catalogue that is not in this model and is not
-//! written down beside it — a grok pattern library for `grok`, the per-source record layout of
-//! the other AWS-vended log types for `parseCloudfront` / `parseRoute53` / `parsePostgres` /
-//! `parseWAF`, the OCSF event mapping for `parseToOCSF`, and the date-format syntax of
+//! (`parseVPC` and `parseWAF`, which read the VPC flow log record and the WAF vended record
+//! held in [`super::log_transformer`]), and the mutate processors that move, rewrite and
+//! retype the fields a parser produced. The remaining kinds each need a published catalogue
+//! that is not in this model and is not written down beside it — a grok pattern library for
+//! `grok`, the per-source record layout of the other AWS-vended log types for
+//! `parseCloudfront` / `parseRoute53` / `parsePostgres`, the OCSF event mapping for
+//! `parseToOCSF`, and the date-format syntax of
 //! `dateTimeConverter$matchPatterns` — so they leave the event as they found it rather than
 //! inventing fields nothing derived. They are still ACCEPTED by `PutTransformer`, which is
 //! what a client observes of them.
@@ -420,8 +421,9 @@ fn apply(event: &mut Event, processor: &Processor, substitutions: &[Option<::reg
         lower_case_string,
         move_keys,
         // The AWS-vended parsers each read one published record layout — the fields that log
-        // type carries, in order. The one this crate holds is the VPC flow log record
-        // ([`super::log_transformer`]); the others' layouts are not written down here.
+        // type carries. The ones this crate holds are the VPC flow log record and the WAF
+        // vended record ([`super::log_transformer`]); the others' layouts are not written
+        // down here.
         parse_cloudfront: _,
         parse_json,
         parse_key_value,
@@ -429,7 +431,7 @@ fn apply(event: &mut Event, processor: &Processor, substitutions: &[Option<::reg
         parse_to_ocsf: _,
         parse_postgres: _,
         parse_vpc,
-        parse_waf: _,
+        parse_waf,
         rename_keys,
         split_string,
         substitute_string,
@@ -446,6 +448,17 @@ fn apply(event: &mut Event, processor: &Processor, substitutions: &[Option<::reg
     if parse_vpc.is_some() {
         for (name, value) in super::log_transformer::vpc_flow_log_fields(event.message) {
             event.write(name, value, true);
+        }
+    }
+
+    // `parseWAF` converts "WAF vended logs" into "a JSON format", extracting the fields of a
+    // WAF record. It "always processes the entire log event message", and "No other value
+    // than `@message` is allowed for `source`", so the record it reads is the ingested
+    // message whatever the configuration names; it names no destination either, so the
+    // fields it extracts are placed at the root.
+    if parse_waf.is_some() {
+        for (name, value) in super::log_transformer::waf_record_fields(event.message) {
+            event.write(&name, value, true);
         }
     }
 
@@ -621,15 +634,13 @@ fn apply(event: &mut Event, processor: &Processor, substitutions: &[Option<::reg
     // `splitString` splits "the key of the field to split" on "the separator characters to
     // split the string entry on", so that field becomes a list of text. Every element is one
     // name and its own bytes, so a split of a long field past what an event may hold is
-    // refused by the write rather than stored.
+    // abandoned as it is built ([`split_parts`]) rather than materialised and then refused.
     if let Some(split_string) = split_string {
         for entry in &split_string.entries {
             if let Some(text) = event.read(&entry.source).and_then(scalar_text) {
-                let parts: Vec<Value> = text
-                    .split(entry.delimiter.as_str())
-                    .map(|part| Value::String(part.to_string()))
-                    .collect();
-                event.write(&entry.source, Value::Array(parts), true);
+                if let Some(parts) = split_parts(&text, &entry.delimiter) {
+                    event.write(&entry.source, Value::Array(parts), true);
+                }
             }
         }
     }
@@ -752,6 +763,26 @@ fn substituted(expression: &::regex::Regex, text: &str, replacement: &str) -> Op
     }
     substituted.push_str(text.get(after_previous..)?);
     (substituted.len() <= MAX_EVENT_BYTES).then_some(substituted)
+}
+
+/// `text` split on `delimiter`, or `None` when the list would hold more than one event may
+/// hold ([`MAX_EVENT_FIELDS`] names, [`MAX_EVENT_BYTES`] bytes).
+///
+/// Built element by element, and ABANDONED as soon as what has been built passes either
+/// ceiling — so a one-character delimiter matching at nearly every position of a long field
+/// allocates no more than one event's worth before the split is dropped, rather than
+/// materialising one element per position and having the write refuse the finished list.
+fn split_parts(text: &str, delimiter: &str) -> Option<Vec<Value>> {
+    let mut parts: Vec<Value> = Vec::new();
+    let mut bytes = 0;
+    for part in text.split(delimiter) {
+        bytes += part.len();
+        if parts.len() >= MAX_EVENT_FIELDS || bytes > MAX_EVENT_BYTES {
+            return None;
+        }
+        parts.push(Value::String(part.to_string()));
+    }
+    Some(parts)
 }
 
 /// `value` as the type `type_name` names, or `None` where it is not one of that type: a

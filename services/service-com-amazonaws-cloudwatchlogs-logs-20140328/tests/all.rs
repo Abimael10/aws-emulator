@@ -355,5 +355,7 @@ mod vended_log_template_catalog_rows;
 mod vended_log_template_schemas;
 #[path = "all/vended_parser_position.rs"]
 mod vended_parser_position;
+#[path = "all/waf_vended_parser.rs"]
+mod waf_vended_parser;
 #[path = "all/zz_probe_defaults.rs"]
 mod zz_probe_defaults;

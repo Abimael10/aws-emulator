@@ -11,18 +11,19 @@
 //! them, because a format is a published property of the log type rather than of any
 //! processor's configuration.
 //!
-//! One format is held here: the VPC flow log record, which `parseVPC` reads. The other vended
-//! parsers (`parseCloudfront`, `parseRoute53`, `parsePostgres`, `parseWAF`) read one record
-//! layout each as well, and gain a reading here when that layout is written down; until then
-//! [`super::transformer`] leaves the event as it found it for them rather than inventing
-//! fields nothing derived.
+//! Two formats are held here: the VPC flow log record, which `parseVPC` reads, and the WAF
+//! vended record, which `parseWAF` reads. The other vended parsers (`parseCloudfront`,
+//! `parseRoute53`, `parsePostgres`) read one record layout each as well, and gain a reading
+//! here when that layout is written down; until then [`super::transformer`] leaves the event
+//! as it found it for them rather than inventing fields nothing derived.
 //!
-//! Reading one record costs one pass over the message: the fields are the message's
-//! space-delimited fields ([`super::filter_pattern::space_delimited_fields`]), paired with
-//! the catalogue of the format, which bounds how many fields one record can produce whatever
-//! the message carries.
+//! Reading one record costs one pass over the message: for the flow log record the fields are
+//! the message's space-delimited fields ([`super::filter_pattern::space_delimited_fields`]),
+//! paired with the catalogue of the format, which bounds how many fields one record can
+//! produce whatever the message carries; for the WAF record, whose own form is JSON, they are
+//! the members the document carries, read once.
 
-use ::serde_json::Value;
+use ::serde_json::{Map, Value};
 
 /// The value a vended record carries for a field that "is not applicable or could not be
 /// computed for a specific record": the record "displays a '-' symbol for that entry". Such a
@@ -91,9 +92,84 @@ pub fn vpc_flow_log_fields(record: &str) -> Vec<(&'static str, Value)> {
         .collect()
 }
 
+/// The member of a WAF vended record that carries the request the web ACL evaluated, under
+/// which the request's headers sit.
+const WAF_REQUEST_MEMBER: &str = "httpRequest";
+
+/// The member of that request carrying the headers the request was sent with. The vended
+/// record writes it as a LIST, one entry per header.
+const WAF_HEADERS_MEMBER: &str = "headers";
+
+/// The member of one entry of that list naming the header.
+const WAF_HEADER_NAME_MEMBER: &str = "name";
+
+/// The member of one entry of that list carrying what was sent under that header.
+const WAF_HEADER_VALUE_MEMBER: &str = "value";
+
+/// The fields one WAF vended record carries, "convert[ed] ... into a JSON format": the record
+/// is itself a JSON document, so its own members are the fields, each under the name the
+/// record gives it, with ONE conversion applied — the request's headers, which the record
+/// vends as a list of entries each naming a header and carrying its value, become a single
+/// object KEYED BY HEADER NAME, so a reader addressing one header by name reaches its value.
+/// Every other member of the record, the request's own other members included, is the member
+/// the record carried, unchanged.
+///
+/// Source: the published WAF log format, whose `httpRequest.headers` is the list of the
+/// request's headers, each entry carrying a `name` and a `value`.
+///
+/// A message that is no JSON object is no record of this format and yields no field.
+pub fn waf_record_fields(record: &str) -> Vec<(String, Value)> {
+    let Ok(Value::Object(members)) = ::serde_json::from_str::<Value>(record) else {
+        return Vec::new();
+    };
+    members
+        .into_iter()
+        .map(|(name, mut value)| {
+            if name == WAF_REQUEST_MEMBER {
+                key_headers_by_name(&mut value);
+            }
+            (name, value)
+        })
+        .collect()
+}
+
+/// Key `request`'s headers by header name, where it carries them as the list the vended record
+/// writes them as: every entry that names a header and carries a value contributes one member,
+/// and where two entries name one header the later value stands, because one member of an
+/// object holds one value. A request whose headers are not that list — already keyed, absent,
+/// or not a request structure at all — is left exactly as the record carried it.
+///
+/// The entries are MOVED into the keyed object rather than copied into it, so one header's
+/// value is not duplicated while an event is read.
+fn key_headers_by_name(request: &mut Value) {
+    let Some(members) = request.as_object_mut() else {
+        return;
+    };
+    let Some(Value::Array(entries)) = members.get_mut(WAF_HEADERS_MEMBER) else {
+        return;
+    };
+    let entries = ::std::mem::take(entries);
+    let mut keyed = Map::new();
+    for entry in entries {
+        let Value::Object(mut entry) = entry else {
+            continue;
+        };
+        let Some(Value::String(name)) = entry.remove(WAF_HEADER_NAME_MEMBER) else {
+            continue;
+        };
+        let Some(value) = entry.remove(WAF_HEADER_VALUE_MEMBER) else {
+            continue;
+        };
+        keyed.insert(name, value);
+    }
+    members.insert(WAF_HEADERS_MEMBER.to_string(), Value::Object(keyed));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::vpc_flow_log_fields;
+    use ::serde_json::json;
+
+    use super::{vpc_flow_log_fields, waf_record_fields};
 
     /// A record parses to the catalogue's fields with its numeric fields as JSON numbers and
     /// its identifiers as JSON strings, and a field the record could not compute is ABSENT
@@ -153,6 +229,85 @@ mod tests {
                     "case {case}: {name} is a JSON number: {expected_number}, got {value}"
                 );
             }
+        }
+    }
+
+    /// A WAF record's request headers are read as an object keyed by header name, whatever
+    /// the entries the list carries, and every other member of the record is the member the
+    /// record carried.
+    #[test]
+    fn a_waf_record_reads_its_request_headers_keyed_by_header_name() {
+        let cases: [(&str, ::serde_json::Value, ::serde_json::Value); 6] = [
+            (
+                "several headers",
+                json!([
+                    {"name": "Host", "value": "a.example"},
+                    {"name": "Accept", "value": "*/*"},
+                ]),
+                json!({"Host": "a.example", "Accept": "*/*"}),
+            ),
+            (
+                "one header",
+                json!([{"name": "Host", "value": "a.example"}]),
+                json!({"Host": "a.example"}),
+            ),
+            ("no header at all", json!([]), json!({})),
+            (
+                "two entries naming one header",
+                json!([
+                    {"name": "Cookie", "value": "a=1"},
+                    {"name": "Cookie", "value": "b=2"},
+                ]),
+                json!({"Cookie": "b=2"}),
+            ),
+            (
+                "an entry naming no header",
+                json!([{"value": "a.example"}, {"name": "Accept", "value": "*/*"}]),
+                json!({"Accept": "*/*"}),
+            ),
+            (
+                // Already keyed: nothing to convert, so the member stands.
+                "headers already keyed by name",
+                json!({"Host": "a.example"}),
+                json!({"Host": "a.example"}),
+            ),
+        ];
+        for (case, headers, expected) in cases {
+            let record = json!({
+                "formatVersion": 1,
+                "action": "ALLOW",
+                "httpRequest": {"clientIp": "192.0.2.10", "headers": headers, "uri": "/a"},
+            });
+            let fields: ::serde_json::Map<String, ::serde_json::Value> =
+                waf_record_fields(&record.to_string()).into_iter().collect();
+            assert_eq!(
+                fields.get("httpRequest").and_then(|request| request.get("headers")),
+                Some(&expected),
+                "case {case}: the request's headers are keyed by name, got {fields:?}"
+            );
+            assert_eq!(
+                fields.get("formatVersion"),
+                Some(&json!(1)),
+                "case {case}: every other member is the one the record carried, got {fields:?}"
+            );
+            assert_eq!(
+                fields.get("httpRequest").and_then(|request| request.get("uri")),
+                Some(&json!("/a")),
+                "case {case}: the request's other members are unchanged, got {fields:?}"
+            );
+        }
+    }
+
+    /// A message that is no JSON object is no record of the WAF format, so it reads as no
+    /// field and the ingested message stands.
+    #[test]
+    fn a_message_that_is_no_waf_record_reads_as_no_field() {
+        for case in ["not json at all", "[1,2,3]", "\"text\"", ""] {
+            let fields = waf_record_fields(case);
+            assert!(
+                fields.is_empty(),
+                "case {case:?}: no field is derived, got {fields:?}"
+            );
         }
     }
 }
