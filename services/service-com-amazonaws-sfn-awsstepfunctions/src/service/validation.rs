@@ -22,20 +22,25 @@
 //! lists a member name and the decision cannot fall behind a model that grows a
 //! `@sensitive` one.
 //!
-//! What is left for this module is ONE difference, which no shared entry point
-//! can make for it: Step Functions echoes a rejected value as the member's
+//! What is left for this module is TWO differences, which no shared entry point
+//! can make for it. First, Step Functions echoes a rejected value as the member's
 //! MODELLED TYPE renders it. A member whose target shape is a Smithy
 //! `float`/`double` renders with a fractional part (`150` -> `150.0`), where an
 //! integral member (`integer`, `long`) renders without one — and Rust's own
 //! `Display` for a float drops a zero fraction (`150f32.to_string() == "150"`),
 //! so the framework's default clause reports a float member's value in an
-//! integer's spelling. The violations are re-rendered that way and then handed
-//! to the shared wording, so the envelope, the clauses, the member paths, the
-//! requirements and the withholding are all stated in one place.
+//! integer's spelling. Second, the ENUM VALUE SET a clause advertises is listed
+//! in the order this service states that enum's values in, which is not the
+//! order the model declares its members in ([`STATED_ENUM_VALUE_SETS`], applied
+//! through the shared wording's own seam for such a table). The
+//! violations are re-rendered that way and then handed to the shared wording, so
+//! the envelope, the clauses, the member paths, the requirements and the
+//! withholding are all stated in one place.
 //!
-//! Nothing here is keyed to an operation or to a particular value: the rule is
-//! applied to whatever [`Violation`] the walk produces, so it holds for every
-//! constrained member of every operation of this service.
+//! Nothing here is keyed to an operation or to a particular value: each rule is
+//! applied to whatever [`Violation`] the walk produces — one by the member's
+//! modelled type, one by the value SET the violation carries — so each holds for
+//! every constrained member of every operation of this service.
 //!
 //! The structural fix is still owed upstream — a `Violation` carrying the
 //! member's modelled numeric kind, or a framework that renders a value per
@@ -131,6 +136,38 @@ fn in_modelled_type(violation: &Violation) -> Violation {
     rendered
 }
 
+/// The order this service states the `InspectionLevel` value set in, paired with the
+/// values the model declares.
+///
+/// RECORDED text: the model declares the enum's members in another order
+/// (`smithy_query(query="shape",shape="InspectionLevel")` -> `INFO | DEBUG | TRACE`),
+/// and the order a refusal ADVERTISES is the service's own rather than the model's
+/// declaration order — which is the order the value set reaches this seam in.
+const INSPECTION_LEVELS: (&[&str], &[&str]) =
+    (&["INFO", "DEBUG", "TRACE"], &["TRACE", "INFO", "DEBUG"]);
+
+/// Every enum value set this service states in an order of its own, as the shared
+/// wording reads such a table
+/// ([`::service_common::validation_message::StatedEnumValueSets`]).
+///
+/// One row per enumerated type whose stated order is known to differ from its
+/// declaration order; a value set absent from this table is stated as the model
+/// declares it, because this service has shown no other order for it. A row is matched
+/// by its declared value SET, so every member targeting one enum — of any operation, at
+/// any depth — advertises that enum's set in the one order.
+const STATED_ENUM_VALUE_SETS: &::service_common::validation_message::StatedEnumValueSets<'_> =
+    &[INSPECTION_LEVELS];
+
+/// `violation` as THIS SERVICE states it: its value in the member's modelled type
+/// ([`in_modelled_type`]) and its enum value set in the order the service advertises
+/// that enum's values in ([`STATED_ENUM_VALUE_SETS`], through the shared seam).
+fn as_this_service_states_it(violation: &Violation) -> Violation {
+    ::service_common::validation_message::in_stated_enum_order(
+        &in_modelled_type(violation),
+        STATED_ENUM_VALUE_SETS,
+    )
+}
+
 /// How this service states `refusal`, or `None` to keep the framework's wording.
 ///
 /// Only an input-constraint refusal is reworded. An authentication refusal is a
@@ -140,7 +177,8 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
-    let in_modelled_types: Vec<Violation> = violations.iter().map(in_modelled_type).collect();
+    let in_modelled_types: Vec<Violation> =
+        violations.iter().map(as_this_service_states_it).collect();
     let mut stated = shared_wording(&in_modelled_types)?;
     // A member whose bound is a payload SIZE states the requirement about that size
     // rather than the character-length sentence the framework states for every other

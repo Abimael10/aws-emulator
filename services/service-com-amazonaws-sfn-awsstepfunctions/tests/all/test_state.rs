@@ -449,9 +449,11 @@ async fn state_name_picks_the_state_of_the_definition_that_runs() {
 /// Every stage of the data flow a state carrying all of them produces, which the two
 /// data-flow levels report and `INFO` does not.
 ///
-/// `afterResultSelector` is absent because the Amazon States Language gives a `Pass`
-/// state a `Result`, not a `ResultSelector`, and the HTTP `request`/`response` are
-/// absent because they are an HTTP Task's, which no state tested here is.
+/// `afterResultSelector` carries the state's raw result: the Amazon States Language
+/// gives a `Pass` state a `Result` rather than a `ResultSelector`, so no such filter
+/// stands between the result and the `ResultPath` that places it. The HTTP
+/// `request`/`response` are absent because they are an HTTP Task's, which no state
+/// tested here is.
 #[tokio::test]
 async fn the_inspection_level_decides_what_is_reported() {
     const DEFINITION: &str = r#"{"Type":"Pass","InputPath":"$.detail","Parameters":{"doubled.$":"States.MathAdd($.n,$.n)"},"ResultPath":"$.out","End":true}"#;
@@ -503,7 +505,7 @@ async fn the_inspection_level_decides_what_is_reported() {
         assert_stage(case, &answered, "afterInputPath", Some(r#"{"n":2}"#));
         assert_stage(case, &answered, "afterParameters", Some(r#"{"doubled":4}"#));
         assert_stage(case, &answered, "result", Some(r#"{"doubled":4}"#));
-        assert_stage(case, &answered, "afterResultSelector", None);
+        assert_stage(case, &answered, "afterResultSelector", Some(r#"{"doubled":4}"#));
         assert_stage(
             case,
             &answered,
@@ -869,14 +871,17 @@ async fn test_state_refuses_a_request_it_cannot_serve() {
             "ValidationException",
         ),
         (
+            // The two types this API tests only through a mocked outcome are not
+            // among the types it tests at all without one, which is a defect of the
+            // DEFINITION it was given rather than of another member.
             "a Map state with no mock to stand in for its iterations",
             json!({ "definition": MAP_STATE }),
-            "ValidationException",
+            "InvalidDefinition",
         ),
         (
             "a Parallel state with no mock to stand in for its branches",
             json!({ "definition": PARALLEL_STATE }),
-            "ValidationException",
+            "InvalidDefinition",
         ),
         (
             "a mock naming both a result and an errorOutput",

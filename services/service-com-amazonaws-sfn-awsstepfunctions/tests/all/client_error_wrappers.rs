@@ -24,8 +24,9 @@
 //! 3. a value outside a modelled enum is refused with the standard validation
 //!    envelope, which names the member, echoes the rejected value and lists
 //!    exactly the value set the MODEL declares. The ORDER that set is listed in
-//!    is the model's declaration order, which no published rule fixes, so it is
-//!    asserted as a set rather than as a sequence.
+//!    is the service's own where its recordings fix one, which
+//!    `test_state_reported_detail.rs` owns, so it is asserted as a set rather
+//!    than as a sequence here.
 //!
 //! The harness (`Emulator`, `create_machine`, `string`) is the one
 //! `state_machine_lifecycle` already builds; `tests/all.rs` is this binary's
@@ -366,9 +367,9 @@ fn declared_enum_values(shape_id: &str) -> BTreeSet<String> {
 /// model declares.
 ///
 /// Rows span two enum members of two operations and several rejected values. The
-/// listed set is compared as a SET: the sequence a service lists it in is not
-/// derivable from the model (which declares one order) and AWS publishes no rule
-/// for it, so only membership is asserted.
+/// listed set is compared as a SET: which SEQUENCE a service lists it in is the
+/// service's own, asserted where its recordings fix one
+/// (`test_state_reported_detail.rs`), so only membership is asserted here.
 #[tokio::test]
 async fn an_out_of_set_enum_value_lists_the_set_the_model_declares() {
     const CLAUSE: &str = "Member must satisfy enum value set: [";

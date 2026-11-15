@@ -3967,6 +3967,18 @@ pub const TEST_STATUS_RETRIABLE: &str = "RETRIABLE";
 /// `Next` with the error output.
 pub const TEST_STATUS_CAUGHT_ERROR: &str = "CAUGHT_ERROR";
 
+/// The `Retry` position a failure no retrier of the state answers for reports: the
+/// first one, which is the position every state's `Retry` numbering starts at.
+///
+/// RECORDED: the answer to a state whose failure a `Catch` took over carries this
+/// member beside the catcher's own position even where no retrier of the state matched
+/// the error, so it is reported rather than left out.
+/// `InspectionErrorDetails$retryIndex` is "the array index of the Retry which handled
+/// the exception", bounded at a minimum of zero by the model
+/// (`smithy_query(query="shape",shape="InspectionErrorDetails")`), which is the
+/// position named here.
+const NO_RETRIER_INDEX: i32 = 0;
+
 /// The state types whose `Parameters` member is a payload template over the state's
 /// effective INPUT (see [`executable_members`]); the other types declare no such
 /// member, so no `afterParameters` stage exists for them.
@@ -4046,8 +4058,9 @@ pub struct Trial {
     pub error: Option<String>,
     pub cause: Option<String>,
     pub inspection: Inspection,
-    /// The position in `Retry` of the retrier that matched a [`TEST_STATUS_RETRIABLE`]
-    /// failure, and how long that retrier waits before the attempt it owes.
+    /// The position in `Retry` of the retrier that answers for the failure, and how
+    /// long that retrier waits before the attempt a [`TEST_STATUS_RETRIABLE`] failure
+    /// owes.
     pub retry_index: Option<i32>,
     pub retry_backoff_seconds: Option<i32>,
     /// The position in `Catch` of the catcher that took a
@@ -4328,7 +4341,7 @@ impl Interpreter<'_> {
             Err(failure) => return self.classify(test, language, raw, &context, failure, inspection),
         };
         if language != JSONATA {
-            inspection.after_input_path = Some(effective.to_string());
+            inspection.after_input_path = Some(self.echo(&effective));
         }
         let templated = TEMPLATED_STATE_TYPES.contains(&state_type);
         let after_parameters = match templated {
@@ -4342,8 +4355,8 @@ impl Interpreter<'_> {
         };
         if templated {
             match language {
-                JSONATA => inspection.after_arguments = Some(after_parameters.to_string()),
-                _ => inspection.after_parameters = Some(after_parameters.to_string()),
+                JSONATA => inspection.after_arguments = Some(self.echo(&after_parameters)),
+                _ => inspection.after_parameters = Some(self.echo(&after_parameters)),
             }
         }
 
@@ -4378,7 +4391,7 @@ impl Interpreter<'_> {
                 // rule's decide it together, exactly as they do in the walk.
                 JSONATA => {
                     if let Some(result) = result.as_ref() {
-                        inspection.result = Some(result.to_string());
+                        inspection.result = Some(self.echo(result));
                     }
                     match chosen.as_ref() {
                         Some(chosen) => {
@@ -4487,9 +4500,16 @@ impl Interpreter<'_> {
                 self.wait_duration(state, language, effective, context, Duration::ZERO)
                     .map_err(|failure| Failure {
                         error: failure.error,
-                        cause: failure
-                            .cause
-                            .map(|why| format!("{SINGLE_STATE_LABEL}: {why}")),
+                        // A diagnosis this module worded about the state's own
+                        // expression already names the field it is written in, so it
+                        // is carried exactly as raised — the rule the walk applies
+                        // around every such diagnosis ([`diagnosed`]). Every other
+                        // reason a `Wait`'s members could not be read names the state
+                        // under test, which is the only name this trial has for it.
+                        cause: failure.cause.map(|why| match names_its_state(&why) {
+                            true => why,
+                            false => format!("{SINGLE_STATE_LABEL}: {why}"),
+                        }),
                     })?;
                 Ok(None)
             }
@@ -4526,14 +4546,16 @@ impl Interpreter<'_> {
         context: &Value,
         inspection: &mut Inspection,
     ) -> Result<Value, Failure> {
-        inspection.result = Some(result.to_string());
+        inspection.result = Some(self.echo(&result));
         let with_selector = SELECTOR_STATE_TYPES.contains(&state_type);
         let selected = select_result(state, result, context, with_selector)?;
-        if with_selector {
-            inspection.after_result_selector = Some(selected.to_string());
-        }
+        // "The effective result after Step Functions applies the ResultSelector
+        // filter": the stage is the state's result as the result-side data flow
+        // RECEIVES it, so a state whose type has no such filter — or that declares
+        // none — reports its raw result there rather than nothing at all.
+        inspection.after_result_selector = Some(self.echo(&selected));
         let placed = path_result(state, raw, selected)?;
-        inspection.after_result_path = Some(placed.to_string());
+        inspection.after_result_path = Some(self.echo(&placed));
         self.output_value(state, placed, context)
     }
 
@@ -4555,27 +4577,32 @@ impl Interpreter<'_> {
     ) -> Trial {
         let state = test.state;
         let name = failure.name().to_string();
-        for (index, retrier) in retry_entries(state, "Retry").iter().enumerate() {
-            let Some(retrier) = retrier.as_object() else {
-                continue;
-            };
-            if !errors_match(retrier, &name) {
-                continue;
-            }
+        // Which `Retry` entry answers for this error, whether or not it still has an
+        // attempt left: "the array index of the Retry which handled the exception" is
+        // what the trial reports for a failure the state's own error handling took
+        // over, and a state with no retrier for the error has none to name.
+        let retrier = retry_entries(state, "Retry")
+            .iter()
+            .enumerate()
+            .filter_map(|(index, retrier)| retrier.as_object().map(|retrier| (index, retrier)))
+            .find(|(_, retrier)| errors_match(retrier, &name));
+        let retry_index = Some(match retrier {
+            Some((index, _)) => i32::try_from(index).unwrap_or(i32::MAX),
+            None => NO_RETRIER_INDEX,
+        });
+        if let Some((_, retrier)) = retrier {
             let max_attempts = retrier
                 .get("MaxAttempts")
                 .and_then(Value::as_u64)
                 .unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS);
-            if test.retries_taken >= max_attempts {
-                break;
+            if test.retries_taken < max_attempts {
+                let mut trial = Trial::failed(inspection, failure);
+                trial.status = TEST_STATUS_RETRIABLE;
+                trial.retry_index = retry_index;
+                trial.retry_backoff_seconds =
+                    Some(retry_delay_seconds(retrier, test.retries_taken).round() as i32);
+                return trial;
             }
-            let mut trial = Trial::failed(inspection, failure);
-            trial.status = TEST_STATUS_RETRIABLE;
-            trial.retry_index = Some(i32::try_from(index).unwrap_or(i32::MAX));
-            trial.retry_backoff_seconds = Some(
-                retry_delay_seconds(retrier, test.retries_taken).round() as i32,
-            );
-            return trial;
         }
         for (index, catcher) in retry_entries(state, "Catch").iter().enumerate() {
             let Some(catcher) = catcher.as_object() else {
@@ -4611,9 +4638,12 @@ impl Interpreter<'_> {
             };
             let mut trial = Trial::failed(inspection, failure);
             trial.status = TEST_STATUS_CAUGHT_ERROR;
-            trial.output = Some(output.to_string());
+            trial.output = Some(self.echo(&output));
             trial.next_state = Some(next.to_string());
             trial.catch_index = Some(i32::try_from(index).unwrap_or(i32::MAX));
+            // A caught failure reports both handler positions: the catcher that took it
+            // over, and the retrier whose attempts preceded it.
+            trial.retry_index = retry_index;
             return trial;
         }
         Trial::failed(inspection, failure)

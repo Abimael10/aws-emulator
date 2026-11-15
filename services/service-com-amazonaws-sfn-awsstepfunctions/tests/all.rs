@@ -288,6 +288,8 @@ mod task_work_event_families;
 mod terminal_runtime_errors;
 #[path = "all/test_state.rs"]
 mod test_state;
+#[path = "all/test_state_reported_detail.rs"]
+mod test_state_reported_detail;
 #[path = "all/test_state_reveal_secrets_authorization.rs"]
 mod test_state_reveal_secrets_authorization;
 #[path = "all/unassumable_role_cause.rs"]

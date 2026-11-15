@@ -475,17 +475,33 @@ fn evaluation_failure(text: &str, why: &::jsonata_rs::Error, allowed_ms: usize) 
     }
 }
 
-/// The engine's own account of an expression that THREW, as the language states one:
-/// the error CODE the failure carries, then the message for it.
+/// The engine's own account of an expression that THREW, as the LANGUAGE states one:
+/// the error CODE the failure carries, then the message for it, with every value and
+/// token the message substitutes written as the JSON text of that value.
 ///
-/// The engine renders both in one line, with the offset into the expression text at
-/// which it stopped and with the token the message quotes in the backquotes this
-/// implementation writes it in. The OFFSET is a position in a caller's text rather than
-/// part of the account, and the quoting of a token is the implementation's rather than
-/// the language's, so the account is normalised here: the code and the message, with
-/// every quoted token in the double quotes the language's own messages carry.
+/// The language's own implementation substitutes each value into its message template
+/// as JSON — a string and a token in double quotes, a number as JSON writes one — and
+/// the error a caller matches on is that sentence. This engine renders the same
+/// failures in Rust's own terms instead: the offset into the expression text at which
+/// it stopped, a token in the backquotes this implementation writes it in or with no
+/// quotes at all, and a number in the debug form of the double it is held as
+/// (`10.0`). The account is therefore NORMALISED here, in the one place that reads the
+/// engine's failures: the offset is dropped, every token is written in double quotes,
+/// and every number is written as the language writes one ([`language_number`]).
 fn thrown_account(why: &::jsonata_rs::Error) -> String {
-    let rendered = why.to_string().replace('`', "\"");
+    // The one failure whose message substitutes VALUES as well as a token, which the
+    // engine renders with the token unquoted: it is built from the parts rather than
+    // repaired from the sentence, so each part is written as the language writes it.
+    if let ::jsonata_rs::Error::T2009BinaryOpMismatch(_, left, right, operator) = why {
+        return format!(
+            "T2009: The values {} and {} either side of operator {} must be of the same data \
+             type",
+            substituted(left),
+            substituted(right),
+            substituted(operator)
+        );
+    }
+    let rendered = language_numbers(&why.to_string().replace('`', "\""));
     let Some((code, message)) = rendered.split_once(": ") else {
         return rendered;
     };
@@ -493,6 +509,52 @@ fn thrown_account(why: &::jsonata_rs::Error) -> String {
         Some((code, _offset)) => format!("{code}: {message}"),
         None => rendered,
     }
+}
+
+/// One value the language substitutes into a message, as the JSON text of it: a value
+/// the engine already rendered as JSON (a quoted string, a number, a literal) with
+/// its numbers written as the language writes them, and every other token — an
+/// operator, a function name — in the double quotes JSON writes a string in.
+fn substituted(value: &str) -> String {
+    if ::serde_json::from_str::<Value>(value).is_ok() {
+        return language_number(value).unwrap_or_else(|| value.to_string());
+    }
+    Value::String(value.to_string()).to_string()
+}
+
+/// `text` with every number OUTSIDE a quoted value in it written as the language
+/// writes one.
+///
+/// A quoted value is a caller's own data — a string the expression read, which may
+/// itself hold a figure and spaces — so the scan is over the spans BETWEEN the double
+/// quotes the engine wrote the values in: a number inside one is left exactly as the
+/// engine rendered it, however the text around it reads. The figures the normalisation
+/// is about sit in the message's own words, which is where the engine substituted a
+/// number of its own.
+fn language_numbers(text: &str) -> String {
+    text.split('"')
+        .enumerate()
+        .map(|(span, text)| match span % 2 {
+            // Between the quotes: a value the message quotes, carried as rendered.
+            1 => text.to_string(),
+            _ => text
+                .split(' ')
+                .map(|word| language_number(word).unwrap_or_else(|| word.to_string()))
+                .collect::<Vec<_>>()
+                .join(" "),
+        })
+        .collect::<Vec<_>>()
+        .join("\"")
+}
+
+/// `word` as the language writes the NUMBER it is, or `None` when it is not one.
+///
+/// The engine holds every number as a double and renders a whole one with the
+/// fractional part JSON does not write (`10.0`), which is the one difference between
+/// the two renderings: a number with a fractional part reads the same either way.
+fn language_number(word: &str) -> Option<String> {
+    let whole = word.strip_suffix(".0")?;
+    whole.parse::<i64>().ok().map(|number| number.to_string())
 }
 
 /// Whether the JSON text of `value` fits in what is left of `allowance`, spending it
@@ -830,6 +892,71 @@ mod tests {
             nesting(&deep) > MAX_EVALUATION_DEPTH,
             "a document past the ceiling is reported past it"
         );
+    }
+
+    /// An expression the engine evaluated and that THREW is accounted for as the
+    /// language words such a failure: its error code, and the message that code
+    /// carries with every value and token written as JSON text.
+    ///
+    /// Rows vary along the shape of the message the code carries — values and a token,
+    /// a token alone, neither — and along the value types either side of the operator,
+    /// so the number and the quoting rules are each pinned on more than one code.
+    #[test]
+    fn a_thrown_expression_is_accounted_for_as_the_language_words_it() {
+        // (case, the expression, the account the language words)
+        let cases: [(&str, &str, &str); 7] = [
+            (
+                "a whole number against a string",
+                "'abc' > 10",
+                "T2009: The values \"abc\" and 10 either side of operator \">\" must be of the \
+                 same data type",
+            ),
+            (
+                "the same values the other way round",
+                "10 > 'abc'",
+                "T2009: The values 10 and \"abc\" either side of operator \">\" must be of the \
+                 same data type",
+            ),
+            (
+                "a fractional number keeps its fraction",
+                "'a' < 2.5",
+                "T2009: The values \"a\" and 2.5 either side of operator \"<\" must be of the \
+                 same data type",
+            ),
+            (
+                "a negative whole number",
+                "'a' >= -3",
+                "T2009: The values \"a\" and -3 either side of operator \">=\" must be of the \
+                 same data type",
+            ),
+            (
+                "a quoted value holding a figure of its own",
+                "'a 10.0 b' > 1",
+                "T2009: The values \"a 10.0 b\" and 1 either side of operator \">\" must be of \
+                 the same data type",
+            ),
+            (
+                "a code whose message substitutes a token alone",
+                "'text' + 1",
+                "T2001: The left side of the \"+\" operator must evaluate to a number",
+            ),
+            (
+                "a code whose message substitutes nothing",
+                "$notafunction(1)",
+                "T1006: Attempted to invoke a non-function",
+            ),
+        ];
+
+        for (case, text, expected) in cases {
+            let answered = over(text, &json!({}));
+            let Some(Refused::Threw(account)) = answered.as_ref().err() else {
+                panic!("case {case:?}: expected a thrown refusal, got {answered:?}");
+            };
+            assert_eq!(
+                account, expected,
+                "case {case:?}: expected the account {expected:?}, got {account:?}"
+            );
+        }
     }
 
     /// The size of a value is charged the way its JSON text is written, so the text is

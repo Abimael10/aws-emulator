@@ -199,6 +199,35 @@ fn invalid_definition_sentence(sentence: &str) -> TestStateError {
 /// quote a parse diagnostic instead, which is why this is worded here.
 const DEFINITION_NOT_JSON: &str = "The state definition must be valid JSON";
 
+/// The state types this operation tests only through a mocked outcome: the two whose
+/// own work is a state machine of its own.
+///
+/// "TestState only supports the following when a mock is specified: Activity tasks,
+/// .sync or .waitForTaskToken service integration patterns, Parallel, or Map states"
+/// — so a state of one of these types with no mock standing in for its outcome is
+/// not among the types the operation tests ([`MOCK_ONLY_STATE_TYPES_REFUSAL`]).
+const MOCK_ONLY_STATE_TYPES: &[&str] = &["Map", "Parallel"];
+
+/// What this operation answers for a [`MOCK_ONLY_STATE_TYPES`] state it was given no
+/// mocked outcome for: the two types it does not test, and the types it does.
+///
+/// RECORDED text, and a FIXED sentence — the state under test is not named in it,
+/// because what the caller is told is which types this API tests rather than anything
+/// about the state it sent.
+const MOCK_ONLY_STATE_TYPES_REFUSAL: &str =
+    "TestState API does not support Map or Parallel states. Supported state types include: \
+     [Task, Wait, Pass, Succeed, Fail, Choice]";
+
+/// What this operation answers for a `mock` supplied for a state type that takes
+/// none: the type of the state under test, which is the only variable part.
+///
+/// RECORDED text. "A mock can only be specified for Task, Map, or Parallel states. If
+/// it is specified for another state type, an exception will be thrown" — the
+/// exception says which type was sent and nothing about the set it is outside of.
+fn mock_unsupported_state_type(state_type: &str) -> String {
+    format!("State type '{state_type}' is not supported when a mock is specified")
+}
+
 /// The mocked outcome `mock` names: "A JSON object that contains a mocked `result` or
 /// `errorOutput`" — exactly one of the two, since the state's invocation either
 /// produced a result or failed.
@@ -508,11 +537,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(mock) => {
                 if !asl::INVOKING_STATE_TYPES.contains(&state_type) {
-                    return Err(refuse(format!(
-                        "a mock may only be specified for a [{}] state, and the state under test \
-                         is a '{state_type}' state",
-                        asl::INVOKING_STATE_TYPES.join(", ")
-                    )));
+                    return Err(refuse(mock_unsupported_state_type(state_type)));
                 }
                 Some(read_mock(mock)?)
             }
@@ -520,12 +545,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "TestState only supports the following when a mock is specified: Activity
         // tasks, .sync or .waitForTaskToken service integration patterns, Parallel, or
         // Map states." A `Map`'s iterations and a `Parallel`'s branches are the
-        // state's own work, so without a mock standing in for their outcome there is
-        // no single state to test.
-        if mock.is_none() && matches!(state_type, "Map" | "Parallel") {
-            return Err(refuse(format!(
-                "a '{state_type}' state is tested only when a mock is specified for its outcome"
-            )));
+        // state's own work, so without a mock standing in for their outcome those two
+        // types are not among the ones the operation tests at all.
+        if mock.is_none() && MOCK_ONLY_STATE_TYPES.contains(&state_type) {
+            return Err(invalid_definition_sentence(MOCK_ONLY_STATE_TYPES_REFUSAL));
         }
 
         // "The number of retry attempts that have occurred for the state's Retry that
