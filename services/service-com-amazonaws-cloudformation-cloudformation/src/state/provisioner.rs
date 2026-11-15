@@ -874,6 +874,18 @@ pub(super) enum Provisioner {
     /// `template::identity_is_service_assigned` names the type and the create replaces the
     /// stand-in the naming rules computed with the id Systems Manager answered.
     SsmAssociation,
+    /// `AWS::SSM::MaintenanceWindow`: a maintenance window of AWS Systems Manager, which
+    /// `CreateMaintenanceWindow` creates and `DeleteMaintenanceWindow` removes, and
+    /// `AWS::SSM::MaintenanceWindowTarget`: one target registered with such a window, which
+    /// `RegisterTargetWithMaintenanceWindow` registers and
+    /// `DeregisterTargetFromMaintenanceWindow` removes.
+    ///
+    /// Each one's identity is the id that service MINTS — the `mw-…` `WindowId` and the
+    /// target's own UUID — which is why `template::identity_is_service_assigned` names both
+    /// types and each create replaces the stand-in the naming rules computed
+    /// ([`ssm_maintenance_windows`]).
+    SsmMaintenanceWindow,
+    SsmMaintenanceWindowTarget,
     /// `AWS::SSM::Document`: a document of AWS Systems Manager — a command document, a
     /// runbook, a session document — which `CreateDocument` creates under the name the stack
     /// decided, `UpdateDocument` adds a new version to and `DeleteDocument` removes.
@@ -1164,6 +1176,10 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         RESOURCE_GROUPS_GROUP => Some(Provisioner::ResourceGroupsGroup),
         SSM_PARAMETER => Some(Provisioner::SsmParameter),
         SSM_ASSOCIATION => Some(Provisioner::SsmAssociation),
+        ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW => Some(Provisioner::SsmMaintenanceWindow),
+        ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW_TARGET => {
+            Some(Provisioner::SsmMaintenanceWindowTarget)
+        }
         ssm_documents::SSM_DOCUMENT => Some(Provisioner::SsmDocument),
         STEP_FUNCTIONS_ACTIVITY => Some(Provisioner::StepFunctionsActivity),
         SCHEDULER_SCHEDULE_GROUP => Some(Provisioner::SchedulerScheduleGroup),
@@ -1583,6 +1599,16 @@ impl Provisioner {
             // documents and managed nodes rather than the associations between them — so the
             // type is not taggable and no tags are propagated to one.
             Self::SsmAssociation => create_ssm_association(ctx, region, resource).await,
+            // `AWS::SSM::MaintenanceWindow` takes its own `Tags` property as a member of the
+            // create itself, and `AWS::SSM::MaintenanceWindowTarget` publishes no `Tags`
+            // property at all — Systems Manager tags the WINDOW, not the targets registered
+            // with it — so neither type has tags propagated to it here.
+            Self::SsmMaintenanceWindow => {
+                create_ssm_maintenance_window(ctx, region, resource).await
+            }
+            Self::SsmMaintenanceWindowTarget => {
+                create_ssm_maintenance_window_target(ctx, region, resource).await
+            }
             // `AWS::SSM::Document` publishes `Tags` as the `[{Key, Value}]` list most types
             // do, which is the shape `CreateDocument`'s own `Tags` member takes, so a
             // document a stack creates carries the tags CloudFormation gives it beside the
@@ -3256,6 +3282,16 @@ impl Provisioner {
             Self::SsmAssociation => {
                 delete_ssm_association(ctx, region, physical_resource_id).await
             }
+            // A window is addressed by the id Systems Manager minted for it, which is this
+            // resource's physical id; a TARGET is addressed by that window AND its own minted
+            // id, and only the resource's own record carries both, so that delete takes the
+            // record.
+            Self::SsmMaintenanceWindow => {
+                delete_ssm_maintenance_window(ctx, region, physical_resource_id).await
+            }
+            Self::SsmMaintenanceWindowTarget => {
+                delete_ssm_maintenance_window_target(ctx, region, resource).await
+            }
             // A document is addressed by its name, which is this resource's physical id.
             Self::SsmDocument => delete_ssm_document(ctx, region, physical_resource_id).await,
             Self::StepFunctionsActivity => {
@@ -3773,6 +3809,15 @@ impl Provisioner {
             Self::SsmAssociation => {
                 describe_ssm_association(ctx, region, physical_resource_id).await
             }
+            // Systems Manager's own read of the window the stack created, by the id it minted
+            // for it — and of the target, out of that window's own listing, which is the one
+            // read that service publishes for a target.
+            Self::SsmMaintenanceWindow => {
+                describe_ssm_maintenance_window(ctx, region, physical_resource_id).await
+            }
+            Self::SsmMaintenanceWindowTarget => {
+                describe_ssm_maintenance_window_target(ctx, region, resource).await
+            }
             // Systems Manager's own read of the document the stack created, by the name it was
             // created under.
             Self::SsmDocument => {
@@ -4148,6 +4193,9 @@ mod network_and_delivery;
 /// keyed by its own ARN rather than by a name.
 mod s3_table_buckets;
 mod ssm_associations;
+/// The AWS Systems Manager MAINTENANCE WINDOW arms: visible to the rest of this service's
+/// state because both types' own NAMES live here, beside the arms that provision them.
+pub(in crate::state) mod ssm_maintenance_windows;
 /// The AWS Systems Manager DOCUMENT arms: visible to the rest of this service's state because
 /// the type's own NAME lives here, beside the arms that provision it.
 pub(in crate::state) mod ssm_documents;
@@ -4171,6 +4219,7 @@ use rds_db_clusters::*;
 use redshift_parameter_groups::*;
 use redshift_snapshot_copy_grants::*;
 use ssm_associations::*;
+use ssm_maintenance_windows::*;
 use ssm_documents::*;
 use resource_groups::*;
 use compute_fleet::*;

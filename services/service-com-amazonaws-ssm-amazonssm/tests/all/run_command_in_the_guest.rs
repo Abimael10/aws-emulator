@@ -16,7 +16,8 @@
 //! instance became (`ec2_instance_managed_nodes`).
 //!
 //! The rows span what the rule generalises over: a script the guest performs, a script it
-//! cannot, a script that writes the machine's own storage and reads it back, several lines
+//! cannot, a script that writes the machine's own storage and reads it back, a script that
+//! names what that storage holds, several lines
 //! of output, and the parameter form the published document takes its script in.
 
 use std::time::{Duration, Instant, SystemTime};
@@ -112,7 +113,10 @@ async fn send(emulator: &Emulator, case: &str, instance: &str, commands: &[&str]
 /// so a case about WHAT the guest answered does not wait out the span — the same way this
 /// crate's other clock-owed suites move an owed instant through the store rather than
 /// sleeping for it. One case below leaves it alone and waits on the real clock instead.
-fn finish_due(emulator: &Emulator, command_id: &str) {
+pub(crate) fn finish_due(emulator: &Emulator, command_id: &str) {
+    // `pub(crate)`: the invocation-LISTING suite
+    // (`tests/all/command_invocation_listing.rs`) needs the same move, and a second copy of
+    // it would reach into the store a second way.
     let state = emulator.ssm_state();
     let mut store = state.lock();
     let command = store
@@ -197,6 +201,39 @@ async fn an_invocation_reports_what_the_guest_ran() {
             status: "Success",
             response_code: 0,
             output: "kept\n",
+        },
+        // The file utilities a script written against a machine's storage names: `touch`
+        // makes the file and `ls` writes the path back, which is how such a script checks
+        // that what it made is there.
+        ScriptCase {
+            case: "a script that makes a file and names it back",
+            commands: vec!["touch /tmp/made && ls /tmp/made"],
+            status: "Success",
+            response_code: 0,
+            output: "/tmp/made\n",
+        },
+        ScriptCase {
+            case: "a script that lists a directory of the machine's storage",
+            commands: vec![
+                "mkdir -p /tmp/listed",
+                "touch /tmp/listed/beta",
+                "touch /tmp/listed/alpha",
+                "ls /tmp/listed",
+            ],
+            status: "Success",
+            response_code: 0,
+            output: "alpha\nbeta\n",
+        },
+        // A path the machine does not hold is the utility's own failure, reported in its own
+        // wording. The guest's session reports ONE stream, so that diagnostic is what the
+        // invocation carries as its output — the same way the file utilities beside `ls`
+        // report a path they could not read.
+        ScriptCase {
+            case: "a script that names a path the machine does not hold",
+            commands: vec!["ls /tmp/not-there"],
+            status: "Failed",
+            response_code: 1,
+            output: "ls: cannot access '/tmp/not-there': No such file or directory\n",
         },
     ];
 

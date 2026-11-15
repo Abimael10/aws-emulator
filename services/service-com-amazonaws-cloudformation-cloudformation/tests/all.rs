@@ -505,6 +505,8 @@ mod signalling_instance_gates;
 mod ssm_association_resources;
 #[path = "all/ssm_document_resources.rs"]
 mod ssm_document_resources;
+#[path = "all/ssm_maintenance_windows.rs"]
+mod ssm_maintenance_windows;
 #[path = "all/ssm_typed_parameters.rs"]
 mod ssm_typed_parameters;
 #[path = "all/stack_bucket_website_configuration.rs"]

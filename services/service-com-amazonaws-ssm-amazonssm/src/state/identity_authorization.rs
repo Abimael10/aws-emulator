@@ -72,6 +72,28 @@ use ::service_common::iam_authorization::{self as iam, Decision};
 /// scoped to one resource cannot allow it while one covering the account's resources can.
 pub const ANY_RESOURCE: &str = "*";
 
+/// The ARN namespace Amazon EC2 mints an instance under, and the resource type an instance
+/// carries in it: an EC2 instance is `arn:aws:ec2:<region>:<account>:instance/<id>`, which is
+/// the resource "Resource types defined by AWS Systems Manager" names for the actions of this
+/// service that address a managed node (the `instance` resource type).
+const EC2_ARN_SERVICE: &str = "ec2";
+const EC2_INSTANCE_RESOURCE_TYPE: &str = "instance";
+
+/// The ARN of the EC2 instance `instance_id` names in `region` — the resource an
+/// authorization decision about a call addressed to that node is made against.
+///
+/// Built from the id the REQUEST carried, before anything is looked up, so the decision does
+/// not depend on whether that instance exists or is managed: a caller holding no grant must
+/// not learn from the refusal what the account holds.
+#[must_use]
+pub fn instance_resource(region: &str, instance_id: &str) -> String {
+    ::engine::emulator_arn(
+        EC2_ARN_SERVICE,
+        region,
+        &format!("{EC2_INSTANCE_RESOURCE_TYPE}/{instance_id}"),
+    )
+}
+
 /// The IAM action `operation` is performed under: `ssm:<OperationName>` ("Actions defined
 /// by AWS Systems Manager", IAM Service Authorization Reference), whose prefix is this
 /// service's own ARN namespace ([`super::ARN_SERVICE`]).

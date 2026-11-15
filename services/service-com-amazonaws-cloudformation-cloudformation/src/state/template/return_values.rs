@@ -449,6 +449,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // association ID" publishes and what `DescribeAssociation`, `UpdateAssociation` and
         // `DeleteAssociation` each take.
         || resource_type == SSM_ASSOCIATION
+        // A MAINTENANCE WINDOW and a target registered with one are two more:
+        // `CreateMaintenanceWindow` takes the window's schedule and the `Name` it is CALLED
+        // by and answers the `mw-…` `WindowId` Systems Manager minted, and
+        // `RegisterTargetWithMaintenanceWindow` takes no identifier for the target at all and
+        // answers the `WindowTargetId` it minted — each the handle every call on that
+        // resource takes, and neither a value a naming rule here could compute.
+        || resource_type == crate::state::provisioner::ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW
+        || resource_type
+            == crate::state::provisioner::ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW_TARGET
         // An IAM access key is one more: "Ref returns the AWS::IAM::AccessKey resource's
         // access key ID", `CreateAccessKey` takes no identifier — the declaration states
         // only the user the key belongs to — and that id is what every IAM operation on a

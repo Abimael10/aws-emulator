@@ -2739,6 +2739,14 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // A maintenance window TARGET belongs to the window it was registered with and is of
+        // the kind the register stated: `WindowId` addresses the target rather than being a
+        // value of it, and `ResourceType` is a member of the register and of no update
+        // (`UpdateMaintenanceWindowTarget` takes the targets, the owner information, the name
+        // and the description), so a declaration restating either asks for a different target.
+        crate::state::provisioner::ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW_TARGET => {
+            &["ResourceType", "WindowId"]
+        }
         // An Amplify UI Builder component, form or theme belongs to the app environment its
         // `AppId` and `EnvironmentName` name: both are URI labels of every call on one — the
         // create included — and that service publishes no call that moves an entity to another

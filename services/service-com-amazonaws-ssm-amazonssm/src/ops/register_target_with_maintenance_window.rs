@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterTargetWithMaintenanceWindow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterTargetWithMaintenanceWindow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Register a target with a maintenance window — the write half of this service's
+//! maintenance-window target slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterTargetWithMaintenanceWindow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it persists is read back by `DescribeMaintenanceWindowTargets` and removed by
+//! `DeregisterTargetFromMaintenanceWindow`; all three reach the one store in
+//! [`crate::state::maintenance_window_targets`]. The register resolves ONE thing from state:
+//! the WINDOW the target is registered with, which has to be a window the Region holds — "the
+//! ID of the maintenance window the target should be registered with" names a window, so an
+//! id no window of this endpoint carries is refused `DoesNotExistException` and nothing is
+//! written.
+//!
+//! The `Targets` the register states are CRITERIA rather than identities ("you can specify
+//! targets using managed node IDs, resource group names, or tags that have been applied to
+//! managed nodes"): criteria describing no node today may describe one tomorrow, which is the
+//! point of registering them with a window that runs later, so they are held as stated rather
+//! than resolved here.
+//!
+//! The id is the SERVICE's to choose — no input member carries one — and a retry carrying the
+//! same `ClientToken` reports the target that register already minted rather than minting a
+//! second one.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +182,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterTargetWithMaintenanceWindow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterTargetWithMaintenanceWindowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterTargetWithMaintenanceWindow"))
+        use crate::state::maintenance_window_targets::MaintenanceWindowTargetRecord;
+
+        // `WindowId`'s length and pattern, `ResourceType`'s enum, the `Targets` list's
+        // length, `Name`'s pattern and every length are MODELLED constraints, so the
+        // centralized walk has already refused anything outside them: what is resolved here
+        // is which window the target is registered with.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterTargetWithMaintenanceWindowErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the maintenance window store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A window lives in the Region its endpoint names, which is the signed credential
+        // scope's — so the window id is resolved against that Region's records.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let mut record = MaintenanceWindowTargetRecord {
+            // Replaced by the minted id below, once this register is known to be one.
+            window_target_id: String::new(),
+            region: region.clone(),
+            window_id: input.window_id,
+            resource_type: input.resource_type,
+            targets: input.targets,
+            owner_information: input.owner_information,
+            name: input.name,
+            description: input.description,
+            client_token: input.client_token,
+            registered_at: now,
+        };
+
+        // "User-provided idempotency token": a retry of one register reports the target that
+        // register already minted, and the same token carrying different members is another
+        // call rather than a retry. Decided before the window is resolved, so a retry is
+        // answered the way the call it retries was.
+        if let Some(token) = record.client_token.clone() {
+            if let Some(held) = store.maintenance_window_target_with_client_token(&region, &token) {
+                if held.registration_fingerprint() != record.registration_fingerprint() {
+                    // The modelled shape's `Message` is optional and this service states
+                    // this refusal through its error code alone, the way its sibling create
+                    // does.
+                    return Err(
+                        RegisterTargetWithMaintenanceWindowErrorModeled::IdempotentParameterMismatch(
+                            IdempotentParameterMismatch { message: None },
+                        )
+                        .into(),
+                    );
+                }
+                return Ok(RegisterTargetWithMaintenanceWindowOutput {
+                    window_target_id: Some(held.window_target_id.clone()),
+                });
+            }
+        }
+
+        // The window the target is registered WITH has to exist: a target of a window this
+        // endpoint holds none of would be a target nothing could ever run.
+        if store
+            .maintenance_window(&region, &record.window_id)
+            .is_none()
+        {
+            return Err(
+                RegisterTargetWithMaintenanceWindowErrorModeled::DoesNotExistException(
+                    DoesNotExistException {
+                        message: Some(
+                            crate::state::maintenance_windows::maintenance_window_not_found_message(
+                                &record.window_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is BOUNDED: past the emulator's own ceiling a register is refused rather
+        // than admitting another record, through the modelled refusal for exactly that.
+        if !store.can_hold_another_maintenance_window_target(&region, &record.window_id) {
+            return Err(
+                RegisterTargetWithMaintenanceWindowErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        message: Some(
+                            crate::state::maintenance_window_targets::target_ceiling_message(
+                                &record.window_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The id is the SERVICE's to choose, in the one form the model admits: the
+        // 8-4-4-4-12 hexadecimal `MaintenanceWindowTargetId`, minted by the crate's one
+        // minter of that form.
+        record.window_target_id = crate::state::new_uuid();
+        let window_target_id = record.window_target_id.clone();
+        store.insert_maintenance_window_target(record);
+
+        // "The ID of the target definition in this maintenance window": the id this call
+        // minted, which is the key the target is now held under.
+        Ok(RegisterTargetWithMaintenanceWindowOutput {
+            window_target_id: Some(window_target_id),
+        })
     }
 }

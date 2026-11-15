@@ -89,7 +89,8 @@
 //! session's — and a session that HAS one performs the forms a program inside a machine is
 //! written in, over that tree and nothing else:
 //!
-//! * the file utilities ([`VOLUME_COMMANDS`]) beside the session-local catalog;
+//! * the file utilities ([`VOLUME_COMMANDS`]) beside the session-local catalog, which name
+//!   what the tree holds as well as change it;
 //! * the redirections that reach the tree's other descriptors: standard error to a file or a
 //!   device, and standard input from one;
 //! * arithmetic expansion ([`super::posix_shell_arithmetic`]), which is how such a program
@@ -308,7 +309,8 @@ pub trait ProgramFiles {
 /// their names.
 ///
 /// Each one's whole effect is inside the session and the tree it works over: `printf` writes
-/// one line of output, `mkdir`, `touch` and `rm` change the tree, `test` (and its `[`
+/// one line of output, `mkdir`, `touch` and `rm` change the tree, `ls` names what the tree
+/// holds, `test` (and its `[`
 /// spelling) answers a question about it, `sh` performs a program in this same session —
 /// `sh -c PROGRAM` the text it was given and `sh FILE` the script the TREE holds at that
 /// path, which is how a machine's init system runs one line and how a script left in the
@@ -320,8 +322,15 @@ pub trait ProgramFiles {
 /// environment with storage of its own has, and such a session's tree is only the files its
 /// redirections left.
 pub const VOLUME_COMMANDS: &[&str] = &[
-    "printf", "mkdir", "touch", "rm", "test", "[", "sh", "bash", ".", "source", "sleep",
+    "printf", "mkdir", "touch", "rm", LIST_COMMAND, "test", "[", "sh", "bash", ".", "source",
+    "sleep",
 ];
+
+/// The one command of [`VOLUME_COMMANDS`] that only READS the tree, and so the one an
+/// environment's own program for that name takes precedence over
+/// ([`ShellSession::run_built_in`]): a caller whose storage has its own catalog of names
+/// answers `ls` out of that catalog.
+const LIST_COMMAND: &str = "ls";
 
 /// The commands an assignment written before them persists in the session for: POSIX's
 /// special built-in utilities, for which "variable assignments specified with special
@@ -1774,6 +1783,18 @@ impl ShellSession {
                 return self.run_text_filter(name, arguments, redirections);
             }
             if (self.volume.is_some() || self.working_tree) && VOLUME_COMMANDS.contains(&name) {
+                // `ls` NAMES what the tree holds rather than changing it, and an environment
+                // whose storage has its own catalog provides its own program for that name —
+                // which this must not shadow, the same precedence the text filters above
+                // take. The file utility is what a session whose environment provides none
+                // falls back to.
+                if name == LIST_COMMAND {
+                    if let Some(status) =
+                        self.performed_environment_program(name, arguments, redirections)
+                    {
+                        return status;
+                    }
+                }
                 return self.run_volume_command(name, arguments, redirections);
             }
             return self.run_environment_program(name, arguments, redirections);
@@ -1842,6 +1863,7 @@ impl ShellSession {
     /// `printf` writes its format with its arguments substituted. `mkdir` makes a
     /// directory (`-p` makes the ones above it too), `touch` makes an empty file where the
     /// tree holds none, and `rm` removes a file (`-f` passes over one that is not there).
+    /// `ls` writes the names the tree holds at the paths it was given ([`Self::run_list`]).
     /// `test`, and its `[` spelling, answers a question about the tree or about two values.
     /// `sh -c` performs a program in THIS session, which is how a machine's init system
     /// runs one line of a script, `sh FILE` performs the script the tree holds at that path
@@ -1860,6 +1882,7 @@ impl ShellSession {
             "mkdir" => self.run_mkdir(arguments, redirections),
             "touch" => self.run_touch(arguments, redirections),
             "rm" => self.run_remove(arguments, redirections),
+            "ls" => self.run_list(arguments, redirections),
             "test" | "[" => self.run_test(name, arguments),
             "sh" | "bash" => self.run_nested_program(arguments, redirections),
             "." | "source" => self.run_dot(arguments, redirections),
@@ -2131,6 +2154,87 @@ impl ShellSession {
             }
         }
         status
+    }
+
+    /// `ls`: the names the tree holds at the paths the command was given, one per line.
+    ///
+    /// "For each operand that names a file of a type other than directory … `ls` shall write
+    /// the name of the file"; for one that names a directory it writes "the names of files
+    /// contained within" it, and "if no operands are given, the contents of the current
+    /// directory shall be written" — which is the tree's own root here, the directory every
+    /// path of this tree is relative to. Several operands are written as blocks separated by a
+    /// blank line, each directory's block headed by its own path, and the names are sorted,
+    /// which is the order this utility is specified to write them in.
+    ///
+    /// An operand the tree holds nothing at is reported on standard error in the utility's own
+    /// wording and leaves the command answering failure, the way the file utilities beside it
+    /// report one. Every option but `-1` — which asks for the one-name-per-line form this
+    /// command already writes — is a form this session does not perform: a long listing's
+    /// modes, owners and sizes are facts no tree here holds.
+    fn run_list(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
+        let mut operands: Vec<String> = Vec::new();
+        for argument in arguments {
+            if argument == "-1" {
+                continue;
+            }
+            if argument.len() > 1 && argument.starts_with('-') {
+                return self.config.statuses.could_not_run;
+            }
+            operands.push(argument.clone());
+        }
+        operands.sort();
+        let mut status = self.config.statuses.success;
+        let mut blocks: Vec<String> = Vec::new();
+        if operands.is_empty() {
+            blocks.push(self.listed_names(""));
+        } else {
+            // A file operand is written as the caller spelled it, and all of them together
+            // make the first block — the order `ls` writes a mixed list of operands in.
+            let mut named = String::new();
+            let mut directories: Vec<(String, String)> = Vec::new();
+            for path in &operands {
+                if self.tree_holds_directory(path) {
+                    let names = self.listed_names(path);
+                    directories.push((path.clone(), names));
+                } else if self.tree_holds(path) {
+                    named.push_str(path);
+                    named.push('\n');
+                } else {
+                    let _ = self.write_stderr(
+                        &format!("ls: cannot access '{path}': No such file or directory\n"),
+                        redirections,
+                    );
+                    status = self.config.statuses.failure;
+                }
+            }
+            let headed = operands.len() > 1;
+            if !named.is_empty() {
+                blocks.push(named);
+            }
+            for (path, names) in directories {
+                if headed {
+                    blocks.push(format!("{path}:\n{names}"));
+                } else {
+                    blocks.push(names);
+                }
+            }
+        }
+        // Each block already ends in a newline, so joining them with one leaves the blank
+        // line `ls` separates two blocks with.
+        let written = blocks.join("\n");
+        if !written.is_empty() && !self.write_stdout(&written, redirections) {
+            return self.config.statuses.failure;
+        }
+        status
+    }
+
+    /// The names directly under the directory `path` names, one per line — what [`Self::run_list`]
+    /// writes for a directory operand.
+    fn listed_names(&self, path: &str) -> String {
+        self.tree_entry_names(path)
+            .into_iter()
+            .map(|name| format!("{name}\n"))
+            .collect()
     }
 
     /// `test` / `[`: the question its arguments ask, answered as a status — success for

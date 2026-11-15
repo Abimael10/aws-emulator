@@ -45,6 +45,8 @@ mod document_versions;
 mod cloud_connectors;
 #[path = "all/command_history.rs"]
 mod command_history;
+#[path = "all/command_invocation_listing.rs"]
+mod command_invocation_listing;
 #[path = "all/default_patch_baselines.rs"]
 mod default_patch_baselines;
 #[path = "all/documents.rs"]
@@ -69,6 +71,8 @@ mod instance_properties;
 mod just_in_time_node_access;
 #[path = "all/maintenance_windows.rs"]
 mod maintenance_windows;
+#[path = "all/maintenance_window_targets.rs"]
+mod maintenance_window_targets;
 #[path = "all/managed_node_filter_validation.rs"]
 mod managed_node_filter_validation;
 #[path = "all/managed_node_iam_role.rs"]
@@ -153,6 +157,8 @@ mod run_command;
 mod run_command_in_the_guest;
 #[path = "all/secretsmanager_reference.rs"]
 mod secretsmanager_reference;
+#[path = "all/send_command_authorization.rs"]
+mod send_command_authorization;
 #[path = "all/secure_string_decryption.rs"]
 mod secure_string_decryption;
 #[path = "all/secure_string_encryption_at_rest.rs"]

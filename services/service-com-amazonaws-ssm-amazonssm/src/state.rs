@@ -136,7 +136,12 @@
 //! read reports. What the window will DO is not stored but read from its schedule: the
 //! next execution is the first instant that cron or rate expression names inside the
 //! interval the window is active over
-//! ([`maintenance_windows::MaintenanceWindowRecord::next_execution_time`]).
+//! ([`maintenance_windows::MaintenanceWindowRecord::next_execution_time`]). The **targets**
+//! a window's tasks run against ([`maintenance_window_targets`]) hang off the same key
+//! space, keyed by `(region, window target id)`:
+//! `RegisterTargetWithMaintenanceWindow` mints one against a window the Region holds,
+//! `DescribeMaintenanceWindowTargets` reports that window's own, and
+//! `DeregisterTargetFromMaintenanceWindow` removes it.
 //!
 //! Then the **execution previews** ([`execution_previews`]), keyed by
 //! `(region, execution preview id)`: `StartExecutionPreview` works out what running an
@@ -269,6 +274,10 @@ pub mod resource_data_syncs;
 /// The maintenance windows this service holds: the record a create persists, the schedule
 /// grammar it is held to, and the instants that schedule names.
 pub mod maintenance_windows;
+
+/// The targets registered with a maintenance window: the record a register persists, and how
+/// a describe and a deregister address one.
+pub mod maintenance_window_targets;
 
 /// The account-level settings the Systems Manager service teams provision, which
 /// `GetServiceSetting` reports and `UpdateServiceSetting`/`ResetServiceSetting` modify.
@@ -3538,6 +3547,16 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// two windows of one store never carry one id.
     pub maintenance_window_sequence: u64,
 
+    /// Every target registered with a maintenance window, keyed by
+    /// `(region, window target id)`: a target is registered through the endpoint of the
+    /// Region its window lives in and is identified there by the id the register minted,
+    /// with the window it belongs to on the record. A `BTreeMap` so a listing walks a
+    /// stable, total order. See [`maintenance_window_targets`].
+    pub maintenance_window_targets: BTreeMap<
+        (String, String),
+        maintenance_window_targets::MaintenanceWindowTargetRecord,
+    >,
+
     /// Every Session Manager session, keyed by `(region, session id)`: a session is started
     /// through one Region's endpoint and is reached there by the id the start minted
     /// ([`sessions::mint_session_id`]). A `BTreeMap` so a report walks a stable, total
@@ -3589,6 +3608,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             access_request_sequence: 0,
             maintenance_windows: BTreeMap::new(),
             maintenance_window_sequence: 0,
+            maintenance_window_targets: BTreeMap::new(),
             sessions: BTreeMap::new(),
             // One key per store, from the system's randomness: see `parameter_pagination`.
             page_token_key: parameter_pagination::PageTokenKey::new(),

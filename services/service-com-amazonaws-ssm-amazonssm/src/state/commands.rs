@@ -33,8 +33,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AlarmConfiguration, CloudWatchOutputConfig, Command, CommandInvocation, DocumentParameter,
-    NotificationConfig, Target,
+    AlarmConfiguration, CloudWatchOutputConfig, Command, CommandInvocation, CommandPlugin,
+    DocumentParameter, NotificationConfig, Target,
 };
 use super::ManagedNodeRecord;
 
@@ -293,6 +293,26 @@ impl CommandInvocationRecord {
         self.status = outcome.status().to_string();
         self.status_details = outcome.status_details().to_string();
     }
+
+    /// What the node's agent RAN for this invocation, once the clock has made its move off
+    /// `Pending` due and a guest really took it — and `None` otherwise, because an
+    /// invocation nothing has finished has no exit code and no output a plugin produced.
+    pub fn ran(&self) -> Option<&InvocationOutcome> {
+        let finished = TERMINAL_INVOCATION_STATUSES.contains(&self.status.as_str());
+        self.outcome
+            .as_ref()
+            .filter(|outcome| finished && outcome.delivered)
+    }
+
+    /// Whether a `Status` filter value selects this invocation.
+    ///
+    /// An invocation carries the two readings of its status a command does — the modelled
+    /// `CommandInvocationStatus` and the detailed status `CommandInvocation$StatusDetails`
+    /// spells in words ("Delivery Timed Out") — and the documented filter values carry no
+    /// spaces, so a value selects it when it names either.
+    pub fn matches_status_filter(&self, value: &str) -> bool {
+        self.status == value || self.status_details.replace(' ', "") == value
+    }
 }
 
 /// A command as this store holds it: the request as Systems Manager received it, and the
@@ -530,9 +550,40 @@ impl CommandRecord {
         }
     }
 
+    /// Whether the filter `key`=`value` selects ONE invocation of this command.
+    ///
+    /// Every key but the status narrows by a property of the COMMAND — when it was
+    /// requested and which document it runs are facts of the command, shared by each of its
+    /// invocations — so those are read through [`Self::matches_filter`]. The status is the
+    /// INVOCATION's: "ListCommandInvocations provide status about command execution", and an
+    /// invocation of a command reaches its own status, which is what a caller narrowing a
+    /// listing of invocations by status is asking about.
+    pub fn matches_invocation_filter(
+        &self,
+        invocation: &CommandInvocationRecord,
+        key: &str,
+        value: &str,
+    ) -> bool {
+        match key {
+            COMMAND_FILTER_KEY_STATUS => invocation.matches_status_filter(value),
+            other => self.matches_filter(other, value),
+        }
+    }
+
     /// The modelled `CommandInvocation` for one node's invocation of this command — the
     /// command's own members plus that invocation's status.
-    pub fn to_command_invocation(&self, invocation: &CommandInvocationRecord) -> CommandInvocation {
+    ///
+    /// `details` is what "If set this returns the response of the command executions and any
+    /// command output" (`ListCommandInvocationsRequest$Details`) asks for: the per-step
+    /// results of the invocation, which are reported only for a step that has RUN
+    /// ([`CommandInvocationRecord::ran`]) — an invocation nothing has finished has no exit
+    /// code or output a plugin produced.
+    pub fn to_command_invocation(
+        &self,
+        invocation: &CommandInvocationRecord,
+        details: bool,
+    ) -> CommandInvocation {
+        let ran = invocation.ran();
         CommandInvocation {
             command_id: Some(self.command_id.clone()),
             instance_id: Some(invocation.instance_id.clone()),
@@ -543,17 +594,77 @@ impl CommandRecord {
             requested_date_time: Some(::aws_smithy_types::DateTime::from(self.requested_at)),
             status: Some(invocation.status.clone()),
             status_details: Some(invocation.status_details.clone()),
-            // The trace output, the output URLs and the per-step results come from a step
-            // that ran on the node; nothing has been delivered, so there are none.
+            // "Gets the trace output sent by the agent" (`CommandInvocation$TraceOutput`):
+            // the agent in the guest reports the one stream the session has — what the
+            // program wrote — so there is no second, diagnostic stream to report, and the
+            // URLs name files a plugin wrote to Amazon S3, of which there are none.
             trace_output: None,
-            standard_output_url: None,
-            standard_error_url: None,
-            command_plugins: None,
+            standard_output_url: Some(String::new()),
+            standard_error_url: Some(String::new()),
+            // The per-step results, which are only asked for.
+            command_plugins: details
+                .then(|| {
+                    ran.map(|ran| {
+                        vec![self.to_command_plugin(ran)]
+                    })
+                })
+                .flatten(),
             service_role: self.service_role.clone(),
             notification_config: self.notification_config.clone(),
             cloud_watch_output_config: self.cloud_watch_output_config.clone(),
         }
     }
+
+    /// The modelled `CommandPlugin` for the step that RAN on one node: "describes plugin
+    /// details" — the step's name, the status it left the invocation in, the exit code it
+    /// answered, when it ran and what it wrote.
+    ///
+    /// The one plugin an invocation of this emulator reports is the step the node's agent
+    /// performed ([`InvocationOutcome::plugin_name`]): a document declaring several steps
+    /// still has exactly one its platform runs ([`super::guest_execution::shell_step`]), so
+    /// there is no second step with a status of its own.
+    fn to_command_plugin(&self, ran: &InvocationOutcome) -> CommandPlugin {
+        CommandPlugin {
+            name: Some(ran.plugin_name.clone()),
+            status: Some(ran.status().to_string()),
+            status_details: Some(ran.status_details().to_string()),
+            response_code: ran.response_code,
+            // The agent took the command when it was sent and its run was owed to have
+            // finished at the invocation's own due instant.
+            response_start_date_time: Some(::aws_smithy_types::DateTime::from(self.requested_at)),
+            response_finish_date_time: Some(::aws_smithy_types::DateTime::from(ran.due_at)),
+            output: Some(truncated_plugin_output(&ran.standard_output())),
+            // The URLs name the files a plugin wrote to Amazon S3: "if the S3 bucket for the
+            // command wasn't specified, then this string is empty"
+            // (`CommandPlugin$StandardOutputUrl`), and nothing here writes one.
+            standard_output_url: Some(String::new()),
+            standard_error_url: Some(String::new()),
+            // "(Deprecated) You can no longer specify this parameter. The system ignores
+            // it" (`CommandPlugin$OutputS3Region`).
+            output_s3_region: None,
+            output_s3_bucket_name: self.output_s3_bucket_name.clone(),
+            output_s3_key_prefix: self.output_s3_key_prefix.clone(),
+        }
+    }
+}
+
+/// How many bytes of a plugin's output one `CommandPlugin` carries: the modelled length of
+/// `CommandPlugin$Output` (`len 0..2500`), past which the member could not hold what the
+/// guest wrote. The whole of it is what `GetCommandInvocation`'s `StandardOutputContent`
+/// reports.
+const MAX_PLUGIN_OUTPUT_BYTES: usize = 2_500;
+
+/// `output` cut to [`MAX_PLUGIN_OUTPUT_BYTES`], on a character boundary so the member still
+/// carries text.
+fn truncated_plugin_output(output: &str) -> String {
+    if output.len() <= MAX_PLUGIN_OUTPUT_BYTES {
+        return output.to_string();
+    }
+    let mut cut = MAX_PLUGIN_OUTPUT_BYTES;
+    while cut > 0 && !output.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    output[..cut].to_string()
 }
 
 /// The ids of the nodes `region` holds that one target selects, or `Err(key)` when the

@@ -21,6 +21,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508 as iam;
 use service_com_amazonaws_ssm_amazonssm as ssm;
+use service_com_amazonaws_sts_awssecuritytokenservicev20110615 as sts;
 
 /// The Region every call is signed for unless a case says otherwise.
 pub(crate) const REGION: &str = "us-west-2";
@@ -30,6 +31,14 @@ const EC2_API_VERSION: &str = "2016-11-15";
 
 /// The IAM API version an `awsQuery` body carries.
 const IAM_API_VERSION: &str = "2010-05-08";
+
+/// The AWS STS API version an `awsQuery` body carries, for the suite that signs a call as a
+/// principal of its own rather than as the account's published credential.
+const STS_API_VERSION: &str = "2011-06-15";
+
+/// The access key id every call of this harness presents unless a case names another: one
+/// neither STS nor IAM holds a record for, which resolves to the account's own identity.
+const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
 
 /// The `X-Amz-Target` prefix from the crate's `OPERATIONS.md` wire-protocol section.
 const TARGET_PREFIX: &str = "AmazonSSM";
@@ -80,6 +89,10 @@ impl Emulator {
         router.register_service(ssm::EmulatedService::new(Arc::clone(&engine)));
         router.register_service(ec2::EmulatedService::new(Arc::clone(&engine)));
         router.register_service(iam::EmulatedService::new(Arc::clone(&engine)));
+        // AWS STS, so a case can sign a call as a principal of its own: the identity a
+        // request speaks for is resolved from the access key id it signed with, which is the
+        // same place `sts:GetCallerIdentity` answers from.
+        router.register_service(sts::EmulatedService::new(Arc::clone(&engine)));
         Self { engine, router }
     }
 
@@ -120,6 +133,30 @@ impl Emulator {
         body
     }
 
+    /// One `awsQuery` AWS STS call, which must be served.
+    pub(crate) async fn sts(&self, case: &str, action: &str, params: &[(&str, &str)]) -> String {
+        let (status, body) = self
+            .form(
+                &format!("https://sts.{REGION}.amazonaws.com/"),
+                "sts",
+                STS_API_VERSION,
+                action,
+                params,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: STS {action} must be served, got {status}: {body}"
+        );
+        body
+    }
+
+    /// The text of the first `<tag>` element of an XML answer — the id or ARN a setup call
+    /// answered with.
+    pub(crate) fn answered(body: &str, tag: &str) -> Option<String> {
+        elements(body, tag).into_iter().next()
+    }
+
     /// One form-encoded POST, as both of those wires carry.
     async fn form(
         &self,
@@ -150,24 +187,50 @@ impl Emulator {
 
     /// One Systems Manager call signed for `region`.
     pub(crate) async fn ssm(&self, region: &str, operation: &str, body: &Value) -> (u16, Value) {
+        self.ssm_as(ACCOUNT_KEY, region, operation, body).await
+    }
+
+    /// The same call, signed with `access_key_id` in the credential scope — which is where a
+    /// service reads WHO the caller is.
+    pub(crate) async fn ssm_as(
+        &self,
+        access_key_id: &str,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
             .header("host", format!("ssm.{region}.amazonaws.com"))
             .header("content-type", "application/x-amz-json-1.1")
             .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-            .header("authorization", authorization("ssm", region))
+            .header(
+                "authorization",
+                authorization_as(access_key_id, "ssm", region),
+            )
             .body(Bytes::from(
                 serde_json::to_vec(body).expect("serialize the request body"),
             ))
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
-        let parsed: Value = if response.body().is_empty() {
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let mut parsed: Value = if response.body().is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(response.body()).unwrap_or(Value::Null)
         };
+        // The error shape travels in `__type`; fold in the header the framework also sets so
+        // one accessor reads either.
+        if let (Some(error_type), Value::Object(map)) = (error_type, &mut parsed) {
+            map.entry("__type")
+                .or_insert_with(|| Value::String(error_type));
+        }
         (status, parsed)
     }
 
@@ -305,9 +368,15 @@ impl Emulator {
 /// picks the service out and where each service reads the Region from. The harness switches
 /// request authentication off, so the signature itself is never verified.
 fn authorization(signing_name: &str, region: &str) -> String {
+    authorization_as(ACCOUNT_KEY, signing_name, region)
+}
+
+/// [`authorization`] presenting `access_key_id`: the credential scope is also where a service
+/// reads WHO the caller is, so a case that signs as a principal of its own names its key here.
+fn authorization_as(access_key_id: &str, signing_name: &str, region: &str) -> String {
     format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/{signing_name}/aws4_request, \
-         SignedHeaders=host, Signature=00"
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/{signing_name}/\
+         aws4_request, SignedHeaders=host, Signature=00"
     )
 }
 

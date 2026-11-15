@@ -5,7 +5,17 @@
 //! This is the ONLY file to touch for this operation.
 //!
 //! What it persists is read back by `GetCommandInvocation`; both reach the one store in
-//! [`crate::state::commands`]. The send resolves three things from state and refuses what
+//! [`crate::state::commands`].
+//!
+//! A send is a signed call, so it is decided against the CALLER's own identity-based IAM
+//! policies first ([`crate::state::identity_authorization`]): the action is this operation's
+//! own (`ssm:SendCommand`) and the resource is the EC2 instance ARN of each node the request
+//! NAMES — the account's resources for one that names none and describes its nodes instead.
+//! A caller no readable document allows is refused `AccessDeniedException` before anything is
+//! resolved and before a command is minted, so the refusal does not depend on what the
+//! account holds.
+//!
+//! The send then resolves three things from state and refuses what
 //! it cannot resolve:
 //!
 //! * the DOCUMENT, by name or by its ARN, among the documents the Region holds and the
@@ -154,6 +164,8 @@
 //!
 //! ## Errors
 //!
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   requester doesn't have permissions to perform the requested operation.
 //! * `DuplicateInstanceId` (HTTP 400) — You can't specify a managed node ID in more than one
 //!   association.
 //! * `InternalServerError` (HTTP 500) — An error occurred on the server side.
@@ -196,9 +208,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `SendCommandError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#SendCommand")]
+//
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models the
+// shape — "the requester doesn't have permissions to perform the requested operation" — and
+// a send is a signed call the caller's own identity policies decide, which is the refusal
+// such a caller is answered with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#SendCommand",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum SendCommandErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     DuplicateInstanceId(DuplicateInstanceId),
     InternalServerError(InternalServerError),
     InvalidDocument(InvalidDocument),
@@ -275,6 +296,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The caller's own identity-based policies decide this call before anything is
+        // resolved and before anything is written, about the node the command is addressed
+        // to — so the refusal does not depend on whether that node exists or is managed, and
+        // a refused send mints no command. A send that names several nodes addresses each of
+        // them, so each is decided; one that names none describes its nodes instead, which
+        // addresses the account's resources rather than one record.
+        let signed_for = crate::state::request_region(ctx.parts());
+        let addressed: Vec<String> = match input.instance_ids.as_deref().unwrap_or_default() {
+            [] => vec![crate::state::identity_authorization::ANY_RESOURCE.to_string()],
+            named => named
+                .iter()
+                .map(|id| {
+                    crate::state::identity_authorization::instance_resource(&signed_for, id)
+                })
+                .collect(),
+        };
+        for resource in &addressed {
+            if let Some(message) = crate::state::identity_authorization::refusal(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                resource,
+            ) {
+                return Err(SendCommandErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message },
+                )
+                .into());
+            }
+        }
+
         // "The ARN of the Identity and Access Management (IAM) service role to use to
         // publish … notifications" (`ServiceRoleArn`): a value that is not an IAM role
         // ARN names no role to publish them with.
@@ -322,7 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before anything here resolves against the store. The account holds the documents
         // a caller created here AND the ones Systems Manager publishes, so a name the
         // catalogue carries resolves without any create.
-        let region = crate::state::request_region(ctx.parts());
+        let region = signed_for;
         let now = ::std::time::SystemTime::now();
         // The registration an instance of this Region had already made by now was owed at
         // the same instant whether or not anybody called, and a send resolves its nodes

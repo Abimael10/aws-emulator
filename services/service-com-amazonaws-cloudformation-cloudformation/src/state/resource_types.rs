@@ -79,6 +79,7 @@
 //! template is admitted, and its resources are recorded as declared.
 
 use super::provisioner::redshift_snapshot_copy_grants::REDSHIFT_SNAPSHOT_COPY_GRANT;
+use super::provisioner::ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW_TARGET;
 use super::template::{
     DeclaredResource, Template, ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY,
     ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION, ACMPCA_PERMISSION, AMPLIFYUIBUILDER_COMPONENT,
@@ -836,6 +837,10 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::SSM::Association",
     "AWS::SSM::Document",
     "AWS::SSM::MaintenanceWindow",
+    // The target a maintenance window's tasks run against, which the resource reference
+    // publishes beside the window itself and which this emulator registers in that service
+    // (`super::provisioner::ssm_maintenance_windows`).
+    SSM_MAINTENANCE_WINDOW_TARGET,
     "AWS::SSM::Parameter",
     "AWS::SSM::PatchBaseline",
     "AWS::SSM::ResourceDataSync",
