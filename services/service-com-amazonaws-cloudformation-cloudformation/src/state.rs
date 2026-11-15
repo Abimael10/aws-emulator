@@ -463,6 +463,10 @@ pub mod stack_set_rollout;
 /// instance ([`stack_set_events`]).
 pub mod stack_set_events;
 
+/// What the STACKS of a deployment's stack instances make due for the operation that
+/// deployed them.
+pub mod stack_set_instance_outcomes;
+
 /// The DRIFT DETECTION status-change events this service publishes onto the account's
 /// default EventBridge bus: one per status a drift detection reaches ([`drift_events`]).
 pub mod drift_events;
@@ -2418,6 +2422,9 @@ impl ComAmazonawsCloudformationCloudformationState {
         for refactor in &mut self.stack_refactors {
             refactor.settle(now);
         }
+        // A deployment's own conclusion is its instances' stacks' ([`stack_set_instance_outcomes`]):
+        // carried into the operations in flight before each stack set concludes them.
+        self.settle_stack_set_instance_outcomes(now);
         for stack_set in &mut self.stack_sets {
             stack_set.settle(now);
         }

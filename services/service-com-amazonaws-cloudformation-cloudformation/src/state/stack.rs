@@ -2360,6 +2360,11 @@ impl StoredStack {
         };
         let failed_status = failed_status_of(&self.status);
         let updating = self.status == status::UPDATE_IN_PROGRESS;
+        // The RESOURCE the wait was for is what the operation could not get through, recorded
+        // before the barriers are retired and before the failure below flushes the walk: a
+        // wait that ran out is not a resource that came up
+        // ([`Self::fail_expired_wait_resources`]).
+        self.fail_expired_wait_resources(now, &reason);
         self.wait_conditions.clear();
         // The UPDATE whose rollback is opened right below never rests in the failed status,
         // so no event of the stack's reports it ([`Self::fail_transition_superseded`]);

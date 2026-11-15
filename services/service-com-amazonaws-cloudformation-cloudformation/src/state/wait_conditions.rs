@@ -468,40 +468,11 @@ impl super::StoredStack {
             })?;
         let creating = self.status == super::status::CREATE_IN_PROGRESS;
         let updating = self.status == super::status::UPDATE_IN_PROGRESS;
-        // A ROLLBACK is the third operation a wait can run out in: it deploys the previous
-        // configuration, so a wait condition it puts back waits as any deployment's does.
-        let rolling_back = !creating && !updating;
         let failed_status = failed_status(&self.status);
         // The RESOURCE the wait was for did not come up: its own terminal event becomes that
         // failure rather than the completion the walk had planned for it, so the event stream
-        // says which resource the operation failed at and why — the same rewrite a resource
-        // its owning service never got ready gets
-        // ([`super::StoredStack::fail_stabilisation`]).
-        let expired: Vec<String> = self
-            .wait_conditions
-            .iter()
-            .filter(|barrier| barrier.has_expired(now) && !self.barrier_satisfied(barrier))
-            .map(|barrier| barrier.logical_id().to_string())
-            .collect();
-        for logical_id in &expired {
-            let deployed_before = self
-                .resources
-                .iter()
-                .any(|deployed| &deployed.resource.logical_id == logical_id);
-            let resource_status = if rolling_back || (deployed_before && updating) {
-                super::resource_status::UPDATE_FAILED
-            } else {
-                super::resource_status::CREATE_FAILED
-            };
-            self.fail_planned_resource_event(logical_id, resource_status, &reason);
-            if rolling_back {
-                // "You can specify only resources that are in the UPDATE_FAILED state
-                // because a rollback failed" (`ContinueUpdateRollback$ResourcesToSkip`): the
-                // resource the rollback could not get through is the one in that state, so
-                // that is what it reports — with the event that says so.
-                self.fail_deployed_resource(logical_id, resource_status, &reason, now);
-            }
-        }
+        // says which resource the operation failed at and why.
+        self.fail_expired_wait_resources(now, &reason);
         // What a rollback of this update would have to put back, and so which of the
         // previous configuration's wait conditions it re-creates — read BEFORE the failure
         // below retires the plan that says so.
@@ -548,6 +519,55 @@ impl super::StoredStack {
             needs: super::provisioning::dependencies_in_flight(self),
             policies: self.rolled_back_resource_policies(),
         })
+    }
+
+    /// Record, on each RESOURCE an expired, unsatisfied wait of the operation in flight was
+    /// for, that it is what the operation could not get through.
+    ///
+    /// "If the wait condition doesn't receive the specified number of success signals before
+    /// the `Timeout` period expires, CloudFormation assumes that the wait condition has
+    /// failed": the resource the wait was for did not come up, so its own terminal event
+    /// becomes that failure rather than the completion the walk had planned for it — the same
+    /// rewrite a resource its owning service never got ready gets
+    /// ([`super::StoredStack::fail_stabilisation`]). It is the one report of a timed-out wait,
+    /// so both paths that materialise an expiry make it: the one that can carry out what the
+    /// failure owes the owning services ([`Self::fail_expired_wait`]) and the one that runs
+    /// under the store lock and cannot ([`super::StoredStack::settle_wait_conditions`]).
+    ///
+    /// Called with the stack still in the status of the operation that expired, which is what
+    /// says WHICH transition of the resource failed.
+    pub(super) fn fail_expired_wait_resources(&mut self, now: SystemTime, reason: &str) {
+        let creating = self.status == super::status::CREATE_IN_PROGRESS;
+        let updating = self.status == super::status::UPDATE_IN_PROGRESS;
+        // A ROLLBACK is the third operation a wait can run out in: it deploys the previous
+        // configuration, so a wait condition it puts back waits as any deployment's does, and
+        // the resource it is for is one the stack already HAS.
+        let rolling_back = !creating && !updating;
+        let expired: Vec<String> = self
+            .wait_conditions
+            .iter()
+            .filter(|barrier| barrier.has_expired(now) && !self.barrier_satisfied(barrier))
+            .map(|barrier| barrier.logical_id().to_string())
+            .collect();
+        for logical_id in &expired {
+            let deployed_before = self
+                .resources
+                .iter()
+                .any(|deployed| &deployed.resource.logical_id == logical_id);
+            let resource_status = if rolling_back || (deployed_before && updating) {
+                super::resource_status::UPDATE_FAILED
+            } else {
+                super::resource_status::CREATE_FAILED
+            };
+            self.fail_planned_resource_event(logical_id, resource_status, reason);
+            if rolling_back {
+                // "You can specify only resources that are in the UPDATE_FAILED state
+                // because a rollback failed" (`ContinueUpdateRollback$ResourcesToSkip`): the
+                // resource the rollback could not get through is the one in that state, so
+                // that is what it reports — with the event that says so.
+                self.fail_deployed_resource(logical_id, resource_status, reason, now);
+            }
+        }
     }
 
     /// Record that the resource `logical_id` names is the one the operation in flight could

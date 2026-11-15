@@ -4729,3 +4729,10 @@ mod appended_notes;
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of this
 //! file, which the layout check refuses: the `#[path]` is what points each module into
 //! `tests/all/`.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with a
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted. The list holds
+//! nothing else, so a landing has one place to insert and nothing to keep consistent.
+//! in this target. An inner doc comment (`//!`) is legal only before the first item, so THIS
+//! BLOCK IS THE ONLY PLACE ONE MAY STAND: past it, `//!` is `E0753` and compiles no suite of
+//! this target, so leave no note below — add a declaration, not a note about one.
+//! file — which the layout check refuses. The `#[path]` is what points each module into

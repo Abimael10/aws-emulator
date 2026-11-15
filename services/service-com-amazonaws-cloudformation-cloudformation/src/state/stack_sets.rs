@@ -1209,6 +1209,12 @@ impl StoredStackSet {
                 for instance in &mut self.instances {
                     if instance.last_operation_id != concluded.operation_id
                         || instance.detailed_status == detailed_status::CANCELLED
+                        // ...and neither is a target the deployment FAILED in one of: an
+                        // operation that SUCCEEDED having stayed within the failure tolerance
+                        // it was given still failed in that account and Region, and reports
+                        // that target as the failure it was
+                        // ([`super::stack_set_instance_outcomes`]).
+                        || instance.detailed_status == detailed_status::FAILED
                     {
                         continue;
                     }
