@@ -203,7 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 authorized_account_id,
                 authorized_aws_region,
                 created_at: now,
-                tags: input.tags.unwrap_or_default(),
+                // The create-time tags become THE tag set of this authorization, the
+                // one the tagging operations read and change through its ARN.
+                tags: crate::state::tag_set(&input.tags.unwrap_or_default()),
             })
             .to_shape();
 

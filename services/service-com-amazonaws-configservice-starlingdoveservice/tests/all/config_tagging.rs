@@ -83,11 +83,12 @@ type CreationCase = (&'static str, String, Tags);
 
 /// A fresh emulator holding one of each resource type this emulator persists and can
 /// tag — a configuration recorder, a Config rule and a configuration aggregator — plus
-/// the ARNs the service minted for them. The other resource types `TagResource`
-/// documents (`OrganizationConfigRule`, `ConformancePack`,
-/// `OrganizationConformancePack`, `AggregationAuthorization`, `Connector`) have no
-/// write operation in this emulator yet, so none can be in the store; a `StoredQuery`
-/// does, and `config_stored_queries` covers its tags.
+/// the ARNs the service minted for them. Of the other resource types `TagResource`
+/// documents, `OrganizationConfigRule` and `OrganizationConformancePack` have no write
+/// operation in this emulator yet, so neither can be in the store; a `ConformancePack`,
+/// a `StoredQuery`, an `AggregationAuthorization` and a `Connector` do reach the store,
+/// and `conformance_packs`, `config_stored_queries` and
+/// `aggregation_authorization_tags` cover their tags.
 async fn taggable_resources() -> (Emulator, Vec<Taggable>) {
     let emulator = Emulator::new();
     with_recorder_and_channel(&emulator).await;

@@ -9,6 +9,11 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+// Declared HERE, where it sorts, rather than appended at the tail of this file: every
+// suite that lands appends there, so a declaration added there conflicts with the next
+// one that lands.
+#[path = "all/aggregation_authorization_tags.rs"]
+mod aggregation_authorization_tags;
 #[path = "all/config_aggregation_authorization.rs"]
 mod config_aggregation_authorization;
 #[path = "all/config_aggregator_lifecycle.rs"]

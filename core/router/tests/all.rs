@@ -2174,3 +2174,14 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // name is `E0428`, which fails every suite in this target.
 // Four suites check those rules rather than restating them:
 // test it explains; `all/appended_notes.rs` keeps the notes landings had appended here.
+// suite file under `tests/all/`, sorted by name, and NO other line. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair where its name sorts to, so two branches landing
+// at once insert two lines in two places and have no prose to duplicate, re-word or mistype.
+// the declarations compiles no suite of this target. With none anywhere in the file, no merge
+// of two landings can leave one past the first item.
+// This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of it
+// under `tests/`, which the layout check refuses: the `#[path]` above each `mod` is what
+// points the declaration into `tests/all/`.
+// belongs in that suite's own module header, where it is read beside the test it explains; a
+// note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
+// suite. `all/all_rs_declares_each_suite_once.rs`,

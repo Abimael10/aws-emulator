@@ -107,7 +107,7 @@ pub(crate) fn seed_connector(emulator: &Emulator, tenant: &str, client: &str) ->
                 }),
             },
             created_at: SystemTime::now(),
-            tags: Vec::new(),
+            tags: state::TagSet::new(),
         },
     );
     arn

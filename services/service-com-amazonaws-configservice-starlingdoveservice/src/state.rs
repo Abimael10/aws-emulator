@@ -1382,9 +1382,12 @@ pub struct ConnectorEntry {
     /// recreate it"), so this never changes once stored.
     pub connector_configuration: ConnectorConfiguration,
     pub created_at: SystemTime,
-    /// Tags are taken at creation (`PutConnector`: "Tags are added at creation and
-    /// cannot be updated with this operation").
-    pub tags: Vec<Tag>,
+    /// The tags the connector was CREATED with (`PutConnector`: "Tags are added at
+    /// creation and cannot be updated with this operation"), and whatever the tagging
+    /// operations have since made of them: they are the one tag set of this resource,
+    /// reached through
+    /// [`ComAmazonawsConfigserviceStarlingdoveserviceState::tags_of`].
+    pub tags: TagSet,
 }
 
 impl ConnectorEntry {
@@ -2029,11 +2032,14 @@ pub struct AggregationAuthorizationEntry {
     pub authorized_aws_region: String,
     pub arn: String,
     pub created_at: SystemTime,
-    /// Tags are taken at creation and not updated afterwards
+    /// The tags the authorization was CREATED with
     /// (`PutAggregationAuthorization`: "Tags are added at creation and cannot be
     /// updated with this operation ... tags will not be updated, even if they are
-    /// different. Use TagResource and UntagResource to update tags after creation").
-    pub tags: Vec<Tag>,
+    /// different. Use TagResource and UntagResource to update tags after creation"),
+    /// and whatever the tagging operations have since made of them: they are the one
+    /// tag set of this resource, reached through
+    /// [`ComAmazonawsConfigserviceStarlingdoveserviceState::tags_of`].
+    pub tags: TagSet,
 }
 
 impl AggregationAuthorizationEntry {
@@ -2709,72 +2715,6 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         )
     }
 
-    /// The tags of the resource `arn` identifies, or `None` when this store holds no
-    /// resource with that ARN.
-    ///
-    /// This is the ONE place an ARN is resolved to a tag set, so the tagging
-    /// operations agree with each other and with the resource's own read path: the
-    /// tags live ON the resource, which is also why deleting the resource deletes its
-    /// tags (`TagResource`: "When a resource is deleted, the tags associated with that
-    /// resource are deleted as well"). Every taggable resource this emulator persists
-    /// is reached here; a resource type whose write operation is still scaffolded
-    /// cannot be in the store at all, so its ARN resolves to `None` exactly as an
-    /// ARN of a deleted resource does.
-    pub fn tags_of(&self, arn: &str) -> Option<&TagSet> {
-        if let Some(recorder) = self.recorders.values().find(|entry| entry.arn == arn) {
-            return Some(&recorder.tags);
-        }
-        if let Some(rule) = self.config_rules.values().find(|entry| entry.arn == arn) {
-            return Some(&rule.tags);
-        }
-        if let Some(aggregator) = self
-            .configuration_aggregators
-            .values()
-            .find(|entry| entry.arn == arn)
-        {
-            return Some(&aggregator.tags);
-        }
-        if let Some(stored_query) = self.stored_queries.values().find(|entry| entry.arn == arn) {
-            return Some(&stored_query.tags);
-        }
-        if let Some(pack) = self.conformance_packs.values().find(|entry| entry.arn == arn) {
-            return Some(&pack.tags);
-        }
-        None
-    }
-
-    /// The tags of the resource `arn` identifies, for a request that changes them.
-    /// See [`Self::tags_of`].
-    pub fn tags_of_mut(&mut self, arn: &str) -> Option<&mut TagSet> {
-        if let Some(recorder) = self.recorders.values_mut().find(|entry| entry.arn == arn) {
-            return Some(&mut recorder.tags);
-        }
-        if let Some(rule) = self.config_rules.values_mut().find(|entry| entry.arn == arn) {
-            return Some(&mut rule.tags);
-        }
-        if let Some(aggregator) = self
-            .configuration_aggregators
-            .values_mut()
-            .find(|entry| entry.arn == arn)
-        {
-            return Some(&mut aggregator.tags);
-        }
-        if let Some(stored_query) = self
-            .stored_queries
-            .values_mut()
-            .find(|entry| entry.arn == arn)
-        {
-            return Some(&mut stored_query.tags);
-        }
-        if let Some(pack) = self
-            .conformance_packs
-            .values_mut()
-            .find(|entry| entry.arn == arn)
-        {
-            return Some(&mut pack.tags);
-        }
-        None
-    }
 }
 
 // The part of the resource-evaluation surface the SUMMARY derives — the status an
@@ -4950,6 +4890,9 @@ mod delivery_channel;
 mod discovered_resource;
 // How the ids above are DRAWN, in one place, so no mint derives one from a counter.
 mod identifier;
+// How a tagging request's `ResourceArn` is resolved to the tag set of the resource it
+// names, for every taggable resource type this store holds.
+mod tagging;
 pub use aggregator::*;
 pub use config_rule::*;
 pub use conformance_pack::*;
