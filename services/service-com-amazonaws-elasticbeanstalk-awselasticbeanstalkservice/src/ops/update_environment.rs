@@ -514,6 +514,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let solution_stack_name =
             requested_stack.or_else(|| resolved_stack.as_ref().map(|stack| stack.name()));
 
+        // A value the platform version's published option description does not
+        // accept is not a configuration this environment can run: the request
+        // is refused with the sentence the service states a configuration it
+        // cannot accept with, naming the option and the requirement its value
+        // failed. The same evaluation `ValidateConfigurationSettings` reports,
+        // taken against the platform version the environment runs AFTER this
+        // update, which is the one the deployed values have to be valid for.
+        if let Some(message) = store.configuration_settings_refusal(
+            &region,
+            solution_stack_name.as_deref(),
+            platform_arn.as_deref(),
+            requested_settings,
+        ) {
+            return Err(UpdateEnvironmentError::configuration_validation(message));
+        }
+
         // Everything the request named resolved, so the update is written to the
         // one stored record every reader of this environment reads.
         let environment = store.environments.get_mut(&environment_id).ok_or_else(|| {

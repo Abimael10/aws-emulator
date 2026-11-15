@@ -29,6 +29,8 @@ mod configuration_options;
 mod configuration_resolution;
 #[path = "all/configuration_set_deployment_status.rs"]
 mod configuration_set_deployment_status;
+#[path = "all/configuration_setting_validation.rs"]
+mod configuration_setting_validation;
 #[path = "all/configuration_templates.rs"]
 mod configuration_templates;
 #[path = "all/create_platform_version_authorization.rs"]

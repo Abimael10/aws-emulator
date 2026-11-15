@@ -492,6 +492,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::too_many_option_settings_message(option_settings.len()),
             ));
         }
+        // A value the platform version's published option description does not
+        // accept is not a configuration this environment can run: the request
+        // is refused with the sentence the service states a configuration it
+        // cannot accept with, naming the option and the requirement its value
+        // failed. The same evaluation `ValidateConfigurationSettings` reports.
+        if let Some(message) = store.configuration_settings_refusal(
+            &region,
+            solution_stack_name.as_deref(),
+            platform_arn.as_deref(),
+            input.option_settings.as_deref().unwrap_or_default(),
+        ) {
+            return Err(CreateEnvironmentError::configuration_validation(message));
+        }
         let created = crate::state::now();
         let mut environment = crate::state::Environment {
             environment_id: environment_id.clone(),

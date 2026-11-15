@@ -1783,35 +1783,18 @@ fn scaffolded_operations() -> Vec<String> {
     operations
 }
 
-#[tokio::test]
-async fn every_still_scaffolded_operation_refuses_the_call() {
-    let emulator = Emulator::new();
+/// RULE: no handler of this service carries the scaffold marker any more — every
+/// operation the model binds is implemented, so the stub census
+/// ([`scaffolded_operations`]) is empty.
+///
+/// A stub answers 501 `NotImplemented`, which is correct for a stub and never an
+/// empty 200; the census, not a name written here, is what is asserted, so an
+/// operation that regressed to a scaffold fails this test by reappearing in it.
+#[test]
+fn no_operation_of_this_service_is_scaffolded() {
     let operations = scaffolded_operations();
     assert!(
-        !operations.is_empty(),
-        "no handler carries the scaffold marker any more: delete this probe with the last stub"
+        operations.is_empty(),
+        "case \"the stub census\": expected every operation to be implemented, got {operations:?}"
     );
-
-    // A stub answers 501 `NotImplemented` — never an empty 200, which a client
-    // cannot tell from a real implementation. An operation whose input has a
-    // required member is refused by the boundary validator before its handler
-    // runs, so a parameterless call to one of those answers 400 instead; what
-    // must never happen is a success.
-    for operation in &operations {
-        let answer = emulator.call(operation, &[]).await;
-        assert!(
-            answer.status == 501 || answer.status == 400,
-            "case {operation:?}: a scaffolded operation must refuse the call, got {} and body {}",
-            answer.status,
-            answer.body
-        );
-        if answer.status == 501 {
-            assert_eq!(
-                answer.error_code(),
-                "NotImplemented",
-                "case {operation:?}: unexpected error code in {}",
-                answer.body
-            );
-        }
-    }
 }

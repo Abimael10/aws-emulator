@@ -230,11 +230,13 @@ pub(super) fn maintenance_window(settings: &[ConfigurationOptionSetting]) -> Opt
     let day = components.next()?;
     // The option publishes the hour and the minute as a two-digit field each,
     // inside the hours of a day and the minutes of an hour
-    // ([`PREFERRED_START_TIME_PATTERN`]). Nothing validates a configuration
-    // option's value where it is WRITTEN, so a value in any other form — more
-    // components, a sign, a word, a number outside the field — reaches here
-    // from the request and states no window at all, which leaves the
-    // environment maintained on the week of its own launch.
+    // ([`PREFERRED_START_TIME_PATTERN`]). An operation that WRITES option
+    // settings refuses a value outside that published form (see
+    // [`super::configuration_setting_validation`]), so this reader is only
+    // tolerant: a value in any other form — more components, a sign, a word, a
+    // number outside the field — states no window at all, which leaves the
+    // environment maintained on the week of its own launch rather than making a
+    // read of the schedule fail.
     let hour = preferred_start_time_field(components.next()?, 23)?;
     let minute = preferred_start_time_field(components.next()?, 59)?;
     if components.next().is_some() {

@@ -537,11 +537,14 @@ async fn a_platform_update_is_scheduled_only_up_to_the_configured_update_level()
 #[tokio::test]
 async fn a_scheduled_action_opens_in_the_configured_maintenance_window() {
     // Rows span the week, the clock and the two ends of a day, the case that
-    // states no window at all, and the values that state NO window because they
-    // are not the weekday-and-time form the option publishes: nothing validates
-    // a configuration option's value where it is written, so each of these
-    // reaches the schedule from the request and leaves the environment
-    // maintained on the week of its own launch, exactly as stating none does.
+    // states no window at all, and the values that are not the weekday-and-time
+    // form the option publishes. A value outside that published form is refused
+    // where it is WRITTEN — the published `Regex` restriction is one of the
+    // requirements a configuration has to meet, and
+    // `all/configuration_setting_validation.rs` is the suite for that rule — so
+    // such a row asserts the refusal; a configuration that states no window at
+    // all, or states it empty, leaves the environment maintained on the week of
+    // its own launch.
     let windows = [
         Some("Mon:00:00"),
         Some("Tue:09:00"),
@@ -568,6 +571,29 @@ async fn a_scheduled_action_opens_in_the_configured_maintenance_window() {
         let mut settings = vec![(MANAGED_ACTIONS, MANAGED_ACTIONS_ENABLED, "true")];
         if let Some(window) = window {
             settings.push((MANAGED_ACTIONS, PREFERRED_START_TIME, window));
+        }
+        // A value the published form does not admit is not a configuration the
+        // environment can be launched with: the create is refused and nothing is
+        // launched for this row.
+        if (*window).is_some_and(|window| !window.is_empty() && !states_a_window(window)) {
+            let mut params = vec![
+                ("ApplicationName".to_string(), "window-app".to_string()),
+                ("EnvironmentName".to_string(), name.clone()),
+                ("PlatformArn".to_string(), branch.from_arn.clone()),
+            ];
+            params.extend(option_params(&settings));
+            let refused = emulator
+                .call("CreateEnvironment", &borrowed(&params))
+                .await;
+            assert_eq!(
+                (refused.status, refused.error_code()),
+                (400, "ConfigurationValidationException"),
+                "case {case:?}: a window outside the published form must be refused where it \
+                 is written, got {} and body {}",
+                refused.status,
+                refused.body
+            );
+            continue;
         }
         let launched = launch(
             &emulator,

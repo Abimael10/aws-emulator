@@ -51,6 +51,7 @@ pub mod application_runtime;
 pub mod caller_archive;
 pub mod configuration_option_catalog;
 pub mod configuration_option_descriptions;
+pub mod configuration_setting_validation;
 pub mod deployed_application;
 pub mod environment_health;
 pub mod environment_plane_endpoint;
@@ -64,6 +65,7 @@ pub use application_runtime::*;
 pub use caller_archive::*;
 pub use configuration_option_catalog::*;
 pub use configuration_option_descriptions::*;
+pub use configuration_setting_validation::*;
 pub use deployed_application::*;
 pub use environment_health::*;
 pub use environment_plane_endpoint::*;
@@ -2386,6 +2388,11 @@ pub const ENVIRONMENT_TYPE_LOAD_BALANCED: &str = "LoadBalanced";
 const NAMESPACE_AUTOSCALING_ASG: &str = "aws:autoscaling:asg";
 /// See [`NAMESPACE_AUTOSCALING_ASG`].
 const OPTION_MIN_SIZE: &str = "MinSize";
+/// The other bound of that same group: "maximum number of instances you want
+/// running", which the minimum may not exceed. Named here beside
+/// [`OPTION_MIN_SIZE`] so the catalog that publishes the pair and the evaluation
+/// that compares them cannot spell either one a second way.
+const OPTION_MAX_SIZE: &str = "MaxSize";
 
 /// `aws:autoscaling:asg` / `MinSize`'s documented default, and the number of
 /// instances a `SingleInstance` environment runs ("one EC2 instance").

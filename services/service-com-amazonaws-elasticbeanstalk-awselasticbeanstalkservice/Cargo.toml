@@ -72,6 +72,11 @@ service-common = { path = "../common" }
 # credential speaks for and the user a long-term key belongs to, plus the policy documents
 # in force on each, which is what that gate reads the caller's permissions from.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# A configuration option's published `Regex` restriction is "the regular expression pattern
+# that a string configuration option value with this restriction must match", so
+# `ValidateConfigurationSettings` matches a desired value against it with a
+# regular-expression engine rather than reading the pattern by hand.
+regex = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

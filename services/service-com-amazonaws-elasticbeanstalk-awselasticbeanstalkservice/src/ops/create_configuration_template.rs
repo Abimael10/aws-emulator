@@ -444,6 +444,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let solution_stack_name =
             solution_stack_name.or_else(|| resolved_stack.as_ref().map(|stack| stack.name()));
 
+        // A value the platform version's published option description does not
+        // accept is not a configuration this template can hold: the request is
+        // refused with the sentence the service states a configuration it
+        // cannot accept with, naming the option and the requirement its value
+        // failed. The same evaluation `ValidateConfigurationSettings` reports.
+        if let Some(message) = store.configuration_settings_refusal(
+            &region,
+            solution_stack_name.as_deref(),
+            platform_arn.as_deref(),
+            requested_settings,
+        ) {
+            return Err(CreateConfigurationTemplateError::configuration_validation(
+                message,
+            ));
+        }
+
         // "If specified, these values override the values obtained from the
         // solution stack or the source configuration." The result is bounded the
         // same way the request's own list is: a configuration whose inherited

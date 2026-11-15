@@ -271,7 +271,7 @@ pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
     ),
     ConfigurationOption::new(
         NAMESPACE_AUTOSCALING_ASG,
-        "MaxSize",
+        OPTION_MAX_SIZE,
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "4",
     )

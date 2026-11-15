@@ -227,6 +227,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // A value the platform version's published option description does not
+        // accept is not a configuration this template can hold: the request is
+        // refused with the sentence the service states a configuration it
+        // cannot accept with, naming the option and the requirement its value
+        // failed. The same evaluation `ValidateConfigurationSettings` reports.
+        if let Some(message) = store.configuration_settings_refusal(
+            &region,
+            template.solution_stack_name.as_deref(),
+            template.platform_arn.as_deref(),
+            requested_settings,
+        ) {
+            return Err(UpdateConfigurationTemplateError::configuration_validation(
+                message,
+            ));
+        }
+
         // "Constraint: You can remove only UserDefined configuration options."
         // An option whose VALUE the service itself sets on the resources it
         // provisions (the topic it created, the queue it created) is not the

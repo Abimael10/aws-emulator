@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ValidateConfigurationSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ValidateConfigurationSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: evaluates the DESIRED option settings the request sends against the
+//! configuration option catalog the platform version of the named configuration set —
+//! a stored configuration template, or a stored running environment — publishes, and
+//! reports one `error` `ValidationMessage` per setting whose value that option does not
+//! take. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ValidateConfigurationSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The settings are evaluated, never stored: this operation "determines whether those
+//! values are valid" and persists nothing of its own.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +149,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ValidateConfigurationSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ValidateConfigurationSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ValidateConfigurationSettings"))
+        // The platform version a configuration set runs is named regionally (by
+        // its ARN), and that version's catalog is what the desired values are
+        // evaluated against.
+        let region = crate::state::request_region(ctx);
+
+        // A statement about the REQUEST is answered before any resource the
+        // request names is resolved.
+
+        // "EnvironmentName: the name of the environment to validate the settings
+        // against. Condition: you cannot specify both this and a configuration
+        // template name" — and a request naming neither names no configuration
+        // set, so there is no platform version whose published options the
+        // desired values could be evaluated against.
+        let wanted = match (
+            input.template_name.as_deref(),
+            input.environment_name.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    ValidateConfigurationSettingsError::invalid_parameter_combination(
+                        "You cannot specify both TemplateName and EnvironmentName.",
+                    ),
+                );
+            }
+            (None, None) => {
+                return Err(ValidateConfigurationSettingsError::missing_parameter(
+                    "Must specify either a TemplateName or an EnvironmentName.",
+                ));
+            }
+            (Some(template_name), None) => ConfigurationSet::Template(template_name),
+            (None, Some(environment_name)) => ConfigurationSet::Environment(environment_name),
+        };
+
+        // How many option settings one request may send is a bound on the
+        // REQUEST, so it is answered here, before anything is resolved — the
+        // same bound every operation that takes the list enforces (see
+        // `crate::state::MAX_CONFIGURATION_OPTION_SETTINGS`).
+        if input.option_settings.len() > crate::state::MAX_CONFIGURATION_OPTION_SETTINGS {
+            return Err(ValidateConfigurationSettingsError::invalid_parameter_value(
+                crate::state::too_many_option_settings_message(input.option_settings.len()),
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ValidateConfigurationSettingsError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // This operation only REPORTS: it "determines whether those values are
+        // valid" and persists nothing. The one write it performs is the clock's
+        // own — an environment status change or an application deletion the
+        // clock has already made due — which was owed at the same instant
+        // whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "The name of the application that the configuration template or
+        // environment belongs to": the configuration set is resolved inside it,
+        // so a name this account holds no application under names no set.
+        if !store.applications.contains_key(&input.application_name) {
+            return Err(ValidateConfigurationSettingsError::invalid_parameter_value(
+                format!("No Application named '{}' found.", input.application_name),
+            ));
+        }
+
+        // The platform version the set is for, and the settings the set already
+        // holds: the desired values are evaluated as an override of THAT
+        // configuration, which is what a restriction naming another option (the
+        // Auto Scaling group's two bounds) is compared across.
+        let (solution_stack_name, platform_arn, stored_settings) = match wanted {
+            // A template name "must be unique per application", so the pair
+            // resolves one stored template.
+            ConfigurationSet::Template(template_name) => {
+                let Some(template) = store
+                    .configuration_templates
+                    .get(&(input.application_name.clone(), template_name.to_string()))
+                else {
+                    return Err(ValidateConfigurationSettingsError::invalid_parameter_value(
+                        crate::state::missing_configuration_template_message(
+                            &input.application_name,
+                            template_name,
+                        ),
+                    ));
+                };
+                (
+                    template.solution_stack_name.clone(),
+                    template.platform_arn.clone(),
+                    template.option_settings.clone(),
+                )
+            }
+            // "The name of the environment to validate the settings against": a
+            // terminated environment runs no configuration to validate against,
+            // and an environment of another application is not one this request
+            // names.
+            ConfigurationSet::Environment(environment_name) => {
+                let Some(environment) = store
+                    .environment_name_index
+                    .get(environment_name)
+                    .and_then(|environment_id| store.environments.get(environment_id))
+                    .filter(|environment| {
+                        !environment.is_terminated()
+                            && environment.application_name == input.application_name
+                    })
+                else {
+                    return Err(ValidateConfigurationSettingsError::invalid_parameter_value(
+                        crate::state::missing_environment_message(None, Some(environment_name)),
+                    ));
+                };
+                (
+                    environment.solution_stack_name.clone(),
+                    environment.platform_arn.clone(),
+                    environment.option_settings.clone(),
+                )
+            }
+        };
+
+        // "This action returns a list of messages indicating any errors or
+        // warnings associated with the selection of option values." The
+        // selection is evaluated against the option catalog the platform
+        // version that configuration set runs publishes, and against the
+        // configuration these settings would put in force — the same evaluation
+        // every operation that writes option settings is refused by. A
+        // selection the platform version accepts produces none, which is the
+        // empty list rather than an absent member.
+        let messages = store.configuration_validation_messages(
+            &region,
+            solution_stack_name.as_deref(),
+            platform_arn.as_deref(),
+            &stored_settings,
+            &input.option_settings,
+        );
+
+        Ok(ValidateConfigurationSettingsOutput {
+            messages: Some(messages),
+        })
     }
+}
+
+/// Which configuration set the request named: "either a configuration template
+/// or environment". The request names exactly one of the two, so the pair of
+/// optional members is reduced to this choice once, before anything is resolved.
+enum ConfigurationSet<'a> {
+    /// `TemplateName`, resolved inside the request's application.
+    Template(&'a str),
+    /// `EnvironmentName`.
+    Environment(&'a str),
 }

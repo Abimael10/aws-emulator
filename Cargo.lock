@@ -13467,6 +13467,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "regex",
  "rquickjs",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",

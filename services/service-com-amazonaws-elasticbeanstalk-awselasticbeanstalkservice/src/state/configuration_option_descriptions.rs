@@ -49,7 +49,7 @@ pub(super) const OPTION_DESCRIPTIONS: &[OptionDescription] = &[
     ),
     (
         NAMESPACE_AUTOSCALING_ASG,
-        "MaxSize",
+        OPTION_MAX_SIZE,
         "Maximum number of instances you want running. Must be a positive integer that is less \
          than 10000.",
     ),

@@ -44,7 +44,8 @@
 //! This service uses that channel for the awsQuery service-level errors its
 //! model declares no shape for but its own documentation (or its recorded
 //! behaviour) names: `ValidationError`, `InvalidParameterValue`,
-//! `InvalidParameterCombination`, `MissingRequiredParameter`, `MissingParameter`
+//! `InvalidParameterCombination`, `MissingRequiredParameter`, `MissingParameter`,
+//! `ConfigurationValidationException`
 //! and `InternalFailure`. See
 //! [`Scaffolded::Service`].
 
@@ -284,6 +285,17 @@ pub const INTERNAL_FAILURE: &str = "InternalFailure";
 /// elsewhere. See `crate::service::authorization`.
 pub const ACCESS_DENIED: &str = "AccessDenied";
 
+/// `ConfigurationValidationException`: the configuration the request asks for is
+/// not one the platform version accepts — a desired configuration option value
+/// outside the restriction that option's published description carries.
+///
+/// Elastic Beanstalk's own evaluation of a configuration is
+/// `ValidateConfigurationSettings`, which REPORTS those errors; an operation
+/// that WRITES the settings answers this code instead of carrying them out, with
+/// the same sentence in its message. Like the codes around it, the model declares
+/// no error shape for it.
+pub const CONFIGURATION_VALIDATION_EXCEPTION: &str = "ConfigurationValidationException";
+
 /// The payload of a query client error: the code a client branches on, the status
 /// it is returned with, and the message explaining what to fix.
 #[derive(Debug, Clone)]
@@ -377,6 +389,16 @@ impl<E> Scaffolded<E> {
     pub fn invalid_parameter_combination(message: impl Into<String>) -> Self {
         Self::Service(ServiceError {
             code: INVALID_PARAMETER_COMBINATION,
+            status: 400,
+            message: message.into(),
+        })
+    }
+
+    /// Refuse the request with HTTP 400 [`CONFIGURATION_VALIDATION_EXCEPTION`]:
+    /// the configuration it asks for is not one the platform version accepts.
+    pub fn configuration_validation(message: impl Into<String>) -> Self {
+        Self::Service(ServiceError {
+            code: CONFIGURATION_VALIDATION_EXCEPTION,
             status: 400,
             message: message.into(),
         })

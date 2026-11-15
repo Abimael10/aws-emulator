@@ -8,8 +8,8 @@
 //!
 //! 1. ENVELOPE — every error this service answers with is an awsQuery `<ErrorResponse>`
 //!    carrying a `<RequestId>`, a sibling AFTER `<Error>`, whichever layer produced the
-//!    failure: a handler, a modelled error shape, the boundary validator, the scaffold's
-//!    501, or the routing table. Each response reports its OWN id, and a successful
+//!    failure: a handler, a modelled error shape, the boundary validator, or the routing
+//!    table. Each response reports its OWN id, and a successful
 //!    response is left alone (its id is already in `ResponseMetadata`).
 //! 2. ORDER — a parameter the request did not supply is reported BEFORE any resource the
 //!    request names is resolved, so the answer states the input defect rather than
@@ -166,7 +166,8 @@ async fn every_error_envelope_names_the_request_it_answers() {
 
     // Rows span the LAYERS that can produce an error, because the rule is the
     // envelope's and not any one handler's: a handler refusal, a modelled error shape,
-    // the boundary validator, an absent required member, the scaffold's 501, and an
+    // the boundary validator, an absent required member, a handler refusing a request
+    // whose members cannot be served together, and an
     // `Action` the routing table does not name.
     let cases = vec![
         EnvelopeCase {
@@ -219,20 +220,25 @@ async fn every_error_envelope_names_the_request_it_answers() {
             code: "MissingRequiredParameter",
         },
         EnvelopeCase {
-            // `ValidateConfigurationSettings` still carries the scaffold header,
-            // so it answers the 501 — which is an error response and carries the
-            // element too. Both of its input's required members are supplied, so
-            // the request reaches the handler rather than the boundary validator.
-            case: "the scaffold's 501",
+            // Every operation of this service is implemented, so the layer that
+            // used to answer the scaffold's 501 here is gone; a handler refusing
+            // a configuration the platform version cannot accept is the layer
+            // this row stands for now. Both of
+            // `ValidateConfigurationSettings`'s required members are supplied,
+            // so the request reaches the handler rather than the boundary
+            // validator.
+            case: "a handler refusal for a configuration that cannot be served",
             action: "ValidateConfigurationSettings",
             params: owned(&[
                 ("ApplicationName", "envelope-app"),
+                ("TemplateName", "envelope-template"),
+                ("EnvironmentName", "envelope-env"),
                 ("OptionSettings.member.1.Namespace", "aws:autoscaling:asg"),
                 ("OptionSettings.member.1.OptionName", "MinSize"),
                 ("OptionSettings.member.1.Value", "1"),
             ]),
-            status: 501,
-            code: "NotImplemented",
+            status: 400,
+            code: "InvalidParameterCombination",
         },
         EnvelopeCase {
             case: "an Action the routing table does not name",
