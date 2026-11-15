@@ -254,10 +254,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // An association whose last change has not settled yet still has one in
-        // flight, so this one is refused with the sentence the model states for
-        // that class and the record is left exactly as it is.
-        if status != crate::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE {
+        // An association on its way out is not one an update is applied from:
+        // the model's `ConflictException` answers that transition. An
+        // association whose own last change is still settling IS
+        // (`crate::state::firewall_rule_group_association_status_admits_update`)
+        // — the change this call carries is applied whole over the earlier one
+        // and the settle deadline is restamped below, so a second writer is
+        // never refused for a change that has not landed yet.
+        if !crate::state::firewall_rule_group_association_status_admits_update(&status) {
             return Err(
                 UpdateFirewallRuleGroupAssociationErrorModeled::ConflictException(
                     crate::state::state_transition_conflict(),

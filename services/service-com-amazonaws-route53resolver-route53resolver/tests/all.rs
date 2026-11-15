@@ -27,6 +27,8 @@ mod endpoint_vpc_and_addresses;
 mod firewall_association_error_bodies;
 #[path = "all/firewall_association_priority_band.rs"]
 mod firewall_association_priority_band;
+#[path = "all/firewall_association_update_serialisation.rs"]
+mod firewall_association_update_serialisation;
 #[path = "all/firewall_block_option_refusals.rs"]
 mod firewall_block_option_refusals;
 #[path = "all/firewall_canonical_dns_names.rs"]

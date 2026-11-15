@@ -7241,3 +7241,19 @@ mod zz_glue_job_source_permission_probe;
 //! this file and for every service crate's `tests/all.rs`.
 //! file (`tests/<name>.rs`), which the layout check refuses — hence the `#[path]` above
 //! every `mod` below.
+//! `#[path = "all/<name>.rs"]` attribute and the `mod <name>;` it points into `tests/all/`,
+//! keeping the list sorted: one pair per suite file and NOTHING else, so a landing has one
+//! place to insert and nothing to keep consistent. `tests/all.rs` is a test-target CRATE
+//! ROOT, so a bare `mod` resolves to a SIBLING of this file, which the layout check
+//! refuses; the `#[path]` is what points the module into `tests/all/`. Every file under
+//! `tests/all/` is declared here — some are shared harnesses (`query_wire`, `eks_wire`)
+//! rather than suites — because a file no declaration names is compiled nowhere.
+//! A suite that is not declared here compiles nowhere and its tests never run; a suite left
+//! at the top level of `tests/` fails the build; and a suite declared twice is `E0428`,
+//! which fails every suite in this target.
+//! DECLARATION — never a note about one, and never a copy of this header; append nothing
+//! to the end of this file but a declaration.
+//! this file and for every service crate's `tests/all.rs`, so a note about either rule
+//! belongs there. What a suite covers, and why it lives in this cross-service target rather
+//! than in one service crate's own, is stated in that suite's own module doc, where it is
+//! read beside the test it explains.

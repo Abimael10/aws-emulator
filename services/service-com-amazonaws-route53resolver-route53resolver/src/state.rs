@@ -877,6 +877,31 @@ pub const FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_UPDATING: &str = "UPDATING";
 /// that association is on its way out.
 pub const FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_DELETING: &str = "DELETING";
 
+/// Whether `status` is a step a rule-group-to-VPC association is CHANGED in.
+///
+/// Two of the three the model declares are: the step an association rests in
+/// once its last change is through
+/// ([`FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE`]) and the step it reports
+/// while a change a caller already asked for is still settling
+/// ([`FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_UPDATING`]). The second is what
+/// makes a further writer legal: the association is changed IN PLACE, so
+/// writers are serialised rather than refused — every member the later request
+/// names is applied whole over the earlier change and the settle deadline is
+/// restamped — and no caller is turned away merely because a change it or
+/// another writer made moments earlier has not landed yet.
+///
+/// [`FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_DELETING`] is the one step that is
+/// not: an association on its way out is no longer there to change, which is the
+/// invalid transition the model's `ConflictException`
+/// ([`state_transition_conflict`]) describes.
+pub fn firewall_rule_group_association_status_admits_update(status: &str) -> bool {
+    matches!(
+        status,
+        FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE
+            | FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_UPDATING
+    )
+}
+
 /// `ResourceNotFoundException$ResourceType` for a rule-group-to-VPC
 /// association: the modelled shape name of the resource, as for
 /// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
