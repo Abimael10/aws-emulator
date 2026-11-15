@@ -29,6 +29,8 @@ mod instance_health_follows_the_backend;
 mod instance_health_probe;
 #[path = "all/instance_health_timeline.rs"]
 mod instance_health_timeline;
+#[path = "all/listener_policy_set.rs"]
+mod listener_policy_set;
 #[path = "all/listeners_health_check_and_attributes.rs"]
 mod listeners_health_check_and_attributes;
 #[path = "all/load_balancer_lifecycle.rs"]

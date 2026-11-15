@@ -161,19 +161,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "This policy must not be enabled for any listeners": a policy a listener is
         // configured with is in use, so removing it would change that listener's
         // configuration behind the caller's back.
-        if let Some(listener) = record
+        if record
             .listeners
             .iter()
-            .find(|listener| listener.policy_names.contains(&input.policy_name))
+            .any(|listener| listener.policy_names.contains(&input.policy_name))
         {
             return Err(
                 DeleteLoadBalancerPolicyErrorModeled::InvalidConfigurationRequestException(
                     InvalidConfigurationRequestException {
-                        message: Some(format!(
-                            "Policy [{}] cannot be deleted because it is enabled for the \
-                             listener on port {}",
-                            input.policy_name, listener.load_balancer_port
-                        )),
+                        message: Some(policy_in_use_message(&input.policy_name)),
                     },
                 )
                 .into(),
@@ -190,4 +186,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through `DescribeLoadBalancers`, which reports the policy set it left behind.
         Ok(DeleteLoadBalancerPolicyOutput {})
     }
+}
+
+/// How this service states the refusal of a delete of a policy that is still enabled —
+/// the one sentence this error carries for a policy in use, whose only variable part is
+/// the `PolicyName` the request named.
+///
+/// The sentence names no listener and no port: whether the policy is enabled on a
+/// listener or referred to by another enabled policy, what the caller has to do is the
+/// same, so the refusal states the condition rather than one of its forms.
+fn policy_in_use_message(policy_name: &str) -> String {
+    format!(
+        "You cannot delete policy [{policy_name}] since it is enabled or referred by \
+         other enabled policy."
+    )
 }
