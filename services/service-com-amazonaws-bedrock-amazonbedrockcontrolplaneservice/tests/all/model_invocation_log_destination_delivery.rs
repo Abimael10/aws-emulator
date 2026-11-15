@@ -24,6 +24,10 @@
 //! as `core/router` assembles them: this control plane, the Bedrock Runtime data plane
 //! that serves the inference, and the Amazon S3 whose bucket the record lands in — which
 //! is listed and fetched here through Amazon S3's own operations.
+//!
+//! That harness is this file's and its siblings': the suite that reads a destination the
+//! way an audit consumer reads it ([`crate::model_invocation_log_poller_view`]) drives the
+//! same three services through it rather than standing a second one up.
 
 use std::io::Read;
 use std::sync::Arc;
@@ -38,7 +42,7 @@ use crate::support::Reply;
 /// The Region every call here is signed for: Amazon S3 places a bucket created with no
 /// `LocationConstraint` in us-east-1, which is also the Region a delivered record is
 /// written from, so one Region label serves every call.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// A SigV4 credential scope naming Amazon S3, which is what routes a request to the object
 /// store.
@@ -48,21 +52,21 @@ const S3_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// A SigV4 credential scope naming the Bedrock Runtime data plane's signing name, which is
 /// what routes an inference request to it rather than to this control plane.
-const RUNTIME_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+pub(crate) const RUNTIME_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-east-1/bedrock/aws4_request, \
      SignedHeaders=host, Signature=0000";
 
 /// The bucket every destination below delivers into.
-const BUCKET: &str = "example-invocation-logs";
+pub(crate) const BUCKET: &str = "example-invocation-logs";
 
 /// The model every inference below is served on.
-const MODEL: &str = "amazon.nova-lite-v1:0";
+pub(crate) const MODEL: &str = "amazon.nova-lite-v1:0";
 
 /// The URI the logging configuration is addressed by.
-const LOGGING_URI: &str = "/logging/modelinvocations";
+pub(crate) const LOGGING_URI: &str = "/logging/modelinvocations";
 
 /// The account the emulator serves, which every delivered key names.
-fn account_id() -> String {
+pub(crate) fn account_id() -> String {
     ::engine::emulator_account_id().to_string()
 }
 
@@ -70,11 +74,11 @@ fn account_id() -> String {
 // The harness: this control plane, the inference plane and Amazon S3 on one shared engine.
 // ---------------------------------------------------------------------------------------
 
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(bedrock::EmulatedService::new(Arc::clone(&engine)));
@@ -92,7 +96,7 @@ fn emulator() -> Emulator {
 impl Emulator {
     /// One request, signed with `authorization` — which is what decides the service it
     /// reaches.
-    async fn request(
+    pub(crate) async fn request(
         &self,
         authorization: &str,
         host: &str,
@@ -131,13 +135,13 @@ impl Emulator {
     }
 
     /// One control-plane call.
-    async fn bedrock(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn bedrock(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
         self.request(RUNTIME_AUTHORIZATION, "bedrock", method, path, body)
             .await
     }
 
     /// One Converse call on the data plane mounted beside it.
-    async fn converse(&self, case: &str, prompt: &str) -> Reply {
+    pub(crate) async fn converse(&self, case: &str, prompt: &str) -> Reply {
         let reply = self
             .request(
                 RUNTIME_AUTHORIZATION,
@@ -159,7 +163,7 @@ impl Emulator {
 
     /// One path-style request to the emulator's Amazon S3 front door, whose body is the
     /// object's own bytes rather than JSON.
-    async fn s3(&self, method: &str, path: &str) -> (u16, bytes::Bytes) {
+    pub(crate) async fn s3(&self, method: &str, path: &str) -> (u16, bytes::Bytes) {
         let request = http::Request::builder()
             .method(method)
             .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))
@@ -174,7 +178,7 @@ impl Emulator {
 
 /// `PUT /<bucket>` — the destination bucket a caller creates before configuring logging
 /// into it.
-async fn given_bucket(emu: &Emulator, case: &str) {
+pub(crate) async fn given_bucket(emu: &Emulator, case: &str) {
     let (status, body) = emu.s3("PUT", &format!("/{BUCKET}")).await;
     assert_eq!(
         status,
@@ -184,9 +188,13 @@ async fn given_bucket(emu: &Emulator, case: &str) {
     );
 }
 
-/// Every key the destination bucket holds, as `ListObjectsV2` reports them.
-async fn delivered_keys(emu: &Emulator, case: &str) -> Vec<String> {
-    let (status, body) = emu.s3("GET", &format!("/{BUCKET}?list-type=2")).await;
+/// Every key the destination bucket holds under `prefix`, as `ListObjectsV2` reports them;
+/// an empty `prefix` lists the whole bucket. `prefix` travels in the query string as
+/// written, so pass a prefix that needs no percent-encoding.
+pub(crate) async fn delivered_keys(emu: &Emulator, case: &str, prefix: &str) -> Vec<String> {
+    let (status, body) = emu
+        .s3("GET", &format!("/{BUCKET}?list-type=2&prefix={prefix}"))
+        .await;
     assert_eq!(
         status, 200,
         "case {case:?}: the destination bucket must be listable, got {status}"
@@ -202,7 +210,7 @@ async fn delivered_keys(emu: &Emulator, case: &str) -> Vec<String> {
 
 /// The records one delivered object carries: fetched through `GetObject`, decompressed,
 /// one JSON document per line.
-async fn records_of(emu: &Emulator, case: &str, key: &str) -> Vec<Value> {
+pub(crate) async fn records_of(emu: &Emulator, case: &str, key: &str) -> Vec<Value> {
     let (status, body) = emu.s3("GET", &format!("/{BUCKET}/{key}")).await;
     assert_eq!(
         status, 200,
@@ -324,7 +332,7 @@ async fn an_installed_logging_configuration_is_delivered_to_by_every_invocation(
         let answered = emu.converse(name, &prompt).await;
 
         let prefix = logging::record_key_prefix(case.key_prefix, &account_id(), REGION);
-        let keys = delivered_keys(&emu, name).await;
+        let keys = delivered_keys(&emu, name, "").await;
         assert_eq!(
             keys.len(),
             1,
@@ -395,7 +403,7 @@ async fn a_withdrawn_configuration_stops_the_records_and_leaves_the_delivered_on
     );
 
     emu.converse(case, "the call before the delete").await;
-    let before = delivered_keys(&emu, case).await;
+    let before = delivered_keys(&emu, case, "").await;
     assert_eq!(
         before.len(),
         1,
@@ -411,7 +419,7 @@ async fn a_withdrawn_configuration_stops_the_records_and_leaves_the_delivered_on
 
     emu.converse(case, "the byte-identical call after the delete")
         .await;
-    let after = delivered_keys(&emu, case).await;
+    let after = delivered_keys(&emu, case, "").await;
     assert_eq!(
         after, before,
         "case {case:?}: expected no further record and the delivered one untouched, got \
@@ -435,7 +443,7 @@ async fn an_account_with_no_configuration_has_nothing_delivered() {
     );
 
     emu.converse(case, "an unlogged call").await;
-    let keys = delivered_keys(&emu, case).await;
+    let keys = delivered_keys(&emu, case, "").await;
     assert!(
         keys.is_empty(),
         "case {case:?}: expected nothing delivered, got {keys:?}"
