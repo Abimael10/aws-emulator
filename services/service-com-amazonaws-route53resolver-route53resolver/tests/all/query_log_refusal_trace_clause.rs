@@ -153,8 +153,11 @@ const REFUSALS: &[Refusal] = &[
         case: "a disassociate naming a configuration the store holds nothing under",
         operation: "DisassociateResolverQueryLogConfig",
         body: |_| json!({ "ResolverQueryLogConfigId": UNKNOWN_CONFIG, "ResourceId": HELD_VPC }),
-        sentence: CONFIG_GONE_SENTENCE,
-        resource_type: "ResolverQueryLogConfig",
+        // What a disassociate resolves is the ASSOCIATION the (configuration,
+        // VPC) pair was made from, so a configuration the store holds nothing
+        // under holds no association either and is reported for that.
+        sentence: ASSOCIATION_GONE_SENTENCE,
+        resource_type: "ResolverQueryLogConfigAssociation",
     },
     Refusal {
         case: "a read of an association the store holds nothing under",

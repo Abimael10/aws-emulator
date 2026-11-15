@@ -458,9 +458,11 @@ async fn a_non_ascii_domain_or_delegation_record_is_refused_and_nothing_is_creat
 }
 
 /// Every operation that resolves a `ResolverQueryLogConfigId` answers an id it
-/// holds no configuration under with the one coded sentence, which names
-/// NOTHING from the request, and a refused associate leaves no association
-/// behind.
+/// holds no configuration under with a coded sentence that names NOTHING from
+/// the request, and a refused associate leaves no association behind: the
+/// configuration's own sentence where the operation resolves the configuration,
+/// and the association's where it resolves the association the (configuration,
+/// VPC) pair was made from.
 ///
 /// The table spans the forms a `ResourceId` (length 1..64) takes: the form this
 /// service mints, an association's form, no Resolver form at all, and both
@@ -487,18 +489,28 @@ async fn an_unknown_query_log_config_is_refused_with_the_coded_sentence() {
         ("the shortest ResourceId (length 1)", "c".to_string()),
         ("the longest ResourceId (length 64)", "c".repeat(64)),
     ] {
-        for (operation, body) in [
+        for (operation, body, sentence, resource_type) in [
             (
                 "AssociateResolverQueryLogConfig",
                 json!({ "ResolverQueryLogConfigId": unknown, "ResourceId": vpc }),
+                CONFIG_GONE_SENTENCE,
+                "ResolverQueryLogConfig",
             ),
             (
+                // The disassociate resolves the ASSOCIATION the (configuration,
+                // VPC) pair was made from, and a configuration the store holds
+                // nothing under holds no association either, so this one path
+                // answers the association's own coded sentence.
                 "DisassociateResolverQueryLogConfig",
                 json!({ "ResolverQueryLogConfigId": unknown, "ResourceId": vpc }),
+                ASSOCIATION_GONE_SENTENCE,
+                "ResolverQueryLogConfigAssociation",
             ),
             (
                 "GetResolverQueryLogConfig",
                 json!({ "ResolverQueryLogConfigId": unknown }),
+                CONFIG_GONE_SENTENCE,
+                "ResolverQueryLogConfig",
             ),
         ] {
             let (status, parsed) = call(&router, operation, body).await;
@@ -508,11 +520,11 @@ async fn an_unknown_query_log_config_is_refused_with_the_coded_sentence() {
                 status,
                 &parsed,
                 "ResourceNotFoundException",
-                CONFIG_GONE_SENTENCE,
+                sentence,
             );
             assert_eq!(
                 string_member(&parsed, "ResourceType"),
-                "ResolverQueryLogConfig",
+                resource_type,
                 "case {case:?}/{operation}: the refusal must name the missing resource, got \
                  {parsed}"
             );

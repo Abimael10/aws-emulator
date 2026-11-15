@@ -167,36 +167,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // "Disassociates a VPC from a query logging configuration": the
-        // configuration named is what the association hangs off, so an id this
-        // service holds no configuration under is "the specified resource
-        // doesn't exist" whatever VPC the request carries, and nothing is
-        // written. The VPC id is NOT resolved against the account's Amazon EC2
-        // inventory: here it SELECTS an association the service already holds
-        // rather than making one, so a VPC that has since been deleted still
-        // names the association that was made in it.
-        let Some(config) = store
+        // "Disassociates a VPC from a query logging configuration": this call
+        // addresses an association by the PAIR it was made from, so what it
+        // resolves is the ASSOCIATION and never the configuration on its own —
+        // a configuration this service holds nothing under holds no association
+        // either, exactly as a VPC it was never associated with and a second
+        // disassociate of the same pair hold none, and all three are reported as
+        // the one missing association with nothing written. The VPC id is NOT
+        // resolved against the account's Amazon EC2 inventory: here it SELECTS
+        // an association the service already holds rather than making one, so a
+        // VPC that has since been deleted still names the association that was
+        // made in it.
+        let held = store
             .resolver_query_log_configs
             .get_mut(&input.resolver_query_log_config_id)
-        else {
-            return Err(
-                DisassociateResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
-                    crate::state::resolver_query_log_config_not_found(&trace_root),
-                )
-                .into(),
-            );
-        };
-
-        // This call addresses an association by the PAIR it was made from, so a
-        // VPC this configuration was never associated with, and a second
-        // disassociate of the same pair, are both "the specified resource
-        // doesn't exist" — the same missing ASSOCIATION a read of one by its own
-        // id reports, and reported with the same body. The record leaves the
-        // configuration it was kept on, so the `AssociationCount` every later
-        // read of that configuration reports no longer counts it, and the
-        // configuration can be deleted once the last VPC has been disassociated
-        // from it.
-        let Some(record) = config.remove_association_for_vpc(&input.resource_id) else {
+            // The record leaves the configuration it was kept on, so the
+            // `AssociationCount` every later read of that configuration reports
+            // no longer counts it, and the configuration can be deleted once the
+            // last VPC has been disassociated from it.
+            .and_then(|config| config.remove_association_for_vpc(&input.resource_id));
+        let Some(record) = held else {
             return Err(
                 DisassociateResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
                     crate::state::resolver_query_log_config_association_not_found(&trace_root),

@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lock of this service's store held.
         if crate::state::vpc_configuration_resource_is_unknown(&*self.engine, &input.resource_id) {
             return Err(GetFirewallConfigErrorModeled::ResourceNotFoundException(
-                crate::state::firewall_config_resource_not_found(
+                crate::state::firewall_vpc_not_found(
                     &input.resource_id,
                     &crate::state::request_trace_root(&ctx.parts().headers),
                 ),

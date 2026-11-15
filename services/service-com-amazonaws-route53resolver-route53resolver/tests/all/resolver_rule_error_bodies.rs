@@ -113,6 +113,9 @@ async fn a_missing_rule_is_refused_with_the_coded_sentence() {
         &endpoint,
     )
     .await;
+    // The VPC the associate names is one the account holds, because that write
+    // resolves the VPC before the rule: these rows are about the rule.
+    router.hold_vpcs(["vpc-00000000000000031"]);
 
     for (case, id) in unknown_rule_ids() {
         let requests = [

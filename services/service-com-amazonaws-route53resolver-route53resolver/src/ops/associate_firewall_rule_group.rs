@@ -252,13 +252,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let trace_root = crate::state::request_trace_root(&ctx.parts().headers);
         let timestamp = crate::state::now_rfc3339();
 
-        // This service's own resources are resolved FIRST, under a lock that is
-        // released again so the VPC resolution below never holds two services'
-        // stores at once: a retry of a stored `CreatorRequestId` resolves to the
-        // association it already made, and a rule group this service holds none
-        // of is what the request is refused for, whatever else it carries. Both
-        // lookups are repeated by the write path under the lock it writes
-        // through.
+        // A retry of a stored `CreatorRequestId` resolves to the association it
+        // already made, before any resource the request names is resolved: the
+        // answer is the record that request already produced, whatever the
+        // account holds now. The lock is released again so the VPC resolution
+        // below never holds two services' stores at once, and the lookup is
+        // repeated by the write path under the lock it writes through.
         {
             let store = state.lock();
             if let Some(record) = store
@@ -270,36 +269,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     firewall_rule_group_association: Some(record.to_association(now)),
                 });
             }
-            if !store
-                .firewall_rule_groups
-                .contains_key(&input.firewall_rule_group_id)
-            {
-                return Err(
-                    AssociateFirewallRuleGroupErrorModeled::ResourceNotFoundException(
-                        crate::state::firewall_rule_group_not_found(
-                            &input.firewall_rule_group_id,
-                            &trace_root,
-                        ),
-                    )
-                    .into(),
-                );
-            }
         }
 
         // `VpcId` is "the unique identifier of the VPC that you want to
         // associate with the rule group" — a VPC of the caller's own account, so
         // the id is resolved against that account's Amazon EC2 inventory, the
-        // same resolution the endpoint write path makes for a `SubnetId`. This
-        // operation models no `InvalidParameterException`, so the id that
-        // resolves to nothing is reported with the `ValidationException` it does
-        // model, before the store is locked, so nothing is written.
+        // same resolution the endpoint write path makes for a `SubnetId`. The
+        // VPC the association would be made IN is resolved BEFORE the rule group
+        // it would be made FOR, so a request naming neither is refused for the
+        // VPC, and with the DNS Firewall slice's one body for a resource the
+        // caller cannot address (`crate::state::firewall_vpc_not_found`, the
+        // same body its per-VPC configuration reads report). Resolved before the
+        // store is locked, so nothing is written.
         if let Some(unknown) =
             crate::state::unresolvable_vpc_id(&*self.engine, [input.vpc_id.as_str()])
         {
-            return Err(AssociateFirewallRuleGroupErrorModeled::ValidationException(
-                crate::state::vpc_not_found_validation(&unknown),
-            )
-            .into());
+            return Err(
+                AssociateFirewallRuleGroupErrorModeled::ResourceNotFoundException(
+                    crate::state::firewall_vpc_not_found(&unknown, &trace_root),
+                )
+                .into(),
+            );
         }
 
         let mut store = state.lock();

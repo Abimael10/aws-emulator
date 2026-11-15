@@ -929,6 +929,9 @@ async fn associating_is_refused_without_a_rule_and_refused_twice_over() {
         ("a rule id that was never minted", "rslvr-rr-ffffffffffffffff"),
         ("the id of a stored Resolver endpoint", endpoint.as_str()),
     ] {
+        // The VPC is one the account holds, because the associate resolves the
+        // VPC before the rule: these rows are about the rule that is missing.
+        router.hold_vpcs(["vpc-0000000000000000c"]);
         expect_error(
             &router,
             "AssociateResolverRule",

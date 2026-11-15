@@ -1549,15 +1549,6 @@ pub fn vpc_not_found(vpc_id: &str) -> InvalidParameterException {
     }
 }
 
-/// The same refusal as [`vpc_not_found`] in the `ValidationException` shape, for
-/// an operation whose model gives it that error and no
-/// `InvalidParameterException` to report a parameter it cannot resolve with.
-pub fn vpc_not_found_validation(vpc_id: &str) -> ValidationException {
-    ValidationException {
-        message: Some(vpc_not_found_message(vpc_id)),
-    }
-}
-
 /// What a VPC id that names no VPC of the account is refused with, in one place
 /// so the operations that resolve one cannot word it two ways.
 ///

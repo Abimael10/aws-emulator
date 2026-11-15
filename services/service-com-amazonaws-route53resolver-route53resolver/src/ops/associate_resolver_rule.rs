@@ -172,13 +172,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // `VPCId`: "The ID of the VPC that you want to associate the Resolver
+        // rule with" — a VPC of the caller's own account, so the id is resolved
+        // against that account's Amazon EC2 inventory, the same resolution the
+        // endpoint write path makes for a `SubnetId`. The VPC the association
+        // would be made IN is resolved BEFORE the rule it would be made FOR, so
+        // a request naming neither is refused for the VPC. Resolved with no lock
+        // of this service's store held, so nothing is written and no association
+        // is left pointing at a VPC that does not exist.
+        if let Some(unknown) =
+            crate::state::unresolvable_vpc_id(&*self.engine, [input.vpc_id.as_str()])
+        {
+            return Err(AssociateResolverRuleErrorModeled::InvalidParameterException(
+                crate::state::vpc_not_found(&unknown),
+            )
+            .into());
+        }
+
         // `ResolverRuleId`: "The ID of the Resolver rule that you want to
         // associate with the VPC" — the rule has to exist for the association to
-        // mean anything, and it is resolved FIRST, so a request naming a rule
-        // this service holds none of is answered for that whatever else it
-        // carries. The lock is released again so the VPC resolution below never
-        // holds two services' stores at once; the write path below repeats this
-        // lookup under the lock it writes through.
+        // mean anything. The lock is released again so the write path below
+        // repeats this lookup under the lock it writes through.
         {
             let store = state.lock();
             if !store.resolver_rules.contains_key(&input.resolver_rule_id) {
@@ -187,21 +201,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-        }
-
-        // `VPCId`: "The ID of the VPC that you want to associate the Resolver
-        // rule with" — a VPC of the caller's own account, so the id is resolved
-        // against that account's Amazon EC2 inventory, the same resolution the
-        // endpoint write path makes for a `SubnetId`. An id that resolves to
-        // nothing is refused before the store is locked, so nothing is written
-        // and no association is left pointing at a VPC that does not exist.
-        if let Some(unknown) =
-            crate::state::unresolvable_vpc_id(&*self.engine, [input.vpc_id.as_str()])
-        {
-            return Err(AssociateResolverRuleErrorModeled::InvalidParameterException(
-                crate::state::vpc_not_found(&unknown),
-            )
-            .into());
         }
 
         let mut store = state.lock();

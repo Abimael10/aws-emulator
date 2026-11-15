@@ -123,22 +123,21 @@ fn account_holds_profile<Eng: Send + Sync + 'static>(engine: &Eng, profile_id: &
     held
 }
 
-/// The `ResourceNotFoundException` the DNS Firewall per-VPC configuration
-/// operations answer for a `ResourceId` that names no VPC of the account.
+/// The `ResourceNotFoundException` the DNS Firewall operations answer for a VPC
+/// id that names no VPC of the account — the `ResourceId` of the per-VPC
+/// configuration operations, and the `VpcId` a rule-group association is made
+/// in.
 ///
-/// Built here so `GetFirewallConfig` and `UpdateFirewallConfig` cannot drift
-/// apart: both report the can't-find sentence naming the id the REQUEST sent,
-/// under the DNS Firewall slice's own code for a resource the caller cannot
-/// address ([`RSLVR_CODE_RESOURCE_NOT_FOUND`], which
+/// Built here so no DNS Firewall operation that resolves a VPC id can drift
+/// apart from the others: every one of them reports the can't-find sentence
+/// naming the id the REQUEST sent, under the DNS Firewall slice's own code for a
+/// resource the caller cannot address ([`RSLVR_CODE_RESOURCE_NOT_FOUND`], which
 /// [`resource_not_found_message`] renders), closed with the trace clause of the
 /// request ([`traced_message`]). No `ResourceType` is reported
 /// beside it: the resource that could not be found is a VPC of the account's
 /// Amazon EC2 inventory, which is not one of this service's own modelled
 /// resource types.
-pub fn firewall_config_resource_not_found(
-    resource_id: &str,
-    trace_root: &str,
-) -> ResourceNotFoundException {
+pub fn firewall_vpc_not_found(resource_id: &str, trace_root: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(traced_message(
             resource_not_found_message(resource_id),
@@ -153,7 +152,7 @@ pub fn firewall_config_resource_not_found(
 /// the one can't-find sentence under the Resolver code
 /// ([`RSLVR_CODE_RESOLVER_RESOURCE_NOT_FOUND`]) rather than the DNS Firewall
 /// one, and carry it ALONE: the trace clause the DNS Firewall slice closes its
-/// refusal with ([`firewall_config_resource_not_found`]) is not part of this
+/// refusal with ([`firewall_vpc_not_found`]) is not part of this
 /// one, as the recorded responses of the two show.
 pub fn resolver_config_resource_not_found(resource_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {

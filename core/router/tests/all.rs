@@ -1540,3 +1540,6 @@ mod lambda_delivery_grant_is_each_sources_own;
 // files below are shared harnesses or probes rather than suites; every one of them is
 // declared, because a file no declaration names is compiled nowhere.
 // `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin every rule
+// by name, and no other line. Put a new suite at `tests/all/<name>.rs` and insert its pair
+// where its name sorts to, so two branches landing at once insert two lines in two places and
+// have no prose to duplicate, re-word or mistype.

@@ -5,16 +5,19 @@
 //! The rule under test: a write that associates a Resolver resource WITH a VPC
 //! resolves the VPC id the request names against the account's own Amazon EC2
 //! VPC inventory, and an id that resolves to nothing is refused at HTTP 400 with
-//! the parameter-validation error that operation's own model gives it, whose
-//! message names the offending id taken from the request, with nothing written.
+//! the error that operation's own model gives it, whose message names the
+//! offending id taken from the request, with nothing written.
 //!
 //! The three writes that name such a VPC are `AssociateResolverRule`'s `VPCId`,
 //! `AssociateResolverQueryLogConfig`'s `ResourceId` ("the ID of an Amazon VPC
 //! that you want this query logging configuration to log queries for") and
 //! `AssociateFirewallRuleGroup`'s `VpcId`, and all three are exercised here. The
-//! first two model `InvalidParameterException`; the third models no
-//! `InvalidParameterException` at all, so it reports the `ValidationException`
-//! it does model
+//! first two model `InvalidParameterException` and report the sentence Amazon
+//! EC2 words for an id its inventory does not hold; the DNS Firewall write
+//! models no `InvalidParameterException` at all and reports the one body that
+//! slice answers for a resource the caller cannot address — the coded can't-find
+//! sentence naming the id, closed with the trace clause of the request, the same
+//! body its per-VPC configuration reads answer
 //! (`smithy_query(query="operation",operation="AssociateResolverRule,AssociateResolverQueryLogConfig,AssociateFirewallRuleGroup")`).
 //! The matching `Disassociate*` operations also take a VPC id, but there it
 //! SELECTS an association the service already holds rather than creating one, so
@@ -76,11 +79,46 @@ impl Association {
     }
 
     /// The modelled error an id that names no VPC of the account is refused
-    /// with: the parameter-validation error this operation's model gives it.
+    /// with: the error this operation's model gives it for a resource it cannot
+    /// resolve.
     fn refusal(self) -> &'static str {
         match self {
             Self::ResolverRule | Self::QueryLogConfig => "InvalidParameterException",
-            Self::FirewallRuleGroup => "ValidationException",
+            Self::FirewallRuleGroup => "ResourceNotFoundException",
+        }
+    }
+
+    /// The `Message` that refusal carries for the id `unknown`, which named no
+    /// VPC of the account.
+    ///
+    /// The two `InvalidParameterException` paths report the sentence Amazon EC2
+    /// words for an id its own inventory does not hold; the DNS Firewall path
+    /// reports that slice's coded can't-find sentence, closed with the trace
+    /// clause of the request, so only the sentence before the clause is compared
+    /// here (the clause itself is
+    /// [`super::firewall_not_found_trace_clause`]'s).
+    fn refusal_message(self, unknown: &str) -> String {
+        match self {
+            Self::ResolverRule | Self::QueryLogConfig => {
+                format!("The vpc ID '{unknown}' does not exist")
+            }
+            Self::FirewallRuleGroup => {
+                format!("[RSLVR-02025] Can’t find the resource with ID \"{unknown}\".")
+            }
+        }
+    }
+
+    /// The part of a refusal `Message` this rule fixes: everything before the
+    /// trace clause the DNS Firewall slice closes its refusals with.
+    fn stated_sentence(self, message: &str) -> String {
+        match self {
+            Self::ResolverRule | Self::QueryLogConfig => message.to_string(),
+            Self::FirewallRuleGroup => super::harness::traced_message(message)
+                .unwrap_or_else(|| {
+                    panic!("the refusal must close with its trace clause, got {message:?}")
+                })
+                .0
+                .to_string(),
         }
     }
 
@@ -250,8 +288,8 @@ struct RefusedCase {
 }
 
 /// An associate naming a VPC the account does not hold is refused at HTTP 400
-/// with that operation's parameter-validation error, the offending id named in
-/// the message, and writes nothing.
+/// with the error that operation models for it, the offending id named in the
+/// message, and writes nothing.
 #[tokio::test]
 async fn an_associate_naming_a_vpc_the_account_does_not_hold_is_refused() {
     let cases = vec![
@@ -311,13 +349,14 @@ async fn an_associate_naming_a_vpc_the_account_does_not_hold_is_refused() {
                 association.refusal()
             );
             let message = string_member(&parsed, "Message");
+            let stated = association.stated_sentence(&message);
             assert_eq!(
-                message,
-                format!("The vpc ID '{unknown}' does not exist"),
+                stated,
+                association.refusal_message(unknown),
                 "case {case:?}: {} must name the id that resolved to nothing, got {parsed}",
                 association.operation()
             );
-            messages.push(message);
+            messages.push(stated);
 
             assert_eq!(
                 association.stored(&router, &owner).await,
@@ -439,8 +478,8 @@ async fn a_vpc_taken_out_of_the_account_stops_resolving() {
             association.operation()
         );
         assert_eq!(
-            string_member(&parsed, "Message"),
-            format!("The vpc ID '{HELD_ID}' does not exist"),
+            association.stated_sentence(&string_member(&parsed, "Message")),
+            association.refusal_message(HELD_ID),
             "{}: the refusal must name the VPC that stopped resolving, got {parsed}",
             association.operation()
         );
@@ -453,14 +492,14 @@ async fn a_vpc_taken_out_of_the_account_stops_resolving() {
     }
 }
 
-/// The resource the association is made FOR is resolved before the VPC: a
-/// request naming one this service holds nothing under is answered for THAT,
-/// even when its VPC would not resolve either.
+/// The VPC the association would be made IN is resolved before the resource it
+/// would be made FOR: a request naming a VPC the account does not hold is
+/// answered for THAT, even when the resource it names does not exist either.
 #[tokio::test]
-async fn the_associated_resource_is_resolved_before_the_vpc() {
+async fn the_vpc_is_resolved_before_the_associated_resource() {
     // The id of each kind that this service holds no resource under, in the form
-    // it mints: a Resolver rule, a query logging configuration and a DNS Firewall
-    // rule group.
+    // it mints: a Resolver rule, a query logging configuration and a DNS
+    // Firewall rule group.
     for (association, missing) in [
         (Association::ResolverRule, "rslvr-rr-0000000000000000"),
         (Association::QueryLogConfig, "rqlc-0000000000000000"),
@@ -480,8 +519,14 @@ async fn the_associated_resource_is_resolved_before_the_vpc() {
             association.operation()
         );
         assert!(
-            error_type(&parsed).contains("ResourceNotFoundException"),
-            "{}: the missing resource is what the request is refused for, got {parsed}",
+            error_type(&parsed).contains(association.refusal()),
+            "{}: the VPC that resolved to nothing is what the request is refused for, got {parsed}",
+            association.operation()
+        );
+        assert_eq!(
+            association.stated_sentence(&string_member(&parsed, "Message")),
+            association.refusal_message(LONG_FORM_ID),
+            "{}: the refusal must name the VPC that resolved to nothing, got {parsed}",
             association.operation()
         );
     }

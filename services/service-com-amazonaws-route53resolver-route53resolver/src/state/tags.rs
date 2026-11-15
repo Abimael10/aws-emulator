@@ -194,9 +194,7 @@ pub fn unacceptable_tag(tags: &[Tag]) -> Option<InvalidParameterException> {
 
 /// The same refusal as [`unacceptable_tag`] in the `ValidationException` shape,
 /// for an operation whose model gives it that error and no
-/// `InvalidParameterException` to report a parameter it will not accept —
-/// exactly as [`vpc_not_found_validation`] is the other shape of
-/// [`vpc_not_found`].
+/// `InvalidParameterException` to report a parameter it will not accept.
 pub fn unacceptable_tag_validation(tags: &[Tag]) -> Option<ValidationException> {
     (!tags_are_acceptable(tags)).then(|| ValidationException {
         message: Some(unacceptable_tag_message()),

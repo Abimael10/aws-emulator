@@ -48,16 +48,11 @@ const LONGEST_VPC_ID: &str =
 /// (`smithy_query(query="shape",shape="ResolverQueryLogConfigAssociationStatus")`).
 const IN_FORCE_STATUSES: &[&str] = &["CREATING", "ACTIVE"];
 
-/// The sentence Resolver answers for a query logging configuration it holds
-/// nothing under: fixed text behind the service error code for that fault,
-/// naming no id, before the trace clause the refusal closes with.
-const CONFIG_GONE_SENTENCE: &str =
-    "[RSLVR-01601] The specified query logging configuration doesn't exist.";
-
 /// The sentence Resolver answers for an association it holds nothing under,
 /// whether the request addressed it by its own id or by the (configuration,
 /// VPC) pair it was made from: fixed text behind its own service error code,
-/// which is what tells this fault from [`CONFIG_GONE_SENTENCE`]'s.
+/// which is what tells this fault from the one a read of the configuration
+/// itself reports.
 const ASSOCIATION_GONE_SENTENCE: &str =
     "[RSLVR-01602] The specified query logging configuration association doesn't exist.";
 
@@ -321,11 +316,14 @@ async fn a_disassociate_takes_out_exactly_the_association_its_pair_was_made_from
 /// VPC associated with ANOTHER configuration, and the two members swapped all
 /// address no association the store holds. Each is refused with
 /// `ResourceNotFoundException`, nothing is taken out, and the sentence is the
-/// service's own for the resource that is missing — the configuration
-/// ([`CONFIG_GONE_SENTENCE`]) or the association itself
-/// ([`ASSOCIATION_GONE_SENTENCE`]). Both sentences are fixed text, so the
-/// bracketed service error code, and not an id echoed into the message, is what
-/// tells the two faults apart.
+/// one this call's missing resource has: what it resolves is the ASSOCIATION the
+/// pair was made from ([`ASSOCIATION_GONE_SENTENCE`]), so a configuration the
+/// store holds nothing under holds no association either and is reported the
+/// same way. The sentence is fixed text, so the bracketed service error code,
+/// and not an id echoed into the message, is what tells this fault from a read
+/// of the configuration itself, which
+/// [`super::resolver_query_log_config_associations`] pins on the readers that do
+/// resolve a configuration.
 #[tokio::test]
 async fn a_pair_the_store_holds_no_association_for_is_refused() {
     let router = emulator();
@@ -351,9 +349,9 @@ async fn a_pair_the_store_holds_no_association_for_is_refused() {
     .await;
     let other = association(&other).clone();
 
-    // A configuration the store holds nothing under is answered for THAT, with
-    // the one fixed sentence every query-logging operation reports a missing
-    // configuration with.
+    // A configuration the store holds nothing under holds no association for
+    // any VPC, so it is answered for the ASSOCIATION this call resolves, with
+    // that fault's own coded sentence.
     let mut config_messages: Vec<String> = Vec::new();
     for (case, unknown) in [
         ("an id nothing minted", "rqlc-0123456789abcdef".to_string()),
@@ -383,12 +381,12 @@ async fn a_pair_the_store_holds_no_association_for_is_refused() {
             )
         });
         assert_eq!(
-            stated, CONFIG_GONE_SENTENCE,
+            stated, ASSOCIATION_GONE_SENTENCE,
             "case {case:?}: the refusal must carry the service's own coded sentence, got {parsed}"
         );
         assert_eq!(
             string_member(&parsed, "ResourceType"),
-            "ResolverQueryLogConfig",
+            "ResolverQueryLogConfigAssociation",
             "case {case:?}: the refusal must name the resource that is missing, got {parsed}"
         );
         config_messages.push(stated.to_string());
@@ -446,16 +444,11 @@ async fn a_pair_the_store_holds_no_association_for_is_refused() {
                  {message:?}"
             )
         });
-        // The swapped row names a configuration the store holds nothing under,
-        // so it is answered for the configuration; the others name a stored
-        // configuration, so they are answered for the association itself.
-        let expected = if config.starts_with("rqlc-") {
-            ASSOCIATION_GONE_SENTENCE
-        } else {
-            CONFIG_GONE_SENTENCE
-        };
+        // Every row addresses no association the store holds — the swapped row
+        // by naming a configuration it holds nothing under — so every one of
+        // them is answered for the association itself.
         assert_eq!(
-            stated, expected,
+            stated, ASSOCIATION_GONE_SENTENCE,
             "case {case:?}: the refusal must carry the coded sentence of the resource that is \
              missing, got {parsed}"
         );
@@ -463,8 +456,8 @@ async fn a_pair_the_store_holds_no_association_for_is_refused() {
     }
     assert_eq!(
         pair_messages.iter().collect::<BTreeSet<&String>>().len(),
-        2,
-        "the rows must answer exactly the two fixed sentences, got {pair_messages:?}"
+        1,
+        "the rows must answer exactly the one fixed sentence, got {pair_messages:?}"
     );
 
     // Nothing was taken out: both associations still read back, both
