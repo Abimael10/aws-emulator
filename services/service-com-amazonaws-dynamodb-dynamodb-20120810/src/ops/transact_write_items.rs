@@ -777,6 +777,13 @@ enum Requested<'a> {
 impl<'a> Requested<'a> {
     /// The one action `entry` states, or the refusal for an entry that states none of
     /// them — or more than one.
+    ///
+    /// The two defects are two violations: an entry that states NO action violates the
+    /// constraint every element of this list is held to
+    /// ([`crate::state::transact_item_states_no_action`]), which is a clause the request's
+    /// own constraint refusal counts beside every violation the model's traits find
+    /// (`crate::service` collects it off the request), while an entry naming SEVERAL
+    /// states no single action.
     fn of(entry: &'a TransactWriteItem) -> Result<Self, crate::state::RequestError> {
         let stated = [
             entry.condition_check.as_ref().map(Self::Check),
@@ -787,6 +794,7 @@ impl<'a> Requested<'a> {
         let mut stated = stated.into_iter().flatten();
         match (stated.next(), stated.next()) {
             (Some(one), None) => Ok(one),
+            (None, _) => Err(crate::state::transact_item_states_no_action()),
             _ => Err(crate::state::exactly_one_operation(
                 "transactItems",
                 "ConditionCheck, Put, Delete or Update",
@@ -990,6 +998,33 @@ fn check_element_shape(
         )
         .map_err(crate::state::refused_in_element)
         .map_err(lift)?;
+    }
+    // And so is the grammar of the condition any of the four actions may state: whether
+    // it READS as a condition depends on its own text and this element's substitution
+    // tables alone, so it is settled in this pass with every other fact of the request —
+    // which is what makes the element a transaction's refusal names the first LISTED one
+    // that carries a defect, rather than whichever element the preparation below reached
+    // first. Evaluating it still waits for the stored item, which is where
+    // [`crate::state::write_condition_satisfied`] reads it.
+    if let Some(condition) = action.condition_expression() {
+        crate::state::ParsedCondition::parse("ConditionExpression", condition, substitutions)
+            .map_err(crate::state::refused_in_element)
+            .map_err(lift)?;
+    }
+    // The documented ceiling on how deeply a stored value may nest is a QUOTA, and the
+    // fixed sentence AWS states for a quota an ELEMENT of a transaction crossed is stated
+    // as the sentence it is — like the item-size sentence beside it below, and like every
+    // other refusal about one element's own members
+    // ([`crate::state::refused_in_element`]) — rather than inside the
+    // `<N> validation error(s) detected: ` envelope that counts violations of the
+    // REQUEST's own members. Asked before the value rules below, which state the same
+    // ceiling inside that envelope for the single-item writes.
+    for value in action.addressed().values() {
+        if crate::state::attribute_depth_exceeds(value, crate::state::MAX_ATTRIBUTE_DEPTH) {
+            return Err(lift(crate::state::unenveloped(
+                crate::state::nesting_levels_exceeded(),
+            )));
+        }
     }
     // Every value the map this element ADDRESSES carries — the item a `Put` writes, the
     // `Key` every other action names — is held to the documented value rules (the nesting

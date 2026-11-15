@@ -1236,3 +1236,15 @@ mod zz_probe_whole_emulator;
 //! The notes concurrent landings had appended to the tail of this file live in
 //! `all/appended_notes.rs`: appended as inner doc comments they were `E0753`, and they had
 //! grown this root past the project's file-length ceiling.
+//! Single integration-test target for the router: the declaration list, and nothing else.
+//! Put a new suite at `tests/all/<name>.rs` and add its `#[path = "all/<name>.rs"]` /
+//! `mod <name>;` pair below, in sorted position — one pair per suite and no other line,
+//! NOTHING after the last pair, so two branches landing at once insert two lines in two
+//! places and have no prose to duplicate or mistype. `all/all_rs_is_a_canonical_declaration_list.rs`,
+//! `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check that shape, for this file
+//! and for every service crate's `tests/all.rs`, so a note about any of these rules belongs
+//! there rather than here, and the notes earlier landings appended to the end of this file
+//! live in `all/appended_notes.rs`. What a suite covers, and why it lives in this
+//! cross-service target rather than in one service crate's own, belongs in that suite's own
+//! module header.

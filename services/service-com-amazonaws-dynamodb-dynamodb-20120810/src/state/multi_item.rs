@@ -680,6 +680,46 @@ pub fn exactly_one_operation(member: &str, choices: &str) -> RequestError {
     ))
 }
 
+/// The member a transaction's actions arrive in, as the request validator spells a member
+/// in the paths it reports (lowerCamel) — the member a `TransactWriteItem` that states no
+/// action at all violates.
+pub const TRANSACT_ITEMS_MEMBER_PATH: &str = "transactItems";
+
+/// The constraint an element of a transactional write that names NONE of the four actions
+/// broke, as AWS's request validator words the requirement: the shape that must carry one
+/// of them and the four it may carry, in the order AWS lists them.
+///
+/// It is a constraint on the `TransactItems` MEMBER — a `TransactWriteItem` is a choice of
+/// four optional members with nothing in the model to say one must be present
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#TransactWriteItem")` gives
+/// `ConditionCheck Put Delete Update`, none of them `@required`) — so an element that
+/// states none of them is an input-constraint violation this service finds itself and
+/// reports as a clause like any other, counted in the `<N> validation error(s) detected: `
+/// envelope beside every violation the model's own traits find
+/// ([`transact_item_states_no_action_clause`]).
+pub const TRANSACT_ITEM_ACTION_REQUIREMENT: &str =
+    "TransactWriteRequest should contain Delete or Put or Update or ConditionCheck";
+
+/// That violation as ONE clause of the envelope: the member the walk names it under, with
+/// the empty value AWS echoes for an element that states nothing.
+///
+/// The one place the sentence is written, for both sides that can report it — the
+/// aggregate the request's own constraint refusal counts, and the handler's refusal of a
+/// request whose only violation this is — so the two cannot drift.
+pub fn transact_item_states_no_action_clause() -> String {
+    constraint_clause(
+        TRANSACT_ITEMS_MEMBER_PATH,
+        Some(""),
+        TRANSACT_ITEM_ACTION_REQUIREMENT,
+    )
+}
+
+/// That violation as the whole refusal, for the request whose ONLY violation it is: the
+/// envelope over that one clause.
+pub fn transact_item_states_no_action() -> RequestError {
+    refused(transact_item_states_no_action_clause())
+}
+
 /// How a transaction that addresses one item twice is refused: "Transaction requests
 /// cannot include multiple operations on one item" (the `TransactWriteItems` doc).
 pub const DUPLICATE_TRANSACT_ITEM_MESSAGE: &str =

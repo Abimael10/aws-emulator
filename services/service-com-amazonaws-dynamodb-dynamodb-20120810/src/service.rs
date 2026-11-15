@@ -142,6 +142,10 @@ mod front_door;
 /// reported on.
 mod request_latency_metrics;
 
+/// The input constraints this service checks ITSELF — the ones the model declares no trait
+/// for — read off the request body so their clauses join the walk's in one refusal.
+mod request_constraints;
+
 /// This front door's AUDIT leg: every control-plane call it serves is a management event of
 /// this service, recorded in the account's event history where CloudTrail reads it.
 pub mod management_events;
@@ -543,6 +547,12 @@ tokio::task_local! {
     /// requires as the walk's clause ([`VALIDATOR_NULL_CLAUSE_OPERATIONS`]), set and read
     /// back the same way.
     static SERVED_NULL_CLAUSE: bool;
+
+    /// The clauses this service's OWN reading of the request found
+    /// ([`request_constraints`]), set around the same run and read back by
+    /// [`validation_envelope`] so they are counted in the one envelope beside the
+    /// violations the validating walk reports.
+    static SERVED_SERVICE_CHECKED_CLAUSES: Vec<String>;
 }
 
 /// The form the operation this task is serving states its clauses in.
@@ -569,6 +579,14 @@ fn served_states_clause_bare() -> bool {
 /// answer every operation this list does not name gives.
 fn served_states_absent_member_as_clause() -> bool {
     SERVED_NULL_CLAUSE.try_with(|clause| *clause).unwrap_or(false)
+}
+
+/// The clauses this service's own reading of the request it is serving found. None at all
+/// is a refusal raised outside an operation's run, where there is no request to have read.
+fn served_service_checked_clauses() -> Vec<String> {
+    SERVED_SERVICE_CHECKED_CLAUSES
+        .try_with(Clone::clone)
+        .unwrap_or_default()
 }
 
 /// Serves a request as the operation the generated routing table names, with that
@@ -617,7 +635,10 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
                         states_service_checked_clause_bare(operation),
                         SERVED_NULL_CLAUSE.scope(
                             states_absent_member_as_clause(operation),
-                            op.run(svc, req, ctx),
+                            SERVED_SERVICE_CHECKED_CLAUSES.scope(
+                                request_constraints::service_checked_clauses(operation, req),
+                                op.run(svc, req, ctx),
+                            ),
                         ),
                     ),
                 )
@@ -812,6 +833,16 @@ fn validation_envelope(violations: &[Violation]) -> Option<String> {
         .into_iter()
         .map(|violation| violation_clause(violation, served_clause_form()))
         .collect::<Option<Vec<_>>>()?;
+    // The violations this service found by READING the request are violations of the same
+    // input, so they are clauses of the same envelope and are counted with the walk's
+    // ([`request_constraints`]). They come first because the members they are about are
+    // declared first — the one order the refusal states its members in. A refusal the
+    // walk raised for another request cannot pick them up: the scope they are read from
+    // is the run of the request they were read off.
+    let clauses: Vec<String> = served_service_checked_clauses()
+        .into_iter()
+        .chain(clauses)
+        .collect();
     // A refusal about nothing but the members this service checks itself is stated bare
     // by the operations that state such a clause bare ([`BARE_CLAUSE_OPERATIONS`]), and
     // inside the envelope by every other operation. Anything else — a bound the

@@ -2747,10 +2747,13 @@ impl<'a> ExprParser<'a> {
         self.tokens.get(self.at)
     }
 
-    fn next_token(&mut self) -> Result<ExprToken, RequestError> {
-        let token = self.peek().cloned().ok_or_else(|| self.syntax())?;
-        self.at += 1;
-        Ok(token)
+    /// The token the parse is AT, left where it is: a grammar position that cannot
+    /// accept it has not consumed it, so its refusal names that token
+    /// ([`Self::syntax`]) rather than the one after it. A caller that DOES accept the
+    /// token advances past it itself. Running out of tokens is the same syntax error at
+    /// the end of the expression.
+    fn token_here(&self) -> Result<ExprToken, RequestError> {
+        self.peek().cloned().ok_or_else(|| self.syntax())
     }
 
     /// Consume `token` if that is what comes next.
@@ -2844,8 +2847,9 @@ impl<'a> ExprParser<'a> {
         {
             return Err(self.syntax());
         }
-        match self.next_token()? {
+        match self.token_here()? {
             ExprToken::Word(word) => {
+                self.at += 1;
                 // Noted, not refused: the refusal is this parser's to raise once the
                 // whole expression has parsed ([`Self::check_no_reserved_name`]).
                 if is_reserved_word(&word) && self.reserved.is_none() {
@@ -2853,7 +2857,10 @@ impl<'a> ExprParser<'a> {
                 }
                 Ok(word)
             }
-            ExprToken::Alias(alias) => self.alias_name(&alias),
+            ExprToken::Alias(alias) => {
+                self.at += 1;
+                self.alias_name(&alias)
+            }
             _ => Err(self.syntax()),
         }
     }
@@ -2942,8 +2949,9 @@ impl<'a> ExprParser<'a> {
             }
             return Ok(ConditionNode::In(left, candidates));
         }
-        match self.next_token()? {
+        match self.token_here()? {
             ExprToken::Compare(operator) => {
+                self.at += 1;
                 let right = self.operand()?;
                 Ok(ConditionNode::Compare(left, operator, right))
             }
@@ -3044,8 +3052,11 @@ impl<'a> ExprParser<'a> {
     /// The value operand `ADD` and `DELETE` take, which is a `:placeholder` — both
     /// actions take a value, not another of the item's attributes.
     fn action_value(&mut self) -> Result<AttributeValue, RequestError> {
-        match self.next_token()? {
-            ExprToken::Placeholder(placeholder) => self.placeholder_value(&placeholder),
+        match self.token_here()? {
+            ExprToken::Placeholder(placeholder) => {
+                self.at += 1;
+                self.placeholder_value(&placeholder)
+            }
             _ => Err(self.syntax()),
         }
     }

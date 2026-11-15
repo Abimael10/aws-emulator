@@ -32,11 +32,23 @@ pub const POINT_IN_TIME_RECOVERY_DISABLED: &str = "DISABLED";
 /// (`PointInTimeRecoverySpecification$RecoveryPeriodInDays`).
 pub const DEFAULT_RECOVERY_PERIOD_IN_DAYS: i32 = 35;
 
-/// How far behind the present the newest restorable point sits:
-/// "`LatestRestorableDateTime` is typically 5 minutes before the current time" (the
-/// `UpdateContinuousBackups` doc and
-/// `PointInTimeRecoveryDescription$LatestRestorableDateTime`).
-pub const RESTORE_WINDOW_LAG: Duration = Duration::from_secs(5 * 60);
+/// How far behind the present the newest restorable point sits.
+///
+/// The window's newest point TRAILS the clock — "`LatestRestorableDateTime` is typically
+/// 5 minutes before the current time" (the `UpdateContinuousBackups` doc and
+/// `PointInTimeRecoveryDescription$LatestRestorableDateTime`) — so a point in time only
+/// becomes restorable once the recovery that has to reproduce it has caught up with it.
+/// AWS states no figure it holds to ("typically"), and the figure is not what a caller
+/// can act on: what it acts on is that the newest point ADVANCES with the clock and
+/// REACHES an instant the caller has already observed, so a restore to that instant stops
+/// being refused. That catching up is a progression the clock owes, so it takes this
+/// emulator's ONE span for such a progression ([`STATUS_TRANSITION`]) rather than a wait
+/// no client of an emulator can sit out: a caller that records an instant now, and polls
+/// the window the way a backup runbook does, sees the window pass it and the restore
+/// accepted. The span is never zero, so a caller that reads the window and immediately
+/// names a LATER instant still meets the modelled refusal of a point the window has not
+/// reached.
+pub const RESTORE_WINDOW_LAG: Duration = STATUS_TRANSITION;
 
 /// One day, the unit `RecoveryPeriodInDays` counts the recovery window in.
 pub(super) const DAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -238,11 +250,10 @@ impl PointInTimeRecovery {
     /// time to restore to.
     ///
     /// DERIVED at every read rather than stored, because it moves with the clock: the
-    /// newest point is one [`RESTORE_WINDOW_LAG`] behind now ("LatestRestorableDateTime
-    /// is typically 5 minutes before the current time") and the oldest the configured
-    /// period behind now, each held at or after the instant recovery started — before
-    /// which there is nothing to restore from. The bounds are ordered by construction,
-    /// so the window is never empty.
+    /// newest point is one [`RESTORE_WINDOW_LAG`] behind now ("LatestRestorableDateTime"
+    /// trails the present) and the oldest the configured period behind now, each held at
+    /// or after the instant recovery started — before which there is nothing to restore
+    /// from. The bounds are ordered by construction, so the window is never empty.
     pub fn restorable_window(&self, now: SystemTime) -> Option<(SystemTime, SystemTime)> {
         let enabled_at = self.enabled_at?;
         let latest = now

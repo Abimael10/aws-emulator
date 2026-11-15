@@ -93,6 +93,8 @@ mod expression_parameter_generations;
 mod expression_refusal_families;
 #[path = "all/expression_rules_and_write_admission.rs"]
 mod expression_rules_and_write_admission;
+#[path = "all/expression_syntax_error_positions.rs"]
+mod expression_syntax_error_positions;
 #[path = "all/fine_grained_condition_keys.rs"]
 mod fine_grained_condition_keys;
 #[path = "all/global_secondary_indexes.rs"]
@@ -187,6 +189,8 @@ mod partiql_transactions;
 mod partiql_unsupported_operations;
 #[path = "all/point_in_time_item_history.rs"]
 mod point_in_time_item_history;
+#[path = "all/point_in_time_window_catches_up.rs"]
+mod point_in_time_window_catches_up;
 #[path = "all/probe.rs"]
 mod probe;
 #[path = "all/provisioned_capacity_metrics.rs"]
@@ -293,6 +297,8 @@ mod table_replicas;
 mod table_scan;
 #[path = "all/table_streams.rs"]
 mod table_streams;
+#[path = "all/transact_write_defect_precedence.rs"]
+mod transact_write_defect_precedence;
 #[path = "all/transact_write_expression_parse_defects.rs"]
 mod transact_write_expression_parse_defects;
 #[path = "all/table_throughput_mode_and_warm_capacity.rs"]
