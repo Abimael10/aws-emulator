@@ -88,6 +88,17 @@ pub(crate) async fn stage(router: &MultiServiceRouter, bucket: &str, objects: &[
     put(router, bucket, objects).await;
 }
 
+/// Remove `bucket` from the object store, which a crawler's stored target may then name
+/// nothing: the resolution a crawler WRITE makes answers for the store as it was then.
+pub(crate) async fn remove_bucket(router: &MultiServiceRouter, bucket: &str) {
+    s3(router)
+        .delete_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("the bucket {bucket} must be removed, got {error:?}"));
+}
+
 /// Put further objects into a bucket that already exists.
 async fn put(router: &MultiServiceRouter, bucket: &str, objects: &[(&str, &str)]) {
     let client = s3(router);
@@ -1073,6 +1084,9 @@ async fn a_crawl_reports_what_it_could_and_could_not_do() {
 async fn starting_a_crawler_that_does_not_exist_is_a_miss() {
     let (router, _engine) = emulator_with_s3();
     given_database(&router, DATABASE).await;
+    // The crawler's target is resolved against the object store when it is created, so the
+    // bucket it names is one the store holds.
+    stage(&router, "crawl-miss", &[("data/rows.csv", "id\n1\n")]).await;
     given_crawler(
         &router,
         "stored",

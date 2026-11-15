@@ -48,3 +48,39 @@ Cause 2:
 Boot the emulator and replay these checks from suite simparity-behavioral-aws-v1 (cross-service group emr__glue__s3; every hanging call is a Glue call):
 1. Cause 1 — emr__glue__s3.cfn-deploy-glue-crawler-s3-target-stack-positive: CreateStack with a bucket + crawler role + AWS::Glue::Crawler targeting `s3://<bucket>/data/`, put one CSV object there, call StartCrawler, then poll GetCrawler until State==READY and assert LastCrawl.Status==SUCCEEDED and that GetTables returns one inferred 3-column table located at `s3://<bucket>/data/`. Replay emr__glue__s3.cfn-deploy-glue-crawler-invalid-s3-path-negative (same positive control, then a stack whose crawler targets a nonexistent bucket must fail with the crawler's S3-target 404 in the failure reason) and emr__glue__s3.eventbridge-s3-object-created-triggers-glue-crawler-positive (S3 Object Created -> EventBridge rule -> Lambda -> StartCrawler, then observe the crawl finish).
 2. Cause 2 — emr__glue__s3.glue-job-missing-s3-getobject-source-rejected: create two roles (one without s3:GetObject on `data/*`), CreateJob twice over the same PySpark script, StartJobRun both with --SOURCE_PATH/--OUTPUT_PATH, and poll GetJobRun. Expect the denied run FAILED with error text naming the unreadable source and an empty `output/bad-run/`, and the permitted run SUCCEEDED with a `part-*` object under `output/good-run/` containing `3`.
+
+## Resolution
+
+Cause 1 (the crawler that never crawls) was already implemented when this report was picked
+up: `StartCrawler` performs the crawl, the crawler leaves `READY` and is owed its way back one
+span later with a populated `LastCrawl`, and the datasets found behind its Amazon S3 targets
+are written into the target database. What was MISSING for the third check was the other half
+of that flow: a crawler's `S3Target$Path` was never resolved against the object store, so a
+crawler whose target bucket does not exist was created and the CloudFormation stack that
+declares it reached CREATE_COMPLETE instead of rolling back. `CreateCrawler` and
+`UpdateCrawler` now resolve every Amazon S3 target against the store and refuse a path whose
+bucket it does not hold with `InvalidInputException`, naming the target and the store's own 404
+(`state::s3_target_refusal`, `state::messages::s3_target_not_found`). Pinned by
+`tests/all/crawler_s3_target_resolution.rs`. The three crawler checks of this report pass.
+
+Cause 2 (the job run that settles without executing its script) was likewise implemented: a
+Spark job run executes its script with the Spark engine and the AWS Glue ETL library on its
+import path, reading and writing as the job's `Role`. What this change fixed is HOW a source
+the role may not read is reported: a read resolves its source path before it plans anything,
+and an object store answers a caller it may not read the same way whether or not a file is
+there — so a refused resolution is reported as Spark's analysis failure for a path that does
+not exist, naming the path (`services/common/src/spark_runtime/filesystem.rs`,
+`state/glue_etl/table_data.rs`), where it previously surfaced the store's raw 403. A refused
+WRITE still reports the store's own refusal. Pinned by
+`services/service-com-amazonaws-glue-awsglue/tests/all/job_run_source_authorization.rs` and,
+on the assembled router with request authentication ON, by
+`core/router/tests/all/zz_glue_job_source_permission_probe.rs`: the denied run comes to rest
+FAILED naming its unreadable source with nothing under its output path, and the permitted run
+SUCCEEDED with one `part-` object holding the count of the source's rows.
+
+`emr__glue__s3.glue-job-missing-s3-getobject-source-rejected` still ends as `Check timed out
+after 60.0s`: it burns its 60 s harness budget inside its own retry sleep
+(`_start_and_wait_with_retry`), and the check's script and its `_is_source_read_blocked`
+predicate are not readable from this checkout, so what it needs beyond the rule above is
+unknown from here. Open issue
+`20261114T025704Z-emr-glue-s3-a-glue-etl-job-run.md` carries that same check.

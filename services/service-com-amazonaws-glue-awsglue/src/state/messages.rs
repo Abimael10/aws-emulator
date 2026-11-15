@@ -444,6 +444,24 @@ pub fn event_queue_inaccessible(queue_arn: &str) -> String {
     )
 }
 
+/// `CreateCrawler`/`UpdateCrawler` for an S3 target whose `Path` names a bucket the object
+/// store does not hold ([`super::s3_target_refusal`]).
+///
+/// NOT recorded verbatim: what is pinned is the behaviour — 400 with the operation's modelled
+/// `InvalidInputException`, nothing stored — and the message states it the way this service
+/// states a refusal its framework raised, with two variable parts: the `Path` the target
+/// named, exactly as the request supplied it, and the store's own answer about it in the
+/// diagnostic clause ([`with_diagnostic`]), which is the 404 a bucket that is not there is
+/// raised with.
+pub fn s3_target_not_found(path: &str) -> String {
+    with_diagnostic(
+        &format!("S3 target {path} does not exist"),
+        DIAGNOSTIC_SERVICE_S3,
+        DIAGNOSTIC_STATUS_NOT_FOUND,
+        DIAGNOSTIC_CODE_NO_SUCH_BUCKET,
+    )
+}
+
 /// A job run addressed by the (job name, run id) PAIR that this endpoint holds no run
 /// under — the read (`GetJobRun`), the retry a start names (`StartJobRun$JobRunId`) and
 /// each entry of a stop the job holds no such run for (`BatchStopJobRun`).
@@ -643,6 +661,17 @@ const DIAGNOSTIC_SERVICE_JOB_EXECUTOR: &str = "AWSGlueJobExecutor";
 
 /// The `Error Code` a clause states for a reference that resolved to nothing.
 const DIAGNOSTIC_CODE_ENTITY_NOT_FOUND: &str = "EntityNotFoundException";
+
+/// The component a diagnostic clause names for an answer the OBJECT STORE gave: the
+/// component this service resolves a crawler's Amazon S3 target against
+/// ([`s3_target_not_found`]).
+const DIAGNOSTIC_SERVICE_S3: &str = "Amazon S3";
+
+/// The `Error Code` the object store's own answer carries for a bucket it does not hold,
+/// which is the code the clause of [`s3_target_not_found`] states — and the one answer the
+/// resolution that raises it matches on ([`super::s3_target_refusal`]), so the code the store
+/// is read for and the code the message states cannot diverge.
+pub(super) const DIAGNOSTIC_CODE_NO_SUCH_BUCKET: &str = "NoSuchBucket";
 
 /// The `Error Code` a clause states for a request the service would not accept.
 const DIAGNOSTIC_CODE_INVALID_INPUT: &str = "InvalidInputException";

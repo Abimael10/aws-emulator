@@ -9,9 +9,9 @@
 //! really left behind, computed from the objects its reads really found, and the modelled
 //! failure state carrying the engine's OWN error for a script that raised. Every read and
 //! write the script makes is signed as the job's `Role`, so one the object store refuses that
-//! role is refused, and the error the script raises — and the run then reports — is that
-//! refusal, naming the path; a source the store holds nothing under is the analysis failure
-//! Spark raises for a source that is not there.
+//! role is refused; a SOURCE the role may not read resolves no file at that path, which is
+//! the analysis failure Spark raises for a source that is not there, and a refused WRITE
+//! reports the store's own refusal naming the object it was making.
 //!
 //! The rows span what the rule generalises over: WHICH engine surface the script computes
 //! through (the dataset reader, the resilient distributed dataset, the AWS Glue dynamic
@@ -51,6 +51,22 @@ args = getResolvedOptions(sys.argv, ["SOURCE_PATH", "OUTPUT_PATH"])
 spark = SparkSession(SparkContext.getOrCreate())
 source = spark.read.option("header", "true").csv(args["SOURCE_PATH"])
 spark.sparkContext.parallelize([str(source.count())]).saveAsTextFile(args["OUTPUT_PATH"])
+"#;
+
+/// The same count, written through the DATASET writer out of a dataset coalesced to one
+/// partition — the other way a Spark program lands one part file.
+const COUNTS_THROUGH_THE_DATASET_WRITER: &str = r#"
+import sys
+
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+
+args = getResolvedOptions(sys.argv, ["SOURCE_PATH", "OUTPUT_PATH"])
+spark = SparkSession(SparkContext.getOrCreate())
+source = spark.read.option("header", "true").csv(args["SOURCE_PATH"])
+counted = spark.createDataFrame([(str(source.count()),)], ["rows"])
+counted.coalesce(1).write.mode("overwrite").csv(args["OUTPUT_PATH"])
 "#;
 
 /// A script that reads a TEXT source — every object under the path — and writes two values
@@ -266,6 +282,15 @@ async fn a_spark_job_runs_output_is_computed_from_the_objects_its_source_holds()
             sources: vec![("input.csv", "west;3\neast;4\n")],
             expected: "west=3\neast=4\n",
         },
+        Row {
+            // The dataset WRITER's own path, over a dataset coalesced to one partition: a
+            // write leaves one part file per partition, so this lands the same one object.
+            case: "the count written through the dataset writer",
+            label: "csv-coalesced",
+            script: COUNTS_THROUGH_THE_DATASET_WRITER,
+            sources: vec![("input.csv", "id,name\n1,ada\n2,bo\n3,cy\n")],
+            expected: "3\n",
+        },
     ];
 
     let (router, engine) = emulator_with_s3();
@@ -407,9 +432,10 @@ struct RoleRow {
 }
 
 /// Every read and write a Spark script makes is signed as the job's role, so one the object
-/// store refuses is refused — and the run reports the store's own refusal, naming the path,
-/// with no output left behind. A source the store holds nothing under is reported as the
-/// source that is not there.
+/// store refuses is refused — and the run reports it, naming the path, with no output left
+/// behind. A SOURCE the role may not read is reported the way a source that is not there is:
+/// the read resolves no file at that path either way. A refused WRITE names the object it was
+/// making, so it reports the store's own refusal.
 #[tokio::test]
 async fn a_run_reports_the_refusal_of_a_source_or_output_its_role_may_not_reach() {
     let rows = [
@@ -435,7 +461,10 @@ async fn a_run_reports_the_refusal_of_a_source_or_output_its_role_may_not_reach(
             ],
             stages_source: true,
             succeeds: false,
-            carries: vec!["AccessDeniedException", "Access Denied", "403"],
+            // The read's own resolution of the source path is what the deny withholds, and a
+            // path it resolved no file at is the analysis failure Spark raises for one that
+            // is not there — the same report as the `a-source-that-is-not-there` row below.
+            carries: vec!["Path does not exist"],
             names_the_output: false,
         },
         RoleRow {

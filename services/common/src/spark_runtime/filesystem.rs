@@ -238,7 +238,10 @@ class FileSystem(object):
         )
 
     def open(self, path, bufferSize=None):
-        return FSDataInputStream(read_bytes(path))
+        # Resolved through `_key`, like every other method of this filesystem: a path in
+        # another bucket, or in no filesystem this holds, is refused here rather than read
+        # through a bucket this instance was not obtained for.
+        return FSDataInputStream(read_bytes("%s/%s" % (self.getUri(), self._key(path))))
 
     def exists(self, path):
         key = self._key(path)
@@ -366,6 +369,25 @@ def _is_denial(error):
     return code in DENIED_CODES
 
 
+def is_denial(error):
+    """The same question, for the readers of a source path that live beside this module."""
+    return _is_denial(error)
+
+
+def unresolved_source(path):
+    """The analysis failure a source path this filesystem could not resolve raises.
+
+    A read RESOLVES its source path before it plans anything over it: it asks the filesystem
+    which files are there. An object store answers a caller it may not read the same way
+    whether or not an object is there, so a resolution it refuses yields no file at the path,
+    exactly as a path holding nothing does — neither tells the filesystem the path is there.
+    Both are therefore this one analysis failure, naming the path. A WRITE is not a
+    resolution: it names the object it is making, so the store's refusal of it is reported as
+    it stands (`_denied`).
+    """
+    return AnalysisException("Path does not exist: %s" % (_text(path),))
+
+
 def _is_missing(error):
     """Whether a store's answer was that it holds no such key."""
     code, _ = _refusal(error)
@@ -400,6 +422,11 @@ def _denied(path, operation, where, error):
 def _uri(bucket, key):
     """The S3 URI of one object, in the scheme a program names a path in."""
     return "s3://%s/%s" % (bucket, key)
+
+
+def uri(bucket, key):
+    """The same address, for the readers of a source path that live beside this module."""
+    return _uri(bucket, key)
 
 
 def _as_bytes(body):
@@ -457,8 +484,9 @@ def source_objects(path):
 
     A path naming a stored object reads that object; one naming a prefix reads every object
     under it, which is how a Spark source path addresses a directory of part files. A path
-    the store holds nothing for is the analysis failure Spark raises for it, and an access
-    the identity was refused is that refusal.
+    whose files this filesystem could not resolve — the store holds nothing under it, or the
+    identity the read is signed as is refused it — is the analysis failure Spark raises for
+    such a path ([`unresolved_source`]).
     """
     named = prefix_of(path)
     if named is None:
@@ -469,24 +497,30 @@ def source_objects(path):
             read = _client().get_object(Bucket=bucket, Key=key)
             return [(_uri(bucket, key), _as_bytes(read["Body"].read()))]
         except Exception as error:
+            # A read the store REFUSES is one the resolution of this path got no file from,
+            # which is what a path holding nothing answers too ([`unresolved_source`]).
             if _is_denial(error):
-                raise _denied(path, "getObject", _uri(bucket, key), error)
+                raise unresolved_source(path)
             # A path the store holds no object for may still name a PREFIX of objects, which
             # is the one answer worth reading on; anything else the store said about this
             # read is what the read failed with.
             if not _is_missing(error):
                 raise
     read = []
-    for stored, _size in list_objects(path):
+    try:
+        listed = list_objects(path)
+    except AccessDeniedException:
+        raise unresolved_source(path)
+    for stored, _size in listed:
         try:
             answer = _client().get_object(Bucket=bucket, Key=stored)
         except Exception as error:
             if _is_denial(error):
-                raise _denied(path, "getObject", _uri(bucket, stored), error)
+                raise unresolved_source(path)
             raise
         read.append((_uri(bucket, stored), _as_bytes(answer["Body"].read())))
     if not read:
-        raise AnalysisException("Path does not exist: %s" % (_text(path),))
+        raise unresolved_source(path)
     return read
 
 

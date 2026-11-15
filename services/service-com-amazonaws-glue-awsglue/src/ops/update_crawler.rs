@@ -250,6 +250,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The `Targets` this update would LEAVE BEHIND are the ones a crawl of this crawler
+        // would walk, so a request that REPLACES them is held to the resolution the create
+        // makes: each `S3Target$Path` is resolved against the object store and a path whose
+        // bucket the store does not hold is refused with nothing written (see
+        // `crate::state::s3_target_refusal`). A request that names no `Targets` keeps the
+        // stored ones, which the create already resolved. Awaited with no store guard held.
+        if let Some(targets) = input.targets.as_ref() {
+            let region = crate::state::request_region(ctx.parts());
+            if let Some(message) = crate::state::s3_target_refusal(ctx, &region, targets).await {
+                return Err(invalid_input(message));
+            }
+        }
+
         // `Role` is "the IAM role or Amazon Resource Name (ARN) of an IAM role that is
         // used by the crawler to access customer resources" and is required on the
         // create, so a crawler cannot be left without one: a blank role names none.

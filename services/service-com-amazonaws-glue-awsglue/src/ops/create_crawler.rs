@@ -20,6 +20,10 @@
 //! role nothing can be shown about is not refused (see
 //! [`crate::state::event_queue_refusal`]).
 //!
+//! Each S3 target's `Path` is RESOLVED against the object store, and a path whose bucket the
+//! store does not hold is refused with `InvalidInputException` with nothing persisted (see
+//! [`crate::state::s3_target_refusal`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -262,6 +266,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(format!(
                         "CatalogId {catalog_id} is not a Data Catalog in this account"
                     )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // `S3Target$Path` is the Amazon S3 path a crawl of this crawler would walk, so each
+        // one is RESOLVED against the object store before the crawler is stored: a path
+        // whose bucket the store does not hold backs no crawl, so the create is refused
+        // naming that target and the store's own answer about it, and nothing is persisted
+        // (see `crate::state::s3_target_refusal`). Only what the store ANSWERED refuses the
+        // create, and a prefix holding no object yet is not refused — a crawler is
+        // routinely registered before the data it crawls is written. Awaited before the
+        // store is locked.
+        if let Some(message) =
+            crate::state::s3_target_refusal(ctx, &region, &input.targets).await
+        {
+            return Err(CreateCrawlerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
                     from_federation_source: None,
                 },
             )

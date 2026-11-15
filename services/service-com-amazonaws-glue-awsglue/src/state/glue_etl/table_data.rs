@@ -37,6 +37,10 @@ MAX_OBJECTS = 1000
 MAX_ROWS = 200000
 MAX_BYTES = 64 * 1024 * 1024
 MAX_PARTITIONS = 1000
+# How WIDE a schema one read assembles. A record's field names are content the objects
+# carry, so the number of distinct columns one read can be made to hold is bounded here the
+# way the rows and the objects are.
+MAX_COLUMNS = 1000
 
 # The names a Spark output writes beside its data, which hold none of the table's rows.
 MARKER_PREFIXES = ("_", ".")
@@ -207,7 +211,16 @@ def _data_keys(bucket, prefix, left, recurse=True):
         request = {"Bucket": bucket, "Prefix": prefix}
         if token:
             request["ContinuationToken"] = token
-        listed = _s3().list_objects_v2(**request)
+        try:
+            listed = _s3().list_objects_v2(**request)
+        except Exception as error:
+            # A listing the store REFUSES tells this read nothing about what is under the
+            # location, which is what a location holding nothing tells it too: the read
+            # resolved no file there, and that is the one failure it reports
+            # (`filesystem.unresolved_source`).
+            if filesystem.is_denial(error):
+                raise filesystem.unresolved_source(filesystem.uri(bucket, prefix))
+            raise
         for entry in listed.get("Contents") or []:
             key = entry.get("Key") or ""
             name = key.rsplit("/", 1)[-1]
@@ -243,7 +256,13 @@ def _object_text(bucket, key, size, left_bytes):
         raise TableTooLarge(
             "one read of a table takes at most %d bytes of it" % (MAX_BYTES,)
         )
-    read = _s3().get_object(Bucket=bucket, Key=key)
+    try:
+        read = _s3().get_object(Bucket=bucket, Key=key)
+    except Exception as error:
+        # As with the listing above: a read the store refuses resolved no file at that path.
+        if filesystem.is_denial(error):
+            raise filesystem.unresolved_source(filesystem.uri(bucket, key))
+        raise
     body = read["Body"].read()
     if isinstance(body, bytes) or isinstance(body, bytearray):
         return (bytes(body).decode("utf-8"), len(body))
@@ -419,6 +438,13 @@ def read_catalog_table(
         for key in table.get("PartitionKeys") or []
     ]
     layout = _layout(table, descriptor)
+    # How WIDE the table is, checked BEFORE any object is fetched: a record carries one entry
+    # per declared column, so the declared width multiplies every row this read builds, and
+    # the declared width is catalog metadata that the byte and row budgets do not count.
+    if len(columns) + len(partition_keys) > MAX_COLUMNS:
+        raise TableTooLarge(
+            "one read of a table takes at most %d of its columns" % (MAX_COLUMNS,)
+        )
     left_rows = MAX_ROWS
     left_bytes = MAX_BYTES
     records = []
@@ -487,6 +513,10 @@ def read_s3_paths(
     quote = str(options.get("quoteChar") or '"')[:1] or '"'
     with_header = bool(options.get("withHeader"))
     columns = []
+    # The names `columns` already holds, for an O(1) answer to "is this column known": a
+    # record's field names come from the objects' own content, so the membership test may not
+    # be a walk of every name read so far.
+    known = {}
     records = []
     left_bytes = MAX_BYTES
     for path in list(paths or []):
@@ -506,16 +536,27 @@ def read_s3_paths(
                     "this emulator reads delimited text or JSON; %r is not a format it can "
                     "resolve into records" % (kind,)
                 )
-            # One record at a time, and the bound checked before each is kept, as the
-            # catalog-table read does it.
+            # One record at a time, and every bound checked BEFORE the thing it bounds is
+            # kept, as the catalog-table read does it: the rows already read, and the
+            # COLUMNS they have named so far — a record's field names are content the
+            # objects carry, so how wide a schema one read assembles is bounded too, and
+            # whether a name is already known is answered from a mapping rather than by
+            # walking the names read so far.
             for record in read:
                 if len(records) >= MAX_ROWS:
                     raise TableTooLarge(
                         "one read takes at most %d rows of the objects it reads" % (MAX_ROWS,)
                     )
                 for name in record:
-                    if name not in columns:
-                        columns.append(name)
+                    if name in known:
+                        continue
+                    if len(columns) >= MAX_COLUMNS:
+                        raise TableTooLarge(
+                            "one read takes at most %d columns of the objects it reads"
+                            % (MAX_COLUMNS,)
+                        )
+                    known[name] = True
+                    columns.append(name)
                 records.append(record)
     return ([(name, "string") for name in columns], records)
 
@@ -547,6 +588,13 @@ def _delimited_documents(text, delimiter, quote, with_header, known_columns):
     for cells in reader:
         if not cells or (len(cells) == 1 and cells[0] == ""):
             continue
+        # How many columns a row may name is bounded for the reason `MAX_COLUMNS` gives: a
+        # header row is content the object carries, so one row may not decide how wide every
+        # record this read builds is.
+        if len(cells) > MAX_COLUMNS:
+            raise TableTooLarge(
+                "one read takes at most %d columns of the objects it reads" % (MAX_COLUMNS,)
+            )
         if pending_header:
             names = [str(cell) for cell in cells]
             pending_header = False

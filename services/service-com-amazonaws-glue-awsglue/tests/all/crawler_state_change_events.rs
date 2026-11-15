@@ -32,7 +32,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::crawler_runs::{
-    already_past, far_future, given_crawler_over, given_database, set_due_instant, stage, DATABASE,
+    already_past, far_future, given_crawler_over, given_database, remove_bucket, set_due_instant,
+    stage, DATABASE,
 };
 use crate::job_run_state_change_events::{
     delivered_event, drain, given_queue, given_rule, grant_delivery,
@@ -79,11 +80,13 @@ fn emulator_with_a_bus() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 struct Row {
     /// The case name every assertion of the row reports.
     case: &'static str,
-    /// The bucket the row's objects live in (no underscore: `CreateBucket` refuses one), or
-    /// `None` for a row whose target names a bucket that does not exist at all.
-    bucket: Option<&'static str>,
+    /// The bucket the row's objects live in (no underscore: `CreateBucket` refuses one).
+    bucket: &'static str,
     /// The objects staged in it, as `(key, body)`.
     objects: Vec<(&'static str, &'static str)>,
+    /// Whether that bucket is REMOVED again once the crawler has been created, which is what
+    /// leaves a stored crawler whose target the object store no longer serves.
+    removes_the_bucket: bool,
     /// The `S3Targets` list the crawler carries.
     targets: Value,
     /// The `state` the event must carry.
@@ -98,19 +101,21 @@ fn rows() -> Vec<Row> {
     vec![
         Row {
             case: "one dataset of delimited text",
-            bucket: Some("crawler-events-one"),
+            bucket: "crawler-events-one",
             objects: vec![("sales/day=01/part-0.csv", "order_id,amount\n1,10.5\n")],
+            removes_the_bucket: false,
             targets: json!([{ "Path": "s3://crawler-events-one/sales/" }]),
             state: STATE_SUCCEEDED,
             counts: (1, 0, 0),
         },
         Row {
             case: "two datasets, one per target",
-            bucket: Some("crawler-events-two"),
+            bucket: "crawler-events-two",
             objects: vec![
                 ("orders/day=01/part-0.csv", "order_id\n1\n"),
                 ("items/day=01/part-0.csv", "item_id\n7\n"),
             ],
+            removes_the_bucket: false,
             targets: json!([
                 { "Path": "s3://crawler-events-two/orders/" },
                 { "Path": "s3://crawler-events-two/items/" },
@@ -119,9 +124,13 @@ fn rows() -> Vec<Row> {
             counts: (2, 0, 0),
         },
         Row {
-            case: "a target whose bucket the object store does not serve",
-            bucket: None,
+            // The target is resolved against the object store when the crawler is created, so
+            // a stored crawler whose target the store does not serve is one whose bucket went
+            // away after it was created.
+            case: "a target whose bucket the object store no longer serves",
+            bucket: "crawler-events-absent",
             objects: Vec::new(),
+            removes_the_bucket: true,
             targets: json!([{ "Path": "s3://crawler-events-absent/sales/" }]),
             state: STATE_FAILED,
             counts: (0, 0, 0),
@@ -233,10 +242,11 @@ async fn a_crawl_that_comes_to_rest_publishes_a_glue_crawler_state_change() {
     for (index, row) in rows().into_iter().enumerate() {
         let case = row.case;
         let crawler = format!("crawler-event-{index}");
-        if let Some(bucket) = row.bucket {
-            stage(&router, bucket, &row.objects).await;
-        }
+        stage(&router, row.bucket, &row.objects).await;
         given_crawler_over(&router, &crawler, row.targets.clone(), json!({})).await;
+        if row.removes_the_bucket {
+            remove_bucket(&router, row.bucket).await;
+        }
 
         // The crawl is held in flight first: a crawl that has come to rest at nothing
         // publishes nothing, whatever its data looked like.

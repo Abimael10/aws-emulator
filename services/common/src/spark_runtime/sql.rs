@@ -267,9 +267,15 @@ class DataFrameWriter(object):
     def _write(self, kind, path):
         lines = self._rendered(kind)
         prefix = filesystem._text(path).rstrip("/")
-        filesystem.write_text(
-            "%s/part-00000" % (prefix,), "".join("%s\n" % (line,) for line in lines)
-        )
+        # One part file per PARTITION of the dataset, which is the output layout a write
+        # leaves: `coalesce` and `repartition` are what a program names that count with, so a
+        # write of a dataset coalesced to one partition leaves one part file, and a write of
+        # one repartitioned leaves a part per partition the rows were spread over.
+        for index, part in enumerate(slices(lines, self._frame.partitions())):
+            filesystem.write_text(
+                "%s/part-%05d" % (prefix, index),
+                "".join("%s\n" % (line,) for line in part),
+            )
         filesystem.write_text("%s/_SUCCESS" % (prefix,), "")
         return None
 
@@ -289,17 +295,33 @@ class DataFrameWriter(object):
 class DataFrame(object):
     """A dataset of rows: the rows themselves, and the computations over them."""
 
-    def __init__(self, rows, columns):
+    def __init__(self, rows, columns, numPartitions=1):
         self._rows = list(rows)
         self._columns = list(columns)
+        self._partitions = max(int(numPartitions or 1), 1)
 
     @property
     def columns(self):
         return list(self._columns)
 
+    def partitions(self):
+        """How many partitions this dataset holds, which is what a write of it leaves."""
+        return self._partitions
+
     @property
     def rdd(self):
-        return RDD(slices(self._rows, 1))
+        return RDD(slices(self._rows, self._partitions))
+
+    def coalesce(self, numPartitions):
+        """The same rows over FEWER partitions — a coalesce never raises the count."""
+        asked = max(int(numPartitions), 1)
+        return DataFrame(self._rows, self._columns, min(self._partitions, asked))
+
+    def repartition(self, numPartitions=None, *columns):
+        """The same rows over the partitions asked for, as many as were named."""
+        if numPartitions is None or not isinstance(numPartitions, int):
+            return DataFrame(self._rows, self._columns, self._partitions)
+        return DataFrame(self._rows, self._columns, max(int(numPartitions), 1))
 
     @property
     def write(self):
@@ -330,7 +352,7 @@ class DataFrame(object):
         rows = [
             Row(**dict((name, row[name]) for name in names)) for row in self._rows
         ]
-        return DataFrame(rows, names)
+        return DataFrame(rows, names, self._partitions)
 
     def show(self, n=20, truncate=True, vertical=False):
         for row in self._rows[: max(int(n), 0)]:

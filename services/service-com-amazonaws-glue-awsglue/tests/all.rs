@@ -113,6 +113,8 @@ mod crawler_metrics;
 mod crawler_role_trust;
 #[path = "all/crawler_runs.rs"]
 mod crawler_runs;
+#[path = "all/crawler_s3_target_resolution.rs"]
+mod crawler_s3_target_resolution;
 #[path = "all/crawler_schedule_suspension.rs"]
 mod crawler_schedule_suspension;
 #[path = "all/crawler_schedules.rs"]
@@ -257,6 +259,8 @@ mod job_run_positive_control;
 mod job_run_rest;
 #[path = "all/job_run_retries.rs"]
 mod job_run_retries;
+#[path = "all/job_run_source_authorization.rs"]
+mod job_run_source_authorization;
 #[path = "all/job_run_state_change_events.rs"]
 mod job_run_state_change_events;
 #[path = "all/job_run_state_progression.rs"]
