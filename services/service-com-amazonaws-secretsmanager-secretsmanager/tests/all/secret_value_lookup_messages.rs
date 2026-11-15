@@ -207,12 +207,10 @@ async fn a_value_read_that_resolves_nothing_names_the_member_it_resolved_by() {
             json!({"VersionId": other_version.clone()}),
             expected_for_version_id(&other_version),
         ),
-        (
-            "a VersionId the secret holds, under a staging label it does not carry".to_string(),
-            name,
-            json!({"VersionId": first.clone(), "VersionStage": "AWSPREVIOUS"}),
-            expected_for_version_id(&first),
-        ),
+        // A `VersionId` the secret HOLDS, named alongside a staging label that
+        // version does not carry, resolves a version and contradicts itself about
+        // which one: it is refused for the state of the secret rather than as a
+        // value that cannot be found (`secret_version_selector_disagreement`).
         (
             "an absent VersionId alongside a staging label the secret does carry".to_string(),
             name,

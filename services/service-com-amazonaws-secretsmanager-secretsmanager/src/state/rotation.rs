@@ -342,7 +342,7 @@ fn still_awaited<Eng: Send + Sync + 'static>(engine: &Arc<Eng>, rotation: &Rotat
     store
         .get(&rotation.region, &rotation.secret_arn)
         .is_some_and(|secret| {
-            secret.rotation_enabled
+            secret.rotation_on()
                 && secret.pending_version_id() == Some(rotation.version_id.as_str())
         })
 }

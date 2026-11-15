@@ -272,7 +272,9 @@ fn entry_for(view: crate::state::SecretView<'_>) -> SecretListEntry {
         r#type: content.secret_type.clone(),
         description: content.description.clone(),
         kms_key_id: secret.kms_key_id.clone(),
-        rotation_enabled: Some(content.rotation_enabled),
+        // Reported exactly as `DescribeSecret` reports it: only for a secret rotation
+        // has been configured for, and omitted for one it never was.
+        rotation_enabled: content.rotation_enabled,
         // The rotation configuration `RotateSecret` persisted, the same way
         // `DescribeSecret` projects it. `LastRotatedDate` stays absent until a
         // rotation completes.

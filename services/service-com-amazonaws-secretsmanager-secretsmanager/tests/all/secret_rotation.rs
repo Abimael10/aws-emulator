@@ -501,8 +501,9 @@ async fn rotation_rules_the_service_does_not_allow_are_refused() {
         let described = describe(&router, name, case).await;
         assert_eq!(
             described.get("RotationEnabled"),
-            Some(&json!(false)),
-            "case {case:?}: expected a refused call to configure nothing, got {described}"
+            None,
+            "case {case:?}: expected a refused call to configure nothing, so a secret rotation \
+             was never decided for reports no RotationEnabled, got {described}"
         );
     }
 
@@ -1065,8 +1066,9 @@ async fn rotate_secret_refusals() {
         let described = describe(&router, "unconfigured", case).await;
         assert_eq!(
             described.get("RotationEnabled"),
-            Some(&json!(false)),
-            "case {case:?}: expected the refused call to enable nothing, got {described}"
+            None,
+            "case {case:?}: expected the refused call to enable nothing, so a secret rotation \
+             was never decided for reports no RotationEnabled, got {described}"
         );
     }
 
@@ -1146,8 +1148,9 @@ async fn rotate_secret_refusals() {
         );
         assert_eq!(
             described.get("RotationEnabled"),
-            Some(&json!(false)),
-            "case {case:?}: expected the refused call to enable nothing, got {described}"
+            None,
+            "case {case:?}: expected the refused call to enable nothing, so a secret rotation \
+             was never decided for reports no RotationEnabled, got {described}"
         );
     }
 }

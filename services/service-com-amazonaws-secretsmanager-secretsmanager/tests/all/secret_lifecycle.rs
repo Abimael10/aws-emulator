@@ -330,9 +330,10 @@ async fn a_created_secret_reads_back_byte_for_byte_through_get_and_describe() {
             "case {case:?}: expected the stored Tags back, got {described}"
         );
         assert_eq!(
-            described.get("RotationEnabled").and_then(Value::as_bool),
-            Some(false),
-            "case {case:?}: expected rotation to be off, got {described}"
+            described.get("RotationEnabled"),
+            None,
+            "case {case:?}: rotation was never decided for this secret, so DescribeSecret \
+             reports no RotationEnabled at all, got {described}"
         );
         assert!(
             described.get("DeletedDate").is_none(),

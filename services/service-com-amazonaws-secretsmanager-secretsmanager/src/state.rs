@@ -238,11 +238,13 @@ pub const INVALID_SECRET_NAME_MESSAGE: &str = "Invalid name. Must be a valid nam
 ///
 /// "If you include both this parameter and `VersionId`, the two parameters must
 /// refer to the same secret version." (`GetSecretValueRequest$VersionStage`,
-/// this service's Smithy model.) Both halves resolve — the version exists and
-/// the label is attached to another version — so the request is not a miss but a
-/// contradiction, and it is refused for the state of the secret rather than
-/// reported as a version that is gone. The sentence is fixed and carries neither
-/// identifier.
+/// this service's Smithy model.) The `VersionId` resolves — it names a version
+/// of the secret — and the label is not one that version carries, so the request
+/// is not a miss but a contradiction, and it is refused for the state of the
+/// secret rather than reported as a version that is gone. It makes no difference
+/// whether the label is attached to another version or to no version at all:
+/// either way it does not refer to the version the id does. The sentence is fixed
+/// and carries neither identifier.
 pub const VERSION_ID_AND_STAGE_DISAGREE_MESSAGE: &str =
     "You provided a VersionStage that is not associated to the provided VersionId.";
 
@@ -267,7 +269,7 @@ pub fn system_tag_message(key: &str) -> String {
 /// catalogue; the ORDER is the one Secrets Manager's own refusal of an unknown filter key
 /// states them in, which is neither the order the model declares them in nor the sorted one
 /// (recorded in
-/// `issues/things-that-do-not-work/20261103T043509Z-secretsmanager-secrets-manager-version-selector-pending-deletion-and-rotation.md`,
+/// `issues/things-that-now-work/20261103T043509Z-secretsmanager-secrets-manager-version-selector-pending-deletion-and-rotation.md`,
 /// whose cause 6 pins this ordering against a recorded response). A value set is a SET, so
 /// the order a message states it in belongs to the service rather than to the model, and it
 /// is fixed text — no member of the request and nothing in the store varies it — which is
@@ -1883,7 +1885,24 @@ pub struct Secret {
     ///
     /// [`expire_due`]: ComAmazonawsSecretsmanagerSecretsmanagerState::expire_due
     pub purge_at: Option<SystemTime>,
-    pub rotation_enabled: bool,
+    /// Whether automatic rotation is on for this secret, and `None` while
+    /// rotation has never been CONFIGURED for it.
+    ///
+    /// `RotationEnabled` is "whether automatic rotation is turned on for this
+    /// secret" (`DescribeSecretResponse$RotationEnabled`, this service's Smithy
+    /// model), a boolean the model gives no default, so the member is reported
+    /// only once rotation has been configured for this secret
+    /// ([`configure_rotation`]) — true while it is on, and false once a call
+    /// turned it off again ([`cancel_rotation`], [`schedule_deletion`]) — and is
+    /// omitted for a secret rotation was never configured for, just as the rest of
+    /// the rotation view is. That presence is what tells a never-configured secret
+    /// apart from one rotation was explicitly turned off for, so neither a read
+    /// nor a call that turns off what was never configured may materialise it.
+    ///
+    /// [`configure_rotation`]: Secret::configure_rotation
+    /// [`cancel_rotation`]: Secret::cancel_rotation
+    /// [`schedule_deletion`]: Secret::schedule_deletion
+    pub rotation_enabled: Option<bool>,
     /// The ARN of the Lambda rotation function `RotateSecret` configured for
     /// this secret; `None` for a secret no rotation has been configured for.
     pub rotation_lambda_arn: Option<String>,
@@ -1956,7 +1975,7 @@ impl Secret {
             deleted_date: None,
             deletion_date: None,
             purge_at: None,
-            rotation_enabled: false,
+            rotation_enabled: None,
             rotation_lambda_arn: None,
             rotation_rules: None,
             external_rotation_metadata: Vec::new(),
@@ -1982,19 +2001,23 @@ impl Secret {
     /// the end of the recovery window it reports as `DeletionDate`, and
     /// `purge_at` the instant the store owes its permanent removal.
     ///
-    /// Scheduling a deletion also turns ROTATION off: a secret on its way out is
-    /// not rotated, and `RotationEnabled` is "whether automatic rotation is turned
-    /// on for this secret" (`DescribeSecretResponse$RotationEnabled`, this
-    /// service's Smithy model), which it no longer is. The rotation
+    /// Scheduling a deletion also turns ROTATION off, for a secret rotation was
+    /// configured for: a secret on its way out is not rotated, and
+    /// `RotationEnabled` is "whether automatic rotation is turned on for this
+    /// secret" (`DescribeSecretResponse$RotationEnabled`, this service's Smithy
+    /// model), which it no longer is. The rotation
     /// CONFIGURATION is kept, so a restored secret can be put back on a schedule
     /// by `RotateSecret` — "to turn on automatic rotation again, call
     /// RotateSecret" — but nothing turns it back on by itself, which is why
-    /// [`cancel_deletion`] leaves it off.
+    /// [`cancel_deletion`] leaves it off. A secret rotation was never configured
+    /// for is left with no rotation state at all ([`rotation_enabled`]): turning
+    /// off what was never configured decides nothing to report.
     ///
     /// Re-scheduling a secret that is already marked replaces all three, so a
     /// second deletion request measures its window from itself.
     ///
     /// [`cancel_deletion`]: Secret::cancel_deletion
+    /// [`rotation_enabled`]: Secret::rotation_enabled
     pub fn schedule_deletion(
         &mut self,
         requested_at: SystemTime,
@@ -2004,7 +2027,9 @@ impl Secret {
         self.deleted_date = Some(requested_at);
         self.deletion_date = Some(deletion_date);
         self.purge_at = Some(purge_at);
-        self.rotation_enabled = false;
+        if self.rotation_enabled.is_some() {
+            self.rotation_enabled = Some(false);
+        }
         self.next_rotation_date = None;
     }
 
@@ -2197,6 +2222,14 @@ impl Secret {
             .or_else(|| self.reserved_pending_version_id())
     }
 
+    /// Whether automatic rotation is currently ON for this secret, which a secret
+    /// rotation was never configured for ([`rotation_enabled`]) is not.
+    ///
+    /// [`rotation_enabled`]: Secret::rotation_enabled
+    pub fn rotation_on(&self) -> bool {
+        self.rotation_enabled.unwrap_or(false)
+    }
+
     /// Whether a rotation of this secret is still in progress.
     ///
     /// "When rotation is successful, the AWSPENDING staging label might be
@@ -2240,7 +2273,7 @@ impl Secret {
     /// (`DescribeSecretResponse$NextRotationDate`).
     fn reschedule_next_rotation(&mut self, anchor: SystemTime) {
         self.next_rotation_date = self
-            .rotation_enabled
+            .rotation_on()
             .then(|| self.rotation_schedule())
             .flatten()
             .and_then(|schedule| schedule.next_after(anchor));
@@ -2698,7 +2731,7 @@ impl Secret {
         if let Some(role_arn) = config.role_arn {
             self.external_rotation_role_arn = Some(role_arn);
         }
-        self.rotation_enabled = true;
+        self.rotation_enabled = Some(true);
         self.reschedule_next_rotation(at);
         self.last_changed_date = at;
     }
@@ -2756,12 +2789,22 @@ impl Secret {
     /// rotation can block you from starting future rotations." — the caller
     /// cleans them up with `UpdateSecretVersionStage`, which is also why the id
     /// is reported back here.
+    ///
+    /// A secret rotation was never configured for has no schedule to turn off, so
+    /// this leaves its ROTATION state as it was: the cancel reports the secret,
+    /// and the secret still reports no rotation view at all
+    /// ([`rotation_enabled`]). It is still a write of the secret, so
+    /// `LastChangedDate` moves as it does for any other.
+    ///
+    /// [`rotation_enabled`]: Secret::rotation_enabled
     pub fn cancel_rotation(&mut self, at: SystemTime) -> Option<String> {
         let cancelled = self
             .rotation_in_progress()
             .then(|| self.pending_version_id().map(str::to_string))
             .flatten();
-        self.rotation_enabled = false;
+        if self.rotation_enabled.is_some() {
+            self.rotation_enabled = Some(false);
+        }
         self.next_rotation_date = None;
         self.last_changed_date = at;
         cancelled

@@ -443,12 +443,12 @@ async fn a_tag_in_the_reserved_namespace_is_refused_naming_the_key() {
 async fn a_read_whose_two_selectors_name_two_versions_is_refused_for_the_state() {
     // "If you include both this parameter and VersionId, the two parameters must refer to
     // the same secret version." (`GetSecretValueRequest$VersionStage`, this service's
-    // Smithy model.) When each selector resolves and the two resolve to DIFFERENT versions
-    // the request contradicts itself and is refused for the state of the secret; when one
-    // of them resolves to nothing, the read found no value and says which member it
-    // resolved by. The rows run over which selector names which version, over both
-    // reserved staging labels and one attached to nothing, and over a version id the
-    // secret does not hold.
+    // Smithy model.) When the `VersionId` resolves and the staging label beside it is not
+    // one that version carries, the request contradicts itself and is refused for the state
+    // of the secret; when the `VersionId` itself resolves to nothing, the read found no
+    // value and says which member it resolved by. The rows run over which selector names
+    // which version, over both reserved staging labels and one attached to nothing, and
+    // over a version id the secret does not hold.
     let router = emulator();
     let name = "selectors";
     let first = create(&router, name, "setup").await;
@@ -481,10 +481,12 @@ async fn a_read_whose_two_selectors_name_two_versions_is_refused_for_the_state()
         );
     }
 
-    // They disagree: both resolve, to two different versions.
+    // They disagree: the version id resolves, and the label is not one that version
+    // carries — whether another version carries it or no version does.
     for (case, version, stage) in [
         ("the previous version under AWSCURRENT", &first, "AWSCURRENT"),
         ("the current version under AWSPREVIOUS", &second, "AWSPREVIOUS"),
+        ("a staging label no version carries", &first, "AWSPENDING"),
     ] {
         let answered = err(
             &router,
@@ -496,12 +498,10 @@ async fn a_read_whose_two_selectors_name_two_versions_is_refused_for_the_state()
         refused(case, answered, STATE, VERSION_ID_AND_STAGE_DISAGREE_MESSAGE);
     }
 
-    // One of them resolves to nothing: the read is a miss, named by the version id it
+    // The version id resolves to nothing: the read is a miss, named by the version id it
     // resolved by.
-    for (case, version, stage) in [
-        ("a staging label no version carries", &first, "AWSPENDING"),
-        ("a version id the secret does not hold", &absent, "AWSCURRENT"),
-    ] {
+    for (case, version, stage) in [("a version id the secret does not hold", &absent, "AWSCURRENT")]
+    {
         let answered = err(
             &router,
             "GetSecretValue",

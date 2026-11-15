@@ -2036,3 +2036,19 @@ mod zz_probe_whole_emulator;
 // file belongs in `all/appended_notes.rs`, declared below like any other suite. The rules
 // above are pinned by the `all/all_rs_*`, `all/declaration_roots_are_canonical_and_complete.rs`
 // and `all/every_suite_file_is_declared.rs` suites, so check there rather than leaving a note
+// Put a new suite at `tests/all/<name>.rs` and insert one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair into the sorted list below. The list holds
+// those pairs and no other line, so two branches landing at once insert two lines in two
+// places and have no prose here to duplicate, re-word or mistype.
+// Every comment in this file is an ordinary `//` one, this header included: an inner doc
+// comment and an inner attribute are legal only before the first item, so one that lands past
+// the declarations is `E0753` and compiles no suite of this target at all. With none anywhere
+// at the top level of `tests/` fails the build; and a suite declared twice is `E0428`, which
+// compiles neither copy. `tests/all.rs` is a test-target crate root, so a bare `mod` would
+// resolve to a sibling of this file, which the layout check refuses: the `#[path]` above each
+// `mod` is what points it into `tests/all/`.
+// note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
+// suite. The `all/all_rs_*`, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` suites pin the rules above, for this
+// file and for every service crate's `tests/all.rs`, so check there rather than leaving a
+// note here.

@@ -259,23 +259,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the primary's: a replica serves the primary's values under its own
             // identity (see `crate::state::replication`).
             let version = match input.version_id.as_deref() {
-                // A `VersionId` names the version outright; a `VersionStage` given
-                // alongside it has to agree with the labels that version carries:
-                // "If you include both this parameter and VersionId, the two
-                // parameters must refer to the same secret version."
-                // (`GetSecretValueRequest$VersionStage`, this service's Smithy
-                // model.) When each half resolves to a version and the two are
-                // DIFFERENT versions, nothing the request named is missing: the
-                // request contradicts itself, and it is refused for the state of the
-                // secret (`InvalidRequestException`) rather than answered as a
-                // version that is gone — a caller told the version does not exist
-                // concludes the secret lost it and recreates it. A half that
-                // resolves to NOTHING is still a miss, and is answered below.
+                // A `VersionId` names the version outright, so it is what this read
+                // resolves by: an id no version of the secret carries names no value,
+                // and is the miss answered below. Once it DOES name a version, a
+                // `VersionStage` given alongside it has to be one of the labels that
+                // version carries: "If you include both this parameter and VersionId,
+                // the two parameters must refer to the same secret version."
+                // (`GetSecretValueRequest$VersionStage`, this service's Smithy model.)
+                // A label the named version does not carry refers to another version
+                // or to none at all, and either way to a DIFFERENT version than the
+                // id does — nothing the request named is missing, the request
+                // contradicts itself, so it is refused for the state of the secret
+                // (`InvalidRequestException`) rather than answered as a version that is
+                // gone: a caller told the version does not exist concludes the secret
+                // lost it and recreates it.
                 Some(version_id) => {
                     let named = content.version(version_id);
-                    let labelled = stage.and_then(|stage| content.version_with_stage(stage));
-                    if let (Some(named), Some(labelled)) = (named, labelled) {
-                        if named.version_id != labelled.version_id {
+                    if let (Some(named), Some(stage)) = (named, stage) {
+                        if !named.has_stage(stage) {
                             return Err(GetSecretValueErrorModeled::InvalidRequestException(
                                 InvalidRequestException {
                                     message: Some(
@@ -287,7 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .into());
                         }
                     }
-                    named.filter(|version| stage.is_none_or(|stage| version.has_stage(stage)))
+                    named
                 }
                 // "If you don't specify either a VersionStage or VersionId, Secrets
                 // Manager returns the AWSCURRENT version."

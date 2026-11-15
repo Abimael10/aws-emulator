@@ -87,6 +87,8 @@ mod secret_rotation_schedule;
 mod secret_rotation_span;
 #[path = "all/secret_rotation_staging_ladder.rs"]
 mod secret_rotation_staging_ladder;
+#[path = "all/secret_rotation_state_presence.rs"]
+mod secret_rotation_state_presence;
 #[path = "all/secret_service_owned_writes.rs"]
 mod secret_service_owned_writes;
 #[path = "all/secret_service_set_tag_keys.rs"]
@@ -109,6 +111,8 @@ mod secret_version_id_token_forms;
 mod secret_version_ids;
 #[path = "all/secret_version_ids_are_caller_named.rs"]
 mod secret_version_ids_are_caller_named;
+#[path = "all/secret_version_selector_disagreement.rs"]
+mod secret_version_selector_disagreement;
 #[path = "all/secret_version_stage_stale_remove_from.rs"]
 mod secret_version_stage_stale_remove_from;
 #[path = "all/secret_version_stages.rs"]

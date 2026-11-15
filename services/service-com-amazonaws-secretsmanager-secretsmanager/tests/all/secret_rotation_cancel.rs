@@ -435,7 +435,8 @@ async fn cancel_turns_rotation_off_and_keeps_the_configuration() {
 }
 
 /// A secret rotation was never configured for has no schedule to turn off, so
-/// the cancel reports the secret and no version id, and leaves rotation off.
+/// the cancel reports the secret and no version id, and leaves it exactly as it
+/// was — including reporting no rotation view at all.
 ///
 /// The rows differ along the form of the `SecretId` and the kind of value the
 /// secret holds.
@@ -480,8 +481,9 @@ async fn cancel_succeeds_when_rotation_was_never_configured() {
         let described = describe(&router, &name, case).await;
         assert_eq!(
             described.get("RotationEnabled"),
-            Some(&json!(false)),
-            "case {case:?}: expected rotation to stay off, got {described}"
+            None,
+            "case {case:?}: the cancel left a secret rotation was never decided for as it was, \
+             so it still reports no RotationEnabled, got {described}"
         );
         assert_eq!(
             described.get("RotationLambdaARN"),

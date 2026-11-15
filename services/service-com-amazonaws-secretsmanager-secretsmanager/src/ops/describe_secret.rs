@@ -254,7 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             r#type: content.secret_type.clone(),
             description: content.description.clone(),
             kms_key_id: secret.kms_key_id.clone(),
-            rotation_enabled: Some(content.rotation_enabled),
+            // "Whether automatic rotation is turned on for this secret." The
+            // member has no default, so it is reported only for a secret rotation
+            // has been configured for, and omitted — like the rest of the rotation
+            // view — for one it never was.
+            rotation_enabled: content.rotation_enabled,
             // The rotation configuration `RotateSecret` persisted, and the
             // schedule's next due instant computed from it. `LastRotatedDate` is
             // "the last date and time that this secret was modified in any way"
