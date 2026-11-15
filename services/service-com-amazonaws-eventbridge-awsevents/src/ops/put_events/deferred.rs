@@ -112,7 +112,7 @@ async fn perform(
         &mut budget,
     )
     .await;
-    dead_letter_refusal(
+    let dead_lettered = dead_letter_refusal(
         callback,
         &mut clients,
         &invocation.region,
@@ -123,7 +123,12 @@ async fn perform(
         retries.as_ref(),
     )
     .await;
-    count_invocation(stores.cloudwatch.as_ref(), &handover, &outcome);
+    count_invocation(
+        stores.cloudwatch.as_ref(),
+        &handover,
+        &outcome,
+        dead_lettered,
+    );
     let mut store = stores.events.lock();
     // The place this invocation held while it waited is given back on every path, so a
     // delivery that failed does not keep another from being deferred.

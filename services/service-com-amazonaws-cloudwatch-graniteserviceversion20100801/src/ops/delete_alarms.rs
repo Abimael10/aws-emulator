@@ -300,9 +300,46 @@ fn delete_named_alarms(
     // A name the request repeats names ONE alarm, so the deduplicated list is what is
     // walked.
     for name in &named {
+        // The CONFIGURATION CHANGE this deletion publishes onto the account's default event
+        // bus, built BEFORE the alarm is removed: the event reports the configuration that was
+        // deleted and the state the alarm was in when it went
+        // ([`crate::state::alarm_configuration_events`]). A name this store holds no alarm for
+        // deletes nothing, so it announces nothing.
+        let deleted = store
+            .alarms
+            .get(name.as_str())
+            .and_then(|stored| {
+                crate::state::alarm_configuration_events::AlarmConfigurationChange::of_metric_deletion(
+                    &stored.alarm,
+                    now,
+                )
+            })
+            .or_else(|| {
+                store.composite_alarms.get(name.as_str()).and_then(|stored| {
+                    crate::state::alarm_configuration_events::AlarmConfigurationChange::of_composite_deletion(
+                        &stored.alarm,
+                        now,
+                    )
+                })
+            })
+            .or_else(|| {
+                store.log_alarms.get(name.as_str()).and_then(|stored| {
+                    crate::state::alarm_configuration_events::AlarmConfigurationChange::of_log_deletion(
+                        &stored.alarm,
+                        now,
+                    )
+                })
+            });
         store.alarms.remove(name.as_str());
         store.composite_alarms.remove(name.as_str());
         store.log_alarms.remove(name.as_str());
+        // The state the alarm's last state-change event announced goes with the alarm: an
+        // alarm written again under this name is a NEW alarm, and its first transition moves
+        // it out of the state that write left rather than out of the deleted alarm's.
+        store.published_alarm_states.remove(name.as_str());
+        if let Some(change) = deleted {
+            store.enqueue_configuration_change(change);
+        }
     }
     // A deleted alarm is an input every composite alarm whose rule references it loses,
     // so the alarms downstream of this call are evaluated before it returns.

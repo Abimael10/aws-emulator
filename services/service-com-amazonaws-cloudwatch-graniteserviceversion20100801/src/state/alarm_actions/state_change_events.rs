@@ -178,6 +178,28 @@ impl AlarmStateChange {
         Value::Object(detail)
     }
 
+    /// The `detail.state` document this transition reports — the state the alarm moved TO, as
+    /// the event announces it.
+    ///
+    /// Kept by the store for the alarm that moved and handed to [`Self::reports_previous_state`]
+    /// on that alarm's NEXT transition, which is what makes the events of one alarm a chain.
+    #[must_use]
+    pub fn state_document(&self) -> Value {
+        self.state.clone()
+    }
+
+    /// Report `document` as `detail.previousState`: the state the alarm moved OUT OF, as the
+    /// event that announced it reported it.
+    ///
+    /// The state the alarm's own members carry is the state as it reads NOW, and an evaluation
+    /// that moved the alarm nowhere rewrites its explanation over the one the last transition
+    /// published — so a consumer following one alarm would otherwise be handed a previous state
+    /// no event of that alarm ever announced. What a transition moved OUT OF is what the
+    /// preceding transition moved the alarm INTO, so that document is what this reports.
+    pub fn reports_previous_state(&mut self, document: Value) {
+        self.previous_state = document;
+    }
+
     /// The document a LAMBDA alarm action's function is invoked with: the transition under
     /// `alarmData`, beside the identity of the alarm that owes it.
     ///
@@ -219,7 +241,11 @@ impl AlarmStateChange {
 /// One alarm state as the transition documents report it: the value, its explanation and the
 /// instant the alarm moved there. A member the alarm does not carry is left out rather than
 /// reported as null.
-fn state_document(
+///
+/// `pub(crate)` because a CONFIGURATION change reports the state the alarm is in too
+/// ([`crate::state::alarm_configuration_events`]): one rendering of an alarm state serves both
+/// events, so the two cannot word the same state differently.
+pub(crate) fn state_document(
     value: &str,
     reason: Option<&str>,
     reason_data: Option<&str>,
@@ -520,19 +546,72 @@ pub async fn publish(
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     changes: &[AlarmStateChange],
 ) {
-    let mut by_region: Vec<(&str, Vec<&AlarmStateChange>)> = Vec::new();
-    for change in changes {
-        let Some(region) = change.region() else {
+    let events: Vec<AlarmEvent> = changes
+        .iter()
+        .map(|change| AlarmEvent {
+            alarm_name: change.alarm_name.clone(),
+            alarm_arn: change.alarm_arn.clone(),
+            at_secs: change.at_secs,
+            detail_type: STATE_CHANGE_DETAIL_TYPE,
+            detail: change.detail(),
+        })
+        .collect();
+    publish_alarm_events(callback, &events).await;
+}
+
+/// ONE event this service publishes ABOUT one alarm: which alarm, WHEN what it reports
+/// happened, and the `detail-type` and `detail` that report it.
+///
+/// Both of the events an alarm owes are published as this — the state change [`AlarmStateChange`]
+/// reports and the configuration change [`crate::state::alarm_configuration_events`] reports — so
+/// the envelope every alarm event of this service carries (its `source`, the bus it goes onto,
+/// the alarm's ARN in `resources` and its own instant) is stated ONCE and the two cannot drift
+/// apart.
+pub(crate) struct AlarmEvent {
+    /// The alarm the event is about, by name.
+    pub(crate) alarm_name: String,
+    /// That alarm's own ARN: the resource the event names in its `resources`, and the Region the
+    /// publication is addressed in.
+    pub(crate) alarm_arn: Option<String>,
+    /// WHEN what the event reports happened, which is the event's own `time`.
+    pub(crate) at_secs: f64,
+    /// The `detail-type` a rule matches the event under.
+    pub(crate) detail_type: &'static str,
+    /// The `detail` document the event carries.
+    pub(crate) detail: Value,
+}
+
+impl AlarmEvent {
+    /// The Region this event is published in: the alarm's own, and `None` for an alarm whose ARN
+    /// names none — there is no bus to address for such an alarm.
+    fn region(&self) -> Option<&str> {
+        self.alarm_arn
+            .as_deref()
+            .and_then(::service_common::arn::parse)
+            .map(|arn| arn.region)
+            .filter(|region| !region.is_empty())
+    }
+}
+
+/// Publish `events` onto the account's default EventBridge bus, grouped by the Region each
+/// alarm lives in — the ONE hop every alarm event of this service takes to the bus.
+pub(crate) async fn publish_alarm_events(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    events: &[AlarmEvent],
+) {
+    let mut by_region: Vec<(&str, Vec<&AlarmEvent>)> = Vec::new();
+    for event in events {
+        let Some(region) = event.region() else {
             ::tracing::warn!(
-                alarm = %change.alarm_name,
-                "this alarm's ARN names no Region, so its state change is published onto no \
+                alarm = %event.alarm_name,
+                "this alarm's ARN names no Region, so the event it owes is published onto no \
                  event bus"
             );
             continue;
         };
         match by_region.iter_mut().find(|(held, _)| *held == region) {
-            Some((_, grouped)) => grouped.push(change),
-            None => by_region.push((region, vec![change])),
+            Some((_, grouped)) => grouped.push(event),
+            None => by_region.push((region, vec![event])),
         }
     }
     for (region, grouped) in by_region {
@@ -541,32 +620,32 @@ pub async fn publish(
         let Some(region) = ::service_common::arn::region_label(region) else {
             ::tracing::warn!(
                 region = %region,
-                "this is no Region an event bus can be addressed in, so the alarm state changes \
-                 of its alarms are published onto none"
+                "this is no Region an event bus can be addressed in, so the events its alarms \
+                 owe are published onto none"
             );
             continue;
         };
         let client = ::service_common::eventbridge_client::eventbridge_client(callback, region);
         for window in grouped.chunks(MAX_PUT_EVENTS_ENTRIES) {
             let mut request = client.put_events();
-            for change in window {
+            for event in window {
                 let mut entry = ::aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
                     .event_bus_name(DEFAULT_EVENT_BUS)
                     .source(EVENT_SOURCE)
-                    .detail_type(STATE_CHANGE_DETAIL_TYPE)
-                    .detail(change.detail().to_string());
+                    .detail_type(event.detail_type)
+                    .detail(event.detail.to_string());
                 // "The time stamp of the event, per RFC3339. If no time stamp is provided, the
                 // time stamp of the PutEvents call is used" — the event's own instant is when
                 // the alarm moved. It is held to the instant the documents of this same
                 // transition report, so the two readings of one transition agree; an instant
                 // those documents cannot represent is left to the documented default rather
                 // than converted into a different one.
-                if let Some(instant) = representable_instant(change.at_secs) {
+                if let Some(instant) = representable_instant(event.at_secs) {
                     entry = entry.time(instant);
                 }
                 // "Resources: AWS resources, identified by Amazon Resource Name (ARN), which
-                // the event primarily concerns" — the alarm that moved.
-                if let Some(arn) = change.alarm_arn.as_deref() {
+                // the event primarily concerns" — the alarm the event is about.
+                if let Some(arn) = event.alarm_arn.as_deref() {
                     entry = entry.resources(arn);
                 }
                 request = request.entries(entry.build());
@@ -580,7 +659,7 @@ pub async fn publish(
                     ::tracing::warn!(
                         region = %region,
                         rejected = answer.failed_entry_count(),
-                        "the default event bus did not accept every alarm state change of this \
+                        "the default event bus did not accept every alarm event of this \
                          publication"
                     );
                 }
@@ -589,7 +668,7 @@ pub async fn publish(
                     ::tracing::warn!(
                         region = %region,
                         error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                        "an alarm state change could not be published to EventBridge"
+                        "an alarm event could not be published to EventBridge"
                     );
                 }
             }

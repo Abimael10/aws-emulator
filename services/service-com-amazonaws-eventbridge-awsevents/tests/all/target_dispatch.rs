@@ -36,9 +36,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
     ComAmazonawsEventbridgeAwseventsState, InvocationOutcome, DEFAULT_EVENT_BUS_NAME,
-    EVENT_BUS_NAME_DIMENSION, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC, MATCHED_EVENTS_METRIC,
-    METRIC_NAMESPACE, RULE_NAME_DIMENSION, SERVICE_PRINCIPAL,
-    SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, TRIGGERED_RULES_METRIC,
+    EVENT_BUS_NAME_DIMENSION, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC,
+    INVOCATIONS_SENT_TO_DLQ_METRIC, MATCHED_EVENTS_METRIC, METRIC_NAMESPACE, RULE_NAME_DIMENSION,
+    SERVICE_PRINCIPAL, SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, TRIGGERED_RULES_METRIC,
 };
 use service_com_amazonaws_eventbridge_awsevents::EmulatedService;
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
@@ -1029,12 +1029,13 @@ pub(crate) fn bus_dimensions(bus: &str) -> Value {
 pub(crate) const ROUTING_COUNTERS: [&str; 2] = [MATCHED_EVENTS_METRIC, TRIGGERED_RULES_METRIC];
 
 /// The AWS/Events counters EventBridge publishes under the rule's whole identity
-/// AND under the rule name on its own: the three that count what became of a
+/// AND under the rule name on its own: the four that count what became of a
 /// handover. Stated here for the same reason as [`ROUTING_COUNTERS`].
-pub(crate) const HANDOVER_COUNTERS: [&str; 3] = [
+pub(crate) const HANDOVER_COUNTERS: [&str; 4] = [
     INVOCATIONS_METRIC,
     SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
     FAILED_INVOCATIONS_METRIC,
+    INVOCATIONS_SENT_TO_DLQ_METRIC,
 ];
 
 /// Whether `metric` is one of the counters published under the rule name ALONE
@@ -1448,12 +1449,16 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
                         "guarded",
                         &[
                             FAILED_INVOCATIONS_METRIC,
+                            // The event went to the target's dead-letter queue, which is
+                            // the second thing this refusal is counted as: parked rather
+                            // than lost.
+                            INVOCATIONS_SENT_TO_DLQ_METRIC,
                             MATCHED_EVENTS_METRIC,
                             TRIGGERED_RULES_METRIC,
                         ],
                     )),
-                    "case {:?}: expected the rule's own match and FailedInvocations series, \
-                     got {series:?}",
+                    "case {:?}: expected the rule's own match, FailedInvocations and \
+                     InvocationsSentToDlq series, got {series:?}",
                     row.case
                 );
                 if row.kind == Kind::StateMachine {

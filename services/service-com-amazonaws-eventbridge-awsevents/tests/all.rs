@@ -63,6 +63,8 @@ mod connection_oauth_grant;
 mod connection_refusal_wording;
 #[path = "all/cross_region_bus_target.rs"]
 mod cross_region_bus_target;
+#[path = "all/dead_letter_accounting.rs"]
+mod dead_letter_accounting;
 #[path = "all/dead_letter_condition_classification.rs"]
 mod dead_letter_condition_classification;
 #[path = "all/dead_letter_error_code.rs"]

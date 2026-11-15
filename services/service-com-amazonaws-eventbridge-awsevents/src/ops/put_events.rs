@@ -615,8 +615,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // budget its deliveries are. Nothing is counted on the
                         // rule's `FailedInvocations` for it: no target
                         // invocation was made, and a refusal for want of a
-                        // permission is not one AWS counts there.
-                        dead_letter_refusal(
+                        // permission is not one AWS counts there. The dead letter
+                        // this writes is not counted on the rule's
+                        // `InvocationsSentToDlq` either, for the same reason: that
+                        // metric is about an invocation a TARGET refused, and this
+                        // forward never reached one.
+                        let _ = dead_letter_refusal(
                             ctx.callback(),
                             &mut clients,
                             &dispatch.region,
@@ -1876,7 +1880,7 @@ pub(crate) async fn deliver(
     // the dead-letter queue configured for that target" and counts it on
     // `FailedInvocations`. Both follow from the SAME outcome, so they happen in
     // one place.
-    dead_letter_refusal(
+    let dead_lettered = dead_letter_refusal(
         callback,
         clients,
         region,
@@ -1890,7 +1894,7 @@ pub(crate) async fn deliver(
     // Every handover that reached the target's API is counted on the rule's own
     // invocation metrics, whichever way it went — a rule that is delivering is
     // as observable as one that is failing.
-    count_invocation(stores.cloudwatch, handover, &outcome);
+    count_invocation(stores.cloudwatch, handover, &outcome, dead_lettered);
     Handed::Outcome(outcome)
 }
 
@@ -2134,6 +2138,10 @@ const GLUE_CONCURRENT_RUNS_EXCEEDED_CODE: &str = "ConcurrentRunsExceededExceptio
 /// ([`republish`]) record a refusal the same way. A handover that was NOT
 /// ATTEMPTED is nothing AWS would dead-letter: a gap in this emulator is not an
 /// event the target refused.
+/// `true` when the event was really WRITTEN to a dead-letter queue, which is what
+/// the rule's `InvocationsSentToDlq` counts ([`count_invocation`]): `false` for an
+/// outcome nothing is dead-lettered for, for a target carrying no dead-letter
+/// queue, and for a write that queue itself refused.
 #[allow(clippy::too_many_arguments)]
 async fn dead_letter_refusal(
     callback: &smithy_server_runtime::EmbeddedEmulator,
@@ -2144,10 +2152,10 @@ async fn dead_letter_refusal(
     body: &str,
     outcome: &crate::state::InvocationOutcome,
     retries: Option<&Retries>,
-) {
+) -> bool {
     let target = handover.target;
     let crate::state::InvocationOutcome::Failed { code, message } = outcome else {
-        return;
+        return false;
     };
     ::tracing::warn!(
         target = %target.arn,
@@ -2156,10 +2164,10 @@ async fn dead_letter_refusal(
         "an EventBridge target could not be invoked"
     );
     let Some(dead_letter_arn) = target.dead_letter_arn.as_deref() else {
-        return;
+        return false;
     };
     let Some(queue) = sqs_queue(dead_letter_arn) else {
-        return;
+        return false;
     };
     // The dead-letter queue is reached in ITS OWN Region, which is not
     // necessarily the target's or the request's.
@@ -2169,7 +2177,7 @@ async fn dead_letter_refusal(
         callback, clients, dlq_region, kms, &queue, dead_letter_arn, handover, body, code,
         message, retries,
     )
-    .await;
+    .await
 }
 
 /// What a target that asks for the event to be RESHAPED receives, or `Ok(None)`
@@ -4226,6 +4234,8 @@ fn log_group_write_refusal(stream_arn: &str, action: &str) -> (String, String) {
 /// granted this service nothing receives no dead letter either, and the event is
 /// dropped with that fact in the log rather than enqueued where AWS would not
 /// have enqueued it.
+/// `true` when the message was really enqueued: a write the dead-letter queue's
+/// own policy refused, and one that service answered with a fault, park nothing.
 #[allow(clippy::too_many_arguments)]
 async fn dead_letter(
     callback: &smithy_server_runtime::EmbeddedEmulator,
@@ -4239,7 +4249,7 @@ async fn dead_letter(
     code: &str,
     message: &str,
     retries: Option<&Retries>,
-) {
+) -> bool {
     let mut attributes: Vec<(&str, String)> = vec![
         ("RULE_ARN", handover.rule_arn.to_string()),
         ("TARGET_ARN", handover.target.arn.clone()),
@@ -4274,7 +4284,7 @@ async fn dead_letter(
     .await
     .is_some()
     {
-        return;
+        return false;
     }
     let mut request = client
         .send_message()
@@ -4301,7 +4311,9 @@ async fn dead_letter(
             error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
             "an undeliverable EventBridge event could not be sent to the dead-letter queue"
         );
+        return false;
     }
+    true
 }
 
 /// Count what came of ONE handover on the rule's own invocation metrics.
@@ -4312,15 +4324,24 @@ async fn dead_letter(
 /// handover that was NOT ATTEMPTED is counted on neither — nothing was invoked,
 /// and a gap in this emulator is not a failure AWS reports.
 ///
+/// A refused handover whose event was WRITTEN to the target's dead-letter queue
+/// (`dead_lettered`, what [`dead_letter_refusal`] answers) is counted on the
+/// rule's `InvocationsSentToDlq` as well: the two are separate facts about one
+/// refusal — that the invocation failed, and that the event was parked rather
+/// than lost — and a client reads the second to tell a dead-lettered delivery
+/// from one whose target carried no dead-letter queue at all.
+///
 /// The decision is EventBridge's; where the metric LIVES and how it is appended
 /// is CloudWatch's, so the write itself is [`crate::state::count_invocation`] /
-/// [`crate::state::count_failed_invocation`] over the CloudWatch store in this
-/// same engine. `None` is a deployment with no CloudWatch mounted, which is
+/// [`crate::state::count_failed_invocation`] /
+/// [`crate::state::count_invocation_sent_to_dlq`] over the CloudWatch store in
+/// this same engine. `None` is a deployment with no CloudWatch mounted, which is
 /// nothing to count on.
 fn count_invocation(
     cloudwatch: Option<&::engine::ServiceState<crate::state::CloudWatchState>>,
     handover: &Handover<'_>,
     outcome: &crate::state::InvocationOutcome,
+    dead_lettered: bool,
 ) {
     let Some(cloudwatch) = cloudwatch else {
         return;
@@ -4334,6 +4355,9 @@ fn count_invocation(
             crate::state::count_failed_invocation(&mut cloudwatch.lock(), bus, rule);
         }
         crate::state::InvocationOutcome::NotAttempted(_) => {}
+    }
+    if dead_lettered {
+        crate::state::count_invocation_sent_to_dlq(&mut cloudwatch.lock(), bus, rule);
     }
 }
 

@@ -8,10 +8,14 @@
 //!
 //! The RULE asserted here: the `ERROR_CODE` EventBridge stamps on a dead-lettered
 //! event is the service's OWN classification of why the delivery failed, never the
-//! target service's error code. A target that was not there to take the event is
-//! `NO_RESOURCE`; one that refused the identity the call was made as — whether a
-//! queue policy that grants this service nothing or a role whose policies withhold
-//! the call — is `NO_PERMISSIONS`; a failure of any other kind is `UNKNOWN`. The
+//! target service's error code. A target this service could not address — one that
+//! was not there to take the event, and a queue whose own policy grants this service
+//! nothing, which it cannot tell apart from one that is not there — is
+//! `NO_RESOURCE`; one whose service told this service the IDENTITY the call was made
+//! as was refused, as a role whose policies withhold the call does, is
+//! `NO_PERMISSIONS` (the class `tests/all/dead_letter_error_code.rs` spans over the
+//! two steps of a role-governed handover); a failure of any other kind is `UNKNOWN`.
+//! The
 //! target service's own answer is what the `ERROR_MESSAGE` beside it carries, in
 //! full, so nothing of the refusal is lost by classifying it.
 //!
@@ -33,7 +37,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    InvocationOutcome, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL, UNKNOWN_CONDITION,
+    InvocationOutcome, NO_RESOURCE, SERVICE_PRINCIPAL, UNKNOWN_CONDITION,
 };
 
 use crate::target_dispatch::{
@@ -206,7 +210,7 @@ async fn the_dead_letter_condition_classifies_the_targets_own_answer() {
         Row {
             case: "a queue whose policy grants this service nothing",
             target: Target::QueueGrantingNothing,
-            condition: Some(NO_PERMISSIONS),
+            condition: Some(NO_RESOURCE),
         },
         Row {
             case: "a queue ARN no queue was created for",

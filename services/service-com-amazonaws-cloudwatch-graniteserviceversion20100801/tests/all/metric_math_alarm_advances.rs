@@ -388,14 +388,14 @@ const ROWS: &[Row] = &[
                 back: 0,
             }],
             // The window now folds to 10.0, which is still under the threshold: the
-            // evaluation reaches the state the alarm already reports, so no transition is
-            // recorded and neither state stamp moves — while the EXPLANATION is this
-            // evaluation's, over the value it graded, because the one the alarm carries was
-            // written by an evaluation too.
+            // evaluation reaches the state the alarm already reports, so it moves the alarm
+            // nowhere — no transition is recorded, neither state stamp moves, and the
+            // EXPLANATION stays the one the evaluation that really put the alarm in this state
+            // wrote, over the value THAT one graded.
             Verdict {
                 state: "OK",
-                recent: &[10.0],
-                rests_on: &[10.0],
+                recent: &[6.0],
+                rests_on: &[6.0],
             },
         ),
         reads_back: &[10.0],

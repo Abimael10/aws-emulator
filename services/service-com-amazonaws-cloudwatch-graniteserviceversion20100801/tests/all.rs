@@ -27,6 +27,8 @@ mod alarm_actions_switch;
 mod alarm_closed_period_grading;
 #[path = "all/alarm_configuration.rs"]
 mod alarm_configuration;
+#[path = "all/alarm_configuration_change_events.rs"]
+mod alarm_configuration_change_events;
 #[path = "all/alarm_configuration_refusal_messages.rs"]
 mod alarm_configuration_refusal_messages;
 #[path = "all/alarm_configuration_update_summaries.rs"]
@@ -63,6 +65,8 @@ mod alarm_reason_datapoints;
 mod alarm_reason_statistic;
 #[path = "all/alarm_rule_parse_diagnosis.rs"]
 mod alarm_rule_parse_diagnosis;
+#[path = "all/alarm_state_change_event_chain.rs"]
+mod alarm_state_change_event_chain;
 #[path = "all/alarm_state_change_events.rs"]
 mod alarm_state_change_events;
 #[path = "all/alarm_update_regrades.rs"]

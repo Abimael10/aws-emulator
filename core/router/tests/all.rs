@@ -2479,3 +2479,6 @@ mod appended_prose;
 // and for every service crate's `tests/all.rs`, so a note about one belongs there.
 #[path = "all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs"]
 mod declaration_roots_keep_inner_attributes_ahead_of_the_first_item;
+// Single integration-target for the router.
+// had grown hundreds of re-typed copies of its header, many of them written as inner doc
+// comments past the first item (`E0753`), so no suite of this target compiled at all.

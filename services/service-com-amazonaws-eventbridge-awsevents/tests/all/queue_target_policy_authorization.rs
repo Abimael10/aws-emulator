@@ -20,10 +20,11 @@
 //! the target's dead-letter queue — which is the same send by the same principal, so
 //! that queue's own policy decides it the same way. What the dead letter REPORTS is
 //! the answer Amazon SQS gave the refused `sqs:SendMessage`: an authorization
-//! failure naming the principal, the action and the queue, so the condition names
-//! the PERMISSION (`NO_PERMISSIONS`) — the identity the call was made as was not
-//! allowed it, while the queue was there all along — and the message is that
-//! answer, carrying the id of the refused request.
+//! failure naming the principal, the action and the queue, carrying the id of the
+//! refused request, under the condition that names the RESOURCE (`NO_RESOURCE`) — a
+//! queue whose document withholds every grant from this service is one this service
+//! cannot address at all, which is the same condition a queue that is not there
+//! earns.
 //!
 //! The first test spans a TABLE whose rows differ along what the queue's document
 //! states: whether there is one at all, which principal it names, which action and
@@ -42,8 +43,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC,
-    NO_PERMISSIONS, SERVICE_PRINCIPAL,
+    rule_arn, DEFAULT_EVENT_BUS_NAME, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC, NO_RESOURCE,
+    SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
@@ -454,7 +455,7 @@ async fn a_withheld_delivery_is_dead_lettered_only_where_that_queue_allows_it() 
                 .as_str()
                 .unwrap_or_default();
             assert_eq!(
-                code, NO_PERMISSIONS,
+                code, NO_RESOURCE,
                 "case {case:?}: expected the dead letter to name the condition the delivery \
                  failed at, got {message:?}"
             );

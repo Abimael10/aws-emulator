@@ -990,23 +990,15 @@ impl State {
         };
         budget.settled_one();
         // An evaluation that computes the state the alarm already reports moves it nowhere, so
-        // nothing about the TRANSITION changes: no history item, no action, and no new instant
-        // on `StateUpdatedTimestamp` or `StateTransitionedTimestamp`. Its EXPLANATION is this
-        // evaluation's, though, where the explanation the alarm carries is one an EVALUATION
-        // wrote: "an explanation for the alarm state" (`MetricAlarm$StateReason` /
-        // `$StateReasonData`, the decision record naming the datapoints that were graded) is
-        // about the state the alarm is in now, so an alarm that keeps its state reports the
-        // datapoints the evaluation that is current graded rather than the ones the evaluation
-        // that last moved it had. An explanation a WRITE left — the reason `PutMetricAlarm`
-        // creates an alarm with, or the one a caller forced with `SetAlarmState`, neither of
-        // which carries a decision record — stands until an evaluation really moves the alarm.
+        // NOTHING about the alarm changes: no history item, no action, no new instant on
+        // `StateUpdatedTimestamp` or `StateTransitionedTimestamp` — and not the EXPLANATION
+        // either. "An explanation for the alarm state" (`MetricAlarm$StateReason` /
+        // `$StateReasonData`, the decision record naming the datapoints that were graded) is the
+        // record of the evaluation that PUT the alarm in the state it is in, which is the one
+        // the state change announced for it: an evaluation that moved it nowhere decided nothing
+        // about that state, so the alarm goes on reporting the record of the evaluation that
+        // did, however many times it is graded again meanwhile.
         if alarm.state_value.as_deref() == Some(evaluation.state) {
-            if alarm.state_reason_data.is_some() {
-                if let Some(stored) = self.alarms.get_mut(name) {
-                    stored.alarm.state_reason = Some(evaluation.reason);
-                    stored.alarm.state_reason_data = Some(evaluation.reason_data);
-                }
-            }
             return;
         }
 
@@ -1802,6 +1794,22 @@ impl State {
         now_secs: f64,
     ) {
         let mut notification = notification;
+        // What the event this transition publishes reports as the state the alarm moved OUT OF:
+        // the state the LAST event of this alarm announced, which is the state this transition
+        // moved it out of. The alarm's own state members are the state as it reads now — an
+        // evaluation that moved the alarm nowhere still rewrites the explanation of the state it
+        // is in, and a write re-stating the same state refreshes its instant — so a consumer
+        // following one alarm would otherwise be handed a previous state no event of that alarm
+        // ever announced, and the chain of its transitions would not join up.
+        if let Some(announced) = self.published_alarm_states.get(&notification.alarm_name) {
+            notification
+                .state_change
+                .reports_previous_state(announced.clone());
+        }
+        self.published_alarm_states.insert(
+            notification.alarm_name.clone(),
+            notification.state_change.state_document(),
+        );
         if let Some(rule_name) = self.muting_alarm_mute_rule(
             &notification.alarm_name,
             notification.alarm_arn.as_deref(),
@@ -2399,6 +2407,8 @@ pub(crate) fn decimal_text(value: f64) -> String {
 ///
 /// A period the missing-data treatment substituted a datapoint for carries no instant and no
 /// value: nothing was measured over it, and the arm that decided it is what the entry names.
+/// A state NO datapoint decided — insufficient data — names the periods it had no value for
+/// instead, each entry carrying that period's instant and nothing else.
 ///
 /// "An explanation for the alarm state, in JSON format." (`MetricAlarm$StateReasonData`),
 /// bounded by [`MAX_STATE_REASON_DATA_LEN`] — a document is JSON, so it can never be
@@ -2510,6 +2520,30 @@ fn state_reason_data(
                         Datapoint::Missing => "missing",
                     }),
                 );
+            }
+            datapoints.push(Value::Object(entry));
+        }
+    } else {
+        // A state decided with too few datapoints to grade rests on NO datapoint: what its
+        // record names is the periods the evaluation had no value for — the ones its sentence
+        // counts as unknown — one entry per unknown period, carrying that period's own instant
+        // on the grid the evaluation graded and NOTHING else, because nothing was measured over
+        // it. A period that really held a datapoint is named by `recentDatapoints` above and is
+        // not one of these.
+        let graded: Vec<usize> = evaluated.iter().filter_map(|slot| slot.window).collect();
+        let unknown = evaluated
+            .len()
+            .saturating_sub(evaluated.iter().filter(|slot| slot.value.is_some()).count());
+        for index in 0..evaluated.len() {
+            if datapoints.len() >= unknown {
+                break;
+            }
+            if graded.contains(&index) {
+                continue;
+            }
+            let mut entry = Map::new();
+            if let Some(at) = super::document_instant(grid.window_start(now_secs, index, period)) {
+                entry.insert("timestamp".to_string(), Value::from(at));
             }
             datapoints.push(Value::Object(entry));
         }

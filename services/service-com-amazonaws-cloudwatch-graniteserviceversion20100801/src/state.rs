@@ -64,6 +64,10 @@ use crate::ops::types::{
 /// the ARNs the alarm names.
 pub mod alarm_actions;
 
+/// The event a change to an ALARM's CONFIGURATION publishes onto the account's default event
+/// bus, and the writes that publish none.
+pub mod alarm_configuration_events;
+
 /// The alarm mute rules this store holds, and the mute windows their schedules name.
 /// Re-exported below, so a handler reaches them as `crate::state::…` like every other part of
 /// this store.
@@ -1851,6 +1855,20 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// [`alarm_evaluation::MAX_PENDING_NOTIFICATIONS`]; drained by
     /// [`alarm_actions::settle_alarms`], which is what delivers them.
     pub pending_notifications: VecDeque<alarm_actions::AlarmNotification>,
+    /// The configuration changes the alarm writes this store has made owe but nothing has
+    /// published yet, oldest first. Bounded by
+    /// [`alarm_configuration_events::MAX_PENDING_CONFIGURATION_CHANGES`]; drained by
+    /// [`alarm_actions::settle_alarms`], which is what publishes them.
+    pub pending_configuration_changes:
+        VecDeque<alarm_configuration_events::AlarmConfigurationChange>,
+    /// The `detail.state` document the last state-change event each alarm published reported,
+    /// by alarm name — what the NEXT state change of that alarm reports as the state it moved
+    /// out of ([`alarm_actions::state_change_events::AlarmStateChange::reports_previous_state`]).
+    ///
+    /// One entry per alarm that has ever moved, dropped with the alarm itself: an alarm written
+    /// again under a name that was deleted is a new alarm, whose first transition moves it out
+    /// of the state that write left rather than out of a state the alarm before it published.
+    pub published_alarm_states: HashMap<String, Value>,
     /// The in-process task that waits for this store's due alarm evaluations and delivers
     /// what the transitions they materialise owe ([`alarm_actions::drive_alarm_clock`]), when
     /// one is running.
@@ -4099,7 +4117,9 @@ pub fn log_configuration_update_history_data(
 /// metric alarm's: "If you call this operation with the name of an existing log alarm, the
 /// operation replaces the previous configuration of that alarm." (`PutLogAlarm`), so a
 /// configuration write records configuration only.
-fn log_alarm_configuration_document(alarm: &LogAlarm) -> Value {
+///
+/// `pub(crate)` for the reason [`alarm_configuration_document`] gives.
+pub(crate) fn log_alarm_configuration_document(alarm: &LogAlarm) -> Value {
     let mut config = Map::new();
     insert_member(&mut config, "alarmName", json_text(&alarm.alarm_name));
     insert_member(&mut config, "alarmArn", json_text(&alarm.alarm_arn));
@@ -4247,7 +4267,9 @@ fn warm_up_configuration_document(warm_up: &WarmUpConfiguration) -> Value {
 /// those it carries. The state members are NOT part of it, for the same reason they are not
 /// part of a metric alarm's: "When you update an existing alarm, its state is left
 /// unchanged" (`PutCompositeAlarm`), so a configuration write records no state.
-fn composite_alarm_configuration_document(alarm: &CompositeAlarm) -> Value {
+///
+/// `pub(crate)` for the reason [`alarm_configuration_document`] gives.
+pub(crate) fn composite_alarm_configuration_document(alarm: &CompositeAlarm) -> Value {
     let mut config = Map::new();
     insert_member(&mut config, "alarmName", json_text(&alarm.alarm_name));
     insert_member(&mut config, "alarmArn", json_text(&alarm.alarm_arn));
@@ -4342,7 +4364,12 @@ fn alarm_state_document(alarm: &AlarmStateSnapshot, reason_data: bool) -> Value 
 /// — a member the alarm does not have is absent from the document, exactly as it is absent
 /// from the alarm. The state members are NOT part of it: "When you update an existing alarm,
 /// its state is left unchanged" (`PutMetricAlarm`), so a configuration write records no state.
-fn alarm_configuration_document(alarm: &MetricAlarm) -> Value {
+///
+/// `pub(crate)` because it is also what decides whether a write CHANGED an alarm's
+/// configuration at all ([`alarm_configuration_events`]): one record of a configuration serves
+/// both, so a write the history reports as an update cannot be one the event path reports as a
+/// no-op.
+pub(crate) fn alarm_configuration_document(alarm: &MetricAlarm) -> Value {
     let mut config = Map::new();
     insert_member(&mut config, "alarmName", json_text(&alarm.alarm_name));
     insert_member(&mut config, "alarmArn", json_text(&alarm.alarm_arn));

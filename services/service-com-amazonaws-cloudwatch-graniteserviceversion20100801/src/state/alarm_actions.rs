@@ -56,6 +56,11 @@
 //! publication is owed by the TRANSITION rather than by the action list, so it is made for
 //! every transition this settles — including one of an alarm that carries no action, one whose
 //! actions are disabled or suppressed, and one a mute rule mutes.
+//!
+//! The same settle publishes the other event an alarm owes that bus: the CONFIGURATION change a
+//! write to the alarm makes ([`super::alarm_configuration_events`]). It is queued by the
+//! handler that made the write and published here, with no lock held, for the same reason a
+//! state change is.
 
 use ::serde_json::{Map, Value};
 
@@ -482,7 +487,7 @@ async fn settle<Eng: Send + Sync + 'static>(
     // produce is recorded and folded into those alarms' states, so the transitions they cause
     // are queued by the time this settle takes the queue below.
     super::log_alarm_evaluation::scheduled_runs::settle_log_alarms(engine, callback).await;
-    let owed = {
+    let (owed, configured) = {
         // The evaluation pass is CPU-bound and runs under the store's lock, so it is moved
         // off the async worker: the runtime keeps serving every other request while it runs,
         // and this request's own deadline has an await point to land on when it returns. The
@@ -499,9 +504,22 @@ async fn settle<Eng: Send + Sync + 'static>(
             // references it, so the composite alarms are evaluated after it, in the same pass
             // and out of the same budget.
             store.evaluate_composite_alarms(now, &mut budget);
-            store.take_pending_notifications(MAX_NOTIFICATIONS_PER_REQUEST)
+            (
+                store.take_pending_notifications(MAX_NOTIFICATIONS_PER_REQUEST),
+                store.take_pending_configuration_changes(
+                    super::alarm_configuration_events::MAX_CONFIGURATION_CHANGES_PER_REQUEST,
+                ),
+            )
         })
     };
+
+    // The CONFIGURATION changes the alarm writes of this store have made go out here, beside
+    // the state changes below: both are events this service owes the bus about one of its
+    // alarms, so one settle publishes both and neither waits for the other's work.
+    if !configured.is_empty() {
+        super::alarm_configuration_events::publish(callback, &configured).await;
+    }
+
     if owed.is_empty() {
         return;
     }

@@ -1125,6 +1125,19 @@ fn write_alarm(
         .map(|stored| stored.creation_id.clone())
         .unwrap_or_else(|| crate::state::alarm_creation_id(now));
 
+    // The CONFIGURATION CHANGE this write publishes onto the account's default event bus: a
+    // create for a name the store held no alarm of, an update for one whose configuration this
+    // write really changed, and nothing at all for a write that re-stated the configuration the
+    // alarm already had ([`crate::state::alarm_configuration_events`]). Built from the alarm
+    // this write stores and the one it replaces, and queued for the settle this handler runs
+    // with the lock released to publish.
+    let configuration_change =
+        crate::state::alarm_configuration_events::AlarmConfigurationChange::of_metric_write(
+            previous.as_ref(),
+            &alarm,
+            now,
+        );
+
     store.alarms.insert(
         input.alarm_name.clone(),
         crate::state::StoredAlarm {
@@ -1168,5 +1181,8 @@ fn write_alarm(
             alarm_contributor_attributes: None,
         },
     );
+    if let Some(change) = configuration_change {
+        store.enqueue_configuration_change(change);
+    }
     Ok(())
 }

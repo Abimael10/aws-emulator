@@ -919,6 +919,10 @@ pub const INVOCATIONS_METRIC: &str = "Invocations";
 /// only way a client can tell "delivery succeeded" from "nothing is counted".
 pub const SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC: &str = "SuccessfulInvocationAttempts";
 
+/// The EventBridge metric counting the events a rule's target invocation failed
+/// for that were WRITTEN to that target's dead-letter queue.
+pub const INVOCATIONS_SENT_TO_DLQ_METRIC: &str = "InvocationsSentToDlq";
+
 /// The EventBridge metric counting the events a rule's `EventPattern` matched.
 pub const MATCHED_EVENTS_METRIC: &str = "MatchedEvents";
 
@@ -2620,6 +2624,20 @@ pub fn count_failed_invocation(cloudwatch: &mut CloudWatchState, bus: &str, rule
     count_handover(cloudwatch, FAILED_INVOCATIONS_METRIC, bus, rule);
 }
 
+/// Count ONE event a rule's failed target invocation sent to that target's
+/// dead-letter queue, on the rule's `InvocationsSentToDlq` metric.
+///
+/// Counted where the dead letter was really WRITTEN: the metric is what tells a
+/// client that an undeliverable event was parked rather than lost, so an event a
+/// target carrying no dead-letter queue could not be delivered to counts here
+/// not at all, and neither does one whose dead-letter queue refused the write.
+/// It is a fact about a failed TARGET INVOCATION, which is why a handover that
+/// never reached a target invocation does not count here even when its event
+/// reached a dead-letter queue.
+pub fn count_invocation_sent_to_dlq(cloudwatch: &mut CloudWatchState, bus: &str, rule: &str) {
+    count_handover(cloudwatch, INVOCATIONS_SENT_TO_DLQ_METRIC, bus, rule);
+}
+
 /// Count ONE invocation a rule's target accepted, on both counters an accepted
 /// handover is reported on: the rule's `Invocations` and its
 /// `SuccessfulInvocationAttempts`.
@@ -3120,11 +3138,16 @@ const SQS_ACCESS_DENIED_STATUS: u16 = 403;
 /// ([`target_policy_admits`]), and what the delivery SEES when that document
 /// grants nothing is Amazon SQS's own refusal of the `sqs:SendMessage` — the
 /// authorization sentence naming the principal the call was made as, the action
-/// and the queue, followed by the metadata block an AWS error carries. So the
-/// condition names the PERMISSION ([`NO_PERMISSIONS`]), which is what the
-/// delivery failed for: the identity it was made as was not allowed the call,
-/// and the resource was there all along ([`NO_RESOURCE`] is the condition of a
-/// target that is NOT).
+/// and the queue, followed by the metadata block an AWS error carries.
+///
+/// The condition is [`NO_RESOURCE`], the SAME one a queue that is not there earns:
+/// a queue whose policy withholds every grant from this service is a queue this
+/// service cannot address at all, so what the delivery can report about it is that
+/// it had no queue to deliver to rather than which of the two it was. That is what
+/// a dead letter of such a delivery carries, and the sentence beside it is where
+/// the authorization failure itself is reported. A refusal of the IDENTITY the
+/// call was made as ([`NO_PERMISSIONS`]) is the condition of a target whose own
+/// service told this service which of the two it was.
 ///
 /// The request id is MINTED here and nowhere else: it identifies the one refused
 /// call, so it is drawn fresh rather than derived from the event or the target,
@@ -3135,7 +3158,7 @@ const SQS_ACCESS_DENIED_STATUS: u16 = 403;
 pub fn queue_access_refusal(queue_arn: &str) -> (String, String) {
     let request_id = ::service_common::query_error_envelope::new_request_id();
     (
-        NO_PERMISSIONS.to_string(),
+        NO_RESOURCE.to_string(),
         format!(
             "{} (Service: {SQS_SERVICE_NAME}; Status Code: {SQS_ACCESS_DENIED_STATUS}; Error \
              Code: {SQS_ACCESS_DENIED_CODE}; Request ID: {request_id}; Proxy: null)",
