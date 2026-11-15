@@ -17,6 +17,8 @@ mod bot_aliases;
 mod bot_lifecycle;
 #[path = "all/bot_locale.rs"]
 mod bot_locale;
+#[path = "all/bot_version_listing.rs"]
+mod bot_version_listing;
 #[path = "all/bot_versions.rs"]
 mod bot_versions;
 #[path = "all/export_archive.rs"]

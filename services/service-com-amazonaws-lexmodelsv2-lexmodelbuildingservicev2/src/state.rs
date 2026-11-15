@@ -30,7 +30,8 @@
 //! every operation that reports a resource holding one reports the server-side defaults
 //! Amazon Lex materialized onto it.
 //!
-//! The version slice (`CreateBotVersion`, `DescribeBotVersion`) is served out of
+//! The version slice (`CreateBotVersion`, `DescribeBotVersion`, `ListBotVersions`) is
+//! served out of
 //! `bot_versions`, keyed by the bot and the number the version was created under. A
 //! version is an immutable SNAPSHOT of the version each of its locales was taken from,
 //! so creating one copies those locales and everything defined in them — intents, slot
@@ -67,7 +68,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     AudioFillerSettings, BotAliasSummary, BotMember, BotSummary, BotVersionLocaleDetails,
-    CompositeSlotTypeSetting, DataPrivacy,
+    BotVersionSummary, CompositeSlotTypeSetting, DataPrivacy,
     DialogCodeHookSettings, ErrorLogSettings, ExternalSourceSetting, FulfillmentCodeHookSettings,
     GenerativeAISettings, InitialResponseSetting, InputContext, IntentClosingSetting,
     IntentConfirmationSetting, KendraConfiguration, MultipleValuesSetting, ObfuscationSetting,
@@ -187,6 +188,10 @@ pub const BOT_FILTER_NAMES: [&str; 2] = ["BotName", "BotType"];
 /// Every member of the modelled `BotFilterOperator` enum
 /// (`smithy_query(query="shape",shape="BotFilterOperator")`).
 pub const BOT_FILTER_OPERATORS: [&str; 3] = ["CO", "EQ", "NE"];
+
+/// Every member of the modelled `BotVersionSortAttribute` enum
+/// (`smithy_query(query="shape",shape="BotVersionSortAttribute")`).
+pub const BOT_VERSION_SORT_ATTRIBUTES: [&str; 1] = ["BotVersion"];
 
 /// Every member of the modelled `SlotTypeSortAttribute` enum
 /// (`smithy_query(query="shape",shape="SlotTypeSortAttribute")`).
@@ -419,6 +424,23 @@ impl Bot {
         }
     }
 
+    /// This bot's working copy as a `ListBotVersions` summary entry.
+    ///
+    /// A bot has its `DRAFT` version from the moment it is created — that is the version
+    /// a locale, an intent or a slot is defined in and the one `CreateBotVersion` takes a
+    /// snapshot of — so the draft is reported off the bot's own record: the working copy
+    /// IS the bot as it currently stands, which is why its name, description, status and
+    /// creation instant are the bot's.
+    pub fn draft_version_summary(&self) -> BotVersionSummary {
+        BotVersionSummary {
+            bot_name: Some(self.bot_name.clone()),
+            bot_version: Some(DRAFT_BOT_VERSION.to_string()),
+            description: self.description.clone(),
+            bot_status: Some(self.bot_status.clone()),
+            creation_date_time: Some(to_date_time(self.creation_date_time)),
+        }
+    }
+
     /// Does this bot's network include the bot `bot_id` names? A bot the store holds no
     /// members for has no network to include anything.
     pub fn has_network_member(&self, bot_id: &str) -> bool {
@@ -588,6 +610,19 @@ impl BotVersion {
     /// Schedule `status` to become this version's status once `after` has elapsed.
     pub fn schedule_status(&mut self, status: &str, after: Duration) {
         self.pending_status = Some((status.to_string(), Instant::now() + after));
+    }
+
+    /// This version as a `ListBotVersions` summary entry, read back off the stored
+    /// snapshot: a version is immutable, so its name and description are the ones it was
+    /// created with rather than the draft's as it stands now.
+    pub fn summary(&self) -> BotVersionSummary {
+        BotVersionSummary {
+            bot_name: Some(self.bot_name.clone()),
+            bot_version: Some(self.bot_version.clone()),
+            description: self.description.clone(),
+            bot_status: Some(self.bot_status.clone()),
+            creation_date_time: Some(to_date_time(self.creation_date_time)),
+        }
     }
 }
 
@@ -1216,6 +1251,22 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
             .get_mut(&bot_version_key(bot_id, bot_version))?;
         version.settle();
         Some(version)
+    }
+
+    /// Every NUMBERED version of one bot, each with any due status transition applied
+    /// first — the same contract as [`Self::settled_bot_version`], over the whole bot.
+    /// A version of any other bot is not in it, and the bot's `DRAFT` working copy is
+    /// not a record of this map: it is reported off the bot itself
+    /// ([`Bot::draft_version_summary`]).
+    pub fn settled_bot_versions_of_bot(&mut self, bot_id: &str) -> Vec<&BotVersion> {
+        self.bot_versions
+            .iter_mut()
+            .filter(|((bot, _), _)| bot == bot_id)
+            .map(|(_, version)| {
+                version.settle();
+                &*version
+            })
+            .collect()
     }
 
     /// Drop every version of `bot_id` and answer how many went: a version cannot outlive

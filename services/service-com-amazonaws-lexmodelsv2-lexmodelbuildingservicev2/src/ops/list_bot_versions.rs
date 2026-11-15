@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBotVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBotVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBotVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Builds `botVersionSummaries` for the bot the URI names out of [`crate::state`]: the
+//! bot's `DRAFT` working copy, which every bot has from the moment it is created, plus
+//! one entry per numbered version the store still holds for it. That is why the listing
+//! of a bot nothing else was done to is not empty.
+//!
+//! `BotVersion` is the model's only sort attribute, and a version is named either by a
+//! number or by `DRAFT`, so the order this operation returns puts the working copy first
+//! and the numbered versions after it by their NUMBER (so 10 follows 2, as numbers do),
+//! which keeps that order total and `nextToken` paging stable across calls;
+//! `Descending` reverses it.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +168,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBotVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBotVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBotVersionsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        // `sortBy` carries modelled enums, which the wire renders as plain strings:
+        // refuse a value outside the enum rather than silently ignoring it.
+        let mut descending = false;
+        if let Some(sort_by) = &input.sort_by {
+            if !crate::state::BOT_VERSION_SORT_ATTRIBUTES.contains(&sort_by.attribute.as_str()) {
+                return Err(invalid(format!(
+                    "sortBy.attribute must be one of [{}]; received {}",
+                    crate::state::BOT_VERSION_SORT_ATTRIBUTES.join(", "),
+                    sort_by.attribute
+                )));
+            }
+            if !crate::state::SORT_ORDERS.contains(&sort_by.order.as_str()) {
+                return Err(invalid(format!(
+                    "sortBy.order must be one of [{}]; received {}",
+                    crate::state::SORT_ORDERS.join(", "),
+                    sort_by.order
+                )));
+            }
+            descending = sort_by.order == "Descending";
+        }
+
+        // `maxResults` carries the modelled range 1..1000. A value outside it is refused,
+        // not reinterpreted, so a caller that asked for an illegal page size never gets a
+        // plausible success. A request that asks for no page size is served the modelled
+        // maximum, which keeps every response bounded — the same way `ListBots` does.
+        let page_size = match input.max_results {
+            Some(max_results) => {
+                let requested = usize::try_from(max_results)
+                    .ok()
+                    .filter(|size| (1..=crate::state::MAX_LIST_PAGE).contains(size));
+                let Some(page_size) = requested else {
+                    return Err(invalid(format!(
+                        "maxResults must be between 1 and {}; received {max_results}",
+                        crate::state::MAX_LIST_PAGE
+                    )));
+                };
+                page_size
+            }
+            None => crate::state::MAX_LIST_PAGE,
+        };
+
+        let mut store = state.lock();
+
+        // The listing is scoped to the one bot the URI names. A bot the store holds has
+        // its `DRAFT` working copy, so such a bot always has at least that entry to
+        // report; this operation models no error for a bot the store does not hold
+        // (`smithy_query(query="operation",operation="ListBotVersions")` declares no
+        // not-found error), so such a request is answered with the versions that bot
+        // has: none.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBotVersions"))
+        // `settled_bot` and `settled_bot_versions_of_bot` apply a status transition the
+        // clock already made due before reporting; they never invent one, so a listing
+        // agrees with what `DescribeBot` and `DescribeBotVersion` say about the same
+        // records.
+        let mut page: Vec<BotVersionSummary> = Vec::new();
+        if let Some(bot) = store.settled_bot(&input.bot_id) {
+            page.push(bot.draft_version_summary());
+        }
+        page.extend(
+            store
+                .settled_bot_versions_of_bot(&input.bot_id)
+                .into_iter()
+                .map(crate::state::BotVersion::summary),
+        );
+
+        page.sort_by_key(entry_order_key);
+        if descending {
+            page.reverse();
+        }
+
+        // The cursor `nextToken` carries is the sort key of the first entry of the page
+        // it opens, so the remainder is resolved against the same total order and a
+        // version deleted between pages does not strand the listing: paging resumes at
+        // the first entry at or after the cursor.
+        if let Some(token) = input.next_token.as_deref() {
+            let Some(cursor) = parse_cursor(token) else {
+                return Err(invalid(format!(
+                    "nextToken {token} is not a token this operation issued; restart the listing"
+                )));
+            };
+            let resume_at = page
+                .iter()
+                .position(|entry| at_or_after(entry, &cursor, descending))
+                .unwrap_or(page.len());
+            page.drain(..resume_at);
+        }
+
+        // Whatever is left over is handed back as an opaque token, so the page itself is
+        // always within `page_size`.
+        let next_token = if page.len() > page_size {
+            let remainder = page.split_off(page_size);
+            remainder.first().map(render_cursor)
+        } else {
+            None
+        };
+
+        Ok(ListBotVersionsOutput {
+            bot_id: Some(input.bot_id),
+            bot_version_summaries: Some(page),
+            next_token,
+        })
     }
+}
+
+/// An entry's `botVersion`, which names it among the versions of one bot and is the only
+/// attribute the model sorts this listing by. Every summary this handler builds carries
+/// one.
+fn entry_version(entry: &BotVersionSummary) -> &str {
+    entry.bot_version.as_deref().unwrap_or_default()
+}
+
+/// Where one `botVersion` sorts in the ascending order this listing returns: the working
+/// copy first, then the numbered versions by their number.
+///
+/// The modelled `BotVersion` shape admits exactly those two forms (pattern
+/// `^(DRAFT|[0-9]+)$`, `smithy_query(query="shape",shape="BotVersion")`), and a version
+/// number names one version of a bot only, so this key is a TOTAL order over the
+/// versions of one bot. Every entry is built from a stored record, so the parse answers the
+/// number the version was created under; the fallback is unreachable for a version this
+/// service minted, and ranks anything else first among the numbers rather than panicking.
+fn order_key(bot_version: &str) -> (u8, u64) {
+    if bot_version == crate::state::DRAFT_BOT_VERSION {
+        (0, 0)
+    } else {
+        (1, bot_version.parse().unwrap_or_default())
+    }
+}
+
+/// [`order_key`] of one entry of the listing.
+fn entry_order_key(entry: &BotVersionSummary) -> (u8, u64) {
+    order_key(entry_version(entry))
+}
+
+/// The opaque `nextToken` that resumes a listing at `entry`.
+///
+/// The cursor inside it is the entry's `botVersion`, which is what the order is over, and
+/// [`crate::state::encode_page_token`] renders it opaque.
+fn render_cursor(entry: &BotVersionSummary) -> String {
+    crate::state::encode_page_token(entry_version(entry))
+}
+
+/// The `botVersion` a `nextToken` resumes at, or `None` when it is not a token this
+/// operation issued.
+///
+/// A token this operation minted carries one `botVersion`, so one that decodes to anything
+/// else — a cursor of another listing, or a value the modelled `BotVersion` shape does not
+/// admit (`^(DRAFT|[0-9]+)$`, length 1..5) — is refused rather than resolved against this
+/// order.
+fn parse_cursor(token: &str) -> Option<String> {
+    let cursor = crate::state::decode_page_token(token)?;
+    let is_version = cursor == crate::state::DRAFT_BOT_VERSION
+        || ((1..=5).contains(&cursor.len()) && cursor.bytes().all(|byte| byte.is_ascii_digit()));
+    is_version.then_some(cursor)
+}
+
+/// Does this entry sort at or after `cursor` in the order being returned?
+fn at_or_after(entry: &BotVersionSummary, cursor: &str, descending: bool) -> bool {
+    let key = entry_order_key(entry);
+    let cursor = order_key(cursor);
+    if descending {
+        key <= cursor
+    } else {
+        key >= cursor
+    }
+}
+
+/// Refuse the request with the modelled `ValidationException` (HTTP 400).
+fn invalid(message: String) -> ListBotVersionsError {
+    ListBotVersionsErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }
