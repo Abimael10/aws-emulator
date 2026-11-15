@@ -7485,3 +7485,7 @@ mod events_lambda_target_permission_granted_after_the_rule;
 // goes last and a note goes up there (as an ordinary `//` comment) or, better, in the suite
 // file it is about. Add ONE `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, in
 // its sorted position, and nothing else.
+// The rules this file is bound by are stated in its header, above the first declaration:
+// one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, each declared once, and
+// nothing else. A note about one belongs in that suite's own module doc.
+// `all/appended_notes.rs` holds the notes successive landings had appended here.

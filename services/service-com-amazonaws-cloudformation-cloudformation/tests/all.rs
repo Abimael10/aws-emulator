@@ -717,6 +717,8 @@ mod monitored_registrations;
 mod stack_declared_resource_policy;
 #[path = "all/cognito_principal_tag_identity.rs"]
 mod cognito_principal_tag_identity;
+#[path = "all/cognito_user_pool_client_identity.rs"]
+mod cognito_user_pool_client_identity;
 #[path = "all/nested_stack_dynamodb_outputs.rs"]
 mod nested_stack_dynamodb_outputs;
 #[path = "all/reference_read_authorization.rs"]
