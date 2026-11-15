@@ -29,6 +29,8 @@ mod pending_invitation_resources;
 mod permission_deletion;
 #[path = "all/permission_listing.rs"]
 mod permission_listing;
+#[path = "all/private_ca_sharing.rs"]
+mod private_ca_sharing;
 #[path = "all/permission_refusal_wording.rs"]
 mod permission_refusal_wording;
 #[path = "all/resource_policies.rs"]

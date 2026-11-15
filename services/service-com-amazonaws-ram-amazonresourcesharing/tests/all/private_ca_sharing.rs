@@ -1,0 +1,456 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! Sharing a private certificate authority: the resource type this service shares, and the
+//! managed permissions Amazon Web Services publishes for it.
+//!
+//! The rule the rows below pin: a resource ARN is classified as shareable from the catalog
+//! of resource types AWS Resource Access Manager publishes (`RESOURCE_TYPES`, the catalog
+//! `ListResourceTypes` reports), which carries one entry per `(service, resource)` pair that
+//! documentation names — Amazon Web Services Private CA's certificate authority among them —
+//! and the managed-permission library publishes, for each such type, every permission Amazon
+//! Web Services maintains for it, exactly one of which is that type's default. A type the
+//! catalog does not carry is still refused by KIND, with the fixed text that refusal carries.
+//!
+//! Why these rows: a certificate authority is shared precisely so another principal — a
+//! service principal, for an Amazon Web Services service that brokers certificates — may have
+//! certificates issued from it, so a share of one that this service refuses is a CA no such
+//! service can use.
+//!
+//! The rows vary along what the rule generalises over:
+//!
+//! * the FORM of the certificate authority's ARN: the Region the request signs for and
+//!   another one, the owning account and another account, and an id segment that is not a
+//!   UUID — the classification is about the resource TYPE, not about the id;
+//! * WHICH published permission the share names: the type's default, each issuance permission
+//!   of the family, and none at all, where the share is governed by the type's default;
+//! * WHO the share names as its principal: an account id and an Amazon Web Services service
+//!   principal;
+//! * WHICH spelling a read filters the permission library by: the display spelling the
+//!   catalog publishes, the hyphenated spelling a resource ARN carries, and that spelling
+//!   shouted;
+//! * WHICH ARNs are still refused by kind: another service's certificate, and a resource code
+//!   of the private CA service that names no shareable type.
+
+use serde_json::{json, Value};
+use service_com_amazonaws_ram_amazonresourcesharing::state::{
+    aws_managed_permission_arn, resource_type_matches, AWS_MANAGED_PERMISSIONS,
+    ASSOCIATION_STATUS_ASSOCIATED, ASSOCIATION_STATUS_ASSOCIATING, FIRST_PERMISSION_VERSION,
+    NON_SHAREABLE_RESOURCE_TYPE_MESSAGE, PERMISSION_TYPE_AWS_MANAGED, RESOURCE_TYPES,
+};
+use smithy_server_runtime::MultiServiceRouter;
+
+// Every suite in this crate calls the service the one way: through `tests/all/harness.rs`.
+use super::harness::*;
+
+/// The resource type a private certificate authority's ARN names, as `RESOURCE_TYPES`
+/// publishes it.
+const CERTIFICATE_AUTHORITY_TYPE: &str = "acm-pca:CertificateAuthority";
+
+/// The permission that type's family publishes as its default — the one this service attaches
+/// to a share of a certificate authority that names no permission of its own.
+const DEFAULT_CA_PERMISSION: &str = "AWSRAMDefaultPermissionCertificateAuthority";
+
+/// The action a share of a certificate authority exists to grant: every published permission
+/// of the family allows it, and it is what a service brokering certificates from the shared CA
+/// performs.
+const ISSUE_CERTIFICATE_ACTION: &str = "acm-pca:IssueCertificate";
+
+/// An Amazon Web Services service principal, which is what a share with a service that brokers
+/// certificates from the CA names as its principal.
+const SERVICE_PRINCIPAL: &str = "pca-connector-scep.amazonaws.com";
+
+/// A Region other than the one the harness signs for.
+const OTHER_REGION: &str = "eu-west-1";
+
+/// An account other than the one that owns the shares.
+const OTHER_ACCOUNT: &str = "111122223333";
+
+async fn list_share_permissions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/listresourcesharepermissions", Some(body)).await
+}
+
+async fn list_permissions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/listpermissions", Some(body)).await
+}
+
+async fn get_permission(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/getpermission", Some(body)).await
+}
+
+async fn get_policies(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/getresourcepolicies", Some(body)).await
+}
+
+/// A string member of a reported object.
+fn field(case: &str, value: &Value, member: &str) -> String {
+    value
+        .get(member)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a {member} member, got {value:?}"))
+        .to_string()
+}
+
+/// The permissions a read of a share's permission set reported, by ARN, sorted.
+fn permission_arns(case: &str, body: &Value) -> Vec<String> {
+    let mut arns: Vec<String> = body
+        .get("permissions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: response carried no permissions, got {body:?}"))
+        .iter()
+        .map(|permission| field(case, permission, "arn"))
+        .collect();
+    arns.sort();
+    arns
+}
+
+/// The permissions a read of a share's permission set reported, as objects.
+fn permissions(case: &str, body: &Value) -> Vec<Value> {
+    body.get("permissions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: response carried no permissions, got {body:?}"))
+}
+
+/// Every permission the library publishes for the certificate-authority type, read off the
+/// catalog rather than spelled again here.
+fn certificate_authority_family() -> Vec<&'static str> {
+    AWS_MANAGED_PERMISSIONS
+        .iter()
+        .filter(|entry| resource_type_matches(entry.resource_type, CERTIFICATE_AUTHORITY_TYPE))
+        .map(|entry| entry.name)
+        .collect()
+}
+
+/// One row of the sharing table: the ARN of the certificate authority shared, who with, and
+/// which published permission the share names.
+struct Row {
+    case: &'static str,
+    certificate_authority: String,
+    principal: &'static str,
+    /// The published permission the create names, or `None` where it names none and the
+    /// share is governed by the type's default.
+    permission: Option<&'static str>,
+}
+
+fn rows() -> Vec<Row> {
+    let family = certificate_authority_family();
+    vec![
+        Row {
+            case: "a CA in the request's Region shared with a service principal",
+            certificate_authority: format!(
+                "arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/\
+                 1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+            ),
+            principal: SERVICE_PRINCIPAL,
+            permission: Some(
+                "AWSRAMBlankEndEntityCertificateAPICSRPassthroughIssuanceCertificateAuthority",
+            ),
+        },
+        Row {
+            case: "the same type shared naming no permission at all",
+            certificate_authority: format!(
+                "arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/\
+                 2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e"
+            ),
+            principal: SERVICE_PRINCIPAL,
+            permission: None,
+        },
+        Row {
+            case: "a CA in another Region",
+            certificate_authority: format!(
+                "arn:aws:acm-pca:{OTHER_REGION}:{ACCOUNT}:certificate-authority/\
+                 3c4d5e6f-7a8b-4c9d-8e1f-2a3b4c5d6e7f"
+            ),
+            principal: OTHER_ACCOUNT,
+            permission: Some(DEFAULT_CA_PERMISSION),
+        },
+        Row {
+            case: "a CA owned by another account",
+            certificate_authority: format!(
+                "arn:aws:acm-pca:{REGION}:{OTHER_ACCOUNT}:certificate-authority/\
+                 4d5e6f7a-8b9c-4d8e-9f2a-3b4c5d6e7f80"
+            ),
+            principal: SERVICE_PRINCIPAL,
+            permission: Some(
+                "AWSRAMBlankEndEntityCertificateAPIPassthroughIssuanceCertificateAuthority",
+            ),
+        },
+        Row {
+            case: "a CA whose id segment is not a UUID",
+            certificate_authority: format!(
+                "arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/device-enrolment"
+            ),
+            principal: SERVICE_PRINCIPAL,
+            // The last entry of the published family, whichever it is, so the table reaches
+            // one the rows above do not name.
+            permission: family.last().copied(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_private_certificate_authority_is_shared_and_reads_back() {
+    let router = emulator();
+    for (index, row) in rows().into_iter().enumerate() {
+        let case = row.case;
+        let name = format!("ca-share-{index}");
+        let mut request = json!({
+            "name": name,
+            "resourceArns": [row.certificate_authority.clone()],
+            "principals": [row.principal],
+        });
+        if let Some(permission) = row.permission {
+            request["permissionArns"] = json!([aws_managed_permission_arn(permission)]);
+        }
+
+        let (status, created) = create(&router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: sharing a certificate authority expected 200, got {status} with \
+             {created:?}"
+        );
+        let share = created
+            .get("resourceShare")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: create reported no share, got {created:?}"));
+        let share_arn = arn_of(case, &share);
+        assert_share_arn(case, &share_arn);
+
+        // Round trip: the share the create minted is the share a read reports.
+        let (status, read) = get_shares(
+            &router,
+            &json!({"resourceOwner": "SELF", "resourceShareArns": [share_arn.clone()]}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading the share back expected 200, got {status} with {read:?}"
+        );
+        assert_eq!(
+            only_share(case, &read),
+            share,
+            "case {case:?}: the read-back must be the record the create reported"
+        );
+
+        // The resource and the principal the create named are the entities it associated.
+        for (association_type, entity) in [
+            ("RESOURCE", row.certificate_authority.as_str()),
+            ("PRINCIPAL", row.principal),
+        ] {
+            let (status, found) = get_associations(
+                &router,
+                &json!({"associationType": association_type, "resourceShareArns": [share_arn]}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}/{association_type}: expected 200, got {status} with {found:?}"
+            );
+            let reported = associations_of(case, &found);
+            let entities: Vec<String> = reported
+                .iter()
+                .map(|association| field(case, association, "associatedEntity"))
+                .collect();
+            assert_eq!(
+                entities,
+                vec![entity.to_string()],
+                "case {case:?}/{association_type}: expected the entity the create named, got \
+                 {reported:?}"
+            );
+            let status_reported = field(case, &reported[0], "status");
+            assert!(
+                [
+                    ASSOCIATION_STATUS_ASSOCIATING,
+                    ASSOCIATION_STATUS_ASSOCIATED
+                ]
+                .contains(&status_reported.as_str()),
+                "case {case:?}/{association_type}: expected an association that is coming up or \
+                 up, got {status_reported:?}"
+            );
+        }
+
+        // The share is governed by the permission it named, or — where it named none — by the
+        // default the library publishes for the type.
+        let governing = row.permission.unwrap_or(DEFAULT_CA_PERMISSION);
+        let (status, listed) =
+            list_share_permissions(&router, &json!({"resourceShareArn": share_arn})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading the share's permissions expected 200, got {status} with \
+             {listed:?}"
+        );
+        assert_eq!(
+            permission_arns(case, &listed),
+            vec![aws_managed_permission_arn(governing)],
+            "case {case:?}: expected the share to be governed by {governing:?}, got {listed:?}"
+        );
+        let permission = permissions(case, &listed)
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: no permission reported in {listed:?}"));
+        assert_eq!(
+            field(case, &permission, "resourceType"),
+            CERTIFICATE_AUTHORITY_TYPE,
+            "case {case:?}: expected the certificate-authority resource type, got {permission:?}"
+        );
+        assert_eq!(
+            field(case, &permission, "permissionType"),
+            PERMISSION_TYPE_AWS_MANAGED,
+            "case {case:?}: a published permission is Amazon Web Services' own, got \
+             {permission:?}"
+        );
+        assert_eq!(
+            field(case, &permission, "version"),
+            FIRST_PERMISSION_VERSION.to_string(),
+            "case {case:?}: expected the version the library publishes, got {permission:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_resource_type_catalog_publishes_the_certificate_authority_type() {
+    let entry = RESOURCE_TYPES
+        .iter()
+        .find(|entry| entry.resource_type == CERTIFICATE_AUTHORITY_TYPE)
+        .unwrap_or_else(|| {
+            panic!(
+                "case {CERTIFICATE_AUTHORITY_TYPE:?}: the catalog must publish the type, got \
+                 {:?}",
+                RESOURCE_TYPES
+                    .iter()
+                    .map(|entry| entry.resource_type)
+                    .collect::<Vec<_>>()
+            )
+        });
+    // A type shared only through the permissions Amazon Web Services manages for it takes no
+    // customer managed permission.
+    assert!(
+        !entry.customer_managed_permissions,
+        "case {CERTIFICATE_AUTHORITY_TYPE:?}: expected a type shared through AWS managed \
+         permissions alone, got {entry:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_published_certificate_authority_permission_reads_back() {
+    let router = emulator();
+    let family = certificate_authority_family();
+    assert!(
+        family.len() > 1,
+        "case {CERTIFICATE_AUTHORITY_TYPE:?}: the library publishes a family of permissions for \
+         the type, got {family:?}"
+    );
+    let defaults: Vec<&str> = AWS_MANAGED_PERMISSIONS
+        .iter()
+        .filter(|entry| {
+            entry.is_resource_type_default
+                && resource_type_matches(entry.resource_type, CERTIFICATE_AUTHORITY_TYPE)
+        })
+        .map(|entry| entry.name)
+        .collect();
+    assert_eq!(
+        defaults,
+        vec![DEFAULT_CA_PERMISSION],
+        "case {CERTIFICATE_AUTHORITY_TYPE:?}: expected exactly that type's default, got \
+         {defaults:?}"
+    );
+
+    for name in family {
+        let arn = aws_managed_permission_arn(name);
+        let (status, read) = get_permission(&router, &json!({"permissionArn": arn})).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected HTTP 200, got {status} with {read:?}"
+        );
+        let permission = read
+            .get("permission")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {name:?}: no permission reported in {read:?}"));
+        assert_eq!(
+            field(name, &permission, "name"),
+            name,
+            "case {name:?}: expected the published name, got {permission:?}"
+        );
+        assert_eq!(
+            field(name, &permission, "resourceType"),
+            CERTIFICATE_AUTHORITY_TYPE,
+            "case {name:?}: expected the certificate-authority resource type, got {permission:?}"
+        );
+        assert_eq!(
+            field(name, &permission, "permissionType"),
+            PERMISSION_TYPE_AWS_MANAGED,
+            "case {name:?}: expected AWS_MANAGED, got {permission:?}"
+        );
+        // A share of a certificate authority exists to let the receiving principal have
+        // certificates issued from it, so every permission of the family allows that action.
+        let document = field(name, &permission, "permission");
+        assert!(
+            document.contains(ISSUE_CERTIFICATE_ACTION),
+            "case {name:?}: expected {ISSUE_CERTIFICATE_ACTION:?} among the actions, got \
+             {document:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_permission_library_filters_on_every_spelling_of_the_type() {
+    let router = emulator();
+    let mut expected: Vec<String> = certificate_authority_family()
+        .into_iter()
+        .map(aws_managed_permission_arn)
+        .collect();
+    expected.sort();
+
+    // The display spelling the catalog publishes, the spelling a certificate authority's own
+    // ARN carries, and that spelling shouted: `ListPermissions$resourceType` "is not case
+    // sensitive".
+    for spelling in [
+        "acm-pca:CertificateAuthority",
+        "acm-pca:certificate-authority",
+        "ACM-PCA:CERTIFICATE-AUTHORITY",
+    ] {
+        let case = format!("resourceType {spelling:?}");
+        let (status, listed) = list_permissions(&router, &json!({"resourceType": spelling})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {listed:?}"
+        );
+        assert_eq!(
+            permission_arns(&case, &listed),
+            expected,
+            "case {case:?}: expected the permissions published for that type, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_arn_of_a_type_the_catalog_does_not_publish_is_still_refused_by_kind() {
+    let router = emulator();
+    for (case, arn) in [
+        (
+            "another service's certificate",
+            format!("arn:aws:acm:{REGION}:{ACCOUNT}:certificate/0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d"),
+        ),
+        (
+            "a resource code of the private CA service that names no shareable type",
+            format!("arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate/0a1b2c3d4e5f6a7b"),
+        ),
+    ] {
+        let (status, body) = get_policies(&router, &json!({"resourceArns": [arn]})).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "MalformedArnException",
+            "case {case:?}: expected the ARN-kind refusal, got {body:?}"
+        );
+        assert_eq!(
+            error_message(&body),
+            NON_SHAREABLE_RESOURCE_TYPE_MESSAGE,
+            "case {case:?}: expected the fixed non-shareable text, got {:?}",
+            error_message(&body)
+        );
+    }
+}

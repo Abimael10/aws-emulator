@@ -410,10 +410,11 @@ pub struct ResourceTypeEntry {
 /// ListResourceTypes)"), and the model publishes no shape enumerating them. Source:
 /// the resource types AWS Resource Access Manager documents as shareable, one entry
 /// per `(service, resource)` pair it names, with the support for customer managed
-/// permissions that documentation records for each — the Amazon EC2 and Amazon VPC
-/// resources there are shared only through the permissions Amazon Web Services
-/// manages for them.
+/// permissions that documentation records for each — the Amazon EC2, Amazon VPC,
+/// Amazon API Gateway and Amazon Web Services Private CA resources there are shared
+/// only through the permissions Amazon Web Services manages for them.
 pub const RESOURCE_TYPES: &[ResourceTypeEntry] = &[
+    resource_type_entry("acm-pca:CertificateAuthority", false),
     resource_type_entry("apigateway:Domainnames", false),
     resource_type_entry("appmesh:Mesh", true),
     resource_type_entry("cloudtrail:EventDataStore", true),

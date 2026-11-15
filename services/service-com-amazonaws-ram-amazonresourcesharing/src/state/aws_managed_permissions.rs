@@ -61,9 +61,75 @@ pub struct AwsManagedPermission {
     pub is_resource_type_default: bool,
 }
 
+/// The resource type a private certificate authority's ARN names, spelled as
+/// [`super::RESOURCE_TYPES`] publishes it. Named once because the permissions Amazon Web
+/// Services publishes for it are a family rather than a single entry.
+const CERTIFICATE_AUTHORITY_RESOURCE_TYPE: &str = "acm-pca:CertificateAuthority";
+
+/// The actions every managed permission for a private certificate authority allows: the
+/// reads a receiving account makes about the shared CA, plus the issuance the share exists
+/// to grant.
+///
+/// The permissions of that family differ from one another in the certificate TEMPLATE a
+/// condition on the issuance admits — which is the `Condition` element of each published
+/// policy, not its `Action` element — so every entry of the family allows the same actions.
+/// A catalog record carries a permission's effect and its actions
+/// (`ResourceSharePermissionDetail$permission`, "The permission's effect and actions in JSON
+/// format"), so the template condition is not a field of one.
+const CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS: &[&str] = &[
+    "acm-pca:DescribeCertificateAuthority",
+    "acm-pca:GetCertificate",
+    "acm-pca:GetCertificateAuthorityCertificate",
+    "acm-pca:IssueCertificate",
+    "acm-pca:ListPermissions",
+    "acm-pca:ListTags",
+];
+
 /// The AWS managed permissions this service serves, one entry per published
 /// permission. See the module documentation for the source.
 pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
+    entry(
+        "AWSRAMDefaultPermissionCertificateAuthority",
+        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
+        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMBlankEndEntityCertificateAPIPassthroughIssuanceCertificateAuthority",
+        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
+        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMBlankEndEntityCertificateAPICSRPassthroughIssuanceCertificateAuthority",
+        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
+        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMSubordinateCACertificatePathLen0IssuanceCertificateAuthority",
+        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
+        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMSubordinateCACertificatePathLen1IssuanceCertificateAuthority",
+        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
+        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMSubordinateCACertificatePathLen2IssuanceCertificateAuthority",
+        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
+        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMSubordinateCACertificatePathLen3IssuanceCertificateAuthority",
+        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
+        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
+        false,
+    ),
     entry(
         "APIGatewayPrivateDomainNameManagementPolicyDefaultPermission",
         "apigateway:Domainnames",
