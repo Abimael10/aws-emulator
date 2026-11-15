@@ -99,20 +99,15 @@ impl Row {
     }
 
     /// RULE 5: the sentence the PACKAGE-scoped operations state for this coordinate when the
-    /// repository holds no such package. Written out here rather than imported, so a wrong
-    /// sentence in the implementation cannot make this suite pass.
+    /// repository holds no such package — the addressed format and package name, with no
+    /// namespace component whether or not the coordinate carries one. Written out here
+    /// rather than imported, so a wrong sentence in the implementation cannot make this
+    /// suite pass.
     fn package_family_message(&self) -> String {
-        match self.namespace {
-            Some(namespace) => format!(
-                "Package not found in repository. Package = {{format={}, namespace={namespace}, \
-                 name={}}}",
-                self.format, self.package
-            ),
-            None => format!(
-                "Package not found in repository. Package = {{format={}, name={}}}",
-                self.format, self.package
-            ),
-        }
+        format!(
+            "Package not found in repository. Package = {{format={}, name={}}}",
+            self.format, self.package
+        )
     }
 
     /// RULE 1: the sentence the VERSION-addressing operations state for the same absence,

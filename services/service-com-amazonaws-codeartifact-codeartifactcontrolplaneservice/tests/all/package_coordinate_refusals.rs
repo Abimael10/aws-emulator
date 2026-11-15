@@ -16,8 +16,8 @@
 //!    for in. `CopyPackageVersions` names its SOURCE repository, the one the versions were
 //!    looked for in.
 //! 2. The PACKAGE-scoped `DescribePackage` states the other sentence for the same absence —
-//!    the `(format, namespace, name)` triple with no repository — so the two families stay
-//!    distinguishable.
+//!    the addressed format and package NAME, with neither a repository nor a namespace
+//!    component — so the two families stay distinguishable.
 //! 3. Both sentences are built from the REQUEST: the rows differ along the format, along
 //!    whether the coordinate carries a namespace, and along the package and repository names.
 
@@ -83,19 +83,14 @@ impl Coordinate {
         }
     }
 
-    /// RULE 2: the sentence the PACKAGE-scoped operations state for this coordinate.
+    /// RULE 2: the sentence the PACKAGE-scoped operations state for this coordinate — the
+    /// format and the name the request carried, and no namespace component whether or not
+    /// the request carried one.
     fn package_family_message(&self) -> String {
-        match self.namespace {
-            Some(namespace) => format!(
-                "Package not found in repository. Package = {{format={}, namespace={namespace}, \
-                 name={}}}",
-                self.format, self.package
-            ),
-            None => format!(
-                "Package not found in repository. Package = {{format={}, name={}}}",
-                self.format, self.package
-            ),
-        }
+        format!(
+            "Package not found in repository. Package = {{format={}, name={}}}",
+            self.format, self.package
+        )
     }
 }
 
@@ -305,7 +300,7 @@ async fn every_version_addressing_operation_names_the_repository_it_looked_in() 
 /// RULE 2 and RULE 3: the package-scoped `DescribePackage` states the other sentence for the
 /// same absence, so one wording is never served for the other.
 #[tokio::test]
-async fn the_package_scoped_describe_states_the_package_triple_sentence() {
+async fn the_package_scoped_describe_states_the_format_and_name_sentence() {
     let router = emulator();
     given_repositories(&router).await;
 
@@ -326,7 +321,7 @@ async fn the_package_scoped_describe_states_the_package_triple_sentence() {
         assert_eq!(
             answer.message(),
             coordinate.package_family_message(),
-            "case {case:?}: expected the package-triple sentence, got {:?}",
+            "case {case:?}: expected the package-scoped sentence, got {:?}",
             answer.message()
         );
         // The two families are different sentences for the same absence, which is the point

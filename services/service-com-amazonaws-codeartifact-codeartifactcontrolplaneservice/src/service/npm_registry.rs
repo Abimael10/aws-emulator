@@ -655,11 +655,7 @@ fn tarball(
 /// ([`crate::state::package_not_found_message`]), so a client reading both reads one
 /// wording.
 fn package_not_found(package: &NpmPackage) -> String {
-    crate::state::package_not_found_message(
-        PACKAGE_FORMAT_NPM,
-        package.namespace.as_deref(),
-        &package.name,
-    )
+    crate::state::package_not_found_message(PACKAGE_FORMAT_NPM, &package.name)
 }
 
 /// Every distribution tag `package` carries that a client can resolve: the tag map npm's

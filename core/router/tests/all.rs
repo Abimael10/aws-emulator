@@ -2159,3 +2159,17 @@ mod zz_probe_whole_emulator;
 // `all/appended_notes_tail.rs`, `all/appended_header_notes.rs` and `all/appended_prose.rs`.
 // `all/declaration_roots_are_canonical_and_complete.rs` check those rules, for this file and
 // for every service crate's `tests/all.rs`, so a note about any of them belongs there.
+// sorts to.
+// EVERY comment here is an ordinary `//` one, this header included: an inner doc comment
+// (`//` followed by `!`) is legal only before the first item, so one appended past the
+// declarations is `E0753` and compiles no suite of this target. With none anywhere in the
+// name is `E0428` — and declare every suite file, since one no `mod` names is compiled
+// nowhere.
+// explains; a note about THIS file belongs in `all/appended_notes.rs`, declared below like
+// any other suite. `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs`
+// and `all/declaration_roots_are_canonical_and_complete.rs` check all of it, for this file
+// and for every service crate's `tests/all.rs`.
+// A note a suite's own header wraps without the indentation `clippy::doc_lazy_continuation`
+// asks of a doc list item, so the lint is allowed for the whole target here — an inner
+// attribute, like an inner doc comment, is legal only before the first item.

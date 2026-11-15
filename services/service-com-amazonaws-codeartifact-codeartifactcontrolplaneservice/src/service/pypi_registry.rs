@@ -518,7 +518,7 @@ fn distribution(
 /// ([`crate::state::package_not_found_message`]), so a client reading both reads one
 /// wording.
 fn project_not_found(project: &str) -> String {
-    crate::state::package_not_found_message(PACKAGE_FORMAT_PYPI, None, project)
+    crate::state::package_not_found_message(PACKAGE_FORMAT_PYPI, project)
 }
 
 /// The package record the addressed repository holds for `project`, or `None`.

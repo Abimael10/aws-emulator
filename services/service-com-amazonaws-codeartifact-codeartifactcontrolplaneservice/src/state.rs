@@ -2757,22 +2757,15 @@ pub fn package_version_resource_id(
 /// as opposed to the version-addressing ones, which state
 /// [`package_coordinate_not_found_message`].
 ///
-/// A package is addressed by its whole `(format, namespace, name)` triple, so the refusal
-/// states that whole triple: a caller that addressed the right name under the wrong format
-/// — or without the namespace the package carries — addressed a DIFFERENT package, and a
-/// sentence naming only the name could not tell it which of the three was wrong. The
-/// namespace clause appears exactly where the request carried one, since a format whose
-/// packages carry no namespace component has none to name.
-pub fn package_not_found_message(format: &str, namespace: Option<&str>, package: &str) -> String {
-    match namespace {
-        Some(namespace) => format!(
-            "Package not found in repository. Package = {{format={format}, \
-             namespace={namespace}, name={package}}}"
-        ),
-        None => {
-            format!("Package not found in repository. Package = {{format={format}, name={package}}}")
-        }
-    }
+/// The brace list this sentence renders is the `format` the request addressed and the
+/// package NAME it addressed, in that order and nothing else: the namespace a request may
+/// carry is part of the package's identity ([`package_key`]) but is not a component of
+/// this rendering, so the sentence reads the same for a namespaced coordinate as for a
+/// namespace-less one. That is what distinguishes it from the richer coordinate the
+/// VERSION- and asset-addressing refusals render ([`package_version_coordinate`]), which
+/// does carry a namespace component.
+pub fn package_not_found_message(format: &str, package: &str) -> String {
+    format!("Package not found in repository. Package = {{format={format}, name={package}}}")
 }
 
 /// The `ResourceNotFoundException` message for a version the addressed package does not

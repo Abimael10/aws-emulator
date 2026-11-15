@@ -269,11 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeletePackage<Eng
             crate::state::package_key(&input.format, input.namespace.as_deref(), &input.package);
         let Some(removed) = repository.packages.remove(&key) else {
             return Err(not_found(
-                crate::state::package_not_found_message(
-                    &input.format,
-                    input.namespace.as_deref(),
-                    &input.package,
-                ),
+                crate::state::package_not_found_message(&input.format, &input.package),
                 &input.package,
                 "package",
             ));

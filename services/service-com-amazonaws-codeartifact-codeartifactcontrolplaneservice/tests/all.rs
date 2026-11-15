@@ -129,3 +129,5 @@ mod root_package_group_description;
 mod external_connection_not_found_sentence;
 #[path = "all/announced_repository_endpoint.rs"]
 mod announced_repository_endpoint;
+#[path = "all/package_not_found_sentence.rs"]
+mod package_not_found_sentence;
