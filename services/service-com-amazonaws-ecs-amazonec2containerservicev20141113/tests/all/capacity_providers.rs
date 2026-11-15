@@ -6,7 +6,8 @@
 //! The rules under test:
 //!
 //! * a capacity provider is a PERSISTED, account-scoped record — `CreateCapacityProvider`
-//!   mints its ARN and stores the binding it was given (an Auto Scaling group, or capacity
+//!   mints its ARN and stores the binding it was given (an Auto Scaling group of the
+//!   caller's, whose own ARN that service minted is what the binding reports, or capacity
 //!   Amazon ECS manages), and `DescribeCapacityProviders` reports that stored record back:
 //!   its name, status, ARN, binding, type and tags;
 //! * a provider over an Auto Scaling group the caller ALREADY has is created `ACTIVE`,
@@ -30,8 +31,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    create_auto_scaling_group, create_cluster, list, ok, refusal, refused, service, string,
-    ACCOUNT, SIGNED_REGION,
+    auto_scaling_group_arn, create_auto_scaling_group, create_cluster, list, ok, refusal, refused,
+    service, string, ACCOUNT, SIGNED_REGION,
 };
 
 /// One row of the create table: how the provider is created, and what the stored record
@@ -45,10 +46,11 @@ struct CreateCase {
     expect_cluster: Option<&'static str>,
     /// The `type` the stored provider must report, if any.
     expect_type: Option<&'static str>,
-    /// The `autoScalingGroupProvider.autoScalingGroupArn` the stored provider must
-    /// report, if any — the value AS GIVEN, since the service stores the reference the
-    /// request carried rather than rewriting it.
-    expect_group: fn() -> Option<String>,
+    /// The NAME of the Auto Scaling group the stored provider must report its binding onto,
+    /// which it reports as the ARN Amazon EC2 Auto Scaling minted for that group — whichever
+    /// of the two forms the request named it by. `None` for a provider over capacity Amazon
+    /// ECS manages, which binds onto no group of the caller's.
+    expect_group: Option<&'static str>,
     /// The tags the stored provider must report.
     expect_tags: Value,
     /// The `status` the create answers under: a provider over a group the caller already
@@ -160,7 +162,7 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
             },
             expect_cluster: None,
             expect_type: Some("EC2_AUTOSCALING"),
-            expect_group: || Some(group_arn("asg-byarn")),
+            expect_group: Some("asg-byarn"),
             expect_tags: json!([{ "key": "team", "value": "platform" }]),
             expect_status: "ACTIVE",
             expect_update_status: None,
@@ -175,7 +177,7 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
             },
             expect_cluster: None,
             expect_type: Some("EC2_AUTOSCALING"),
-            expect_group: || Some("asg-byname".to_string()),
+            expect_group: Some("asg-byname"),
             expect_tags: json!([]),
             expect_status: "ACTIVE",
             expect_update_status: None,
@@ -195,7 +197,7 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
             },
             expect_cluster: Some("capacity"),
             expect_type: Some("MANAGED_INSTANCES"),
-            expect_group: || None,
+            expect_group: None,
             expect_tags: json!([
                 { "key": "env", "value": "test" },
                 { "key": "owner", "value": "ecs" },
@@ -214,7 +216,7 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
             },
             expect_cluster: Some("capacity"),
             expect_type: Some("MANAGED_INSTANCES"),
-            expect_group: || None,
+            expect_group: None,
             expect_tags: json!([]),
             expect_status: "PROVISIONING",
             expect_update_status: Some("CREATE_IN_PROGRESS"),
@@ -227,7 +229,10 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
         request["name"] = json!(test.provider_name);
         let created = ok(&router, "CreateCapacityProvider", request, case).await;
         let created = created["capacityProvider"].clone();
-        let expect_group = (test.expect_group)();
+        let expect_group = match test.expect_group {
+            Some(group) => Some(auto_scaling_group_arn(&router, group, case).await),
+            None => None,
+        };
 
         // Create and read must agree member for member: the answer is the stored record,
         // not the request.

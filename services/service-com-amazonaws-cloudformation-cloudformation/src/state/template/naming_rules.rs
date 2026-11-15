@@ -191,6 +191,14 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // lowercase), numbers, underscores, and hyphens are allowed" (Amazon ECS API
         // reference) — ECS's model carries no `@length` for it.
         ECS_CLUSTER => rules(255, Characters::AsGenerated),
+        // The same service's `CreateCapacityProvider.name`: "Up to 255 characters are
+        // allowed. They include letters (both upper and lowercase letters), numbers,
+        // underscores (_), and hyphens (-)" (`CreateCapacityProviderRequest$name`) — ECS's
+        // model carries no `@length` for it either, and a generated name is already inside
+        // that character set but may be longer than the bound.
+        crate::state::provisioner::ecs_capacity_providers::ECS_CAPACITY_PROVIDER => {
+            rules(255, Characters::AsGenerated)
+        }
         // Amazon EKS `CreateCluster.name`: "The unique name to give to your cluster", whose
         // own `@length` is 1..100 and whose pattern is `^[0-9A-Za-z][A-Za-z0-9\-_]*$`
         // (`ClusterName` in that service's model) — a generated name is inside that

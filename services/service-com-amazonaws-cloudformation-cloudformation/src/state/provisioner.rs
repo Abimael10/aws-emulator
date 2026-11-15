@@ -717,6 +717,14 @@ pub(super) enum Provisioner {
     /// "Ref returns the Amazon Resource Name (ARN)" of the service, which that create
     /// answers and every call about the service takes ([`ecs_services`]).
     EcsService,
+    /// `AWS::ECS::CapacityProvider`: the capacity provider Amazon ECS's own
+    /// `CreateCapacityProvider` creates under the name the template decided and
+    /// `DeleteCapacityProvider` removes by that same name. "Ref returns the capacity
+    /// provider name", which is the only handle that service takes for one — a
+    /// `DescribeCapacityProviders` read, a `PutClusterCapacityProviders` association and a
+    /// `capacityProviderStrategy` entry each name a provider by it
+    /// ([`ecs_capacity_providers`]).
+    EcsCapacityProvider,
     SqsQueue,
     /// `AWS::SQS::QueuePolicy` and `AWS::SQS::QueueInlinePolicy`, which are not resources
     /// of Amazon SQS's own: each is the `Policy` ATTRIBUTE of the queues it names, so both
@@ -1106,6 +1114,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CODEBUILD_PROJECT => Some(Provisioner::CodeBuildProject),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
         ECS_SERVICE => Some(Provisioner::EcsService),
+        ecs_capacity_providers::ECS_CAPACITY_PROVIDER => Some(Provisioner::EcsCapacityProvider),
         SQS_QUEUE => Some(Provisioner::SqsQueue),
         SQS_QUEUE_POLICY | SQS_QUEUE_INLINE_POLICY => Some(Provisioner::SqsQueuePolicy),
         SAGEMAKER_MODEL_PACKAGE_GROUP => Some(Provisioner::SageMakerModelPackageGroup),
@@ -1349,6 +1358,12 @@ impl Provisioner {
             // is the owning service's whole handler, which schedules the service's tasks.
             Self::EcsService => {
                 Box::pin(create_ecs_service(ctx, region, resource, propagated)).await
+            }
+            // `AWS::ECS::CapacityProvider` publishes `Tags`, which `CreateCapacityProvider`
+            // takes as its own `tags` list, so a provider a stack creates carries the tags
+            // CloudFormation gives it beside the ones the declaration asks for.
+            Self::EcsCapacityProvider => {
+                create_ecs_capacity_provider(ctx, region, resource, propagated).await
             }
             Self::SqsQueue => create_queue(ctx, region, resource, propagated).await,
             // Neither policy type publishes a `Tags` property — a policy is an attribute of
@@ -1935,6 +1950,10 @@ impl Provisioner {
                 // key must not start with aws:") — so a service carries the stack's own tags
                 // without the three.
                 | Self::EcsService
+                // Amazon ECS refuses one on `CreateCapacityProvider`'s `tags` list too, in
+                // that same check, so a capacity provider carries the stack's own tags
+                // without the three.
+                | Self::EcsCapacityProvider
                 | Self::EcrPublicRepository
                 // Amazon ECR refuses a tag key in the reserved namespace on every call
                 // that takes tags — `CreateRepository`'s `tags` and `TagResource` alike —
@@ -2230,6 +2249,15 @@ impl Provisioner {
             Self::SsmDocument => {
                 ssm_document_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreateCapacityProvider` answers a provider whose capacity Amazon ECS has to
+            // stand up `PROVISIONING` — "Only capacity providers in an ACTIVE state can be
+            // used in a cluster" — so the resource is held open until that service reports it
+            // there ([`ecs_capacity_providers::ecs_capacity_provider_readiness`]). A provider
+            // over an Auto Scaling group the caller already has is answered `ACTIVE`, so that
+            // read ends the wait at once.
+            Self::EcsCapacityProvider => {
+                ecs_capacity_provider_readiness(ctx, region, physical_resource_id).await
+            }
             _ => Ok(Readiness::Ready),
         }
     }
@@ -2402,6 +2430,13 @@ impl Provisioner {
             // call that deletes it.)
             Self::ElasticBeanstalkApplication => {
                 eb_application_removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteCapacityProvider` answers a provider whose capacity Amazon ECS has to
+            // take down again `DEPROVISIONING`, so the stack's deletion is held open until
+            // that service reports it deleted
+            // ([`ecs_capacity_providers::ecs_capacity_provider_removal`]).
+            Self::EcsCapacityProvider => {
+                ecs_capacity_provider_removal(ctx, region, physical_resource_id).await
             }
             _ => Ok(Removal::Gone),
         }
@@ -3050,6 +3085,11 @@ impl Provisioner {
                 delete_custom_action_type(ctx, region, resource).await
             }
             Self::EcsCluster => delete_cluster(ctx, region, physical_resource_id).await,
+            // The provider is deleted by the name it was created under, which is this
+            // resource's physical id.
+            Self::EcsCapacityProvider => {
+                delete_ecs_capacity_provider(ctx, region, resource).await
+            }
             Self::SqsQueue => delete_queue(ctx, region, physical_resource_id).await,
             Self::SqsQueuePolicy => delete_queue_policy(ctx, region, resource).await,
             Self::SageMakerModelPackageGroup => {
@@ -3592,6 +3632,11 @@ impl Provisioner {
                 describe_custom_action_type(ctx, region, resource).await
             }
             Self::EcsCluster => describe_cluster(ctx, region, physical_resource_id).await,
+            // Amazon ECS's own read of the capacity provider the stack created, by the name
+            // it was created under.
+            Self::EcsCapacityProvider => {
+                describe_ecs_capacity_provider(ctx, region, physical_resource_id).await
+            }
             Self::SqsQueue => describe_queue(ctx, region, physical_resource_id).await,
             // A policy resource's configuration is the `Policy` attribute of the queues it
             // names, which is read back from Amazon SQS as the document those queues carry
@@ -4059,6 +4104,10 @@ pub(in crate::state) mod cloudwatch_alarms;
 /// The Amazon ECS SERVICE arms, beside the cluster arms [`application_services`] holds for
 /// the same owning service.
 mod ecs_services;
+/// The Amazon ECS CAPACITY PROVIDER arms, beside the cluster and service arms the same owning
+/// service has: visible to the rest of this service's state because the type's own NAME lives
+/// here, beside the arms that provision it.
+pub(in crate::state) mod ecs_capacity_providers;
 mod event_pipes;
 /// The Amazon EventBridge EVENT BUS arms: the bus an `AWS::Events::EventBus` declares, which
 /// the rules, policies and rule targets of the same stack resolve by name, and the grant an
@@ -4133,6 +4182,7 @@ use route53_policies::*;
 pub(crate) use application_services::*;
 use cloudwatch_alarms::*;
 use ecs_services::*;
+use ecs_capacity_providers::*;
 use config_recording::*;
 use bedrock_guardrails::*;
 use bedrock_knowledge_bases::*;

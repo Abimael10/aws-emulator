@@ -301,10 +301,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .map(|reference| crate::state::cluster_name_from_reference(Some(reference)));
         let region = crate::state::request_region(ctx);
-        let requested_group = input
-            .auto_scaling_group_provider
-            .as_ref()
-            .map(|provider| provider.auto_scaling_group_arn.clone());
 
         // A caller-supplied tag may not write into the namespace Amazon Web Services keeps
         // for its own tags, whichever operation carries the `tags` list.
@@ -324,21 +320,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The Amazon Resource Name (ARN) that identifies the Auto Scaling group, or the
         // Auto Scaling group name": the group is a resource of the CALLER's that Amazon EC2
         // Auto Scaling holds, so a reference naming a group the account does not hold binds
-        // the provider onto no capacity at all. Resolved against that service's own records
+        // the provider onto no capacity at all — and the binding the provider REPORTS is
+        // that group's ARN whichever of the two forms the request named it by, which is
+        // what the resolution hands back. Resolved against that service's own records
         // BEFORE this service's store is locked, which is the lock order
-        // [`crate::state::unresolved_auto_scaling_group_refusal`] documents.
-        if let Some(message) = crate::state::unresolved_auto_scaling_group_refusal(
+        // [`crate::state::auto_scaling_group_binding`] documents.
+        let auto_scaling_group_provider = match crate::state::auto_scaling_group_binding(
             &*self.engine,
             &region,
             input.auto_scaling_group_provider.as_ref(),
         ) {
-            return Err(
-                CreateCapacityProviderErrorModeled::ClientException(ClientException {
-                    message: Some(message.to_string()),
-                })
-                .into(),
-            );
-        }
+            Ok(bound) => bound,
+            Err(message) => {
+                return Err(
+                    CreateCapacityProviderErrorModeled::ClientException(ClientException {
+                        message: Some(message.to_string()),
+                    })
+                    .into(),
+                )
+            }
+        };
+        // The group this request binds the provider onto, as the stored provider will
+        // report it.
+        let requested_group = auto_scaling_group_provider
+            .as_ref()
+            .map(|provider| provider.auto_scaling_group_arn.clone());
 
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
@@ -385,7 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // own binding — the comparison the idempotency rule below is decided on.
         let requested_binding = crate::state::capacity_provider_binding_fingerprint(
             cluster_name.as_deref(),
-            input.auto_scaling_group_provider.as_ref(),
+            auto_scaling_group_provider.as_ref(),
             managed_instances_provider.as_ref(),
         );
 
@@ -477,7 +483,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has deleted a provider this call is creating.
             delete_due_at: None,
             cluster: cluster_name,
-            auto_scaling_group_provider: input.auto_scaling_group_provider.clone(),
+            auto_scaling_group_provider,
             // `CapacityProvider$type` names the class of capacity the provider binds onto:
             // the managed instances Amazon ECS runs for the cluster, or the caller's own
             // Auto Scaling group. A provider is built on exactly one of the two, so the

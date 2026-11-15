@@ -65,7 +65,16 @@ pub(crate) async fn cloudwatch(
 }
 
 /// Call one Amazon ECS operation through the same router, signed for `ecs`.
-async fn ecs(router: &MultiServiceRouter, operation: &str, request: &Value) -> (u16, Value) {
+///
+/// `pub(crate)` for the reason [`cloudwatch`] above is: the suite over the capacity provider
+/// an `AWS::ECS::CapacityProvider` declares
+/// (`cloudformation_creates_an_ecs_capacity_provider.rs`) reads Amazon ECS back through this
+/// one calling convention rather than spelling the signing of an `ecs` request again.
+pub(crate) async fn ecs(
+    router: &MultiServiceRouter,
+    operation: &str,
+    request: &Value,
+) -> (u16, Value) {
     json_call(
         router,
         "ecs",

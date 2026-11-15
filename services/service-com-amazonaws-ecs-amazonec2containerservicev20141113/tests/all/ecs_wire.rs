@@ -132,6 +132,61 @@ pub(crate) async fn create_auto_scaling_group_in(
     );
 }
 
+/// The ARN Amazon EC2 Auto Scaling reports for the group it holds under `name`, read through
+/// that service's OWN API.
+///
+/// `AutoScalingGroupProvider$autoScalingGroupArn` is reported as the ARN that service minted
+/// for the group, whichever of the two forms a create named it by, so a suite asserting a
+/// provider's binding reads the group's identity off the service that owns the group rather
+/// than composing one of its own.
+pub(crate) async fn auto_scaling_group_arn(
+    router: &MultiServiceRouter,
+    name: &str,
+    case: &str,
+) -> String {
+    let body = [
+        ("Action", "DescribeAutoScalingGroups"),
+        ("Version", AUTO_SCALING_API_VERSION),
+        ("AutoScalingGroupNames.member.1", name),
+    ]
+    .iter()
+    .map(|(key, value)| {
+        let value =
+            percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC);
+        format!("{key}={value}")
+    })
+    .collect::<Vec<String>>()
+    .join("&");
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://autoscaling.{SIGNED_REGION}.amazonaws.com/"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDECSTEST/20260101/{SIGNED_REGION}\
+                 /autoscaling/aws4_request, SignedHeaders=host, Signature=00"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed awsQuery request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected Auto Scaling to report the group {name}, got {status} with \
+         {payload}"
+    );
+    let (_, after) = payload
+        .split_once("<AutoScalingGroupARN>")
+        .unwrap_or_else(|| panic!("case {case:?}: no AutoScalingGroupARN for {name} in {payload}"));
+    let (arn, _) = after
+        .split_once("</AutoScalingGroupARN>")
+        .unwrap_or_else(|| panic!("case {case:?}: unterminated AutoScalingGroupARN in {payload}"));
+    arn.to_string()
+}
+
 /// The subnet id every `awsvpc` placement below names
 /// ([`awsvpc_network_configuration`]), one of the ids the harness puts in the account's
 /// Amazon VPC records ([`seed_awsvpc_subnets`]).

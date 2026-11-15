@@ -91,6 +91,8 @@ mod change_set_status_refusals;
 mod change_set_template_sources;
 #[path = "all/client_request_tokens.rs"]
 mod client_request_tokens;
+#[path = "all/cloudformation_creates_an_ecs_capacity_provider.rs"]
+mod cloudformation_creates_an_ecs_capacity_provider;
 #[path = "all/cloudformation_ec2_instance_rollback.rs"]
 mod cloudformation_ec2_instance_rollback;
 #[path = "all/cloudwatch_alarm_and_ecs_service_resources.rs"]

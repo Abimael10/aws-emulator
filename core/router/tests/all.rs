@@ -1523,3 +1523,16 @@ mod lambda_in_function_assumed_role_session;
 //! test it describes.
 //! (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each `mod` is
 //! what points the declaration into `tests/all/`.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, keeping the list sorted. The list holds
+//! one pair per suite and NO other line — so two branches landing at once insert two lines in
+//! A suite that is not declared here compiles nowhere and its tests never run (the build-time
+//! layout check fails the build for one); a suite left at the top level of `tests/` is a test
+//! target of its own, which that check refuses too; and a suite declared twice is `E0428`,
+//! which compiles no suite of this target. THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT
+//! (`//!`) MAY STAND IN THIS FILE: past the first item one is `E0753`, which also compiles no
+//! suite of this target.
+//! than one service over the assembled router — belongs in that suite's OWN module doc, where
+//! it is read beside the test it explains, and not here.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check those three rules, for this file and
+#[path = "all/cloudformation_creates_an_ecs_capacity_provider.rs"]
+mod cloudformation_creates_an_ecs_capacity_provider;
