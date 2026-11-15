@@ -579,11 +579,13 @@ async fn get_pipeline_state_reports_the_stored_pipeline_without_changing_it() {
             "stage {stage} reports its stored action names, got {state}"
         );
         // Beside the name, the action's state carries the deep link its action TYPE
-        // publishes, resolved for this action's configuration — the S3 source action's
-        // bucket for the first stage, the CodeBuild project for each later one — and
-        // nothing else, because nothing has run this action.
+        // publishes, resolved for this action's configuration — and nothing else,
+        // because nothing has run this action. The S3 source type's link is the Region's
+        // own S3 console, which names no configuration property of the action; every
+        // later stage's CodeBuild action links the project it is configured with.
         let configured = if index == 0 {
-            "my-bucket".to_string()
+            // The Region the calls in this suite are signed for.
+            "us-east-1".to_string()
         } else {
             format!("project-{index}")
         };

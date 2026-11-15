@@ -187,13 +187,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both filters narrow the one catalog: `actionOwnerFilter` to the action
         // types one creator owns (the member is modelled `ActionOwner`, so the
         // boundary validator has already refused anything that is not one of its
-        // values), `regionFilter` to the ones a caller in that Region can use.
+        // values), `regionFilter` to the ones a caller in that Region can use. The
+        // Region is also the console an action type the service provides publishes its
+        // deep links into, so the catalog is read FOR that Region.
         let owner_filter = input.action_owner_filter;
         let region_filter = input
             .region_filter
             .unwrap_or_else(|| crate::state::request_region(&ctx.parts().headers));
 
-        let catalog = state.lock().action_type_catalog();
+        let catalog = state.lock().action_type_catalog(&region_filter);
         let mut action_types = Vec::new();
         let mut next_token = None;
         for (key, record) in catalog

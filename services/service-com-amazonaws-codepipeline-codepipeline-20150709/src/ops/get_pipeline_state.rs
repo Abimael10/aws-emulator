@@ -203,6 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .get(&input.name)
                     .map(Vec::as_slice)
                     .unwrap_or_default(),
+                // The deep links a reported action carries point into the console of the
+                // Region the state is read in.
+                &crate::state::request_region(&ctx.parts().headers),
             )),
             created: Some(crate::state::to_date_time(pipeline.created)),
             updated: Some(crate::state::to_date_time(pipeline.updated)),

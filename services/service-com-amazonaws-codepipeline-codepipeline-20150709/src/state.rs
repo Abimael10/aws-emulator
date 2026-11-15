@@ -90,6 +90,7 @@ pub use job_records::*;
 pub use action_types::{validate_action_type_declaration, ActionTypeKey, ActionTypeRecord};
 pub use built_in_catalog::{
     BuiltInActionType, BuiltInConfigurationProperty, BUILT_IN_ACTION_TYPES,
+    CATALOG_REGION_PLACEHOLDER,
 };
 pub use action_type_resolution::{
     action_type_identity, action_type_is_published, artifact_count_message,
@@ -1674,10 +1675,15 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     ///
     /// One order over both is what lets a listing page through them with an opaque
     /// cursor that names a position rather than an offset.
-    pub fn action_type_catalog(&self) -> BTreeMap<ActionTypeKey, ActionTypeRecord> {
+    ///
+    /// `region` is the Region the catalog is being read for: an action type the service
+    /// provides publishes the deep links of THAT Region's console
+    /// ([`CATALOG_REGION_PLACEHOLDER`]), so two callers reading the catalog from two
+    /// Regions are each pointed at their own.
+    pub fn action_type_catalog(&self, region: &str) -> BTreeMap<ActionTypeKey, ActionTypeRecord> {
         let mut catalog: BTreeMap<ActionTypeKey, ActionTypeRecord> = BUILT_IN_ACTION_TYPES
             .iter()
-            .map(|entry| (entry.key(), entry.record()))
+            .map(|entry| (entry.key(), entry.record(region)))
             .collect();
         for (key, record) in &self.action_types {
             catalog.insert(key.clone(), record.clone());

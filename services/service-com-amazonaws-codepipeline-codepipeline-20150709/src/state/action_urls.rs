@@ -32,8 +32,9 @@ const CONFIG_REFERENCE_PREFIX: &str = "{Config:";
 /// `@length(min: 1, max: 2048)` (`smithy_query query="shape" shape="ActionState"`).
 const MAX_URL: usize = 2_048;
 
-/// The settings the action type `id` names publishes, or `None` when this account can
-/// reach no action type with that identity, or that action type publishes none.
+/// The settings the action type `id` names publishes to a caller in `region`, or `None`
+/// when this account can reach no action type with that identity, or that action type
+/// publishes none.
 ///
 /// A registration of the identity wins over the catalog the service provides itself,
 /// exactly as the listing's own view of both does
@@ -42,10 +43,11 @@ const MAX_URL: usize = 2_048;
 pub fn action_type_settings(
     store: &ComAmazonawsCodepipelineCodepipeline20150709State,
     id: &ActionTypeId,
+    region: &str,
 ) -> Option<ActionTypeSettings> {
     match store.registered_action_type(&ActionTypeKey::from_id(id)) {
         Some(record) => record.settings.clone(),
-        None => built_in_action_type(id)?.record().settings,
+        None => built_in_action_type(id)?.record(region).settings,
     }
 }
 
@@ -61,8 +63,10 @@ pub fn action_entity_url(
     store: &ComAmazonawsCodepipelineCodepipeline20150709State,
     action: &ActionDeclaration,
     execution: Option<&PipelineExecutionRecord>,
+    region: &str,
 ) -> Option<String> {
-    let template = action_type_settings(store, &action.action_type_id)?.entity_url_template?;
+    let template =
+        action_type_settings(store, &action.action_type_id, region)?.entity_url_template?;
     let variables = execution
         .map(PipelineExecutionRecord::resolution_variables)
         .unwrap_or_default();

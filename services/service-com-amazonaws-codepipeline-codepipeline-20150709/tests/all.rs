@@ -91,6 +91,8 @@ mod pipeline_state;
 mod pipeline_version_changes;
 #[path = "all/probe.rs"]
 mod probe;
+#[path = "all/published_action_type_detail.rs"]
+mod published_action_type_detail;
 #[path = "all/refusal_statements.rs"]
 mod refusal_statements;
 #[path = "all/resource_tags.rs"]

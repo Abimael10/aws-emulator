@@ -45,6 +45,11 @@ const ARTIFACT_COUNT_BOUNDS: (i64, i64) = (0, 5);
 /// (`smithy_query query="shape" shape="ActionConfigurationProperty"`).
 const PROPERTY_NAME_LENGTH: (usize, usize) = (1, 50);
 
+/// `Description`'s modelled `@length(min: 1, max: 160)`, the shape
+/// `ActionConfigurationProperty$description` targets
+/// (`smithy_query query="shape" shape="ActionConfigurationProperty"`).
+const PROPERTY_DESCRIPTION_LENGTH: (usize, usize) = (1, 160);
+
 /// One emulator: the shared engine, the service mounted on it, and the router that
 /// dispatches to it — exactly how `core/router` assembles the production emulator.
 struct Emulator {
@@ -368,8 +373,11 @@ struct DocumentedEntry {
     /// `(minimumCount, maximumCount)` of its input and output artifacts.
     input: (i64, i64),
     output: (i64, i64),
-    /// Its configuration parameters, in order, as `(name, required, key, secret)`.
-    properties: &'static [(&'static str, bool, bool, bool)],
+    /// Its configuration parameters, in order, as `(name, required, secret)`. Every
+    /// property of an action type the SERVICE publishes is reported as a key, so the
+    /// flag is an invariant of the catalog rather than a column here
+    /// (`every_catalog_entry_stays_inside_the_modelled_bounds` is where it is asserted).
+    properties: &'static [(&'static str, bool, bool)],
     /// The `settings` members it reports, by name.
     settings: &'static [&'static str],
 }
@@ -392,10 +400,10 @@ const DOCUMENTED_ENTRIES: &[DocumentedEntry] = &[
         input: (0, 0),
         output: (1, 1),
         properties: &[
-            ("RepositoryName", true, true, false),
-            ("BranchName", true, true, false),
-            ("PollForSourceChanges", false, false, false),
-            ("OutputArtifactFormat", false, false, false),
+            ("RepositoryName", true, false),
+            ("BranchName", true, false),
+            ("PollForSourceChanges", false, false),
+            ("OutputArtifactFormat", false, false),
         ],
         settings: &["entityUrlTemplate"],
     },
@@ -407,11 +415,11 @@ const DOCUMENTED_ENTRIES: &[DocumentedEntry] = &[
         input: (1, 5),
         output: (0, 5),
         properties: &[
-            ("ProjectName", true, true, false),
-            ("PrimarySource", false, false, false),
-            ("BatchEnabled", false, false, false),
-            ("CombineArtifacts", false, false, false),
-            ("EnvironmentVariables", false, false, false),
+            ("ProjectName", true, false),
+            ("PrimarySource", false, false),
+            ("BatchEnabled", false, false),
+            ("CombineArtifacts", false, false),
+            ("EnvironmentVariables", false, false),
         ],
         settings: &["entityUrlTemplate", "executionUrlTemplate"],
     },
@@ -422,10 +430,7 @@ const DOCUMENTED_ENTRIES: &[DocumentedEntry] = &[
         version: "1",
         input: (1, 1),
         output: (0, 0),
-        properties: &[
-            ("ApplicationName", true, true, false),
-            ("DeploymentGroupName", true, true, false),
-        ],
+        properties: &[("ApplicationName", true, false), ("DeploymentGroupName", true, false)],
         settings: &["entityUrlTemplate"],
     },
     DocumentedEntry {
@@ -435,10 +440,7 @@ const DOCUMENTED_ENTRIES: &[DocumentedEntry] = &[
         version: "1",
         input: (0, 5),
         output: (0, 5),
-        properties: &[
-            ("FunctionName", true, true, false),
-            ("UserParameters", false, false, false),
-        ],
+        properties: &[("FunctionName", true, false), ("UserParameters", false, false)],
         settings: &["entityUrlTemplate"],
     },
     DocumentedEntry {
@@ -449,9 +451,9 @@ const DOCUMENTED_ENTRIES: &[DocumentedEntry] = &[
         input: (0, 0),
         output: (0, 0),
         properties: &[
-            ("NotificationArn", false, false, false),
-            ("CustomData", false, false, false),
-            ("ExternalEntityLink", false, false, false),
+            ("NotificationArn", false, false),
+            ("CustomData", false, false),
+            ("ExternalEntityLink", false, false),
         ],
         settings: &[],
     },
@@ -463,13 +465,13 @@ const DOCUMENTED_ENTRIES: &[DocumentedEntry] = &[
         input: (0, 0),
         output: (1, 1),
         properties: &[
-            ("Owner", true, true, false),
-            ("Repo", true, true, false),
-            ("Branch", true, true, false),
+            ("Owner", true, false),
+            ("Repo", true, false),
+            ("Branch", true, false),
             // The caller's credential for the external system: secret, so a read of the
             // pipeline does not hand it back.
-            ("OAuthToken", true, false, true),
-            ("PollForSourceChanges", false, false, false),
+            ("OAuthToken", true, true),
+            ("PollForSourceChanges", false, false),
         ],
         settings: &[
             "entityUrlTemplate",
@@ -512,7 +514,7 @@ async fn the_catalog_reports_each_providers_documented_configuration() {
             );
         }
 
-        let reported: Vec<(String, bool, bool, bool)> = found["actionConfigurationProperties"]
+        let reported: Vec<(String, bool, bool)> = found["actionConfigurationProperties"]
             .as_array()
             .unwrap_or_else(|| panic!("case {case:?}: properties are a list, got {found}"))
             .iter()
@@ -528,22 +530,42 @@ async fn the_catalog_reports_each_providers_documented_configuration() {
                         .unwrap_or_else(|| panic!("case {case:?}: name is a string, got {property}"))
                         .to_string(),
                     flag("required"),
-                    flag("key"),
                     flag("secret"),
                 )
             })
             .collect();
-        let expected: Vec<(String, bool, bool, bool)> = case
+        let expected: Vec<(String, bool, bool)> = case
             .properties
             .iter()
-            .map(|(name, required, key, secret)| {
-                (name.to_string(), *required, *key, *secret)
-            })
+            .map(|(name, required, secret)| (name.to_string(), *required, *secret))
             .collect();
         assert_eq!(
             reported, expected,
             "case {case:?}: unexpected configuration properties, got {found}"
         );
+
+        // The two facts that hold for every property of an action type the service
+        // publishes, whatever the provider: it is reported as a key, and it carries the
+        // text a console displays for it.
+        for property in found["actionConfigurationProperties"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: properties are a list, got {found}"))
+        {
+            assert_eq!(
+                property["key"].as_bool(),
+                Some(true),
+                "case {case:?}: every published property is a key, got {property}"
+            );
+            let description = property["description"].as_str().unwrap_or_else(|| {
+                panic!("case {case:?}: a published property is described, got {property}")
+            });
+            assert!(
+                !description.trim().is_empty()
+                    && description.chars().count() <= PROPERTY_DESCRIPTION_LENGTH.1,
+                "case {case:?}: the description {description:?} must be text inside the \
+                 modelled length {PROPERTY_DESCRIPTION_LENGTH:?}"
+            );
+        }
 
         let mut settings: Vec<&str> = found["settings"]
             .as_object()
@@ -622,6 +644,16 @@ fn every_catalog_entry_stays_inside_the_modelled_bounds() {
                  modelled length {PROPERTY_NAME_LENGTH:?}",
                 property.name
             );
+            // Every property of an action type the service publishes carries the text a
+            // console displays for it, inside the length the member is modelled for.
+            let described = property.description.chars().count();
+            assert!(
+                (PROPERTY_DESCRIPTION_LENGTH.0..=PROPERTY_DESCRIPTION_LENGTH.1)
+                    .contains(&described),
+                "case {case:?}: the description of {:?} is {described} characters, outside \
+                 the modelled length {PROPERTY_DESCRIPTION_LENGTH:?}",
+                property.name
+            );
         }
         let mut names: Vec<&str> = properties.iter().map(|property| property.name).collect();
         let reported = names.len();
@@ -637,8 +669,8 @@ fn every_catalog_entry_stays_inside_the_modelled_bounds() {
                 .collect::<Vec<_>>()
         );
 
-        // A deep link is built from the action's own key properties, so every placeholder
-        // it substitutes must be one of them.
+        // A deep link is built from the action's own properties, so every placeholder it
+        // substitutes must be one of them.
         for template in [
             entry.entity_url_template,
             entry.execution_url_template,
@@ -648,19 +680,10 @@ fn every_catalog_entry_stays_inside_the_modelled_bounds() {
         .flatten()
         {
             for name in placeholders(template) {
-                let property = properties
-                    .iter()
-                    .find(|property| property.name == name)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "case {case:?}: the template {template:?} substitutes {name:?}, \
-                             which this action type does not declare"
-                        )
-                    });
                 assert!(
-                    property.key,
-                    "case {case:?}: {name:?} is substituted into {template:?}, so it must be \
-                     reported as a key property"
+                    properties.iter().any(|property| property.name == name),
+                    "case {case:?}: the template {template:?} substitutes {name:?}, \
+                     which this action type does not declare"
                 );
             }
         }

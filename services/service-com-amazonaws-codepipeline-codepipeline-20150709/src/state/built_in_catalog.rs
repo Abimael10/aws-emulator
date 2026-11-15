@@ -2,8 +2,9 @@
 
 //! The action types this service PROVIDES ITSELF — the catalog no caller created —
 //! with the per-provider detail an `ActionType` reports for each one: its artifact
-//! counts, the configuration properties an action declaration of it must carry, and the
-//! deep links the console follows to the resource the action acts on.
+//! counts, the configuration properties an action declaration of it must carry (each
+//! with the text a console displays for it), and the deep links the console follows to
+//! the resource the action acts on.
 //!
 //! Split out of [`super::action_types`] so one file holds one concern (and so neither
 //! file grows past the project's file-length limit); every name stays re-exported from
@@ -19,26 +20,58 @@
 //!
 //! * the number of input and output artifacts the action takes and produces
 //!   ([`BuiltInActionType::input_artifacts`] / [`BuiltInActionType::output_artifacts`]);
-//! * its configuration parameters and which of them are required
+//! * its configuration parameters, which of them are required, and what each one is
 //!   ([`BuiltInActionType::configuration_properties`]).
 //!
-//! Three choices this file makes, stated rather than hidden, because the model does not
-//! state them:
+//! # What every entry of this catalog reports
 //!
-//! * a provider whose documented artifact count exceeds `MaximumArtifactCount`'s modelled
-//!   `@range(max: 5)` (the CloudFormation deploy action's ten input artifacts, the
-//!   `Commands` action's) is left OUT rather than reported with a count the model cannot
-//!   carry;
-//! * `key` marks a property the action's deep link is built FROM — exactly the ones
-//!   [`BuiltInActionType::entity_url_template`] substitutes, since
-//!   `ActionTypeSettings$entityUrlTemplate` is documented as "a deep link to the resources
-//!   of the external system" and a property that identifies that resource is what such a
-//!   link needs;
+//! Three facts hold for every action type the SERVICE publishes, as against a custom
+//! action type, whose every member is whatever the caller registered:
+//!
+//! * each configuration property carries a `description` — the text
+//!   `ActionConfigurationProperty$description` is documented as ("[t]he description of
+//!   the action configuration property that is displayed to users"), which for a
+//!   provider the service publishes is what that provider's documentation says the
+//!   parameter is (see the note below on which rows quote it and which paraphrase it). A
+//!   catalog entry without one tells a console nothing to display beside the field it
+//!   is asking a user to fill in;
+//! * each configuration property is reported as a `key` (`key: true`), as CodePipeline's
+//!   own catalog reports them: the properties of a published action type are the keys of
+//!   the `configuration` map an action declaration of it carries, required and optional
+//!   alike;
 //! * `queryable` is false on every entry, because `ActionConfigurationProperty$queryable`
 //!   documents it as the member that "is used with `PollForJobs`" "[w]hen creating a custom
-//!   action" — none of these action types is run by a job worker of the caller's account;
-//!   and `description` is left unset, because the display text of a provider's property is
-//!   the provider's own and neither the model nor the reference page states it.
+//!   action" — none of these action types is run by a job worker of the caller's account.
+//!
+//! One further choice, stated rather than hidden, because the model does not state it: a
+//! provider whose documented artifact count exceeds `MaximumArtifactCount`'s modelled
+//! `@range(max: 5)` (the CloudFormation deploy action's ten input artifacts, the
+//! `Commands` action's) is left OUT of this table rather than reported with a count the
+//! model cannot carry — [`super::AWS_ACTION_TYPES_WITHOUT_DETAIL`] is where those
+//! published identities live instead.
+//!
+//! # Which rows are the catalog's own words
+//!
+//! Two kinds of text live in the table below, and a later reader should not have to guess
+//! which is which:
+//!
+//! * the entries whose detail the service's own catalog is observed to publish —
+//!   `Source/AWS/S3`, `Invoke/AWS/Lambda` and `Test/ThirdParty/GhostInspector` — carry that
+//!   text verbatim, property descriptions and URL templates alike (with the Region written as
+//!   [`CATALOG_REGION_PLACEHOLDER`]);
+//! * every other entry's descriptions and console templates are this file's own wording of
+//!   what the provider's reference page documents for that parameter and that console page.
+//!   They state the same facts the reference page states, but they are a paraphrase rather
+//!   than a quotation, so a row of that kind is the place to correct first when a provider's
+//!   published wording turns out to differ.
+//!
+//! # The Region a deep link names
+//!
+//! A console deep link is a link into ONE Region's console, so the URL templates below
+//! write the Region as [`CATALOG_REGION_PLACEHOLDER`] and
+//! [`BuiltInActionType::record`] substitutes the Region the catalog is being read for
+//! (`ListActionTypes$regionFilter`, or the Region the request itself was signed for).
+//! A partner's own pages carry no Region and name none.
 //!
 //! The URL templates below are REPORTED, never followed: each is the text of a modelled
 //! member (`ActionTypeSettings$entityUrlTemplate` is documented as "[t]he URL returned to
@@ -48,19 +81,29 @@
 
 use super::*;
 
+/// What a URL template in this table writes the Region as, substituted by
+/// [`BuiltInActionType::record`].
+///
+/// It is not a `{Config:<property>}` reference ([`super::action_urls`] is what resolves
+/// those, against an action's own configuration), so no action's configuration can be
+/// read as a Region and no Region can be read as a configuration value.
+pub const CATALOG_REGION_PLACEHOLDER: &str = "{region}";
+
 /// One configuration property of an action type the service provides: the members
 /// `ActionConfigurationProperty` carries that the provider's reference page states.
 ///
-/// `queryable` and `description` are not here — see this module's note on both.
+/// `key` and `queryable` are not here — both are the same for every entry of this
+/// catalog; see this module's note on them.
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltInConfigurationProperty {
     /// `ActionConfigurationProperty$name`: the parameter's name, as an action's
     /// `configuration` map keys it.
     pub name: &'static str,
+    /// `ActionConfigurationProperty$description`: what this parameter is, as the
+    /// provider's reference page states it, for a console to display beside the field.
+    pub description: &'static str,
     /// Whether the provider's reference page documents the parameter as required.
     pub required: bool,
-    /// Whether the action's deep link is built from this property (see the module note).
-    pub key: bool,
     /// Whether the value is a secret the API hides from a read of the pipeline — a
     /// credential the caller hands the provider.
     pub secret: bool,
@@ -70,14 +113,14 @@ pub struct BuiltInConfigurationProperty {
 /// `ActionConfigurationProperty`'s members are declared.
 const fn property(
     name: &'static str,
+    description: &'static str,
     required: bool,
-    key: bool,
     secret: bool,
 ) -> BuiltInConfigurationProperty {
     BuiltInConfigurationProperty {
         name,
+        description,
         required,
-        key,
         secret,
     }
 }
@@ -101,7 +144,8 @@ pub struct BuiltInActionType {
     pub output_artifacts: (i32, i32),
     /// `ActionTypeSettings$entityUrlTemplate`: the deep link to the resource the action
     /// acts on, with `{Config:<property>}` standing for the value the action's
-    /// configuration gives that property.
+    /// configuration gives that property and [`CATALOG_REGION_PLACEHOLDER`] for the
+    /// Region the catalog is read for.
     pub entity_url_template: Option<&'static str>,
     /// `ActionTypeSettings$executionUrlTemplate`: the link to the external system's own
     /// view of the work this action ran.
@@ -128,17 +172,21 @@ impl BuiltInActionType {
         }
     }
 
-    /// The URLs this entry reports, or `None` when it names none at all.
+    /// The URLs this entry reports for a reader in `region`, or `None` when it names none
+    /// at all.
     ///
     /// `None` and an empty `ActionTypeSettings` state the same fact, and the member is
     /// reported either way ([`ActionTypeRecord::to_action_type`] always carries it), so
     /// this is the record's own shape rather than the wire's.
-    fn settings(&self) -> Option<ActionTypeSettings> {
+    fn settings(&self, region: &str) -> Option<ActionTypeSettings> {
+        let in_region = |template: Option<&'static str>| {
+            template.map(|template| template.replace(CATALOG_REGION_PLACEHOLDER, region))
+        };
         let settings = ActionTypeSettings {
-            third_party_configuration_url: self.third_party_configuration_url.map(str::to_string),
-            entity_url_template: self.entity_url_template.map(str::to_string),
-            execution_url_template: self.execution_url_template.map(str::to_string),
-            revision_url_template: self.revision_url_template.map(str::to_string),
+            third_party_configuration_url: in_region(self.third_party_configuration_url),
+            entity_url_template: in_region(self.entity_url_template),
+            execution_url_template: in_region(self.execution_url_template),
+            revision_url_template: in_region(self.revision_url_template),
         };
         [
             &settings.third_party_configuration_url,
@@ -151,22 +199,24 @@ impl BuiltInActionType {
         .then_some(settings)
     }
 
-    /// This entry as a stored record: available in every Region, carrying the URLs and
-    /// the configuration properties its provider documents, and tagged by nobody.
-    pub fn record(&self) -> ActionTypeRecord {
+    /// This entry as a stored record, as a caller in `region` reads it: available in
+    /// every Region, carrying the URLs of that Region's console and the configuration
+    /// properties its provider documents, and tagged by nobody.
+    pub fn record(&self, region: &str) -> ActionTypeRecord {
         ActionTypeRecord {
-            settings: self.settings(),
+            settings: self.settings(region),
             configuration_properties: self
                 .configuration_properties
                 .iter()
                 .map(|property| ActionConfigurationProperty {
                     name: property.name.to_string(),
                     required: property.required,
-                    key: property.key,
+                    // See the module note on both members: every property of an action
+                    // type the service publishes is a key, and none of them is queryable.
+                    key: true,
                     secret: property.secret,
-                    // See the module note on both members.
                     queryable: false,
-                    description: None,
+                    description: Some(property.description.to_string()),
                     r#type: None,
                 })
                 .collect(),
@@ -222,19 +272,34 @@ pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 17] = [
         // The manual-approval action takes and produces no artifact, and its three
         // parameters are all optional: it carries the message a reviewer reads.
         configuration_properties: &[
-            property("NotificationArn", false, false, false),
-            property("CustomData", false, false, false),
-            property("ExternalEntityLink", false, false, false),
+            property(
+                "NotificationArn",
+                "The Amazon SNS topic the approval request is published to",
+                false,
+                false,
+            ),
+            property(
+                "CustomData",
+                "The message displayed to the reviewer with the approval request",
+                false,
+                false,
+            ),
+            property(
+                "ExternalEntityLink",
+                "The URL of the information the reviewer needs to approve or reject",
+                false,
+                false,
+            ),
         ],
         ..entry("Approval", "AWS", "Manual", "1", (0, 0), (0, 0))
     },
     // ---- Build ----------------------------------------------------------------------
     BuiltInActionType {
         entity_url_template: Some(
-            "https://console.aws.amazon.com/codesuite/codebuild/projects/{Config:ProjectName}",
+            "https://console.aws.amazon.com/codesuite/codebuild/projects/{Config:ProjectName}?region={region}",
         ),
         execution_url_template: Some(
-            "https://console.aws.amazon.com/codesuite/codebuild/projects/{Config:ProjectName}/history",
+            "https://console.aws.amazon.com/codesuite/codebuild/projects/{Config:ProjectName}/history?region={region}",
         ),
         configuration_properties: CODEBUILD_PROPERTIES,
         ..entry("Build", "AWS", "CodeBuild", "1", (1, 5), (0, 5))
@@ -242,91 +307,219 @@ pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 17] = [
     // ---- Deploy ---------------------------------------------------------------------
     BuiltInActionType {
         entity_url_template: Some(
-            "https://console.aws.amazon.com/codesuite/codedeploy/applications/{Config:ApplicationName}/deployment-groups/{Config:DeploymentGroupName}",
+            "https://console.aws.amazon.com/codesuite/codedeploy/applications/{Config:ApplicationName}/deployment-groups/{Config:DeploymentGroupName}?region={region}",
         ),
         configuration_properties: &[
-            property("ApplicationName", true, true, false),
-            property("DeploymentGroupName", true, true, false),
+            property(
+                "ApplicationName",
+                "The CodeDeploy application the deployment is made with",
+                true,
+                false,
+            ),
+            property(
+                "DeploymentGroupName",
+                "The CodeDeploy deployment group the revision is deployed to",
+                true,
+                false,
+            ),
         ],
         ..entry("Deploy", "AWS", "CodeDeploy", "1", (1, 1), (0, 0))
     },
     BuiltInActionType {
         entity_url_template: Some(
-            "https://console.aws.amazon.com/ecs/home#/clusters/{Config:ClusterName}/services/{Config:ServiceName}/details",
+            "https://console.aws.amazon.com/ecs/home?region={region}#/clusters/{Config:ClusterName}/services/{Config:ServiceName}/details",
         ),
         configuration_properties: &[
-            property("ClusterName", true, true, false),
-            property("ServiceName", true, true, false),
-            property("FileName", false, false, false),
-            property("DeploymentTimeout", false, false, false),
+            property(
+                "ClusterName",
+                "The Amazon ECS cluster the service to update runs in",
+                true,
+                false,
+            ),
+            property(
+                "ServiceName",
+                "The Amazon ECS service whose task definition is updated",
+                true,
+                false,
+            ),
+            property(
+                "FileName",
+                "The name of the image definitions file in the input artifact",
+                false,
+                false,
+            ),
+            property(
+                "DeploymentTimeout",
+                "How many minutes the deployment is given to become stable",
+                false,
+                false,
+            ),
         ],
         ..entry("Deploy", "AWS", "ECS", "1", (1, 1), (0, 0))
     },
     BuiltInActionType {
         entity_url_template: Some(
-            "https://console.aws.amazon.com/elasticbeanstalk/home#/environment/dashboard?applicationName={Config:ApplicationName}&environmentName={Config:EnvironmentName}",
+            "https://console.aws.amazon.com/elasticbeanstalk/home?region={region}#/environment/dashboard?applicationName={Config:ApplicationName}&environmentName={Config:EnvironmentName}",
         ),
         configuration_properties: &[
-            property("ApplicationName", true, true, false),
-            property("EnvironmentName", true, true, false),
+            property(
+                "ApplicationName",
+                "The Elastic Beanstalk application the revision is deployed to",
+                true,
+                false,
+            ),
+            property(
+                "EnvironmentName",
+                "The Elastic Beanstalk environment the revision is deployed to",
+                true,
+                false,
+            ),
         ],
         ..entry("Deploy", "AWS", "ElasticBeanstalk", "1", (1, 1), (0, 0))
     },
     BuiltInActionType {
         entity_url_template: Some(
-            "https://console.aws.amazon.com/codesuite/opsworks/stacks/{Config:Stack}",
+            "https://console.aws.amazon.com/opsworks/home?region={region}#/stack/{Config:Stack}",
         ),
         configuration_properties: &[
-            property("Stack", true, true, false),
-            property("App", true, false, false),
-            property("Layer", false, false, false),
+            property(
+                "Stack",
+                "The OpsWorks Stacks stack the app is deployed in",
+                true,
+                false,
+            ),
+            property("App", "The OpsWorks Stacks app that is deployed", true, false),
+            property(
+                "Layer",
+                "The OpsWorks Stacks layer whose instances the app is deployed to",
+                false,
+                false,
+            ),
         ],
         ..entry("Deploy", "AWS", "OpsWorks", "1", (1, 1), (0, 0))
     },
     BuiltInActionType {
         entity_url_template: Some(
-            "https://console.aws.amazon.com/s3/buckets/{Config:BucketName}",
+            "https://console.aws.amazon.com/s3/buckets/{Config:BucketName}?region={region}",
         ),
         configuration_properties: &[
-            property("BucketName", true, true, false),
-            property("Extract", true, false, false),
-            property("ObjectKey", false, false, false),
-            property("KMSEncryptionKeyARN", false, false, false),
-            property("CannedACL", false, false, false),
-            property("CacheControl", false, false, false),
+            property(
+                "BucketName",
+                "The Amazon S3 bucket the input artifact is deployed to",
+                true,
+                false,
+            ),
+            property(
+                "Extract",
+                "Whether the input artifact's archive is extracted into the bucket",
+                true,
+                false,
+            ),
+            property(
+                "ObjectKey",
+                "The Amazon S3 object key the artifact is deployed under",
+                false,
+                false,
+            ),
+            property(
+                "KMSEncryptionKeyARN",
+                "The AWS KMS key the deployed object is encrypted with",
+                false,
+                false,
+            ),
+            property(
+                "CannedACL",
+                "The canned ACL applied to the deployed object",
+                false,
+                false,
+            ),
+            property(
+                "CacheControl",
+                "The cache control headers the deployed object is served with",
+                false,
+                false,
+            ),
         ],
         ..entry("Deploy", "AWS", "S3", "1", (1, 1), (0, 0))
     },
     // ---- Invoke ---------------------------------------------------------------------
     BuiltInActionType {
         entity_url_template: Some(
-            "https://console.aws.amazon.com/lambda/home#/functions/{Config:FunctionName}",
+            "https://console.aws.amazon.com/lambda/home?region={region}#/functions/{Config:FunctionName}",
         ),
         configuration_properties: &[
-            property("FunctionName", true, true, false),
-            property("UserParameters", false, false, false),
+            property("FunctionName", "The AWS Lambda function to invoke", true, false),
+            property(
+                "UserParameters",
+                "Extra parameters for the AWS Lambda function",
+                false,
+                false,
+            ),
         ],
         ..entry("Invoke", "AWS", "Lambda", "1", (0, 5), (0, 5))
     },
     BuiltInActionType {
+        entity_url_template: Some(
+            "https://console.aws.amazon.com/states/home?region={region}#/statemachines/view/{Config:StateMachineArn}",
+        ),
         configuration_properties: &[
-            property("StateMachineArn", true, true, false),
-            property("ExecutionNamePrefix", false, false, false),
-            property("InputType", false, false, false),
-            property("Input", false, false, false),
+            property(
+                "StateMachineArn",
+                "The state machine an execution is started of",
+                true,
+                false,
+            ),
+            property(
+                "ExecutionNamePrefix",
+                "The prefix the name of the started execution carries",
+                false,
+                false,
+            ),
+            property(
+                "InputType",
+                "Where the execution's input comes from: a literal value or a file",
+                false,
+                false,
+            ),
+            property(
+                "Input",
+                "The input the execution is started with",
+                false,
+                false,
+            ),
         ],
         ..entry("Invoke", "AWS", "StepFunctions", "1", (0, 1), (0, 1))
     },
     // ---- Source ---------------------------------------------------------------------
     BuiltInActionType {
         entity_url_template: Some(
-            "https://console.aws.amazon.com/codesuite/codecommit/repositories/{Config:RepositoryName}/browse/refs/heads/{Config:BranchName}",
+            "https://console.aws.amazon.com/codesuite/codecommit/repositories/{Config:RepositoryName}/browse/refs/heads/{Config:BranchName}?region={region}",
         ),
         configuration_properties: &[
-            property("RepositoryName", true, true, false),
-            property("BranchName", true, true, false),
-            property("PollForSourceChanges", false, false, false),
-            property("OutputArtifactFormat", false, false, false),
+            property(
+                "RepositoryName",
+                "The CodeCommit repository source changes are detected in",
+                true,
+                false,
+            ),
+            property(
+                "BranchName",
+                "The branch source changes are detected on",
+                true,
+                false,
+            ),
+            property(
+                "PollForSourceChanges",
+                "The option to poll for source repository changes",
+                false,
+                false,
+            ),
+            property(
+                "OutputArtifactFormat",
+                "The output artifact format: the zipped source, or a clone reference",
+                false,
+                false,
+            ),
         ],
         ..entry("Source", "AWS", "CodeCommit", "1", (0, 0), (1, 1))
     },
@@ -334,11 +527,36 @@ pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 17] = [
         // The repository lives behind a connection to the external provider, so the
         // console links the connection rather than a resource of this account.
         configuration_properties: &[
-            property("ConnectionArn", true, true, false),
-            property("FullRepositoryId", true, false, false),
-            property("BranchName", true, false, false),
-            property("OutputArtifactFormat", false, false, false),
-            property("DetectChanges", false, false, false),
+            property(
+                "ConnectionArn",
+                "The connection to the external source provider",
+                true,
+                false,
+            ),
+            property(
+                "FullRepositoryId",
+                "The owner and name of the repository source changes are detected in",
+                true,
+                false,
+            ),
+            property(
+                "BranchName",
+                "The branch source changes are detected on",
+                true,
+                false,
+            ),
+            property(
+                "OutputArtifactFormat",
+                "The output artifact format: the zipped source, or a clone reference",
+                false,
+                false,
+            ),
+            property(
+                "DetectChanges",
+                "Whether a change to the branch starts the pipeline",
+                false,
+                false,
+            ),
         ],
         ..entry(
             "Source",
@@ -351,23 +569,44 @@ pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 17] = [
     },
     BuiltInActionType {
         entity_url_template: Some(
-            "https://console.aws.amazon.com/ecr/repositories/{Config:RepositoryName}",
+            "https://console.aws.amazon.com/ecr/repositories/{Config:RepositoryName}?region={region}",
         ),
         configuration_properties: &[
-            property("RepositoryName", true, true, false),
-            property("ImageTag", false, false, false),
+            property(
+                "RepositoryName",
+                "The Amazon ECR repository image pushes are detected in",
+                true,
+                false,
+            ),
+            property(
+                "ImageTag",
+                "The image tag a push is detected for",
+                false,
+                false,
+            ),
         ],
         ..entry("Source", "AWS", "ECR", "1", (0, 0), (1, 1))
     },
     BuiltInActionType {
-        entity_url_template: Some(
-            "https://console.aws.amazon.com/s3/buckets/{Config:S3Bucket}?prefix={Config:S3ObjectKey}",
-        ),
+        // The console page for this action's resource is the Region's bucket list: the
+        // object the action polls is named by the action's own configuration, which the
+        // console reads from the pipeline rather than from the link.
+        entity_url_template: Some("https://console.aws.amazon.com/s3/home?region={region}#"),
         configuration_properties: &[
-            property("S3Bucket", true, true, false),
-            property("S3ObjectKey", true, true, false),
-            property("PollForSourceChanges", false, false, false),
-            property("AllowOverrideForS3ObjectKey", false, false, false),
+            property("S3Bucket", "The Amazon S3 Bucket", true, false),
+            property("S3ObjectKey", "The Amazon S3 object key", true, false),
+            property(
+                "PollForSourceChanges",
+                "The option to poll for source repository changes",
+                false,
+                false,
+            ),
+            property(
+                "AllowOverrideForS3ObjectKey",
+                "Whether S3 Object Key can be overridden during StartPipelineExecution",
+                false,
+                false,
+            ),
         ],
         ..entry("Source", "AWS", "S3", "1", (0, 0), (1, 1))
     },
@@ -378,60 +617,156 @@ pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 17] = [
         revision_url_template: Some("https://github.com/{Config:Owner}/{Config:Repo}/commits"),
         third_party_configuration_url: Some("https://github.com/join"),
         configuration_properties: &[
-            property("Owner", true, true, false),
-            property("Repo", true, true, false),
-            property("Branch", true, true, false),
-            property("OAuthToken", true, false, true),
-            property("PollForSourceChanges", false, false, false),
+            property(
+                "Owner",
+                "The GitHub account or organization that owns the repository",
+                true,
+                false,
+            ),
+            property(
+                "Repo",
+                "The repository source changes are detected in",
+                true,
+                false,
+            ),
+            property(
+                "Branch",
+                "The branch source changes are detected on",
+                true,
+                false,
+            ),
+            property(
+                "OAuthToken",
+                "The token the pipeline reads the repository with",
+                true,
+                true,
+            ),
+            property(
+                "PollForSourceChanges",
+                "The option to poll for source repository changes",
+                false,
+                false,
+            ),
         ],
         ..entry("Source", "ThirdParty", "GitHub", "1", (0, 0), (1, 1))
     },
     // ---- Test -----------------------------------------------------------------------
     BuiltInActionType {
         entity_url_template: Some(
-            "https://console.aws.amazon.com/codesuite/codebuild/projects/{Config:ProjectName}",
+            "https://console.aws.amazon.com/codesuite/codebuild/projects/{Config:ProjectName}?region={region}",
         ),
         execution_url_template: Some(
-            "https://console.aws.amazon.com/codesuite/codebuild/projects/{Config:ProjectName}/history",
+            "https://console.aws.amazon.com/codesuite/codebuild/projects/{Config:ProjectName}/history?region={region}",
         ),
         configuration_properties: CODEBUILD_PROPERTIES,
         ..entry("Test", "AWS", "CodeBuild", "1", (1, 5), (0, 5))
     },
     BuiltInActionType {
         entity_url_template: Some(
-            "https://console.aws.amazon.com/devicefarm/home#/projects/{Config:ProjectId}/runs",
+            "https://console.aws.amazon.com/devicefarm/home?region={region}#/projects/{Config:ProjectId}/runs",
         ),
         configuration_properties: &[
-            property("ProjectId", true, true, false),
-            property("DevicePoolArn", true, false, false),
-            property("AppType", true, false, false),
-            property("App", true, false, false),
-            property("TestType", true, false, false),
-            property("Test", false, false, false),
-            property("TestSpec", false, false, false),
+            property(
+                "ProjectId",
+                "The Device Farm project the test run belongs to",
+                true,
+                false,
+            ),
+            property(
+                "DevicePoolArn",
+                "The device pool the test runs on",
+                true,
+                false,
+            ),
+            property(
+                "AppType",
+                "The type of application the test runs against",
+                true,
+                false,
+            ),
+            property(
+                "App",
+                "The path to the application in the input artifact",
+                true,
+                false,
+            ),
+            property("TestType", "The type of test that is run", true, false),
+            property(
+                "Test",
+                "The path to the test definition in the input artifact",
+                false,
+                false,
+            ),
+            property(
+                "TestSpec",
+                "The path to the test spec file in the input artifact",
+                false,
+                false,
+            ),
         ],
         ..entry("Test", "AWS", "DeviceFarm", "1", (1, 1), (0, 0))
     },
     BuiltInActionType {
         // A partner test integration: the account's pipeline calls the partner's service
-        // with the caller's own credential for it, which is why the token is secret.
-        third_party_configuration_url: Some("https://ghostinspector.com/docs/integration/aws-codepipeline/"),
+        // with the caller's own credential for it, which is why the token is secret. The
+        // partner's own pages are the deep links, and its sign-up page is where a user
+        // configures the integration.
+        entity_url_template: Some("https://app.ghostinspector.com/tests/{Config:TestId}"),
+        execution_url_template: Some(
+            "https://app.ghostinspector.com/results/{ExternalExecutionId}",
+        ),
+        third_party_configuration_url: Some("https://app.ghostinspector.com/code-pipeline"),
         configuration_properties: &[
-            property("ClientId", true, true, false),
-            property("ClientToken", true, false, true),
-            property("TestId", true, false, false),
-            property("ExtraParams", false, false, false),
+            property("ClientId", "The user client id", true, false),
+            property("ClientToken", "The user client token", true, true),
+            property(
+                "TestId",
+                "The test id used by the Ghost Inspector tests",
+                true,
+                false,
+            ),
+            property(
+                "ExtraParams",
+                "A JSON-encoded string of extra parameters to provide to the test or suite at runtime.",
+                false,
+                false,
+            ),
         ],
-        ..entry("Test", "ThirdParty", "GhostInspector", "1", (1, 1), (0, 0))
+        ..entry("Test", "ThirdParty", "GhostInspector", "1", (0, 1), (0, 0))
     },
 ];
 
 /// The CodeBuild action's configuration parameters, shared by the two categories it is
 /// published in (`Build` and `Test`): one provider, one documented parameter list.
 const CODEBUILD_PROPERTIES: &[BuiltInConfigurationProperty] = &[
-    property("ProjectName", true, true, false),
-    property("PrimarySource", false, false, false),
-    property("BatchEnabled", false, false, false),
-    property("CombineArtifacts", false, false, false),
-    property("EnvironmentVariables", false, false, false),
+    property(
+        "ProjectName",
+        "The CodeBuild build project that runs the action",
+        true,
+        false,
+    ),
+    property(
+        "PrimarySource",
+        "The input artifact whose source the build runs against",
+        false,
+        false,
+    ),
+    property(
+        "BatchEnabled",
+        "Whether the action runs the project as a batch build",
+        false,
+        false,
+    ),
+    property(
+        "CombineArtifacts",
+        "Whether a batch build combines its artifacts into one output artifact",
+        false,
+        false,
+    ),
+    property(
+        "EnvironmentVariables",
+        "The environment variables the build runs with, as a JSON array",
+        false,
+        false,
+    ),
 ];

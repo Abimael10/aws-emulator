@@ -710,13 +710,15 @@ pub fn resolved_configuration(
 /// ([`super::condition_state`]).
 ///
 /// `store` is read for the action types the declared actions name, which is what each
-/// action's `entityUrl` is resolved from ([`super::action_urls`]).
+/// action's `entityUrl` is resolved from ([`super::action_urls`]), and `region` is the
+/// Region the state is being read for, which is the console those links point into.
 pub fn stage_states(
     store: &super::ComAmazonawsCodepipelineCodepipeline20150709State,
     pipeline: &super::Pipeline,
     executions: &[&super::PipelineExecutionRecord],
     revisions: &BTreeMap<(String, String, String), crate::ops::types::ActionRevision>,
     rules: &[super::RuleExecutionRecord],
+    region: &str,
 ) -> Vec<StageState> {
     // One pass over the executions, newest first, builds both indexes: the newest
     // execution that ENTERED each stage, and the non-terminal ones still waiting to enter
@@ -802,6 +804,7 @@ pub fn stage_states(
                                 store,
                                 action,
                                 run.map(|(record, _)| record),
+                                region,
                             );
                             run.and_then(|(_, run)| {
                                 run.actions
