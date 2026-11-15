@@ -2972,6 +2972,16 @@ fn record_encryption_change(instants: &mut Vec<SystemTime>, at: SystemTime) {
 pub const ON_DEMAND_SHARD_COUNT_MESSAGE: &str =
     "ShardCount cannot be set while creating stream in On-Demand StreamMode";
 
+/// How `CreateStream` refuses a request that names the provisioned capacity mode and NO
+/// `ShardCount`: "for the data streams with a provisioned mode, you must specify the number
+/// of shards for the data stream" (`CreateStream`), so the member is one such a create must
+/// carry. The counterpart of [`ON_DEMAND_SHARD_COUNT_MESSAGE`] for the other mode, and like
+/// it one sentence of fixed text with nothing taken from the request — the member and the
+/// mode it is required for are the only two things the refusal is about, and both are the
+/// same every time.
+pub const PROVISIONED_SHARD_COUNT_MESSAGE: &str =
+    "ShardCount cannot be null when creating stream in PROVISIONED StreamMode";
+
 /// How an operation that only serves a provisioned stream refuses one whose shard count
 /// the service manages itself: "specifies that you tried to invoke this API for a data
 /// stream with the on-demand capacity mode. This API is only supported for data streams
@@ -3113,12 +3123,11 @@ pub fn retention_period_too_short_message(requested_hours: i32) -> String {
     )
 }
 
-/// How `IncreaseStreamRetentionPeriod` refuses a window shorter than the one the stream
-/// already carries: its member is "the new retention period of the stream, in hours. Must
-/// be more than the current retention period"
-/// (`IncreaseStreamRetentionPeriodInput$RetentionPeriodHours`), and shortening a window is
-/// the other operation's to serve, which the sentence names. Built FROM the request and the
-/// stored record, so the window at fault and the one the stream carries both name it.
+/// How `IncreaseStreamRetentionPeriod` refuses a window strictly SHORTER than the one the
+/// stream already carries: shortening a window is the other operation's to serve, which the
+/// sentence names. Built FROM the request and the stored record, so the window at fault and
+/// the one the stream carries both name it. A window equal to the stored one shortens
+/// nothing, so it never reaches this refusal.
 pub fn retention_period_not_longer_message(
     stream_identifier: &str,
     requested_hours: i32,
@@ -3131,11 +3140,10 @@ pub fn retention_period_not_longer_message(
     )
 }
 
-/// How `DecreaseStreamRetentionPeriod` refuses a window longer than the one the stream
-/// already carries: its member is "the new retention period of the stream, in hours. Must
-/// be less than the current retention period"
-/// (`DecreaseStreamRetentionPeriodInput$RetentionPeriodHours`), and lengthening a window is
-/// the other operation's to serve. The same sentence as
+/// How `DecreaseStreamRetentionPeriod` refuses a window strictly LONGER than the one the
+/// stream already carries: lengthening a window is the other operation's to serve, and a
+/// window equal to the stored one lengthens nothing, so it never reaches this refusal.
+/// The same sentence as
 /// [`retention_period_not_longer_message`] with the direction and the operation it names
 /// turned around: ONE wording for the one rule, in both directions.
 pub fn retention_period_not_shorter_message(

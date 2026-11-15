@@ -319,10 +319,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (true, None) => crate::state::ON_DEMAND_INITIAL_SHARDS,
             (false, None) => {
                 audit(&akid, &region, "refused");
-                return Err(invalid_argument(format!(
-                    "ShardCount is required for a {} stream",
-                    crate::state::STREAM_MODE_PROVISIONED
-                )));
+                return Err(invalid_argument(
+                    crate::state::PROVISIONED_SHARD_COUNT_MESSAGE.to_string(),
+                ));
             }
             // Modelled `range 1..`, so the boundary validator has already refused a
             // non-positive count; a count past the account's shard quota is refused

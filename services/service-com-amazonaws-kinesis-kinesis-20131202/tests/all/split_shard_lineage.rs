@@ -501,6 +501,19 @@ async fn splitting_a_shard_an_earlier_generation_closed_is_refused() {
     }
 }
 
+/// The window the retention rows lengthen their stream to before asking for one the wrong
+/// side of it, so each refusal is about the DIRECTION of the change rather than a published
+/// bound: longer than the default a create gives, and well inside the documented 24..8760.
+const CARRIED_RETENTION_HOURS: i32 = DEFAULT_RETENTION_PERIOD_HOURS * 2;
+
+/// A window strictly SHORTER than [`CARRIED_RETENTION_HOURS`] and still at or above the
+/// published floor, which only `DecreaseStreamRetentionPeriod` may move a stream to.
+const SHORTER_THAN_CARRIED_HOURS: i32 = CARRIED_RETENTION_HOURS - 1;
+
+/// A window strictly LONGER than [`CARRIED_RETENTION_HOURS`] and still at or below the
+/// published ceiling, which only `IncreaseStreamRetentionPeriod` may move a stream to.
+const LONGER_THAN_CARRIED_HOURS: i32 = CARRIED_RETENTION_HOURS + 1;
+
 /// One refusal about a stream a request addressed by its `StreamARN` alone: the operation, the
 /// request it makes and the message it must answer, built from the stream's own NAME.
 struct ArnAddressed {
@@ -547,37 +560,37 @@ async fn a_refusal_names_the_stream_the_request_resolved_by_name() {
             code: "InvalidArgumentException",
         },
         ArnAddressed {
-            case: "arn-addressed-increase-that-lengthens-nothing",
+            case: "arn-addressed-increase-that-shortens",
             operation: "IncreaseStreamRetentionPeriod",
             body: |arn, _, _| {
                 json!({
                     "StreamARN": arn,
-                    "RetentionPeriodHours": DEFAULT_RETENTION_PERIOD_HOURS,
+                    "RetentionPeriodHours": SHORTER_THAN_CARRIED_HOURS,
                 })
             },
             says: |name| {
                 retention_period_not_longer_message(
                     name,
-                    DEFAULT_RETENTION_PERIOD_HOURS,
-                    DEFAULT_RETENTION_PERIOD_HOURS,
+                    SHORTER_THAN_CARRIED_HOURS,
+                    CARRIED_RETENTION_HOURS,
                 )
             },
             code: "InvalidArgumentException",
         },
         ArnAddressed {
-            case: "arn-addressed-decrease-that-shortens-nothing",
+            case: "arn-addressed-decrease-that-lengthens",
             operation: "DecreaseStreamRetentionPeriod",
             body: |arn, _, _| {
                 json!({
                     "StreamARN": arn,
-                    "RetentionPeriodHours": DEFAULT_RETENTION_PERIOD_HOURS,
+                    "RetentionPeriodHours": LONGER_THAN_CARRIED_HOURS,
                 })
             },
             says: |name| {
                 retention_period_not_shorter_message(
                     name,
-                    DEFAULT_RETENTION_PERIOD_HOURS,
-                    DEFAULT_RETENTION_PERIOD_HOURS,
+                    LONGER_THAN_CARRIED_HOURS,
+                    CARRIED_RETENTION_HOURS,
                 )
             },
             code: "InvalidArgumentException",
@@ -605,6 +618,22 @@ async fn a_refusal_names_the_stream_the_request_resolved_by_name() {
     // it holds — never a duration this case measures.
     for refusal in &cases {
         poll_until_active(&emulator, refusal.case, refusal.case).await;
+    }
+
+    // Every row's stream is lengthened off the default window first, so the retention rows
+    // have a window to move the WRONG way from: only a window strictly the wrong side of the
+    // stored one is refused, and the stream the refusal names is what these rows are about.
+    for refusal in &cases {
+        emulator
+            .ok(
+                refusal.case,
+                "IncreaseStreamRetentionPeriod",
+                &json!({
+                    "StreamName": refusal.case,
+                    "RetentionPeriodHours": CARRIED_RETENTION_HOURS,
+                }),
+            )
+            .await;
     }
 
     // Every row's stream gets a closed shard, so the reshard rows have one to name; the

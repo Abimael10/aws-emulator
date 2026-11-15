@@ -89,6 +89,8 @@ mod resource_tag_removal;
 mod resource_tags;
 #[path = "all/retention_period.rs"]
 mod retention_period;
+#[path = "all/retention_reapply.rs"]
+mod retention_reapply;
 #[path = "all/shard_filter_timestamp.rs"]
 mod shard_filter_timestamp;
 #[path = "all/shard_iterators.rs"]

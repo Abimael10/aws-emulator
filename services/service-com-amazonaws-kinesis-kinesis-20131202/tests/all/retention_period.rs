@@ -7,9 +7,12 @@
 //! RULE: a retention change stores the `RetentionPeriodHours` its request carries on the
 //! stream it addresses, so that is the window every later read of that stream reports. The
 //! window is bounded at both ends — 24 hours at the low end and 8760 hours (365 days) at the
-//! high end — and each operation only moves it STRICTLY in its own direction, so a request
-//! outside the bounds, and one that does not move the window the operation's own way, are
-//! refused with `InvalidArgumentException` and leave the stored window exactly as it was. The call is
+//! high end — and each operation only moves it in its own direction, so a request
+//! outside the bounds, and one that would move the window the OTHER way, are
+//! refused with `InvalidArgumentException` and leave the stored window exactly as it was. The
+//! boundary between the two directions belongs to BOTH: a request naming the window the
+//! stream already carries moves it neither way, so both operations accept it as a no-op
+//! (asserted in `retention_reapply`). The call is
 //! served only while the stream is `ACTIVE` (`ResourceInUseException` otherwise) and only
 //! for a stream this account and region hold (`ResourceNotFoundException` otherwise).
 //!
@@ -32,7 +35,9 @@ use service_com_amazonaws_kinesis_kinesis_20131202::state::{
     MIN_RETENTION_PERIOD_HOURS, STREAM_IDENTIFIER_REQUIRED_MESSAGE,
 };
 
-use crate::stream_tags::{error_code, error_message, past_activation, stream_arn, Emulator, REGION};
+use crate::stream_tags::{
+    error_code, error_message, poll_until_active, stream_arn, Emulator, REGION,
+};
 
 /// The operation a row calls: the two directions of the one rule.
 #[derive(Debug, Clone, Copy)]
@@ -116,7 +121,11 @@ async fn a_retention_change_is_what_a_read_reports() {
             )
             .await;
     }
-    tokio::time::sleep(past_activation()).await;
+    // The CONDITION each stream reaches on the emulator's own clock, looked for again until
+    // it holds — never a duration this case measures.
+    for (name, _) in &cases {
+        poll_until_active(&emulator, name, name).await;
+    }
 
     for (name, changes) in &cases {
         assert_eq!(
@@ -265,29 +274,6 @@ async fn a_refused_retention_change_leaves_the_window_as_it_was() {
             },
         },
         Refusal {
-            // "Must be more than the current retention period"
-            // (`IncreaseStreamRetentionPeriodInput$RetentionPeriodHours`), so the window the
-            // stream already carries moves it nowhere and is refused too.
-            case: "increase-to-the-window-it-has",
-            subject: Subject::Default,
-            direction: Direction::Increase,
-            hours: DEFAULT_RETENTION_PERIOD_HOURS,
-            code: "InvalidArgumentException",
-            says: |name, hours| {
-                retention_period_not_longer_message(name, hours, DEFAULT_RETENTION_PERIOD_HOURS)
-            },
-        },
-        Refusal {
-            // The same for the other direction: "must be less than the current retention
-            // period" (`DecreaseStreamRetentionPeriodInput$RetentionPeriodHours`).
-            case: "decrease-to-the-window-it-has",
-            subject: Subject::Lengthened(96),
-            direction: Direction::Decrease,
-            hours: 96,
-            code: "InvalidArgumentException",
-            says: |name, hours| retention_period_not_shorter_message(name, hours, 96),
-        },
-        Refusal {
             case: "still-creating",
             subject: Subject::Creating,
             direction: Direction::Increase,
@@ -320,7 +306,16 @@ async fn a_refused_retention_change_leaves_the_window_as_it_was() {
             Subject::Creating | Subject::Absent => {}
         }
     }
-    tokio::time::sleep(past_activation()).await;
+    // The CONDITION each stream reaches on the emulator's own clock, looked for again until
+    // it holds — never a duration this case measures.
+    for refusal in &cases {
+        match refusal.subject {
+            Subject::Default | Subject::Lengthened(_) => {
+                poll_until_active(&emulator, refusal.case, refusal.case).await;
+            }
+            Subject::Creating | Subject::Absent => {}
+        }
+    }
 
     for refusal in &cases {
         let case = refusal.case;
@@ -414,15 +409,6 @@ async fn a_refused_retention_change_is_worded_as_the_service_words_it() {
                    period (48 hours). Use DecreaseRetentionPeriod API.",
         },
         Wording {
-            case: "wording-increase-to-the-window-it-has",
-            carried: DEFAULT_RETENTION_PERIOD_HOURS,
-            direction: Direction::Increase,
-            hours: DEFAULT_RETENTION_PERIOD_HOURS,
-            says: "Requested retention period (24 hours) for stream \
-                   wording-increase-to-the-window-it-has can not be shorter than existing \
-                   retention period (24 hours). Use DecreaseRetentionPeriod API.",
-        },
-        Wording {
             case: "wording-decrease-that-lengthens",
             carried: 48,
             direction: Direction::Decrease,
@@ -430,15 +416,6 @@ async fn a_refused_retention_change_is_worded_as_the_service_words_it() {
             says: "Requested retention period (72 hours) for stream \
                    wording-decrease-that-lengthens can not be longer than existing retention \
                    period (48 hours). Use IncreaseRetentionPeriod API.",
-        },
-        Wording {
-            case: "wording-decrease-to-the-window-it-has",
-            carried: DEFAULT_RETENTION_PERIOD_HOURS,
-            direction: Direction::Decrease,
-            hours: DEFAULT_RETENTION_PERIOD_HOURS,
-            says: "Requested retention period (24 hours) for stream \
-                   wording-decrease-to-the-window-it-has can not be longer than existing \
-                   retention period (24 hours). Use IncreaseRetentionPeriod API.",
         },
         Wording {
             case: "wording-past-the-ceiling",
@@ -468,7 +445,11 @@ async fn a_refused_retention_change_is_worded_as_the_service_words_it() {
             )
             .await;
     }
-    tokio::time::sleep(past_activation()).await;
+    // The CONDITION each stream reaches on the emulator's own clock, looked for again until
+    // it holds — never a duration this case measures.
+    for row in &rows {
+        poll_until_active(&emulator, row.case, row.case).await;
+    }
 
     for row in &rows {
         let case = row.case;

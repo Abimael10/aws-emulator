@@ -19,7 +19,7 @@
 //! * a pair of identifiers that disagree names BOTH halves, since either one may be the
 //!   wrong one, and the pair is reconciled from the request before any lookup;
 //! * a shard count named beside the on-demand capacity mode is refused with one fixed
-//!   sentence;
+//!   sentence, as is a PROVISIONED create that names none;
 //! * a hash key past the 128-bit key space is a RANGE violation of the member that carried
 //!   it, which is a different fault from a key the shard map does not cover.
 //!
@@ -33,10 +33,13 @@ use service_com_amazonaws_kinesis_kinesis_20131202::state::{
     dry_run_succeeded_message, hash_key_out_of_range_message, shard_id,
     shard_not_found_message, stream_creation_time_not_found_message,
     stream_identifier_mismatch_message, stream_not_found_message, ON_DEMAND_SHARD_COUNT_MESSAGE,
-    SHARD_ITERATOR_TYPE_TRIM_HORIZON, STREAM_MODE_ON_DEMAND,
+    PROVISIONED_SHARD_COUNT_MESSAGE, SHARD_ITERATOR_TYPE_TRIM_HORIZON, STREAM_MODE_ON_DEMAND,
+    STREAM_MODE_PROVISIONED,
 };
 
-use crate::stream_tags::{error_code, error_message, past_activation, stream_arn, Emulator, REGION};
+use crate::stream_tags::{
+    error_code, error_message, past_activation, poll_until_active, stream_arn, Emulator, REGION,
+};
 
 /// The largest hash key a stream's shard map covers: `2^128 - 1`, the last 128-bit integer.
 const LAST_HASH_KEY: &str = "340282366920938463463374607431768211455";
@@ -514,6 +517,97 @@ async fn an_on_demand_create_naming_a_shard_count_is_refused() {
             (status, error_code(&response).as_str()),
             (400, "ResourceNotFoundException"),
             "case {case}: a refused create stores nothing, got {status} with {response}"
+        );
+    }
+}
+
+/// A create that names the PROVISIONED capacity mode and NO shard count is refused with the
+/// one sentence that rule has, however the request spells the mode out — and the same create
+/// carrying a `ShardCount` lays down exactly that many open shards.
+#[tokio::test]
+async fn a_provisioned_create_without_a_shard_count_is_refused() {
+    let emulator = Emulator::new();
+    // The rows differ along what the rule generalises over: whether the mode is named
+    // explicitly or left to the service's default, what else the request carries beside the
+    // mode, and how many shards the create that DOES carry a count asks for.
+    let cases: Vec<(&str, Value, i64)> = vec![
+        (
+            "mode-named-and-nothing-else",
+            json!({ "StreamModeDetails": { "StreamMode": STREAM_MODE_PROVISIONED } }),
+            1,
+        ),
+        (
+            "mode-named-with-tags",
+            json!({
+                "StreamModeDetails": { "StreamMode": STREAM_MODE_PROVISIONED },
+                "Tags": { "owner": "provisioned-wording" },
+            }),
+            2,
+        ),
+        // A request naming no `StreamModeDetails` is a provisioned create too: the
+        // `CreateStream` doc makes the shard count the caller's to choose ("For the data
+        // streams with a provisioned mode, you must specify the number of shards"), which is
+        // the mode such a request gets (`crate::state::DEFAULT_STREAM_MODE`).
+        ("no-mode-at-all", json!({}), 3),
+    ];
+
+    for (case, extra, shards) in &cases {
+        let name = format!("provisioned-{case}");
+        let mut body = extra.clone();
+        body["StreamName"] = json!(name);
+        let (code, message) = refusal(&emulator, case, "CreateStream", &body).await;
+        assert_eq!(
+            code, "InvalidArgumentException",
+            "case {case}: expected the modelled invalid-argument, got {code} with {message:?}"
+        );
+        assert_eq!(
+            message, "ShardCount cannot be null when creating stream in PROVISIONED StreamMode",
+            "case {case}: expected the fixed sentence for that rule, got {message:?}"
+        );
+        assert_eq!(
+            message, PROVISIONED_SHARD_COUNT_MESSAGE,
+            "case {case}: the crate's own sentence is the one the wire carries"
+        );
+        // The refusal names no stream and no count: every variable part of this request is
+        // absent from the sentence.
+        assert!(
+            !message.contains(&name) && !message.contains(&shards.to_string()),
+            "case {case}: the sentence is fixed text, got {message:?}"
+        );
+
+        // Nothing was created: the refused name is still free.
+        let (status, response) = emulator
+            .call("DescribeStreamSummary", &json!({ "StreamName": name }))
+            .await;
+        assert_eq!(
+            (status, error_code(&response).as_str()),
+            (400, "ResourceNotFoundException"),
+            "case {case}: a refused create stores nothing, got {status} with {response}"
+        );
+        assert_eq!(
+            error_message(&response),
+            stream_not_found_message(&name),
+            "case {case}: expected the absent-stream wording, got {response}"
+        );
+
+        // The other half of the rule: the SAME create carrying a `ShardCount` is served and
+        // opens that many shards.
+        let mut served = extra.clone();
+        served["StreamName"] = json!(name);
+        served["ShardCount"] = json!(shards);
+        emulator.ok(case, "CreateStream", &served).await;
+    }
+
+    for (case, _, shards) in &cases {
+        let name = format!("provisioned-{case}");
+        poll_until_active(&emulator, case, &name).await;
+        let summary = emulator
+            .ok(case, "DescribeStreamSummary", &json!({ "StreamName": name }))
+            .await;
+        assert_eq!(
+            summary["StreamDescriptionSummary"]["OpenShardCount"].as_i64(),
+            Some(*shards),
+            "case {case}: expected {shards} open shards, got {summary}"
         );
     }
 }

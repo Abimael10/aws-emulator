@@ -7,9 +7,10 @@
 //!
 //! RULE: an accepted call stores the requested `RetentionPeriodHours` on the stream, so
 //! every later read of that stream reports it and the stream's trim horizon is measured
-//! against it. A window outside the documented 24..8760 hours, and one that is not longer
+//! against it. A window outside the documented 24..8760 hours, and one SHORTER
 //! than the window the stream already carries, are refused with the modelled client error
-//! and leave the stored window exactly as it was; the call is served only while the stream
+//! and leave the stored window exactly as it was; a window EQUAL to the one the stream
+//! already carries is accepted as a no-op. The call is served only while the stream
 //! is `ACTIVE`.
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request. `ctx`
@@ -251,11 +252,12 @@ fn increase_retention_period(
         );
     }
 
-    // This operation INCREASES the window: its member "must be more than the current
-    // retention period", so a window that does not lengthen it is refused and the stored
-    // one is left as it was — shortening it is the other operation's to serve.
+    // This operation INCREASES the window: SHORTENING it is the other operation's to
+    // serve, so only a window strictly shorter than the stored one is refused, and the
+    // stored one is left as it was. The guard is strict, so a request naming the window the
+    // stream ALREADY carries is served as a no-op: it shortens nothing.
     let current = stream.retention_period_hours;
-    if requested <= current {
+    if requested < current {
         // A refusal about the stream this request RESOLVED names it by its `StreamName`,
         // which is the variable part the service's messages carry: whichever identifier
         // addressed the stream, the STORED name is what the message reports.
