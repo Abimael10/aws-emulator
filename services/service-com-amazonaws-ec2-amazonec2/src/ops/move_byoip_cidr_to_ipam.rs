@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pool = store.ipam_pools.get(pool_id).cloned().ok_or_else(|| {
             state::id_not_found(
                 state::INVALID_IPAM_POOL_ID_NOT_FOUND,
-                "IPAM pool ID",
+                state::IPAM_POOL_ID_KIND,
                 pool_id,
             )
         })?;

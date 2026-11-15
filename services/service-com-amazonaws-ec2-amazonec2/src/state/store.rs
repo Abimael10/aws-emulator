@@ -3074,6 +3074,22 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// there are … CIDRs provisioned to it" (`DeleteIpamPool`) is asked of, through
     /// [`Self::ipam_pool_provisioned_cidrs`].
     pub ipam_pool_cidrs: BTreeMap<String, IpamPoolCidrRecord>,
+    /// Every CIDR allocated out of one of the account's IPAM pools, by
+    /// `IpamPoolAllocationId` — see [`IpamPoolAllocationRecord`]. Ordered by that id, the
+    /// stable order `GetIpamPoolAllocations` reports and pages over.
+    ///
+    /// `AllocateIpamPoolCidr` is the operation that adds one, and a range provisioned to a
+    /// pool WITHIN another adds one to that other pool — "an allocation is a CIDR assignment
+    /// from an IPAM pool to another IPAM pool or to a resource" ([`IpamPoolAllocation`]) — so
+    /// this is the store "you cannot delete an IPAM pool if there are allocations in it"
+    /// (`DeleteIpamPool`) is asked of, through [`Self::ipam_pool_allocated_cidrs`].
+    pub ipam_pool_allocations: BTreeMap<String, IpamPoolAllocationRecord>,
+    /// An `AllocateIpamPoolCidr` `ClientToken` and the `IpamPoolAllocationId` that call
+    /// minted, so a replay of the same request answers with that allocation instead of
+    /// handing out a second range: "a unique, case-sensitive identifier that you provide to
+    /// ensure the idempotency of the request"
+    /// (`AllocateIpamPoolCidrRequest$ClientToken`).
+    pub ipam_pool_allocation_client_tokens: HashMap<String, String>,
     /// When a `delete-in-progress` IPAM's own REMOVAL falls due, by `IpamId` — the fact the
     /// modelled [`Ipam`] shape carries no member for, stored beside the IPAM under the same
     /// id, on the same monotonic clock and the same [`TRANSITION_DELAY`] as
@@ -3860,6 +3876,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             ipam_pool_client_tokens: HashMap::new(),
             // Nothing has provisioned a CIDR to a pool or deleted an IPAM yet.
             ipam_pool_cidrs: BTreeMap::new(),
+            // Nothing has allocated a CIDR out of a pool either, so no `ClientToken` has
+            // minted an allocation.
+            ipam_pool_allocations: BTreeMap::new(),
+            ipam_pool_allocation_client_tokens: HashMap::new(),
             ipam_delete_at: BTreeMap::new(),
             // Nothing has created a prefix list resolver or a target against one yet.
             ipam_prefix_list_resolvers: BTreeMap::new(),

@@ -2485,6 +2485,13 @@ mod modify_vpc_endpoint_service_configuration;
 // and a walk in `ServiceId` order over every page size the operation serves. Declared at the
 #[path = "all/describe_vpc_endpoint_service_configuration_pages.rs"]
 mod describe_vpc_endpoint_service_configuration_pages;
+// What `AllocateIpamPoolCidr` takes out of an IPAM pool: the one range it assigns out of the
+// space provisioned to the pool, the block it chooses for a request that names a size, the
+// ranges a request allows and disallows, the preview that assigns nothing, the token that
+// names one allocation, and the round trip back through `GetIpamPoolAllocations`. Declared at
+// the tail of this file, which is where every new ec2 suite inserts its lines.
+#[path = "all/allocate_ipam_pool_cidr.rs"]
+mod allocate_ipam_pool_cidr;
 // The published catalog rows of an AMD x86 compute optimized family and of two AWS Graviton
 // families: the EBS performance and attachment limit, the network figures and adapter
 // capabilities, the host features, boot modes and processor frequency of each reported type,

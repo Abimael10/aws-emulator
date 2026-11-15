@@ -2544,6 +2544,15 @@ pub fn invalid_vpc_endpoint_service_id_not_found<E>(service_id: &str) -> Scaffol
 /// holds no pool for.
 pub const INVALID_IPAM_POOL_ID_NOT_FOUND: &str = "InvalidIpamPoolId.NotFound";
 
+/// How an IPAM pool is NAMED in that refusal: by its `ResourceType`
+/// ([`RESOURCE_TYPE_IPAM_POOL`]) followed by `ID`, which is how EC2 words the sentence
+/// [`id_not_found_message`] builds — "The ipam-pool ID '…' does not exist", the sentence the
+/// wire corpus records for a pool that does not exist.
+///
+/// The ONE spelling of that name, so every operation that resolves an `IpamPoolId` words an
+/// unknown one identically.
+pub const IPAM_POOL_ID_KIND: &str = "ipam-pool ID";
+
 /// `InvalidIpamPoolId.Malformed` (HTTP 400).
 pub const INVALID_IPAM_POOL_ID_MALFORMED: &str = "InvalidIpamPoolId.Malformed";
 

@@ -277,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.ipam_pools.contains_key(pool_id) {
                 return Err(state::id_not_found(
                     state::INVALID_IPAM_POOL_ID_NOT_FOUND,
-                    "IPAM pool ID",
+                    state::IPAM_POOL_ID_KIND,
                     pool_id,
                 ));
             }

@@ -240,6 +240,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// description and the allocation resource tags it retained are given back, the CIDR
     /// records that named it go with it ([`Self::remove_ipam_pool_cidrs`]), and so does every
     /// move the clock still owed it.
+    ///
+    /// Every allocation that NAMES the pool goes too
+    /// ([`Self::remove_ipam_pool_allocations_naming`]): the ones made out of it, and the one a
+    /// pool it drew on held for a range assigned to it — neither can outlive the pool it
+    /// names.
     pub(super) fn remove_ipam_pool(&mut self, pool_id: &str) {
         let Some(pool) = self.ipam_pools.remove(pool_id) else {
             return;
@@ -253,6 +258,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 )),
         );
         self.remove_ipam_pool_cidrs(pool_id);
+        self.remove_ipam_pool_allocations_naming(pool_id);
         self.ipam_pool_create_complete_at.remove(pool_id);
         self.ipam_pool_delete_complete_at.remove(pool_id);
         self.release_client_tokens_naming(TokenHolder::IpamPool, pool_id);

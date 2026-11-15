@@ -443,7 +443,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let source = store.ipam_pools.get(source_pool_id).ok_or_else(|| {
                     state::id_not_found(
                         state::INVALID_IPAM_POOL_ID_NOT_FOUND,
-                        "IPAM pool ID",
+                        state::IPAM_POOL_ID_KIND,
                         source_pool_id,
                     )
                 })?;

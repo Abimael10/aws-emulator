@@ -1913,7 +1913,7 @@ use crate::ops::types::{
     InstanceIpv6Prefix, InstanceNetworkInterface, InstanceNetworkInterfaceAttachment,
     InstancePrivateIpAddress,
     Ipam, IpamInternetRegistryAssociation, IpamOperatingRegion, IpamPolicy, IpamPool,
-    IpamPoolCidr,
+    IpamPoolAllocation, IpamPoolCidr,
     IpamPrefixListResolver, IpamPrefixListResolverRule, IpamPrefixListResolverTarget,
     IpamResourceDiscovery, IpamResourceDiscoveryAssociation, IpamResourceTag,
     IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, IpamScope,
@@ -2298,6 +2298,7 @@ macro_rules! taggable_tag_list_stores {
             instance_event_windows.view as "instance-event-window",
             internet_gateways as "internet-gateway",
             ipam_policies.view as "ipam-policy",
+            ipam_pool_allocations.view as "ipam-pool-allocation",
             ipam_pools as "ipam-pool",
             ipam_prefix_list_resolvers as "ipam-prefix-list-resolver",
             ipam_prefix_list_resolver_targets as "ipam-prefix-list-resolver-target",
@@ -2756,6 +2757,12 @@ mod ipam_deletion;
 mod ipam_policy_enablement;
 mod ipam_prefix_list_resolver_deletion;
 mod ipam_pool_cidrs;
+/// The CIDRs ALLOCATED out of an IPAM pool — the store `AllocateIpamPoolCidr` writes and
+/// `GetIpamPoolAllocations` reports, the one reading of which space of a pool is already
+/// assigned, and the one search for a free block inside a pool's space — in a file of its own
+/// rather than as more lines here. Everything it declares is re-exported below, so a handler
+/// reaches these as `crate::state::<item>` like any primitive of this module.
+mod ipam_pool_allocations;
 mod vpc_endpoints_and_transit_gateway_attachments;
 mod prefix_lists_and_dedicated_hosts;
 /// The Dedicated Host RESERVATION store: the states a reservation takes, its id form, the
@@ -2877,6 +2884,7 @@ pub use ipam_deletion::*;
 pub use ipam_policy_enablement::*;
 pub use ipam_prefix_list_resolver_deletion::*;
 pub use ipam_pool_cidrs::*;
+pub use ipam_pool_allocations::*;
 pub use capacity_billing_and_recycle_bins::*;
 pub use image_usage_report_store::*;
 pub use image_block_public_access_and_metadata_defaults::*;

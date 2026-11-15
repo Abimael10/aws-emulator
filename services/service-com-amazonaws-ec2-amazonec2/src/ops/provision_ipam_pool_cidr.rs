@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pool = store.ipam_pools.get(pool_id).cloned().ok_or_else(|| {
             state::id_not_found(
                 state::INVALID_IPAM_POOL_ID_NOT_FOUND,
-                "IPAM pool ID",
+                state::IPAM_POOL_ID_KIND,
                 pool_id,
             )
         })?;
@@ -241,49 +241,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let netmask_length = u32::try_from(netmask_length).unwrap_or(u32::MAX);
                 match pool.source_ipam_pool_id.as_deref() {
                     Some(source_pool_id) => {
-                        // The space the source pool holds, less every range already given OUT
-                        // of it, is what this pool may be given: the first free block of the
-                        // requested size, so two pools drawing on one source pool cannot be
-                        // given overlapping space. What is "taken" is the space handed to the
-                        // pools FED BY this source pool — the source pool's own ranges are the
-                        // space being handed out, and a pool of another source pool's space
-                        // cannot meet it — so the choice is a function of this source pool's
-                        // own allocations.
+                        // The space the source pool holds, less every range already assigned
+                        // OUT of it, is what this pool may be given: the first free block of
+                        // the requested size, so two pools drawing on one source pool cannot
+                        // be given overlapping space. What is "taken" is read through the ONE
+                        // reader of a pool's assigned space
+                        // ([`crate::state::ComAmazonawsEc2Amazonec2State::ipam_pool_allocated_cidrs`]),
+                        // so the space given to the pools FED BY this source pool and the
+                        // space a caller allocated out of it count exactly the same.
                         let space = store.ipam_pool_provisioned_cidrs(source_pool_id);
-                        let fed_by_source: ::std::collections::BTreeSet<&str> = store
-                            .ipam_pools
-                            .iter()
-                            .filter(|(_, held)| {
-                                held.source_ipam_pool_id.as_deref() == Some(source_pool_id)
-                            })
-                            .map(|(fed_pool_id, _)| fed_pool_id.as_str())
-                            .collect();
-                        let taken: Vec<String> = store
-                            .ipam_pool_cidrs
-                            .values()
-                            .filter(|record| {
-                                fed_by_source.contains(record.ipam_pool_id.as_str())
-                                    && state::ipam_pool_cidr_holds_space(
-                                        record.view.state.as_deref(),
-                                    )
-                            })
-                            .filter_map(|record| record.view.cidr.clone())
-                            .collect();
+                        let taken = store.ipam_pool_allocated_cidrs(source_pool_id);
                         // The cost of the search below is the product of the space, the
                         // candidates inside it and the ranges already given out, so it is
                         // charged to ONE budget — the bound the per-range figure alone cannot
                         // give.
                         let mut budget =
                             state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
-                        first_free_block(&space, netmask_length, &taken, &mut budget)
-                            .map_err(|()| search_budget_spent())?
-                            .ok_or_else(|| {
-                                state::invalid_parameter_value(format!(
-                                    "Invalid value '{netmask_length}' for netmaskLength. The \
-                                     source IPAM pool '{source_pool_id}' has no free CIDR of \
-                                     that size"
-                                ))
-                            })?
+                        state::first_free_cidr_block(
+                            &state::FreeCidrBlockSearch {
+                                space: &space,
+                                netmask_length,
+                                taken: &taken,
+                                allowed: &[],
+                                disallowed: &[],
+                            },
+                            &mut budget,
+                        )
+                        .map_err(|_| search_budget_spent())?
+                        .ok_or_else(|| {
+                            state::invalid_parameter_value(format!(
+                                "Invalid value '{netmask_length}' for netmaskLength. The \
+                                 source IPAM pool '{source_pool_id}' has no free CIDR of \
+                                 that size"
+                            ))
+                        })?
                     }
                     None if family == state::ADDRESS_FAMILY_IPV6 => {
                         // "An Amazon-provided IPv6 CIDR block" comes out of the space Amazon
@@ -307,14 +298,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         let space = ::std::slice::from_ref(&amazon);
                         let mut budget =
                             state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
-                        first_free_block(space, netmask_length, &[], &mut budget)
-                            .map_err(|()| search_budget_spent())?
-                            .ok_or_else(|| {
-                                state::internal_error(format!(
-                                    "the Amazon-provided range '{amazon}' holds no \
-                                     /{netmask_length} block"
-                                ))
-                            })?
+                        state::first_free_cidr_block(
+                            &state::FreeCidrBlockSearch {
+                                space,
+                                netmask_length,
+                                taken: &[],
+                                allowed: &[],
+                                disallowed: &[],
+                            },
+                            &mut budget,
+                        )
+                        .map_err(|_| search_budget_spent())?
+                        .ok_or_else(|| {
+                            state::internal_error(format!(
+                                "the Amazon-provided range '{amazon}' holds no \
+                                 /{netmask_length} block"
+                            ))
+                        })?
                     }
                     None => {
                         return Err(state::invalid_parameter_combination(
@@ -416,68 +416,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
     }
 }
-
-/// The first block of `netmask_length` bits inside `space` that meets none of `taken`, or
-/// `None` when the space holds no such block — and `Err` when finding out would cost more than
-/// `budget` allows.
-///
-/// What a `ProvisionIpamPoolCidr` that names a SIZE rather than a range is given: IPAM chooses
-/// the range out of space it holds, so the choice is the first free block of the asked-for size
-/// in the order the space is held — which makes the choice a function of the store rather than
-/// of the call, so two calls never give out overlapping space.
-///
-/// Each candidate comes from [`crate::state::nth_cidr_block_in`], the crate's one reading of a
-/// CIDR's numeric bounds, so one walk serves IPv4 and IPv6 and a block chosen here is spelled
-/// as every other block of this crate is.
-///
-/// The cost of the walk is the PRODUCT of the ranges in `space`, the candidates inside each one
-/// (which the request's netmask length decides) and the ranges in `taken` — all three grown by
-/// what the store holds — so ONE [`crate::state::MatchBudget`] is charged a step per candidate
-/// AND a step per comparison against a held range, exactly as the filter matching of
-/// `crate::ops::get_ipam_pool_cidrs` charges its own product. A spent budget is an answer the
-/// request cannot be served rather than a search that runs on under the state lock.
-fn first_free_block(
-    space: &[String],
-    netmask_length: u32,
-    taken: &[String],
-    budget: &mut crate::state::MatchBudget,
-) -> Result<Option<String>, ()> {
-    for range in space {
-        for index in 0..MAX_CANDIDATE_BLOCKS {
-            if !budget.spend() {
-                return Err(());
-            }
-            let Some(candidate) = crate::state::nth_cidr_block_in(range, netmask_length, index)
-            else {
-                // Past the end of this range — or a size it cannot be cut into at all, which
-                // the first index already answers.
-                break;
-            };
-            let mut free = true;
-            for held in taken {
-                if !budget.spend() {
-                    return Err(());
-                }
-                if crate::state::cidr_blocks_overlap(held, &candidate) {
-                    free = false;
-                    break;
-                }
-            }
-            if free {
-                return Ok(Some(candidate));
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// How many candidate blocks [`first_free_block`] may try inside ONE range.
-///
-/// A bound on the WORK one request can ask for, not an AWS quota: without it a request naming a
-/// long netmask length inside a short range would walk billions of candidates under the state
-/// lock. The budget above bounds the walk ACROSS ranges, which this per-range figure alone
-/// cannot.
-const MAX_CANDIDATE_BLOCKS: u128 = 4_096;
 
 /// The prefix length of an Amazon-provided IPv6 CIDR block: "an Amazon-provided IPv6 CIDR block
 /// with a /56 prefix length" (`CreateVpcRequest$AmazonProvidedIpv6CidrBlock`), which is the

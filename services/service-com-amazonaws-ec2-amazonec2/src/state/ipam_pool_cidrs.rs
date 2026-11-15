@@ -126,6 +126,14 @@ impl ComAmazonawsEc2Amazonec2State {
     /// range's own rather than a caller's claim about it. The clock owes the CIDR
     /// `provisioned` one [`TRANSITION_DELAY`] later, which is RECORDED rather than slept for,
     /// so a caller acting straight after the call still sees the transient state.
+    ///
+    /// A pool created WITHIN another draws this range out of that pool's space, which is "a
+    /// CIDR assignment from an IPAM pool to another IPAM pool" ([`IpamPoolAllocation`]) — so
+    /// the SOURCE pool is given the allocation that assignment is, through the one writer of
+    /// that store ([`Self::allocate_ipam_pool_cidr`]), and the space stops being free of the
+    /// source pool at the same instant this range starts being held by this one. Either both
+    /// records are stored or neither is: the ceilings are asked for the pair before the first
+    /// write.
     pub fn provision_ipam_pool_cidr(
         &mut self,
         pool_id: &str,
@@ -143,7 +151,14 @@ impl ComAmazonawsEc2Amazonec2State {
             netmask_length,
         };
         let charge = ipam_pool_cidr_payload_bytes(&view);
-        if !self.has_ipam_pool_cidr_capacity() || self.would_exceed_stored_bytes(charge) {
+        let assignment = self.ipam_pool_assignment_to(pool_id, cidr);
+        let assignment_charge = assignment
+            .as_ref()
+            .map_or(0, |(_, allocation)| ipam_pool_allocation_payload_bytes(allocation));
+        if !self.has_ipam_pool_cidr_capacity()
+            || self.would_exceed_stored_bytes(charge.saturating_add(assignment_charge))
+            || (assignment.is_some() && !self.has_ipam_pool_allocation_capacity())
+        {
             return None;
         }
         let cidr_id = self.next_id(IPAM_POOL_CIDR_ID_PREFIX);
@@ -160,7 +175,52 @@ impl ComAmazonawsEc2Amazonec2State {
                 )),
             },
         );
+        if let Some((source_pool_id, allocation)) = assignment {
+            // No `ClientToken` names this allocation: the request that made it names the
+            // provisioned RANGE, which is what a replay of it is answered by.
+            self.allocate_ipam_pool_cidr(&source_pool_id, None, allocation);
+        }
         Some(view)
+    }
+
+    /// The allocation the pool `pool_id` draws on holds for the range `cidr` assigned to that
+    /// pool, and the pool holding it — `None` when `pool_id` names a top-level pool, which
+    /// draws on no pool at all.
+    ///
+    /// The one place that assignment is built, so the allocation a provision makes and the one
+    /// a deprovision gives back ([`Self::release_ipam_pool_allocation_of`]) name the same
+    /// range, resource and pool. What the allocation reports about the resource is the POOL's
+    /// own: "the Amazon Web Services Region of the resource" is the Region that pool allocates
+    /// in — its locale, or the Region of its IPAM when it has none — and the owner is the
+    /// account holding it.
+    fn ipam_pool_assignment_to(
+        &self,
+        pool_id: &str,
+        cidr: &str,
+    ) -> Option<(String, IpamPoolAllocation)> {
+        let pool = self.ipam_pools.get(pool_id)?;
+        let source_pool_id = pool.source_ipam_pool_id.clone()?;
+        Some((
+            source_pool_id,
+            IpamPoolAllocation {
+                cidr: Some(cidr.to_string()),
+                // Minted by the store's one writer of an allocation.
+                ipam_pool_allocation_id: None,
+                // "A description of the pool allocation"
+                // (`IpamPoolAllocation$Description`): nobody described this assignment —
+                // provisioning a range to a pool carries no description at all.
+                description: None,
+                resource_id: Some(pool_id.to_string()),
+                resource_type: Some(
+                    IPAM_POOL_ALLOCATION_RESOURCE_TYPE_IPAM_POOL.to_string(),
+                ),
+                resource_region: pool.locale.clone().or_else(|| pool.ipam_region.clone()),
+                resource_owner: pool.owner_id.clone(),
+                // "The tags for the IPAM pool allocation" (`IpamPoolAllocation$Tags`):
+                // nothing tagged this assignment, which no request made.
+                tags: None,
+            },
+        ))
     }
 
     /// Start deprovisioning the range `cidr` of the pool `pool_id` names, and answer the CIDR
@@ -179,6 +239,12 @@ impl ComAmazonawsEc2Amazonec2State {
     /// managed by this pool at once, the way `MoveByoipCidrToIpam` put it in at once, and the
     /// range itself is left exactly as it was — it is once again a range the account holds
     /// outside IPAM.
+    ///
+    /// A range leaving a pool created WITHIN another is space that pool no longer holds, so the
+    /// allocation the source pool held for it goes back
+    /// ([`Self::release_ipam_pool_allocation_of`]) — at this instant rather than when the
+    /// deprovision settles, because a `pending-deprovision` range already holds no space
+    /// ([`ipam_pool_cidr_holds_space`]).
     pub fn deprovision_ipam_pool_cidr(
         &mut self,
         pool_id: &str,
@@ -188,12 +254,23 @@ impl ComAmazonawsEc2Amazonec2State {
             .ipam_pool_cidr(pool_id, cidr)
             .and_then(|record| record.view.ipam_pool_cidr_id.clone());
         if let Some(cidr_id) = held {
-            let record = self.ipam_pool_cidrs.get_mut(&cidr_id)?;
-            record.view.state = Some(IPAM_POOL_CIDR_STATE_PENDING_DEPROVISION.to_string());
-            record.pending = Some(PendingStateMove::starting_now(
-                IPAM_POOL_CIDR_STATE_DEPROVISIONED,
-            ));
-            return Some(record.view.clone());
+            let view = {
+                let record = self.ipam_pool_cidrs.get_mut(&cidr_id)?;
+                record.view.state =
+                    Some(IPAM_POOL_CIDR_STATE_PENDING_DEPROVISION.to_string());
+                record.pending = Some(PendingStateMove::starting_now(
+                    IPAM_POOL_CIDR_STATE_DEPROVISIONED,
+                ));
+                record.view.clone()
+            };
+            if let Some(source_pool_id) = self
+                .ipam_pools
+                .get(pool_id)
+                .and_then(|pool| pool.source_ipam_pool_id.clone())
+            {
+                self.release_ipam_pool_allocation_of(&source_pool_id, pool_id, cidr);
+            }
+            return Some(view);
         }
         let byoip = self.byoip_cidrs.get_mut(cidr)?;
         if byoip.byoip_cidr.ipam_pool_id.as_deref() != Some(pool_id) {

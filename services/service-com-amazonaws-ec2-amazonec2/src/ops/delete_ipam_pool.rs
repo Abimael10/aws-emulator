@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pool = store.ipam_pools.get(pool_id).cloned().ok_or_else(|| {
             state::id_not_found(
                 state::INVALID_IPAM_POOL_ID_NOT_FOUND,
-                "IPAM pool ID",
+                state::IPAM_POOL_ID_KIND,
                 pool_id,
             )
         })?;
@@ -224,18 +224,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // including provisioned CIDRs, allocations, and other pools" (`Cascade`): every
             // pool within this one is deleted on the same terms as this one — deepest first,
             // so no pool is left inside a pool that is already going — and the CIDRs
-            // provisioned to each of them are deprovisioned.
+            // provisioned to each of them are deprovisioned and the allocations made out of
+            // each of them released.
             for inner_pool_id in &within {
                 store.deprovision_ipam_pool_cidrs(inner_pool_id);
+                store.release_ipam_pool_allocations(inner_pool_id);
                 store.begin_ipam_pool_deletion(inner_pool_id);
             }
             store.deprovision_ipam_pool_cidrs(pool_id);
+            store.release_ipam_pool_allocations(pool_id);
         } else {
             // "You cannot delete an IPAM pool if there are allocations in it or CIDRs
-            // provisioned to it. To deprovision pool CIDRs, see DeprovisionIpamPoolCidr"
-            // (`DeleteIpamPool`), and a pool within this one is a resource within it that
-            // `Cascade` is the one way to delete along with it. EC2 words both refusals the
-            // same way: the action, the resource it is not valid for, and what is still in it.
+            // provisioned to it. To release allocations, see ReleaseIpamPoolAllocation. To
+            // deprovision pool CIDRs, see DeprovisionIpamPoolCidr" (`DeleteIpamPool`), and a
+            // pool within this one is a resource within it that `Cascade` is the one way to
+            // delete along with it. EC2 words every one of those refusals the same way: the
+            // action, the resource it is not valid for, and what is still in it — and they are
+            // asked in the order a caller empties the pool, allocations first, because a range
+            // is allocated OUT OF space provisioned to the pool, so the space cannot go while
+            // an allocation of it is still there.
+            //
+            // The allocations are read through the one reader of which space of a pool is
+            // assigned ([`state::ComAmazonawsEc2Amazonec2State::ipam_pool_allocated_cidrs`]),
+            // so a range a caller allocated out of the pool blocks a delete exactly as a range
+            // given to a pool within it does.
+            if !store.ipam_pool_allocated_cidrs(pool_id).is_empty() {
+                return Err(state::dependency_violation(format!(
+                    "The specified action is not valid for {pool_id}. There are one or more \
+                     allocations in the pool."
+                )));
+            }
             if !store.ipam_pool_provisioned_cidrs(pool_id).is_empty() {
                 return Err(state::dependency_violation(format!(
                     "The specified action is not valid for {pool_id}. There are one or more \

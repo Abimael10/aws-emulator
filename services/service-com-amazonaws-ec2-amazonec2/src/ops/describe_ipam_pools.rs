@@ -274,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::state::id_not_found(
                 crate::state::INVALID_IPAM_POOL_ID_NOT_FOUND,
-                "IPAM pool ID",
+                crate::state::IPAM_POOL_ID_KIND,
                 unknown,
             ));
         }

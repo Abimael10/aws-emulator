@@ -912,7 +912,7 @@ async fn a_pool_id_that_resolves_to_nothing_is_refused_in_its_own_words() {
             "a well-formed pool id the account holds no pool for",
             UNKNOWN_POOL_ID,
             INVALID_IPAM_POOL_ID_NOT_FOUND,
-            format!("The IPAM pool ID '{UNKNOWN_POOL_ID}' does not exist"),
+            format!("The ipam-pool ID '{UNKNOWN_POOL_ID}' does not exist"),
         ),
     ];
 
