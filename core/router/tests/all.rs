@@ -22,6 +22,27 @@
 // each declaration into `tests/all/`.
 //! Single integration-test target for the router.
 //!
+//! Put a new suite at `tests/all/<name>.rs` and declare it below with a
+//! `#[path]`/`mod` pair, keeping the list sorted: one pair per suite and nothing
+//! else, so a landing has one place to insert and nothing to keep consistent.
+//! A suite that is not declared here compiles nowhere and its tests never run. A
+//! suite left at the top level of `tests/` fails the build. Declare each suite
+//! exactly ONCE: this is one crate root, so a second `mod` for the same name is
+//! `E0428` and fails every suite in this target. An inner doc comment (`//!`) is
+//! legal only BEFORE the first item, so THIS header is the only place one may
+//! stand — past it, `//!` is `E0753` and compiles nothing, so a note further down
+//! must be an ordinary `//` comment, or better still belong here instead.
+//! `all/all_rs_declares_each_suite_once.rs` and
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both halves of
+//! that, for this file and for every service crate's `tests/all.rs`, so check
+//! there rather than leaving a note below.
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a
+//! SIBLING (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is
+//! what points each declaration into `tests/all/`.
+//! The notes concurrent landings had appended to the END of this file — fragments
+//! of this header re-typed with `//!`, which is `E0753` and compiled no suite of
+//! this target, and bookkeeping about declarations that are no longer duplicated —
+//! live in `all/appended_notes.rs` rather than here.
 //! Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]` /
 //! `mod` pair, keeping the list sorted: one pair per suite and NOTHING else, so a
 //! landing has one place to insert and nothing to keep consistent.

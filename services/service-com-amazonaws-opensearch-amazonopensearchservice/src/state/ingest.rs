@@ -742,7 +742,9 @@ const TYPE_OBJECT: &str = "object";
 /// * a numeric field takes a number, and a string a number can be read from — numeric
 ///   fields coerce by default ("coerce: try to convert strings to numbers");
 /// * a boolean field takes `true`/`false` and the strings spelling them, and no number;
-/// * a date field takes epoch milliseconds or a date-formatted string;
+/// * a date field takes a value of the format set its mapping declares — the engine's own
+///   default pair where it declares none ([`super::date_values::DEFAULT_FORMATS`]), so an
+///   ISO-8601 instant whose time part is optional and epoch milliseconds alike;
 /// * an `ip` field takes a string holding an IP address;
 /// * an object field takes an object;
 /// * any other type — a geo shape, a vector, a binary blob — is one this emulator does
@@ -778,11 +780,9 @@ fn parses_as(mapped_type: &str, value: &::serde_json::Value) -> bool {
             Value::String(text) => matches!(text.as_str(), "true" | "false" | ""),
             _ => false,
         },
-        "date" | "date_nanos" => match value {
-            Value::Number(_) => true,
-            Value::String(text) => parses_as_date(text),
-            _ => false,
-        },
+        kind if super::date_values::is_date_type(kind) => {
+            super::date_values::instant_millis(value).is_some()
+        }
         "ip" => match value {
             Value::String(text) => text.parse::<::std::net::IpAddr>().is_ok(),
             _ => false,
@@ -790,19 +790,6 @@ fn parses_as(mapped_type: &str, value: &::serde_json::Value) -> bool {
         TYPE_OBJECT | "nested" | "flat_object" => value.is_object(),
         _ => true,
     }
-}
-
-/// Whether `text` holds a date a date field's default format reads: the engine's
-/// `strict_date_optional_time||epoch_millis`, so an ISO 8601 instant or a count of epoch
-/// milliseconds.
-///
-/// The instant is parsed by the runtime's own reader of that format rather than by hand.
-fn parses_as_date(text: &str) -> bool {
-    if text.trim().parse::<i64>().is_ok() {
-        return true;
-    }
-    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
-        .is_ok()
 }
 
 /// How much of `value` a refusal quotes, bounded by [`MAX_VALUE_PREVIEW_BYTES`] so the

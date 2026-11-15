@@ -97,6 +97,8 @@ mod data_source_kinds;
 mod data_source_registry;
 #[path = "all/data_source_updates.rs"]
 mod data_source_updates;
+#[path = "all/date_mapped_fields.rs"]
+mod date_mapped_fields;
 #[path = "all/default_application_setting.rs"]
 mod default_application_setting;
 #[path = "all/detached_attachment_read_refusal.rs"]

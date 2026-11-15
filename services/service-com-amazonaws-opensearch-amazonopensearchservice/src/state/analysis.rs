@@ -1132,6 +1132,16 @@ impl IndexAnalysis {
         path.join(".")
     }
 
+    /// The TYPE the mappings map `field` as, or `None` where they map no such field or give
+    /// it no type of its own.
+    ///
+    /// What a value of the field IS rather than how it is written: the one place a comparison
+    /// — a term, a range bound, an order — asks what kind of thing it is comparing, so every
+    /// one of them reads the mapping the same way.
+    pub fn mapped_type(&self, field: &str) -> Option<&str> {
+        self.field(field)?.get(MAPPING_TYPE)?.as_str()
+    }
+
     /// Whether the field `field` holds its value WHOLE rather than analyzing it — a
     /// keyword, a number, a boolean, a date — which is what decides whether a `match` on it
     /// is analyzed at all. A field the mappings do not map is analyzed, because a

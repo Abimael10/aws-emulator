@@ -190,6 +190,10 @@ mod internal_users;
 mod security_records;
 use security_records::{security_role, security_role_mapping};
 
+/// The query-string syntax a `query_string` clause and the URI form of a search both state
+/// their clauses in.
+mod query_string;
+
 /// The most bytes one data-plane request body is read as JSON.
 ///
 /// The emulator's OWN bound, like [`crate::state::INDEX_QUOTA`]: every byte lives in this
@@ -3572,7 +3576,15 @@ fn selected_documents(
         ..
     } = *asked;
     let body = request.json()?.unwrap_or_else(|| json!({}));
-    let select = selector(body.get("query"), 0)?;
+    // The query a request states in its BODY, or — where it states none there — the one its
+    // QUERY STRING states, which is the URI form of a search ([`query_string`]).
+    let select = match body.get("query") {
+        Some(query) => selector(Some(query), 0)?,
+        None => match query_string::requested(request)? {
+            Some(select) => select,
+            None => selector(None, 0)?,
+        },
+    };
     let patterns = named_patterns(index_name)?;
     // A `BTreeSet` of names, so an index named twice is scanned once and the order is the
     // store's own: two reads of one domain report the same documents in the same order.
@@ -3593,6 +3605,15 @@ fn selected_documents(
         }
         named.extend(matched_indexes(domain, pattern)?);
     }
+    // A clause naming a field PATTERN — a `multi_match` over one, a query-string clause that
+    // names no field — asks its question of the fields the NAMED INDEXES map, because which
+    // fields such a pattern names is a property of those mappings and not of the query. The
+    // expansion is charged against the engine's own clause ceiling AS IT RUNS
+    // ([`Selector::expanded`]) and the tree it produces is counted against that ceiling again
+    // below, so neither a pattern nor the mappings it meets can multiply what one request
+    // evaluates per document.
+    let mut breadth = MAX_QUERY_CLAUSES;
+    let select = select.expanded(&mapped_fields(domain, &named), &mut breadth)?;
     // A query's BREADTH is bounded as its depth is: past the engine's own clause ceiling
     // the query is refused rather than evaluated clause by clause against every document,
     // so the work one request causes is bounded by this constant and not by the size of its
@@ -3635,6 +3656,16 @@ fn selected_documents(
                 &index.index_name,
                 ingest::ILLEGAL_ARGUMENT_EXCEPTION,
                 &fielddata_disabled(field),
+            )));
+        }
+        // A bound the field it is compared against reads no value of its type from states no
+        // limit at all, so the request is refused rather than answered from a comparison
+        // nothing could take — per shard, for the same reason the order above is.
+        if let Some(bound) = select.unreadable_bound(&analysis) {
+            return Err(Box::new(all_shards_failed(
+                &index.index_name,
+                PARSE_EXCEPTION,
+                &unreadable_date(&bound),
             )));
         }
         // What the caller may SEE of THIS index, which is its own roles' narrowing of it:
@@ -3735,6 +3766,35 @@ impl<'r> Reading<'r> {
             admits,
         })
     }
+}
+
+/// The sentence the engine refuses a value a date field reads no instant from with, naming
+/// the value and the format set it was read against.
+fn unreadable_date(value: &str) -> String {
+    format!(
+        "failed to parse date field [{value}] with format [{}]",
+        state::date_values::DEFAULT_FORMATS
+    )
+}
+
+/// The fields the indexes `named` MAP, which is the set a field pattern a query carries
+/// expands against ([`Selector::expanded`]).
+///
+/// The union over the indexes the request reads, de-duplicated, and bounded by
+/// [`MAX_MATCHED_FIELDS`]: a pattern is asked of every field it names of every document the
+/// scan reaches, so the breadth it can reach is a constant rather than the mapping document a
+/// caller wrote times the indexes a path names. A field one index of the set maps and another
+/// does not is simply held by no document of that other index, so asking it there selects
+/// nothing.
+fn mapped_fields(domain: &Domain, named: &BTreeSet<&str>) -> Vec<String> {
+    let mut fields: BTreeSet<String> = BTreeSet::new();
+    for index in named.iter().filter_map(|name| domain.indexes.get(*name)) {
+        if fields.len() >= MAX_MATCHED_FIELDS {
+            break;
+        }
+        fields.extend(state::analysis::IndexAnalysis::of(&index.schema).mapped_fields());
+    }
+    fields.into_iter().take(MAX_MATCHED_FIELDS).collect()
 }
 
 /// The sentence the engine refuses a sort or an aggregation on an analyzed text field with:
@@ -4036,6 +4096,13 @@ impl<'a> Terms<'a> {
         self.analysis.holds_whole_values(field)
     }
 
+    /// The TYPE the index maps `field` as, which is what decides how a clause COMPARES its
+    /// values — an instant as an instant, a number as a number — rather than how it analyzes
+    /// them.
+    fn mapped_type(&self, field: &str) -> Option<&str> {
+        self.analysis.mapped_type(field)
+    }
+
     /// The path in a document's source the field `field` takes its values from: its own,
     /// or — for a MULTI-FIELD — the field it is another indexing of.
     fn source_field(&self, field: &str) -> String {
@@ -4134,411 +4201,6 @@ fn unresolved_chain(unresolved: &state::analysis::Unresolved) -> Box<RtResponse>
         ingest::ILLEGAL_ARGUMENT_EXCEPTION,
         &unresolved.message(false),
     ))
-}
-
-/// Which documents a query selects.
-///
-/// The vocabulary is bounded and stated: `match_all`, `term`, `terms`, `match`, `ids` and
-/// a `bool` composing them. A clause outside it is answered the way the engine answers a
-/// query name it has no handler registered for, rather than silently selecting everything
-/// — a search whose clause this emulator cannot evaluate must not look like one it did.
-#[derive(Debug)]
-enum Selector {
-    /// Every document.
-    All,
-    /// A field's value equals one of these, compared as text so a number and its decimal
-    /// spelling are the same value — which is how a `keyword` term and a `match` on a
-    /// numeric field both behave.
-    Equals { field: String, values: Vec<String> },
-    /// A field's text, ANALYZED, shares a term with this text analyzed the same way: what a
-    /// `match` asks, and what a `match_phrase` asks of the terms in order (`phrase`).
-    Analyzed {
-        field: String,
-        text: String,
-        phrase: bool,
-    },
-    /// The document's id is one of these.
-    Ids(Vec<String>),
-    /// Every one of these selects the document.
-    All_(Vec<Selector>),
-    /// None of these may select the document.
-    None_(Vec<Selector>),
-    /// Any one of these selects the document.
-    Any(Vec<Selector>),
-}
-
-impl Selector {
-    /// Whether this selector selects the document `id`/`source`, as the index's own
-    /// analysis chain turns that document's text into terms (`terms`).
-    fn matches(&self, id: &str, source: &Value, terms: &Terms) -> bool {
-        match self {
-            Self::All => true,
-            Self::Equals { field, values } => terms
-                .texts(source, field)
-                .iter()
-                .any(|held| values.iter().any(|wanted| wanted == held)),
-            Self::Analyzed {
-                field,
-                text,
-                phrase,
-            } => {
-                // A field the index holds its values WHOLE for is not analyzed, so the
-                // clause is the equality a `term` on it would be.
-                let Some(wanted) = terms.query(field, text) else {
-                    return terms.texts(source, field).contains(text);
-                };
-                if wanted.is_empty() {
-                    // Every term of the query was dropped by the chain — a text of nothing
-                    // but stop words — so there is no term left for a document to carry.
-                    return false;
-                }
-                terms.texts(source, field).iter().any(|held| {
-                    let held = terms.document(field, held).unwrap_or_default();
-                    if *phrase {
-                        held.windows(wanted.len()).any(|run| run == wanted)
-                    } else {
-                        wanted.iter().any(|term| held.contains(term))
-                    }
-                })
-            }
-            Self::Ids(ids) => ids.iter().any(|wanted| wanted == id),
-            Self::All_(clauses) => clauses
-                .iter()
-                .all(|clause| clause.matches(id, source, terms)),
-            Self::None_(clauses) => !clauses
-                .iter()
-                .any(|clause| clause.matches(id, source, terms)),
-            Self::Any(clauses) => clauses
-                .iter()
-                .any(|clause| clause.matches(id, source, terms)),
-        }
-    }
-
-    /// Collect the clauses this selector asks an ANALYZED question with — the field each
-    /// names and the text it asks about — so each index resolves its chains and analyzes
-    /// each of those texts once before its documents are scanned.
-    fn analyzed_clauses(&self, into: &mut BTreeSet<(String, String)>) {
-        match self {
-            Self::Analyzed { field, text, .. } => {
-                into.insert((field.clone(), text.clone()));
-            }
-            Self::All_(clauses) | Self::None_(clauses) | Self::Any(clauses) => {
-                for clause in clauses {
-                    clause.analyzed_clauses(into);
-                }
-            }
-            Self::All | Self::Equals { .. } | Self::Ids(_) => {}
-        }
-    }
-
-    /// Collect what this query asks of each FIELD, as this index's chains analyze it: the
-    /// terms a fragment on that field is wrapped around.
-    ///
-    /// A clause asking an analyzed question contributes the terms its text produces through
-    /// the field's own search chain, and one asking for a value whole contributes that value;
-    /// a `must_not` clause contributes nothing, because a document is selected by NOT
-    /// carrying its terms, and an `ids` clause names no field at all.
-    fn wanted(&self, terms: &Terms, into: &mut Wanted) {
-        match self {
-            Self::All | Self::Ids(_) | Self::None_(_) => {}
-            Self::Equals { field, values } => {
-                into.entry(field.clone())
-                    .or_default()
-                    .extend(values.iter().cloned());
-            }
-            Self::Analyzed { field, text, .. } => {
-                let asked = into.entry(field.clone()).or_default();
-                match terms.query(field, text) {
-                    Some(analyzed) => asked.extend(analyzed.iter().cloned()),
-                    None => {
-                        asked.insert(text.clone());
-                    }
-                }
-            }
-            Self::All_(clauses) | Self::Any(clauses) => {
-                for clause in clauses {
-                    clause.wanted(terms, into);
-                }
-            }
-        }
-    }
-
-    /// How many clauses this selector is EVALUATED as: every one of them is asked of every
-    /// document the scan reaches, so this is the breadth [`MAX_QUERY_CLAUSES`] bounds.
-    ///
-    /// Every clause counts, whatever it selects: a clause that selects every document is
-    /// still re-asked per document, so one that counted nothing would let a body compose as
-    /// many of them as it liked and multiply the scan by a number the caller chose. A `bool`
-    /// composition counts the clauses under it rather than itself, as the engine's own
-    /// ceiling counts them; what bounds the compositions THEMSELVES is the number of clauses
-    /// one body may name at all ([`MAX_QUERY_CLAUSE_NODES`], counted as the query is read).
-    fn clauses(&self) -> usize {
-        match self {
-            Self::All | Self::Equals { .. } | Self::Analyzed { .. } | Self::Ids(_) => 1,
-            Self::All_(clauses) | Self::None_(clauses) | Self::Any(clauses) => clauses
-                .iter()
-                .map(Self::clauses)
-                .fold(0_usize, usize::saturating_add),
-        }
-    }
-}
-
-/// The scalar values a document holds at `field`, which may be a dotted path into nested
-/// objects and may hold an array of values.
-fn held_values(source: &Value, field: &str) -> Vec<Value> {
-    let mut node = source;
-    for segment in field.split('.') {
-        match node.get(segment) {
-            Some(next) => node = next,
-            None => return Vec::new(),
-        }
-    }
-    match node {
-        Value::Array(elements) => elements.clone(),
-        other => vec![other.clone()],
-    }
-}
-
-/// A scalar's text, which is what a term is compared against.
-fn scalar_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// The selector the query clause `query` states.
-///
-/// The clauses are counted AS THEY ARE READ, against the number one body may name at all
-/// ([`MAX_QUERY_CLAUSE_NODES`]): a body past it is refused while it is being read rather than
-/// materialised first, so neither the tree this holds nor the per-document work walking it
-/// causes is sized by the body a caller sent. A `bool` composition counts here even though
-/// the engine's own clause ceiling does not count it ([`Selector::clauses`]), because walking
-/// its list is work every document pays for.
-fn selector(query: Option<&Value>, depth: usize) -> Result<Selector, Box<RtResponse>> {
-    let mut counted = Counted::default();
-    read_selector(query, depth, &mut counted)
-}
-
-/// What one reading of a query body has counted: the clauses the scan will EVALUATE per
-/// document, and the clause objects the body names at all.
-///
-/// Two counts because the two ceilings are different things. The engine's own
-/// `max_clause_count` counts the clauses a composition holds and not the composition itself,
-/// which is what [`MAX_QUERY_CLAUSES`] is; walking a composition's own lists is still work
-/// every document pays for, so the objects are counted too, against the emulator's own
-/// [`MAX_QUERY_CLAUSE_NODES`].
-#[derive(Debug, Default)]
-struct Counted {
-    evaluated: usize,
-    named: usize,
-}
-
-impl Counted {
-    /// Count one clause OBJECT the body names, refusing past what one body may name.
-    fn named(&mut self) -> Result<(), Box<RtResponse>> {
-        self.named = self.named.saturating_add(1);
-        if self.named > MAX_QUERY_CLAUSE_NODES {
-            return Err(Box::new(error(
-                400,
-                ingest::ILLEGAL_ARGUMENT_EXCEPTION,
-                &format!("a query may name at most {MAX_QUERY_CLAUSE_NODES} clauses"),
-            )));
-        }
-        Ok(())
-    }
-
-    /// Count one clause the scan asks of every document, refusing past the engine's own
-    /// ceiling.
-    fn evaluated(&mut self) -> Result<(), Box<RtResponse>> {
-        self.evaluated = self.evaluated.saturating_add(1);
-        if self.evaluated > MAX_QUERY_CLAUSES {
-            return Err(too_many_clauses());
-        }
-        Ok(())
-    }
-}
-
-/// The refusal a query naming more clauses than the engine evaluates earns, worded as the
-/// engine words it.
-fn too_many_clauses() -> Box<RtResponse> {
-    Box::new(error(
-        400,
-        TOO_MANY_CLAUSES,
-        &format!("maxClauseCount is set to {MAX_QUERY_CLAUSES}"),
-    ))
-}
-
-/// The selector a query clause states, `depth` levels down a `bool` composition, with
-/// `counted` carrying what the whole walk has read so far.
-fn read_selector(
-    query: Option<&Value>,
-    depth: usize,
-    counted: &mut Counted,
-) -> Result<Selector, Box<RtResponse>> {
-    counted.named()?;
-    // The engine's own bound on how far a `bool` composition may nest
-    // (`indices.query.bool.max_nested_depth`), which is what keeps the walk below from
-    // recursing on a depth the caller chose.
-    if depth > MAX_BOOL_NESTING {
-        return Err(Box::new(error(
-            400,
-            ingest::ILLEGAL_ARGUMENT_EXCEPTION,
-            &format!(
-                "The nested depth of the query exceeds the maximum nested depth for bool \
-                 queries [{MAX_BOOL_NESTING}]"
-            ),
-        )));
-    }
-    let Some(query) = query else {
-        counted.evaluated()?;
-        return Ok(Selector::All);
-    };
-    let Value::Object(clause) = query else {
-        return Err(Box::new(error(
-            400,
-            PARSING_EXCEPTION,
-            "failed to parse: expected a query to be a JSON object",
-        )));
-    };
-    let Some((name, value)) = clause.iter().next() else {
-        counted.evaluated()?;
-        return Ok(Selector::All);
-    };
-    // Every clause but a composition is one the scan asks of each document — including one
-    // that selects every document, which is asked as often as any other.
-    if name != "bool" {
-        counted.evaluated()?;
-    }
-    match name.as_str() {
-        "match_all" => Ok(Selector::All),
-        // A `term` asks for the field's value exactly as it is stored; a `match` and a
-        // `match_phrase` ask the question of the TERMS the field's analyzer produces, which
-        // is what makes an index's own analysis settings decide what a query finds.
-        "term" => {
-            let (field, wanted) = single_field(value)?;
-            let wanted = wanted
-                .get("value")
-                .or_else(|| wanted.get("query"))
-                .unwrap_or(&wanted)
-                .clone();
-            Ok(Selector::Equals {
-                field,
-                values: vec![scalar_text(&wanted)],
-            })
-        }
-        "match" | "match_phrase" => {
-            let (field, wanted) = single_field(value)?;
-            let wanted = wanted
-                .get("query")
-                .or_else(|| wanted.get("value"))
-                .unwrap_or(&wanted)
-                .clone();
-            Ok(Selector::Analyzed {
-                field,
-                text: scalar_text(&wanted),
-                phrase: name == "match_phrase",
-            })
-        }
-        "terms" => {
-            let (field, wanted) = single_field(value)?;
-            let values = match wanted {
-                Value::Array(elements) => {
-                    // The engine's own ceiling on how many terms ONE such clause may name,
-                    // past which it refuses the query rather than materialising the array
-                    // and comparing every one of them against every document.
-                    if elements.len() > MAX_TERMS_COUNT {
-                        return Err(Box::new(error(
-                            400,
-                            ingest::ILLEGAL_ARGUMENT_EXCEPTION,
-                            &format!(
-                                "The number of terms [{}] used in the Terms Query request \
-                                 has exceeded the allowed maximum of [{MAX_TERMS_COUNT}]. \
-                                 This maximum can be set by changing the \
-                                 [index.max_terms_count] index level setting.",
-                                elements.len()
-                            ),
-                        )));
-                    }
-                    elements.iter().map(scalar_text).collect()
-                }
-                other => vec![scalar_text(&other)],
-            };
-            Ok(Selector::Equals { field, values })
-        }
-        "ids" => {
-            let listed = value.get("values").and_then(Value::as_array);
-            // An `ids` clause names its ids one by one and every one of them is compared
-            // against every document the scan reaches, so it is bounded the same way — by
-            // the same count, stated as the emulator's own bound, since the engine words no
-            // ceiling of its own for this clause.
-            if listed.is_some_and(|values| values.len() > MAX_TERMS_COUNT) {
-                return Err(Box::new(error(
-                    400,
-                    ingest::ILLEGAL_ARGUMENT_EXCEPTION,
-                    &format!(
-                        "an ids clause may name at most {MAX_TERMS_COUNT} ids, and this one \
-                         names {}",
-                        listed.map_or(0, Vec::len)
-                    ),
-                )));
-            }
-            Ok(Selector::Ids(
-                listed
-                    .map(|values| values.iter().map(scalar_text).collect())
-                    .unwrap_or_default(),
-            ))
-        }
-        "bool" => {
-            let clauses = |name: &str, counted: &mut Counted| -> Result<Vec<Selector>, Box<RtResponse>> {
-                let listed = match value.get(name) {
-                    None => Vec::new(),
-                    Some(Value::Array(elements)) => elements.clone(),
-                    Some(one) => vec![one.clone()],
-                };
-                listed
-                    .iter()
-                    .map(|one| read_selector(Some(one), depth.saturating_add(1), counted))
-                    .collect()
-            };
-            let mut required = clauses("must", counted)?;
-            required.extend(clauses("filter", counted)?);
-            let forbidden = clauses("must_not", counted)?;
-            let optional = clauses("should", counted)?;
-            let mut composed = vec![Selector::All_(required), Selector::None_(forbidden)];
-            if !optional.is_empty() {
-                composed.push(Selector::Any(optional));
-            }
-            Ok(Selector::All_(composed))
-        }
-        other => Err(Box::new(error(
-            400,
-            PARSING_EXCEPTION,
-            &format!("no [query] registered for [{other}]"),
-        ))),
-    }
-}
-
-/// The one field a `term`/`terms`/`match` clause names, and the value it wants.
-fn single_field(value: &Value) -> Result<(String, Value), Box<RtResponse>> {
-    match value {
-        Value::Object(members) if members.len() == 1 => members
-            .iter()
-            .next()
-            .map(|(field, wanted)| (field.clone(), wanted.clone()))
-            .ok_or_else(|| {
-                Box::new(error(
-                    400,
-                    PARSING_EXCEPTION,
-                    "[term] query does not support an empty field list",
-                ))
-            }),
-        _ => Err(Box::new(error(
-            400,
-            PARSING_EXCEPTION,
-            "[term] query must name exactly one field",
-        ))),
-    }
 }
 
 /// A `PUT`, `GET` or `DELETE` on an index template, in the composable
@@ -4879,3 +4541,7 @@ fn rendered(status: u16, body: &Value) -> RtResponse {
 
 #[cfg(test)]
 mod tests;
+/// WHICH documents a query selects: the clause tree a request's query states, and how that
+/// tree is asked of one document of one index.
+mod selection;
+use selection::*;

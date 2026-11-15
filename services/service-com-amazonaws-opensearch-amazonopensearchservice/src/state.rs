@@ -45,6 +45,11 @@ use std::time::{Duration, SystemTime};
 pub mod authorization;
 pub mod ingest;
 
+/// The INSTANT a value of a field mapped as a date stands for: the format set such a
+/// mapping accepts, and the one parser every path that compares such a value reads it
+/// through.
+pub mod date_values;
+
 /// Fine-grained access control on a domain: the records its security API holds, and the
 /// one decision every request that reaches the domain is taken by.
 pub mod fgac;

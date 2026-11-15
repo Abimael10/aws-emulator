@@ -254,16 +254,34 @@ impl SortKey {
     /// A field holding SEVERAL values orders the document by one of them — the smallest on an
     /// ascending key and the largest on a descending one, which is the sort mode's own
     /// default — and a document holding none orders by no value at all.
+    ///
+    /// A field mapped as an INSTANT orders by the instant its value stands for, answered as
+    /// the milliseconds since the epoch the engine answers such a key's sort value in: the
+    /// form the document happened to write the instant in is a spelling, so two documents
+    /// writing one day differently order as one value rather than as their texts.
     fn value(&self, terms: &Terms<'_>, source: &Value, ordinal: usize) -> Value {
         match self.field.as_str() {
             SCORE_KEY => json!(MATCH_SCORE),
             DOC_KEY => json!(ordinal),
             field => {
+                let instants = terms
+                    .mapped_type(field)
+                    .is_some_and(crate::state::date_values::is_date_type);
                 let mut best: Option<Value> = None;
                 for held in terms.held(source, field) {
                     if held.is_null() {
                         continue;
                     }
+                    let held = if instants {
+                        match crate::state::date_values::instant_millis(&held) {
+                            Some(at) => json!(at),
+                            // A value the field reads no instant from orders the document by
+                            // no value at all, as a missing one does.
+                            None => continue,
+                        }
+                    } else {
+                        held
+                    };
                     let better = match &best {
                         None => true,
                         Some(current) => matches!(
