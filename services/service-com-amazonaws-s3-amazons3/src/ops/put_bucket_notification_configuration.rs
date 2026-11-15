@@ -3,10 +3,11 @@
 //! @op PutBucketNotificationConfiguration
 //! Sets a bucket's whole event notification configuration, replacing whatever it carried
 //! before, and answers the modelled 200 with an empty body. Every destination the container
-//! names is validated against the service that owns it first — it has to BE there, and its
-//! resource policy has to let Amazon S3 publish this bucket's notifications to it — and a
-//! container naming one that fails either is refused whole with `InvalidArgument` (400),
-//! naming each failed destination and its reason, rather than recorded.
+//! names is validated against the service that owns it first — it has to BE there, its
+//! resource policy has to let Amazon S3 publish this bucket's notifications to it, and the
+//! KMS key a destination seals its messages under has to let that publication be encrypted —
+//! and a container naming one that fails any of them is refused whole with `InvalidArgument`
+//! (400), naming each failed destination and its reason, rather than recorded.
 //! `GetBucketNotificationConfiguration` reports what this stored.
 //!
 //! Two values of the container Amazon S3 judges ITSELF rather than against the published
@@ -349,6 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the level below it in the serving task's own frame, which is what makes a
             // legitimately nested put exhaust the stack rather than answer.
             let unvalidated = Box::pin(crate::state::notifications::unvalidated_destinations(
+                &*self.engine,
                 ctx.callback(),
                 &input.bucket,
                 &bucket_region,

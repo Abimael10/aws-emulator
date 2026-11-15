@@ -46,6 +46,13 @@
 //! and the test notification it then publishes is the `s3:TestEvent` a consumer of a
 //! validated destination receives.
 //!
+//! A destination that SEALS its messages under a customer managed KMS key is asked a third
+//! question, because that publication is encrypted before it is written: the KEY's own policy
+//! has to let the Amazon S3 service principal have a data key minted for this bucket, or the
+//! notification cannot be encrypted and so does not happen
+//! ([`super::destination_encryption`]). It is asked BEFORE the test notification is published,
+//! so a destination this refuses is sent nothing at all.
+//!
 //! Delivery is BEST EFFORT and never changes what the operation answers: S3 publishes a
 //! notification asynchronously, after the write that produced it was accepted, so a write
 //! into a bucket whose destination service is not mounted on this engine still succeeds.
@@ -998,12 +1005,15 @@ fn test_notification(bucket: &str, correlation: &RequestCorrelation) -> ::serde_
 /// destination EXISTS, and that the bucket owner has PERMISSION to publish to it"
 /// (`PutBucketNotificationConfiguration`'s own documentation): the destination is read from
 /// its own service, and its resource policy is evaluated for the Amazon S3 service principal
-/// publishing this bucket's notifications ([`destination_granted`]). A queue and a topic are
+/// publishing this bucket's notifications ([`destination_granted`]). A destination that seals
+/// its messages under a customer managed KMS key is asked a third thing, since the publication
+/// is encrypted before it is written: that key has to let a notification of this bucket be
+/// sealed under it ([`unsealable`]). A queue and a topic are
 /// then sent the test notification ([`test_notification`]), which is what a consumer of a
 /// validated destination finds waiting on it; a function is not invoked, because S3
 /// "verifies that the Lambda function permissions grant Amazon S3 permission to invoke the
-/// function" instead. Nothing else is written by any of them, so a put this refuses leaves
-/// every service it asked exactly as it was.
+/// function" instead. Nothing else is written by any of them — the key is only read — so a put
+/// this refuses leaves every service it asked exactly as it was.
 ///
 /// A destination its own service REFUSES is not validated: "the PUT notification is an
 /// atomic operation … if the message fails, the entire PUT action will fail, and Amazon S3
@@ -1018,7 +1028,8 @@ fn test_notification(bucket: &str, correlation: &RequestCorrelation) -> ::serde_
 /// of this same emulator is asked and in which Region. The work is bounded by the container
 /// itself — at most [`super::MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`] destinations, two
 /// awaits each, with the store's guard released — so one request cannot grow it.
-pub async fn unvalidated_destinations(
+pub async fn unvalidated_destinations<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     bucket: &str,
     bucket_region: &str,
@@ -1047,6 +1058,7 @@ pub async fn unvalidated_destinations(
             // nested frames are what a 2 MiB thread runs out of.
             super::NotificationDestination::Queue => {
                 Box::pin(queue_rejection(
+                    engine,
                     &mut clients,
                     callback,
                     &region,
@@ -1058,6 +1070,7 @@ pub async fn unvalidated_destinations(
             }
             super::NotificationDestination::Topic => {
                 Box::pin(topic_rejection(
+                    engine,
                     &mut clients,
                     callback,
                     &region,
@@ -1100,6 +1113,10 @@ enum DestinationRejection {
     /// It is there, and its resource policy does not let Amazon S3 publish this bucket's
     /// notifications to it.
     Unpermitted,
+    /// It is there and it does, and it seals its messages under a KMS key that no
+    /// notification of this bucket can be sealed under — so the publication cannot be
+    /// encrypted and does not happen ([`super::destination_encryption`]).
+    Unencryptable,
 }
 
 impl DestinationRejection {
@@ -1107,7 +1124,7 @@ impl DestinationRejection {
     ///
     /// A LAMBDA destination reads the same for either rejection
     /// ([`super::function_invoke_detail`] says why), and names the function the reference
-    /// pointed at; a queue and a topic are told apart by WHICH of the two questions failed.
+    /// pointed at; a queue and a topic are told apart by WHICH of the three questions failed.
     fn detail(self, destination: super::NotificationDestination, arn: &str) -> String {
         if destination == super::NotificationDestination::LambdaFunction {
             return super::function_invoke_detail(arn);
@@ -1115,6 +1132,7 @@ impl DestinationRejection {
         match self {
             Self::Absent => super::destination_absent_detail(destination),
             Self::Unpermitted => super::destination_permissions_detail(destination),
+            Self::Unencryptable => super::destination_encryption_detail(destination),
         }
     }
 }
@@ -1128,7 +1146,14 @@ const PUBLISH_ACTION: &str = "sns:Publish";
 
 /// Why the queue `arn` names is not a destination this configuration may be recorded with,
 /// or `None` when it is one.
-async fn queue_rejection(
+///
+/// Three things are asked of it, in the order the publication performs them: SQS has to hold
+/// it, its own access policy has to let Amazon S3 send this bucket's notifications to it, and
+/// — for a queue on a customer managed KMS key — that key has to let the publication be
+/// encrypted ([`super::destination_encryption`]). The last is decided BEFORE the test
+/// notification is published, so a queue S3 could not have encrypted for is sent nothing.
+async fn queue_rejection<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
     clients: &mut Clients,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
@@ -1145,12 +1170,16 @@ async fn queue_rejection(
     // The queue's `Policy` attribute is "the queue's policy. A valid Amazon Web Services
     // policy" (`GetQueueAttributes`), and `QueueArn` is the ARN that policy's statements
     // name — so the grant is judged against the ARN SQS itself resolved the queue to.
+    // `KmsMasterKeyId` is "the ID of an Amazon Web Services managed customer master key (CMK)
+    // for Amazon SQS or a custom CMK" (same operation): the key every message written to the
+    // queue is encrypted under, which is the second authority over the publication.
     let answer = clients
         .sqs(callback, region)
         .get_queue_attributes()
         .queue_url(&url)
         .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::Policy)
         .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::KmsMasterKeyId)
         .send()
         .await;
     let attributes = match answer {
@@ -1172,9 +1201,20 @@ async fn queue_rejection(
     };
     let resolved = attribute(&::aws_sdk_sqs::types::QueueAttributeName::QueueArn);
     let document = attribute(&::aws_sdk_sqs::types::QueueAttributeName::Policy);
+    let master_key_id = attribute(&::aws_sdk_sqs::types::QueueAttributeName::KmsMasterKeyId);
     let queue_arn = if resolved.is_empty() { arn } else { &resolved };
     if !destination_granted(&document, SEND_MESSAGE_ACTION, queue_arn, bucket) {
         return Some(DestinationRejection::Unpermitted);
+    }
+    if let Some(reason) = unsealable(
+        engine,
+        region,
+        &master_key_id,
+        super::NotificationDestination::Queue,
+        bucket,
+    ) {
+        withheld("an Amazon SQS queue", queue_arn, &reason);
+        return Some(DestinationRejection::Unencryptable);
     }
     let answer = clients
         .sqs(callback, region)
@@ -1201,8 +1241,11 @@ async fn queue_rejection(
 /// The topic's `Policy` attribute is the document that decides it — "the JSON serialization
 /// of the topic's access control policy" (`GetTopicAttributes`) — which is where the grant
 /// S3 needs lives, so a topic that exists and states no such grant is refused rather than
-/// published to.
-async fn topic_rejection(
+/// published to. A topic on a customer managed KMS key is asked the same third question a
+/// queue on one is ([`super::destination_encryption`]), from the `KmsMasterKeyId` attribute
+/// the same reader reports, and before anything is published to it.
+async fn topic_rejection<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
     clients: &mut Clients,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
@@ -1216,12 +1259,8 @@ async fn topic_rejection(
         .topic_arn(arn)
         .send()
         .await;
-    let document = match answer {
-        Ok(answered) => answered
-            .attributes()
-            .and_then(|held| held.get(TOPIC_POLICY_ATTRIBUTE))
-            .cloned()
-            .unwrap_or_default(),
+    let attributes = match answer {
+        Ok(answered) => answered.attributes().cloned().unwrap_or_default(),
         Err(error) => {
             if refused_by_its_service(&error) {
                 return Some(DestinationRejection::Absent);
@@ -1230,8 +1269,26 @@ async fn topic_rejection(
             return None;
         }
     };
+    let document = attributes
+        .get(TOPIC_POLICY_ATTRIBUTE)
+        .cloned()
+        .unwrap_or_default();
     if !destination_granted(&document, PUBLISH_ACTION, arn, bucket) {
         return Some(DestinationRejection::Unpermitted);
+    }
+    let master_key_id = attributes
+        .get(TOPIC_MASTER_KEY_ATTRIBUTE)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(reason) = unsealable(
+        engine,
+        region,
+        &master_key_id,
+        super::NotificationDestination::Topic,
+        bucket,
+    ) {
+        withheld("an Amazon SNS topic", arn, &reason);
+        return Some(DestinationRejection::Unencryptable);
     }
     let answer = clients
         .sns(callback, region)
@@ -1255,6 +1312,13 @@ async fn topic_rejection(
 /// The topic attribute carrying its access control policy, as `GetTopicAttributes` names
 /// it.
 const TOPIC_POLICY_ATTRIBUTE: &str = "Policy";
+
+/// The topic attribute carrying the customer master key its messages are encrypted under:
+/// "the following attribute applies only to server-side-encryption: `KmsMasterKeyId` — the ID
+/// of an Amazon Web Services managed customer master key (CMK) for Amazon SNS or a custom CMK"
+/// (`GetTopicAttributes`). The sibling of a queue's own `KmsMasterKeyId`, read for the same
+/// question.
+const TOPIC_MASTER_KEY_ATTRIBUTE: &str = "KmsMasterKeyId";
 
 /// Why the function `arn` names is not a destination this configuration may be recorded
 /// with, or `None` when it is one.
@@ -1368,6 +1432,48 @@ fn destination_granted(document: &str, action: &str, resource: &str, bucket: &st
             .with_published_keys(&[SOURCE_ARN_KEY, SOURCE_ACCOUNT_KEY]);
     ::service_common::iam_authorization::resource_decision(document, &request)
         == ::service_common::iam_authorization::Decision::Allowed
+}
+
+/// Why a notification of `bucket` cannot be SEALED under the key `master_key_id` names — the
+/// one the destination encrypts every message written to it under — or `None` when it can.
+///
+/// The same question for a queue and for a topic, differing only in the service the use
+/// reaches KMS through ([`super::NotificationDestination::arn_service`]): the publication is
+/// made by Amazon S3 as its own service principal acting for the publishing bucket, which is
+/// what a key policy narrowed by `aws:SourceArn` is decided against — the identical pair this
+/// crate judges a destination's own resource policy by ([`destination_granted`]). The decision
+/// itself is KMS's ([`super::destination_encryption`]), so a key policy this reads and the same
+/// policy read by the service that encrypts for the destination cannot disagree.
+///
+/// A destination on no customer managed key answers `None`, so nothing is asked of KMS for one.
+fn unsealable<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    master_key_id: &str,
+    destination: super::NotificationDestination,
+    bucket: &str,
+) -> Option<String> {
+    super::destination_encryption::unsealable_notification(
+        engine,
+        region,
+        master_key_id,
+        destination.arn_service(),
+        S3_SERVICE_PRINCIPAL,
+        &bucket_arn(bucket),
+    )
+}
+
+/// Log one destination whose own encryption key withholds the publication, with KMS's own
+/// sentence for it: the configuration naming it is refused, and this is where an operator reads
+/// WHICH document has to change for it to be accepted.
+fn withheld(destination: &str, named: &str, reason: &str) {
+    ::tracing::warn!(
+        destination,
+        named,
+        reason,
+        "this notification destination encrypts its messages under a KMS key that will not \
+         seal a notification of this bucket; the configuration naming it is refused"
+    );
 }
 
 /// The error codes that are the EMULATOR's own refusal of the call rather than an answer

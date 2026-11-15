@@ -41,6 +41,10 @@ pub mod aws_published;
 // configured destinations are notified, what each notification carries, and the
 // in-process delivery itself — lives in `state/notifications.rs`.
 pub mod notifications;
+// Whether Amazon S3 can have a notification ENCRYPTED for a destination that seals its
+// messages under a customer managed KMS key — the second authority over a destination a
+// notification configuration names — lives in `state/destination_encryption.rs`.
+pub mod destination_encryption;
 // The request-correlation pair one response carries, which is also what a notification
 // names the call it came of by — see `state/request_ids.rs`.
 pub mod request_ids;
@@ -2281,6 +2285,21 @@ pub fn destination_permissions_detail(destination: NotificationDestination) -> S
 /// is a different reason and so reads differently.
 pub fn destination_absent_detail(destination: NotificationDestination) -> String {
     format!("The destination {} does not exist", destination.noun())
+}
+
+/// The same detail for a destination that IS there, whose own resource policy DOES let Amazon
+/// S3 publish this bucket's notifications to it, and that seals its messages under a KMS key
+/// no notification of this bucket can be sealed under
+/// ([`destination_encryption::unsealable_notification`] decides it): the publication cannot be
+/// encrypted, so it does not happen and the destination does not validate.
+///
+/// Only the destination's kind varies in the sentence, as it does in the two above
+/// ([`NotificationDestination::noun`]); nothing of the request is interpolated.
+pub fn destination_encryption_detail(destination: NotificationDestination) -> String {
+    format!(
+        "The message to the SSE {} could not be encrypted using KMS",
+        destination.noun()
+    )
 }
 
 /// The per-destination detail S3 carries for a LAMBDA destination it may not publish to,
