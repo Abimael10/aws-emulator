@@ -1855,12 +1855,20 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     // [model] service-com-amazonaws-autoscaling-autoscaling-2011-01-01
     // `src/ops/create_auto_scaling_group.rs`: "service-linked role named
     // AWSServiceRoleForAutoScaling".
+    (
+        "appstream.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_AppStreamFleet",
+    ),
     ("autoscaling.amazonaws.com", "AWSServiceRoleForAutoScaling"),
     ("backup.amazonaws.com", "AWSServiceRoleForBackup"),
     // [model] service-com-amazonaws-batch-awsbatchv20160810
     // `src/ops/update_compute_environment.rs`: "the AWSServiceRoleForBatch
     // service-linked role".
     ("batch.amazonaws.com", "AWSServiceRoleForBatch"),
+    (
+        "cassandra.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_CassandraTable",
+    ),
     ("cloudtrail.amazonaws.com", "AWSServiceRoleForCloudTrail"),
     // AWS CodeStar Notifications' own "Using service-linked roles for AWS CodeStar
     // Notifications" page names the role it creates to publish notifications to a
@@ -1872,6 +1880,10 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
         "codestar-notifications.amazonaws.com",
         "AWSServiceRoleForCodeStarNotifications",
     ),
+    (
+        "comprehend.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_ComprehendEndpoint",
+    ),
     // AWS Compute Optimizer: the hyphen of the principal's label is not in the role
     // AWS names in "Using service-linked roles for AWS Compute Optimizer",
     // AWSServiceRoleForComputeOptimizer.
@@ -1880,14 +1892,27 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     // `src/ops/put_service_linked_configuration_recorder.rs`: "creates a
     // service-linked role AWSServiceRoleForConfig in your account".
     ("config.amazonaws.com", "AWSServiceRoleForConfig"),
+    (
+        "custom-resource.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_CustomResource",
+    ),
     // Application Auto Scaling publishes one role per scaled service, named
     // `AWSServiceRoleForApplicationAutoScaling_<resource type>` — the suffixes this
     // repository already lists in
     // service-com-amazonaws-applicationautoscaling-anyscalefrontendservice
-    // `src/state.rs` (`SERVICE_LINKED_ROLE_SUFFIXES`).
+    // `src/state.rs` (`SERVICE_LINKED_ROLE_SUFFIXES`), one per namespace that service
+    // scales. EVERY one of those namespaces has a row here, under its own principal
+    // `<namespace>.application-autoscaling.amazonaws.com`: the resource-type suffix is
+    // no transformation of the namespace (`ec2` names `EC2SpotFleetRequest`,
+    // `elasticmapreduce` names `EMRInstanceGroup`), so the derived fallback names none
+    // of them.
     (
         "dynamodb.application-autoscaling.amazonaws.com",
         "AWSServiceRoleForApplicationAutoScaling_DynamoDBTable",
+    ),
+    (
+        "ec2.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_EC2SpotFleetRequest",
     ),
     ("ec2fleet.amazonaws.com", "AWSServiceRoleForEC2Fleet"),
     // [model] service-com-amazonaws-ecs-amazonec2containerservicev20141113
@@ -1901,10 +1926,18 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     ("eks-nodegroup.amazonaws.com", "AWSServiceRoleForAmazonEKSNodegroup"),
     ("eks.amazonaws.com", "AWSServiceRoleForAmazonEKS"),
     ("elasticache.amazonaws.com", "AWSServiceRoleForElastiCache"),
+    (
+        "elasticache.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_ElastiCacheRG",
+    ),
     ("elasticbeanstalk.amazonaws.com", "AWSServiceRoleForElasticBeanstalk"),
     (
         "elasticloadbalancing.amazonaws.com",
         "AWSServiceRoleForElasticLoadBalancing",
+    ),
+    (
+        "elasticmapreduce.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_EMRInstanceGroup",
     ),
     // [model] service-com-amazonaws-fms-awsfms-20180101
     // `src/ops/put_notification_channel.rs`: "a role other than the
@@ -1912,12 +1945,20 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     ("fms.amazonaws.com", "AWSServiceRoleForFMS"),
     ("globalaccelerator.amazonaws.com", "AWSServiceRoleForGlobalAccelerator"),
     ("guardduty.amazonaws.com", "AWSServiceRoleForAmazonGuardDuty"),
+    (
+        "kafka.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_KafkaCluster",
+    ),
     // [model] service-com-amazonaws-lakeformation-awslakeformation
     // `src/ops/register_resource.rs`: "choose the
     // AWSServiceRoleForLakeFormationDataAccess".
     (
         "lakeformation.amazonaws.com",
         "AWSServiceRoleForLakeFormationDataAccess",
+    ),
+    (
+        "lambda.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_LambdaConcurrency",
     ),
     ("lex.amazonaws.com", "AWSServiceRoleForLexBots"),
     ("macie.amazonaws.com", "AWSServiceRoleForAmazonMacie"),
@@ -1939,6 +1980,10 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     (
         "migrationhub-strategy.amazonaws.com",
         "AWSServiceRoleForMigrationHubStrategy",
+    ),
+    (
+        "neptune.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_NeptuneCluster",
     ),
     (
         "opensearchservice.amazonaws.com",
@@ -1969,6 +2014,10 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     // (`resource-explorer-2`), which the role AWS names in "Using service-linked
     // roles for Resource Explorer" does not — AWSServiceRoleForResourceExplorer.
     ("resource-explorer-2.amazonaws.com", "AWSServiceRoleForResourceExplorer"),
+    (
+        "sagemaker.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_SageMakerEndpoint",
+    ),
     ("securityhub.amazonaws.com", "AWSServiceRoleForSecurityHub"),
     // Amazon EC2 Spot and Spot Fleet: each role is assumed through the FEATURE's own
     // principal (`spot.amazonaws.com`, `spotfleet.amazonaws.com`), which is neither
@@ -1982,6 +2031,20 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     ("sso.amazonaws.com", "AWSServiceRoleForSSO"),
     ("support.amazonaws.com", "AWSServiceRoleForSupport"),
     ("trustedadvisor.amazonaws.com", "AWSServiceRoleForTrustedAdvisor"),
+    // Amazon WorkSpaces Instances: the role the service requires in the account before
+    // it will launch an instance, so the name every client reads back as that
+    // prerequisite. "Using service-linked roles for WorkSpaces Instances" names
+    // AWSServiceRoleForWorkspacesInstances — the service's own two-word name in mixed
+    // case, which drops the hyphen the principal's label carries, so the derived
+    // fallback (first label capitalised, hyphen kept) names no role AWS publishes.
+    (
+        "workspaces-instances.amazonaws.com",
+        "AWSServiceRoleForWorkspacesInstances",
+    ),
+    (
+        "workspaces.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_WorkSpacesPool",
+    ),
 ];
 
 /// AWS's own role name for `service_principal`, when it publishes one.

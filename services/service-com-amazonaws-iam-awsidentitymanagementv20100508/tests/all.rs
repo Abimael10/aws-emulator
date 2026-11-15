@@ -353,6 +353,8 @@ mod server_certificate_untag_listing;
 mod server_certificates;
 #[path = "all/service_last_accessed_details.rs"]
 mod service_last_accessed_details;
+#[path = "all/service_linked_role_bootstrap.rs"]
+mod service_linked_role_bootstrap;
 #[path = "all/service_linked_role_deletion.rs"]
 mod service_linked_role_deletion;
 #[path = "all/service_linked_role_published_names.rs"]
