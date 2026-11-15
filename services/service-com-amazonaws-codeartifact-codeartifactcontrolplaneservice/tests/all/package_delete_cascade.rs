@@ -25,9 +25,10 @@
 //! 4. The domain's derived `assetSizeBytes` drops by exactly what the removed package's
 //!    versions held, so the cascade is committed to the store rather than hidden from one
 //!    read.
-//! 5. A package the addressed repository does not hold is refused with the PACKAGE-scoped
-//!    404 sentence, and the SCOPE the request is addressed to (the domain, the repository)
-//!    is refused with the same 404 naming the kind it could not resolve — and neither
+//! 5. A package the addressed repository does not hold is the delete's own goal, so it is
+//!    answered with HTTP 200 carrying no `deletedPackage`, while the SCOPE the request is
+//!    addressed to (the domain, the repository) not resolving is still
+//!    `ResourceNotFoundException` (404) naming the kind it could not resolve — and neither
 //!    removes anything.
 
 use serde_json::{json, Value};
@@ -98,11 +99,10 @@ impl Row {
         query
     }
 
-    /// RULE 5: the sentence the PACKAGE-scoped operations state for this coordinate when the
-    /// repository holds no such package — the addressed format and package name, with no
-    /// namespace component whether or not the coordinate carries one. Written out here
-    /// rather than imported, so a wrong sentence in the implementation cannot make this
-    /// suite pass.
+    /// RULE 1: the sentence `DescribePackage` states for this coordinate when the repository
+    /// holds no such package — the addressed format and package name, with no namespace
+    /// component whether or not the coordinate carries one. Written out here rather than
+    /// imported, so a wrong sentence in the implementation cannot make this suite pass.
     fn package_family_message(&self) -> String {
         format!(
             "Package not found in repository. Package = {{format={}, name={}}}",
@@ -623,16 +623,16 @@ async fn a_deleted_coordinate_can_be_held_again() {
     }
 }
 
-/// RULE 5: an absence that is not the target's is a refusal, and the refusals name what
-/// they could not resolve. Nothing is removed by any of them.
+/// RULE 5: the SCOPE a delete is addressed to is a refusal when it does not resolve, while
+/// the target's own absence is the call's goal and answers success. Nothing is removed by
+/// any of them.
 #[tokio::test]
 async fn an_unresolvable_target_or_scope_is_refused_and_removes_nothing() {
     let router = emulator();
     given_repositories(&router).await;
 
-    // The package-scoped sentence, for a package the repository does not hold: a coordinate
-    // never seeded, and a seeded row addressed under the WRONG format or namespace — which
-    // addresses a different package.
+    // A package the repository does not hold: a coordinate never seeded, and a seeded row
+    // addressed under the WRONG format or namespace — which addresses a different package.
     let absent: Vec<Row> = vec![
         Row {
             case: "a coordinate never held",
@@ -658,21 +658,17 @@ async fn an_unresolvable_target_or_scope_is_refused_and_removes_nothing() {
     ];
     for row in &absent {
         let case = row.case;
-        let refused = delete_package(&router, &row.query(REPOSITORY)).await;
+        let answer = delete_package(&router, &row.query(REPOSITORY)).await;
         assert_eq!(
-            (refused.status, refused.code(), refused.message()),
-            (
-                404,
-                "ResourceNotFoundException".to_string(),
-                row.package_family_message()
-            ),
-            "case {case:?}: an absent package must be refused with the package-scoped \
-             sentence, got {refused:?}"
+            (answer.status, answer.body.clone()),
+            (200, json!({})),
+            "case {case:?}: a package the repository does not hold must answer success with \
+             no removed record, got {answer:?}"
         );
         assert_eq!(
-            refused.body["resourceType"].as_str(),
-            Some("package"),
-            "case {case:?}: the refusal must name the kind it could not resolve, got {refused:?}"
+            answer.code(),
+            String::new(),
+            "case {case:?}: a successful delete carries no error shape, got {answer:?}"
         );
     }
 

@@ -131,3 +131,5 @@ mod external_connection_not_found_sentence;
 mod announced_repository_endpoint;
 #[path = "all/package_not_found_sentence.rs"]
 mod package_not_found_sentence;
+#[path = "all/package_delete_repeat.rs"]
+mod package_delete_repeat;

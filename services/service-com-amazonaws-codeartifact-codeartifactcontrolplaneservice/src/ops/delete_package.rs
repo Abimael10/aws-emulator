@@ -13,9 +13,12 @@
 //! * the package itself is addressed by its whole `(format, namespace, package)` triple,
 //!   the same key [`crate::state::package_key`] builds for every package-scoped
 //!   operation: a request naming the right package name under another format or namespace
-//!   addresses a DIFFERENT package, and one the repository does not hold is refused with
-//!   the package-scoped sentence [`crate::state::package_not_found_message`] states — the
-//!   wording `DescribePackage` already answers that absence with;
+//!   addresses a DIFFERENT package, and one the repository does not hold is NOT refused —
+//!   the disappearance of the named package is this call's goal, so a goal already met is
+//!   answered with HTTP 200 carrying no `deletedPackage`, the same way every other delete
+//!   in this service answers for a target it does not hold (`DeleteDomain`,
+//!   `DeleteRepository`, `DeletePackageGroup`, both policy removals), and nothing is
+//!   changed;
 //! * the removal CASCADES to the versions, because "Deletes a package and all associated
 //!   package versions. A deleted package cannot be restored. To delete one or more package
 //!   versions, use the DeletePackageVersions API" (this operation's own documentation): a
@@ -263,16 +266,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeletePackage<Eng
 
         // A package is addressed by its whole (format, namespace, name) triple, the same
         // key `DescribePackage` resolves: a request naming the right package name under a
-        // different format or namespace addresses a DIFFERENT package, and that one is not
-        // found — in the sentence the PACKAGE-scoped operations state.
+        // different format or namespace addresses a DIFFERENT package.
+        //
+        // A triple the repository holds no package under is NOT a refusal: what this call
+        // is for is the package's ABSENCE, and `DeletePackageResult$deletedPackage` is
+        // optional, so a request whose goal is already met — a repeat of a delete that
+        // already committed, or a speculative one — is answered with the success that
+        // carries no removed record, leaving the repository untouched. Only the SCOPE
+        // above (the domain, the repository) is a precondition this call refuses on.
         let key =
             crate::state::package_key(&input.format, input.namespace.as_deref(), &input.package);
         let Some(removed) = repository.packages.remove(&key) else {
-            return Err(not_found(
-                crate::state::package_not_found_message(&input.format, &input.package),
-                &input.package,
-                "package",
-            ));
+            return Ok(DeletePackageOutput {
+                deleted_package: None,
+            });
         };
 
         // Removing the record is the whole operation: the versions it held, their assets
@@ -310,8 +317,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeletePackage<Eng
     }
 }
 
-/// A `ResourceNotFoundException` (404) naming the resource that was addressed, so a caller
-/// can tell an unknown domain from an unknown repository or package.
+/// A `ResourceNotFoundException` (404) naming the scope resource that could not be
+/// resolved, so a caller can tell an unknown domain from an unknown repository.
 fn not_found(message: String, resource_id: &str, resource_type: &str) -> DeletePackageError {
     DeletePackageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message,

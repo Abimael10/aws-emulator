@@ -6,13 +6,14 @@
 //! production emulator serves with, against a repository that exists, so the only thing
 //! under test is the refusal a client reads.
 //!
-//! The rule under test, over a TABLE rather than one example: the sentence the
-//! PACKAGE-scoped operations (`DescribePackage`, `DeletePackage`) state for a package the
-//! addressed repository does not hold renders the request's FORMAT and the request's
-//! package NAME and nothing else — `Package not found in repository. Package =
-//! {format=<format>, name=<package>}` — so it is INDEPENDENT of the namespace the request
-//! carried, while the lookup it refuses is not: a namespace still addresses a different
-//! package.
+//! The rule under test, over a TABLE rather than one example: the sentence
+//! `DescribePackage` states for a package the addressed repository does not hold renders
+//! the request's FORMAT and the request's package NAME and nothing else — `Package not
+//! found in repository. Package = {format=<format>, name=<package>}` — so it is
+//! INDEPENDENT of the namespace the request carried, while the lookup it refuses is not: a
+//! namespace still addresses a different package. (`DeletePackage` addresses a package by
+//! the same triple but states no sentence for one that is absent: its target's absence is
+//! what it is for, so it answers success — pinned in `package_delete_cascade`.)
 //!
 //! Asserted as:
 //!
@@ -140,9 +141,9 @@ impl Row {
     }
 }
 
-/// The PACKAGE-scoped operations, each as the wire reaches it: both state the sentence for
-/// the same absence.
-const PACKAGE_SCOPED: [(&str, &str); 2] = [("DescribePackage", "GET"), ("DeletePackage", "DELETE")];
+/// The PACKAGE-addressing read, as the wire reaches it: the operation that states this
+/// sentence.
+const PACKAGE_SCOPED: [(&str, &str); 1] = [("DescribePackage", "GET")];
 
 /// The domain and the repository every case addresses.
 async fn given_repository(router: &MultiServiceRouter) {
