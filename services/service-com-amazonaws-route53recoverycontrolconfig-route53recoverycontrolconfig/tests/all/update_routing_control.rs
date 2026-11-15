@@ -499,9 +499,18 @@ async fn renaming_onto_a_name_its_own_panel_already_holds_is_refused() {
         .to_string();
 
     // The refusal wording this service states for a name already taken inside the parent
-    // that scopes it, restated here independently of the service's own code.
-    let expected_message =
-        format!("Routing Control {taken_name} already exists in Control Panel {panel_arn}.");
+    // that scopes it, restated here independently of the service's own code: the colliding
+    // control's own id, then the name the request asked for.
+    let taken_arn = taken["RoutingControlArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let taken_id = taken_arn
+        .rsplit_once('/')
+        .map_or(taken_arn.as_str(), |(_, id)| id);
+    let expected_message = format!(
+        "A routing control with the specified name already exists: {taken_id}, {taken_name}"
+    );
 
     let (status, answer) = update_routing_control(&router, &mover_arn, &taken_name).await;
     assert_eq!(

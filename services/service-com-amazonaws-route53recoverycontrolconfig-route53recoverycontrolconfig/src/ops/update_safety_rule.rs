@@ -221,14 +221,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The name is scoped to the rule's control panel, so a rename onto a name another
         // rule of that panel already holds is refused the way the create states it.
-        if guard.safety_rule_name_taken(&panel_arn, &name, Some(&safety_rule_arn)) {
+        if let Some(taken) = guard.safety_rule_named(&panel_arn, &name, Some(&safety_rule_arn)) {
             return Err(UpdateSafetyRuleErrorModeled::ValidationException(
                 ValidationException {
                     message: crate::state::already_exists_message(
                         crate::state::SAFETY_RULE_RESOURCE,
+                        crate::state::resource_id(&taken.arn),
                         &name,
-                        crate::state::CONTROL_PANEL_RESOURCE,
-                        &panel_arn,
                     ),
                 },
             )

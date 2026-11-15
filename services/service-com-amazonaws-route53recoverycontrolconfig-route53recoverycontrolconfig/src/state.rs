@@ -617,38 +617,40 @@ impl ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigState {
             .any(|rule| rule.controls.references(routing_control_arn))
     }
 
-    /// Whether `control_panel_arn` already holds a safety rule called `name`, other than
-    /// the rule `except_arn` names.
+    /// The safety rule `control_panel_arn` already holds under `name`, other than the
+    /// rule `except_arn` names, or `None` when that name is free there.
     ///
     /// A rule's name identifies it within its control panel, so this is what the create
-    /// and the update both ask before taking a name. Scanned in place: no ordering is
-    /// needed to answer it.
-    pub fn safety_rule_name_taken(
+    /// and the update both ask before taking a name; the record is answered rather than a
+    /// yes/no because the refusal names the colliding rule's own id. Scanned in place: no
+    /// ordering is needed to answer it.
+    pub fn safety_rule_named(
         &self,
         control_panel_arn: &str,
         name: &str,
         except_arn: Option<&str>,
-    ) -> bool {
-        self.safety_rules.values().any(|rule| {
+    ) -> Option<&SafetyRuleRecord> {
+        self.safety_rules.values().find(|rule| {
             rule.control_panel_arn == control_panel_arn
                 && rule.name == name
                 && except_arn.is_none_or(|arn| rule.arn != arn)
         })
     }
 
-    /// Whether `cluster_arn` already holds a control panel called `name`, other than the
-    /// panel `except_arn` names.
+    /// The control panel `cluster_arn` already holds under `name`, other than the panel
+    /// `except_arn` names, or `None` when that name is free there.
     ///
     /// A control panel's name identifies it within its cluster, so this is what the create
-    /// and the rename both ask before taking a name. Scanned in place: no ordering is
-    /// needed to answer it.
-    pub fn control_panel_name_taken(
+    /// and the rename both ask before taking a name; the record is answered rather than a
+    /// yes/no because the refusal names the colliding panel's own id. Scanned in place: no
+    /// ordering is needed to answer it.
+    pub fn control_panel_named(
         &self,
         cluster_arn: &str,
         name: &str,
         except_arn: Option<&str>,
-    ) -> bool {
-        self.control_panels.values().any(|panel| {
+    ) -> Option<&ControlPanelRecord> {
+        self.control_panels.values().find(|panel| {
             panel.cluster_arn == cluster_arn
                 && panel.name == name
                 && except_arn.is_none_or(|arn| panel.arn != arn)
@@ -680,19 +682,20 @@ impl ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigState {
             .unwrap_or(i32::MAX)
     }
 
-    /// Whether `control_panel_arn` already holds a routing control called `name`, other
-    /// than the control `except_arn` names.
+    /// The routing control `control_panel_arn` already holds under `name`, other than the
+    /// control `except_arn` names, or `None` when that name is free there.
     ///
     /// A routing control's name identifies it within its control panel, so this is what
-    /// the create and the update both ask before taking a name. Scanned in place: no
-    /// ordering is needed to answer it.
-    pub fn routing_control_name_taken(
+    /// the create and the update both ask before taking a name; the record is answered
+    /// rather than a yes/no because the refusal names the colliding control's own id.
+    /// Scanned in place: no ordering is needed to answer it.
+    pub fn routing_control_named(
         &self,
         control_panel_arn: &str,
         name: &str,
         except_arn: Option<&str>,
-    ) -> bool {
-        self.routing_controls.values().any(|rc| {
+    ) -> Option<&RoutingControlRecord> {
+        self.routing_controls.values().find(|rc| {
             rc.control_panel_arn == control_panel_arn
                 && rc.name == name
                 && except_arn.is_none_or(|arn| rc.arn != arn)
@@ -1132,16 +1135,32 @@ pub const ROUTING_CONTROL_DEPENDENTS: &str = "Routing Controls";
 /// The dependents a control panel cannot be deleted while it still owns.
 pub const SAFETY_RULE_DEPENDENTS: &str = "Safety Rules";
 
-/// The `ValidationException$Message` for a create request whose name is already taken
+/// The `ValidationException$Message` for a create or rename whose name is already taken
 /// inside the parent that scopes it.
 ///
-/// `<Resource> <name> already exists in <Parent> <parent arn>.` — the kind of resource
-/// being created and the name the request asked for, then the parent the name is scoped
-/// to, both as the request named them. Worded in the same voice as the two sentences the
-/// recordings carry ([`does_not_exist_message`], [`cannot_delete_message`]): the kind of
-/// resource in title case, the request's own values, one full stop.
-pub fn already_exists_message(resource: &str, name: &str, parent: &str, parent_arn: &str) -> String {
-    format!("{resource} {name} already exists in {parent} {parent_arn}.")
+/// `A <resource> with the specified name already exists: <existing id>, <name>` — the
+/// kind of resource the name belongs to, written as the lower-case prose noun of the
+/// title-case `*_RESOURCE` constant, then the SERVER-CHOSEN id of the resource that
+/// already holds the name ([`resource_id`] of its stored ARN), then the name the request
+/// asked for, verbatim. The colliding resource is named by its own id, not by the parent
+/// the name is scoped to, so a caller can read out of the refusal which stored resource
+/// took the name as well as which name it asked for. No full stop: the sentence ends with
+/// the requested name.
+pub fn already_exists_message(resource: &str, existing_id: &str, name: &str) -> String {
+    format!(
+        "A {} with the specified name already exists: {existing_id}, {name}",
+        resource.to_lowercase()
+    )
+}
+
+/// The server-chosen id of the resource `arn` names: the last segment of its resource
+/// path, which every create of this service mints with [`Store::mint_id`] and appends to
+/// its parent's ARN.
+///
+/// A value no id can be read out of — one carrying no `/` at all — is its own id, so a
+/// refusal that names a resource always names something.
+pub fn resource_id(arn: &str) -> &str {
+    arn.rsplit_once('/').map_or(arn, |(_, id)| id)
 }
 
 /// The `ValidationException$Message` for a delete request against the resource a parent

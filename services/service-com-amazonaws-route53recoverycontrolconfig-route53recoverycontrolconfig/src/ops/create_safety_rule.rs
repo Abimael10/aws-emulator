@@ -283,12 +283,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A safety rule name identifies the rule within its control panel, so the loser of
         // a race for one name is refused on its INPUT: the name is taken, and no retry of
         // the same request can win it.
-        if guard.safety_rule_name_taken(&panel_arn, &name, None) {
+        if let Some(taken) = guard.safety_rule_named(&panel_arn, &name, None) {
             return Err(invalid(crate::state::already_exists_message(
                 crate::state::SAFETY_RULE_RESOURCE,
+                crate::state::resource_id(&taken.arn),
                 &name,
-                crate::state::CONTROL_PANEL_RESOURCE,
-                &panel_arn,
             )));
         }
 

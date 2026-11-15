@@ -21,6 +21,8 @@ mod common;
 mod create_safety_rule_rule_choice;
 #[path = "all/cross_account_authorization.rs"]
 mod cross_account_authorization;
+#[path = "all/duplicate_name_message.rs"]
+mod duplicate_name_message;
 #[path = "all/list_clusters.rs"]
 mod list_clusters;
 #[path = "all/not_found_message.rs"]

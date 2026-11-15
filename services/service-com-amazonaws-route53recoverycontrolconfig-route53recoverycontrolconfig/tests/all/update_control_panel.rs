@@ -415,20 +415,31 @@ async fn renaming_onto_a_name_taken_in_the_same_cluster_is_refused() {
         status, 200,
         "case list the cluster's panels: expected 200, got {status} {listed:?}"
     );
-    let default_name = listed["ControlPanels"]
+    let default_panel = listed["ControlPanels"]
         .as_array()
         .and_then(|panels| {
             panels
                 .iter()
                 .find(|panel| panel["DefaultControlPanel"] == json!(true))
         })
-        .and_then(|panel| panel["Name"].as_str())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let default_name = default_panel["Name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let default_arn = default_panel["ControlPanelArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let first_arn = first["ControlPanelArn"]
+        .as_str()
         .unwrap_or_default()
         .to_string();
 
-    for (case, taken) in [
-        ("a sibling panel's name", "taken".to_string()),
-        ("the default panel's name", default_name),
+    for (case, taken, taken_arn) in [
+        ("a sibling panel's name", "taken".to_string(), first_arn),
+        ("the default panel's name", default_name, default_arn),
     ] {
         let (status, answer) = update_control_panel(&router, &second_arn, &taken).await;
         assert_eq!(
@@ -441,7 +452,12 @@ async fn renaming_onto_a_name_taken_in_the_same_cluster_is_refused() {
             "case {case}: expected ValidationException, got {answer:?}"
         );
         let actual = answer["message"].as_str().unwrap_or_default();
-        let expected = format!("Control Panel {taken} already exists in Cluster {cluster_arn}.");
+        // The colliding panel's own id, then the name the request asked for.
+        let taken_id = taken_arn
+            .rsplit_once('/')
+            .map_or(taken_arn.as_str(), |(_, id)| id);
+        let expected =
+            format!("A control panel with the specified name already exists: {taken_id}, {taken}");
         assert_eq!(
             actual, expected,
             "case {case}: expected {expected:?}, got {actual:?}"

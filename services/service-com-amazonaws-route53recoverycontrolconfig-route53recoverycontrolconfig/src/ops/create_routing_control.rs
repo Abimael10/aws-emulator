@@ -270,14 +270,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // loser of a race for one name is refused on its INPUT — the name is taken, and
         // no retry of the same request can win it — not with a transient-collision
         // class.
-        if guard.routing_control_name_taken(&panel_arn, &input.routing_control_name, None) {
+        if let Some(taken) =
+            guard.routing_control_named(&panel_arn, &input.routing_control_name, None)
+        {
             return Err(CreateRoutingControlErrorModeled::ValidationException(
                 ValidationException {
                     message: crate::state::already_exists_message(
                         crate::state::ROUTING_CONTROL_RESOURCE,
+                        crate::state::resource_id(&taken.arn),
                         &input.routing_control_name,
-                        crate::state::CONTROL_PANEL_RESOURCE,
-                        &panel_arn,
                     ),
                 },
             )

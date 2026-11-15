@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The name is scoped to the panel's cluster, so a rename onto a name another panel
         // of that cluster already holds is refused the way the create states it.
-        if guard.control_panel_name_taken(
+        if let Some(taken) = guard.control_panel_named(
             &cluster_arn,
             &input.control_panel_name,
             Some(&input.control_panel_arn),
@@ -197,9 +197,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ValidationException {
                     message: crate::state::already_exists_message(
                         crate::state::CONTROL_PANEL_RESOURCE,
+                        crate::state::resource_id(&taken.arn),
                         &input.control_panel_name,
-                        crate::state::CLUSTER_RESOURCE,
-                        &cluster_arn,
                     ),
                 },
             )

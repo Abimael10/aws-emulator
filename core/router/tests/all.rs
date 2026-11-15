@@ -2564,3 +2564,13 @@ mod declaration_roots_are_canonical_and_complete;
 mod cloudformation_stack_set_status_change_events;
 #[path = "all/cloudformation_stackset_failed_instance_events.rs"]
 mod cloudformation_stackset_failed_instance_events;
+//! `mod <name>;` pair below, into the sorted list — one pair per suite and no other line,
+//! so two branches landing at once insert two lines in two places and have no prose to
+//! duplicate, re-word or mistype.
+//! comment (`//!`) past the first item is `E0753`. Each of those fails EVERY suite in this
+//! target, so this header is the only place an inner doc comment may stand, and what goes
+//! below it is a declaration — never a note about one, and never a copy of this header.
+//! What a suite covers, and why it drives the assembled router rather than one service
+//! crate, belongs in that suite's own module header; `all/appended_notes.rs` keeps the notes
+//! earlier landings had appended to this file.
+//! file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points

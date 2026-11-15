@@ -92,10 +92,14 @@ fn cannot_delete(resource: &str, dependents: &str) -> String {
     format!("Cannot delete a {resource} with {dependents}.")
 }
 
-/// The sentence a create is refused with when the name it asks for is already taken
-/// inside the parent that scopes it.
-fn already_exists(resource: &str, name: &str, parent: &str, parent_arn: &str) -> String {
-    format!("{resource} {name} already exists in {parent} {parent_arn}.")
+/// The sentence a create or a rename is refused with when the name it asks for is already
+/// taken inside the parent that scopes it: the kind of resource, the colliding resource's
+/// own id, then the name the request asked for.
+fn already_exists(resource: &str, existing_arn: &str, name: &str) -> String {
+    let existing_id = existing_arn
+        .rsplit_once('/')
+        .map_or(existing_arn, |(_, id)| id);
+    format!("A {resource} with the specified name already exists: {existing_id}, {name}")
 }
 
 /// The sentence a delete of the resource a parent is created with is refused with.
@@ -366,7 +370,21 @@ async fn a_name_taken_inside_its_parent_is_a_validation_error_and_one_create_win
 
     // Rows: one per level this service scopes a name to, including the default panel
     // reached by omitting `ControlPanelArn`; each with the sentence it is refused by.
-    let default_panel_arn = implicit["ControlPanelArn"]
+    let implicit_arn = implicit["RoutingControlArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // The middle row needs the name to exist first; the others already do.
+    let first = create_routing_control(
+        &router,
+        json!({
+            "ClusterArn": cluster_arn,
+            "ControlPanelArn": panel_arn,
+            "RoutingControlName": "first",
+        }),
+    )
+    .await;
+    let first_arn = first["RoutingControlArn"]
         .as_str()
         .unwrap_or_default()
         .to_string();
@@ -375,7 +393,7 @@ async fn a_name_taken_inside_its_parent_is_a_validation_error_and_one_create_win
             "a control panel name inside its cluster",
             "/controlpanel",
             json!({ "ClusterArn": cluster_arn, "ControlPanelName": "racing-panel" }),
-            already_exists("Control Panel", "racing-panel", "Cluster", &cluster_arn),
+            already_exists("control panel", &panel_arn, "racing-panel"),
         ),
         (
             "a routing control name inside its control panel",
@@ -385,25 +403,15 @@ async fn a_name_taken_inside_its_parent_is_a_validation_error_and_one_create_win
                 "ControlPanelArn": panel_arn,
                 "RoutingControlName": "first",
             }),
-            already_exists("Routing Control", "first", "Control Panel", &panel_arn),
+            already_exists("routing control", &first_arn, "first"),
         ),
         (
             "a routing control name inside the default control panel",
             "/routingcontrol",
             json!({ "ClusterArn": cluster_arn, "RoutingControlName": "implicit" }),
-            already_exists("Routing Control", "implicit", "Control Panel", &default_panel_arn),
+            already_exists("routing control", &implicit_arn, "implicit"),
         ),
     ];
-    // The middle row needs the name to exist first; the others already do.
-    create_routing_control(
-        &router,
-        json!({
-            "ClusterArn": cluster_arn,
-            "ControlPanelArn": panel_arn,
-            "RoutingControlName": "first",
-        }),
-    )
-    .await;
 
     for (case, path, body, expected) in taken {
         let (status, answer) = call(&router, "POST", path, Some(body.clone())).await;

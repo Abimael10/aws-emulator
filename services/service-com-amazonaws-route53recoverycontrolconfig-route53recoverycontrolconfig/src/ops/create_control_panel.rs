@@ -230,14 +230,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A control panel name identifies the panel within its cluster. A name already
         // taken under the same parent is a refusal of the request's INPUT, not a
         // transient collision a retry could win.
-        if guard.control_panel_name_taken(&input.cluster_arn, &input.control_panel_name, None) {
+        if let Some(taken) =
+            guard.control_panel_named(&input.cluster_arn, &input.control_panel_name, None)
+        {
             return Err(CreateControlPanelErrorModeled::ValidationException(
                 ValidationException {
                     message: crate::state::already_exists_message(
                         crate::state::CONTROL_PANEL_RESOURCE,
+                        crate::state::resource_id(&taken.arn),
                         &input.control_panel_name,
-                        crate::state::CLUSTER_RESOURCE,
-                        &input.cluster_arn,
                     ),
                 },
             )

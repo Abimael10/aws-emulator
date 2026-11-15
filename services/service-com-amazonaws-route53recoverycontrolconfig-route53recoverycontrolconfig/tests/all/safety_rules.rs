@@ -80,9 +80,13 @@ fn cannot_delete(resource: &str, dependents: &str) -> String {
     format!("Cannot delete a {resource} with {dependents}.")
 }
 
-/// The sentence a create whose name is already taken in its control panel is refused with.
-fn already_exists(name: &str, panel_arn: &str) -> String {
-    format!("Safety Rule {name} already exists in Control Panel {panel_arn}.")
+/// The sentence a create or a rename whose name is already taken in its control panel is
+/// refused with: the colliding rule's own id, then the name the request asked for.
+fn already_exists(existing_arn: &str, name: &str) -> String {
+    let existing_id = existing_arn
+        .rsplit_once('/')
+        .map_or(existing_arn, |(_, id)| id);
+    format!("A safety rule with the specified name already exists: {existing_id}, {name}")
 }
 
 /// A `RuleConfig` body.
@@ -674,6 +678,10 @@ async fn a_create_naming_an_unstored_resource_or_both_kinds_is_refused() {
         status, 200,
         "case the first rule under a name: expected 200, got {status} {answer:?}"
     );
+    let taken_arn = answer["AssertionRule"]["SafetyRuleArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     let (status, answer) =
         create_rule(&router, assertion(&panel_arn, &controls[0], "taken-name")).await;
     assert_eq!(
@@ -683,7 +691,7 @@ async fn a_create_naming_an_unstored_resource_or_both_kinds_is_refused() {
     let actual = message(&answer);
     assert_eq!(
         actual,
-        already_exists("taken-name", &panel_arn),
+        already_exists(&taken_arn, "taken-name"),
         "case a second rule under the same name: expected the already-exists sentence, got \
          {actual:?}"
     );
@@ -881,7 +889,7 @@ async fn an_update_persists_the_name_and_wait_period_of_the_rule_it_addresses() 
             json!({ "AssertionRuleUpdate": { "Name": "gating-renamed", "SafetyRuleArn": assertion_arn, "WaitPeriodMs": 5000 } }),
             400,
             "ValidationException",
-            already_exists("gating-renamed", &panel_arn),
+            already_exists(&gating_arn, "gating-renamed"),
         ),
     ];
 
