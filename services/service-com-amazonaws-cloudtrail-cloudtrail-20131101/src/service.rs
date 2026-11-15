@@ -61,10 +61,9 @@ pub mod authorization;
 pub mod management_events;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
-use aws_smithy_schema_server::constraints;
 use service_common::audited_operation::AuditedDefinition;
 use smithy_server_runtime::{
-    http, BoxFuture, DeserializableStruct, ErasedOperation, ErasedServiceDefinition, Operation,
+    http, BoxFuture, ErasedOperation, ErasedServiceDefinition, Operation,
     OperationContext, Refusal, Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
@@ -101,9 +100,15 @@ const LOOKUP_ATTRIBUTES_PATH: &str = "lookupAttributes";
 /// event category that is not valid is specified as a value of EventCategory."
 const INVALID_EVENT_CATEGORY_CODE: &str = "InvalidEventCategoryException";
 
+/// The HTTP status that shape's `@httpError` declares.
+const INVALID_EVENT_CATEGORY_STATUS: u16 = 400;
+
 /// The wire error code of the modelled `InvalidLookupAttributesException`: "Occurs when
 /// a lookup attribute is specified that is not valid."
 const INVALID_LOOKUP_ATTRIBUTES_CODE: &str = "InvalidLookupAttributesException";
+
+/// The HTTP status that shape's `@httpError` declares.
+const INVALID_LOOKUP_ATTRIBUTES_STATUS: u16 = 400;
 
 /// The target rule in isolation, as THIS service's prefix forms exercise it: which
 /// operation an `X-Amz-Target` names, over the prefix forms a client can write.
@@ -331,7 +336,7 @@ fn max_results_refusal(violation: &Violation) -> Option<String> {
 }
 
 /// How the validating walk spells the page-size member of the operations wired to
-/// [`ModelledRefusal::InvalidMaxResults`]: lowerCamel, at the top level of the input.
+/// [`ModelledRefusal::MaxResults`]: lowerCamel, at the top level of the input.
 ///
 /// It is the member each of those operations declares as its `@paginated` `pageSize`
 /// (`smithy_query(query="operation", operation="ListQueries,ListEventDataStores")`),
@@ -478,7 +483,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         //   - `LookupEvents`, whose maximum is stated of the results RETURNED ("The
         //     default number of results returned is 50, with a maximum of 50 possible"),
         //     so a larger limit is served with a capped page instead of being refused —
-        //     the member carries `skip_validation` and the handler caps the page.
+        //     the member carries `skip_validation` and the handler caps the page;
+        //
+        // * `LookupEvents`, for the two of ITS members the constraint walk can refuse
+        //   ahead of its handler and whose model declares an error of its own:
+        //   `EventCategory` and the `LookupAttributes` list.
         let audited = management_events::audited_table(&engine);
         Self {
             entry: AuditedDefinition::new(crate::ServiceDefinition::new(engine), audited),
@@ -514,32 +523,45 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// error.
 struct InModelledEnvelope<O> {
     operation: O,
-    /// Which refusal this operation states in a shape its own model declares.
-    refusal: ModelledRefusal,
+    /// Which refusals this operation states in a shape its own model declares, read in
+    /// order: an operation whose model declares a shape of its own for more than one
+    /// pre-handler refusal states each of them in that shape.
+    refusals: &'static [ModelledRefusal],
 }
 
 /// A refusal that precedes a handler and that CloudTrail answers in a shape the
 /// operation's own model declares, rather than in the framework's generic
 /// `ValidationException`.
 ///
-/// One variant per such shape. Which operations each is wired to is stated once, where
-/// they are wrapped in [`EmulatedService::new`]: an operation is wrapped for a variant
-/// only when its model declares that error, so this can never answer a code the
-/// operation does not carry.
+/// One variant per such shape, each named for the member or the rule the refusal speaks
+/// for (the shape itself is named by the code the arm answers with). Which operations each
+/// is wired to is stated once, where they are wrapped in [`EmulatedService::new`]: an
+/// operation is wrapped for a variant only when its model declares that error, so this can
+/// never answer a code the operation does not carry.
 #[derive(Debug, Clone, Copy)]
 enum ModelledRefusal {
     /// A tag key or value outside the modelled `TagKey` / `TagValue` length — see
     /// [`tag_length_refusal`].
-    InvalidTagParameter,
+    TagParameter,
     /// A `MaxResults` outside the modelled range of the operation's page-size member
     /// — see [`max_results_refusal`].
-    InvalidMaxResults,
+    MaxResults,
+    /// An `EventCategory` outside the values the modelled enum declares — see
+    /// [`event_category_refusal`].
+    EventCategory,
+    /// A lookup attribute the service cannot read — a key outside the modelled
+    /// `LookupAttributeKey` values, or a value outside its member's constraint — see
+    /// [`lookup_attribute_refusal`].
+    LookupAttributes,
 }
 
 impl<O> InModelledEnvelope<O> {
     /// Wrap one operation, already constructed from the shared engine.
-    fn new(operation: O, refusal: ModelledRefusal) -> Self {
-        Self { operation, refusal }
+    fn new(operation: O, refusals: &'static [ModelledRefusal]) -> Self {
+        Self {
+            operation,
+            refusals,
+        }
     }
 }
 
@@ -557,7 +579,7 @@ where
             // Read the protocol out before the await: `&dyn ErasedServiceDefinition`
             // is not `Sync`, and this future is. The protocol itself is.
             let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
-            if let Some(refused) = refused_before_handling::<O>(protocol, req, self.refusal) {
+            if let Some(refused) = refused_before_handling::<O>(protocol, req, self.refusals) {
                 return refused;
             }
             self.operation.run(svc, req, ctx).await
@@ -571,15 +593,9 @@ where
     }
 }
 
-/// The modelled error `refusal` states for `req`, when the request breaks the rule
-/// that refusal speaks for; `None` when it does not, so the request reaches the
+/// The modelled error one of `refusals` states for `req`, when the request breaks the
+/// rule that refusal speaks for; `None` when it does not, so the request reaches the
 /// handler.
-///
-/// `None` also when the request cannot be read at all — a body the codec rejects, or
-/// one missing a required member, carries no value to hold to its constraint, and the
-/// framework's own walk words that refusal — and when the chosen error cannot be
-/// serialized, which leaves that walk to refuse the request rather than answering with
-/// no reason at all.
 ///
 /// A request this does not refuse is deserialized and walked a SECOND time by the
 /// generated `ErasedOperation::run`. That is the cost of stating the refusal in the
@@ -590,14 +606,32 @@ where
 fn refused_before_handling<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-    refusal: ModelledRefusal,
+    refusals: &[ModelledRefusal],
 ) -> Option<RtResponse> {
-    let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
-    let input = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer).ok()?;
-    drop(deserializer);
-    let violations = constraints::validate(&input, O::INPUT_SCHEMA);
+    // A member the shape requires is found ABSENT while the request is read, and a value
+    // outside a declared bound while the request that was read is walked. They are the same
+    // refusal to a caller ([`Refusal::Invalid`] carries both), so both are collected by the
+    // ONE shared collector every service that words its own pre-handler refusal reads
+    // (`service_common::validation::refusing_violations`), from the framework's own
+    // deserializer and constraint walk: this cannot find a different set from the walk that
+    // follows it, and a modelled shape that speaks for a member speaks for it absent as well.
+    let violations = ::service_common::validation::refusing_violations::<O>(protocol, req);
+    refusals
+        .iter()
+        .find_map(|refusal| stated_in_modelled_shape(protocol, *refusal, &violations))
+}
+
+/// The response `refusal` states for `violations`, rendered FROM the modelled error
+/// shape — so the body carries the member name that shape's model spells (`Message`)
+/// rather than the lowercase `message` of the framework's generic envelope — or `None`
+/// when no violation falls in the class that refusal speaks for.
+fn stated_in_modelled_shape(
+    protocol: &dyn ServerHttpProtocol,
+    refusal: ModelledRefusal,
+    violations: &[Violation],
+) -> Option<RtResponse> {
     match refusal {
-        ModelledRefusal::InvalidTagParameter => {
+        ModelledRefusal::TagParameter => {
             let message = violations.iter().find_map(tag_length_refusal)?;
             protocol
                 .serialize_error(
@@ -610,7 +644,7 @@ fn refused_before_handling<O: Operation>(
                 )
                 .ok()
         }
-        ModelledRefusal::InvalidMaxResults => {
+        ModelledRefusal::MaxResults => {
             let message = violations.iter().find_map(max_results_refusal)?;
             protocol
                 .serialize_error(
@@ -620,6 +654,32 @@ fn refused_before_handling<O: Operation>(
                     &crate::ops::types::shared_types::SCHEMA_INVALID_MAX_RESULTS_EXCEPTION,
                     INVALID_MAX_RESULTS_EXCEPTION,
                     INVALID_MAX_RESULTS_EXCEPTION_STATUS,
+                )
+                .ok()
+        }
+        ModelledRefusal::EventCategory => {
+            let message = violations.iter().find_map(event_category_refusal)?;
+            protocol
+                .serialize_error(
+                    &crate::ops::types::lookup_events_types::InvalidEventCategoryException {
+                        message: Some(message.to_string()),
+                    },
+                    &crate::ops::types::lookup_events_types::SCHEMA_INVALID_EVENT_CATEGORY_EXCEPTION,
+                    INVALID_EVENT_CATEGORY_CODE,
+                    INVALID_EVENT_CATEGORY_STATUS,
+                )
+                .ok()
+        }
+        ModelledRefusal::LookupAttributes => {
+            let message = violations.iter().find_map(lookup_attribute_refusal)?;
+            protocol
+                .serialize_error(
+                    &crate::ops::types::lookup_events_types::InvalidLookupAttributesException {
+                        message: Some(message.to_string()),
+                    },
+                    &crate::ops::types::lookup_events_types::SCHEMA_INVALID_LOOKUP_ATTRIBUTES_EXCEPTION,
+                    INVALID_LOOKUP_ATTRIBUTES_CODE,
+                    INVALID_LOOKUP_ATTRIBUTES_STATUS,
                 )
                 .ok()
         }
@@ -721,7 +781,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // out-of-range `GetQueryResults` `MaxQueryResults` carries. The operations whose
         // model declares `InvalidMaxResultsException` for the member they declare as
         // their page size answer it through the per-operation seam instead
-        // ([`ModelledRefusal::InvalidMaxResults`], wired in [`InModelledEnvelope`]), which
+        // ([`ModelledRefusal::MaxResults`], wired in [`InModelledEnvelope`]), which
         // knows which operation it wraps. Every other refusal, authentication included,
         // keeps the framework's wording because every reader declines it.
         let Refusal::Invalid(violations) = refusal else {
@@ -787,6 +847,10 @@ fn is_under(path: &str, member: &str) -> bool {
 /// path (lowerCamel): the last step of `lookupAttributes.<1-based index>.member.<member>`.
 const ATTRIBUTE_KEY_MEMBER: &str = "attributeKey";
 
+/// The member a lookup attribute's VALUE sits at, as the validating walk spells a member
+/// path (lowerCamel): the last step of `lookupAttributes.<1-based index>.member.<member>`.
+const ATTRIBUTE_VALUE_MEMBER: &str = "attributeValue";
+
 /// How this service answers a `LookupEvents` refusal the model declares an error OF ITS
 /// OWN for: that error's code, and the fixed sentence CloudTrail words that error class
 /// with.
@@ -806,23 +870,53 @@ const ATTRIBUTE_KEY_MEMBER: &str = "attributeKey";
 /// attribute is the attribute-not-valid one.
 fn lookup_events_refusal(violations: &[Violation]) -> Option<Refused> {
     violations.iter().find_map(|violation| {
-        if violation.path == EVENT_CATEGORY_PATH {
+        if let Some(message) = event_category_refusal(violation) {
             return Some(Refused {
                 code: INVALID_EVENT_CATEGORY_CODE.to_string(),
-                message: crate::ops::lookup_events::INVALID_EVENT_CATEGORY_MESSAGE.to_string(),
+                message: message.to_string(),
             });
         }
-        if !is_under(&violation.path, LOOKUP_ATTRIBUTES_PATH) {
-            return None;
-        }
-        let message = if violation.path.rsplit('.').next() == Some(ATTRIBUTE_KEY_MEMBER) {
-            crate::ops::lookup_events::ABSENT_LOOKUP_ATTRIBUTE_KEY_MESSAGE
-        } else {
-            crate::ops::lookup_events::INVALID_LOOKUP_ATTRIBUTE_MESSAGE
-        };
+        let message = lookup_attribute_refusal(violation)?;
         Some(Refused {
             code: INVALID_LOOKUP_ATTRIBUTES_CODE.to_string(),
             message: message.to_string(),
         })
     })
+}
+
+/// The sentence a `LookupEvents` `EventCategory` outside the modelled value set is refused
+/// with, or `None` for a violation that is not that member's.
+///
+/// Read by both places this refusal can leave from, as [`tag_length_refusal`] is: the
+/// modelled envelope [`InModelledEnvelope`] serializes, and the framework's pre-dispatch
+/// envelope [`Service::override_refusal`] rewords for a request that wrapper could not read
+/// as an input.
+fn event_category_refusal(violation: &Violation) -> Option<&'static str> {
+    (violation.path == EVENT_CATEGORY_PATH)
+        .then_some(crate::ops::lookup_events::INVALID_EVENT_CATEGORY_MESSAGE)
+}
+
+/// The sentence a lookup attribute the service cannot read is refused with, or `None` for a
+/// violation that is not one of that member's.
+///
+/// Which of the three sentences is the class the violation falls in: an attribute is read BY
+/// its key, so a key the service cannot read — absent, or outside the keys lookup supports
+/// — is the key sentence; a VALUE it cannot read — absent, or empty — is the sentence naming
+/// the value; and anything else about the attribute is the attribute-not-valid one.
+fn lookup_attribute_refusal(violation: &Violation) -> Option<&'static str> {
+    if !is_under(&violation.path, LOOKUP_ATTRIBUTES_PATH) {
+        return None;
+    }
+    let member = violation.path.rsplit('.').next();
+    if member == Some(ATTRIBUTE_KEY_MEMBER) {
+        return Some(crate::ops::lookup_events::ABSENT_LOOKUP_ATTRIBUTE_KEY_MESSAGE);
+    }
+    let unreadable_value = matches!(
+        violation.kind,
+        ViolationKind::MissingRequiredMember | ViolationKind::MinLength(_)
+    );
+    if member == Some(ATTRIBUTE_VALUE_MEMBER) && unreadable_value {
+        return Some(crate::ops::lookup_events::ABSENT_LOOKUP_ATTRIBUTE_VALUE_MESSAGE);
+    }
+    Some(crate::ops::lookup_events::INVALID_LOOKUP_ATTRIBUTE_MESSAGE)
 }

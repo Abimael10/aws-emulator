@@ -15,6 +15,8 @@
 //!   digest files within the specified time range"), with an absent bound reading as the
 //!   instant of the call ("if not specified, the current time is used, and the current
 //!   public key is returned");
+//! * a window spanning several of the rotation schedule's periods reports ONE key per
+//!   period, each carrying its own validity range as whole-second instants;
 //! * no key exists for a period that has not begun, and none predates the service, so a
 //!   window wholly in the future or wholly before CloudTrail existed selects nothing;
 //! * a key is a real PKCS#1 public key with a fingerprint over its own body, and is stable:
@@ -501,6 +503,83 @@ async fn an_inverted_window_is_refused_in_one_sentence() {
             "case {case:?}: expected CloudTrail's one sentence for an inverted window, \
              got {reply:?}"
         );
+    }
+}
+
+/// A window spanning several of the schedule's periods reports the key of EACH of them, and
+/// every validity instant a key is reported with is a whole second.
+///
+/// The span one key signs for is read off the schedule itself — the current key's own range —
+/// so the rows generalise over how many periods a window covers rather than naming a period
+/// length: a window of `k` spans back from the call covers `k + 1` of them, since the
+/// instant `k` spans back sits at the same offset inside its own period as the call does
+/// inside the current one.
+#[tokio::test]
+async fn a_window_spanning_several_periods_reports_one_key_per_period() {
+    let emulator = Emulator::new();
+
+    // The current key, which a request stating neither bound asks about.
+    let current = reported_keys(
+        &list_in(&emulator, HOME_REGION, None, None).await,
+        "the current key",
+    );
+    assert_eq!(
+        current.len(),
+        1,
+        "case the current key: expected exactly the current key, got {current:?}"
+    );
+    let span_seconds = current[0].end - current[0].start + 1.0;
+    assert!(
+        span_seconds > 0.0,
+        "case the current key: expected a forward validity range, got {current:?}"
+    );
+    let span_millis = (span_seconds * 1_000.0).round() as i64;
+
+    for periods in [1_i64, 2, 3, 4, 12] {
+        let case = match periods {
+            1 => "one period back",
+            2 => "two periods back",
+            3 => "three periods back",
+            4 => "four periods back",
+            _ => "a year's worth of periods back",
+        };
+        let now = now_millis();
+        let keys = reported_keys(
+            &list_in(
+                &emulator,
+                HOME_REGION,
+                Some(now - periods * span_millis),
+                Some(now),
+            )
+            .await,
+            case,
+        );
+        assert_schedule(&keys, case);
+        let expected = usize::try_from(periods + 1).expect("a small count fits a usize");
+        assert_eq!(
+            keys.len(),
+            expected,
+            "case {case:?}: expected one key per period the window covers, got {keys:?}"
+        );
+        for key in &keys {
+            // Each entry carries its OWN period, not the window the request asked about.
+            assert!(
+                (key.end - key.start + 1.0 - span_seconds).abs() <= SECOND_SLACK,
+                "case {case:?}: expected each key's range to span its own period of \
+                 {span_seconds} seconds, got {key:?}"
+            );
+            // Both instants are whole seconds: the granularity every reported validity
+            // bound carries, which is what a second-granularity consumer parses.
+            for (member, instant) in [("ValidityStartTime", key.start), ("ValidityEndTime", key.end)]
+            {
+                assert_eq!(
+                    instant.fract(),
+                    0.0,
+                    "case {case:?}: expected {member} to be a whole number of seconds, got \
+                     {instant} in {key:?}"
+                );
+            }
+        }
     }
 }
 

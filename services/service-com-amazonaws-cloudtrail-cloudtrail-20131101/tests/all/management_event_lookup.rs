@@ -19,9 +19,9 @@
 //! * `StartTime` / `EndTime` bound the window INCLUSIVELY ("after or at" / "before or
 //!   at"), only the last 90 days are retrievable, and `StartTime` after `EndTime` is an
 //!   `InvalidTimeRangeException`;
-//! * a lookup filters on at most ONE `LookupAttribute` ("Currently the list can contain
-//!   only one item"), whose key is one of the eight the model's `LookupAttributeKey`
-//!   declares, and each key filters on the event field it names;
+//! * a lookup filters on the `LookupAttribute`s it states — each key one of the eight the
+//!   model's `LookupAttributeKey` declares, each filtering on the event field it names
+//!   (`tests/all/lookup_event_filters.rs` pins what a list of several states);
 //! * `EventCategory` takes only the value the model declares (`insight`), and an absent
 //!   category asks for management events;
 //! * `MaxResults` bounds the PAGE (at most 50, default 50) rather than the request — a
@@ -741,29 +741,15 @@ async fn each_lookup_attribute_filters_on_its_own_field() {
     }
 }
 
-/// A lookup filters on at most one attribute, the key must be one the model declares,
-/// and `ReadOnly` takes only the two values an event reports it as.
+/// A lookup attribute's key must be one the model declares, and `ReadOnly` takes only the
+/// two values an event reports it as. How MANY attributes the list carries is not a rule a
+/// request is held to (`tests/all/lookup_event_filters.rs`).
 #[tokio::test]
 async fn an_invalid_lookup_attribute_is_refused() {
     let emulator = Emulator::new();
     emulator.seed(served("CallA", HOME_REGION), base_instant());
 
     let cases: Vec<(&str, Value)> = vec![
-        (
-            "two attributes",
-            json!([
-                {"AttributeKey": "EventName", "AttributeValue": "CallA"},
-                {"AttributeKey": "EventSource", "AttributeValue": EVENT_SOURCE},
-            ]),
-        ),
-        (
-            "three attributes",
-            json!([
-                {"AttributeKey": "EventName", "AttributeValue": "CallA"},
-                {"AttributeKey": "EventSource", "AttributeValue": EVENT_SOURCE},
-                {"AttributeKey": "ReadOnly", "AttributeValue": "false"},
-            ]),
-        ),
         (
             "a key the model does not declare",
             json!([{"AttributeKey": "EventRegion", "AttributeValue": HOME_REGION}]),

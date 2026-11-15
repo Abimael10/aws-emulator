@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = millis_of(::std::time::SystemTime::now());
 
         let category = wanted_category(input.event_category.as_deref())?;
-        let attribute = single_attribute(input.lookup_attributes)?;
+        let attributes = requested_attributes(input.lookup_attributes)?;
 
         // "Specifies that only events that occur after or at the specified time are
         // returned" / "before or at", so both bounds are INCLUSIVE; "If the specified
@@ -241,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let fingerprint = filter_fingerprint(
             &region,
             category,
-            attribute.as_ref(),
+            &attributes,
             requested_start,
             requested_end,
         );
@@ -270,10 +270,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|event| event.call.aws_region == region)
             .filter(|event| event.event_category == category)
             .filter(|event| (from..=to).contains(&event.event_time_millis()))
+            // "Specifies an attribute and value that filter the events returned": every
+            // attribute the request states filters, so an event is selected when it
+            // satisfies all of them, and a request stating none filters on nothing.
             .filter(|event| {
-                attribute
-                    .as_ref()
-                    .is_none_or(|lookup| matches_attribute(event, lookup))
+                attributes
+                    .iter()
+                    .all(|lookup| matches_attribute(event, lookup))
             })
             .collect();
         // "The events list is sorted by time. The most recent event is listed first."
@@ -341,6 +344,19 @@ pub(crate) const INVALID_EVENT_CATEGORY_MESSAGE: &str = "Invalid event category 
 pub(crate) const ABSENT_LOOKUP_ATTRIBUTE_KEY_MESSAGE: &str =
     "Lookup attribute key cannot be null or empty.";
 
+/// How CloudTrail words a lookup attribute whose VALUE it cannot read — absent, or empty:
+/// the fixed sentence for that error class, carrying no part of the request.
+///
+/// An attribute is a key AND the value that key filters on, so a value the service cannot
+/// read leaves the attribute unreadable just as an unreadable key does, and the recorded
+/// refusal of such a value is the service's absent-value sentence — the key sentence's
+/// twin, naming the VALUE. It quotes neither the value nor the key it was given for.
+///
+/// Read by both exits this refusal can leave through, as [`INVALID_EVENT_CATEGORY_MESSAGE`]
+/// is.
+pub(crate) const ABSENT_LOOKUP_ATTRIBUTE_VALUE_MESSAGE: &str =
+    "Lookup attribute value cannot be null or empty.";
+
 /// How CloudTrail words a lookup attribute that is otherwise not valid — a readable key
 /// whose VALUE is outside the domain that key filters on, say: the fixed sentence for
 /// that error class, carrying no part of the request.
@@ -370,6 +386,32 @@ const MAX_RESULTS_MAX: i32 = 50;
 /// The same number as [`MAX_RESULTS_MAX`] today, but a different model fact.
 const MAX_RESULTS_DEFAULT: i32 = 50;
 
+/// The upper end of the range CloudTrail's limit refusal STATES for a lookup's page size.
+///
+/// It bounds nothing: a larger limit is served with the page capped at [`MAX_RESULTS_MAX`],
+/// the maximum documented of the results returned. It is part of the sentence the service
+/// answers a limit it will not read with ([`max_results_not_valid_message`]), which names
+/// the range a caller is told to choose from rather than the modelled range of the member.
+const MAX_RESULTS_STATED_MAX: i32 = 1_000;
+
+/// How CloudTrail words a `MaxResults` that names no page a lookup can answer: the value
+/// the request sent, and the range the refusal tells a caller to choose from.
+///
+/// `InvalidMaxResultsException` is "thrown if the limit specified is not valid", and the
+/// recorded refusal of a limit below the minimum is this sentence — fixed text around one
+/// part taken from the request, the value exactly as it was sent, and the two bounds the
+/// service states ([`MAX_RESULTS_MIN`], [`MAX_RESULTS_STATED_MAX`]).
+///
+/// It is this OPERATION's wording, as [`INVERTED_TIME_RANGE_MESSAGE`] is: an operation whose
+/// page size the pre-dispatch seam refuses keeps the sentence pinned for it
+/// (`crate::state::limit_not_valid_message`).
+fn max_results_not_valid_message(requested: i32) -> String {
+    format!(
+        "A max results value of {requested} is invalid. Specify max results between \
+         {MAX_RESULTS_MIN} and {MAX_RESULTS_STATED_MAX}."
+    )
+}
+
 /// How many events one page carries, or the refusal a limit that cannot name a page is
 /// answered with.
 ///
@@ -390,13 +432,7 @@ fn page_size(requested: Option<i32>) -> Result<usize, LookupEventsError> {
     if requested < MAX_RESULTS_MIN {
         return Err(LookupEventsErrorModeled::InvalidMaxResultsException(
             InvalidMaxResultsException {
-                // The ONE wording of a limit refusal this service has
-                // (`crate::state::limit_not_valid_message`), so this sentence and the
-                // pre-dispatch seam's cannot drift apart.
-                message: Some(crate::state::limit_not_valid_message(
-                    "maxResults",
-                    &format!("greater than or equal to {MAX_RESULTS_MIN}"),
-                )),
+                message: Some(max_results_not_valid_message(requested)),
             },
         )
         .into());
@@ -437,31 +473,64 @@ fn wanted_category(requested: Option<&str>) -> Result<&'static str, LookupEvents
     }
 }
 
-/// The one lookup attribute a request may filter on.
+/// The lookup attributes a request filters on, each one this service can act on.
 ///
-/// "Contains a list of lookup attributes. Currently the list can contain only one
-/// item.", and an attribute outside what Lookup supports is an
-/// `InvalidLookupAttributesException` ("Occurs when a lookup attribute is specified that
-/// is not valid").
-fn single_attribute(
+/// An attribute outside what Lookup supports is an `InvalidLookupAttributesException`
+/// ("Occurs when a lookup attribute is specified that is not valid"), judged per
+/// attribute: the refusal is about the attribute, not about the list.
+///
+/// How MANY attributes the list carries is not a rule the service holds a request to:
+/// `LookupAttributesList` declares no `@length`
+/// (`smithy_query(query="shape", shape="LookupAttributesList")`), and the recorded answer
+/// to a lookup carrying more than one attribute is a 200 with the events that satisfy
+/// them. So a list of any length a lookup can filter on is served, and the "currently the
+/// list can contain only one item" the member documents is left as the guidance it is
+/// rather than enforced as a bound the service does not enforce — up to
+/// [`MAX_LOOKUP_ATTRIBUTES`], which is what keeps the work one request costs from being
+/// the caller's to choose.
+fn requested_attributes(
     requested: Option<Vec<LookupAttribute>>,
-) -> Result<Option<LookupAttribute>, LookupEventsError> {
+) -> Result<Vec<LookupAttribute>, LookupEventsError> {
     let requested = requested.unwrap_or_default();
-    // Each attribute is judged on ITSELF before the list's length is judged, which is the
-    // order the service answers in: a list carrying a key the service cannot read is
-    // refused for that key whether or not it also carries more attributes than one lookup
-    // filters on.
+    // Each attribute is judged on ITSELF first, which is the order the service answers in:
+    // a list carrying an attribute the service cannot read is refused for that attribute
+    // whether or not the list is also longer than one lookup filters on.
     for attribute in &requested {
         readable_attribute(attribute)?;
     }
-    if requested.len() > 1 {
-        return Err(invalid_lookup_attributes(format!(
-            "LookupAttributes carries {} attributes: a lookup filters on at most one \
-             attribute",
-            requested.len()
+    if requested.len() > MAX_LOOKUP_ATTRIBUTES {
+        return Err(invalid_lookup_attributes(too_many_attributes_message(
+            requested.len(),
         )));
     }
-    Ok(requested.into_iter().next())
+    Ok(requested)
+}
+
+/// How many attributes one lookup filters on, at most.
+///
+/// Every attribute the list states filters, so the comparisons a lookup costs are the
+/// events it reads TIMES the attributes it states — and without a bound here the second
+/// factor is the caller's to choose. The bound is far above every list AWS itself accepts:
+/// the member documents "currently the list can contain only one item", and the recorded
+/// answer to a lookup stating two is a served page, so no request a client makes reaches
+/// it. What it bounds is a list longer than any lookup filters on, which is an attribute
+/// the service cannot act on and is refused as one — never served against a truncated
+/// filter, which would report events the request did not ask for.
+const MAX_LOOKUP_ATTRIBUTES: usize = 64;
+
+/// How this operation words a list longer than [`MAX_LOOKUP_ATTRIBUTES`]: the length the
+/// request stated and the length a lookup filters on.
+///
+/// This sentence is the emulator's OWN and has no recorded wording to reproduce, because the
+/// real service does not refuse a list for its length at all — AWS documents one item and
+/// serves more. It names the condition it refuses rather than borrowing one of the fixed
+/// sentences above, each of which is about a single ATTRIBUTE and would misdescribe this
+/// refusal to a client that classifies by sentence.
+fn too_many_attributes_message(stated: usize) -> String {
+    format!(
+        "LookupAttributes carries {stated} attributes: a lookup filters on at most \
+         {MAX_LOOKUP_ATTRIBUTES} attributes"
+    )
 }
 
 /// The refusal a lookup attribute this service cannot act on is answered with.
@@ -473,15 +542,21 @@ fn invalid_lookup_attributes(message: String) -> LookupEventsError {
 }
 
 /// Whether one lookup attribute is one this service can filter on: a key lookup supports,
-/// carrying a value inside the domain that key filters on.
+/// carrying a value it can read that is inside the domain that key filters on.
 ///
-/// Both refusals are `InvalidLookupAttributesException` ones, each worded with the fixed
-/// sentence CloudTrail states that class with — the absent-key sentence for a key it
-/// cannot read, the attribute-not-valid sentence for a value outside its key's domain.
+/// All three refusals are `InvalidLookupAttributesException` ones, each worded with the
+/// fixed sentence CloudTrail states that class with — the absent-key sentence for a key it
+/// cannot read, the absent-value sentence for a value it cannot read, the
+/// attribute-not-valid sentence for a value outside its key's domain.
 fn readable_attribute(attribute: &LookupAttribute) -> Result<(), LookupEventsError> {
     if !LOOKUP_ATTRIBUTE_KEY_VALUES.contains(&attribute.attribute_key.as_str()) {
         return Err(invalid_lookup_attributes(
             ABSENT_LOOKUP_ATTRIBUTE_KEY_MESSAGE.to_string(),
+        ));
+    }
+    if attribute.attribute_value.is_empty() {
+        return Err(invalid_lookup_attributes(
+            ABSENT_LOOKUP_ATTRIBUTE_VALUE_MESSAGE.to_string(),
         ));
     }
     if attribute.attribute_key == READ_ONLY_ATTRIBUTE_KEY
@@ -564,23 +639,29 @@ fn to_event(event: &ManagementEvent) -> Event {
 }
 
 /// The filter a token belongs to, mixed into one opaque value: the Region, the event
-/// category, the lookup attribute and the requested window.
+/// category, EVERY lookup attribute the call stated and the requested window.
+///
+/// Each attribute contributes its key and its value in the order the request listed them,
+/// so a token continues a page of exactly the filter that minted it — a call that drops,
+/// adds or reorders an attribute states a different filter and its token is refused.
 fn filter_fingerprint(
     region: &str,
     category: &str,
-    attribute: Option<&LookupAttribute>,
+    attributes: &[LookupAttribute],
     start: Option<i64>,
     end: Option<i64>,
 ) -> String {
     let bound = |value: Option<i64>| value.map(|v| v.to_string()).unwrap_or_default();
-    ::service_common::stable_hex_id(&[
-        region,
-        category,
-        attribute.map(|a| a.attribute_key.as_str()).unwrap_or(""),
-        attribute.map(|a| a.attribute_value.as_str()).unwrap_or(""),
-        &bound(start),
-        &bound(end),
-    ])
+    let mut parts: Vec<&str> = vec![region, category];
+    for attribute in attributes {
+        parts.push(attribute.attribute_key.as_str());
+        parts.push(attribute.attribute_value.as_str());
+    }
+    let start = bound(start);
+    let end = bound(end);
+    parts.push(&start);
+    parts.push(&end);
+    ::service_common::stable_hex_id(&parts)
 }
 
 /// The token that continues this filter's lookup below `cursor`.

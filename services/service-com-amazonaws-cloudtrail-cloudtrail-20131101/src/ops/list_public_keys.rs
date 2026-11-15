@@ -231,12 +231,21 @@ const INVERTED_WINDOW_MESSAGE: &str = "Invalid input parameter! Start time is af
 /// the service itself, which is what bounds how far back a listing can reach.
 const KEY_SCHEDULE_START_MILLIS: i64 = 1_383_264_000_000;
 
-/// How long one key pair signs a Region's digest files for before CloudTrail rotates it.
+/// How long one key pair signs a Region's digest files for before CloudTrail rotates it:
+/// 30 days, the span each key reported by the real service is valid for.
 ///
-/// The service publishes no rotation interval, so this span is the emulator's own choice.
-/// What the model does state is what a caller sees either way: a key carries a validity
-/// range, and "the returned public keys may have validity time ranges that overlap".
-const KEY_VALIDITY_SPAN_MILLIS: i64 = 90 * 24 * 60 * 60 * 1_000;
+/// The service publishes no rotation interval in the model, but every key a recorded
+/// listing reports carries a validity period of a whole month, and that span is what decides
+/// how many keys a window selects — a listing over several months reports the key of each
+/// month it covers, which is what a validator walks to find the key a digest was signed
+/// with. What the model states holds either way: a key carries a validity range, and "the
+/// returned public keys may have validity time ranges that overlap".
+const KEY_VALIDITY_SPAN_MILLIS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
+/// The resolution the validity instants of a key are reported at: whole seconds, which is
+/// the granularity every recorded `ValidityStartTime` / `ValidityEndTime` carries, so a
+/// consumer that parses them as second-granularity instants loses nothing.
+const VALIDITY_RESOLUTION_MILLIS: i64 = 1_000;
 
 /// The keys whose validity range overlaps the window `[from, to]`, oldest first.
 ///
@@ -276,10 +285,12 @@ fn validity_start_millis(period: i64) -> i64 {
     KEY_SCHEDULE_START_MILLIS.saturating_add(period.saturating_mul(KEY_VALIDITY_SPAN_MILLIS))
 }
 
-/// "The ending time of validity of the public key" of `period`: the last instant before the
-/// next key takes over, so the ranges tile the schedule rather than leaving a gap.
+/// "The ending time of validity of the public key" of `period`: the last whole SECOND before
+/// the next key takes over, so the ranges tile the schedule rather than leaving a gap, and
+/// both bounds of a reported range are whole seconds
+/// ([`VALIDITY_RESOLUTION_MILLIS`]) as the service reports them.
 fn validity_end_millis(period: i64) -> i64 {
-    validity_start_millis(period.saturating_add(1)).saturating_sub(1)
+    validity_start_millis(period.saturating_add(1)).saturating_sub(VALIDITY_RESOLUTION_MILLIS)
 }
 
 /// The modelled `PublicKey` of the key pair `region` signs with in `period`.

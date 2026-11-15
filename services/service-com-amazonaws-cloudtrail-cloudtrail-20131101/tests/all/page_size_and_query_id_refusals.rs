@@ -46,6 +46,11 @@ const LOOKUP_MAX_RESULTS_MIN: i64 = 1;
 /// See [`LOOKUP_MAX_RESULTS_MIN`].
 const LOOKUP_MAX_RESULTS_MAX: i64 = 50;
 
+/// The upper end of the range CloudTrail's limit refusal for a lookup STATES, which is not
+/// the modelled maximum above and bounds nothing: a limit past it is served with the page
+/// capped at [`LOOKUP_MAX_RESULTS_MAX`] (the rows of the case above cover 1000 and 1001).
+const LOOKUP_STATED_MAX_RESULTS: i64 = 1_000;
+
 /// `GetQueryResults$MaxQueryResults`' modelled `@range`
 /// (`smithy_query(query="operation", operation="GetQueryResults")` gives
 /// `@range{min:1,max:1000}` on a member its `@paginated` trait does not name).
@@ -216,10 +221,12 @@ async fn a_lookup_page_size_above_its_maximum_is_served_with_the_page_capped() {
 }
 
 /// RULE: a `MaxResults` below the modelled minimum asks for a page that cannot exist,
-/// and is refused with the error the operation models for a limit that is not valid.
+/// and is refused with the error the operation models for a limit that is not valid,
+/// worded as CloudTrail words it: the value the request sent, and the range it tells a
+/// caller to choose from.
 ///
 /// The rows are the values below the published minimum, including the one just under it
-/// and the extreme a 32-bit integer carries.
+/// and the extreme a 32-bit integer carries — each one a different value in the sentence.
 #[tokio::test]
 async fn a_lookup_page_size_below_the_minimum_is_refused() {
     let emulator = Emulator::new();
@@ -234,10 +241,10 @@ async fn a_lookup_page_size_below_the_minimum_is_refused() {
         assert_eq!(
             reply.message(),
             format!(
-                "The limit at 'maxResults' is not valid: it must have value greater than \
-                 or equal to {LOOKUP_MAX_RESULTS_MIN}."
+                "A max results value of {max_results} is invalid. Specify max results \
+                 between {LOOKUP_MAX_RESULTS_MIN} and {LOOKUP_STATED_MAX_RESULTS}."
             ),
-            "case {case:?}: expected the member and the bound it broke, got {:?}",
+            "case {case:?}: expected the value sent and the range stated, got {:?}",
             reply.body
         );
     }

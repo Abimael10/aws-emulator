@@ -71,6 +71,8 @@ mod insights_metric_data;
 mod lake_queries;
 #[path = "all/list_tags_reader.rs"]
 mod list_tags_reader;
+#[path = "all/lookup_event_filters.rs"]
+mod lookup_event_filters;
 #[path = "all/management_event_lookup.rs"]
 mod management_event_lookup;
 #[path = "all/query_cancellation.rs"]

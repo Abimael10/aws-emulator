@@ -473,7 +473,6 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
         list_public_keys::ListPublicKeys => reports,
         list_tags::ListTags => reports,
         list_trails::ListTrails => reports,
-        lookup_events::LookupEvents => reports,
         put_event_configuration::PutEventConfiguration => mutates,
         put_event_selectors::PutEventSelectors => mutates,
         put_insight_selectors::PutInsightSelectors => mutates,
@@ -500,7 +499,7 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
     audited_in_modelled_envelope!(
         table,
         engine,
-        super::ModelledRefusal::InvalidTagParameter,
+        &[super::ModelledRefusal::TagParameter],
         add_tags::AddTags => mutates,
         create_channel::CreateChannel => mutates,
         create_dashboard::CreateDashboard => mutates,
@@ -513,9 +512,24 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
     audited_in_modelled_envelope!(
         table,
         engine,
-        super::ModelledRefusal::InvalidMaxResults,
+        &[super::ModelledRefusal::MaxResults],
         list_event_data_stores::ListEventDataStores => reports,
         list_queries::ListQueries => reports,
+    );
+    // `LookupEvents`, whose model declares an error of its own for each of the two members
+    // the framework's constraint walk can refuse before its handler runs: an
+    // `EventCategory` outside the modelled enum (`InvalidEventCategoryException`) and a
+    // lookup attribute the service cannot read (`InvalidLookupAttributesException`). Both
+    // are stated in those shapes, so the body carries the `Message` member the model
+    // spells.
+    audited_in_modelled_envelope!(
+        table,
+        engine,
+        &[
+            super::ModelledRefusal::EventCategory,
+            super::ModelledRefusal::LookupAttributes,
+        ],
+        lookup_events::LookupEvents => reports,
     );
     table.finish()
 }
