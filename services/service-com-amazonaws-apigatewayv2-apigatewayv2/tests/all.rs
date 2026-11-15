@@ -147,6 +147,8 @@ mod http_api_signed_invoke;
 mod http_api_stage_metrics;
 #[path = "all/http_api_step_functions_subtype.rs"]
 mod http_api_step_functions_subtype;
+#[path = "all/http_api_throttle_burst.rs"]
+mod http_api_throttle_burst;
 #[path = "all/integration_deletion.rs"]
 mod integration_deletion;
 #[path = "all/integration_lifecycle.rs"]

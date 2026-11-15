@@ -53,7 +53,7 @@
 //!   integration is the caller reaching that service through the api, so a refusal it earned
 //!   is told to it as the service stated it ([`super::service_action`]);
 //! * `429` `{"message":"Too Many Requests"}` for a request the serving stage's
-//!   `RouteSettings` throttle ([`crate::state::route_throttle`]);
+//!   `RouteSettings` throttle ([`throttle`], [`crate::state::route_throttle`]);
 //! * `400` `{"message":"Bad Request"}` for a request that does not carry what a first-class
 //!   service-action integration's mapping selects for a parameter its action REQUIRES: the
 //!   mapping is the api's own configuration and the request is what failed to satisfy it, so
@@ -68,7 +68,10 @@
 //! stage carries no variable for names no backend at all, so it is the "produced no
 //! response" class rather than a call to a URI carrying an unresolved reference.
 
-use std::time::{Duration, Instant};
+/// The serving stage's throttle, metered around the answer this step produces.
+mod throttle;
+
+use std::time::Duration;
 
 use aws_smithy_runtime_api::http::Response as RtResponse;
 use smithy_server_runtime::OperationContext;
@@ -88,11 +91,6 @@ use crate::state::{Authorizer, Integration};
 /// every sentence this endpoint answers follows.
 const UNAVAILABLE_STATUS: u16 = 503;
 const UNAVAILABLE_MESSAGE: &str = "Service Unavailable";
-
-/// The status a request the serving stage's route settings throttle is refused with, and
-/// the sentence it carries — the same reason-phrase convention (RFC 6585 §4).
-const TOO_MANY_REQUESTS_STATUS: u16 = 429;
-const TOO_MANY_REQUESTS_MESSAGE: &str = "Too Many Requests";
 
 /// The status a request that cannot satisfy its route's own parameter mapping is refused
 /// with, and the sentence it carries — the same reason-phrase convention (RFC 7231 §6.5.1).
@@ -159,8 +157,14 @@ pub async fn perform<Eng: Send + Sync + 'static>(
     };
     // The throttle is metered once the route's authorization — including the authorizer's
     // own decision above — has admitted the request, and before anything the route fronts is
-    // reached.
-    if let Some(refusal) = throttle_refusal(engine, &dispatch) {
+    // reached. The submission stays in flight for the rest of this function: the burst the
+    // stage states is what the requests arriving TOGETHER at this route may draw ahead of its
+    // rate, so what the throttle admits depends on which of them are still being answered.
+    let submission = throttle::metered(engine, &dispatch);
+    if let Some(refusal) = submission
+        .as_ref()
+        .and_then(throttle::Submission::refusal)
+    {
         return refusal;
     }
     // A first-class service action names what it invokes ITSELF, so it is reached before a
@@ -205,46 +209,6 @@ pub async fn perform<Eng: Send + Sync + 'static>(
     json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None)
 }
 
-/// The refusal the serving stage's throttle owes this request, or `None` for a route the
-/// stage meters nothing on and for one whose bucket had capacity for it.
-///
-/// It is applied once the route's own authorization has admitted the request — the gate
-/// `super::invoke` applies and the authorizer's own decision above — and before anything the
-/// route fronts is reached, so a route the stage throttles answers `429`
-/// `{"message":"Too Many Requests"}` while its twin on the same stage is served, and the
-/// integration observes no invocation for the refused request.
-fn throttle_refusal<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    dispatch: &Dispatch,
-) -> Option<RtResponse> {
-    let limits = dispatch.throttle?;
-    let state = crate::state::service_state(engine)?;
-    let admitted = state.lock().route_throttles.admits(
-        &dispatch.request.api_id,
-        &dispatch.request.stage_name,
-        &dispatch.route_key,
-        limits,
-        Instant::now(),
-    );
-    if admitted {
-        return None;
-    }
-    ::tracing::info!(
-        api_id = %dispatch.request.api_id,
-        stage = %dispatch.request.stage_name,
-        route_key = %dispatch.route_key,
-        rate = limits.rate,
-        burst = limits.burst,
-        "refusing an invoke: the serving stage's route settings throttle this route, so its \
-         integration is not reached"
-    );
-    Some(json_response(
-        TOO_MANY_REQUESTS_STATUS,
-        TOO_MANY_REQUESTS_MESSAGE,
-        None,
-    ))
-}
-
 /// The answer for an invoke served from a seam that carries no in-process transport: the
 /// Lambda proxy integration cannot be performed from there, so the class it falls into is
 /// reported.
@@ -252,7 +216,11 @@ fn throttle_refusal<Eng: Send + Sync + 'static>(
 /// Everything that does not need the transport is unchanged — the throttle, and the `307`
 /// an `HTTP_PROXY` upstream is answered with, which is the caller's to reach either way.
 pub fn unperformable<Eng: Send + Sync + 'static>(engine: &Eng, dispatch: &Dispatch) -> RtResponse {
-    if let Some(refusal) = throttle_refusal(engine, dispatch) {
+    let submission = throttle::metered(engine, dispatch);
+    if let Some(refusal) = submission
+        .as_ref()
+        .and_then(throttle::Submission::refusal)
+    {
         return refusal;
     }
     if let Some(integration) = dispatch.integration.as_ref() {

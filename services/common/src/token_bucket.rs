@@ -12,9 +12,11 @@
 //! chance to get the refill or the cap wrong, so the bucket lives here once.
 //!
 //! What stays with the service is everything ABOUT ITS OWN MODEL: which members declare the
-//! pair, what an absent or non-positive member means for that resource, and what the thing
-//! being metered is keyed by. This module owns only the bucket: how much capacity is left,
-//! how it refills, and whether one request may be admitted.
+//! pair, what an absent or non-positive member means for that resource, what the thing
+//! being metered is keyed by, and which of its requests may draw on the rate before the bucket
+//! has refilled ([`Bucket::admits_ahead`], the reading a pair gets whose burst is the number
+//! of requests served AT ONCE). This module owns only the bucket: how much capacity is left,
+//! how it refills, how far it may be drawn, and whether one request may be admitted.
 //!
 //! Nothing here sleeps or waits: the capacity is computed from how much time has passed
 //! since the last admitted request, so a caller that was idle finds its whole burst again
@@ -83,6 +85,27 @@ impl Bucket {
             return false;
         }
         self.charge(cost);
+        true
+    }
+
+    /// Admit one request that may draw on the capacity the rate has NOT refilled yet — up to
+    /// one `limits.burst` AHEAD of it — and record it, or report that `limits` admit none even
+    /// that far ahead at `now`.
+    ///
+    /// The same bucket as [`Self::admits`], with its floor one burst lower, and the same
+    /// charge: what is taken ahead of the rate is still spent, so the rate REPAYS it and what
+    /// a caller is served over time is still the steady-state rate. What this bounds is how far
+    /// ahead of the rate the bucket may be drawn — a BUDGET, not a count, and one that is lower
+    /// by a whole burst whatever the bucket already held, so a caller may take the capacity the
+    /// bucket holds and then draw a burst more before the rate has refilled it, and is held to
+    /// the rate afterwards until the draw is repaid. How MANY requests are served at once is a
+    /// different bound and the caller's own: the reading a pair gets whose burst is the number
+    /// served together counts the requests it is serving and stops asking at the burst.
+    pub fn admits_ahead(&mut self, limits: Limits, now: ::std::time::Instant) -> bool {
+        if self.capacity_at(limits, now) < ONE_REQUEST - limits.burst {
+            return false;
+        }
+        self.charge(ONE_REQUEST);
         true
     }
 
@@ -259,5 +282,110 @@ mod tests {
             (999.0, 512.0),
             "case a request inside both budgets: expected both charged what it brought"
         );
+    }
+
+    /// One row of the draw-ahead table: the pair the limits state, how many requests the
+    /// burst is worth, and how long the rate takes to repay that draw and one request more.
+    struct Ahead {
+        case: &'static str,
+        rate: f64,
+        burst: f64,
+        worth: usize,
+        repaid: Duration,
+    }
+
+    /// Drawing AHEAD of the rate: a bucket the rate has not refilled yet admits up to one
+    /// burst more, charges every one of them, and admits nothing again until the rate has
+    /// repaid what was taken — so the burst bounds how far ahead the bucket may be drawn and
+    /// the rate still bounds what is taken over time.
+    #[test]
+    fn a_bucket_drawn_ahead_of_its_rate_is_repaid_before_it_admits_again() {
+        let start = Instant::now();
+        // Rows differ along the pair: a burst of one, a wider burst, a fractional rate, a
+        // burst no rate ever repays, and a pair stating no capacity at all.
+        let cases = [
+            Ahead {
+                case: "a burst of one",
+                rate: 1.0,
+                burst: 1.0,
+                worth: 1,
+                repaid: Duration::from_secs(2),
+            },
+            Ahead {
+                case: "a burst of four",
+                rate: 10.0,
+                burst: 4.0,
+                worth: 4,
+                repaid: Duration::from_millis(500),
+            },
+            Ahead {
+                case: "a rate stated in fractions of a request",
+                rate: 0.5,
+                burst: 2.0,
+                worth: 2,
+                repaid: Duration::from_secs(6),
+            },
+            Ahead {
+                case: "a burst no rate ever repays",
+                rate: 0.0,
+                burst: 1.0,
+                worth: 1,
+                repaid: Duration::from_secs(60),
+            },
+            Ahead {
+                case: "limits that admit nothing",
+                rate: 0.0,
+                burst: 0.0,
+                worth: 0,
+                repaid: Duration::from_secs(60),
+            },
+        ];
+        for row in cases {
+            let case = row.case;
+            let limits = Limits {
+                rate: row.rate,
+                burst: row.burst,
+            };
+            let mut bucket = Bucket::full(limits, start);
+            // Spend what the bucket held, the way the requests already admitted spend it.
+            let mut spent = 0usize;
+            while bucket.admits(limits, start) {
+                spent += 1;
+                assert!(
+                    spent <= row.worth,
+                    "case {case:?}: a full bucket admitted more than its burst"
+                );
+            }
+            // Then draw ahead: the burst is how far the bucket may be drawn before the rate
+            // has refilled it.
+            let mut ahead = 0usize;
+            while bucket.admits_ahead(limits, start) {
+                ahead += 1;
+                assert!(
+                    ahead <= row.worth,
+                    "case {case:?}: drawing ahead was not bounded by the burst"
+                );
+            }
+            assert_eq!(
+                (spent, ahead),
+                (row.worth, row.worth),
+                "case {case:?}: expected the burst spent and the burst drawn ahead, got \
+                 {spent} spent and {ahead} ahead"
+            );
+            // What was drawn ahead is charged, so nothing is admitted at that instant.
+            assert!(
+                !bucket.admits_ahead(limits, start),
+                "case {case:?}: expected nothing admitted past the draw the burst bounds"
+            );
+            // Once the rate has repaid the draw, the bucket is the rate's again — and a rate
+            // that refills nothing never repays it.
+            let after = bucket.admits(limits, start + row.repaid);
+            assert_eq!(
+                after,
+                row.rate > 0.0,
+                "case {case:?}: expected the repaid bucket to admit a request again only \
+                 where the rate refills it at all, got {after}"
+            );
+        }
     }
 }

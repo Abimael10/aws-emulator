@@ -1095,9 +1095,10 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// configured — and `ResetAuthorizersCache` takes away the entries of one stage
     /// ([`authorizer_cache::AuthorizerCache::clear_stage`]).
     pub authorizer_cache: authorizer_cache::AuthorizerCache,
-    /// How much of each metered route's throttle the requests already served have taken:
-    /// the token bucket a stage's `RouteSettings` meter a route with
-    /// (`ThrottlingRateLimit` / `ThrottlingBurstLimit`). Data-plane state, like
+    /// How much of each metered route's throttle the requests already served have taken, and
+    /// which submissions of it the gateway is still answering: the token bucket a stage's
+    /// `RouteSettings` meter a route with (`ThrottlingRateLimit` / `ThrottlingBurstLimit`) and
+    /// what the requests arriving together may draw ahead of its rate. Data-plane state, like
     /// [`Self::authorizer_cache`], so it lives beside the apis rather than inside one.
     pub route_throttles: route_throttle::RouteThrottles,
     /// The SOCKET each WebSocket api is reached at and the connections open on it: the
