@@ -367,6 +367,11 @@ service-com-amazonaws-xray-awsxray = { workspace = true }
 # collection it created is read back through that service's own API.
 service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice = { workspace = true }
 service-com-amazonaws-opensearchserverless-opensearchserverless = { workspace = true }
+# The Bedrock Agent BUILD-TIME plane, mounted beside those two on that same engine: the
+# knowledge base a handler retrieves from — and the custom data source whose documents it
+# retrieves — are created and ingested through this plane's own API, so what the handler gets
+# back is read out of the records those creates really wrote.
+service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda = { workspace = true }
 # The search DOMAIN whose REST data plane a handler's own signed requests are decided by,
 # mounted beside lambda on ONE engine: the write a handler signs is admitted or refused by
 # that service's own authorization, and the document it stored is read back through its own

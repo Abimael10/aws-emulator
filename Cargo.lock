@@ -15689,6 +15689,7 @@ dependencies = [
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-appconfig-amazonappconfig",
  "service-com-amazonaws-appconfigdata-appconfigdata",
+ "service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda",
  "service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
