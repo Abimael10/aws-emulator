@@ -2490,3 +2490,16 @@ mod declaration_roots_keep_inner_attributes_ahead_of_the_first_item;
 // here so a re-appended note is a note rather than a build failure. An inner attribute, like
 // an inner doc comment, is legal only before the first item, so it stands here rather than in
 // the list below.
+// This file holds this header, then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
+// `tests/all/<name>.rs` and insert its pair in the one place its name sorts to; what that
+// in that suite's own module header, where it is read beside the test it explains. A note
+// about THIS file belongs in `all/appended_notes.rs`, declared below like any other suite.
+// Every comment in this file is an ordinary `//` one, this header included, and nothing but a
+// declaration pair stands below it. A suite no `mod` names compiles nowhere and its tests
+// never run; a suite declared twice is `E0428`; and an inner doc comment is legal only before
+// the first item, so a re-typed copy of one appended past the declarations compiles no suite
+// of this target at all. `all/all_rs_declares_each_suite_once.rs`,
+// `all/declaration_roots_are_canonical_and_complete.rs` check those rules, for this file and
+// for every service crate's `tests/all.rs`.
+// `tests/all.rs` is a test-target CRATE ROOT, where a bare `mod` would resolve to a SIBLING
+// of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each

@@ -56,6 +56,9 @@ mod saml_federation;
 #[path = "all/saml_relayed_refusal.rs"]
 mod saml_relayed_refusal;
 
+#[path = "all/saml_signature_refusal_message.rs"]
+mod saml_signature_refusal_message;
+
 #[path = "all/session_audit_records.rs"]
 mod session_audit_records;
 
