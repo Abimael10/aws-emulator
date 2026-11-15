@@ -232,20 +232,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is a fact of that service's own store
         // (`crate::state::account_holds_query_log_destination`, read with no
         // lock of this service's store held). A destination the caller cannot
-        // write to is answered with the `AccessDenied` this operation models —
-        // the refusal discloses nothing about whether the destination exists
-        // (`crate::state::resolver_access_denied`) — and NO configuration is
-        // created, so the store never holds one whose logs could not be
-        // delivered.
+        // write to is answered with the `AccessDenied` this operation models,
+        // worded as this slice words its denials and under this slice's own
+        // service error code — the refusal discloses nothing about whether the
+        // destination exists
+        // (`crate::state::query_log_destination_access_denied`) — and NO
+        // configuration is created, so the store never holds one whose logs
+        // could not be delivered.
         if !crate::state::account_holds_query_log_destination(
             &*self.engine,
             &input.destination_arn,
         ) {
             return Err(
                 CreateResolverQueryLogConfigErrorModeled::AccessDeniedException(
-                    crate::state::resolver_access_denied(&crate::state::request_trace_root(
-                        &ctx.parts().headers,
-                    )),
+                    crate::state::query_log_destination_access_denied(
+                        &crate::state::request_trace_root(&ctx.parts().headers),
+                    ),
                 )
                 .into(),
             );

@@ -77,6 +77,31 @@ pub fn account_holds_query_log_destination<Eng: Send + Sync + 'static>(
     }
 }
 
+/// The `AccessDeniedException` a query-logging write answers for a destination
+/// the account does not hold.
+///
+/// A destination the caller cannot write to is answered with the model's
+/// `AccessDeniedException` ("the current account doesn't have the IAM
+/// permissions required to perform the specified Resolver operation"), and the
+/// body carries NOTHING from the request: the refusal discloses neither the ARN
+/// it was handed nor whether the resource exists, exactly as
+/// [`resolver_access_denied`] discloses nothing about the resource it was asked
+/// about.
+///
+/// The sentence is the one the QUERY-LOGGING slice words its denials with
+/// ([`query_log_access_denied_message`]) — under that slice's own service error
+/// code, and not the code another slice's denial carries — closed with the trace
+/// clause of the request ([`traced_message`]), which is the only part of the body
+/// that is not fixed text.
+pub fn query_log_destination_access_denied(trace_root: &str) -> AccessDeniedException {
+    AccessDeniedException {
+        message: Some(traced_message(
+            query_log_access_denied_message(),
+            trace_root,
+        )),
+    }
+}
+
 /// Whether the account's own Amazon S3 inventory holds the bucket `bucket`.
 fn account_holds_bucket<Eng: Send + Sync + 'static>(engine: &Eng, bucket: &str) -> bool {
     let Some(state) = ::service_com_amazonaws_s3_amazons3::state::service_state(engine) else {

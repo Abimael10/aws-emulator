@@ -7,7 +7,6 @@
 // name. Why a suite belongs to this cross-service target rather than to one service
 // crate's own is stated in that suite's own module doc, which is where it stays readable:
 // a note here is prose two landing branches duplicate, re-word and mistype.
-//
 // Three rules this file lives or dies by, each pinned by a suite of its own
 // (`all/all_rs_declares_each_suite_once.rs`,
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
@@ -34,7 +33,6 @@
 //! (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points each
 //! declaration into `tests/all/`.
 // Single integration-test target for the router.
-//
 // Put a new suite at `tests/all/<name>.rs` and declare it below with a `#[path]`/`mod`
 // pair, keeping the list sorted: one pair per suite, and nothing else that a landing has to
 // keep consistent.
@@ -47,7 +45,6 @@
 // producing — is `E0753` and compiles no suite of this target. With no inner doc comment
 // anywhere, no merge of two landings can put one past the first item.
 // `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs` and
 // `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the list holds one
 // pair per suite, sorted, and no other line — for this file and for every service crate's
 // `tests/all.rs`, so check there rather than leaving a note here.
@@ -1428,3 +1425,15 @@ mod lambda_in_function_assumed_role_session;
 //! compiles no suite of this target, so add a declaration below, never a note about one.
 //! every service crate's `tests/all.rs`. What a suite covers belongs in that suite's own
 //! module header; the notes earlier landings appended here live in `all/appended_notes.rs`.
+// Single integration-test target for the router: the declaration list, and nothing else.
+// name. The list holds no other line: what a suite covers, and why it belongs to this
+// module doc, where it is read beside the test it explains.
+// suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would
+// resolve to a SIBLING of this file, which the layout check refuses: the `#[path]` is what
+// points each declaration into `tests/all/`.
+// EVERY comment in this file is an ORDINARY one, this block included, and that is deliberate:
+// an inner doc comment is legal only before the first item, so one that lands past the
+// declarations — which is what concurrent landings appending to this file kept producing — is
+// `E0753` and compiles no suite of this target. With no inner doc comment anywhere, no merge
+// of two landings can put one past the first item. Nothing follows the last declaration.
+// `all/all_rs_is_a_canonical_declaration_list.rs` check these rules, for this file and for

@@ -268,6 +268,22 @@ pub fn query_log_config_still_associated() -> InvalidRequestException {
     }
 }
 
+/// The message the query-logging slice words an access denial with: the service
+/// error code of ITS denial ([`RSLVR_CODE_QUERY_LOG_ACCESS_DENIED`]) and the
+/// fault it states, and nothing from the request.
+///
+/// Every denial of this slice reports the one sentence — the policy read with no
+/// policy attached ([`query_log_config_policy_access_denied`]) and the create
+/// naming a destination the account does not hold
+/// ([`query_log_destination_access_denied`]) — so the two cannot drift apart,
+/// and the code in it is what tells a caller a query-logging denial from the
+/// denial another slice of the service answers under the same error shape and
+/// the same HTTP status. It is written out here rather than through
+/// [`rslvr_message`] because the service ends this sentence with no period.
+pub fn query_log_access_denied_message() -> String {
+    format!("[{RSLVR_CODE_QUERY_LOG_ACCESS_DENIED}] Access denied")
+}
+
 /// One association between a VPC and a Resolver query logging configuration, as
 /// stored. It lives on the configuration it belongs to, so the configuration's
 /// `AssociationCount` and the associations it holds cannot disagree.

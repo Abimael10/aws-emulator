@@ -25,6 +25,14 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 
 use super::harness::{call, emulator, emulator_on, error_type, ok, string_member, Emulator};
 
+/// The sentence the query-logging slice words its denials with, as the recorded
+/// responses of that slice state it — a different code and different prose from
+/// the denial the per-VPC configuration slice answers
+/// ([`RSLVR_CODE_ACCESS_DENIED`]), which is what tells the two faults apart
+/// under the one error shape and the one HTTP status. The body of this denial is
+/// pinned case by case in [`super::query_log_access_denied_message`].
+const QUERY_LOG_DENIAL: &str = "[RSLVR-01600] Access denied";
+
 /// What the `Message` of a refusal states.
 enum Refusal {
     /// The coded can't-find sentence naming the id from the request, closed with
@@ -445,9 +453,9 @@ async fn a_destination_the_account_does_not_hold_is_refused_and_creates_nothing(
             "case {case:?}: a refusal carries no configuration, got {refused}"
         );
         assert!(
-            string_member(&refused, "Message")
-                .starts_with(&format!("[{RSLVR_CODE_ACCESS_DENIED}] ")),
-            "case {case:?}: the refusal must state the coded fault, got {refused}"
+            string_member(&refused, "Message").starts_with(QUERY_LOG_DENIAL),
+            "case {case:?}: the refusal must state the coded fault this slice words its denials \
+             with, got {refused}"
         );
         let listed = listed_ids(&router).await;
         assert!(

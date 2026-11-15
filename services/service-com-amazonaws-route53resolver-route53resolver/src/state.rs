@@ -401,16 +401,20 @@ pub const RSLVR_CODE_TAG_NOT_ACCEPTABLE: &str = "RSLVR-00908";
 /// do not tell this fault apart from the others that share them.
 pub const RSLVR_CODE_INVALID_IAM_POLICY: &str = "RSLVR-02035";
 
-/// The Route 53 Resolver service error code reported when a caller asks for a
-/// query logging configuration's resource policy and there is no policy to
-/// read.
+/// The Route 53 Resolver service error code reported when the QUERY-LOGGING
+/// slice denies a caller what a request asked for: a configuration's resource
+/// policy read while no policy is attached, and a configuration created for a
+/// log destination the account does not hold.
 ///
 /// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
 /// status (400) and the exception shape name together do not say which Resolver
 /// fault occurred, and the model states no message text, so this code comes
-/// from the recorded responses of the query-logging policy read. See
-/// [`query_log_config_policy_access_denied`].
-pub const RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_ACCESS_DENIED: &str = "RSLVR-01600";
+/// from the recorded responses of the query-logging operations that raise
+/// `AccessDeniedException`. It is the code of THIS slice's denial, which is what
+/// tells it apart from the denial of another slice
+/// ([`RSLVR_CODE_ACCESS_DENIED`]) when both answer the one error shape under the
+/// one status. See [`query_log_access_denied_message`].
+pub const RSLVR_CODE_QUERY_LOG_ACCESS_DENIED: &str = "RSLVR-01600";
 
 /// The Route 53 Resolver service error code reported when the caller is granted
 /// nothing on the resource a request names.
@@ -419,9 +423,9 @@ pub const RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_ACCESS_DENIED: &str = "RSLVR-01600"
 /// status (400) and the exception shape name together do not say which Resolver
 /// fault occurred, and the model states no message text, so this code comes from
 /// the recorded denial of the per-VPC configuration read. It is NOT the code of
-/// the denial a query logging configuration's policy read answers
-/// ([`RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_ACCESS_DENIED`]), which that slice's
-/// own recorded response states. See [`resolver_access_denied`].
+/// the denials the query-logging slice answers
+/// ([`RSLVR_CODE_QUERY_LOG_ACCESS_DENIED`]), which that slice's own recorded
+/// responses state. See [`resolver_access_denied`].
 pub const RSLVR_CODE_ACCESS_DENIED: &str = "RSLVR-01803";
 
 /// The Route 53 Resolver service error code reported when a request names an
@@ -2012,16 +2016,13 @@ pub fn unknown_resolver_query_log_config_arn(arn: &str) -> UnknownResourceExcept
 /// attached: with nothing attached the caller is granted nothing to read, which
 /// the model's `AccessDeniedException` ("the current account doesn't have the
 /// IAM permissions required to perform the specified Resolver operation") is the
-/// modelled answer for. The message is the one sentence the service words that
-/// fault with, carried behind its service error code
-/// ([`RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_ACCESS_DENIED`]) and carrying nothing
-/// from the request; it is written out here rather than through
-/// [`rslvr_message`] because the service ends this sentence with no period.
+/// modelled answer for. The message is the one the query-logging slice words
+/// every denial with ([`query_log_access_denied_message`]), and this read
+/// carries it alone: the recorded response of the policy read closes with no
+/// trace clause.
 pub fn query_log_config_policy_access_denied() -> AccessDeniedException {
     AccessDeniedException {
-        message: Some(format!(
-            "[{RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_ACCESS_DENIED}] Access denied"
-        )),
+        message: Some(query_log_access_denied_message()),
     }
 }
 
@@ -2071,7 +2072,10 @@ pub fn traced_message(message: String, trace_root: &str) -> String {
 /// The sentence is the one the service's recorded denial words that fault with,
 /// behind its service error code ([`RSLVR_CODE_ACCESS_DENIED`]) and closed with
 /// the trace clause of the request ([`traced_message`]), which is the only part
-/// of it that is not fixed text.
+/// of it that is not fixed text. A denial the QUERY-LOGGING slice answers words
+/// the fault its own way, under its own code
+/// ([`query_log_access_denied_message`]), so this is not the body for one of
+/// those.
 pub fn resolver_access_denied(trace_root: &str) -> AccessDeniedException {
     AccessDeniedException {
         message: Some(traced_message(

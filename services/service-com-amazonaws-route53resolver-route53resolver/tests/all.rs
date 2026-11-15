@@ -89,6 +89,8 @@ mod managed_firewall_domain_lists;
 mod outpost_binding;
 #[path = "all/outpost_resolvers.rs"]
 mod outpost_resolvers;
+#[path = "all/query_log_access_denied_message.rs"]
+mod query_log_access_denied_message;
 #[path = "all/query_log_refusal_trace_clause.rs"]
 mod query_log_refusal_trace_clause;
 #[path = "all/resolver_config_listing.rs"]
