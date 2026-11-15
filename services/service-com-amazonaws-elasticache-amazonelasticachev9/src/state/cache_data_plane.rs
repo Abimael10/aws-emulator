@@ -660,6 +660,22 @@ pub async fn serve_cache_cluster<Eng: Send + Sync + 'static>(
     state: &::engine::ServiceState<super::ComAmazonawsElasticacheAmazonelasticachev9State>,
     cache_cluster_id: &str,
 ) {
+    serve_cache_cluster_holding(engine, state, cache_cluster_id, None).await
+}
+
+/// [`serve_cache_cluster`] for a cluster that keeps a data set it already had:
+/// `keyspace` is the data the new socket serves, and `None` starts it empty.
+///
+/// The one caller that hands a keyspace in is the delete that RETAINS a
+/// replication group's primary cluster: the group's socket closes with the group,
+/// and the cluster that stays behind keeps what it held, because retaining the
+/// primary is what keeps a group's data.
+pub async fn serve_cache_cluster_holding<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    state: &::engine::ServiceState<super::ComAmazonawsElasticacheAmazonelasticachev9State>,
+    cache_cluster_id: &str,
+    keyspace: Option<SharedKeyspace>,
+) {
     let identity = CacheIdentity::CacheCluster {
         cache_cluster_id: cache_cluster_id.to_string(),
     };
@@ -675,7 +691,7 @@ pub async fn serve_cache_cluster<Eng: Send + Sync + 'static>(
         }
         cluster.transit_encryption_enabled.unwrap_or(false)
     };
-    let Some(plane) = open_cache_data_plane(engine, state, identity.clone(), tls, None).await
+    let Some(plane) = open_cache_data_plane(engine, state, identity.clone(), tls, keyspace).await
     else {
         return;
     };
@@ -814,6 +830,27 @@ pub fn close_cache_cluster_data_plane(
         },
     };
     store.cache_data_planes.remove(&identity);
+}
+
+/// The keyspace the member cluster `cache_cluster_id` of the replication group
+/// `replication_group_id` is served out of, if this emulator serves one for it.
+///
+/// What a cache HOLDS, so a cluster that outlives the group it was a member of —
+/// the primary a `DeleteReplicationGroup` retains — is served the same data on
+/// its own socket rather than starting empty.
+pub fn member_cluster_keyspace(
+    store: &super::ComAmazonawsElasticacheAmazonelasticachev9State,
+    replication_group_id: &str,
+    cache_cluster_id: &str,
+) -> Option<SharedKeyspace> {
+    let identity = CacheIdentity::ReplicationGroupMember {
+        replication_group_id: replication_group_id.to_string(),
+        cache_cluster_id: cache_cluster_id.to_string(),
+    };
+    store
+        .cache_data_planes
+        .get(&identity)
+        .map(|plane| Arc::clone(plane.keyspace()))
 }
 
 /// Close every socket a replication group's members were served on.

@@ -38,7 +38,11 @@ use crate::harness::{params, poll_until, Emulator, Reply, REGION};
 
 /// A span far longer than any transition this service schedules, for the half of a row
 /// that reads a record while the clock still owes it a change.
-const HELD_OUT_OF_REACH: Duration = Duration::from_secs(60 * 60);
+///
+/// `pub(crate)` with [`every_pending_change_due_in`], for the reason the harness module
+/// gives: a second suite that has to hold a resource in its transient phase drives it
+/// through THESE rather than carrying a second copy of them.
+pub(crate) const HELD_OUT_OF_REACH: Duration = Duration::from_secs(60 * 60);
 
 /// What the report issued inside the span must show, and what the clock must then settle.
 #[derive(Debug, Clone, Copy)]
@@ -86,7 +90,7 @@ struct Phase {
 /// the transient phase whatever it is (`HELD_OUT_OF_REACH`) and then make the whole
 /// outstanding set due at once (`Duration::ZERO`). Only the DUE INSTANT moves: the status
 /// the clock owes, and everything else the record carries, is the handler's own.
-fn every_pending_change_due_in(emulator: &Emulator, due_in: Duration) {
+pub(crate) fn every_pending_change_due_in(emulator: &Emulator, due_in: Duration) {
     let due = SystemTime::now() + due_in;
     emulator.with_state(|store| {
         for cluster in store.cache_clusters.values_mut() {

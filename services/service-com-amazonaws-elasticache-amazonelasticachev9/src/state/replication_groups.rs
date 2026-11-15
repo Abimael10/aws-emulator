@@ -446,6 +446,42 @@ impl NodeGroupRecord {
         }
     }
 
+    /// This shard as the modelled `NodeGroupConfiguration`: the shard
+    /// configuration a snapshot of a replication group reports for it, which
+    /// `DescribeSnapshots$ShowNodeGroupConfig` asks for ("if true, the node group
+    /// (shard) configuration is included in the snapshot description").
+    ///
+    /// Every value is derived from the shard's own membership — its keyspace, how
+    /// many replicas it holds and where they sit — rather than from the request
+    /// that created the group, so a shard that has been scaled or failed over
+    /// since reports what it holds NOW.
+    pub fn to_configuration(&self) -> NodeGroupConfiguration {
+        let replicas: Vec<&NodeGroupMemberRecord> = self
+            .members
+            .iter()
+            .filter(|member| member.current_role != ROLE_PRIMARY)
+            .collect();
+        let replica_zones: Vec<String> = replicas
+            .iter()
+            .filter_map(|member| member.availability_zone.clone())
+            .collect();
+        NodeGroupConfiguration {
+            node_group_id: Some(self.node_group_id.clone()),
+            slots: self.slots.clone(),
+            replica_count: i32::try_from(replicas.len()).ok(),
+            primary_availability_zone: self
+                .members
+                .iter()
+                .find(|member| member.current_role == ROLE_PRIMARY)
+                .and_then(|member| member.availability_zone.clone()),
+            replica_availability_zones: (!replica_zones.is_empty()).then_some(replica_zones),
+            // Outposts are not modelled by this service: `CreateCacheCluster`
+            // refuses every Outpost member, so no member here sits in one.
+            primary_outpost_arn: None,
+            replica_outpost_arns: None,
+        }
+    }
+
     /// The endpoint a WRITER of this shard connects to.
     ///
     /// It is the address of the member currently holding the primary role: where this
@@ -835,6 +871,22 @@ impl ReplicationGroupRecord {
         });
         for shard in &mut self.node_groups {
             shard.status = status.to_string();
+        }
+    }
+
+    /// Put this group and its shards into [`STATUS_DELETING`].
+    ///
+    /// `DeleteReplicationGroup` documents exactly this: "when you receive a
+    /// successful response from this operation, Amazon ElastiCache immediately
+    /// begins deleting the selected resources; you cannot cancel or revert this
+    /// operation" — so the answer a caller is handed reports the group going
+    /// away. Any status change that was still pending is dropped: a group that is
+    /// going away is not owed `available` any more.
+    pub fn begin_deletion(&mut self) {
+        self.status = STATUS_DELETING.to_string();
+        self.pending_status = None;
+        for shard in &mut self.node_groups {
+            shard.status = STATUS_DELETING.to_string();
         }
     }
 

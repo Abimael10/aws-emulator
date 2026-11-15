@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteReplicationGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteReplicationGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DeleteReplicationGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -170,18 +166,394 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteReplicationGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteReplicationGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteReplicationGroup"))
+        let _ = ctx;
+        // This operation MUTATES: "when you receive a successful response from
+        // this operation, Amazon ElastiCache immediately begins deleting the
+        // selected resources; you cannot cancel or revert this operation."
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The FORM of the identifier before it is resolved, as every lookup in
+        // this service does it: a value no replication group could ever carry is
+        // a bad parameter value rather than a group that does not exist — see
+        // `crate::service::identifier_length_rules::replication_group_id_refusal`.
+        if let Some(message) =
+            crate::service::identifier_length_rules::replication_group_id_refusal(
+                &input.replication_group_id,
+            )
+        {
+            return Err(invalid_value(message));
+        }
+
+        // `ReplicationGroupId` "is stored as a lowercase string", so the lookup
+        // lowercases too.
+        let key = input.replication_group_id.to_ascii_lowercase();
+        // "If set to true, all of the read replicas are deleted, but the primary
+        // node is retained." Absent, the whole group goes.
+        let retain_primary = input.retain_primary_cluster.unwrap_or(false);
+        let now = ::std::time::SystemTime::now();
+
+        // Everything this call writes happens under ONE lock; the socket the
+        // retained primary is served on is opened after it, because opening one
+        // is async and no await may happen while the store is held.
+        let (answer, retained) = {
+            let mut store = state.lock();
+            // A snapshot whose removal a `DeleteSnapshot` made due is gone, so
+            // the name it held is free again and it does not count against the
+            // quota the final snapshot below is held to.
+            store.purge_deleted_snapshots(now);
+
+            // The group, with whatever status change the clock owes it already
+            // materialised.
+            let (members, shards, group_engine, group_node_type, group_kms_key_id, global_key) = {
+                let Some(group) = store.settled_replication_group_mut(&key, now) else {
+                    return Err(DeleteReplicationGroupErrorModeled::ReplicationGroupNotFoundFault(
+                        ReplicationGroupNotFoundFault {
+                            message: Some(crate::state::replication_group_not_found_message(
+                                &input.replication_group_id,
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                // A delete begins from the group's settled, usable status: one
+                // still `creating`, or `modifying` from a change the clock has
+                // not carried through, is refused with the modelled state fault
+                // and the group is left exactly as it was.
+                if group.status != crate::state::STATUS_AVAILABLE {
+                    return Err(invalid_state(
+                        crate::state::replication_group_delete_state_refusal(&key),
+                    ));
+                }
+                let members: Vec<(String, bool)> = group
+                    .node_groups
+                    .iter()
+                    .flat_map(|shard| shard.members.iter())
+                    .map(|member| {
+                        (
+                            member.cache_cluster_id.clone(),
+                            member.current_role == crate::state::ROLE_PRIMARY,
+                        )
+                    })
+                    .collect();
+                (
+                    members,
+                    group.node_groups.len(),
+                    group.engine.clone(),
+                    group.cache_node_type.clone(),
+                    group.kms_key_id.clone(),
+                    group.global_replication_group_id.clone(),
+                )
+            };
+
+            // Deleting the group deletes the CLUSTERS it is made of, so every
+            // one of them has to be in a state a delete may begin from: a member
+            // being snapshotted, still `creating`, or `modifying` from a change
+            // that has not settled, blocks the call. The refusal names the
+            // member that blocks it, read off the group's own membership.
+            for (member, _) in &members {
+                let blocked = store
+                    .settled_cluster_mut(member, now)
+                    .is_some_and(|cluster| cluster.status != crate::state::STATUS_AVAILABLE);
+                if blocked {
+                    return Err(invalid_state(
+                        crate::state::cache_cluster_delete_state_refusal(member),
+                    ));
+                }
+            }
+
+            // "If the replication group has only one primary, you can
+            // optionally delete only the read replicas, while retaining the
+            // primary": a group whose keyspace is partitioned has a primary per
+            // shard, so there is no single primary to keep.
+            if retain_primary && shards > 1 {
+                return Err(invalid_value(
+                    "Invalid value true for RetainPrimaryCluster: only the primary of a \
+                     replication group with one node group (shard) can be retained."
+                        .to_string(),
+                ));
+            }
+
+            // "The name of a final node group (shard) snapshot … After the final
+            // snapshot is taken, the replication group is immediately deleted."
+            // The snapshot is held to the same rules `CreateSnapshot` holds one
+            // to — the name's form, the name being free, the store's quota, and
+            // whether the source can be snapshotted at all — because it is the
+            // same resource under another operation's parameter.
+            let final_snapshot = match input.final_snapshot_identifier.as_deref() {
+                Some(requested) => {
+                    let snapshot_name = requested.to_ascii_lowercase();
+                    if !crate::state::is_valid_snapshot_name(&snapshot_name) {
+                        return Err(invalid_value(format!(
+                            "Invalid value {requested} for FinalSnapshotIdentifier: a name must \
+                             contain from 1 to 255 alphanumeric characters or hyphens."
+                        )));
+                    }
+                    if store.snapshots.contains_key(&snapshot_name) {
+                        return Err(
+                            DeleteReplicationGroupErrorModeled::SnapshotAlreadyExistsFault(
+                                SnapshotAlreadyExistsFault {
+                                    message: Some(
+                                        crate::state::SNAPSHOT_ALREADY_EXISTS_MESSAGE.to_string(),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    if store.snapshots.len() >= crate::state::SNAPSHOT_QUOTA {
+                        return Err(
+                            DeleteReplicationGroupErrorModeled::SnapshotQuotaExceededFault(
+                                SnapshotQuotaExceededFault {
+                                    message: Some(format!(
+                                        "This account already holds the maximum of {} snapshots.",
+                                        crate::state::SNAPSHOT_QUOTA
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    // The two sources ElastiCache cannot snapshot, as
+                    // `SnapshotFeatureNotSupportedFault` names them: a cache
+                    // that runs Memcached rather than Valkey or Redis OSS, and
+                    // one running on the node type that supports no snapshot.
+                    if !crate::state::engine_speaks_resp(&group_engine) {
+                        return Err(
+                            DeleteReplicationGroupErrorModeled::SnapshotFeatureNotSupportedFault(
+                                SnapshotFeatureNotSupportedFault {
+                                    message: Some(format!(
+                                        "Replication group {key} runs {group_engine}, and \
+                                         snapshots are supported for valkey and redis only."
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    if group_node_type.as_deref().is_some_and(|node_type| {
+                        node_type.eq_ignore_ascii_case(crate::state::UNSNAPSHOTTABLE_NODE_TYPE)
+                    }) {
+                        return Err(
+                            DeleteReplicationGroupErrorModeled::SnapshotFeatureNotSupportedFault(
+                                SnapshotFeatureNotSupportedFault {
+                                    message: Some(format!(
+                                        "Replication group {key} runs on {}, which does not \
+                                         support snapshots.",
+                                        crate::state::UNSNAPSHOTTABLE_NODE_TYPE
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    let Some(record) =
+                        final_snapshot_of(&store, &key, snapshot_name, group_kms_key_id, now)
+                    else {
+                        // Unreachable: the group resolved under this same lock,
+                        // and a stored group has a member cluster record per
+                        // shard. Refused rather than served, because a delete
+                        // that answered 200 here would have taken the group and
+                        // stored no snapshot for the name the request named.
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            crate::state::STORE_UNAVAILABLE,
+                        ));
+                    };
+                    Some(record)
+                }
+                None => None,
+            };
+
+            // The group is leaving: it answers `deleting` from this call, and so
+            // do the clusters it is made of, and the answer is read back out of
+            // the store rather than built beside it.
+            if let Some(group) = store.replication_groups.get_mut(&key) {
+                group.begin_deletion();
+            }
+            for (member, primary) in &members {
+                if retain_primary && *primary {
+                    continue;
+                }
+                if let Some(cluster) = store.cache_clusters.get_mut(member) {
+                    cluster.status = crate::state::STATUS_DELETING.to_string();
+                    cluster.pending_status = None;
+                    cluster.pending_event = None;
+                    cluster.set_node_status(crate::state::STATUS_DELETING);
+                }
+            }
+            let Some(answer) = store.modeled_replication_group(&key) else {
+                // Unreachable: resolved under this same lock above.
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::STORE_UNAVAILABLE,
+                ));
+            };
+
+            // The primary the request asked to keep, and the data it holds: the
+            // group's socket closes with the group, so the cluster that stays
+            // behind is served the very keyspace it was reading and writing.
+            let retained = members
+                .iter()
+                .find(|(_, primary)| retain_primary && *primary)
+                .map(|(member, _)| {
+                    (
+                        member.clone(),
+                        crate::state::member_cluster_keyspace(&store, &key, member),
+                    )
+                });
+            // Every socket the group's members were served on closes with them:
+            // dropping a handle closes the port and severs every connection on
+            // it, so no client keeps reaching a cache that is going away.
+            crate::state::close_replication_group_data_plane(&mut store, &key);
+
+            // Deleting a cluster is one of the events this service records; see
+            // `crate::state::EventRecord`. The log outlives the record, so the
+            // events of a deleted member are still reported, and the
+            // notification its topic is owed is queued while the record naming
+            // that topic is still here.
+            for (member, primary) in &members {
+                if retain_primary && *primary {
+                    continue;
+                }
+                store.record_cluster_event(
+                    member,
+                    Some(crate::state::EVENT_DELETE_CACHE_CLUSTER_COMPLETE),
+                    "Cache cluster deleted",
+                    now,
+                );
+                store.cache_clusters.remove(member);
+            }
+            // A retained primary is a standalone cluster from here on: it
+            // belongs to no replication group, so `DescribeCacheClusters` stops
+            // reporting one for it.
+            if let Some((member, _)) = retained.as_ref() {
+                if let Some(cluster) = store.cache_clusters.get_mut(member) {
+                    cluster.replication_group_id = None;
+                    cluster.replication_group_log_delivery_enabled = None;
+                }
+            }
+            store.replication_groups.remove(&key);
+            // A Global datastore cannot report a member that no longer exists,
+            // so the membership goes with the group — the pair
+            // `DisassociateGlobalReplicationGroup` clears, cleared here by the
+            // delete instead.
+            if let Some(global_key) = global_key.map(|id| id.to_ascii_lowercase()) {
+                if let Some(datastore) = store.global_replication_groups.get_mut(&global_key) {
+                    datastore
+                        .members
+                        .retain(|member| !member.replication_group_id.eq_ignore_ascii_case(&key));
+                }
+            }
+            // The final snapshot outlives the group it was taken of: it is
+            // stored after the group is gone, and a later `DescribeSnapshots`
+            // still reports it.
+            if let Some(record) = final_snapshot {
+                let stored = store.insert_snapshot(record);
+                let snapshot_name = stored.snapshot_name.clone();
+                store.record_event(
+                    crate::state::SOURCE_TYPE_REPLICATION_GROUP,
+                    &key,
+                    format!("Snapshot {snapshot_name} created"),
+                    now,
+                );
+            }
+            store.record_event(
+                crate::state::SOURCE_TYPE_REPLICATION_GROUP,
+                &key,
+                "Replication group deleted",
+                now,
+            );
+            (answer, retained)
+        };
+
+        // The retained primary's own socket, opened once the store is released:
+        // it holds what the group held, and the address it answers on is
+        // published on its record, so `DescribeCacheClusters` reports an endpoint
+        // a client can still reach.
+        if let Some((member, keyspace)) = retained {
+            crate::state::serve_cache_cluster_holding(&*self.engine, &state, &member, keyspace)
+                .await;
+        }
+
+        Ok(DeleteReplicationGroupOutput {
+            replication_group: Some(answer),
+        })
     }
+}
+
+/// The final snapshot of the replication group `key`, taken from the PRIMARY of
+/// each of its shards — the source `FinalSnapshotIdentifier` names: "ElastiCache
+/// creates the snapshot from the primary node in the cluster, rather than one of
+/// the replicas."
+///
+/// `None` for a group no shard of which has a primary cluster to copy, which is a
+/// group this store holds no member record for.
+fn final_snapshot_of(
+    store: &crate::state::ComAmazonawsElasticacheAmazonelasticachev9State,
+    key: &str,
+    snapshot_name: String,
+    kms_key_id: Option<String>,
+    now: ::std::time::SystemTime,
+) -> Option<crate::state::SnapshotRecord> {
+    let group = store.replication_groups.get(key)?;
+    let shards: Vec<(&crate::state::NodeGroupRecord, &crate::state::CacheClusterRecord)> = group
+        .node_groups
+        .iter()
+        .filter_map(|shard| {
+            let primary = shard
+                .members
+                .iter()
+                .find(|member| member.current_role == crate::state::ROLE_PRIMARY)?;
+            Some((shard, store.cache_clusters.get(&primary.cache_cluster_id)?))
+        })
+        .collect();
+    // The VPC the snapshot reports is the source's subnet group's, which is
+    // another record of this store.
+    let vpc_id = group.cache_subnet_group_name.as_ref().and_then(|name| {
+        store
+            .cache_subnet_groups
+            .get(&name.to_ascii_lowercase())
+            .map(|subnets| subnets.vpc_id.clone())
+    });
+    crate::state::SnapshotRecord::from_replication_group(
+        group,
+        &shards,
+        crate::state::NewSnapshot {
+            snapshot_name,
+            // A snapshot a caller asked for by name is a MANUAL one, whichever
+            // operation's parameter named it.
+            source: crate::state::SNAPSHOT_SOURCE_MANUAL.to_string(),
+            kms_key_id,
+            vpc_id,
+            // This request carries no tags of its own.
+            tags: Vec::new(),
+            now,
+        },
+    )
+}
+
+/// The modelled refusal for a parameter value this operation cannot accept:
+/// `InvalidParameterValueException` ("The value for a parameter is invalid"),
+/// HTTP 400.
+fn invalid_value(message: String) -> DeleteReplicationGroupError {
+    DeleteReplicationGroupErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled refusal for a group, or a cluster of it, that is not in a state a
+/// delete may begin from: `InvalidReplicationGroupStateFault` (awsQuery code
+/// `InvalidReplicationGroupState`), HTTP 400.
+fn invalid_state(message: String) -> DeleteReplicationGroupError {
+    DeleteReplicationGroupErrorModeled::InvalidReplicationGroupStateFault(
+        InvalidReplicationGroupStateFault {
+            message: Some(message),
+        },
+    )
+    .into()
 }

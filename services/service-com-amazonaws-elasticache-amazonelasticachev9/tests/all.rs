@@ -292,3 +292,7 @@ mod cache_data_consequences;
 // still owes the resource a change it has already scheduled.
 #[path = "all/lifecycle_convergence.rs"]
 mod lifecycle_convergence;
+// Appended for the same reason: the `DeleteReplicationGroup` suite, which holds a member
+// cluster in its transient phase through the convergence suite's clock helper.
+#[path = "all/replication_group_delete.rs"]
+mod replication_group_delete;

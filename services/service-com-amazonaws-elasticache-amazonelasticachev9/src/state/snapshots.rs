@@ -11,11 +11,22 @@ pub struct SnapshotRecord {
     /// stored as a lowercase string".
     pub snapshot_name: String,
     pub cache_cluster_id: Option<String>,
-    /// The source replication group. Always absent in this slice: every
-    /// replication-group operation is a scaffolded 501, so no group can be
-    /// snapshotted; it is what `DescribeSnapshots$ReplicationGroupId` filters
-    /// on, so that filter reads stored state rather than a constant.
+    /// The source replication group, which
+    /// `DescribeSnapshots$ReplicationGroupId` filters on: present on a snapshot
+    /// taken OF a group, and on one taken of a cluster that is a member of one.
     pub replication_group_id: Option<String>,
+    /// "A description of the source replication group"
+    /// (`Snapshot$ReplicationGroupDescription`): the source GROUP's own, so only
+    /// a snapshot taken of a group carries it — a cache cluster has no
+    /// replication-group description to copy.
+    pub replication_group_description: Option<String>,
+    /// "The number of node groups (shards) in this snapshot"
+    /// (`Snapshot$NumNodeGroups`), and the `AutomaticFailover` the source ran
+    /// with (`Snapshot$AutomaticFailover`): both the source GROUP's, so a
+    /// snapshot of a cache cluster carries neither.
+    pub num_node_groups: Option<i32>,
+    /// See [`SnapshotRecord::num_node_groups`].
+    pub automatic_failover: Option<String>,
     /// One of `Snapshot$SnapshotStatus`'s values (`creating | available |
     /// restoring | copying | deleting`), which spell the first two exactly as
     /// [`STATUS_CREATING`] and [`STATUS_AVAILABLE`] do.
@@ -87,6 +98,11 @@ impl SnapshotRecord {
             snapshot_name: new.snapshot_name,
             cache_cluster_id: Some(cluster.cache_cluster_id.clone()),
             replication_group_id: cluster.replication_group_id.clone(),
+            // The source is a CLUSTER, so the three values that describe a
+            // source replication group are not this snapshot's to report.
+            replication_group_description: None,
+            num_node_groups: None,
+            automatic_failover: None,
             status: STATUS_CREATING.to_string(),
             pending_status: Some(PendingTransition {
                 due: new.now + SNAPSHOT_TRANSITION,
@@ -113,6 +129,54 @@ impl SnapshotRecord {
             kms_key_id: new.kms_key_id,
             tags: new.tags,
         }
+    }
+
+    /// A snapshot of the replication group `group`, taken from the PRIMARY of
+    /// each of its shards.
+    ///
+    /// `FinalSnapshotIdentifier` states which node of a shard is captured:
+    /// "ElastiCache creates the snapshot from the primary node in the cluster,
+    /// rather than one of the replicas; this is to ensure that it captures the
+    /// freshest data." `shards` is one (shard, that shard's primary cluster)
+    /// pair per shard of the group, in the group's own shard order, resolved by
+    /// the caller — which holds the store the member clusters live in.
+    ///
+    /// What describes the captured CLUSTERS (node type, engine, port, parameter
+    /// group, maintenance window) is read off the first shard's primary, because
+    /// every member of a group runs the group's own configuration; what belongs
+    /// to the group as a whole — its description, how many shards it has, the
+    /// failover it ran with — is read off the group. Every value is COPIED, which
+    /// is what makes a snapshot a copy of the source as of the instant it was
+    /// taken.
+    pub fn from_replication_group(
+        group: &ReplicationGroupRecord,
+        shards: &[(&NodeGroupRecord, &CacheClusterRecord)],
+        new: NewSnapshot,
+    ) -> Option<Self> {
+        let (_, first) = shards.first()?;
+        let mut record = SnapshotRecord::from_cluster(first, new.clone());
+        record.cache_cluster_id = None;
+        record.replication_group_id = Some(group.replication_group_id.clone());
+        record.replication_group_description = Some(group.description.clone());
+        record.num_node_groups = i32::try_from(shards.len()).ok();
+        record.automatic_failover = Some(group.automatic_failover.clone());
+        // One node snapshot per captured node, each naming the shard it was
+        // taken from — which is what a group's snapshot carries and a cluster's
+        // does not.
+        record.node_snapshots = shards
+            .iter()
+            .flat_map(|(shard, primary)| {
+                primary.nodes.iter().map(move |node| NodeSnapshotRecord {
+                    cache_cluster_id: primary.cache_cluster_id.clone(),
+                    cache_node_id: node.cache_node_id.clone(),
+                    node_group_id: Some(shard.node_group_id.clone()),
+                    node_group_configuration: Some(shard.to_configuration()),
+                    cache_node_create_time: node.create_time,
+                    snapshot_create_time: new.now,
+                })
+            })
+            .collect();
+        Some(record)
     }
 
     /// A copy of this snapshot stored under another name.
@@ -191,9 +255,7 @@ impl SnapshotRecord {
         Snapshot {
             snapshot_name: Some(self.snapshot_name.clone()),
             replication_group_id: self.replication_group_id.clone(),
-            // The description of the source replication group: a snapshot of a
-            // cache cluster has no source group to take one from.
-            replication_group_description: None,
+            replication_group_description: self.replication_group_description.clone(),
             cache_cluster_id: self.cache_cluster_id.clone(),
             snapshot_status: Some(self.status.clone()),
             snapshot_source: Some(self.source.clone()),
@@ -220,8 +282,8 @@ impl SnapshotRecord {
             // The number of node groups (shards) and the automatic-failover
             // status are the source replication group's; a cache cluster's
             // snapshot carries neither.
-            num_node_groups: None,
-            automatic_failover: None,
+            num_node_groups: self.num_node_groups,
+            automatic_failover: self.automatic_failover.clone(),
             node_snapshots: Some(
                 self.node_snapshots
                     .iter()

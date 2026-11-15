@@ -753,6 +753,26 @@ pub fn replication_group_modify_state_refusal() -> String {
     format!("Replication group must be in {STATUS_AVAILABLE} state to modify.")
 }
 
+/// How ElastiCache refuses a DELETE of a replication group one of whose member
+/// clusters is not in a state a delete may begin from — a member being
+/// snapshotted ([`STATUS_SNAPSHOTTING`]), still [`STATUS_CREATING`], or
+/// [`STATUS_MODIFYING`] from a change that has not settled.
+///
+/// The sentence states the rule — that cluster's state does not admit a delete —
+/// and its one variable part is the MEMBER cluster that blocks the call, read off
+/// the group's own membership rather than named by the request.
+pub fn cache_cluster_delete_state_refusal(cache_cluster_id: &str) -> String {
+    format!("Cache cluster {cache_cluster_id} is not in a valid state to be deleted.")
+}
+
+/// How ElastiCache refuses a DELETE of a replication group that is not itself in
+/// a state a delete may begin from (one still `creating`, or `modifying` from a
+/// change the clock has not settled): the same sentence
+/// [`cache_cluster_delete_state_refusal`] states, about the group.
+pub fn replication_group_delete_state_refusal(replication_group_id: &str) -> String {
+    format!("Replication group {replication_group_id} is not in a valid state to be deleted.")
+}
+
 /// How ElastiCache refuses a replica-count change that asks for the count a
 /// shard already has: the `NoOperationFault` states that the requested count
 /// already matches, naming neither the shard nor the group.
