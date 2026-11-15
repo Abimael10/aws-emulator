@@ -217,8 +217,8 @@ async fn the_six_operations_run_end_to_end() {
     );
     let (status, body) = emulator.get(TABLE, "demo-table").await;
     assert_eq!(
-        status, 404,
-        "GetResource after the delete: expected HTTP 404, got {status} with body {body:?}"
+        status, 400,
+        "GetResource after the delete: expected HTTP 400, got {status} with body {body:?}"
     );
     assert!(
         code(&body).contains("ResourceNotFoundException"),
@@ -266,8 +266,8 @@ async fn a_resource_operation_is_in_progress_before_it_completes() {
     // The resource is not provisioned yet, so neither read reports it.
     let (status, body) = emulator.get(LOG_GROUP, "app-logs").await;
     assert_eq!(
-        status, 404,
-        "GetResource during the create: expected HTTP 404, got {status} with body {body:?}"
+        status, 400,
+        "GetResource during the create: expected HTTP 400, got {status} with body {body:?}"
     );
     assert!(
         code(&body).contains("ResourceNotFoundException"),
@@ -483,8 +483,8 @@ async fn unknown_identifiers_and_tokens_are_the_modelled_refusals() {
     ];
     for (case, (status, body)) in rows {
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status} with body {body:?}"
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
         );
         assert!(
             code(&body).contains("ResourceNotFoundException"),
@@ -535,8 +535,8 @@ async fn unknown_identifiers_and_tokens_are_the_modelled_refusals() {
     for token in ["bogus", "00000000-0000-0000-0000-000000000000", "AAAA="] {
         let (status, body) = emulator.status(token).await;
         assert_eq!(
-            status, 404,
-            "token {token:?}: expected HTTP 404, got {status} with body {body:?}"
+            status, 400,
+            "token {token:?}: expected HTTP 400, got {status} with body {body:?}"
         );
         assert!(
             code(&body).contains("RequestTokenNotFoundException"),

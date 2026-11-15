@@ -263,8 +263,8 @@ async fn a_not_found_refusal_carries_the_owning_handlers_whole_verdict() {
         for (operation, (status, body)) in answers {
             let case = format!("{case} ({operation})");
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected HTTP 404, got {status} with body {body:?}"
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
             );
             assert!(
                 code(&body).contains("ResourceNotFoundException"),
@@ -455,8 +455,8 @@ async fn an_unknown_request_token_is_refused_naming_the_token() {
     for (case, token) in rows {
         let (status, body) = emulator.status(&token).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status} with body {body:?}"
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
         );
         assert!(
             code(&body).contains("RequestTokenNotFoundException"),
@@ -1021,8 +1021,8 @@ async fn a_type_the_registry_does_not_hold_is_refused_before_anything_it_names_i
         ];
         for (operation, (status, body)) in answers {
             let case = format!("{type_name} ({operation})");
-            // RECORDED behaviour: the model annotates TypeNotFoundException
-            // `@httpError 404`, and this awsJson1_0 service answers it with 400.
+            // RECORDED behaviour: the model annotates the not-found error shapes
+            // `@httpError 404`, and this awsJson1_0 service answers them with 400.
             assert_eq!(
                 status, 400,
                 "case {case:?}: expected HTTP 400, got {status} with body {body:?}"

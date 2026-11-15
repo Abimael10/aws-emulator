@@ -235,9 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names no resource provider to run, so nothing about the request is resolved
         // and no resource operation request is minted for it.
         if !crate::state::type_is_registered(&input.type_name) {
-            return Err(crate::scaffolded::Scaffolded::type_not_found(
-                crate::state::type_not_found_message(&input.type_name),
-            ));
+            return Err(DeleteResourceErrorModeled::TypeNotFoundException(
+                TypeNotFoundException {
+                    message: Some(crate::state::type_not_found_message(&input.type_name)),
+                },
+            )
+            .into());
         }
 
         // The registry's record also says whether the type has a provider to run at all:

@@ -9,7 +9,7 @@
 //! those resources were provisioned using Cloud Control API" (`GetResource`) — so an
 //! `AWS::SQS::Queue` reads as the queue Amazon SQS holds, a write through Cloud Control
 //! API is a write to that queue, and an identifier Amazon SQS holds no queue for is
-//! refused with the modelled `ResourceNotFoundException` (HTTP 404) by the synchronous
+//! refused with the modelled `ResourceNotFoundException` (HTTP 400) by the synchronous
 //! operations, and failed with the handler's `NotFound` verdict by the asynchronous
 //! delete.**
 //!
@@ -277,8 +277,8 @@ async fn a_queue_the_owning_service_holds_is_the_one_cloud_control_reports() {
     );
     let (status, body) = emulator.get(QUEUE, &phantom).await;
     assert_eq!(
-        status, 404,
-        "GetResource for a url naming no queue: expected HTTP 404, got {status} with body \
+        status, 400,
+        "GetResource for a url naming no queue: expected HTTP 400, got {status} with body \
          {body:?}"
     );
 }
@@ -635,8 +635,8 @@ async fn a_queue_cloud_control_deletes_is_gone_from_the_owning_service() {
         // of the type's inventory naming it.
         let (status, body) = emulator.get(QUEUE, &url).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: GetResource after the delete: expected HTTP 404, got {status} \
+            status, 400,
+            "case {case:?}: GetResource after the delete: expected HTTP 400, got {status} \
              with body {body:?}"
         );
         let listed = emulator.list(QUEUE, None, None).await;
@@ -730,7 +730,7 @@ async fn a_queue_is_addressed_by_its_url_and_by_its_name() {
         emulator.delete_and_settle(QUEUE, &reference).await;
         let (status, body) = emulator.get(QUEUE, &url).await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: the deleted queue must be gone, got {status} with body {body:?}"
         );
     }
@@ -846,8 +846,8 @@ async fn an_identifier_no_queue_answers_to_is_refused_as_not_found() {
         for (operation, (status, body)) in answers {
             let case = format!("{case} ({operation})");
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected HTTP 404, got {status} with body {body:?}"
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
             );
             assert!(
                 code(&body).contains("ResourceNotFoundException"),

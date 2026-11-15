@@ -233,7 +233,7 @@ async fn a_refused_call_leaves_no_record() {
 
     // Nothing is created, so each of these is refused before it changes anything.
     let (status, _) = emulator.get(TABLE, "refused-table").await;
-    assert_eq!(status, 404, "the read of an absent resource must refuse");
+    assert_eq!(status, 400, "the read of an absent resource must refuse");
     let (status, _) = emulator
         .update(
             TABLE,
@@ -242,7 +242,7 @@ async fn a_refused_call_leaves_no_record() {
             None,
         )
         .await;
-    assert_eq!(status, 404, "the patch of an absent resource must refuse");
+    assert_eq!(status, 400, "the patch of an absent resource must refuse");
     let (status, _) = emulator
         .create(TABLE, &json!({ "TableName": {} }), None)
         .await;

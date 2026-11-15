@@ -221,9 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answering it with an empty page would make a type name nothing publishes
         // indistinguishable from an account that owns none of that type.
         if !crate::state::type_is_registered(&input.type_name) {
-            return Err(crate::scaffolded::Scaffolded::type_not_found(
-                crate::state::type_not_found_message(&input.type_name),
-            ));
+            return Err(ListResourcesErrorModeled::TypeNotFoundException(
+                TypeNotFoundException {
+                    message: Some(crate::state::type_not_found_message(&input.type_name)),
+                },
+            )
+            .into());
         }
 
         // The registry's record also says whether the type has a provider to run at all:

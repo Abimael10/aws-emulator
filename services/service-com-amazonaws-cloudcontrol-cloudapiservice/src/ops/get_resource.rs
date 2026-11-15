@@ -219,9 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reporting it as a resource that cannot be found would conflate a type name
         // nothing publishes with a resource nothing created.
         if !crate::state::type_is_registered(&input.type_name) {
-            return Err(crate::scaffolded::Scaffolded::type_not_found(
-                crate::state::type_not_found_message(&input.type_name),
-            ));
+            return Err(GetResourceErrorModeled::TypeNotFoundException(
+                TypeNotFoundException {
+                    message: Some(crate::state::type_not_found_message(&input.type_name)),
+                },
+            )
+            .into());
         }
 
         // The registry's record also says whether the type has a provider to run at all:

@@ -33,6 +33,8 @@ mod metric_alarm_provisioning;
 mod native_queue_lifecycle;
 #[path = "all/native_resource_resolution.rs"]
 mod native_resource_resolution;
+#[path = "all/not_found_refusal_status.rs"]
+mod not_found_refusal_status;
 #[path = "all/patch_removal_defaults.rs"]
 mod patch_removal_defaults;
 #[path = "all/primary_identifier.rs"]

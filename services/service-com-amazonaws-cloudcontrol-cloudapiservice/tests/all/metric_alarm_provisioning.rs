@@ -187,7 +187,7 @@ async fn a_patch_and_a_delete_act_on_the_alarm_amazon_cloudwatch_holds() {
     );
     let (status, body) = emulator.get(ALARM, name).await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "the deleted alarm must resolve to nothing, got {status} with body {body:?}"
     );
 }

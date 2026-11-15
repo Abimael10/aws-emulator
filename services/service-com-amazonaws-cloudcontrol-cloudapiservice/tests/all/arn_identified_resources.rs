@@ -113,8 +113,8 @@ async fn the_identifier_is_the_topic_arn_whatever_name_the_create_chose() {
         );
         let (status, body) = emulator.get(TOPIC, &arn).await;
         assert_eq!(
-            status, 404,
-            "name {name:?}: GetResource after the delete: expected HTTP 404, got {status} \
+            status, 400,
+            "name {name:?}: GetResource after the delete: expected HTTP 400, got {status} \
              with body {body:?}"
         );
     }

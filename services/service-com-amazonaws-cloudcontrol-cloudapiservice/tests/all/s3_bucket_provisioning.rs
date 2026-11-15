@@ -95,8 +95,8 @@ async fn native_holds(emulator: &Emulator, name: &str) -> bool {
 async fn resolves(emulator: &Emulator, name: &str) -> bool {
     let (status, body) = emulator.get(BUCKET, name).await;
     assert!(
-        status == 200 || status == 404,
-        "GetResource {name:?}: expected 200 or 404, got {status} with body {body:?}"
+        status == 200 || status == 400,
+        "GetResource {name:?}: expected 200 or 400, got {status} with body {body:?}"
     );
     status == 200
 }
@@ -376,7 +376,7 @@ async fn a_delete_waits_for_the_owning_service_to_allow_it() {
     );
     let (status, body) = emulator.get(BUCKET, "occupied-bucket").await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "the deleted bucket must resolve to nothing, got {status} with body {body:?}"
     );
 }
@@ -431,7 +431,7 @@ async fn a_bucket_the_owning_api_created_is_the_same_resource() {
     );
     let (status, body) = emulator.get(BUCKET, "native-bucket").await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "a bucket the owning API deleted must resolve to nothing, got {status} with body \
          {body:?}"
     );

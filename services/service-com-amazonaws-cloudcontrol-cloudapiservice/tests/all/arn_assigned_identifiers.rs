@@ -235,8 +235,8 @@ async fn the_identifier_is_the_policy_arn_whatever_name_and_path_the_create_chos
         );
         let (status, body) = emulator.get(MANAGED_POLICY, &arn).await;
         assert_eq!(
-            status, 404,
-            "name {:?}: GetResource after the delete: expected HTTP 404, got {status} with \
+            status, 400,
+            "name {:?}: GetResource after the delete: expected HTTP 400, got {status} with \
              body {body:?}",
             case.name
         );
@@ -620,8 +620,8 @@ async fn the_identifier_is_the_state_machine_arn_whatever_name_the_create_chose(
         );
         let (status, body) = emulator.get(STATE_MACHINE, &arn).await;
         assert_eq!(
-            status, 404,
-            "name {:?}: GetResource after the delete: expected HTTP 404, got {status} with \
+            status, 400,
+            "name {:?}: GetResource after the delete: expected HTTP 400, got {status} with \
              body {body:?}",
             case.name
         );

@@ -172,8 +172,8 @@ async fn every_answer_names_the_resource_by_the_primary_identifier_its_type_decl
         );
         let (status, body) = emulator.get(case.type_name, &case.identifier).await;
         assert_eq!(
-            status, 404,
-            "case {:?}: GetResource after the delete: expected HTTP 404, got {status} with \
+            status, 400,
+            "case {:?}: GetResource after the delete: expected HTTP 400, got {status} with \
              body {body:?}",
             case.name
         );
@@ -221,8 +221,8 @@ async fn a_resource_is_deleted_through_any_identifier_its_type_declares_for_it()
         );
         let (status, body) = emulator.get(type_name, &primary).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: the deleted resource: expected HTTP 404, got {status} with body \
+            status, 400,
+            "case {case:?}: the deleted resource: expected HTTP 400, got {status} with body \
              {body:?}"
         );
     }
@@ -374,7 +374,7 @@ async fn a_delete_of_an_absent_resource_is_admitted_and_fails_on_its_own_token()
         diagnostic.check(&text(&failed, "StatusMessage"), case);
         let (status, body) = emulator.get(type_name, identifier).await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: the resource must still not exist, got {status} with body \
              {body:?}"
         );
@@ -425,8 +425,8 @@ async fn a_delete_of_a_resource_created_moments_earlier_is_accepted() {
         );
         let (status, body) = emulator.get(type_name, &identifier).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: the deleted resource: expected HTTP 404, got {status} with body \
+            status, 400,
+            "case {case:?}: the deleted resource: expected HTTP 400, got {status} with body \
              {body:?}"
         );
     }

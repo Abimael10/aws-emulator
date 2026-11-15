@@ -278,8 +278,8 @@ async fn a_parameter_deleted_in_either_plane_stops_resolving_in_both() {
         // And Cloud Control API reports the handler's not-found verdict for it.
         let (status, body) = emulator.get(PARAMETER, name).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: GetResource after the delete expected HTTP 404, got {status} \
+            status, 400,
+            "case {case:?}: GetResource after the delete expected HTTP 400, got {status} \
              with body {body:?}"
         );
         assert_handler_not_found(
@@ -596,7 +596,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
         // Nothing was written, in either plane: a refused create leaves no resource behind.
         let (status, body) = emulator.get(PARAMETER, name).await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: the refused create must leave no resource, got {status} with \
              body {body:?}"
         );

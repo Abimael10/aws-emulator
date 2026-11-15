@@ -5,7 +5,7 @@
 //!
 //! The rule every case here holds the service to: **a cancel resolves its `RequestToken`
 //! against the resource operation requests this service holds — a token no request answers
-//! to is refused with the modelled `RequestTokenNotFoundException` (HTTP 404) naming that
+//! to is refused with the modelled `RequestTokenNotFoundException` (HTTP 400) naming that
 //! token; a request in one of the two statuses a cancel acts on IS canceled: it abandons the
 //! work it owed, reports `CANCEL_IN_PROGRESS`, explains that status with the message for a
 //! cancellation the caller initiated, and reaches `CANCEL_COMPLETE` still carrying it; a
@@ -192,7 +192,7 @@ async fn a_running_request_is_canceled_and_its_work_is_abandoned() {
     }
     let (status, body) = emulator.get(STREAM, "never-made").await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "the canceled create must have provisioned nothing, got {status} with body {body:?}"
     );
     let kept = emulator.properties(STREAM, &patched).await;
@@ -341,8 +341,8 @@ async fn a_token_no_request_answers_to_is_the_modelled_refusal() {
     for token in tokens {
         let (status, body) = emulator.cancel(token).await;
         assert_eq!(
-            status, 404,
-            "token {token:?}: expected HTTP 404, got {status} with body {body:?}"
+            status, 400,
+            "token {token:?}: expected HTTP 400, got {status} with body {body:?}"
         );
         assert!(
             code(&body).contains("RequestTokenNotFoundException"),

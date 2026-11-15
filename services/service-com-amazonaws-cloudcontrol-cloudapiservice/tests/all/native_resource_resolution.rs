@@ -9,7 +9,7 @@
 //! return information about an existing resource in your account and Amazon Web Services
 //! Region, whether those resources were provisioned using Cloud Control API"
 //! (`GetResource`) — and a resource that service no longer holds is reported with the
-//! modelled `ResourceNotFoundException` (HTTP 404), whichever API removed it.**
+//! modelled `ResourceNotFoundException` (HTTP 400), whichever API removed it.**
 //!
 //! The rows differ along what the rule generalises over: which API the resource came into
 //! being through, which API changed or removed it, which resource TYPE of the owning
@@ -218,8 +218,8 @@ async fn a_resource_the_owning_service_no_longer_holds_is_reported_as_not_found(
 
         let (status, body) = emulator.get(LOG_GROUP, &name).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: GetResource after the delete: expected HTTP 404, got {status} \
+            status, 400,
+            "case {case:?}: GetResource after the delete: expected HTTP 400, got {status} \
              with body {body:?}"
         );
         assert!(
@@ -422,7 +422,7 @@ async fn a_model_the_owning_service_cannot_hold_is_refused_rather_than_dropped()
         // Nothing was created, in either store.
         let (status, body) = emulator.get(LOG_GROUP, &identifier).await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: a refused create must leave no resource, got {status} with body \
              {body:?}"
         );
@@ -461,8 +461,8 @@ async fn a_type_with_nowhere_else_to_live_is_served_from_this_services_own_store
     emulator.delete_and_settle(STREAM, "both").await;
     let (status, body) = emulator.get(STREAM, "both").await;
     assert_eq!(
-        status, 404,
-        "the deleted stream: expected HTTP 404, got {status} with body {body:?}"
+        status, 400,
+        "the deleted stream: expected HTTP 400, got {status} with body {body:?}"
     );
     let listed = emulator.list(LOG_GROUP, None, None).await;
     assert_eq!(
@@ -603,8 +603,8 @@ async fn a_second_type_of_the_same_owning_service_resolves_the_same_way() {
         .await;
     let (status, body) = emulator.get(DESTINATION, native).await;
     assert_eq!(
-        status, 404,
-        "GetResource after the native delete: expected HTTP 404, got {status} with body \
+        status, 400,
+        "GetResource after the native delete: expected HTTP 400, got {status} with body \
          {body:?}"
     );
     assert_handler_not_found(
@@ -652,7 +652,7 @@ async fn a_second_type_of_the_same_owning_service_resolves_the_same_way() {
         );
         let (status, body) = emulator.get(DESTINATION, "incomplete").await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: a refused create must leave no resource, got {status} with body \
              {body:?}"
         );

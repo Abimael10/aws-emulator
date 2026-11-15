@@ -228,8 +228,8 @@ async fn the_same_identifier_under_two_types_is_two_resources() {
     emulator.delete_and_settle(TABLE, "shared").await;
     let (status, body) = emulator.get(TABLE, "shared").await;
     assert_eq!(
-        status, 404,
-        "the deleted resource: expected HTTP 404, got {status} with body {body:?}"
+        status, 400,
+        "the deleted resource: expected HTTP 400, got {status} with body {body:?}"
     );
     let (status, body) = emulator.get(LOG_GROUP, "shared").await;
     assert_eq!(

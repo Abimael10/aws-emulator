@@ -174,8 +174,8 @@ async fn a_cancelled_create_provisions_nothing_in_the_service_that_owns_the_type
         // create was provisioning, and the type's inventory names it nowhere.
         let (http, body) = emulator.get(type_name, &identifier).await;
         assert_eq!(
-            http, 404,
-            "case {case:?}: GetResource after the cancellation: expected HTTP 404, got {http} \
+            http, 400,
+            "case {case:?}: GetResource after the cancellation: expected HTTP 400, got {http} \
              with body {body:?}"
         );
         let identifiers = inventory(&emulator, type_name).await;

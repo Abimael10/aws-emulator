@@ -303,7 +303,7 @@ async fn a_compound_identifier_cannot_be_half_named_or_patched() {
     );
     let (status, body) = emulator.get(LOG_STREAM, &identifier).await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "the deleted stream must resolve to nothing, got {status} with body {body:?}"
     );
 }
@@ -454,7 +454,7 @@ async fn a_resource_is_addressable_by_a_json_identifier_of_the_schemas_propertie
         .await;
     let (status, body) = emulator.get(LOG_STREAM, &stream).await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "the deleted stream must resolve to nothing, got {status} with body {body:?}"
     );
 }
@@ -490,7 +490,7 @@ async fn a_stream_under_a_group_that_is_not_there_fails_the_request() {
         .get(LOG_STREAM, &format!("absent{DELIMITER}host"))
         .await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "nothing must resolve under the identifier of a stream that was not created, got \
          {status} with body {body:?}"
     );

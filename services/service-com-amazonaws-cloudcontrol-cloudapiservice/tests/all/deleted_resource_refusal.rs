@@ -67,8 +67,8 @@ async fn assert_every_refusal_names_the_resource(
     for (operation, (status, body)) in answers {
         let case = format!("{case} ({operation})");
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status} with body {body:?}"
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
         );
         assert!(
             code(&body).contains("ResourceNotFoundException"),
@@ -203,8 +203,8 @@ async fn a_rendered_identifier_is_the_json_object_the_schemas_pointer_names() {
 
     let (status, body) = emulator.get(LOG_GROUP, name).await;
     assert_eq!(
-        status, 404,
-        "the deleted group: expected HTTP 404, got {status} with body {body:?}"
+        status, 400,
+        "the deleted group: expected HTTP 400, got {status} with body {body:?}"
     );
     let stated = message(&body);
     let opening = format!("Resource of type '{LOG_GROUP}' with identifier '");

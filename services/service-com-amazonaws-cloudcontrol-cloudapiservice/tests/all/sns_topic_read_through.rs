@@ -216,8 +216,8 @@ async fn a_topic_amazon_sns_holds_is_resolved_and_removed_through_cloud_control(
     );
     let (status, body) = emulator.get(TOPIC, &arn).await;
     assert_eq!(
-        status, 404,
-        "GetResource after the delete: expected HTTP 404, got {status} with body {body:?}"
+        status, 400,
+        "GetResource after the delete: expected HTTP 400, got {status} with body {body:?}"
     );
     assert!(
         inventory(&emulator).await.is_empty(),

@@ -177,76 +177,34 @@ impl SerializableStruct for ValidationException {
     }
 }
 
-/// The `Message` member of the synthetic `TypeNotFoundException` error shape.
+/// The status the model annotates this service's not-found error shapes with.
 ///
-/// Spelled `Message` because that is how this service's modelled error shapes spell
-/// their prose member (`ErrorMessage` is bound as `Message` on every one of them), so a
-/// client reads this refusal exactly as it reads the modelled ones.
-static TYPE_NOT_FOUND_MESSAGE: Schema = Schema::new_member(
-    ShapeId::from_static(
-        "smithy.framework#TypeNotFoundException$Message",
-        "smithy.framework",
-        "Message",
-    ),
-    ShapeType::String,
-    "Message",
-    0,
-)
-.with_xml_name("Message");
+/// It is the status those shapes' `@httpError` trait carries, which is NOT the status this
+/// service puts on the wire for them — see [`wire_status`].
+const MODELLED_NOT_FOUND_STATUS: u16 = 404;
 
-/// Schema for the `TypeNotFoundException` this service answers a `TypeName` the
-/// CloudFormation registry does not hold with.
+/// The status this service answers a refusal the model annotates
+/// [`MODELLED_NOT_FOUND_STATUS`] with.
 ///
-/// In the `smithy.framework` namespace for the same reason as the two shapes above: it
-/// must not collide with the modelled shape of that name. It exists BESIDE that modelled
-/// shape because only the status differs — see [`Scaffolded::TypeNotFound`].
-pub static TYPE_NOT_FOUND_SCHEMA: Schema = Schema::new_struct(
-    ShapeId::from_static(
-        "smithy.framework#TypeNotFoundException",
-        "smithy.framework",
-        "TypeNotFoundException",
-    ),
-    ShapeType::Structure,
-    &[&TYPE_NOT_FOUND_MESSAGE],
-);
+/// RECORDED behaviour: the recorded wire responses of this awsJson1_0 service carry 400 for
+/// every not-found refusal — the only shapes this model annotates `@httpError 404` are its
+/// three not-found errors (a resource, a request token and a registry type that cannot be
+/// found). The wire is the truth about the wire, so the status is 400 while the error code
+/// and the `Message` stay the modelled shape's.
+const NOT_FOUND_WIRE_STATUS: u16 = 400;
 
-/// The payload of a `TypeNotFoundException`: which type could not be found.
-#[derive(Debug, Clone)]
-pub struct TypeNotFound {
-    pub message: String,
-}
-
-impl TypeNotFound {
-    /// A `TypeNotFoundException` carrying `message`.
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
+/// The status this service puts on the wire for a refusal the MODEL gives `modelled`.
+///
+/// Every status but the modelled not-found one is the model's own; that one is the status
+/// the service answers a not-found with ([`NOT_FOUND_WIRE_STATUS`]), so no operation of this
+/// service can answer one refusal class with two statuses.
+fn wire_status(modelled: u16) -> u16 {
+    if modelled == MODELLED_NOT_FOUND_STATUS {
+        NOT_FOUND_WIRE_STATUS
+    } else {
+        modelled
     }
 }
-
-impl std::fmt::Display for TypeNotFound {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TypeNotFoundException: {}", self.message)
-    }
-}
-
-impl std::error::Error for TypeNotFound {}
-
-impl SerializableStruct for TypeNotFound {
-    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
-        s.write_string(&TYPE_NOT_FOUND_MESSAGE, self.message.as_str())?;
-        Ok(())
-    }
-}
-
-/// The status Cloud Control API answers a `TypeName` the registry does not hold with.
-///
-/// RECORDED behaviour, which is why this variant exists at all: the model annotates
-/// `TypeNotFoundException` `@httpError 404`, and the recorded wire response for this
-/// awsJson1_0 service carries 400. The wire is the truth about the wire, so the status
-/// here is 400 while the error code and the message stay the modelled shape's.
-const TYPE_NOT_FOUND_STATUS: u16 = 400;
 
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
@@ -254,7 +212,9 @@ const TYPE_NOT_FOUND_STATUS: u16 = 400;
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status this service puts on
+    /// the wire for it ([`wire_status`]), which is the model's own for every refusal class
+    /// but a not-found.
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -267,23 +227,12 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
-    /// The `TypeName` names no extension in the CloudFormation registry. Renders with
-    /// the modelled error code `TypeNotFoundException` and the status the service
-    /// actually answers it with ([`TYPE_NOT_FOUND_STATUS`]), which is the one thing the
-    /// modelled variant cannot do: its status comes from the model's `@httpError`.
-    TypeNotFound(TypeNotFound),
 }
 
 impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
-    }
-
-    /// Refuse the request because the CloudFormation registry holds no such type, with
-    /// the status this service answers that refusal with.
-    pub fn type_not_found(message: impl Into<String>) -> Self {
-        Self::TypeNotFound(TypeNotFound::new(message))
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -311,7 +260,6 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
-            Self::TypeNotFound(e) => write!(f, "{e}"),
         }
     }
 }
@@ -324,22 +272,22 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
-            Self::TypeNotFound(e) => e.source(),
         }
     }
 }
 
 /// Every `OperationError` method delegates to the modeled error, so wrapping an
-/// implemented operation's error channel changes NOTHING about how that error is
-/// rendered. Only the synthetic variant behaves differently — and it is the one that
-/// must answer 501.
+/// implemented operation's error channel changes nothing about the payload or the error
+/// code that error renders with. The synthetic variants are the ones that behave
+/// differently — one of them must answer 501 — and the one status a MODELED error does not
+/// take from the model is the not-found one, which this service answers on the wire with
+/// [`NOT_FOUND_WIRE_STATUS`].
 impl<E: OperationError> OperationError for Scaffolded<E> {
     fn as_serializable(&self) -> &dyn SerializableStruct {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
-            Self::TypeNotFound(e) => e,
         }
     }
 
@@ -348,7 +296,6 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
-            Self::TypeNotFound(_) => &TYPE_NOT_FOUND_SCHEMA,
         }
     }
 
@@ -361,20 +308,20 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
-            Self::TypeNotFound(_) => "TypeNotFoundException",
         }
     }
 
-    /// 501 for the scaffold signal.
+    /// 501 for the scaffold signal, and for a modeled error the status this service puts on
+    /// the wire for it ([`wire_status`]) rather than the model's `@httpError` where the two
+    /// differ.
     ///
-    /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
+    /// Keep the 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => wire_status(e.http_status()),
             Self::ValidationException(_) => 400,
-            Self::TypeNotFound(_) => TYPE_NOT_FOUND_STATUS,
         }
     }
 
@@ -387,10 +334,6 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
-            // Same reason: the synthetic shape carries no `awsQueryError` trait. The
-            // MODELLED shape of this name does, but this service speaks awsJson1_0, on
-            // which the trait is inert.
-            Self::TypeNotFound(_) => None,
         }
     }
 }

@@ -1929,3 +1929,15 @@ mod cloudtrail_iam_credential_write_audit;
 // service crate's `tests/all.rs`. What a suite covers, and why it drives the assembled
 // router rather than one service crate, belongs in that suite's own module header; the notes
 // earlier landings had appended to this file live in `all/appended_notes.rs`.
+// Single integration-test target for the router: the CANONICAL DECLARATION LIST of every
+// at the top level of `tests/` fails the build; and a suite declared twice is `E0428`, which
+// `mod <name>;` would resolve to a SIBLING of this file: the `#[path]` above each `mod` is
+// what points the declaration into `tests/all/`.
+// Three suites check those rules rather than restating them here:
+// `all/all_rs_is_a_canonical_declaration_list.rs`. What a suite covers, and why it belongs
+// to this cross-service target rather than to one service crate's own, is stated in that
+// suite's OWN module header, beside the test it explains; a note about THIS file belongs in
+// `all/appended_notes.rs`.
+// The lint allowed below is for the suite files this root compiles: a wrapped paragraph in a
+// module header is a note rather than a build failure. An inner attribute, like an inner doc
+// comment, is legal only before the first item, so it stands here rather than in the list.

@@ -9,7 +9,7 @@
 //! resource in your account and Amazon Web Services Region, whether those resources were
 //! provisioned using Cloud Control API" (`GetResource`) — whichever API created it, and once
 //! the owning service no longer holds it, whichever API removed it, every reference to it is
-//! refused with the modelled `ResourceNotFoundException` (HTTP 404) carrying the owning
+//! refused with the modelled `ResourceNotFoundException` (HTTP 400) carrying the owning
 //! handler's not-found verdict for the type and the identifier the request carried.**
 //!
 //! The rows differ along what the rule generalises over: which API the queue came into being
@@ -281,8 +281,8 @@ async fn a_queue_resolves_exactly_while_amazon_sqs_holds_it() {
             let case = format!("{case} (read by its {} after the delete)", reference.label());
             let (status, body) = emulator.get(QUEUE, &identifier).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected HTTP 404, got {status} with body {body:?}"
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
             );
             assert!(
                 code(&body).contains("ResourceNotFoundException"),
