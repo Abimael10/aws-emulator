@@ -36,8 +36,8 @@ pub fn endpoint_host(region: &str) -> String {
 /// at — `smithy_server_runtime::UNSERVED_URL_BASE` for a router that was given none.
 pub const ANNOUNCED_REGISTRY_URL: &str = ::smithy_server_runtime::UNSERVED_URL_BASE;
 
-/// The `host[:port]` half of [`ANNOUNCED_REGISTRY_URL`], which is what an announced
-/// `repositoryUri` is built on.
+/// The `host[:port]` half of [`ANNOUNCED_REGISTRY_URL`], which is the endpoint a
+/// `docker login` made through this harness is pointed at.
 pub fn announced_registry_endpoint() -> &'static str {
     ::service_common::data_plane_addressing::url_authority(ANNOUNCED_REGISTRY_URL)
 }
@@ -45,6 +45,24 @@ pub fn announced_registry_endpoint() -> &'static str {
 /// The account id every generated emulator vends, spelled out here rather than imported
 /// so a wrong registry id in the implementation fails these tests.
 pub const REGISTRY_ID: &str = "000000000000";
+
+/// `<registryId>.dkr.ecr.<region>.amazonaws.com` — the host of this account's registry in
+/// `region`, in the registry URL form `AuthorizationData$proxyEndpoint` documents ("The
+/// Amazon ECR registry URL format is `https://aws_account_id.dkr.ecr.region.amazonaws.com`").
+///
+/// Composed here rather than imported from the crate, so a wrong composition in the
+/// implementation fails these tests. `region` is of the commercial partition, which is the
+/// partition every Region these suites sign for belongs to.
+pub fn registry_host(region: &str) -> String {
+    format!("{REGISTRY_ID}.dkr.ecr.{region}.amazonaws.com")
+}
+
+/// The URI Amazon ECR reports for the repository `name` of this account's registry in
+/// `region` (`Repository$repositoryUri`): that registry's host ([`registry_host`]) followed
+/// by the repository's own name.
+pub fn repository_uri(region: &str, name: &str) -> String {
+    format!("{}/{name}", registry_host(region))
+}
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire protocol").
 const TARGET_PREFIX: &str = "AmazonEC2ContainerRegistry_V20150921";

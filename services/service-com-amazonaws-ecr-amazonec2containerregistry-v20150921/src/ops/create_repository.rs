@@ -256,10 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_tag_count(&[], &tags).map_err(fault_error)?;
 
         let now = ::std::time::SystemTime::now();
-        // ECR is regional: the ARN names the region the request was signed for. The
-        // repository's URI names no Region — it is the endpoint this emulator serves the
-        // registry at (`crate::state::announced_registry_endpoint`), which serves every
-        // Region.
+        // ECR is regional: the ARN and the repository's URI both name the Region the
+        // request was signed for, since a registry is one account's in one Region
+        // (`crate::state::repository_uri`).
         let region = crate::state::request_region(ctx.parts());
         let name = input.repository_name;
         let mut store = state.lock();
@@ -330,8 +329,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for it rather than two entries for one key.
         repo.merge_tags(tags);
 
-        let repository =
-            repo.to_repository(&crate::state::announced_registry_endpoint(ctx));
+        let repository = repo.to_repository();
         store
             .repositories
             .insert(crate::state::repository_key(&region, &name), repo);

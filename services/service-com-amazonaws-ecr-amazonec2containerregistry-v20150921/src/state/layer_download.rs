@@ -3,15 +3,17 @@
 use super::*;
 
 /// The endpoint the request reached this emulator on, as every address this registry
-/// ANNOUNCES names it — a layer download URL, a repository's own `repositoryUri` and the
-/// registry endpoint a `docker login` is pointed at alike: the request's own `Host`, else
-/// the authority its URI carries, else [`LOOPBACK_HOST`].
+/// ANNOUNCES for a client to DIAL names it — a layer download URL and the registry endpoint
+/// a `docker login` is pointed at alike: the request's own `Host`, else the authority its
+/// URI carries, else [`LOOPBACK_HOST`].
 ///
 /// Read from the request rather than built from this registry's own
-/// `<account>.dkr.ecr.<region>.amazonaws.com` host, because the address
+/// `<account>.dkr.ecr.<region>.<dnsSuffix>` host, because the address
 /// has to resolve for whoever was handed it: that host is AWS's, and an address naming it
 /// would send the next client out of the emulator entirely, while a client addressing
-/// the emulator by socket is handed that socket.
+/// the emulator by socket is handed that socket. A repository's own `repositoryUri` is not
+/// such an address: it NAMES the registry that holds the repository, so it carries the
+/// account and the Region instead (`super::registry_address`).
 ///
 /// The value is the CALLER's and it is interpolated into a URL this service announces, so
 /// only a BARE AUTHORITY is honoured: anything else is not an endpoint, and the loopback

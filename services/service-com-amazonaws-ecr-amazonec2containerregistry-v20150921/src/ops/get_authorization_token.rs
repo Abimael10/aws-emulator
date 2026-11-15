@@ -20,8 +20,10 @@
 //! address the client is expected to FETCH from next — it is where `docker login` and
 //! every pull after it go — and this emulator is what answers the registry API
 //! (`crate::service`'s registry data plane), so an address naming AWS's host would send
-//! the next client out of the emulator entirely. The same reading the `repositoryUri`
-//! every repository is reported with is built on.
+//! the next client out of the emulator entirely. A repository's `repositoryUri` is the
+//! other kind of value: it NAMES the registry that holds the repository, by the account
+//! and Region a client derives a registry, an image reference and a cross-account check
+//! from (`crate::state::registry_address`).
 //!
 //! `registryIds` selects nothing. The model marks the member `@deprecated` with the
 //! reason spelled out — "This field is deprecated. The returned authorization token can

@@ -127,6 +127,8 @@ mod repository_image_lifecycle;
 mod repository_policy;
 #[path = "all/repository_policy_principal.rs"]
 mod repository_policy_principal;
+#[path = "all/repository_registry_uri.rs"]
+mod repository_registry_uri;
 #[path = "all/request_preconditions.rs"]
 mod request_preconditions;
 #[path = "all/resource_tag_mutations.rs"]

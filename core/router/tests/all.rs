@@ -1966,3 +1966,17 @@ mod cloudformation_cloudfront_published_edge_address;
 // `all/every_suite_file_is_declared.rs` check the rules above rather than restating them.
 #[path = "all/ses_configuration_set_cursor_shared_across_v1_and_v2.rs"]
 mod ses_configuration_set_cursor_shared_across_v1_and_v2;
+// file under `tests/all/`, sorted by name, and no other line — nothing after the last pair.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair into the sorted list; what it
+// covers, and why it drives the assembled router rather than one service crate, belongs in
+// that suite's own module header, and a note about THIS file belongs in
+// `all/appended_notes.rs`.
+// deliberate: an inner doc comment (`//` followed by `!`) and an inner attribute are legal
+// only BEFORE the first item, so one that lands past the declarations is `E0753` and compiles
+// no suite of this target — which is what repeated landings appending re-typed copies of this
+// header had done. With no inner doc comment anywhere in the file, no merge of two landings
+// can leave one past the first item.
+// above each `mod` is what points the declaration into `tests/all/`. A suite file no `mod`
+// here names is compiled nowhere and its tests never run, and a second `mod` for one name is
+// `E0428` — either fails every suite in this target.
+// Six suites of this target check the rules above rather than restating them:

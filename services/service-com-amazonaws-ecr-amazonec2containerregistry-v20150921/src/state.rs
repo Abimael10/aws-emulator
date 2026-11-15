@@ -2097,8 +2097,8 @@ pub fn evaluate_lifecycle_policy(
 
 /// One stored repository, with the identity fields computed once at creation so every
 /// later read reports exactly what the create returned. The one field NOT stored is the
-/// repository's URI: that names the endpoint this registry answers at rather than anything
-/// about the repository, so every read composes it for the client it is answering
+/// repository's URI: it is composed from the registry id and the Region this record
+/// already carries, so every read reports the same URI without a second copy of it
 /// ([`Repo::to_repository`]).
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -2158,19 +2158,18 @@ pub struct Repo {
 }
 
 impl Repo {
-    /// The `Repository` every operation that reports this repository returns, announced at
-    /// `registry_endpoint` — the endpoint this emulator serves the registry at for the
-    /// calling client ([`announced_registry_endpoint`]).
+    /// The `Repository` every operation that reports this repository returns.
     ///
-    /// `repositoryUri` is composed here rather than stored on the record, because it is
-    /// not a fact about the repository: it is the address this registry answers at, so
-    /// every read announces the address the reader itself can reach.
-    pub fn to_repository(&self, registry_endpoint: &str) -> Repository {
+    /// `repositoryUri` is composed here rather than stored on the record, from the
+    /// registry account and the Region this repository belongs to ([`repository_uri`]): it
+    /// follows from the record, so the two cannot drift, and every operation that reports
+    /// this repository reports the one URI that names it.
+    pub fn to_repository(&self) -> Repository {
         Repository {
             repository_arn: Some(self.arn.clone()),
             registry_id: Some(self.registry_id.clone()),
             repository_name: Some(self.name.clone()),
-            repository_uri: Some(repository_uri(registry_endpoint, &self.name)),
+            repository_uri: Some(repository_uri(&self.registry_id, &self.region, &self.name)),
             created_at: Some(reported_instant(self.created_at)),
             image_tag_mutability: Some(self.image_tag_mutability.clone()),
             image_tag_mutability_exclusion_filters: if self
@@ -2724,17 +2723,29 @@ pub fn upstream_registry_for_url(url: &str) -> Option<&'static str> {
     None
 }
 
-/// The account id and the Region an `<accountId>.dkr.ecr.<region>.amazonaws.com` host
+/// The account id and the Region an `<accountId>.dkr.ecr.<region>.<dnsSuffix>` host
 /// names, as the `upstreamRegistryUrl` doc spells Amazon ECR's: an account id, the two
-/// fixed labels, one Region label, and nothing else. `host` is already lowercased, and
-/// `None` for every host of another shape.
+/// fixed labels, one Region label, and the DNS suffix of the Region's partition
+/// ([`registry_dns_suffix`]). `host` is already lowercased, and `None` for every host of
+/// another shape.
 ///
-/// The ONE reading of that host layout: the `upstreamRegistryUrl` resolution above asks
-/// whether a URL names Amazon ECR at all ([`is_ecr_registry_host`]), and a PULL asks which
-/// Region and account the reference it carries addresses
-/// ([`registry_pull::parse_reference`]), so neither walks the labels itself.
+/// The ONE reading of that host layout, and the inverse of the ONE composition of it
+/// ([`registry_host`]): the `upstreamRegistryUrl` resolution above asks whether a URL names
+/// Amazon ECR at all ([`is_ecr_registry_host`]), and a PULL asks which Region and account
+/// the reference it carries addresses ([`registry_pull::parse_reference`]), so neither
+/// walks the labels itself — and a URI this registry announces for one of its own
+/// repositories reads back here as that repository.
 pub fn ecr_registry_host_parts(host: &str) -> Option<(&str, &str)> {
-    let rest = host.strip_suffix(".amazonaws.com")?;
+    // The suffix is the one the Region's own partition publishes, which is what makes this
+    // the inverse of the composition: a Region of one partition under another partition's
+    // suffix is no registry host of this service's.
+    let rest = ::std::iter::once(COMMERCIAL_DNS_SUFFIX)
+        .chain(PARTITION_DNS_SUFFIXES.iter().map(|(_, suffix)| *suffix))
+        .find_map(|suffix| {
+            let rest = host.strip_suffix(suffix)?.strip_suffix('.')?;
+            let region = rest.split('.').next_back()?;
+            (registry_dns_suffix(region) == suffix).then_some(rest)
+        })?;
     let mut labels = rest.split('.');
     let account = labels.next().filter(|account| {
         account.len() == ACCOUNT_ID_LEN && account.bytes().all(|byte| byte.is_ascii_digit())
@@ -2746,7 +2757,7 @@ pub fn ecr_registry_host_parts(host: &str) -> Option<(&str, &str)> {
     labels.next().is_none().then_some((account, region))
 }
 
-/// Whether `host` is an `<accountId>.dkr.ecr.<region>.amazonaws.com` registry host of ANY
+/// Whether `host` is an `<accountId>.dkr.ecr.<region>.<dnsSuffix>` registry host of ANY
 /// account, which is what makes an `upstreamRegistryUrl` name Amazon ECR.
 fn is_ecr_registry_host(host: &str) -> bool {
     ecr_registry_host_parts(host).is_some()

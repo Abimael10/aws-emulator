@@ -528,17 +528,12 @@ async fn a_stacks_registry_and_its_task_definition_exist_in_the_services_that_ow
             );
         }
 
-        // The URI Amazon ECR published for the repository, which is an ADDRESS a container
-        // client dials: whatever endpoint this registry announces it at, it ends in the
-        // repository's own name, so a client composes a tag or a digest on what it was
-        // handed. The stack publishes one for the repository it created too. Asserted by that
-        // FORM rather than against the documented
-        // `aws_account_id.dkr.ecr.region.amazonaws.com/repository-name` value because the host
-        // this registry announces is the open
-        // `20261111T021229Z-ecr-describerepositories-reports-a-repositoryuri-whose-host-is`;
-        // tighten this to `registry_uri(&repository)` once that issue is fixed.
+        // The URI Amazon ECR publishes for the repository: the registry host of the account
+        // and Region that holds it, followed by the repository's own name, so a client
+        // composes a tag or a digest on what it was handed. The stack publishes one for the
+        // repository it created too, and the two must agree.
         let published_uri = held["repositoryUri"].as_str().unwrap_or_default().to_string();
-        let suffix = format!("/{repository}");
+        let expected_uri = registry_uri(&repository);
         for (reported_by, uri) in [
             ("Amazon ECR", published_uri.clone()),
             (
@@ -546,10 +541,10 @@ async fn a_stacks_registry_and_its_task_definition_exist_in_the_services_that_ow
                 outputs.get("RepositoryUri").cloned().unwrap_or_default(),
             ),
         ] {
-            assert!(
-                uri.ends_with(&suffix) && uri.len() > suffix.len(),
-                "case {:?}: expected the repository URI {reported_by} reports to be a registry \
-                 endpoint followed by {suffix:?}, got {uri:?}",
+            assert_eq!(
+                uri, expected_uri,
+                "case {:?}: expected the repository URI {reported_by} reports to be \
+                 {expected_uri:?}, got {uri:?}",
                 row.case
             );
         }

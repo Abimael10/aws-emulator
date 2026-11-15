@@ -18,7 +18,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The wire harness lives in `tests/all/wire.rs`, shared with every other suite.
 use crate::wire::{
-    announced_registry_endpoint, at, call, emulator, given_layer, ok, REGION, REGISTRY_ID,
+    at, call, emulator, given_layer, ok, repository_uri, REGION, REGISTRY_ID,
 };
 
 /// The values `ImageTagMutability` accepts, from the model's enum. Spelled out here so a
@@ -178,9 +178,9 @@ async fn a_created_repository_is_described_from_what_was_stored() {
         );
         assert_eq!(
             at(&repository, "/repositoryUri"),
-            json!(format!("{}/{name}", announced_registry_endpoint())),
-            "case {case:?}: expected the repository announced at the endpoint this \
-             emulator serves the registry at, got {:?}",
+            json!(repository_uri(REGION, &name)),
+            "case {case:?}: expected the URI of the repository in this account's registry \
+             for the signed Region, got {:?}",
             at(&repository, "/repositoryUri")
         );
         assert!(
