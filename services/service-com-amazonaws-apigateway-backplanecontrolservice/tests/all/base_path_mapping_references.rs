@@ -79,7 +79,11 @@ fn assert_bad_request(answer: &Answer, message: &str, case: &str) {
 /// names, written out here rather than taken from the handler's own renderer: the FIXED
 /// text is what this test pins, and the VARIABLE parts are the identifier the request
 /// addressed and the domain names the mappings belong to.
-fn api_refusal(rest_api_id: &str, domain_names: &[&str]) -> String {
+///
+/// `pub(crate)` so the sibling `refused_control_plane_writes` suite, which drives this same
+/// refusal as one row of its table, states the sentence the one way rather than keeping a
+/// second copy of it.
+pub(crate) fn api_refusal(rest_api_id: &str, domain_names: &[&str]) -> String {
     format!(
         "Deleting RestApi {rest_api_id} failed. Please remove all base path mappings \
          related to the RestApi in your domains: {}",
@@ -90,7 +94,9 @@ fn api_refusal(rest_api_id: &str, domain_names: &[&str]) -> String {
 /// The same sentence over the STAGE a mapping names, which is the record `DeleteStage`
 /// addresses; see [`api_refusal`]. The recorded refusals spell each record's kind as that
 /// refusal spells it — the shape name for the API, the common noun for the stage.
-fn stage_refusal(stage_name: &str, domain_names: &[&str]) -> String {
+///
+/// `pub(crate)` for the reason [`api_refusal`] is.
+pub(crate) fn stage_refusal(stage_name: &str, domain_names: &[&str]) -> String {
     format!(
         "Deleting stage {stage_name} failed. Please remove all base path mappings related \
          to the stage in your domains: {}",

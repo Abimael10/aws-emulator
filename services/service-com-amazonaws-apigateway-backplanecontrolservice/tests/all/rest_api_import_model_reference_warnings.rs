@@ -30,20 +30,28 @@ use crate::rest_api_lifecycle::{assert_failure, Gateway};
 
 /// The sentence an import states for a model reference it could not resolve, by the
 /// MODEL's own name: fixed text with the name of the model the reference pointed at.
-fn unresolved(model: &str) -> String {
+///
+/// `pub(crate)` so the sibling `refused_control_plane_writes` suite, which drives this same
+/// refusal as one row of its table, states the sentence the one way rather than keeping a
+/// second copy of it.
+pub(crate) fn unresolved(model: &str) -> String {
     format!("Reference to model '{model}' not found. Ignoring.")
 }
 
 /// The sentence an import states for the FORMAT a method is left without once the model
 /// of one of its media types resolved to nothing: fixed text with the media type and the
 /// method's verb.
-fn unreadable(media_type: &str, verb: &str) -> String {
+///
+/// `pub(crate)` for the reason [`unresolved`] is.
+pub(crate) fn unreadable(media_type: &str, verb: &str) -> String {
     format!("Invalid format for model {media_type} for method {verb}")
 }
 
 /// The `failOnWarnings` refusal for `warnings`: API Gateway's fixed lead and one
 /// tab-indented line per warning, in the order the served import reports them.
-fn refusal(warnings: &[String]) -> String {
+///
+/// `pub(crate)` for the reason [`unresolved`] is.
+pub(crate) fn refusal(warnings: &[String]) -> String {
     let mut message = String::from("Warnings found during import:");
     for warning in warnings {
         message.push_str("\n\t");

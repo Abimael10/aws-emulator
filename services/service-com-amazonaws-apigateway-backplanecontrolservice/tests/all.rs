@@ -750,3 +750,7 @@ mod vpc_link_status_message;
 // subordinate to it and never hold it back.
 #[path = "all/domain_name_delete_cascade.rs"]
 mod domain_name_delete_cascade;
+// Appended for the reason the note above gives: what a control-plane request this service
+// REFUSES leaves behind — nothing, in any collection of the account.
+#[path = "all/refused_control_plane_writes.rs"]
+mod refused_control_plane_writes;

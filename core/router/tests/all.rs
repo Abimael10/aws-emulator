@@ -7499,3 +7499,19 @@ mod events_lambda_target_permission_granted_after_the_rule;
 //! written in, so the language accepts it only ahead of the first item: THIS HEADER IS THE
 //! ONLY PLACE ONE MAY STAND IN THIS FILE, and one written further down is `E0753` and
 //! compiles nothing. A note below must be an ordinary `//` comment — better still, add a
+//! its tests never run; a suite left at the top level of `tests/` fails the build.
+//! Three rules this crate root lives by, each checked by a suite of its own:
+//! * declare each suite exactly ONCE — this is one crate root, so a second `mod` for one
+//!   name is `E0428` and compiles neither copy (`all/all_rs_declares_each_suite_once.rs`);
+//! * an inner doc comment (`//!`) is legal only BEFORE the first item, so THESE lines are
+//!   the only place one may stand; past the first item `//!` is `E0753` and compiles no
+//!   suite of this target, so a note further down is an ordinary `//` comment
+//!   (`all/all_rs_inner_doc_comments_precede_the_first_item.rs`);
+//! * this file is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING under
+//!   `tests/` — which the layout check refuses. The `#[path]` is what points each
+//!   declaration into `tests/all/`.
+//! So keep this file to the declarations themselves: one `#[path]`/`mod` pair per suite,
+//! inserted in sorted order, and NOTHING after the last one. Each suite's own file header
+//! says what that suite is for, which is where an explanation belongs — a note here is a
+//! copy that goes stale, and the runs of them landings had appended past the end of this
+//! list live in `all/appended_notes.rs` instead.
