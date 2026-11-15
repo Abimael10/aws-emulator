@@ -25,6 +25,8 @@ mod archive_rule_update;
 mod aws_worded_messages;
 #[path = "all/check_no_public_access.rs"]
 mod check_no_public_access;
+#[path = "all/date_time_wire_form.rs"]
+mod date_time_wire_form;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
 #[path = "all/external_access_findings.rs"]
@@ -47,6 +49,8 @@ mod policy_check_reason_text;
 mod policy_checks;
 #[path = "all/policy_generation.rs"]
 mod policy_generation;
+#[path = "all/policy_generation_trail_resolution.rs"]
+mod policy_generation_trail_resolution;
 #[path = "all/policy_validation.rs"]
 mod policy_validation;
 #[path = "all/queue_policy_findings.rs"]

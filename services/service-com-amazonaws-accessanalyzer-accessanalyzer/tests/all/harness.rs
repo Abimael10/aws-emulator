@@ -65,10 +65,30 @@ pub struct Emulator {
 
 impl Emulator {
     pub fn new() -> Self {
+        Self::with_engine().0
+    }
+
+    /// One emulator and the engine it was mounted on, for a suite that has to reach the
+    /// store of ANOTHER service of the account.
+    pub fn with_engine() -> (Self, Arc<engine::InMemoryEngine>) {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        (Self { router }, engine)
+    }
+
+    /// One emulator with this service and the service `mount` builds on the SAME engine,
+    /// for a case whose rule reaches another service of this emulator — which is how the
+    /// production router assembles them too.
+    ///
+    /// The engine comes back beside it, because a resource of that other service may have
+    /// prerequisites of its own in a third one.
+    pub fn beside<S: smithy_server_runtime::Service>(
+        mount: impl FnOnce(Arc<engine::InMemoryEngine>) -> S,
+    ) -> (Self, Arc<engine::InMemoryEngine>) {
+        let (mut emulator, engine) = Self::with_engine();
+        emulator.router.register_service(mount(Arc::clone(&engine)));
+        (emulator, engine)
     }
 
     pub async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
@@ -206,6 +226,57 @@ impl Emulator {
     /// `PUT /policy/generation` with the given request body.
     pub async fn start_policy_generation(&self, body: Value) -> Reply {
         self.send("PUT", "/policy/generation", Some(body)).await
+    }
+
+    /// Call an operation of a service mounted BESIDE this one that speaks the `awsJson1_1`
+    /// envelope: `POST /` with the whole operation target in `X-Amz-Target`, and that
+    /// service's signing name in the SigV4 credential scope, which is what routes the
+    /// request to it.
+    ///
+    /// For a suite whose rule reaches another service of the account — a policy generation
+    /// resolving a trail against CloudTrail — so the prerequisite is created through that
+    /// service's own API rather than written into its store.
+    pub async fn send_rpc(
+        &self,
+        signing_name: &str,
+        target: &str,
+        region: &str,
+        body: Value,
+    ) -> Reply {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/20260101/{region}/{signing_name}/aws4_request, SignedHeaders=host, Signature=0000"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("x-amz-target", target)
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("authorization", authorization)
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let error_code = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body: Value = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        let error_code = error_code.or_else(|| {
+            body.get("__type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        Reply {
+            status,
+            error_code,
+            body,
+            body_bytes: response.body().len(),
+        }
     }
 
     /// `GET /policy/generation/{jobId}{query}`.

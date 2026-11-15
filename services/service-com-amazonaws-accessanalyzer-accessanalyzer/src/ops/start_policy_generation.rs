@@ -13,7 +13,11 @@
 //! The request is validated SYNCHRONOUSLY, before any job exists: a request that does not
 //! describe CloudTrail activity to analyze (no `cloudTrailDetails` at all, no trail in it,
 //! or a time range that ends before it starts) is refused with the modelled
-//! `ValidationException` (HTTP 400) and records nothing.
+//! `ValidationException` (HTTP 400) and records nothing — and so is one naming a trail
+//! CloudTrail does not hold, which is resolved against that service before the job is
+//! minted ([`crate::state::resolve_trail`]), and one naming more trails than
+//! [`crate::state::MAX_RESOLVED_TRAILS`], which is this emulator's ceiling on how much
+//! resolution a single request may drive.
 //!
 //! ## Shape of an operation
 //!
@@ -207,6 +211,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "cloudTrailDetails.endTime",
                         "cloudTrailDetails.endTime must be at or after cloudTrailDetails.startTime",
                     ),
+                )
+                .into());
+            }
+        }
+
+        // What a generation reads is the activity of the trails the request NAMES, and a
+        // trail is CloudTrail's resource, not this service's: each `cloudTrailArn` is
+        // therefore resolved where CloudTrail holds it, synchronously and before any job
+        // exists, and one it does not hold is refused with the modelled
+        // `ValidationException`. An emulator with no CloudTrail to ask establishes nothing
+        // about a trail and so refuses nothing ([`crate::state::resolve_trail`]).
+        //
+        // The fan-out is bounded before the first question is put: the list length is the
+        // caller's (`TrailList` carries no `@length`), so a request naming more trails than
+        // the ceiling is refused here, and each DISTINCT ARN is resolved once however many
+        // times the list repeats it.
+        if cloud_trail_details.trails.len() > crate::state::MAX_RESOLVED_TRAILS {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
+            return Err(StartPolicyGenerationErrorModeled::ValidationException(
+                crate::state::too_many_trails_exception(cloud_trail_details.trails.len()),
+            )
+            .into());
+        }
+        let region = crate::state::request_region(ctx.parts());
+        let mut resolved: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for trail in &cloud_trail_details.trails {
+            if !resolved.insert(trail.cloud_trail_arn.as_str()) {
+                continue;
+            }
+            // The loop also stops at the FIRST trail CloudTrail does not hold, so a refused
+            // request puts no question about the trails behind it.
+            if crate::state::resolve_trail(ctx, &region, &trail.cloud_trail_arn).await
+                == crate::state::AnalyzedTrail::Absent
+            {
+                crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
+                return Err(StartPolicyGenerationErrorModeled::ValidationException(
+                    crate::state::unknown_trail_exception(&trail.cloud_trail_arn),
                 )
                 .into());
             }

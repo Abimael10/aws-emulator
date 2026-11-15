@@ -42,6 +42,14 @@ sha2 = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-s3-amazons3 = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# `arn::region_label`: the one narrowing of a caller-supplied Region before it reaches
+# the AUTHORITY of the endpoint URL a call to another service of this emulator is
+# addressed to, rather than a second copy of that grammar here.
+service-common = { path = "../common" }
+# `GetTrail`: the read that resolves each `cloudTrailArn` a `StartPolicyGeneration`
+# names against the service that HOLDS the trail, over the in-process callback, so a
+# generation is started only for CloudTrail data the account really has.
+aws-sdk-cloudtrail = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -51,6 +59,10 @@ emulator-core-build-support = { workspace = true }
 # the way an SDK encodes a label value. Pinned here rather than referenced from the
 # root `[workspace.dependencies]`, which this project does not allow editing.
 percent-encoding = "2.3"
+# The CloudTrail this emulator's own policy generation resolves a `cloudTrailArn`
+# against, mounted beside this service on one engine so the trail a generation analyzes
+# is a trail CloudTrail itself holds.
+service-com-amazonaws-cloudtrail-cloudtrail-20131101 = { workspace = true }
 
 [lints]
 workspace = true

@@ -35,6 +35,11 @@ use std::time::{Duration, SystemTime};
 mod external_access;
 pub use external_access::*;
 
+/// The CloudTrail trails a policy generation would analyze, resolved against the service
+/// that HOLDS them — so a start names CloudTrail data the account really has.
+mod analyzed_trails;
+pub use analyzed_trails::*;
+
 use crate::ops::types::{
     AccessPreview, AccessPreviewStatusReason, AnalyzerConfiguration, AnalyzerSummary,
     ArchiveRuleSummary, CloudTrailProperties, Configuration, ConflictException, Criterion,
