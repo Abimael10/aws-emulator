@@ -28,13 +28,23 @@
 //! no pattern at all (an unclosed group, a quantifier with nothing to repeat) is refused
 //! with `InvalidInputException`, as is one whose compiled matcher would be larger than
 //! [`MAX_PATTERN_PROGRAM_BYTES`], so the work a caller-supplied pattern can buy stays
-//! bounded. `MaxResults` truncates the page and the returned `NextToken` is the last name
-//! on it, so the next call resumes at the first stored name strictly after it. A page size
-//! LARGER than the bound the model declares for that member is served rather than refused,
-//! which is what the service does: one call asking for a thousand tables answers with
-//! every matching table and no `NextToken`. A size below the modelled minimum names no
-//! servable page and is refused with this service's own `InvalidInputException`, the error
-//! class a Glue client can match, rather than with the cross-service `ValidationException`.
+//! bounded. `MaxResults` bounds the tables ONE response examines, in the order the catalog
+//! keeps them in, and the page holds those of them the request selects — so a FILTERED
+//! listing serves pages shorter than the size it asked for (an empty one included) and goes
+//! on being continued while stored tables are left. The returned `NextToken` is an OPAQUE
+//! token this store minted for THIS listing ([`crate::state::pagination`]) — never the
+//! name of a table, which would put catalog contents into a cursor and let a client
+//! assemble a position the catalog never offered — so the next call resumes at the first
+//! stored name strictly after the one the token carries, and a `NextToken` this store did
+//! not mint for this catalog and database (a forged one, one minted for another database,
+//! one from another process) names no position and is refused with `InvalidInputException`.
+//! A page size ABOVE the largest page the service admits at that member
+//! ([`MAX_PAGE_SIZE`]) is refused at the request boundary like any value outside a
+//! member's range, as a `ValidationException` naming the member and the bound; a size
+//! between the modelled maximum and that bound is served, so one call asking for a
+//! thousand tables answers with every matching table and no `NextToken`. A size below the
+//! modelled minimum names no servable page and is refused with this service's own
+//! `InvalidInputException`, the error class a Glue client can match.
 //!
 //! Members this slice does not act on, and why: `AuditContext` is input-only Lake
 //! Formation audit metadata that does not change this operation's answer. Every other
@@ -157,10 +167,22 @@ use super::types::*;
 /// largest page the model describes is the one a request that asks for no particular size
 /// is served.
 ///
-/// A request that DOES name a size is served that size, above this one included: the
-/// service answers a `MaxResults` of a thousand with every matching table on one page, so
-/// the modelled maximum bounds the default and not the request.
+/// A request that DOES name a size above this one is served that size, up to
+/// [`MAX_PAGE_SIZE`]: the service answers a `MaxResults` of a thousand with every matching
+/// table on one page, so the modelled maximum bounds the default and not the request.
 const DEFAULT_PAGE_SIZE: i32 = 100;
+
+/// The largest page a request may ask for. RECORDED behaviour: the live service refuses a
+/// `MaxResults` of 1001 at this member with the bound 1000, so a thousand is the page size
+/// it admits — above the 100 the checked-in model declares for `CatalogGetterPageSize`,
+/// which is why a size between the two is served rather than refused.
+const MAX_PAGE_SIZE: i32 = 1_000;
+
+/// How the API spells the member a page size is sent at, for the refusal of a size outside
+/// its range: the member's own name as a parameter path, which is the lowerCamel spelling
+/// the validating walk builds for `MaxResults`
+/// (`aws_smithy_schema_server::constraints::path::member`).
+const MAX_RESULTS_MEMBER: &str = "maxResults";
 
 /// The smallest page a request may ask for: the minimum of that same modelled range. A
 /// request naming fewer than one table per page asks for a page no listing can serve, and
@@ -188,20 +210,51 @@ enum Projection {
 
 impl Projection {
     /// Narrow a rebuilt `Table` to the members this projection asked for.
+    ///
+    /// `AttributesToGet` names ATTRIBUTES of the table definition, so a projection narrows
+    /// the definition — and not what the catalog answers ABOUT the element it is serving:
+    /// which catalog and database hold the table, whether a row-level filter is in force
+    /// and whether the object is a materialized view travel on every element the catalog
+    /// returns, which is what a client keying a listing by database, branching on row
+    /// filtering or telling a table from a materialized view reads. `IsMultiDialectView`,
+    /// by contrast, describes the view DEFINITION — which dialects its query can be read
+    /// in — so it is projected away with the rest of the definition.
     fn apply(self, table: Table) -> Table {
+        let identified = |projected: Table| Table {
+            catalog_id: table.catalog_id.clone(),
+            database_name: table.database_name.clone(),
+            database_id: table.database_id.clone(),
+            is_row_filtering_enabled: table.is_row_filtering_enabled,
+            is_materialized_view: table.is_materialized_view,
+            ..projected
+        };
         match self {
             Self::Full => table,
-            Self::Name => Table {
-                name: table.name,
+            Self::Name => identified(Table {
+                name: table.name.clone(),
                 ..Table::default()
-            },
-            Self::NameAndTableType => Table {
-                name: table.name,
-                table_type: table.table_type,
+            }),
+            Self::NameAndTableType => identified(Table {
+                name: table.name.clone(),
+                table_type: table.table_type.clone(),
                 ..Table::default()
-            },
+            }),
         }
     }
+}
+
+/// The scope this listing's continuation tokens are bound to: the set being paged is the
+/// tables of ONE database of ONE Data Catalog, so a token minted while listing it resolves
+/// against nothing else ([`crate::state::listing_scope`]).
+///
+/// The database is named as the catalog KEYS it — the Hive-compatible fold every catalog
+/// name is stored and looked up under — so a continuation spelled in another case resumes
+/// the listing it continues, exactly as it addresses the same database.
+fn page_token_scope(operation: &str, catalog_id: &str, database_name: &str) -> String {
+    crate::state::listing_scope(
+        operation,
+        &[catalog_id, &crate::state::fold_name(database_name)],
+    )
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -287,6 +340,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A `MaxResults` outside the range this member admits is refused where the
+        // validating walk would have refused it: BEFORE any other member is read, as the
+        // cross-service `ValidationException` naming the member and the bound. The member
+        // carries `skip_validation` (the modelled range is narrower than the service's own
+        // bound), so this operation applies the range the service enforces.
+        if let Some(requested) = input.max_results {
+            if requested > MAX_PAGE_SIZE {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::messages::page_size_above_maximum(
+                        MAX_RESULTS_MEMBER,
+                        requested,
+                        MAX_PAGE_SIZE,
+                    ),
+                ));
+            }
+        }
         // The model documents that `QueryAsOfTime` "cannot be specified along with
         // TransactionId", so that pair is a client error whatever else is supported.
         if input.transaction_id.is_some() && input.query_as_of_time.is_some() {
@@ -429,6 +498,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The scope every continuation token of THIS listing is bound to, built once from
+        // the catalog and database the request addressed.
+        let token_scope = page_token_scope(Self::NAME, &catalog_id, &input.database_name);
+
         // `Expression` is a regular expression in which `*` stands for any run of
         // characters, matched against the WHOLE table name through the ONE pattern
         // language every listing of these tables shares
@@ -456,16 +529,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The page size: what the request asked for, else the page a request that names no
         // size is served. A size below the modelled minimum names no servable page and is
-        // refused as this service's own input error; a size ABOVE the modelled maximum is
-        // served, because the service serves it.
+        // refused as this service's own input error; a size between the modelled maximum
+        // and [`MAX_PAGE_SIZE`] is served, because the service serves it.
         let requested_page_size = input.max_results.unwrap_or(DEFAULT_PAGE_SIZE);
         if requested_page_size < MIN_PAGE_SIZE {
             return Err(GetTablesErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(crate::state::messages::page_size_below_minimum(
-                        requested_page_size,
-                        MIN_PAGE_SIZE,
-                    )),
+                    message: Some(
+                        crate::state::messages::PAGE_SIZE_NOT_POSITIVE.to_string(),
+                    ),
                     from_federation_source: None,
                 },
             )
@@ -515,9 +587,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            let matching: Vec<&crate::state::TableEntry> = database
-                .tables_ordered()
-                .into_iter()
+            // The tables of this database in the ONE order the catalog keeps them in,
+            // which is the order a page SCANS and a cursor resumes against.
+            let ordered: Vec<&crate::state::TableEntry> = database.tables_ordered();
+
+            // The token names the last table the previous page SCANNED, so this page
+            // resumes at the first stored name strictly after it — which stays correct
+            // across tables created or deleted between two calls. It is opaque and bound to
+            // THIS catalog and database ([`crate::state::pagination`]), so a value this
+            // store did not mint for this listing — a forged cursor, a cursor minted for
+            // another database, one from another process — names no position and is refused
+            // rather than resolved against a name that happens to sort somewhere.
+            let start = match input.next_token.as_deref() {
+                Some(token) => {
+                    let Some(cursor) = crate::state::decode_page_token(
+                        &store.page_token_key,
+                        &token_scope,
+                        token,
+                    ) else {
+                        return Err(GetTablesErrorModeled::InvalidInputException(
+                            InvalidInputException {
+                                message: Some(
+                                    crate::state::messages::INVALID_TOKEN_VALUE.to_string(),
+                                ),
+                                from_federation_source: None,
+                            },
+                        )
+                        .into());
+                    };
+                    ordered.partition_point(|table| table.name.as_str() <= cursor.as_str())
+                }
+                None => 0,
+            };
+            // `MaxResults` is "the maximum number of tables to return in a single
+            // response", and what one response examines is `MaxResults` tables of the
+            // database: the page holds those of them the request SELECTS, so a filtered
+            // listing serves pages shorter than the size it asked for — an empty one
+            // included — and goes on being continued while stored tables are left. Cutting
+            // on the MATCHES instead would make a page's content depend on how many
+            // non-matching tables the catalog holds between two matches, which is not what
+            // a continuation of this listing resumes.
+            let scanned_to = start.saturating_add(page_size).min(ordered.len());
+            let scanned = &ordered[start..scanned_to];
+
+            let page: Vec<&crate::state::TableEntry> = scanned
+                .iter()
+                .copied()
                 .filter(|table| !federated_only || table.federated_table.is_some())
                 .filter(|table| {
                     filter
@@ -530,22 +645,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                 })
                 .collect();
-
-            // The token is the last name of the previous page, so the page resumes at the
-            // first stored name strictly after it — which stays correct across tables
-            // created or deleted between two calls.
-            let start = match input.next_token.as_deref() {
-                Some(cursor) => matching.partition_point(|table| table.name.as_str() <= cursor),
-                None => 0,
-            };
-            let end = start.saturating_add(page_size).min(matching.len());
-
-            let page = &matching[start..end];
             // The listing serves the SAME projection as the single-table read, element by
             // element — including the catalog/database identity and the row-filtering flag
             // — so a client that works from a listing is never less informed than one that
             // re-reads each table. Only `AttributesToGet` narrows an element, and then to
-            // exactly the members it named.
+            // the attributes it named BESIDE that identity, which the catalog writes onto
+            // every table it returns.
             let table_list: Vec<Table> = page
                 .iter()
                 .map(|table| {
@@ -571,10 +676,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .filter_map(|table| table.encryption.clone())
                 .collect();
-            // The token names the last entry of the page, taken from the page itself so
-            // there is no index arithmetic to underflow on an empty page.
-            let next_token = if end < matching.len() {
-                page.last().map(|table| table.name.clone())
+            // The token names the last table the page SCANNED, taken from the scan itself
+            // so there is no index arithmetic to underflow, and minted for this listing so
+            // only this store can resolve it. A page that reached the end of the database
+            // continues nothing, so it carries none.
+            let next_token = if scanned_to < ordered.len() {
+                scanned.last().map(|table| {
+                    crate::state::encode_page_token(
+                        &store.page_token_key,
+                        &token_scope,
+                        &table.name,
+                    )
+                })
             } else {
                 None
             };

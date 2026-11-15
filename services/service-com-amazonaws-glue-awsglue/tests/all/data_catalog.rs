@@ -409,17 +409,18 @@ async fn get_tables_pages_over_the_stored_tables() {
 }
 
 /// The page size a `GetTables` is served is the one its `MaxResults` asks for: a value
-/// above the bound the member's modelled type declares is SERVED rather than refused, which
-/// is what the service does — the common "one big page" listing answers with every matching
-/// table and no `NextToken` — and a value that names no servable page at all is refused with
-/// Glue's own `InvalidInputException`, the error class a Glue client can match, and never
-/// with the cross-service `ValidationException`.
+/// above the bound the member's modelled type declares is SERVED rather than refused, up to
+/// the largest page the service admits at that member — the common "one big page" listing
+/// answers with every matching table and no `NextToken` — while a value PAST that bound is
+/// refused at the request boundary, and a value that names no servable page at all is
+/// refused with Glue's own `InvalidInputException`, the error class a Glue client can match.
 ///
 /// The rows differ along the page size asked for: each published bound of the modelled
 /// range (1 and 100, from `smithy_query` on `GetTablesRequest$MaxResults`), one past the
-/// upper bound (101), a page far larger than the catalog holds (1000), the largest value
-/// the member's type can carry, and \u2014 on the refusal side \u2014 one past the lower bound (0)
-/// and a negative size.
+/// upper bound (101) and a page far larger than the catalog holds (1000, the largest the
+/// service admits) — and, on the refusal side, one past the lower bound (0) and a negative
+/// size. The sizes past the SERVED bound, and the wording each refusal carries, are the
+/// table in `tests/all/pagination_tokens.rs`.
 #[tokio::test]
 async fn get_tables_serves_the_page_size_the_request_asks_for() {
     let router = emulator();
@@ -430,12 +431,11 @@ async fn get_tables_serves_the_page_size_the_request_asks_for() {
     }
 
     // (the page size asked for, how many tables the first page must carry)
-    let served: [(i64, usize); 5] = [
+    let served: [(i64, usize); 4] = [
         (1, 1),
         (100, stored.len()),
         (101, stored.len()),
         (1000, stored.len()),
-        (i64::from(i32::MAX), stored.len()),
     ];
     for (page_size, expected) in served {
         let (status, body) = call(
@@ -1251,6 +1251,52 @@ async fn attributes_to_get_projects_the_answer_and_enforces_its_combinations() {
         table.get("Owner").is_none_or(Value::is_null),
         "case AttributesToGet [NAME, TABLE_TYPE]: Owner must not be projected, got {table}"
     );
+
+    // The catalog's own identification of each element survives every projection:
+    // `AttributesToGet` names attributes of the table DEFINITION, not which catalog and
+    // database hold the table or whether a row-level filter is in force. Each member is
+    // compared against the value the UNPROJECTED listing reports for the same table, so
+    // nothing here is pinned to a literal.
+    let whole = ok(
+        &router,
+        "GetTables",
+        &json!({ "DatabaseName": "projected_db" }),
+    )
+    .await;
+    let identified = &whole["TableList"][0];
+    for attributes in [json!(["NAME"]), json!(["NAME", "TABLE_TYPE"])] {
+        let projected = ok(
+            &router,
+            "GetTables",
+            &json!({
+                "DatabaseName": "projected_db",
+                "AttributesToGet": attributes.clone()
+            }),
+        )
+        .await;
+        let element = &projected["TableList"][0];
+        for member in [
+            "CatalogId",
+            "DatabaseName",
+            "DatabaseId",
+            "IsRowFilteringEnabled",
+            "IsMaterializedView",
+        ] {
+            assert!(
+                element.get(member).is_some_and(|value| !value.is_null()),
+                "case AttributesToGet {attributes}: {member} identifies the element the \
+                 catalog served and must be reported, got {element}"
+            );
+            assert_eq!(
+                element.get(member),
+                identified.get(member),
+                "case AttributesToGet {attributes}: expected {member} as the unprojected \
+                 listing reports it ({:?}), got {:?}",
+                identified.get(member),
+                element.get(member)
+            );
+        }
+    }
 
     // GetTable: DEFAULT is the Hive-style definition this slice stores.
     let fetched = ok(

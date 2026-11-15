@@ -784,12 +784,49 @@ pub const JOB_METADATA_MISSING: &str = "Failed to start job run due to missing m
 pub const ARN_WRONG_REGION: &str = "Arn passed doesn't belong to this region.";
 
 /// A listing whose `MaxResults` asks for a page smaller than one entry
-/// (`crate::ops::get_tables`). NOT recorded: what is pinned is the behaviour — 400
-/// with the operation's modelled `InvalidInputException` rather than the cross-service
-/// `ValidationException` — and a sentence carrying the value the request sent and the
-/// smallest page the member admits, which the model declares for it.
-pub fn page_size_below_minimum(requested: i32, minimum: i32) -> String {
-    format!("MaxResults {requested} is below the minimum page size of {minimum}")
+/// (`crate::ops::get_tables`).
+///
+/// RECORDED constant: entirely fixed text — neither the value the request sent nor the
+/// bound it missed is interpolated, and the member is named as the service names it
+/// internally rather than as the wire spells it.
+pub const PAGE_SIZE_NOT_POSITIVE: &str = "MaxItems has to be a positive number";
+
+/// A Data Catalog getter handed a `NextToken` the catalog did not issue for that listing
+/// ([`super::pagination`]): `GetTables`.
+///
+/// RECORDED constant: entirely fixed text, with nothing of the value echoed — the token is
+/// the caller's and a refusal that quoted it back would be the only place a forged cursor
+/// is reflected.
+pub const INVALID_TOKEN_VALUE: &str = "Invalid token value";
+
+/// A JOB listing handed a `NextToken` this account's store did not issue for it
+/// (`ListJobs`). RECORDED constant, and deliberately NOT the catalog's sentence above:
+/// Glue words the same refusal differently per operation, so each states its own.
+pub const INVALID_PAGINATION_TOKEN: &str = "Invalid pagination token.";
+
+/// A listing whose `MaxResults` asks for a page LARGER than the service admits at that
+/// member (`crate::ops::get_tables`): refused at the request boundary, as a value outside
+/// a member's range is, rather than served as a bigger page.
+///
+/// RECORDED template, and nothing of it is spelled here: the envelope is the cross-service
+/// one ([`::service_common::validation_message::envelope_over`]) and the clause and its
+/// requirement are the framework's own rendering of a `@range` maximum
+/// (`aws_smithy_schema_server::Violation::message`), so this refusal reads exactly as one
+/// the validating walk could have reported. The variable parts are the value the request
+/// sent, the member it sent it at — spelled as the API spells the parameter — and the
+/// largest page that member admits.
+pub fn page_size_above_maximum(member_path: &str, requested: i32, maximum: i32) -> String {
+    let clause = ::aws_smithy_schema_server::Violation {
+        path: member_path.to_string(),
+        kind: ::aws_smithy_schema_server::ViolationKind::MaxValue(maximum.to_string()),
+        // The clause quotes the value the request carried; `MaxResults` carries no
+        // `@sensitive`, so there is nothing to withhold.
+        value: Some(requested.to_string()),
+        sensitive: false,
+    }
+    .message();
+    ::service_common::validation_message::envelope_over(std::slice::from_ref(&clause))
+        .unwrap_or(clause)
 }
 
 /// Any Data Catalog operation whose `DatabaseName`/`Name` names no database

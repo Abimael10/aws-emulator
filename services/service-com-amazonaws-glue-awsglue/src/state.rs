@@ -286,6 +286,7 @@ mod job_script;
 mod jobs;
 mod lookups;
 mod ml_transforms;
+mod pagination;
 mod partition_predicate;
 mod schema_compatibility;
 mod schema_registry;
@@ -323,6 +324,7 @@ pub use job_script::*;
 pub use jobs::*;
 pub use lookups::*;
 pub use ml_transforms::*;
+pub use pagination::*;
 pub use partition_predicate::*;
 pub use schema_compatibility::*;
 pub use schema_registry::*;
@@ -1339,6 +1341,14 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// ([`MAX_PENDING_CRAWLER_EVENTS`], oldest dropped first) because every crawl that finishes
     /// appends to it, and each entry names the Region whose bus it belongs on.
     pub pending_crawler_events: VecDeque<CrawlerStateChange>,
+    /// The secret this store's paginated listings authenticate their continuation tokens
+    /// under ([`pagination`]).
+    ///
+    /// Drawn from the system's randomness when the store is created and never reported:
+    /// it is what lets a listing tell a `NextToken` it ISSUED from one a caller
+    /// assembled. `PageTokenKey`'s own `Debug` renders nothing of it, so this struct's
+    /// `Debug` carries no key material.
+    pub page_token_key: PageTokenKey,
     /// Whether this store's CLOCK PUMP is running ([`drive_clock`]), so at most one does.
     pub clock_pump_running: bool,
     /// Which claim on that pump is the live one: a pump releases its own claim and never a

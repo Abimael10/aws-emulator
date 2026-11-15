@@ -1456,3 +1456,16 @@ mod lambda_in_function_assumed_role_session;
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling
 //! of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what
 //! points each declaration into `tests/all/`.
+//! Single integration-test target for the router: the declaration list of its suites.
+//! pair, keeping the list sorted: one pair per suite and NOTHING else, so two landings
+//! insert two lines in two places and have nothing to keep consistent. What a suite covers,
+//! and why it lives in THIS target rather than in a service crate's own, belongs in that
+//! suite's own module header, where it is read beside the test it explains.
+//! Three rules this file lives or dies by, each pinned by a suite of its own
+//! `all/all_rs_is_a_canonical_declaration_list.rs`, for this file and for every service
+//! crate's `tests/all.rs`):
+//! * An inner doc comment (`//!`) is legal only BEFORE the first item, so this header is the
+//!   only place one may stand: one written further down is `E0753` and compiles nothing.
+//! * The list holds nothing but the pairs. `tests/all.rs` is a test-target CRATE ROOT, so a
+//!   bare `mod` would resolve to a sibling of this file (`tests/<name>.rs`), which the
+//!   layout check refuses: the `#[path]` is what points each declaration into `tests/all/`.

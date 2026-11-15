@@ -9,6 +9,12 @@
 //! client that lists before it reads sees exactly the jobs that exist, and a job this
 //! listing reports is one `GetJob` resolves.
 //!
+//! `NextToken` is an OPAQUE token this store minted for THIS listing
+//! ([`crate::state::pagination`]) — never a job name, which would put the account's
+//! contents into a cursor and let a client assemble a position the service never offered.
+//! A value this store did not mint for this Region's job listing names no position and is
+//! refused with the operation's modelled `InvalidInputException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -81,6 +87,14 @@ use super::types::*;
 /// (`ListJobsRequest$MaxResults`, `PageSize` range 1..1000) — and so the page size for a
 /// request that names none.
 const MAX_PAGE_SIZE: i32 = 1_000;
+
+/// The scope this listing's continuation tokens are bound to: the set being paged is the
+/// job definitions of ONE Region, so a token minted while listing them resolves against
+/// nothing else ([`crate::state::listing_scope`]) — a job exists only in the Region it was
+/// created in.
+fn page_token_scope(operation: &str, region: &str) -> String {
+    crate::state::listing_scope(operation, &[region])
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -193,11 +207,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         names.sort();
 
-        // The token is the last name of the previous page, so the page resumes at the
+        // The token names the last entry of the previous page, so the page resumes at the
         // first stored name strictly after it — which stays correct across jobs created or
-        // deleted between two calls.
+        // deleted between two calls. It is opaque and bound to THIS Region's listing
+        // ([`crate::state::pagination`]), so a value this store did not mint for it — a
+        // forged cursor, one minted for another Region or by another process — names no
+        // position and is refused rather than resolved against a name that happens to sort
+        // somewhere.
+        let token_scope = page_token_scope(Self::NAME, &region);
         let start = match input.next_token.as_deref() {
-            Some(cursor) => names.partition_point(|name| name.as_str() <= cursor),
+            Some(token) => {
+                let Some(cursor) =
+                    crate::state::decode_page_token(&store.page_token_key, &token_scope, token)
+                else {
+                    return Err(ListJobsErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                crate::state::messages::INVALID_PAGINATION_TOKEN.to_string(),
+                            ),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                };
+                names.partition_point(|name| name.as_str() <= cursor.as_str())
+            }
             None => 0,
         };
         // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose
@@ -210,9 +244,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         let end = start.saturating_add(page.len());
         // The token names the last entry of the page, taken from the page itself so there
-        // is no index arithmetic to underflow on an empty page.
+        // is no index arithmetic to underflow on an empty page, and minted for this
+        // listing so only this store can resolve it.
         let next_token = if end < names.len() {
-            page.last().cloned()
+            page.last()
+                .map(|name| crate::state::encode_page_token(&store.page_token_key, &token_scope, name))
         } else {
             None
         };
