@@ -2470,3 +2470,10 @@ mod accept_vpc_peering_connection;
 mod purchase_reserved_instances_offering;
 #[path = "all/provision_ipam_pool_cidr.rs"]
 mod provision_ipam_pool_cidr;
+// How `DescribeVpcEndpointServiceConfigurations` selects and pages the account's own endpoint
+// services: the values of one filter joined with an OR and matched with wildcards, several
+// filters joined with an AND, `ServiceIds` naming a service once however often it is repeated,
+// and a walk in `ServiceId` order over every page size the operation serves. Declared at the
+// tail of this file, which is where every new ec2 suite inserts its lines.
+#[path = "all/describe_vpc_endpoint_service_configuration_pages.rs"]
+mod describe_vpc_endpoint_service_configuration_pages;
