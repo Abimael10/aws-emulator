@@ -10,6 +10,10 @@
 //! carrying the code for WHICH reference missed, while every other item is still
 //! reported in `results`. Both lists keep the request's order.
 //!
+//! The item's `message` is the FIXED sentence for that code ([`Missed::message`]):
+//! the references the item asked about travel in its own `policyStoreId` and
+//! `policyId` members, so no request value is spliced into the text.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -143,26 +147,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let store_id = match state.lookup_store_id(&region, &item.policy_store_id) {
                 Ok(store_id) => store_id,
                 Err(crate::state::StoreLookupMiss::AliasNotFound) => {
-                    let alias = item
-                        .policy_store_id
-                        .strip_prefix(crate::state::ALIAS_PREFIX)
-                        .unwrap_or(&item.policy_store_id);
-                    errors.push(error_item(
-                        "POLICY_STORE_ALIAS_NOT_FOUND",
-                        item,
-                        format!("No policy store alias exists with the input name: {alias}"),
-                    ));
+                    errors.push(error_item(Missed::PolicyStoreAlias, item));
                     continue;
                 }
                 Err(crate::state::StoreLookupMiss::StoreNotFound) => {
-                    errors.push(error_item(
-                        "POLICY_STORE_NOT_FOUND",
-                        item,
-                        format!(
-                            "No policy store exists with the input ID: {}",
-                            item.policy_store_id
-                        ),
-                    ));
+                    errors.push(error_item(Missed::PolicyStore, item));
                     continue;
                 }
             };
@@ -172,11 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .and_then(|policy_id| store.policies.get(&policy_id))
             });
             let Some(policy) = policy else {
-                errors.push(error_item(
-                    "POLICY_NOT_FOUND",
-                    item,
-                    format!("No policy exists with the input ID: {}", item.policy_id),
-                ));
+                errors.push(error_item(Missed::Policy, item));
                 continue;
             };
 
@@ -202,14 +187,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// One per-item miss. `code` is a [`BATCH_GET_POLICY_ERROR_CODE_VALUES`] value, and
-/// the echoed references are the request item's own, so a caller can pair the error
-/// with the item it asked about.
-fn error_item(
-    code: &str,
-    item: &BatchGetPolicyInputItem,
-    message: String,
-) -> BatchGetPolicyErrorItem {
+/// WHICH of a request item's three references missed, which is what the model's
+/// `BatchGetPolicyErrorCode` enumerates: the alias in a
+/// `policy-store-alias/<name>` store reference, the store that reference resolves
+/// to, and the policy inside it.
+///
+/// One value per modelled code, so the code a miss is reported under and the
+/// sentence it carries are decided together and the three cannot drift apart.
+#[derive(Debug, Clone, Copy)]
+enum Missed {
+    /// `POLICY_STORE_ALIAS_NOT_FOUND`.
+    PolicyStoreAlias,
+    /// `POLICY_STORE_NOT_FOUND`.
+    PolicyStore,
+    /// `POLICY_NOT_FOUND`.
+    Policy,
+}
+
+impl Missed {
+    /// The `BatchGetPolicyErrorCode` this miss is reported under, one of
+    /// [`BATCH_GET_POLICY_ERROR_CODE_VALUES`].
+    fn code(self) -> &'static str {
+        match self {
+            Self::PolicyStoreAlias => "POLICY_STORE_ALIAS_NOT_FOUND",
+            Self::PolicyStore => "POLICY_STORE_NOT_FOUND",
+            Self::Policy => "POLICY_NOT_FOUND",
+        }
+    }
+
+    /// The sentence the item's `message` carries: the resource KIND that was not
+    /// found, and nothing else.
+    ///
+    /// A per-item miss reports itself in the members the model gives it — the
+    /// code in `code`, and the references the item carried in `policyStoreId`
+    /// and `policyId`, both required — so the `message` is one FIXED sentence
+    /// per code rather than prose the request's own values are spliced into: the
+    /// corpus records an item naming a policy the store it addressed does not
+    /// hold answering `Policy not found`, with the id it asked about reported in
+    /// `policyId` alone. A message interpolating the reference would differ for
+    /// every request, which is what leaves a batch's error reporting
+    /// unaggregatable.
+    fn message(self) -> &'static str {
+        match self {
+            Self::PolicyStoreAlias => "Policy store alias not found",
+            Self::PolicyStore => "Policy store not found",
+            Self::Policy => "Policy not found",
+        }
+    }
+}
+
+/// One per-item miss: the code for the reference that missed, that code's own
+/// sentence, and the request item's references echoed back, so a caller can pair
+/// the error with the item it asked about.
+fn error_item(missed: Missed, item: &BatchGetPolicyInputItem) -> BatchGetPolicyErrorItem {
+    let code = missed.code();
     debug_assert!(
         BATCH_GET_POLICY_ERROR_CODE_VALUES.contains(&code),
         "{code} is not a modeled BatchGetPolicyErrorCode"
@@ -218,6 +249,6 @@ fn error_item(
         code: code.to_string(),
         policy_store_id: item.policy_store_id.clone(),
         policy_id: item.policy_id.clone(),
-        message,
+        message: missed.message().to_string(),
     }
 }

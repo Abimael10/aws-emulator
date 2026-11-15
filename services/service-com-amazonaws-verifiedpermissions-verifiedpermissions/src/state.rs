@@ -205,6 +205,55 @@ pub fn identity_source_not_found_for_issuer(issuer: &str, policy_store_id: &str)
     format!("Identity Source does not exist for issuer {issuer} in policy store {policy_store_id}")
 }
 
+/// The message the operations on a policy store's IDENTITY SOURCES answer a
+/// reference that resolves to nothing with: the KIND of resource that does not
+/// exist, stated as a sentence of its own.
+///
+/// A policy store's identity sources are reached through their own operations —
+/// the five `*IdentitySource*` calls, and the issuer lookup a token-based
+/// authorization call makes — and that half of the API names the resource kind
+/// it could not resolve rather than summarising the miss. The corpus records
+/// `CreateIdentitySource` under a policy store that does not exist answering
+/// `Policy Store does not exist.`; the issuer lookup's own recorded refusal
+/// opens exactly the same way ([`identity_source_not_found_for_issuer`]), as
+/// does the refusal of an identity source's reference to a user pool that does
+/// not exist ([`user_pool_does_not_exist`]). The resources the
+/// CONTROL PLANE owns keep [`RESOURCE_NOT_FOUND_MESSAGE`], the fixed summary
+/// their own recordings answer with.
+///
+/// A CONSTANT per resource kind: the kind comes from the `ResourceType` the
+/// reference named, and the id of what was missing travels in the exception's
+/// own `resourceId` member, so no request value enters the text and two callers
+/// naming different ids read the same sentence.
+pub fn resource_kind_does_not_exist(resource_type: &str) -> String {
+    format!(
+        "{} does not exist.",
+        resource_kind_capitalised(resource_type)
+    )
+}
+
+/// A `ResourceType` value as the capitalised words the sentence above names it
+/// by: `POLICY_STORE` is the `Policy Store`, which is how the recorded sentences
+/// of that family spell the resource kind opening one. The enum's own spelling
+/// is SCREAMING_SNAKE_CASE, so the words are its underscore-separated parts
+/// lowercased with each first letter raised.
+fn resource_kind_capitalised(resource_type: &str) -> String {
+    resource_type
+        .split('_')
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => {
+                    first.to_ascii_uppercase().to_string()
+                        + characters.as_str().to_ascii_lowercase().as_str()
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
 /// A `ResourceType` value as the words it names, for a sentence that reports it:
 /// `POLICY_STORE` is a policy store. The enum's own spelling is
 /// SCREAMING_SNAKE_CASE, so the words are its value lowercased with the
@@ -1477,6 +1526,15 @@ impl ReferencedResource {
     /// `resourceType` members model.
     pub fn not_found(self) -> crate::ops::types::ResourceNotFoundException {
         crate::ops::resource_not_found(&self.resource_id, &self.resource_type)
+    }
+
+    /// The same modelled `ResourceNotFoundException`, worded as the operations on
+    /// a policy store's IDENTITY SOURCES word it: the message states the KIND of
+    /// resource that does not exist ([`resource_kind_does_not_exist`]), and
+    /// `resourceId`/`resourceType` are the same members the control-plane form
+    /// reports.
+    pub fn not_found_stating_the_kind(self) -> crate::ops::types::ResourceNotFoundException {
+        crate::ops::resource_not_found_stating_the_kind(&self.resource_id, &self.resource_type)
     }
 
     /// The same modelled `ResourceNotFoundException`, worded as an AUTHORIZATION

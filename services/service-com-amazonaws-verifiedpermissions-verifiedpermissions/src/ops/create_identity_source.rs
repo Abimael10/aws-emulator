@@ -74,7 +74,10 @@
 //!
 //! * `ConflictException` (HTTP 409) — the same `clientToken` was replayed with
 //!   different parameters.
-//! * `ResourceNotFoundException` (HTTP 404) — no such policy store.
+//! * `ResourceNotFoundException` (HTTP 404) — no such policy store. Its message
+//!   states the KIND of resource that does not exist, as every operation on a
+//!   policy store's identity sources words it
+//!   ([`crate::state::resource_kind_does_not_exist`]).
 //! * `ServiceQuotaExceededException` (HTTP 402) — the store is at
 //!   [`crate::state::MAX_IDENTITY_SOURCES_PER_STORE`].
 //! * `ValidationException` (HTTP 400) — the configuration names a provider this
@@ -170,9 +173,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // An identity-source operation names the resource KIND it could not
+        // resolve, which for this one is always the policy store the new source
+        // would live in — see
+        // [`crate::state::resource_kind_does_not_exist`].
         let not_found = || {
             CreateIdentitySourceErrorModeled::ResourceNotFoundException(
-                crate::state::policy_store_reference(&input.policy_store_id).not_found(),
+                crate::state::policy_store_reference(&input.policy_store_id)
+                    .not_found_stating_the_kind(),
             )
         };
         let unavailable = || {

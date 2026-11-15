@@ -822,6 +822,31 @@ pub fn resource_not_found_naming_the_resource(
     }
 }
 
+/// The modelled `ResourceNotFoundException` an operation on a policy store's
+/// IDENTITY SOURCES answers for a reference that names no live resource: the
+/// message states the KIND of resource that does not exist
+/// ([`crate::state::resource_kind_does_not_exist`]), with the same `resourceId`
+/// and `resourceType` the control-plane form below reports.
+///
+/// The identity sources of a policy store are reached through their own
+/// operations, and that half of the API names the kind it could not resolve
+/// where the control plane answers its fixed summary; which half an operation
+/// belongs to is what chooses between this builder and [`resource_not_found`].
+/// Reached through
+/// [`crate::state::ReferencedResource::not_found_stating_the_kind`] for a
+/// reference a request member carries, so the kind and the id come from the one
+/// reader of that member and no handler shapes the sentence itself.
+pub fn resource_not_found_stating_the_kind(
+    resource_id: &str,
+    resource_type: &str,
+) -> self::types::ResourceNotFoundException {
+    self::types::ResourceNotFoundException {
+        message: crate::state::resource_kind_does_not_exist(resource_type),
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
+    }
+}
+
 /// The modelled `ResourceNotFoundException` a TOKEN-based authorization call
 /// answers when the token's issuer is no identity source of the policy store the
 /// request addressed.

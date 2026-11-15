@@ -193,14 +193,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Both references this operation resolves name the resource KIND that
+        // does not exist, as every operation on a policy store's identity
+        // sources words it ([`crate::state::resource_kind_does_not_exist`]).
         let store_not_found = || {
             GetIdentitySourceErrorModeled::ResourceNotFoundException(
-                crate::state::policy_store_reference(&input.policy_store_id).not_found(),
+                crate::state::policy_store_reference(&input.policy_store_id)
+                    .not_found_stating_the_kind(),
             )
         };
         let source_not_found = || {
             GetIdentitySourceErrorModeled::ResourceNotFoundException(
-                crate::ops::resource_not_found(&input.identity_source_id, "IDENTITY_SOURCE"),
+                crate::ops::resource_not_found_stating_the_kind(
+                    &input.identity_source_id,
+                    crate::state::RESOURCE_TYPE_IDENTITY_SOURCE,
+                ),
             )
         };
 

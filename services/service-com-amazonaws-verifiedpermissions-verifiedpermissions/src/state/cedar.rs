@@ -390,17 +390,49 @@ pub fn check_statement_size(statement: &str) -> Result<(), InvalidInput> {
     Ok(())
 }
 
+/// The reason a static policy's `fieldList` entry carries when the Cedar text it
+/// submitted does not PARSE: the fixed classification of the failing element,
+/// with the element itself named by the entry's sibling `path`.
+///
+/// `ValidationExceptionField` models `path` as "the path to the specific element
+/// that Verified Permissions found to be not valid" and `message` as what
+/// "describes the policy validation error", and the recorded refusal of a static
+/// definition whose statement does not parse carries exactly this sentence — so
+/// the classification is the API's surface and the PARSER's own diagnostic is
+/// not: that diagnostic names whichever token happened to break the parse, so it
+/// differs for every malformed statement of the same class and changes with the
+/// parser rather than with the API.
+///
+/// Every path that hands a caller's STATIC policy statement to the Cedar parser
+/// states it ([`parse_static_policy`], [`validate_static_policy`]), so a
+/// statement is refused with the same sentence whether the store validates
+/// against a schema or not, and whichever operation submitted it. A policy
+/// TEMPLATE's statement keeps the parser's diagnostic, which is what the
+/// recorded refusal of one carries ([`parse_template`]), and the store's SCHEMA
+/// refusing a policy that parsed is its own class, reported one `fieldList`
+/// entry per reason the validator raised ([`validation_reasons`]).
+pub const POLICY_BODY_REFUSAL: &str = "Failed to validate policy body";
+
+/// That refusal as the [`InvalidInput`] a caller's unparseable static statement
+/// is answered with: the member at fault is [`paths::STATIC_STATEMENT`], the
+/// element the entry's `path` names, and the reason is the constant above.
+fn policy_body_refusal() -> InvalidInput {
+    InvalidInput::new(paths::STATIC_STATEMENT, POLICY_BODY_REFUSAL)
+}
+
 /// Parse one Cedar static policy and read its effect and scope off the parsed
-/// form. `Err` names [`paths::STATIC_STATEMENT`] and carries the parser's own
-/// diagnostic unwrapped, for a `ValidationException` — the same rule
-/// [`parse_template`] states.
+/// form. `Err` names [`paths::STATIC_STATEMENT`] and carries
+/// [`POLICY_BODY_REFUSAL`], the classification of a policy body that does not
+/// parse, for a `ValidationException`.
 ///
 /// Refuses a statement past [`MAX_STATEMENT_BYTES`] BEFORE handing it to the
-/// parser, so an over-long payload costs a length check rather than a parse.
+/// parser, so an over-long payload costs a length check rather than a parse —
+/// and that refusal states the bound it exceeded, because the size check is this
+/// emulator's own and not a parse.
 pub fn parse_static_policy(statement: &str) -> Result<StaticScope, InvalidInput> {
     check_statement_size(statement)?;
-    let policy = cedar_policy::Policy::parse(None, statement)
-        .map_err(|e| InvalidInput::new(paths::STATIC_STATEMENT, e.to_string()))?;
+    let policy =
+        cedar_policy::Policy::parse(None, statement).map_err(|_| policy_body_refusal())?;
 
     Ok(scope_of(&policy))
 }
@@ -545,8 +577,8 @@ pub fn validate_static_policy(schema_json: &str, statement: &str) -> Result<(), 
              validated against it: {e}"
         ))
     })?;
-    let policy = cedar_policy::Policy::parse(None, statement)
-        .map_err(|e| InvalidInput::new(paths::STATIC_STATEMENT, e.to_string()))?;
+    let policy =
+        cedar_policy::Policy::parse(None, statement).map_err(|_| policy_body_refusal())?;
     let mut set = cedar_policy::PolicySet::new();
     set.add(policy).map_err(|e| {
         InvalidInput::new(

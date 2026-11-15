@@ -21,6 +21,8 @@ mod alias_name_prefix_precedence;
 mod alias_region_scope;
 #[path = "all/batch_get_policy.rs"]
 mod batch_get_policy;
+#[path = "all/batch_get_policy_error_messages.rs"]
+mod batch_get_policy_error_messages;
 #[path = "all/batch_is_authorized.rs"]
 mod batch_is_authorized;
 #[path = "all/batch_is_authorized_with_token.rs"]
@@ -51,6 +53,8 @@ mod idempotency_parameter_escaping;
 mod identity_source_configuration_writers;
 #[path = "all/identity_source_group_entity_type.rs"]
 mod identity_source_group_entity_type;
+#[path = "all/identity_source_not_found_message.rs"]
+mod identity_source_not_found_message;
 #[path = "all/identity_source_pool_refusal_message.rs"]
 mod identity_source_pool_refusal_message;
 #[path = "all/identity_source_pool_refusal_stages.rs"]
@@ -87,6 +91,8 @@ mod not_found_precedes_payload_refusal;
 mod oidc_identity_source_authorization;
 #[path = "all/oidc_token_audience_claim.rs"]
 mod oidc_token_audience_claim;
+#[path = "all/policy_body_parse_refusal.rs"]
+mod policy_body_parse_refusal;
 #[path = "all/policy_store_alias.rs"]
 mod policy_store_alias;
 #[path = "all/policy_store_authorization.rs"]

@@ -11,9 +11,14 @@
 //! * `ResourceNotFoundException` models `resourceId` ("The unique ID of the
 //!   resource referenced in the failed request") and `resourceType` as required
 //!   members, so the identity of the missing resource has its own modelled home
-//!   and the message is one fixed sentence — the same whatever operation raised
-//!   it, whatever form the reference took (an id, an alias reference, a
-//!   `name/` reference, an ARN) and whatever resource type was missing.
+//!   and the message is one fixed sentence — the same for every CONTROL-PLANE
+//!   operation that raised it, whatever form the reference took (an id, an alias
+//!   reference, a `name/` reference, an ARN) and whatever resource type was
+//!   missing. The other two halves of this API word their own not-found: an
+//!   authorization call names the resource the request referenced
+//!   ([`super::response_fidelity`]), and an operation on a policy store's
+//!   identity sources names the resource KIND that does not exist
+//!   ([`super::identity_source_not_found_message`]).
 //! * `InvalidStateException` models a single `message`, and both its own model
 //!   documentation and the recorded wire response carry one fixed
 //!   deletion-protection refusal sentence, which names no resource.
@@ -169,22 +174,17 @@ async fn store_arn(router: &MultiServiceRouter, store_id: &str) -> String {
 /// character the pattern admits, an alias reference that no longer resolves, a
 /// policy id, a `name/` reference, a policy-store ARN, another service's ARN),
 /// and the TYPE of resource that is missing (`POLICY_STORE`, `POLICY`,
-/// `POLICY_TEMPLATE`, `POLICY_STORE_ALIAS`, `IDENTITY_SOURCE`).
+/// `POLICY_TEMPLATE`, `POLICY_STORE_ALIAS`).
 ///
 /// The AUTHORIZATION calls are the other half of this API and word their own
 /// not-found, naming the resource the request referenced; that half of the rule —
 /// and that the two halves stay apart — is pinned in
-/// [`super::response_fidelity`].
+/// [`super::response_fidelity`]. The operations on a policy store's IDENTITY
+/// SOURCES word theirs by naming the resource KIND that does not exist, which is
+/// pinned in [`super::identity_source_not_found_message`].
 #[tokio::test]
 async fn every_control_plane_not_found_path_answers_the_same_constant_message() {
     let router = router();
-    // The pool an identity-source row references really exists, so such a row
-    // fails on the resource the row is about.
-    let seeded_pool_arn = user_pool_arn(
-        SIGNING_REGION,
-        &user_pool(&router, "not-found-row-pool").await,
-    );
-
     // A live store with one policy in it, so a row can miss the POLICY inside a
     // store that really exists.
     let live_store = store_with_mode(&router, "OFF").await;
@@ -236,7 +236,6 @@ async fn every_control_plane_not_found_path_answers_the_same_constant_message() 
     let unknown_policy = "SPDOESNOTEXIST000000".to_string();
     let unknown_policy_name = "name/no-such-policy".to_string();
     let unknown_alias = format!("{ALIAS_PREFIX}no-such-alias");
-    let unknown_identity_source = "ISDOESNOTEXIST000000".to_string();
     let unknown_template = "PTDOESNOTEXIST000000".to_string();
     let fake_arn =
         "arn:aws:verifiedpermissions::000000000000:policy-store/PSFAKE0000000000000".to_string();
@@ -434,39 +433,6 @@ async fn every_control_plane_not_found_path_answers_the_same_constant_message() 
             reference: pending_alias.clone(),
             resource_id: "pending-deletion".to_string(),
             resource_type: "POLICY_STORE_ALIAS",
-        },
-        NotFound {
-            case: "CreateIdentitySource, unknown store",
-            operation: "CreateIdentitySource",
-            request: json!({
-                "policyStoreId": unknown_store,
-                "configuration": cognito_configuration(&seeded_pool_arn),
-            }),
-            reference: unknown_store.clone(),
-            resource_id: unknown_store.clone(),
-            resource_type: "POLICY_STORE",
-        },
-        NotFound {
-            case: "GetIdentitySource, live store and unknown identity source id",
-            operation: "GetIdentitySource",
-            request: json!({
-                "policyStoreId": live_store,
-                "identitySourceId": unknown_identity_source,
-            }),
-            reference: unknown_identity_source.clone(),
-            resource_id: unknown_identity_source.clone(),
-            resource_type: "IDENTITY_SOURCE",
-        },
-        NotFound {
-            case: "GetIdentitySource, unknown store",
-            operation: "GetIdentitySource",
-            request: json!({
-                "policyStoreId": unknown_store,
-                "identitySourceId": unknown_identity_source,
-            }),
-            reference: unknown_store.clone(),
-            resource_id: unknown_store.clone(),
-            resource_type: "POLICY_STORE",
         },
         NotFound {
             // An `aliasName` always names an alias, and its id is that name
