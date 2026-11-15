@@ -1271,6 +1271,154 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .auto_recovery(true)
         .host_features(true, false)
         .boot_modes(&["legacy-bios"]),
+    // C6a — compute optimized, 3rd generation AMD EPYC 7R13 (Milan) at a sustained 3.6 GHz,
+    // with no local instance store. Its EBS figures are its own rows of "Amazon EBS optimized
+    // instance types": the four sizes below the `8xlarge` publish a baseline they burst above,
+    // up to 10,000 Mbps and 40,000 IOPS, and the bandwidth is dedicated from that size up,
+    // reaching 40,000 Mbps on the `32xlarge` and 240,000 IOPS on the sizes that hold the whole
+    // host. The network figures are the family's own ladder — a quarter of the host's 50 Gigabit
+    // bursting to 12.5 below the `8xlarge`, then its share of the host — and its volumes come
+    // out of the attachment pool shared with its interfaces, so the virtualized sizes leave the
+    // limit the derivation above counts; the bare metal size takes the 31 EBS volumes "Instance
+    // volume limits" publishes for a bare metal instance and IS offered CloudWatch action based
+    // recovery, which the hypervisor-backed rule would deny it. The Elastic Fabric Adapter is
+    // offered on the largest virtualized size and the bare metal one alone. Hibernation is
+    // published for the sizes up to the `8xlarge` and for none above it, and ENA Express is
+    // published the other way round — the sizes up to the `8xlarge` carry less dedicated network
+    // bandwidth than the Scalable Reliable Datagram transport needs, so it is offered from the
+    // `12xlarge` up and on the bare metal size. That bare metal size is also offered reboot
+    // migration, and it boots the legacy BIOS alone: UEFI reaches every x86 size built on the
+    // Nitro System EXCEPT a bare metal one, which has no hypervisor to present it.
+    PublishedInstanceTypeFacts::of("c6a.large")
+        .ebs(650, 3_600, 10_000, 40_000)
+        .network("Up to 12.5 Gigabit")
+        .processor("AMD", 3.6)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6a.xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .network("Up to 12.5 Gigabit")
+        .processor("AMD", 3.6)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6a.2xlarge")
+        .ebs(2_500, 12_000, 10_000, 40_000)
+        .network("Up to 12.5 Gigabit")
+        .processor("AMD", 3.6)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6a.4xlarge")
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .network("Up to 12.5 Gigabit")
+        .processor("AMD", 3.6)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6a.8xlarge")
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .network("12.5 Gigabit")
+        .processor("AMD", 3.6)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6a.12xlarge")
+        .ebs(15_000, 60_000, 15_000, 60_000)
+        .network("18.75 Gigabit")
+        .processor("AMD", 3.6)
+        .hibernation(false),
+    PublishedInstanceTypeFacts::of("c6a.16xlarge")
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .network("25 Gigabit")
+        .processor("AMD", 3.6)
+        .hibernation(false),
+    PublishedInstanceTypeFacts::of("c6a.24xlarge")
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .network("37.5 Gigabit")
+        .processor("AMD", 3.6)
+        .hibernation(false),
+    PublishedInstanceTypeFacts::of("c6a.32xlarge")
+        .ebs(40_000, 160_000, 40_000, 160_000)
+        .network("50 Gigabit")
+        .processor("AMD", 3.6)
+        .hibernation(false),
+    PublishedInstanceTypeFacts::of("c6a.48xlarge")
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .network("50 Gigabit")
+        .efa(1)
+        .processor("AMD", 3.6)
+        .hibernation(false),
+    PublishedInstanceTypeFacts::of("c6a.metal")
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .ebs_attachments(31)
+        .network("50 Gigabit")
+        .efa(1)
+        .processor("AMD", 3.6)
+        .ena_srd(true)
+        .hibernation(false)
+        .auto_recovery(true)
+        .host_features(true, false)
+        .boot_modes(&["legacy-bios"]),
+    // C6g — compute optimized on AWS Graviton2, at a sustained 2.5 GHz, with no local instance
+    // store. Its EBS figures are the Graviton2 compute ladder's rows of "Amazon EBS optimized
+    // instance types": the sizes below the `4xlarge` publish a baseline they burst above, up to
+    // 4,750 Mbps and 20,000 IOPS, and the bandwidth is dedicated from that size up. The network
+    // figures are the family's published ones — up to 10 Gigabit below the `8xlarge`, then 12,
+    // 20 and the host's 25 — and its smallest size takes two interfaces of four private
+    // addresses each rather than the count its step of the size ladder publishes. The volumes
+    // come out of the shared attachment pool, so the virtualized sizes leave the limit the
+    // derivation above counts, while the bare metal size takes the 31 EBS volumes published for
+    // a bare metal instance and IS offered CloudWatch action based recovery. ENA Express is not
+    // offered on this hardware generation — the adapter that carries it arrives with the
+    // network optimized sibling — and the Elastic Fabric Adapter is offered on no size. An
+    // enclave is offered from two vCPUs up on this architecture rather than from the four an
+    // x86 type needs, so the `large` size carries one; the bare metal size is offered reboot
+    // migration and copies a session's packets for Traffic Mirroring, while it carries no local
+    // PTP hardware clock.
+    PublishedInstanceTypeFacts::of("c6g.medium")
+        .ebs(315, 2_500, 4_750, 20_000)
+        .network("Up to 10 Gigabit")
+        .interfaces(2)
+        .ipv4_per_interface(4)
+        .processor("AWS", 2.5)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6g.large")
+        .ebs(630, 3_600, 4_750, 20_000)
+        .network("Up to 10 Gigabit")
+        .processor("AWS", 2.5)
+        .ena_srd(false)
+        .nitro_enclaves(true),
+    PublishedInstanceTypeFacts::of("c6g.xlarge")
+        .ebs(1_188, 6_000, 4_750, 20_000)
+        .network("Up to 10 Gigabit")
+        .processor("AWS", 2.5)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6g.2xlarge")
+        .ebs(2_375, 12_000, 4_750, 20_000)
+        .network("Up to 10 Gigabit")
+        .processor("AWS", 2.5)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6g.4xlarge")
+        .ebs(4_750, 20_000, 4_750, 20_000)
+        .network("Up to 10 Gigabit")
+        .processor("AWS", 2.5)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6g.8xlarge")
+        .ebs(9_500, 40_000, 9_500, 40_000)
+        .network("12 Gigabit")
+        .processor("AWS", 2.5)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6g.12xlarge")
+        .ebs(14_250, 50_000, 14_250, 50_000)
+        .network("20 Gigabit")
+        .processor("AWS", 2.5)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6g.16xlarge")
+        .ebs(19_000, 80_000, 19_000, 80_000)
+        .network("25 Gigabit")
+        .processor("AWS", 2.5)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("c6g.metal")
+        .ebs(19_000, 80_000, 19_000, 80_000)
+        .ebs_attachments(31)
+        .network("25 Gigabit")
+        .processor("AWS", 2.5)
+        .ena_srd(false)
+        .auto_recovery(true)
+        .host_features(true, false)
+        .traffic_mirroring(true),
     // C9gd — compute optimized with local NVMe on the newest AWS Graviton hardware. The
     // family's network and EBS bandwidth is CONFIGURABLE: it publishes the bandwidth
     // weightings a launch may ask for, which the families whose split is fixed publish none
@@ -1973,6 +2121,170 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .efa(1)
         .processor("AWS", 2.6)
         .dedicated_hosts(true),
+    // R8g — memory optimized on AWS Graviton4, at a sustained 2.8 GHz, with no local instance
+    // store. Its network and EBS bandwidth is CONFIGURABLE: every size publishes the bandwidth
+    // weightings a launch may ask for, which the families whose split is fixed publish none of.
+    // The EBS figures are the Graviton4 memory ladder's rows of "Amazon EBS optimized instance
+    // types": the sizes below the `8xlarge` publish a baseline they burst above, up to 10,000
+    // Mbps and 40,000 IOPS, and the bandwidth is dedicated from that size up, reaching 40,000
+    // Mbps and 240,000 IOPS on the sizes that hold the whole host. Those volumes are attached to
+    // EBS hardware of the type's own rather than out of the pool shared with the interfaces, so
+    // the limit every size reports is the EBS devices' own and is of the `dedicated` kind: 32
+    // volumes up to the `12xlarge`, then 48, 64 and 128 as the size grows. The network figures
+    // are the family's published ones — up to 12.5 and up to 15 Gigabit below the `8xlarge`,
+    // then its share of the host's 50 — and the smallest size takes two interfaces of four
+    // private addresses each rather than the count its step of the size ladder publishes. The
+    // family takes no interface attachment from a secondary network, so no private address at
+    // all is available on one, and the Elastic Fabric Adapter is offered on the two sizes that
+    // hold the whole host and on both bare metal ones, which are also offered CloudWatch action
+    // based recovery, reboot migration and a local PTP hardware clock, and whose EBS attachment
+    // limit is their host's own — 79 volumes on the whole host, 39 on the half of it the smaller
+    // bare metal size holds — rather than a rung of the ladder above. The sizes that carry the
+    // cores of TWO processor sockets publish the lower sustained frequency of that part,
+    // 2.7 GHz, where every size that sits on one publishes 2.8. ENA Express is offered from the
+    // `8xlarge` up, the sizes under it carrying less dedicated network bandwidth than its
+    // transport needs; the number of ENA queues cannot be changed on this family's adapter, the
+    // packets of a session cannot be copied under its guest, and an enclave is offered from two
+    // vCPUs up on this architecture rather than from the four an x86 type needs, so the `large`
+    // size carries one.
+    PublishedInstanceTypeFacts::of("r8g.medium")
+        .ebs(315, 2_500, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .interfaces(2)
+        .ipv4_per_interface(4)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r8g.large")
+        .ebs(630, 3_600, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .nitro_enclaves(true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r8g.xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r8g.2xlarge")
+        .ebs(2_500, 12_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 15 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r8g.4xlarge")
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 15 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r8g.8xlarge")
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("15 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r8g.12xlarge")
+        .ebs(15_000, 60_000, 15_000, 60_000)
+        .dedicated_ebs_attachments(32)
+        .network("22.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r8g.16xlarge")
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .dedicated_ebs_attachments(48)
+        .network("30 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r8g.24xlarge")
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .dedicated_ebs_attachments(64)
+        .network("40 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.8)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r8g.48xlarge")
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .dedicated_ebs_attachments(128)
+        .network("50 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.7)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r8g.metal-24xl")
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .dedicated_ebs_attachments(39)
+        .network("40 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.8)
+        .ena_srd(true)
+        .auto_recovery(true)
+        .host_features(true, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r8g.metal-48xl")
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .dedicated_ebs_attachments(79)
+        .network("50 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.7)
+        .ena_srd(true)
+        .auto_recovery(true)
+        .host_features(true, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
     // T3 — burstable performance, Intel Xeon Scalable at a sustained 2.5 GHz. The family's
     // EBS figures do not follow the size ladder: they double up to `large` and then stop, so
     // `large`, `xlarge` and `2xlarge` share one row, and `large` takes 12 private addresses

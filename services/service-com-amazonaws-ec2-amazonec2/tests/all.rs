@@ -32,14 +32,12 @@ mod volume_create_notifications;
 // eligibility follows its own billing, and the association reported against one private IPv4
 // address carries no public DNS name. Declared beside `prefix_lists` for the reason the note
 // above gives: the sorted neighbourhood and the tail of this file are where every new ec2
-// suite inserts its lines.
 // An account's EGRESS-ONLY internet gateways: the create that mints one for a VPC and attaches
 // it, the report that selects and pages over them, the delete that takes one away, and what
 // each of the three refuses. Declared FIRST for the reason the note above gives: the sorted
 // `DescribeSnapshotAttribute`: the one attribute a read reports of a snapshot of each side of
 // the account-visible inventory — who may create a volume from it and the Marketplace codes it
 // is billed through — plus what it refuses. Declared beside `prefix_lists` for the reason the
-// note above gives: the sorted neighbourhood and the tail of this file are where every new ec2
 // `ModifyIpamPool`: the members a modification writes onto a stored IPAM pool and the ones it
 // leaves alone, the allocation tag rules it adds and removes, and what it refuses. Declared
 // FIRST for the reason the note above gives: the sorted neighbourhood and the tail of this
@@ -78,7 +76,6 @@ mod modify_instance_attribute;
 // optimized family with local NVMe devices and of a block storage optimized one: every
 // hardware member of a reported type is the figure AWS publishes for that one type. Declared
 // beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the
-// tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/published_ebs_performance_catalog_rows.rs"]
 mod published_ebs_performance_catalog_rows;
 // The per-instance-type facts no function of a type's NAME can produce: its accelerator
@@ -2486,6 +2483,12 @@ mod modify_vpc_endpoint_service_configuration;
 // services: the values of one filter joined with an OR and matched with wildcards, several
 // filters joined with an AND, `ServiceIds` naming a service once however often it is repeated,
 // and a walk in `ServiceId` order over every page size the operation serves. Declared at the
-// tail of this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/describe_vpc_endpoint_service_configuration_pages.rs"]
 mod describe_vpc_endpoint_service_configuration_pages;
+// The published catalog rows of an AMD x86 compute optimized family and of two AWS Graviton
+// families: the EBS performance and attachment limit, the network figures and adapter
+// capabilities, the host features, boot modes and processor frequency of each reported type,
+// each served from that type's own row rather than scaled from the size multiplier in its name.
+// Declared beside `snapshot_attributes` for the reason the note above gives: the sorted
+#[path = "all/published_amd_and_graviton_catalog_rows.rs"]
+mod published_amd_and_graviton_catalog_rows;
