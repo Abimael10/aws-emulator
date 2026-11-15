@@ -266,6 +266,7 @@ mod tests {
             filters: Vec::new(),
             reports_batch_item_failures: false,
             attempts_allowed: None,
+            bisects_on_function_error: false,
             on_failure_destination: None,
             cursors: std::collections::BTreeMap::new(),
             initial_cursor: ShardCursor::TrimHorizon,

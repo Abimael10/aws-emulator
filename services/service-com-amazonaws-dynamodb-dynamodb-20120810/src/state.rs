@@ -1801,6 +1801,46 @@ pub struct PendingStreamRecord {
     pub by_caller: bool,
 }
 
+impl PendingStreamRecord {
+    /// Whether this change MODIFIED the item it was made on, which is what a feed of
+    /// item-level changes carries a record for.
+    ///
+    /// "DynamoDB Streams captures a time-ordered sequence of item-level MODIFICATIONS in any
+    /// DynamoDB table" (`StreamSpecification`): a write that stores exactly the values the
+    /// item already held leaves the item as it was, so it modified nothing and no record is
+    /// published for it — the same reason a delete that removed nothing publishes none. Every
+    /// other write did modify the item: one that stored an item that was not there, one that
+    /// removed one, and one whose stored attributes differ from the ones they replaced.
+    ///
+    /// An attribute is compared as the VALUE it is, by the rule a condition compares values
+    /// with ([`attribute_values_equal`]) — a number respelt is the same number, and a set's
+    /// members are a set — so what counts as a change here is what a reader of the item would
+    /// see change.
+    pub fn modifies_item(&self) -> bool {
+        match (&self.old_image, &self.new_image) {
+            (Some(before), Some(after)) => !same_item(before, after),
+            // A change with neither image describes no modification; no write path queues
+            // one.
+            (None, None) => false,
+            _ => true,
+        }
+    }
+}
+
+/// Whether two stored items hold the same attributes with the same values: the question
+/// "did this write change the item" is asked of the whole item, attribute by attribute.
+///
+/// An attribute one version carries and the other does not is a change, whichever side
+/// carries it, which the name count settles before any value is compared.
+fn same_item(before: &Item, after: &Item) -> bool {
+    before.len() == after.len()
+        && before.iter().all(|(name, value)| {
+            after
+                .get(name)
+                .is_some_and(|stored| attribute_values_equal(value, stored))
+        })
+}
+
 /// The most changes this store queues for the streams service before a handler hands
 /// them over.
 ///

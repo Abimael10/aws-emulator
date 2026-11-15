@@ -243,6 +243,10 @@ pub fn publish_item_changes<Eng: Send + Sync + 'static>(
 /// images its own `StreamViewType` does not capture, so what a consumer sees is never
 /// more than the stream was created to capture.
 ///
+/// A queued change that MODIFIED the item not at all is in none of those three: the stream
+/// is a sequence of item-level modifications, so a write that stored exactly the values the
+/// item already held appends no record ([`crate::state::PendingStreamRecord::modifies_item`]).
+///
 /// Publication cannot fail the write that made the change — the item is already stored
 /// and the response is already decided, and DynamoDB publishes to a stream
 /// asynchronously — so a change the registry will not take is LOGGED rather than
@@ -269,6 +273,11 @@ fn publish_to_streams<Eng: Send + Sync + 'static>(
         let Some(stream_arn) = change.stream_arn.as_deref() else {
             continue;
         };
+        // A write that changed nothing about the item is no modification of it, so the
+        // stream carries no record for it.
+        if !change.modifies_item() {
+            continue;
+        }
         let event_name = match (&change.old_image, &change.new_image) {
             (None, Some(_)) => streams::state::OperationType::Insert,
             (Some(_), Some(_)) => streams::state::OperationType::Modify,

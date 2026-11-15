@@ -139,6 +139,8 @@ mod event_source_mapping_attempt_reservation;
 mod event_source_mapping_batch_item_failures;
 #[path = "all/event_source_mapping_batching_window.rs"]
 mod event_source_mapping_batching_window;
+#[path = "all/event_source_mapping_bisect_on_function_error.rs"]
+mod event_source_mapping_bisect_on_function_error;
 #[path = "all/event_source_mapping_delete_in_use.rs"]
 mod event_source_mapping_delete_in_use;
 #[path = "all/event_source_mapping_destination_role.rs"]

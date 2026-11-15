@@ -53,10 +53,22 @@
 //!   specified number of retries" (`MaximumRetryAttempts`): a mapping that states a finite
 //!   count gets the first attempt plus that many at one batch, and once they are spent the
 //!   shard is read on from PAST those records — so the records behind a batch its function
-//!   cannot process are still delivered. The count is a fact about the batch, so a shard
-//!   that has moved on starts it again. Between two attempts at one batch the wait GROWS
+//!   cannot process are still delivered. The count is a fact about the batch, and about the
+//!   attempts the FUNCTION answered for: a pass that could not invoke it at all spends none
+//!   of the allowance, and a shard that has moved on starts the count again. Between two
+//!   attempts at one batch the wait GROWS
 //!   ([`undelivered_backoff`]), so a function that keeps failing is not invoked at the rate
 //!   a healthy mapping polls.
+//! * A BATCH ITS FUNCTION ERRORED ON IS SPLIT WHERE THE MAPPING ASKS. "If the function
+//!   returns an error, split the batch in two before retrying"
+//!   (`BisectBatchOnFunctionError`): a mapping that asks for it attempts half of that batch
+//!   next, and halves again while the half it attempts is errored on too, down to the single
+//!   record — so the records of a batch its function can process are processed and the
+//!   record it cannot is attempted, and given up on, on its own
+//!   ([`PollerWork::bisect`]). Each half is a batch of its own, so it gets the mapping's own
+//!   allowance of attempts. A report that fails the WHOLE batch is such an error; one that
+//!   names a suffix of it has already said which records to read again, and is read again as
+//!   it stands.
 //! * THE BATCH A MAPPING GAVE UP ON IS RECORDED WHERE IT SAYS. The records a mapping
 //!   discards are gone from its function's reach, so the only thing a client can still learn
 //!   about them is what its `DestinationConfig$OnFailure` names: where it names a
@@ -379,6 +391,9 @@ struct ShardSourcedMapping {
     /// from `MaximumRetryAttempts`; `None` for the infinite default
     /// ([`attempts_allowed`]).
     attempts_allowed: Option<u32>,
+    /// Whether the mapping's `BisectBatchOnFunctionError` asks for a batch its function
+    /// errored on to be SPLIT IN TWO before it is attempted again ([`PollerWork::bisect`]).
+    bisects_on_function_error: bool,
     /// The destination the mapping's `DestinationConfig$OnFailure` names, when it names one:
     /// where the record of a discarded batch is written ([`failure_destination`]).
     on_failure_destination: Option<String>,
@@ -624,6 +639,72 @@ struct PollerWork {
     /// the one stream this poller reads, and an entry is given up as soon as its shard moves
     /// on.
     attempts: BTreeMap<String, BatchAttempts>,
+    /// How many records the next batch of a shard holds while a batch its function errored
+    /// on is being SPLIT, keyed by shard id ([`BisectedBatch`]). Bounded and given up like
+    /// [`Self::attempts`], and empty for a mapping that does not ask for the split.
+    bisected: BTreeMap<String, BisectedBatch>,
+}
+
+/// How many records one batch of ONE shard holds while the mapping is splitting a batch its
+/// function errored on, and which batch that is.
+///
+/// "BisectBatchOnFunctionError – If the function returns an error, split the batch in two
+/// before retrying": the split is a fact about the batch the error was answered for, so it
+/// is keyed by the position that batch starts at and is given up as soon as the shard has
+/// moved on — a batch read from a moved position is a different batch and is read at the
+/// mapping's own `BatchSize` again.
+#[derive(Debug)]
+struct BisectedBatch {
+    /// The sequence number of the first record of the batch that was split, which is the
+    /// position the shard is still at.
+    head: String,
+    /// How many records each half of it holds.
+    half: usize,
+}
+
+impl PollerWork {
+    /// How many records one batch read at `head` of `shard` holds: the `configured` size, or
+    /// the half a batch the function errored on was split into, while the shard is still at
+    /// that batch's own position.
+    fn batch_limit(&self, shard: &str, head: &str, configured: usize) -> usize {
+        match self.bisected.get(shard) {
+            Some(held) if held.head == head => held.half.clamp(1, configured.max(1)),
+            _ => configured,
+        }
+    }
+
+    /// Record that the batch of `held` records at `head` of `shard` is to be SPLIT before it
+    /// is attempted again, and answer how many records each half holds.
+    ///
+    /// A split batch is a DIFFERENT batch — it holds other records than the one the error was
+    /// answered for — so the attempts the mapping allows one batch start again for it.
+    /// `MaximumRetryAttempts` is spent on a batch ("Discard records after the specified number
+    /// of retries"), and the halves are not that batch; reading the allowance as one spent
+    /// across a batch and the halves it is split into would make the setting a mapping
+    /// enabled do nothing at all wherever it allows no retry, and would leave the one record
+    /// its function cannot process neither isolated nor recorded at its failure destination —
+    /// which is what splitting the batch is for. So a mapping that allows no retry still
+    /// attempts each half once, and the record that survives the halving is the one that is
+    /// discarded and recorded, rather than the whole batch it arrived in.
+    fn bisect(&mut self, shard: &str, head: &str, held: usize) -> usize {
+        let half = held.div_ceil(2).max(1);
+        self.bisected.insert(
+            shard.to_string(),
+            BisectedBatch {
+                head: head.to_string(),
+                half,
+            },
+        );
+        self.attempts.remove(shard);
+        half
+    }
+
+    /// The shard has MOVED ON, so neither the attempts spent on the batch it was at nor the
+    /// split that batch was being read in says anything about what it reads next.
+    fn moved_on(&mut self, shard: &str) {
+        self.attempts.remove(shard);
+        self.bisected.remove(shard);
+    }
 }
 
 /// How many consecutive attempts the batch at the head of ONE shard has had, and which batch
@@ -754,6 +835,9 @@ fn run_of(
             &mapping.function_response_types,
         ),
         attempts_allowed: attempts_allowed(mapping.maximum_retry_attempts),
+        // "If the function returns an error, split the batch in two before retrying"
+        // (`BisectBatchOnFunctionError`), for a mapping that asks for it.
+        bisects_on_function_error: mapping.bisect_batch_on_function_error.unwrap_or(false),
         on_failure_destination: failure_destination::on_failure_destination(
             mapping.destination_config.as_ref(),
         ),
@@ -845,6 +929,9 @@ async fn move_batches(
             .iter()
             .map(|record| record.sequence_number.clone())
             .collect();
+        // The position the shard is at, which is the record the batch at its head starts
+        // with: what the attempts spent on that batch, and a split of it, are keyed by.
+        let position: &str = sequence_numbers.first().map_or("", String::as_str);
         // One age per BATCH read, because the age is a property of that read: a pass that
         // took several batches off one shard meters each of them.
         for batch in &read {
@@ -872,16 +959,19 @@ async fn move_batches(
                 sequence_numbers.last().cloned(),
                 super::LAST_PROCESSING_RESULT_OK,
             );
-            work.attempts.remove(shard);
+            work.moved_on(shard);
             delivered = true;
             continue;
         };
-        // The batches of this shard that are in flight together.
+        // The batches of this shard that are in flight together, each holding at most the
+        // records one batch of this mapping holds — which is the half its function's error
+        // split the batch at this position into, while one is being split
+        // ([`PollerWork::batch_limit`]).
         let batches = concurrent_batches(
             invoking,
             &grouping_keys(run, listed.partition_key_attribute.as_deref(), invoking),
             run.in_flight_batches,
-            batch_records(run),
+            work.batch_limit(shard, position, batch_records(run)),
         );
         // What each of them is handed over as, and the records it is the function's report
         // about ([`super::batch_item_failures`]): a function can only report about the
@@ -936,8 +1026,9 @@ async fn move_batches(
                 super::LAST_PROCESSING_RESULT_OK,
             );
             // The shard has moved on, so the attempts the batch it was at had are spent on
-            // nothing further: the next batch starts its own count.
-            work.attempts.remove(shard);
+            // nothing further, and a split it was being read in is over: the next batch
+            // starts its own count at the mapping's own `BatchSize`.
+            work.moved_on(shard);
             delivered = true;
             continue;
         }
@@ -959,6 +1050,36 @@ async fn move_batches(
         let given_up_sequence_numbers = handing
             .first()
             .map_or(&[][..], |(_, invoked)| invoked.as_slice());
+        // "BisectBatchOnFunctionError – If the function returns an error, split the batch in
+        // two before retrying": a mapping that asks for it attempts HALF of the batch its
+        // function answered the error for next, and halves again while the half it attempts
+        // is answered with one too, down to the single record — so the records of a batch its
+        // function can process are processed, and the record it cannot is attempted on its
+        // own. Only an ANSWERED failure of the whole batch splits it: a pass that could not
+        // invoke the function at all learnt nothing about the records, and a function that
+        // reported a SUFFIX of the batch as failed has already said which records to read
+        // again, so what it reported is read again as it stands
+        // ([`super::batch_item_failures`]).
+        if run.bisects_on_function_error
+            && attempt.failure.is_some()
+            && attempt.answered.is_some()
+            && given_up_sequence_numbers.len() > 1
+        {
+            let half = work.bisect(shard, position, given_up_sequence_numbers.len());
+            checkpoint(
+                state,
+                uuid,
+                run,
+                shard,
+                None,
+                super::LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED,
+            );
+            failure = Some(format!(
+                "{detail}, so {shard} is read again in batches of {half} record(s)"
+            ));
+            undelivered = true;
+            continue;
+        }
         // Where the shard reads on from once that batch is given up on: past the run of
         // records at the head that are accounted for — what this pass handled, plus the
         // records of the batch it gave up on — so a record no batch of this pass was handed
@@ -976,11 +1097,17 @@ async fn move_batches(
             &GivenUpBatch {
                 sequence_numbers: given_up_sequence_numbers,
                 discarded_through: checkpointed_through(&sequence_numbers, &accounted).as_deref(),
+                // An invocation that was not made at all is no attempt at these records
+                // ([`failed_attempt`]).
+                reached_function: attempt.answered.is_some(),
             },
             &mut work.attempts,
             detail,
         );
         if let Some(attempts) = failed.discarded {
+            // The batch is gone from the shard's reach, so a split it was being read in is
+            // over too: the records behind it are read at the mapping's own `BatchSize`.
+            work.bisected.remove(shard);
             // The records are gone from the function's reach, so the only thing a client can
             // still learn about them is what the mapping's own failure destination says.
             failure_destination::discard_batch(
@@ -1155,6 +1282,14 @@ fn merged_attempt(attempts: Vec<Attempt>) -> Attempt {
 /// records behind the ones that were discarded are delivered, and one no batch of the pass
 /// was handed is not read past. A mapping carrying the infinite default discards nothing and
 /// keeps trying ([`attempts_allowed`]).
+///
+/// What the allowance counts is an attempt the batch was MADE WITH: the member is the maximum
+/// number of times Lambda retries when the FUNCTION returns an error, and that does not apply
+/// to a service error or a throttle where the batch never reached the function. So a pass that
+/// could not invoke the function at all (`reached_function` false) spends none of the
+/// allowance and discards nothing — the records stay in the shard for the pass that follows,
+/// exactly as they do while a read is withheld — and only a batch the function answered for
+/// counts against it.
 fn failed_attempt(
     state: &::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
     uuid: &str,
@@ -1171,6 +1306,23 @@ fn failed_attempt(
             discarded: None,
         };
     };
+    if !batch.reached_function {
+        checkpoint(
+            state,
+            uuid,
+            run,
+            shard,
+            None,
+            super::LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED,
+        );
+        return FailedAttempt {
+            detail: format!(
+                "{detail}; the batch never reached the function, so it is no attempt at those \
+                 records and {shard} reads them again"
+            ),
+            discarded: None,
+        };
+    }
     let made = match attempts.get_mut(shard) {
         // The shard is still at the position this batch was read from, so this is one more
         // attempt at the SAME batch.
@@ -1231,6 +1383,10 @@ struct GivenUpBatch<'pass> {
     /// records the pass accounted for reach, and `None` when that is nowhere, which leaves
     /// the position where it was.
     discarded_through: Option<&'pass str>,
+    /// Whether the batch REACHED the function — whether an invocation was made with it at
+    /// all — which is what decides whether this failure is one of the attempts the mapping
+    /// allows the batch ([`failed_attempt`]).
+    reached_function: bool,
 }
 
 /// What one failed attempt at a batch came to: the sentence it is logged with, and — when

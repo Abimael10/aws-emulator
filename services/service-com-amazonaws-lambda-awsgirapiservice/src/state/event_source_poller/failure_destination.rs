@@ -643,6 +643,7 @@ mod tests {
             filters: Vec::new(),
             reports_batch_item_failures: false,
             attempts_allowed: Some(2),
+            bisects_on_function_error: false,
             on_failure_destination: Some(
                 "arn:aws:sqs:us-east-1:000000000000:failed-batches".to_string(),
             ),

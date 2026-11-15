@@ -65,6 +65,10 @@ pub fn deliver_item_changes<Eng: Send + Sync + 'static>(
     // state is never read under both locks.
     let deliveries: Vec<(&PendingStreamRecord, String, String)> = changes
         .iter()
+        // A write that changed nothing about the item is no item-level change, so no
+        // destination is owed a record for it
+        // ([`PendingStreamRecord::modifies_item`]).
+        .filter(|change| change.modifies_item())
         .flat_map(|change| {
             store
                 .table(&change.region, &change.table_name)
