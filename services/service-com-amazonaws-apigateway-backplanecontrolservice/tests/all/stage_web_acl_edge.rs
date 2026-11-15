@@ -471,6 +471,20 @@ fn origin_body(path_part: &str) -> String {
     format!("{{\"at\":\"{path_part}\"}}")
 }
 
+/// A request body of `len` filler bytes carrying `needle` at offset `at`, or no occurrence of
+/// it at all when `at` is `None`.
+///
+/// What a body-inspection case varies is the SIZE of the body and WHERE in it the fragment a
+/// rule hunts for sits, so those are the two knobs; the filler is a byte the fragment does not
+/// contain, so the only occurrence is the one the case placed.
+fn body_carrying(len: usize, needle: &str, at: Option<usize>) -> Vec<u8> {
+    let mut body = vec![b'.'; len];
+    if let Some(at) = at {
+        body[at..at + needle.len()].copy_from_slice(needle.as_bytes());
+    }
+    body
+}
+
 /// The rule over the STATEMENTS that decide: which action a web ACL settles on, and
 /// what the caller is answered, for each kind of rule a web ACL can carry.
 ///
@@ -777,11 +791,7 @@ async fn body_inspection_stops_at_the_limit_and_oversize_handling_decides_past_i
     /// A body of `len` bytes of filler with `NEEDLE` at `at`, or no needle at all when
     /// `at` is past the end.
     fn body_with_needle(len: usize, at: Option<usize>) -> Vec<u8> {
-        let mut body = vec![b'.'; len];
-        if let Some(at) = at {
-            body[at..at + NEEDLE.len()].copy_from_slice(NEEDLE.as_bytes());
-        }
-        body
+        body_carrying(len, NEEDLE, at)
     }
 
     let cases = [
@@ -856,6 +866,334 @@ async fn body_inspection_stops_at_the_limit_and_oversize_handling_decides_past_i
             answered.status,
             answered.body
         );
+    }
+}
+
+/// The rule over WHERE body inspection stops: WAF inspects a request body only up to
+/// the limit in force for the protected resource type — the 16 KB that type documents,
+/// or the `SizeInspectionLimit` the web ACL's `AssociationConfig` names for it — the
+/// inspected field's `OversizeHandling` decides a body that EXCEEDS that limit, the
+/// protected stage answers the request either way, and every request the web ACL
+/// decided is in the sample `GetSampledRequests` draws from.
+///
+/// One stage per limit in force, each driven AT the bound and one step past it: a
+/// fragment ending on the last inspected byte is seen, the same fragment starting on the
+/// first byte past the prefix is not, and a body one byte over the limit is the oversize
+/// one `MATCH` and `NO_MATCH` decide without inspecting it.
+#[tokio::test]
+async fn body_inspection_stops_at_the_limit_in_force_and_the_stage_answers_either_way() {
+    let edge = Edge::new();
+    let api = Api::build(&edge, "edge-body-limit").await;
+
+    /// The fragment every stage's rule hunts for in the body.
+    const NEEDLE: &str = "needle";
+
+    /// The limit in force when the web ACL configures none: `Body$OversizeHandling`
+    /// gives "for CloudFront, API Gateway, Amazon Cognito, App Runner, and Verified
+    /// Access, the default limit is 16 KB (16,384 bytes)".
+    const DEFAULT_LIMIT: usize = 16 * 1024;
+
+    /// The rule name — and so the metric dimension a sample of a BLOCKED request is
+    /// drawn under — every stage's web ACL carries.
+    const RULE: &str = "inspect-body";
+
+    /// One protected stage: the `OversizeHandling` its rule carries, and the
+    /// `SizeInspectionLimit` its web ACL configures for `API_GATEWAY` (`None` configures
+    /// none, leaving the documented default in force).
+    struct Protected {
+        stage: &'static str,
+        handling: &'static str,
+        configured: Option<&'static str>,
+    }
+
+    /// The byte count a configured `SizeInspectionLimit` names, and [`DEFAULT_LIMIT`] for a
+    /// web ACL that configures none — so the limit a row is driven at is read off the same
+    /// enum value the row configures, rather than restated beside it.
+    fn inspection_limit(configured: Option<&str>) -> usize {
+        match configured {
+            None => DEFAULT_LIMIT,
+            Some("KB_16") => 16 * 1024,
+            Some("KB_32") => 32 * 1024,
+            Some("KB_48") => 48 * 1024,
+            Some("KB_64") => 64 * 1024,
+            Some(other) => panic!(
+                "case {other:?}: expected one of the values SizeInspectionLimit declares, \
+                 which this table does not name"
+            ),
+        }
+    }
+
+    // Every value `SizeInspectionLimit` declares
+    // (`smithy_query(query="shape",shape="SizeInspectionLimit")` → `KB_16`, `KB_32`,
+    // `KB_48`, `KB_64`), plus a web ACL that configures none at all, crossed with the
+    // three values of `OversizeHandling`.
+    let protected = [
+        Protected {
+            stage: "unset",
+            handling: "CONTINUE",
+            configured: None,
+        },
+        Protected {
+            stage: "kb16",
+            handling: "CONTINUE",
+            configured: Some("KB_16"),
+        },
+        Protected {
+            stage: "kb32",
+            handling: "CONTINUE",
+            configured: Some("KB_32"),
+        },
+        Protected {
+            stage: "kb48",
+            handling: "CONTINUE",
+            configured: Some("KB_48"),
+        },
+        Protected {
+            stage: "kb64",
+            handling: "CONTINUE",
+            configured: Some("KB_64"),
+        },
+        Protected {
+            stage: "matched",
+            handling: "MATCH",
+            configured: Some("KB_32"),
+        },
+        Protected {
+            stage: "unmatched",
+            handling: "NO_MATCH",
+            configured: Some("KB_48"),
+        },
+    ];
+
+    let mut web_acls: Vec<String> = Vec::new();
+    for entry in &protected {
+        api.deploy(&edge, entry.stage).await;
+        let extra = match entry.configured {
+            Some(limit) => json!({
+                "AssociationConfig": {
+                    "RequestBody": { "API_GATEWAY": { "DefaultSizeInspectionLimit": limit } }
+                }
+            }),
+            None => json!({}),
+        };
+        let (_, arn, _) = create_web_acl(
+            &edge,
+            &format!("limit-{}", entry.stage),
+            json!({ "Allow": {} }),
+            json!([rule(
+                RULE,
+                0,
+                json!({
+                    "ByteMatchStatement": {
+                        "SearchString": base64_of(NEEDLE),
+                        "FieldToMatch": { "Body": { "OversizeHandling": entry.handling } },
+                        "TextTransformations": [{ "Priority": 0, "Type": "NONE" }],
+                        "PositionalConstraint": "CONTAINS",
+                    }
+                }),
+                json!({ "Block": {} }),
+            )]),
+            extra,
+        )
+        .await;
+        associate(&edge, &arn, &api.id, entry.stage).await;
+        web_acls.push(arn);
+    }
+
+    /// One request to a protected stage and the status its web ACL answers it with.
+    struct Case {
+        case: String,
+        stage: &'static str,
+        body: Vec<u8>,
+        status: u16,
+    }
+
+    let mut cases: Vec<Case> = Vec::new();
+    for entry in &protected {
+        let (stage, limit) = (entry.stage, inspection_limit(entry.configured));
+        let body_with_needle = |len: usize, at: Option<usize>| body_carrying(len, NEEDLE, at);
+        match entry.handling {
+            // `CONTINUE` — "inspect the available body contents normally, according to
+            // the rule inspection criteria": the prefix the limit allows is inspected
+            // and nothing past it is.
+            "CONTINUE" => cases.extend([
+                Case {
+                    case: format!(
+                        "{stage}: the fragment ENDS on the last inspected byte of a body \
+                         at the {limit}-byte limit"
+                    ),
+                    stage,
+                    body: body_with_needle(limit, Some(limit - NEEDLE.len())),
+                    status: 403,
+                },
+                Case {
+                    case: format!(
+                        "{stage}: the fragment STARTS on the first byte past the \
+                         {limit}-byte prefix"
+                    ),
+                    stage,
+                    body: body_with_needle(limit + NEEDLE.len(), Some(limit)),
+                    status: 200,
+                },
+                Case {
+                    case: format!(
+                        "{stage}: an oversize body whose fragment sits inside the \
+                         {limit}-byte prefix"
+                    ),
+                    stage,
+                    body: body_with_needle(limit + 4096, Some(0)),
+                    status: 403,
+                },
+            ]),
+            // `MATCH` — "treat the web request as matching the rule statement", which
+            // only applies ONCE THE BODY IS OVER the limit: a body at the limit is
+            // inspected normally and so carries no fragment to match.
+            "MATCH" => cases.extend([
+                Case {
+                    case: format!(
+                        "{stage}: a fragment-free body AT the {limit}-byte limit is not \
+                         oversize, so nothing matches"
+                    ),
+                    stage,
+                    body: body_with_needle(limit, None),
+                    status: 200,
+                },
+                Case {
+                    case: format!(
+                        "{stage}: a fragment-free body ONE byte past the {limit}-byte \
+                         limit is oversize, so the statement matches"
+                    ),
+                    stage,
+                    body: body_with_needle(limit + 1, None),
+                    status: 403,
+                },
+            ]),
+            // `NO_MATCH` — "treat the web request as not matching the rule statement",
+            // again only past the limit: the SAME fragment inside the prefix decides the
+            // request one way at the limit and the other way one byte over it.
+            _ => cases.extend([
+                Case {
+                    case: format!(
+                        "{stage}: the fragment inside a body AT the {limit}-byte limit is \
+                         inspected normally"
+                    ),
+                    stage,
+                    body: body_with_needle(limit, Some(0)),
+                    status: 403,
+                },
+                Case {
+                    case: format!(
+                        "{stage}: the fragment inside a body ONE byte past the \
+                         {limit}-byte limit does not match"
+                    ),
+                    stage,
+                    body: body_with_needle(limit + 1, Some(0)),
+                    status: 200,
+                },
+            ]),
+        }
+    }
+
+    for case in &cases {
+        let answered = edge
+            .invoke(
+                &api.id,
+                "POST",
+                &format!("/{}/upload", case.stage),
+                &[("content-type", "application/json")],
+                &case.body,
+            )
+            .await;
+        assert_eq!(
+            answered.status,
+            case.status,
+            "case {:?}: expected status {} for a {}-byte body, got {} with {:?}",
+            case.case,
+            case.status,
+            case.body.len(),
+            answered.status,
+            answered.body
+        );
+    }
+
+    /// The samples WAF holds for the `metric` dimension of `web_acl_arn`.
+    async fn samples(edge: &Edge, web_acl_arn: &str, metric: &str) -> Vec<Value> {
+        let answered = edge
+            .waf_ok(
+                "GetSampledRequests",
+                json!({
+                    "WebAclArn": web_acl_arn,
+                    "RuleMetricName": metric,
+                    "Scope": SCOPE,
+                    "MaxItems": 100,
+                    "TimeWindow": { "StartTime": 0, "EndTime": 99_999_999_999_i64 },
+                }),
+            )
+            .await;
+        answered["SampledRequests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    // Every request the web ACL decided — at the limit and past it alike — is in the
+    // population a sample is drawn from, under the dimension that ACTED on it: the rule's
+    // own for one it blocked, the web ACL's for one the `DefaultAction` let through.
+    for (entry, arn) in protected.iter().zip(web_acls.iter()) {
+        let stage = entry.stage;
+        let for_stage = |status: u16| {
+            cases
+                .iter()
+                .filter(|case| case.stage == stage && case.status == status)
+                .count()
+        };
+        let uri = format!("/{stage}/upload");
+
+        let blocked = samples(&edge, arn, RULE).await;
+        assert_eq!(
+            blocked.len(),
+            for_stage(403),
+            "case {stage:?}: expected one sample of the {RULE} dimension per refused \
+             request, got {blocked:?}"
+        );
+        for sample in &blocked {
+            assert_eq!(
+                sample["Action"].as_str(),
+                Some("BLOCK"),
+                "case {stage:?}: expected the refused request sampled as BLOCK, got {sample:?}"
+            );
+            assert_eq!(
+                sample["Request"]["Method"].as_str(),
+                Some("POST"),
+                "case {stage:?}: expected the sampled request's method POST, got {sample:?}"
+            );
+            assert_eq!(
+                sample["Request"]["URI"].as_str(),
+                Some(uri.as_str()),
+                "case {stage:?}: expected the sampled request's URI {uri:?}, got {sample:?}"
+            );
+        }
+
+        let allowed = samples(&edge, arn, &format!("limit-{stage}")).await;
+        assert_eq!(
+            allowed.len(),
+            for_stage(200),
+            "case {stage:?}: expected one sample of the web ACL's own dimension per \
+             request the default action let through, got {allowed:?}"
+        );
+        for sample in &allowed {
+            assert_eq!(
+                sample["Action"].as_str(),
+                Some("ALLOW"),
+                "case {stage:?}: expected the request the default action let through \
+                 sampled as ALLOW, got {sample:?}"
+            );
+            assert_eq!(
+                sample["Request"]["URI"].as_str(),
+                Some(uri.as_str()),
+                "case {stage:?}: expected the sampled request's URI {uri:?}, got {sample:?}"
+            );
+        }
     }
 }
 
