@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventTracker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventTracker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventTracker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: creates an event tracker in a dataset group, mints the tracking id its
+//! `PutEvents` ingestion is addressed by, and records that id in the registry Amazon
+//! Personalize Events resolves. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventTracker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventTrackerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::pipeline::limit_reached_message;
+        use crate::state::trackers::{
+            event_tracker_arn, EventTrackerRecord, MAX_STORED_EVENT_TRACKERS,
+        };
+        use crate::state::{active_at, mint_tracking_id};
+        use std::time::SystemTime;
+
+        // `ctx` carries request metadata only; the region this tracker's ARN is scoped to
+        // comes from the dataset group it belongs to, so a tracker and its group are never
+        // minted in two different regions.
+        let _ = ctx;
+
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateEventTracker",
+            ));
+        };
+
+        let mut state = state.lock();
+
+        // The group "receives the event data", so it has to exist. Its own status is NOT
+        // required to be ACTIVE: the model documents that wait only for adding a DATASET
+        // to a group, and says nothing of it for an event tracker.
+        let Some(region) = state
+            .dataset_groups
+            .get(&input.dataset_group_arn)
+            .map(|group| group.region.clone())
+        else {
+            return Err(not_found(
+                crate::state::MissingResource::DatasetGroup,
+                &input.dataset_group_arn,
+            ));
+        };
+        let arn = event_tracker_arn(&region, &input.name);
+
+        // "Only one event tracker can be associated with a dataset group. You will get an
+        // error if you call CreateEventTracker using the same dataset group as an existing
+        // event tracker": the collision is the tracker already associated with the group,
+        // whatever name this request asked for.
+        if let Some(existing) = state
+            .event_trackers
+            .values()
+            .find(|record| record.dataset_group_arn == input.dataset_group_arn)
+        {
+            return Err(already_exists(&existing.event_tracker_arn));
+        }
+        // A tracker is addressed by an ARN minted from its name, so the name's uniqueness
+        // is the ARN's: the same name under another group collides as well.
+        if state.event_trackers.contains_key(&arn) {
+            return Err(already_exists(&arn));
+        }
+        if state.event_trackers.len() >= MAX_STORED_EVENT_TRACKERS {
+            return Err(CreateEventTrackerErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(limit_reached_message(
+                        "event trackers",
+                        MAX_STORED_EVENT_TRACKERS,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = SystemTime::now();
+        let tracking_id = mint_tracking_id();
+
+        // "The response includes a tracking ID, which you pass as a parameter when you use
+        // the PutEvents operation" — and PutEvents belongs to Amazon Personalize Events, a
+        // different service whose API carries no tracker definition. So the id this create
+        // mints is recorded in the registry that service reads BEFORE the record is kept
+        // here, exactly as `CreateDataset` records a dataset ARN: a tracking id the control
+        // plane reports is one the data plane can ingest through, never a value that
+        // resolves to nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventTracker"))
+        // The id is recorded as soon as it EXISTS rather than when this create's clock
+        // completes, for the reason `CreateDataset` gives: the ingestion API models no
+        // error for a tracker whose create is still in progress, and whether a tracker is
+        // ready is what this service's own `DescribeEventTracker` reports.
+        if let Some(registry) = crate::state::ingestion_registry(&*self.engine) {
+            if registry
+                .lock()
+                .register_event_tracker(&tracking_id, Some(input.dataset_group_arn.clone()))
+                .is_none()
+            {
+                return Err(CreateEventTrackerErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(limit_reached_message(
+                            "ingested event trackers",
+                            ::service_com_amazonaws_personalizeevents_amazonpersonalizeevents::state::MAX_EVENT_TRACKERS,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        state.event_trackers.insert(
+            arn.clone(),
+            EventTrackerRecord {
+                name: input.name.clone(),
+                event_tracker_arn: arn.clone(),
+                tracking_id: tracking_id.clone(),
+                dataset_group_arn: input.dataset_group_arn.clone(),
+                creation_date_time: now,
+                last_updated_date_time: now,
+                // The tracker is NOT created ready: "CREATE PENDING > CREATE IN_PROGRESS >
+                // ACTIVE", and `DescribeEventTracker` derives which of those the clock has
+                // made due from this instant.
+                active_at: active_at(now),
+                tags: input.tags.clone().unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateEventTrackerOutput {
+            event_tracker_arn: Some(arn),
+            tracking_id: Some(tracking_id),
+        })
     }
+}
+
+/// This operation's modelled `ResourceAlreadyExistsException` for the tracker a create
+/// collided with, in the Arn-generic sentence this service words the class with
+/// ([`crate::state::resource_already_exists_message`]).
+fn already_exists(arn: &str) -> CreateEventTrackerError {
+    CreateEventTrackerErrorModeled::ResourceAlreadyExistsException(ResourceAlreadyExistsException {
+        message: Some(crate::state::resource_already_exists_message(arn)),
+    })
+    .into()
+}
+
+/// This operation's modelled `ResourceNotFoundException` for an ARN this service holds no
+/// resource for, worded the way every lookup in this service words the class for that KIND
+/// of resource ([`crate::state::resource_not_found_message`]).
+fn not_found(resource: crate::state::MissingResource, arn: &str) -> CreateEventTrackerError {
+    CreateEventTrackerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::resource_not_found_message(resource, arn)),
+    })
+    .into()
 }

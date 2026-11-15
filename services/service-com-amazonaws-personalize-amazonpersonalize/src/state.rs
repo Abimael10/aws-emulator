@@ -18,6 +18,7 @@ pub mod export;
 pub mod import;
 pub mod ingested;
 pub mod pipeline;
+pub mod trackers;
 pub mod training;
 
 use std::collections::BTreeMap;
@@ -111,6 +112,8 @@ pub struct ComAmazonawsPersonalizeAmazonpersonalizeState {
     pub dataset_groups: BTreeMap<String, DatasetGroupRecord>,
     /// Datasets, keyed by `datasetArn`.
     pub datasets: BTreeMap<String, DatasetRecord>,
+    /// Event trackers, keyed by `eventTrackerArn`.
+    pub event_trackers: BTreeMap<String, trackers::EventTrackerRecord>,
     /// Dataset import jobs, keyed by `datasetImportJobArn`.
     pub dataset_import_jobs: BTreeMap<String, pipeline::DatasetImportJobRecord>,
     /// Dataset export jobs, keyed by `datasetExportJobArn`.
@@ -282,6 +285,7 @@ pub enum MissingResource {
     SolutionVersion,
     Campaign,
     Filter,
+    EventTracker,
 }
 
 /// What a lookup that resolves to nothing answers for `arn`, in the wording Personalize
@@ -300,7 +304,8 @@ pub fn resource_not_found_message(resource: MissingResource, arn: &str) -> Strin
         | MissingResource::Solution
         | MissingResource::SolutionVersion
         | MissingResource::Campaign
-        | MissingResource::Filter => format!("Resource Arn {arn} does not exist."),
+        | MissingResource::Filter
+        | MissingResource::EventTracker => format!("Resource Arn {arn} does not exist."),
     }
 }
 

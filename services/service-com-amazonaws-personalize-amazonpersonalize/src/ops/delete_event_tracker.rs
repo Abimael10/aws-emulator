@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEventTracker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEventTracker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEventTracker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes one stored event tracker and withdraws the tracking id it
+//! ingested through. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +146,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEventTracker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEventTrackerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEventTracker"))
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteEventTracker",
+            ));
+        };
+
+        // The record goes, so a following `DescribeEventTracker` answers
+        // `ResourceNotFoundException` and `ListEventTrackers` no longer reports it. The
+        // dataset group it pointed at is left alone: "Deletes the event tracker. Does not
+        // delete the dataset from the dataset group."
+        let mut state = state.lock();
+        let Some(deleted) = state.event_trackers.remove(&input.event_tracker_arn) else {
+            // The not-found class carries the wording Personalize uses for the KIND of
+            // resource that was looked up, with the ARN the caller asked about as its one
+            // variable part ([`crate::state::resource_not_found_message`]).
+            return Err(DeleteEventTrackerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::MissingResource::EventTracker,
+                        &input.event_tracker_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The tracker no longer exists, so the ingestion registry stops resolving the
+        // tracking id it was created with: a `PutEvents` naming it is refused again, the
+        // way it was before the create ([`crate::state::ingestion_registry`]).
+        if let Some(registry) = crate::state::ingestion_registry(&*self.engine) {
+            registry.lock().forget_event_tracker(&deleted.tracking_id);
+        }
+
+        Ok(DeleteEventTrackerOutput)
     }
 }

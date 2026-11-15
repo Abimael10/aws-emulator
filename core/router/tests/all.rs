@@ -1915,3 +1915,18 @@ mod cognito_user_pool_replica_over_a_multi_region_key;
 // for every service crate's `tests/all.rs`, so check there rather than leaving a note here.
 // An inner attribute, like an inner doc comment, is legal only ahead of the first item, so
 // the one this target needs stands here rather than in the list below.
+// by name, with no line between the pairs and none after the last one. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair in sorted position; two branches landing at
+// once then insert two lines in two places and have no prose to duplicate, re-word or
+// deliberate: a doc comment for the module is legal only before the first item, so a copy
+// of one appended past the declarations compiles no suite of this target at all. With none
+// in the file, no merge of two landings can leave one there.
+// This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it
+// under `tests/`, which the layout check refuses: the `#[path]` is what points each
+// declaration into `tests/all/`. Declare each suite exactly once — a second declaration of
+// one name fails every suite in this target.
+// crate, belongs in that suite's own module header; the notes earlier landings appended to
+// this file live in `all/appended_notes.rs`, `all/appended_notes_tail.rs`,
+// `all/appended_header_notes.rs` and `all/appended_prose.rs`, declared below like any
+// other suite.
+// An inner attribute, like a module doc comment, is legal only before the first item, so
