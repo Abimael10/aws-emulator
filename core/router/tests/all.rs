@@ -2399,3 +2399,5 @@ mod cloudformation_provisions_glue_table_optimizers;
 // belongs in that suite's OWN module doc, where it is read beside the test it explains; a
 // `all/every_suite_file_is_declared.rs` check the rules above rather than restating them,
 // for this file and for every service crate's `tests/all.rs`.
+// all, no merge of two landings can leave one past the first item.
+// declaration into `tests/all/`. Declare each suite exactly once — a second `mod` for one

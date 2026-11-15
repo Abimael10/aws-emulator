@@ -897,14 +897,17 @@ pub const CANNOT_UNLINK_UNAUTHENTICATED_MESSAGE: &str = "Cannot unlink unauthent
 /// caller is told that these logins cannot be linked, which is what it has to act on.
 pub const CANNOT_LINK_LOGINS_MESSAGE: &str = "Cannot link these logins.";
 
-/// How AWS words the refusal of a merge of two developer users that cannot become one
-/// user — they are reached through one public provider as two different users, so no
-/// single identity can hold both.
+/// How AWS words the refusal of a request that would join TWO identities the pool already
+/// holds into one: a merge of two developer users that cannot become one user — they are
+/// reached through one public provider as two different users, so no single identity can
+/// hold both — and the implicit link of a call that has proven one stored identity while
+/// presenting a login already linked to another.
 ///
-/// Fixed text, naming neither the provider the two users share nor either user: what the
-/// caller is told is that this pair cannot be merged, which is the whole of what it can
-/// act on. Worded as [`CANNOT_LINK_LOGINS_MESSAGE`] is, the two being the same kind of
-/// refusal of one combination of logins.
+/// Fixed text, naming neither the provider the two users share, nor either user, nor either
+/// identity: what the caller is told is that this pair cannot be merged, which is the whole
+/// of what it can act on. Worded as [`CANNOT_LINK_LOGINS_MESSAGE`] is, the two being the
+/// same kind of refusal of one combination of logins; which of them a refusal carries
+/// follows whether the pool holds both sides of the link or only one.
 pub const CANNOT_MERGE_IDENTITIES_MESSAGE: &str = "Cannot merge these identities.";
 
 /// How AWS reports a DEVELOPER USER the identity pool has registered against no identity —

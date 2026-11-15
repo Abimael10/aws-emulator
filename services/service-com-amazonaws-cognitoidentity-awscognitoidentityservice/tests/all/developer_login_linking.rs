@@ -53,6 +53,7 @@ const PUBLIC_PROVIDER: &str = "graph.facebook.com";
 /// The fixed sentences AWS words these refusals with, spelled out here so the
 /// wire-visible text is pinned by the test rather than read back out of the crate.
 const CANNOT_LINK_LOGINS: &str = "Cannot link these logins.";
+const CANNOT_MERGE_IDENTITIES: &str = "Cannot merge these identities.";
 const UNMATCHED_LOGINS: &str = "Logins don't match. Please include at least one valid login \
                                 for this identity or identity pool.";
 
@@ -357,12 +358,14 @@ async fn a_developer_login_links_into_the_identity_the_call_names_or_proves() {
 /// RULE: the link is refused only where a presented login is bound to a DIFFERENT identity
 /// than the one the call is about, or where it would join a developer user to an identity
 /// another provider's login proves while presenting no login of that identity — and which
-/// refusal it is follows whose ownership the request got wrong: a request that NAMES an
-/// identity and presents a developer user identifier the pool has already registered
-/// elsewhere has not shown a login of the identity it named, so it is the authorization
-/// failure carrying the logins-mismatch sentence, while a request naming no identity (or one
-/// the pool has registered nothing against) is the link CONFLICT it is. A refused call
-/// writes nothing.
+/// refusal it is follows what the call has proven and how many of the link's sides the pool
+/// holds: a call that presents a login OF the identity it names while presenting a developer
+/// user identifier the pool has registered elsewhere asks to join two stored identities, so
+/// it is the merge conflict; a request that NAMES an identity, shows no login of it and
+/// presents a developer user identifier the pool has already registered elsewhere is the
+/// authorization failure carrying the logins-mismatch sentence; and a request naming no
+/// identity (or one the pool has registered nothing against) is the link CONFLICT it is. A
+/// refused call writes nothing.
 #[tokio::test]
 async fn a_login_bound_to_another_identity_is_what_refuses_the_link() {
     let emulator = Emulator::new();
@@ -403,8 +406,8 @@ async fn a_login_bound_to_another_identity_is_what_refuses_the_link() {
                 (USER_POOL_PROVIDER, user_pool_login.as_str()),
                 (DEVELOPER_PROVIDER, owner_user),
             ],
-            "NotAuthorizedException",
-            UNMATCHED_LOGINS,
+            "ResourceConflictException",
+            CANNOT_MERGE_IDENTITIES,
         ),
         (
             "a provider login bound to another identity, for a guest identity",
