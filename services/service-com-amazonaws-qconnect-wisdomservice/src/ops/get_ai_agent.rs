@@ -181,27 +181,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.assistant_id,
             ));
         }
-        let Some(agent) = store.ai_agent(&input.assistant_id, &input.ai_agent_id) else {
+        // The REVISION the label names: the agent's working copy where the label carries no
+        // qualifier or the floating alias, and the immutable snapshot of a published version
+        // where it carries that version's number.
+        let Some(agent) = store.ai_agent_revision(&input.assistant_id, &input.ai_agent_id) else {
             return Err(not_found(
                 crate::state::MESSAGE_AI_AGENT_NOT_FOUND,
                 &input.ai_agent_id,
             ));
         };
+        let qualifier = crate::state::resolve_qualified_id(&input.ai_agent_id).1;
         Ok(GetAIAgentOutput {
             // The version this read answered for: the one the label addressed, and the
             // working copy's floating alias when the label named no version — which is
             // what the reported ARN carries, so a client can tell which version it read.
-            ai_agent: Some(agent.to_ai_agent_data_at_version(
-                crate::state::resolve_qualified_id(&input.ai_agent_id)
-                    .1
-                    .unwrap_or(crate::state::VERSION_QUALIFIER_LATEST),
-            )),
+            ai_agent: Some(
+                agent.to_ai_agent_data_at_version(
+                    qualifier.unwrap_or(crate::state::VERSION_QUALIFIER_LATEST),
+                ),
+            ),
             // The model's own wording: the version number is "returned if an AI Agent
             // version was specified via use of a qualifier for the `aiAgentId` on the
-            // request". This read answered for the agent's working copy rather than for a
-            // published version of it — a numbered qualifier names nothing here — so there
-            // is no version number to report.
-            version_number: None,
+            // request". A numbered qualifier is what names one, and it resolved to the
+            // published version above; a read of the working copy answered for no version,
+            // so it reports none.
+            version_number: qualifier.and_then(|qualifier| qualifier.parse::<i64>().ok()),
         })
     }
 }

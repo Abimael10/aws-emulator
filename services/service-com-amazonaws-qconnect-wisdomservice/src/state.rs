@@ -15,6 +15,11 @@
 mod ai_prompts;
 pub use ai_prompts::*;
 
+/// The published versions of an AI agent: the snapshot record, its projections and its
+/// lookups.
+mod ai_agent_versions;
+pub use ai_agent_versions::*;
+
 /// The message-template family: the record, its projections and its lookups.
 mod message_templates;
 pub use message_templates::*;
@@ -33,7 +38,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AIAgentConfiguration, AIAgentConfigurationData, AIAgentData, AIGuardrailContentPolicyConfig,
+    AIAgentConfiguration, AIAgentConfigurationData, AIAgentData, AIAgentSummary,
+    AIGuardrailContentPolicyConfig,
     AIGuardrailContextualGroundingPolicyConfig, AIGuardrailData,
     AIGuardrailSensitiveInformationPolicyConfig, AIGuardrailTopicPolicyConfig,
     AIGuardrailWordPolicyConfig, AssistantAssociationData, AssistantAssociationInputData,
@@ -1860,6 +1866,37 @@ impl AiAgent {
             ..self.to_ai_agent_data()
         }
     }
+
+    /// The `AIAgentSummary` every operation that SUMMARISES this agent answers with,
+    /// rendered out of the same stored record [`Self::to_ai_agent_data`] renders: a summary
+    /// reports what a read of the agent it summarises reports.
+    pub fn to_ai_agent_summary(&self) -> AIAgentSummary {
+        AIAgentSummary {
+            assistant_id: self.assistant_id.clone(),
+            assistant_arn: self.assistant_arn.clone(),
+            ai_agent_arn: self.ai_agent_arn.clone(),
+            ai_agent_id: self.ai_agent_id.clone(),
+            name: self.name.clone(),
+            r#type: self.r#type.clone(),
+            configuration: Some(self.configuration.clone()),
+            description: self.description.clone(),
+            visibility_status: self.visibility_status.clone(),
+            tags: tags_out(&self.tags),
+            origin: Some(self.origin.clone()),
+            status: Some(self.status.clone()),
+            modified_time: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+        }
+    }
+
+    /// The same `AIAgentSummary` as [`Self::to_ai_agent_summary`], for a summary of one
+    /// VERSION of this agent: the reported ARN names the version summarised
+    /// ([`version_qualified_arn`]), the way a read of that version reports it.
+    pub fn to_ai_agent_summary_at_version(&self, qualifier: &str) -> AIAgentSummary {
+        AIAgentSummary {
+            ai_agent_arn: version_qualified_arn(&self.ai_agent_arn, qualifier),
+            ..self.to_ai_agent_summary()
+        }
+    }
 }
 
 /// One Amazon Q in Connect AI guardrail, as this emulator persists it.
@@ -2001,6 +2038,11 @@ pub struct Assistant {
     /// ones the create provisions, and any a caller adds later. An AI agent is
     /// reachable only through its assistant, as a session is.
     pub ai_agents: HashMap<String, AiAgent>,
+    /// What every AI agent of this assistant has PUBLISHED, keyed by `aiAgentId`, at most
+    /// [`MAX_AI_AGENT_VERSIONS_PER_AGENT`] versions per agent. A version is a snapshot of
+    /// the agent in [`Self::ai_agents`] that published it, so it goes when that agent goes
+    /// — and when this assistant goes.
+    pub ai_agent_versions: AiAgentVersions,
     /// The AI guardrails this assistant holds, keyed by `aiGuardrailId`, at most
     /// [`MAX_AI_GUARDRAILS_PER_ASSISTANT`] of them. A guardrail is reachable only through
     /// its assistant, as an AI agent and a session are, so it goes when the assistant
@@ -2126,10 +2168,11 @@ impl Assistant {
     /// assistant holds none under it.
     ///
     /// A label carrying the `$LATEST` qualifier names the agent's own working copy, which
-    /// is the record below; any other qualifier names a numbered VERSION of the agent, and
-    /// this emulator publishes none — `CreateAIAgentVersion` is still a scaffold stub — so
-    /// such a label names nothing here and the caller gets the operation's not-found
-    /// answer.
+    /// is the record below; any other qualifier names a numbered VERSION of the agent,
+    /// which is a published snapshot rather than the working copy, so such a label names
+    /// nothing HERE and the caller gets the operation's not-found answer. An operation that
+    /// reports whichever revision a label names resolves through
+    /// [`Self::ai_agent_revision`] instead.
     pub fn ai_agent(&self, label: &str) -> Option<&AiAgent> {
         let (id, qualifier) = resolve_qualified_id(label);
         match qualifier {
@@ -3937,11 +3980,11 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .ai_agent(&assistant_id, agent_label)?
             .ai_agent_id
             .clone();
-        let agent = self
-            .assistants
-            .get_mut(&assistant_id)?
-            .ai_agents
-            .remove(&agent_id)?;
+        let assistant = self.assistants.get_mut(&assistant_id)?;
+        let agent = assistant.ai_agents.remove(&agent_id)?;
+        // A version is a snapshot of the agent that published it, so an agent that is gone
+        // takes every version of it along: nothing addresses `<aiAgentId>:<n>` afterwards.
+        assistant.forget_ai_agent_versions_of(&agent_id);
         self.forget_idempotency_for(&agent_id);
         Some(agent)
     }

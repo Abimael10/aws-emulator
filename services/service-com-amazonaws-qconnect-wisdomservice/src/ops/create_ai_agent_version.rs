@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAIAgentVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAIAgentVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAIAgentVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Publishes an IMMUTABLE, numbered snapshot of the AI agent's current working copy: the
+//! first version of an agent is 1 and each later publish is the previous number plus 1, so
+//! a later write to the working copy leaves every published version as it was and
+//! `<aiAgentId>:<versionNumber>` keeps naming what was published under that number. The
+//! snapshot and the numbering live on the agent's assistant in `crate::state`, so this
+//! response and every later read of the version are rendered out of one record.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +94,41 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> CreateAIAgentVersionError {
+    CreateAIAgentVersionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400).
+fn validation(message: String) -> CreateAIAgentVersionError {
+    CreateAIAgentVersionErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled `ConflictException` (HTTP 409).
+fn conflict(message: String) -> CreateAIAgentVersionError {
+    CreateAIAgentVersionErrorModeled::ConflictException(ConflictException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// One instant in whole milliseconds since the epoch, which is the resolution the two
+/// instants the `modifiedTime` precondition compares are both stated at: the protocol
+/// carries a `Timestamp` as epoch seconds with a fractional part, so a value a caller read
+/// off a response and sent back names the same millisecond it was given but not
+/// necessarily the same nanosecond.
+fn epoch_millis(at: &::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * 1_000 + i128::from(at.subsec_nanos() / 1_000_000)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,18 +203,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAIAgentVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAIAgentVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAIAgentVersion"))
+        // Modelled constraints (both label patterns and `clientToken`'s length) are already
+        // refused BEFORE this handler runs, so reaching here means the input satisfies every
+        // one of them. Everything this operation answers with is rendered out of the stored
+        // record, so nothing here is built from request metadata.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("CreateAIAgentVersion")
+        })?;
+        let mut store = state.lock();
+
+        // An AI agent exists only inside an assistant, so the parent is resolved first: a
+        // publish naming an assistant this account does not hold is not found, whatever the
+        // rest of the route names.
+        let Some(assistant) = store.assistant(&input.assistant_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
+                &input.assistant_id,
+            ));
+        };
+        let assistant_id = assistant.assistant_id.clone();
+
+        // What is published is the agent's WORKING COPY. A label naming a numbered VERSION
+        // names a published snapshot rather than the working copy, and a snapshot is not
+        // something a publish reads from, so such a label names nothing to publish.
+        let Some(agent) = store.ai_agent(&assistant_id, &input.ai_agent_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_AI_AGENT_NOT_FOUND,
+                &input.ai_agent_id,
+            ));
+        };
+        let snapshot = agent.clone();
+
+        // The built-in agents the service provisions with the assistant are the SERVICE's
+        // records, not the caller's — the same rule that keeps them out of reach of an
+        // update and a delete — so the versions of one are not a caller's to publish.
+        if snapshot.origin == crate::state::AI_AGENT_ORIGIN_SYSTEM {
+            return Err(validation(
+                crate::state::message_system_ai_agent_not_versionable(),
+            ));
+        }
+
+        // `modifiedTime` is the caller's precondition on WHAT is published: the member
+        // documents it as the value "returned from the request to create or update an AI
+        // Agent so that version creation can fail if an update to the AI Agent post the
+        // specified modification time has been made", so a publish of a working copy that
+        // has changed since the caller read it is refused rather than numbering a version of
+        // something the caller has not seen. A request that supplies none states no
+        // precondition and publishes the working copy as it stands.
+        if let Some(seen) = input.modified_time {
+            let stored = ::aws_smithy_types::DateTime::from(snapshot.modified_at);
+            if epoch_millis(&stored) > epoch_millis(&seen) {
+                return Err(conflict(crate::state::message_ai_agent_modified_since()));
+            }
+        }
+
+        // What this publish's `@idempotencyToken` identifies: the precondition the request
+        // carried, which is the only member besides the route that says anything about what
+        // gets published. A replayed token answers with the version it already published
+        // rather than numbering a second identical one, while the same token carrying a
+        // DIFFERENT request is the modelled idempotency conflict. The token is scoped to
+        // this operation and this agent, so the same token on another call is another
+        // request.
+        let ai_agent_id = snapshot.ai_agent_id.clone();
+        let fingerprint = crate::state::request_fingerprint(&[input
+            .modified_time
+            .map(|time| epoch_millis(&time).to_string())
+            .unwrap_or_default()]);
+        let token_scope = format!("{}/{assistant_id}/{ai_agent_id}", Self::NAME);
+        match store.replayed_create(&token_scope, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Conflict => {
+                return Err(conflict(
+                    crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string(),
+                ))
+            }
+            crate::state::Replay::Retry(published) => {
+                if let Some(version) = published
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|number| store.ai_agent_version(&assistant_id, &ai_agent_id, number))
+                {
+                    return Ok(CreateAIAgentVersionOutput {
+                        ai_agent: Some(version.to_ai_agent_data()),
+                        version_number: Some(version.version_number),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        let Some(assistant) = store.assistant_mut(&assistant_id) else {
+            // Unreachable: the assistant was resolved above under the same lock.
+            return Err(not_found(
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
+                &input.assistant_id,
+            ));
+        };
+        // The agent's version bound, which is what keeps this store finite.
+        let Some(version_number) = assistant.publish_ai_agent_version(snapshot) else {
+            return Err(
+                CreateAIAgentVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::message_ai_agent_version_quota()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The working copy now has a published version, which is the number this publish
+        // handed out. The record is otherwise untouched: publishing a snapshot of the agent
+        // is no modification of the agent, so its `modifiedTime` stands.
+        if let Some(agent) = assistant.ai_agent_mut(&ai_agent_id) {
+            agent.published_version = Some(version_number);
+        }
+        store.remember_create(
+            &token_scope,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &version_number.to_string(),
+        );
+
+        // Answer out of the record that was just written: what this call reports is what a
+        // later read of that version, and a later `ListAIAgentVersions`, report.
+        let Some(version) = store.ai_agent_version(&assistant_id, &ai_agent_id, version_number)
+        else {
+            // Unreachable: the publish above put this version on the assistant while the
+            // lock is held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateAIAgentVersion",
+            ));
+        };
+        Ok(CreateAIAgentVersionOutput {
+            ai_agent: Some(version.to_ai_agent_data()),
+            version_number: Some(version.version_number),
+        })
     }
 }

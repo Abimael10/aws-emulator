@@ -19,6 +19,8 @@ mod ai_agent;
 mod ai_agent_lifecycle;
 #[path = "all/ai_agent_update.rs"]
 mod ai_agent_update;
+#[path = "all/ai_agent_versions.rs"]
+mod ai_agent_versions;
 #[path = "all/ai_guardrail.rs"]
 mod ai_guardrail;
 #[path = "all/ai_guardrail_update.rs"]

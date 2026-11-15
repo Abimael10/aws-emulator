@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAIAgentVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAIAgentVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAIAgentVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Forgets ONE published version of an AI agent and answers HTTP 204 with an empty body.
+//! The version is removed whatever still NAMES it: an assistant whose
+//! `aiAgentConfiguration` is bound to that exact version keeps the binding and its status,
+//! so this operation enforces no referential integrity of its own — the version simply
+//! stops being listed and stops resolving.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +77,16 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> DeleteAIAgentVersionError {
+    DeleteAIAgentVersionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,18 +161,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAIAgentVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAIAgentVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAIAgentVersion"))
+        // Modelled constraints (both label patterns and `versionNumber`'s `range min 1`) are
+        // already refused BEFORE this handler runs, so reaching here means the input
+        // satisfies every one of them. Nothing here mints an ARN, so the request's region is
+        // not read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("DeleteAIAgentVersion")
+        })?;
+        let mut store = state.lock();
+
+        // A version exists only inside the agent that published it, and that agent only
+        // inside its assistant, so both parents are resolved first: an assistant this
+        // account does not hold, and an agent that assistant does not hold, are not found
+        // whatever version number the route names. The label is resolved to the AGENT — the
+        // version this call removes is the one `versionNumber` names, not one a qualifier
+        // does.
+        let Some(assistant) = store.assistant(&input.assistant_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
+                &input.assistant_id,
+            ));
+        };
+        let assistant_id = assistant.assistant_id.clone();
+        let Some(agent) = assistant.ai_agent(&input.ai_agent_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_AI_AGENT_NOT_FOUND,
+                &input.ai_agent_id,
+            ));
+        };
+        let ai_agent_id = agent.ai_agent_id.clone();
+
+        let Some(assistant) = store.assistant_mut(&assistant_id) else {
+            // Unreachable: the assistant was resolved above under the same lock.
+            return Err(not_found(
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
+                &input.assistant_id,
+            ));
+        };
+        // A version the agent never published, or one a previous delete already removed,
+        // names nothing to remove: the caller gets the modelled not-found rather than a 204
+        // for work nothing did. A version that IS held is removed even while an assistant's
+        // binding still names it — this operation refuses nothing for a reference.
+        if !assistant.remove_ai_agent_version(&ai_agent_id, input.version_number) {
+            return Err(not_found(
+                crate::state::MESSAGE_AI_AGENT_VERSION_NOT_FOUND,
+                &input.version_number.to_string(),
+            ));
+        }
+        Ok(DeleteAIAgentVersionOutput {})
     }
 }

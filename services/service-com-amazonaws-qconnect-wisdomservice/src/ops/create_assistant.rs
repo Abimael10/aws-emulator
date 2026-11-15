@@ -280,6 +280,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )),
             ai_agent_configuration,
             ai_agents,
+            // No AI agent of a fresh assistant has published a version: one is published
+            // by `CreateAIAgentVersion`, on the agent the route names.
+            ai_agent_versions: ::std::collections::HashMap::new(),
             // A fresh assistant holds no AI guardrail: one is created by
             // `CreateAIGuardrail`, under the assistant the route names.
             ai_guardrails: ::std::collections::HashMap::new(),

@@ -194,10 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A binding names an AI agent, and an AI agent is reachable only through its
         // assistant, so the agent the request names has to be one THIS assistant holds —
-        // the service's own built-in agents included. A label resolving to no agent would
-        // configure a type with an id no client could then read, which is the modelled
+        // the service's own built-in agents included, and one PUBLISHED VERSION of an agent
+        // where the binding's qualifier names a version. A label resolving to no revision
+        // would configure a type with an id no client could then read, which is the modelled
         // not-found rather than a success.
-        let Some(agent) = assistant.ai_agent(&input.configuration.ai_agent_id) else {
+        let Some(agent) = assistant.ai_agent_revision(&input.configuration.ai_agent_id) else {
             return Err(not_found(
                 crate::state::MESSAGE_AI_AGENT_NOT_FOUND,
                 &input.configuration.ai_agent_id,
