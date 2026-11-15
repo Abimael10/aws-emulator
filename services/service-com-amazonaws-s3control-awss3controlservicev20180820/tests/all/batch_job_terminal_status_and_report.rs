@@ -46,9 +46,9 @@ use crate::object_store::ObjectStore;
 /// The service principal S3 Batch Operations assumes a job's role as.
 const BATCH_OPERATIONS_PRINCIPAL: &str = "batchoperations.s3.amazonaws.com";
 
-/// The fixed text the reason of a job whose role could not be assumed opens
+/// The fixed text the reason of a job whose role this service was denied opens
 /// with; the role the create named is its variable part.
-const ASSUME_ROLE_FAILURE_TEXT: &str = "Could not assume the IAM role";
+const ASSUME_ROLE_FAILURE_TEXT: &str = "Access denied for the IAM role";
 
 /// The key the manifest object of every job below is written at.
 const MANIFEST_KEY: &str = "manifest.csv";

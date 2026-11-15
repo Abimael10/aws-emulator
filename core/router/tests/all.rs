@@ -4912,3 +4912,7 @@ mod appended_notes;
 //! this header is the only place one may stand: past it a `//!` line is `E0753` and
 //! compiles no suite of this target, so a note further down must be an ordinary `//`
 //! comment. `all/all_rs_declares_each_suite_once.rs` and
+//! in this target. This file is a test-target CRATE ROOT, so a bare `mod` would resolve to
+//! a SIBLING of it: every declaration carries its own `#[path = "all/<name>.rs"]`.
+//! the first item one is `E0753` and compiles no suite of this target, so add a declaration
+//! here rather than a note about one. `all/all_rs_declares_each_suite_once.rs` and

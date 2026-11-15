@@ -66,9 +66,9 @@ const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
 /// rather than imported from the service crate.
 const BATCH_OPERATIONS_PRINCIPAL: &str = "batchoperations.s3.amazonaws.com";
 
-/// The fixed text the reason of a job whose role could not be assumed opens with; the role
-/// the create named is its variable part.
-const ASSUME_ROLE_FAILURE_TEXT: &str = "Could not assume the IAM role";
+/// The fixed text the reason of a job whose role this service was denied opens with; the
+/// role the create named is its variable part.
+const ASSUME_ROLE_FAILURE_TEXT: &str = "Access denied for the IAM role";
 
 /// The bucket every object of this suite lives in.
 const BUCKET: &str = "xsvc-batch-operations";

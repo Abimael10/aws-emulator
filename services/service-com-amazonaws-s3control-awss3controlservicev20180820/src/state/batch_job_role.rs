@@ -47,9 +47,9 @@ pub const BATCH_OPERATIONS_PRINCIPAL: &str = "batchoperations.s3.amazonaws.com";
 /// when nothing of the kind can be shown (see the module docs for the cases that
 /// show nothing).
 ///
-/// The sentence names the role — the one variable part — and the grant that is
-/// missing, and it is what the failed job reports in
-/// `JobDescriptor$FailureReasons`.
+/// The sentence states the denial, names the role — the one variable part — and
+/// states the grant its trust policy is missing, and it is what the failed job
+/// reports in `JobDescriptor$FailureReasons`.
 pub fn assume_refusal(role_arn: &str, iam: &IamState) -> Option<String> {
     let role = iam.roles.values().find(|role| role.arn == role_arn)?;
     let trust = role.assume_role_policy_document.as_deref()?;
@@ -74,18 +74,28 @@ pub fn engine_assume_refusal<Eng: Send + Sync + 'static>(
     assume_refusal(role_arn, &held)
 }
 
-/// The reason a job reports when its role cannot be assumed: WHICH role it is
-/// (the one variable part, taken from the job's own `RoleArn`) and WHY the
-/// assume fails — the trust the role is missing.
+/// The reason a job reports when its role cannot be assumed: the DENIAL this
+/// failure class is (`AccessDenied`), naming WHICH role was denied — the one
+/// variable part, taken from the job's own `RoleArn` — and the grant its trust
+/// policy is missing: [`BATCH_OPERATIONS_PRINCIPAL`] performing
+/// [`::service_common::iam_trust_policy::ASSUME_ROLE_ACTION`] on it.
 ///
-/// The sentence that names the role comes first, in the words the service
-/// reports this failure in; the sentence that states the missing trust follows
-/// whenever both fit inside [`FAILURE_REASON_LENGTH_MAX`], the `@length` of
-/// `JobFailureReason`. A role ARN is `@length(max: 2048)` while the reason is
-/// bounded at 256, so for a long ARN the explanation is left out rather than cut
-/// mid-sentence — what cannot be dropped is which role the job could not assume.
+/// The sentence that states the denial and names the role comes first; the
+/// sentence that states the missing grant follows whenever both fit inside
+/// [`FAILURE_REASON_LENGTH_MAX`], the `@length` of `JobFailureReason`. A role
+/// ARN is `@length(max: 2048)` while the reason is bounded at 256, so for a long
+/// ARN the explanation is left out rather than cut mid-sentence — what cannot be
+/// dropped is the denial and the role it is about.
+///
+/// The denial is what this failure IS, so the reason opens with it: the document
+/// the account's IAM holds for that role withholds the grant, so resubmitting
+/// the same job cannot run it. A reason that instead opened by reporting the
+/// assume as not having succeeded YET would be the sentence of another case — a
+/// grant that has not reached this service — which a client tells apart by the
+/// reason and answers by submitting the job again rather than by reading the
+/// refusal.
 pub fn assume_failure_reason(role_arn: &str) -> String {
-    let named = format!("Could not assume the IAM role {role_arn}.");
+    let named = format!("Access denied for the IAM role {role_arn}.");
     let because = format!(
         " Its trust policy must allow {BATCH_OPERATIONS_PRINCIPAL} to perform {}.",
         ::service_common::iam_trust_policy::ASSUME_ROLE_ACTION

@@ -53,6 +53,8 @@ mod account_public_access_block_authorization;
 mod account_public_access_block_bucket_policy;
 #[path = "all/batch_job_absent_refusal.rs"]
 mod batch_job_absent_refusal;
+#[path = "all/batch_job_access_denied_reason.rs"]
+mod batch_job_access_denied_reason;
 #[path = "all/batch_job_execution.rs"]
 mod batch_job_execution;
 #[path = "all/batch_job_lifecycle.rs"]

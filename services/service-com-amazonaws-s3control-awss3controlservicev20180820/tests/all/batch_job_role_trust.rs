@@ -38,33 +38,34 @@ use crate::batch_job_execution::{csv_manifest, poll_terminal};
 use crate::object_store::ObjectStore;
 
 /// The service principal S3 Batch Operations assumes a job's role as.
-const BATCH_OPERATIONS_PRINCIPAL: &str = "batchoperations.s3.amazonaws.com";
+pub(crate) const BATCH_OPERATIONS_PRINCIPAL: &str = "batchoperations.s3.amazonaws.com";
 
 /// The action a trust document has to grant that principal.
-const ASSUME_ROLE: &str = "sts:AssumeRole";
+pub(crate) const ASSUME_ROLE: &str = "sts:AssumeRole";
 
 /// The tag every job below puts on each object its manifest lists.
-const TAG: (&str, &str) = ("sim2real", "tagged");
+pub(crate) const TAG: (&str, &str) = ("sim2real", "tagged");
 
 /// The key of the one object each job's manifest lists.
-const TARGET_KEY: &str = "data/target.txt";
+pub(crate) const TARGET_KEY: &str = "data/target.txt";
 
 /// The key the manifest object itself is written at.
-const MANIFEST_KEY: &str = "manifest/manifest.csv";
+pub(crate) const MANIFEST_KEY: &str = "manifest/manifest.csv";
 
-/// The `FailureCode` a job carries when its role could not be assumed.
-const ASSUME_ROLE_FAILURE_CODE: &str = "AccessDenied";
+/// The `FailureCode` a job carries when its role could not be assumed. Source:
+/// the recorded failure of such a job, which carries this code.
+pub(crate) const ASSUME_ROLE_FAILURE_CODE: &str = "AccessDenied";
 
-/// The fixed text of the `FailureReason` such a job carries. Source: the
-/// recorded reason for this failure, whose text carries this phrase with the
-/// role ARN as its variable part (`issues/`, the report this suite was written
-/// for). The role the request named is the other part.
-const ASSUME_ROLE_FAILURE_TEXT: &str = "Could not assume the IAM role";
+/// The fixed text of the `FailureReason` such a job carries: the DENIAL that
+/// failure code is, with the role the request named as its variable part. The
+/// grant the role's trust policy is missing follows it; the whole sentence is
+/// pinned by [`crate::batch_job_access_denied_reason`].
+pub(crate) const ASSUME_ROLE_FAILURE_TEXT: &str = "Access denied for the IAM role";
 
 /// The longest `FailureReason` the model lets that member carry: the
 /// `@length(min: 1, max: 256)` of `JobFailureReason`
 /// (`smithy_query(query="shape", shape="JobFailure")`).
-const FAILURE_REASON_LENGTH_MAX: usize = 256;
+pub(crate) const FAILURE_REASON_LENGTH_MAX: usize = 256;
 
 /// What a row expects of the job its role is named on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,13 +91,13 @@ struct Row {
 }
 
 /// A trust policy carrying `statements`.
-fn trust(statements: Value) -> Value {
+pub(crate) fn trust(statements: Value) -> Value {
     json!({"Version": "2012-10-17", "Statement": statements})
 }
 
 /// One trust statement: `effect` the `action` for the service principals
 /// `principals`.
-fn statement(effect: &str, principals: Value, action: Value) -> Value {
+pub(crate) fn statement(effect: &str, principals: Value, action: Value) -> Value {
     json!({"Effect": effect, "Principal": {"Service": principals}, "Action": action})
 }
 
@@ -217,7 +218,7 @@ fn rows() -> Vec<Row> {
 
 /// Create `role_name` under `path` with `trust_document` through IAM itself, and
 /// answer the ARN IAM minted for it.
-async fn create_role(
+pub(crate) async fn create_role(
     iam: &::aws_sdk_iam::Client,
     case: &str,
     path: &str,
@@ -240,7 +241,7 @@ async fn create_role(
 
 /// A `CreateJob` body: one `S3PutObjectTagging` action over the CSV manifest of
 /// `bucket`, running as `role_arn`.
-fn create_job_body(token: &str, bucket: &str, e_tag: &str, role_arn: &str) -> String {
+pub(crate) fn create_job_body(token: &str, bucket: &str, e_tag: &str, role_arn: &str) -> String {
     format!(
         "<CreateJobRequest xmlns=\"{XMLNS}\">\
          <ClientRequestToken>{}</ClientRequestToken><ConfirmationRequired>false\
@@ -257,7 +258,7 @@ fn create_job_body(token: &str, bucket: &str, e_tag: &str, role_arn: &str) -> St
 }
 
 /// The `FailureReasons` entries a settled job reports, as (code, reason) pairs.
-fn failures(settled: &Reply) -> Vec<(String, String)> {
+pub(crate) fn failures(settled: &Reply) -> Vec<(String, String)> {
     settled
         .texts("FailureCode")
         .into_iter()
