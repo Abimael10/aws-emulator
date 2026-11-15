@@ -273,8 +273,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("configuration:{configuration_id}"),
         );
         // A created configuration holds the engine's default settings, so its
-        // first revision is the one Amazon MQ generates, numbered from one. No
-        // request member carries a configuration document for it.
+        // first revision is the one Amazon MQ generates, numbered from one: no
+        // request member carries a configuration document for it, and the document
+        // it carries is the engine's own default
+        // ([`state::default_configuration_document`]).
         let first_revision = state::ConfigurationRevisionRecord::accepted(
             state::FIRST_CONFIGURATION_REVISION,
             created,
@@ -283,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.engine_type,
                 &engine_version,
             ),
-            None,
+            Some(state::default_configuration_data(&input.engine_type)),
         );
         let configuration = state::ConfigurationRecord {
             configuration_id: configuration_id.clone(),

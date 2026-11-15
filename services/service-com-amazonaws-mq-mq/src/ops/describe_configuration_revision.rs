@@ -203,10 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             configuration_id: Some(configuration.configuration_id.clone()),
             created: Some(::aws_smithy_types::DateTime::from(revision.created)),
             // The document the revision holds, in the form this service stored it:
-            // the canonical serialization of the one the update sent. The revision a
-            // CREATE makes holds the engine's own default settings, which no request
-            // supplied and this service does not generate, so that revision reports
-            // no document rather than an invented one.
+            // the canonical serialization of the one the update sent, or — for the
+            // revision a CREATE makes — the engine's own default document
+            // (`state::default_configuration_document`), so every revision this
+            // operation resolves reports the document it carries.
             data: revision.data.clone(),
             description: Some(revision.description.clone()),
             // The number of the revision this answer describes, read from the

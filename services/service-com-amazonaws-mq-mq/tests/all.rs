@@ -25,6 +25,8 @@ mod broker_read_wire_form;
 mod broker_restart;
 #[path = "all/configuration_deleted_id.rs"]
 mod configuration_deleted_id;
+#[path = "all/configuration_document_syntax.rs"]
+mod configuration_document_syntax;
 #[path = "all/configuration_lifecycle.rs"]
 mod configuration_lifecycle;
 #[path = "all/configuration_name.rs"]

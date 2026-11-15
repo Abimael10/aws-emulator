@@ -1698,3 +1698,26 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // The lint allowed below is for the suite files this root compiles, whose wrapped header
 // paragraphs are prose rather than doc list items. An inner attribute, like an inner doc
 // comment, is legal only before the first item, so it stands here rather than in the list.
+// Put a new suite at `tests/all/<name>.rs` and insert one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair below, in the place its name sorts to. One pair per suite file and no
+// other line — no prose between the pairs and NOTHING after the last one — so two branches
+// landing at once insert two lines in two places and have nothing to duplicate, re-word or
+// mistype.
+// EVERY comment in this file is an ordinary `//` one, this header included: an inner doc
+// comment (`//!`) is legal only before the first item, so an appended, re-typed or merged
+// copy of a header line written in that style is `E0753` and compiles no suite of this
+// target at all. With none anywhere in the file, no merge of two landings can leave one past
+// the first item.
+// `tests/all.rs` is a test-target CRATE ROOT, where a bare `mod` resolves to a SIBLING of
+// this file, which the layout check refuses: the `#[path]` above each `mod` is what points
+// it into `tests/all/`. Declare each suite exactly ONCE — a second `mod` for one name is
+// `E0428`, and a suite file no `mod` names compiles nowhere, which this crate's build script
+// refuses. Some of the files below are shared harnesses or probes rather than suites; each
+// is declared like any other.
+// note about THIS file belongs in `all/appended_notes.rs`. The rules this root is held to are
+// checked by `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs` rather than restated here.
+// The lint allowed below is for the suite files this root compiles: a module header that
+// wraps a list item without the indentation `clippy::doc_lazy_continuation` asks for is then
+// a note rather than a build failure. An inner attribute, like an inner doc comment, is legal
+// only before the first item, so it stands here rather than in the list.

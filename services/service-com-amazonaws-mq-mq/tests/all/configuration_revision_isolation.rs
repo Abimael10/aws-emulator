@@ -35,7 +35,8 @@ struct IsolationCase {
 
 /// The rows differ in how many updates the configuration receives (0, 1, 2, 3) and in
 /// the documents those updates carry, so no two configurations can be confused by their
-/// revision count or by the document a revision stores.
+/// revision count or by the document a revision stores. Every row's configuration is an
+/// ActiveMQ one, so every document is the XML `Data` documents for that engine.
 const ISOLATION_CASES: &[IsolationCase] = &[
     IsolationCase {
         name: "isolation-never-updated",
@@ -48,8 +49,8 @@ const ISOLATION_CASES: &[IsolationCase] = &[
     IsolationCase {
         name: "isolation-updated-twice",
         documents: &[
-            "[{rabbit,[{vm_memory_high_watermark,0.4}]}].",
-            "[{rabbit,[{vm_memory_high_watermark,0.6}]}].",
+            "<broker><brokerName>watermark-low</brokerName></broker>",
+            "<broker><brokerName>watermark-high</brokerName></broker>",
         ],
     },
     IsolationCase {
@@ -193,7 +194,8 @@ async fn an_update_grows_only_the_chain_of_the_configuration_it_names() {
         );
 
         // And each revision carries the document THIS configuration's update sent: the
-        // create-time revision carries none, and the update-made ones carry their own.
+        // create-time revision carries the engine's default, and the update-made ones
+        // carry their own.
         for (index, document) in case.documents.iter().enumerate() {
             let revision = i64::from(FIRST_CONFIGURATION_REVISION) + index as i64 + 1;
             let label = format!("{:?} revision {revision}", case.name);

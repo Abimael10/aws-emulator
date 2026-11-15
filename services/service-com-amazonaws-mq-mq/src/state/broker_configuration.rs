@@ -88,7 +88,7 @@ impl ComAmazonawsMqMqState {
             FIRST_CONFIGURATION_REVISION,
             of.created,
             default_configuration_description(&name, of.engine_type, of.engine_version),
-            None,
+            Some(default_configuration_data(of.engine_type)),
         );
         let revision = first_revision.revision;
         self.configurations.insert(

@@ -30,13 +30,15 @@
 //! the document is XML at all — and the listing table's rows along chain length crossed
 //! with page size, at each published bound of `MaxResults` and with the member absent.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use service_com_amazonaws_mq_mq::state::{
-    FIRST_CONFIGURATION_REVISION, MAX_MAX_RESULTS, MIN_MAX_RESULTS,
+    ENGINE_TYPE_ACTIVEMQ, ENGINE_TYPE_RABBITMQ, FIRST_CONFIGURATION_REVISION, MAX_MAX_RESULTS,
+    MIN_MAX_RESULTS,
 };
 
 use crate::broker_lifecycle::{string_at, Mq};
+use crate::configuration_name::configuration_body;
 use crate::configuration_wire_form::base64_data;
 
 /// One row of the document table: the document an update sends and the document the
@@ -110,12 +112,14 @@ const DOCUMENT_CASES: &[DocumentCase] = &[
 ];
 
 /// Documents that are NOT XML: the Cuttlefish configuration `Data` documents for
-/// RabbitMQ, which carries no element at all and is therefore stored as sent.
+/// RabbitMQ, which carries no element at all and is therefore stored as sent. Each is a
+/// Cuttlefish configuration — a `#` comment, a blank line, or a dotted key assigned a
+/// value — because that is the format the engine parses a RabbitMQ document in.
 const CUTTLEFISH_DOCUMENTS: &[(&str, &str)] = &[
     ("a Cuttlefish assignment", "consumer_timeout = 1800000\n"),
     (
-        "a Cuttlefish term",
-        "[{rabbit,[{vm_memory_high_watermark,0.4}]}].",
+        "a commented Cuttlefish document with several assignments",
+        "# raise the delivery acknowledgement timeout\nconsumer_timeout = 3600000\n\nsecure.management.http.headers.enabled = true\n",
     ),
 ];
 
@@ -140,13 +144,25 @@ async fn revision_document(mq: &Mq, case: &str, id: &str, revision: i64) -> Stri
         .unwrap_or_else(|error| panic!("case {case:?}: data must decode to text, got {error}"))
 }
 
-/// Send `document` as the next revision of a fresh configuration and report the document
-/// the service stored for it.
-async fn stored_document(mq: &Mq, case: &str, name: &str, document: &str) -> String {
-    let (status, code, created) = mq.create_configuration(name).await;
+/// Send `document` as the next revision of a fresh configuration of `engine_type` and
+/// report the document the service stored for it.
+///
+/// The engine is the row's because the service parses the document against it: an XML
+/// document is an ActiveMQ configuration's, a Cuttlefish one a RabbitMQ configuration's
+/// (`smithy_query(query="doc", shape="UpdateConfigurationRequest", member="Data")`).
+async fn stored_document(
+    mq: &Mq,
+    case: &str,
+    name: &str,
+    engine_type: &str,
+    document: &str,
+) -> String {
+    let mut body = configuration_body(name);
+    body["engineType"] = json!(engine_type);
+    let (status, created) = mq.call("POST", "/v1/configurations", Some(body)).await;
     assert_eq!(
         status, 200,
-        "case {case:?}: setup expected 200, got {status} {code:?} {created:?}"
+        "case {case:?}: setup expected 200, got {status} {created:?}"
     );
     let id = string_at(&created, "/id");
 
@@ -182,7 +198,8 @@ async fn a_revision_reports_the_canonical_form_of_the_document_it_was_sent() {
             let expected = format!("{prefix}{}", case.stored);
             let name = format!("canonical-{index}-{}", prefix.len());
 
-            let stored = stored_document(&mq, &what, &name, &submitted).await;
+            let stored =
+                stored_document(&mq, &what, &name, ENGINE_TYPE_ACTIVEMQ, &submitted).await;
             assert_eq!(
                 stored, expected,
                 "case {what:?}: expected the stored document {expected:?}, got {stored:?}"
@@ -192,7 +209,8 @@ async fn a_revision_reports_the_canonical_form_of_the_document_it_was_sent() {
             // the service stored gets exactly that document stored again, so a second
             // write does not keep rewriting the document.
             let again = format!("fixed-point-{index}-{}", prefix.len());
-            let restored = stored_document(&mq, &what, &again, &expected).await;
+            let restored =
+                stored_document(&mq, &what, &again, ENGINE_TYPE_ACTIVEMQ, &expected).await;
             assert_eq!(
                 restored, expected,
                 "case {what:?}: the canonical document must be stored unchanged, expected \
@@ -210,7 +228,7 @@ async fn a_revision_of_a_non_xml_document_reports_it_as_sent() {
 
     for (index, (what, document)) in CUTTLEFISH_DOCUMENTS.iter().enumerate() {
         let name = format!("cuttlefish-{index}");
-        let stored = stored_document(&mq, what, &name, document).await;
+        let stored = stored_document(&mq, what, &name, ENGINE_TYPE_RABBITMQ, document).await;
         assert_eq!(
             stored, *document,
             "case {what:?}: expected the document as sent {document:?}, got {stored:?}"

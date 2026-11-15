@@ -14,7 +14,9 @@
 //! broker its create did not), [`broker_endpoints`] (where a client reaches a running
 //! broker) and [`broker_configuration`] (the configuration a broker runs). The form a
 //! configuration revision's document is stored in lives in
-//! [`configuration_document`].
+//! [`configuration_document`], and whether such a document parses for the engine it was
+//! sent as — the question that decides whether a write is accepted at all — in
+//! [`configuration_syntax`].
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -23,6 +25,8 @@ use std::time::{Duration, SystemTime};
 mod broker_configuration;
 /// The form a configuration revision's document is stored in.
 mod configuration_document;
+/// Whether a configuration document parses for the engine it is sent as.
+mod configuration_syntax;
 /// Whether a broker takes part in cross-Region data replication, and in which role.
 mod broker_data_replication;
 /// Where a client reaches a running broker: its console and its wire endpoints.
@@ -42,6 +46,7 @@ pub use broker_data_replication::*;
 pub use broker_endpoints::*;
 pub use broker_restart::*;
 pub use configuration_document::*;
+pub use configuration_syntax::*;
 pub use rabbitmq_plane::*;
 pub use broker_published_values::*;
 
@@ -503,9 +508,10 @@ pub struct ConfigurationRevisionRecord {
     pub description: String,
     /// The configuration document the revision carries (base64), in the form this
     /// service STORES it: the canonical serialization of the document the update sent
-    /// ([`stored_configuration_data`]), not the bytes it sent. `None` for the revision
-    /// a create makes: that one holds the engine's own default settings, which no
-    /// request supplied.
+    /// ([`stored_configuration_data`]), not the bytes it sent. For the revision a
+    /// create makes it is the engine's own default document
+    /// ([`default_configuration_document`]), which no request supplied and this service
+    /// publishes per engine.
     pub data: Option<String>,
     /// Whether the engine judged this revision's document unusable, reported as
     /// `ConfigurationRevision$isInvalid`. A revision is only ever made from a
@@ -576,7 +582,7 @@ impl ConfigurationRecord {
                     &self.engine_type,
                     &self.engine_version,
                 ),
-                None,
+                Some(default_configuration_data(&self.engine_type)),
             )
         })
     }
@@ -1071,15 +1077,13 @@ pub fn configuration_revision_conflict_message(configuration_id: &str) -> String
 /// request resolved to no revision of the configuration it named.
 pub const CONFIGURATION_REVISION_ATTRIBUTE: &str = "configuration-revision";
 
-/// The sentence this service answers a `ConfigurationRevision` that resolves to
-/// no revision of the configuration with. No recorded response covers this
-/// refusal, so it is worded the way this service words the resource-not-found it
-/// does have recorded ([`configuration_not_found_message`]), naming the revision
-/// asked for and the configuration it was asked of — both from the request.
+/// The sentence Amazon MQ answers a `ConfigurationRevision` that resolves to no
+/// revision of the configuration with: fixed text naming the revision asked for and the
+/// configuration it was asked of, both from the request.
 pub fn configuration_revision_not_found_message(configuration_id: &str, revision: &str) -> String {
     format!(
-        "Configuration revision [{revision}] of configuration ID [{configuration_id}] can't be \
-         found. Make sure it exists."
+        "Revision [{revision}] of configuration [{configuration_id}] can't be found. \
+         Make sure it exists."
     )
 }
 

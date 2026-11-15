@@ -8,7 +8,9 @@
 //! `Data` document it sent; a `ConfigurationId` that names no configuration is
 //! answered with the modelled `NotFoundException` (HTTP 404), one this service issued
 //! and has since deleted with the modelled `ConflictException` (HTTP 409), and a `Data`
-//! that is not the base64 the member documents with `BadRequestException` (HTTP 400).
+//! that is not the base64 the member documents, or that is base64 of a document the
+//! configuration's engine cannot parse, with `BadRequestException` (HTTP 400). A
+//! refused write makes no revision and takes no revision number.
 //!
 //! ## Shape of an operation
 //!
@@ -177,12 +179,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller spelled wrongly (see `state::validate_configuration_name`).
         let data = input.data.trim().to_string();
         state::validate_present("data", &data).map_err(bad_request)?;
-        if ::aws_smithy_types::base64::decode(&data).is_err() {
+        let Ok(bytes) = ::aws_smithy_types::base64::decode(&data) else {
             return Err(bad_request(state::Invalid::new(
                 "data",
                 "Make sure your configuration data is base64-encoded.",
             )));
-        }
+        };
+        // The document the base64 carries, as the engine's parser reads it: text. A
+        // byte sequence that is not UTF-8 text carries no statement and no element
+        // either way, so it is read lossily and refused by the parse below rather than
+        // by a separate sentence of its own.
+        let document = String::from_utf8_lossy(&bytes).into_owned();
 
         let mut store = service_state.lock();
         // Which refusal a `ConfigurationId` this store holds no configuration
@@ -241,6 +248,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             }));
         }
+        // Amazon MQ READS the document before it keeps it: `Data` is the engine's own
+        // configuration document (the XML an ActiveMQ broker takes, the Cuttlefish a
+        // RabbitMQ one takes), so a document that does not parse for THIS
+        // configuration's engine is refused naming the member at fault — and is refused
+        // HERE, before a revision number is taken, which is what keeps the numbers a
+        // client reads, pins and rolls back to a count of the writes the service
+        // ACCEPTED (see `state::configuration_document_syntax_error`).
+        if let Some(reason) =
+            state::configuration_document_syntax_error(&configuration.engine_type, &document)
+        {
+            return Err(bad_request(state::Invalid::new(
+                "data",
+                state::configuration_data_unparsable_message(&reason),
+            )));
+        }
+
         let revision = state::ConfigurationRevisionRecord::accepted(
             configuration.next_revision_number(),
             ::std::time::SystemTime::now(),

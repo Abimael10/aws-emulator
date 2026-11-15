@@ -35,8 +35,8 @@ use service_com_amazonaws_mq_mq::ops::types::{
     AUTHENTICATION_STRATEGY_VALUES, ENGINE_TYPE_VALUES,
 };
 use service_com_amazonaws_mq_mq::state::{
-    published_engine_versions, FIRST_CONFIGURATION_REVISION, MAX_CONFIGURATION_REVISIONS,
-    MAX_MAX_RESULTS, MIN_MAX_RESULTS,
+    default_configuration_data, published_engine_versions, ENGINE_TYPE_ACTIVEMQ,
+    FIRST_CONFIGURATION_REVISION, MAX_CONFIGURATION_REVISIONS, MAX_MAX_RESULTS, MIN_MAX_RESULTS,
 };
 
 use crate::broker_lifecycle::{create_body, string_at, Mq};
@@ -443,7 +443,8 @@ async fn an_engine_version_defaults_to_the_newest_version_the_engine_offers() {
 }
 
 /// One row of the revision table: the `Description` an update supplies and the document
-/// it sends.
+/// it sends. Every row's configuration is an ActiveMQ one, so every document is the XML
+/// `Data` documents for that engine.
 struct RevisionCase {
     what: &'static str,
     description: Option<&'static str>,
@@ -467,7 +468,7 @@ const REVISION_CASES: &[RevisionCase] = &[
     RevisionCase {
         what: "an empty description",
         description: Some(""),
-        document: "[{rabbit,[{vm_memory_high_watermark,0.4}]}].",
+        document: "<broker><networkConnectors/></broker>",
     },
     RevisionCase {
         what: "a one-character description",
@@ -702,12 +703,12 @@ async fn every_revision_reads_back_through_the_revision_operations() {
     let id = string_at(&created, "/id");
 
     // What each revision must then report: the create-time one, which carries the
-    // description Amazon MQ generates for it, then one per row of the revision table,
-    // in the order the updates were made.
+    // description Amazon MQ generates for it and the engine's own default document,
+    // then one per row of the revision table, in the order the updates were made.
     let mut expected: Vec<(i64, String, Option<String>)> = vec![(
         i64::from(FIRST_CONFIGURATION_REVISION),
         string_at(&created, "/latestRevision/description"),
-        None,
+        Some(default_configuration_data(ENGINE_TYPE_ACTIVEMQ)),
     )];
     for case in REVISION_CASES {
         let data = base64_data(case.document);
@@ -846,7 +847,7 @@ async fn a_revision_that_names_nothing_is_refused_naming_it() {
         assert_eq!(
             string_at(&answer, "/message"),
             format!(
-                "Configuration revision [{label}] of configuration ID [{id}] can't be found. \
+                "Revision [{label}] of configuration [{id}] can't be found. \
                  Make sure it exists."
             ),
             "case {case:?}: the sentence must name what was asked for, got {answer:?}"
