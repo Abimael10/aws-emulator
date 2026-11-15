@@ -200,10 +200,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::validation_envelope(&[crate::state::constraint_clause(
                     "replicationConfig.state",
                     Some(named),
-                    &format!(
-                        "Member must satisfy enum value set: [{}]",
-                        REPLICATION_STATE_VALUES.join(", ")
-                    ),
+                    // Through the ONE door onto the order this service lists an
+                    // enumerated type's values in, so the set reads the same here as
+                    // in a refusal the boundary worded
+                    // (`crate::state::enum_value_set`).
+                    &crate::state::enum_value_set::requirement_over(REPLICATION_STATE_VALUES),
                 )]),
             ));
         }

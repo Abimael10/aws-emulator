@@ -1553,3 +1553,20 @@ mod lambda_delivery_grant_is_each_sources_own;
 // compiles neither copy. Some of the files below are shared harnesses or probes rather than
 // suites; all are declared, for that reason.
 // one this target carries stands here rather than in the list below.
+// `mod <name>;` pair into the sorted list below, in the one place its name sorts to. Below
+// this header the file holds those pairs and no other line — no prose between them, no blank
+// line, and nothing after the last one — so two branches landing at once insert two lines in
+// two places and have no prose to duplicate, re-word or mistype. What a suite covers, and why
+// it drives the assembled router rather than one service crate, belongs in that suite's OWN
+// module header, where it is read beside the test it explains; a note about THIS file belongs
+// in `all/appended_notes.rs`, declared below like any other file. Some of the files below are
+// shared harnesses or probes rather than suites; every one of them is declared, because a file
+// no declaration names is compiled nowhere.
+// compiles no suite of this target, and with none anywhere in the file there is no such line to
+// copy. A suite file no `mod` here names is compiled nowhere and its tests never run, a name
+// declared twice is `E0428`, and a suite left at the top level of `tests/` fails the build.
+// This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of it,
+// which the layout check refuses: the `#[path]` above each `mod` is what points the declaration
+// into `tests/all/`. The `all/all_rs_*.rs`, `all/declaration_roots_*.rs` and
+// `all/every_suite_file_is_declared.rs` suites pin all of that, for this file and for every
+// service crate's own `tests/all.rs`, so check there rather than leaving a note here.

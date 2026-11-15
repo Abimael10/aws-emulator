@@ -77,6 +77,8 @@ mod encrypted_queue_target_key_policy;
 mod encrypted_topic_target_key_policy;
 #[path = "all/entry_level_semantics.rs"]
 mod entry_level_semantics;
+#[path = "all/enum_value_set_order.rs"]
+mod enum_value_set_order;
 #[path = "all/envelope_time_precision.rs"]
 mod envelope_time_precision;
 #[path = "all/event_bus_configuration.rs"]

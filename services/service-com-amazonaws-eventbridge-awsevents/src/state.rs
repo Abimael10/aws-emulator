@@ -4849,5 +4849,9 @@ pub mod pass_role;
 /// `KmsKeyIdentifier`.
 pub mod bus_encryption;
 
+/// The order this service lists an enumerated type's admissible values in when a HANDLER
+/// refuses a value outside that type, beside the other refusal wording above.
+pub mod enum_value_set;
+
 mod replays;
 pub use replays::*;

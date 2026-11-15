@@ -323,17 +323,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `RuleState` is a modelled enum, but the boundary validator does not
-        // narrow an enum-typed string to its values, so a value the enum does
-        // not admit is refused here rather than stored.
+        // `RuleState` is a modelled enum, so a value the enum does not admit is
+        // refused rather than stored. The refusal is worded through the same
+        // builders a constraint violation found at the boundary is — the clause
+        // naming the member, the value it carried and the admissible set in the
+        // order this service lists that type's values in
+        // (`crate::state::enum_value_set`) — so a caller reads one sentence for
+        // this requirement wherever it is found.
         let rule_state = match input.state {
             None => crate::state::DEFAULT_RULE_STATE.to_string(),
             Some(value) if crate::state::is_rule_state(&value) => value,
             Some(value) => {
-                let admitted = RULE_STATE_VALUES.join(" | ");
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Parameter State is not valid. Reason: {value:?} is not one of {admitted}."
-                )));
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::validation_envelope(&[crate::state::constraint_clause(
+                        STATE_MEMBER_PATH,
+                        Some(&value),
+                        &crate::state::enum_value_set::requirement_over(RULE_STATE_VALUES),
+                    )]),
+                ));
             }
         };
 
@@ -443,3 +450,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The member path a refusal of this request's `State` names it at: the member as
+/// the wire names it, which is what the boundary's own constraint walk reports for
+/// an input member of this `awsJson1_1` service.
+const STATE_MEMBER_PATH: &str = "state";

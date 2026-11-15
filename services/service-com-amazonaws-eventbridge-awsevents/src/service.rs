@@ -48,8 +48,13 @@ use smithy_server_runtime::{
     http, ErasedOperation, Operation, OperationRoutingTable, Refusal, Refused, Service, Violation,
     ViolationKind,
 };
+
 use service_common::validation::SubmittedEcho;
 use std::sync::Arc;
+
+/// The order this service lists an enumerated type's admissible values in, applied to
+/// every refusal this file words.
+pub mod enum_value_sets;
 
 /// The error code this service answers an input-constraint violation with: the
 /// `ValidationException` the framework itself would have chosen for this
@@ -61,13 +66,18 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// Render one constraint violation the way this service states it: the value
 /// that was rejected, the member path it sat at, and the requirement it failed.
 ///
-/// Every requirement but one is worded exactly as the framework words it. The
-/// exception is `@pattern`, reported as the expression a value must satisfy
-/// WITHOUT the anchors the model spells it with
-/// (`crate::state::pattern_requirement`): the anchoring is how the model makes
-/// the match total, not part of the expression the service asks a value to
-/// satisfy, and a client that lifts the expression out of the message to
-/// re-validate its input cannot use one wrapped in anchors it never sent.
+/// Every requirement but two is worded exactly as the framework words it:
+///
+/// * `@pattern` is reported as the expression a value must satisfy WITHOUT the
+///   anchors the model spells it with (`crate::state::pattern_requirement`): the
+///   anchoring is how the model makes the match total, not part of the expression
+///   the service asks a value to satisfy, and a client that lifts the expression
+///   out of the message to re-validate its input cannot use one wrapped in
+///   anchors it never sent.
+/// * an enum value set is listed in the order this service lists that type's values
+///   in, which is not the order the model declares them in: the violations are
+///   restated through [`enum_value_sets`] before they are worded, so the requirement
+///   SENTENCE here stays the framework's.
 ///
 /// `None` for a violation class this service has no wording for, which lets
 /// [`constraint_envelope`] decline the whole refusal and keep the framework's
@@ -89,6 +99,9 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
             format!("Member must have value less than or equal to {max}")
         }
         ViolationKind::Pattern(pattern) => crate::state::pattern_requirement(pattern),
+        // The admissible set as it reached this clause: the ORDER was already
+        // restated by [`constraint_envelope`] ([`enum_value_sets`]), so what is
+        // left here is the framework's own sentence over it.
         ViolationKind::EnumValue(allowed) => {
             format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
         }
@@ -110,11 +123,16 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
 /// The `ValidationException` message for a refusal: the count of violated
 /// constraints over one clause per violation.
 ///
+/// Every violation is restated as this service states it before it is worded
+/// ([`enum_value_sets`]), which is where an enum's admissible set takes the order
+/// this service lists that type's values in — one place, so every refusal this
+/// file words carries it, whichever operation and member the request broke.
+///
 /// `None` declines the whole refusal — see [`constraint_clause`].
 fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     let clauses: Vec<String> = violations
         .iter()
-        .map(constraint_clause)
+        .map(|violation| constraint_clause(&enum_value_sets::as_this_service_states_it(violation)))
         .collect::<Option<Vec<_>>>()?;
     if clauses.is_empty() {
         return None;
