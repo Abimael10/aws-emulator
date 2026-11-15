@@ -531,6 +531,49 @@ const MAX_INCLUDE_METRICS: usize = 100;
 /// follows this prefix verbatim and nothing else of the request appears in it.
 const UNSUPPORTED_STATISTIC_PREFIX: &str = "Unsupported statistic ";
 
+/// The fewest entries a LIST MEMBER of a statistics configuration carries.
+///
+/// Both members of the structure are `required`
+/// (`smithy_query(query="shape",shape="MetricStreamStatisticsConfiguration")`), and each is the
+/// whole of one half of what the configuration says: `IncludeMetrics` is "an array of metric name
+/// and namespace pairs that stream the additional statistics listed in the value of the
+/// AdditionalStatistics parameter" and `AdditionalStatistics` is "the list of additional
+/// statistics that are to be streamed for the metrics listed in the IncludeMetrics array" — so a
+/// configuration naming no metric, or no statistic, configures nothing and is a value fault rather
+/// than a configuration the stream can hold. This is the one place the two empty lists of this
+/// operation part company: an empty `MetricNames` on a FILTER selects every metric of its
+/// namespace, which is what omitting it means, so it is normalised away ([`non_empty`]) instead.
+const MIN_CONFIGURED_ENTRIES: usize = 1;
+
+/// How CloudWatch states a list member that carried fewer entries than it may:
+/// `<Member> less than <floor>` — the member and the bound it broke, and nothing of what the
+/// member held. The mirror of the sentence a member past its CAP is refused with
+/// ([`over_cap`]), which is the form the filter-name cap is recorded in
+/// ([`MAX_FILTER_NAMES_STATED`]).
+fn below_floor(member: &str) -> String {
+    format!("{member} less than {MIN_CONFIGURED_ENTRIES}")
+}
+
+/// How CloudWatch states a list member that carried more entries than it may:
+/// `<Member> greater than <cap>`.
+fn over_cap(member: &str, cap: usize) -> String {
+    format!("{member} greater than {cap}")
+}
+
+/// The percentile bounds a stream's ADDITIONAL statistics stop short of.
+///
+/// `p0` is the smallest value of the window and `p100` its largest, and "by default, a metric
+/// stream always sends the MAX, MIN, SUM, and SAMPLECOUNT statistics for each metric that is
+/// streamed. You can use this parameter to have the metric stream also send additional statistics
+/// in the stream." (`PutMetricStreamInput$StatisticsConfigurations`) — so neither end of the
+/// distribution names a statistic the stream does not already send, which is the only thing this
+/// member can ask for. The percentiles it admits are the ones strictly INSIDE the interval, in
+/// every output format (measured against `monitoring` in us-west-2: `p95`, `p99` and `p99.9` are
+/// stored, `p0` and `p100` are refused as unsupported). The percentile FORM itself is the
+/// service-wide one ([`crate::state::parse_percentile`]), which a metric read and an alarm take
+/// over the closed range `p0.0`..`p100` the read operations document.
+const ADDITIONAL_PERCENTILE_BOUNDS: (f64, f64) = (0.0, 100.0);
+
 /// Refuse a statistics configuration the stream's output format cannot carry.
 ///
 /// "If the `OutputFormat` for the stream is
@@ -559,37 +602,37 @@ fn validate_statistics_configurations(
 ) -> Result<(), PutMetricStreamError> {
     let configurations = input.statistics_configurations.as_deref().unwrap_or(&[]);
     if configurations.len() > MAX_STATISTICS_CONFIGURATIONS {
-        return Err(invalid_parameter_value(format!(
-            "StatisticsConfigurations can have at most {MAX_STATISTICS_CONFIGURATIONS} members; \
-             got {}",
-            configurations.len()
+        return Err(invalid_parameter_value(over_cap(
+            "StatisticsConfigurations",
+            MAX_STATISTICS_CONFIGURATIONS,
         )));
     }
     let percentiles_only = is_opentelemetry_format(&input.output_format);
     for configuration in configurations {
-        if configuration.include_metrics.len() > MAX_INCLUDE_METRICS {
-            return Err(invalid_parameter_value(format!(
-                "IncludeMetrics can have at most {MAX_INCLUDE_METRICS} pairs; got {}",
-                configuration.include_metrics.len()
-            )));
-        }
-        if configuration.additional_statistics.len() > MAX_ADDITIONAL_STATISTICS {
-            return Err(invalid_parameter_value(format!(
-                "AdditionalStatistics can include at most {MAX_ADDITIONAL_STATISTICS} \
-                 statistics; got {}",
-                configuration.additional_statistics.len()
-            )));
+        // Each list member is judged against its own floor and its own cap, in the order the
+        // structure declares the two members: a configuration naming no metric, or no
+        // statistic, carries no half of what it is for ([`MIN_CONFIGURED_ENTRIES`]).
+        for (member, entries, cap) in [
+            (
+                "IncludeMetrics",
+                configuration.include_metrics.len(),
+                MAX_INCLUDE_METRICS,
+            ),
+            (
+                "AdditionalStatistics",
+                configuration.additional_statistics.len(),
+                MAX_ADDITIONAL_STATISTICS,
+            ),
+        ] {
+            if entries < MIN_CONFIGURED_ENTRIES {
+                return Err(invalid_parameter_value(below_floor(member)));
+            }
+            if entries > cap {
+                return Err(invalid_parameter_value(over_cap(member, cap)));
+            }
         }
         for statistic in &configuration.additional_statistics {
-            // Both formats admit only statistics a stream does not already send: the
-            // OpenTelemetry formats narrow that to the percentiles, while json takes every
-            // extended statistic CloudWatch abbreviates.
-            let supported = if percentiles_only {
-                crate::state::parse_percentile(statistic).is_some()
-            } else {
-                crate::state::is_extended_statistic(statistic)
-            };
-            if !supported {
+            if !is_additional_statistic(statistic, percentiles_only) {
                 return Err(invalid_parameter_value(format!(
                     "{UNSUPPORTED_STATISTIC_PREFIX}{statistic} for selected OutputFormat"
                 )));
@@ -597,6 +640,22 @@ fn validate_statistics_configurations(
         }
     }
     Ok(())
+}
+
+/// Whether `statistic` is one a stream can be asked to send IN ADDITION to the statistics it
+/// sends anyway, in an output format that carries `percentiles_only`.
+///
+/// Both formats admit only statistics a stream does not already send: the OpenTelemetry formats
+/// narrow that to the percentiles, while json takes every extended statistic CloudWatch
+/// abbreviates. A percentile is admitted on the open interval the ends of the distribution bound
+/// ([`ADDITIONAL_PERCENTILE_BOUNDS`]), whatever the format, since `p0` and `p100` name the MIN and
+/// MAX a stream already sends.
+fn is_additional_statistic(statistic: &str, percentiles_only: bool) -> bool {
+    if let Some(percentile) = crate::state::parse_percentile(statistic) {
+        let (low, high) = ADDITIONAL_PERCENTILE_BOUNDS;
+        return low < percentile && percentile < high;
+    }
+    !percentiles_only && crate::state::is_extended_statistic(statistic)
 }
 
 /// "You can associate as many as 50 tags with a metric stream."
@@ -727,6 +786,40 @@ mod tests {
             assert!(
                 !crate::state::is_cloudwatch_statistic(statistic),
                 "case {statistic:?}: expected an unsupported statistic, got supported"
+            );
+        }
+    }
+
+    #[test]
+    fn a_percentile_is_additional_only_strictly_inside_the_distribution() {
+        // The ends of the distribution are the MIN and the MAX a stream sends anyway, so neither
+        // is a statistic it can be asked to ADD — in either output format. The rows walk the
+        // interval: both ends in both spellings, one step inside each end, and the middle.
+        // (case, whether the member admits it)
+        for (statistic, admitted) in [
+            ("p0", false),
+            ("p0.0", false),
+            ("p100", false),
+            ("p100.0", false),
+            ("p0.1", true),
+            ("p50", true),
+            ("p99.9", true),
+        ] {
+            for percentiles_only in [false, true] {
+                assert_eq!(
+                    super::is_additional_statistic(statistic, percentiles_only),
+                    admitted,
+                    "case {statistic:?} (percentiles only: {percentiles_only}): expected \
+                     admitted={admitted}"
+                );
+            }
+        }
+        // The interval narrows the PERCENTILES only: the bounded families keep taking their own
+        // spans, and a json stream still admits them.
+        for statistic in ["tm98", "TM(10%:90%)", "PR(:300)", "IQM"] {
+            assert!(
+                super::is_additional_statistic(statistic, false),
+                "case {statistic:?}: expected a json stream to admit it"
             );
         }
     }

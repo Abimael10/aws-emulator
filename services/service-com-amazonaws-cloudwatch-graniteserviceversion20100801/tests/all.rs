@@ -49,6 +49,8 @@ mod alarm_history_data;
 mod alarm_m_of_n_directions;
 #[path = "all/alarm_mute_rule_action_muting.rs"]
 mod alarm_mute_rule_action_muting;
+#[path = "all/alarm_mute_rule_creation_identity.rs"]
+mod alarm_mute_rule_creation_identity;
 #[path = "all/alarm_mute_rules.rs"]
 mod alarm_mute_rules;
 #[path = "all/alarm_period_windows.rs"]

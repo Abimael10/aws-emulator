@@ -226,12 +226,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The tags a rule already carries are kept across an update, and a key the request names
         // again takes the new value — the one rule this service applies tags by
-        // (`crate::state::merge_tags`).
-        let tags = store
+        // (`crate::state::merge_tags`). So is the identity of the write that CREATED the rule:
+        // "CreationId" names that write, so an update keeps it and only a rule that did not exist
+        // mints one (`crate::state::alarm_creation_id`).
+        let existing = store
             .alarm_mute_rules
             .get(&key)
-            .map(|stored| stored.tags.clone());
-        if tags.is_none() && store.alarm_mute_rules.len() >= crate::state::MAX_ALARM_MUTE_RULES {
+            .map(|stored| (stored.tags.clone(), stored.creation_id.clone()));
+        if existing.is_none()
+            && store.alarm_mute_rules.len() >= crate::state::MAX_ALARM_MUTE_RULES
+        {
             // A capacity bound on this in-memory store rather than an AWS quota
             // (`crate::state::MAX_ALARM_MUTE_RULES`), answered through the quota error this
             // operation models: there is no room for another rule.
@@ -245,7 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let mut held = tags.unwrap_or_default();
+        let (tags, creation_id) = existing
+            .unwrap_or_else(|| (Vec::new(), crate::state::alarm_creation_id(now)));
+        let mut held = tags;
         crate::state::merge_tags(&mut held, input.tags.as_deref().unwrap_or_default());
 
         store.alarm_mute_rules.insert(
@@ -260,7 +266,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &region, &input.name,
                     )),
                     description: input.description.clone(),
-                    rule: Some(input.rule.clone()),
+                    // The schedule as submitted, carrying the zone its windows are read in even
+                    // when the request named none: "If you don't specify a time zone, UTC is used
+                    // by default." (`Schedule$Timezone`) — the default is part of what the rule
+                    // MEANS, so it is materialised here rather than left for each reader to guess.
+                    rule: Some(Rule {
+                        schedule: crate::state::scheduled_in_its_timezone(&input.rule.schedule),
+                    }),
                     mute_targets: input.mute_targets.clone(),
                     start_date: input.start_date,
                     expire_date: input.expire_date,
@@ -268,6 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     last_updated_timestamp: Some(crate::state::to_timestamp(now)),
                     mute_type,
                 },
+                creation_id,
                 tags: held,
             },
         );

@@ -146,7 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetAlarmMuteRule<Eng>
 {
     type Input = GetAlarmMuteRuleInput;
-    type Output = GetAlarmMuteRuleOutput;
+    // The modelled output shape plus the `CreationId` CloudWatch reports beside it, which this
+    // model does not declare (`crate::ops::types::ReportedAlarmMuteRule`).
+    type Output = ReportedAlarmMuteRule;
     type Error = GetAlarmMuteRuleError;
 
     const NAME: &'static str = "GetAlarmMuteRule";
@@ -163,7 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing is written. Only the `Status` is not stored — "The returned status indicates
         // the current state of the mute rule" (`GetAlarmMuteRule`), which is what the clock makes
         // of the rule's own schedule, so it is computed from the stored configuration on each
-        // read (`crate::state::alarm_mute_rule_status`) and no read moves a rule's status.
+        // read (`crate::state::alarm_mute_rule_status`) and no read moves a rule's status. The
+        // `CreationId` beside it is the identity of the write that created the rule, minted there
+        // and never on a read.
         //
         // A mute rule is a regional resource, so the one this request names is the one of the
         // Region it was signed for: the same name in another Region is another rule.
@@ -196,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             })?;
-        Ok(stored.reported(now))
+        Ok(stored.read(now))
     }
 }
 

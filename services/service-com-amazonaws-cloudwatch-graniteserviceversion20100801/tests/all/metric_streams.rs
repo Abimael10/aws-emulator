@@ -315,8 +315,12 @@ async fn an_additional_statistic_is_accepted_only_where_the_output_format_carrie
     let statistics: Vec<(&str, bool, bool)> = vec![
         // (statistic, valid for json, valid for an OpenTelemetry format)
         ("p99", true, true),
-        ("p0", true, true),
-        ("p100", true, true),
+        // The ends of the distribution name the MIN and the MAX a stream sends anyway, so
+        // neither is a statistic it can be asked to ADD; the percentiles between them are
+        // (`metric_stream_additional_statistics.rs` tables the interval).
+        ("p0", false, false),
+        ("p0.0", false, false),
+        ("p100", false, false),
         ("p99.9", true, true),
         ("p0.5", true, true),
         ("p101", false, false),

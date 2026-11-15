@@ -32,3 +32,50 @@ pub struct GetAlarmMuteRuleOutput {
     pub mute_type: Option<String>,
 }
 
+/// The `CreationId` member of an alarm mute rule, appended AFTER the member list the model
+/// declares (which occupies indices 0..=9).
+///
+/// RECORDED behaviour, not modelled: `GetAlarmMuteRuleOutput` as this model declares it carries no
+/// `CreationId` member
+/// (`smithy_query(query="operation",operation="GetAlarmMuteRule",model_path="services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/smithy-model/com-amazonaws-cloudwatch-graniteserviceversion20100801.json")`),
+/// while CloudWatch reports one on every read of a rule. `#[smithy_macros::smithy(shape = …)]`
+/// derives a structure's schema and codecs from the model's member list and admits exactly that
+/// list, so a member the model omits cannot be declared through the derive at all: it is written
+/// by [`ReportedAlarmMuteRule`] instead, the same way a metric alarm's `CreationId` is
+/// (`ReportedMetricAlarm`). The model's own members keep the indices the derive gives them, so a
+/// later model refresh that declares `CreationId` only has to move the member onto
+/// [`GetAlarmMuteRuleOutput`] and this wrapper disappears.
+const M_CREATION_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.cloudwatch#GetAlarmMuteRuleOutput$CreationId",
+        "com.amazonaws.cloudwatch",
+        "CreationId",
+    ),
+    ::aws_smithy_schema::ShapeType::String,
+    "CreationId",
+    10,
+);
+
+/// One alarm mute rule as a READ of it reports it: the modelled [`GetAlarmMuteRuleOutput`] and the
+/// `CreationId` beside it ([`M_CREATION_ID`]).
+#[derive(Debug, Clone, Default)]
+pub struct ReportedAlarmMuteRule {
+    /// The rule, as the model declares it.
+    pub rule: GetAlarmMuteRuleOutput,
+    /// The `CreationId` of the write that created the rule.
+    pub creation_id: Option<String>,
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ReportedAlarmMuteRule {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        ::aws_smithy_schema::serde::SerializableStruct::serialize_members(&self.rule, serializer)?;
+        if let Some(creation_id) = self.creation_id.as_deref() {
+            serializer.write_string(&M_CREATION_ID, creation_id)?;
+        }
+        Ok(())
+    }
+}
+

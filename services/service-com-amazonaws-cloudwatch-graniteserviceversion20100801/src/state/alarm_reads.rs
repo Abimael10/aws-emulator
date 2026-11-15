@@ -38,14 +38,16 @@ impl StoredAlarm {
     }
 }
 
-/// The `CreationId` a write that CREATES a metric alarm mints for it: `<uuid>/<epoch-millis>`
-/// — a uuid identifying the write, and the instant it happened at in milliseconds.
+/// The `CreationId` a write that CREATES a resource of this service mints for it:
+/// `<uuid>/<epoch-millis>` — a uuid identifying the write, and the instant it happened at in
+/// milliseconds. One minting for every resource whose reads carry a creation identity (a metric
+/// alarm, an alarm mute rule), so no two of them report the identity in different forms.
 ///
 /// The uuid is minted from this process's own opaque bytes ([`minted_bytes`]) and rendered by
 /// the workspace's ONE rendering of 16 opaque bytes as a version-4 uuid, so neither the version
 /// and variant bits nor the hyphenated layout is spelled out here. Nothing in it comes from the
-/// request: two alarms created with identical configuration carry different creation
-/// identities, and re-creating one alarm never reproduces the id it had.
+/// request: two resources created with identical configuration carry different creation
+/// identities, and re-creating one never reproduces the id it had.
 pub fn alarm_creation_id(now_secs: f64) -> String {
     format!(
         "{}/{}",

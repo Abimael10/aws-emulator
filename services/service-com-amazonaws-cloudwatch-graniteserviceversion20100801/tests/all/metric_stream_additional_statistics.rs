@@ -16,7 +16,9 @@
 //!
 //! Which statistic each format admits is tabled once, in `metric_streams.rs`. What this suite
 //! adds is the rest of the rule: a configuration carries a LIST, so the refusal names the
-//! first entry the format cannot carry, and a refused request changes no state — on the
+//! first entry the format cannot carry; both of its list members have to carry an entry at
+//! all; a percentile is admissible only strictly inside the distribution, since its ends are
+//! the MIN and MAX a stream sends anyway; and a refused request changes no state — on the
 //! create path and on the upsert path of a stream that is already live. The read that
 //! confirms the refused create is answered by its error code alone, with no message
 //! (`not_found_messages.rs` owns that contract for every not-found this service words that
@@ -121,6 +123,209 @@ async fn the_refusal_names_the_first_statistic_the_format_cannot_carry() {
                 "case {case:?}: a refused create must list no stream, got {listed}"
             );
         }
+    }
+}
+
+/// One metric pair a configuration can name, for the rows that vary the OTHER member.
+fn one_pair() -> Value {
+    json!({"Namespace": "MyApp", "MetricName": "Latency"})
+}
+
+/// A `PutMetricStream` request in `output_format` whose `StatisticsConfigurations` are
+/// `configurations` verbatim — the seam for a row that names an EMPTY list member.
+fn configured_request(name: &str, output_format: &str, configurations: Value) -> Value {
+    let mut request = put_request(name, output_format);
+    request["StatisticsConfigurations"] = configurations;
+    request
+}
+
+#[tokio::test]
+async fn a_statistics_configuration_names_at_least_one_metric_and_one_statistic() {
+    // The rule: both list members of a statistics configuration are `required`
+    // (`smithy_query(query="shape",shape="MetricStreamStatisticsConfiguration")`) and each is
+    // the whole of one half of what the configuration says, so a list that arrived EMPTY is a
+    // value fault naming the member and the floor it broke — `<Member> less than 1` — and
+    // nothing is stored. Rows differ along WHICH member is empty, whether both are, and where
+    // in the configuration array the offending configuration sits.
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "no additional statistic",
+            json!([{"IncludeMetrics": [one_pair()], "AdditionalStatistics": []}]),
+            "AdditionalStatistics less than 1",
+        ),
+        (
+            "no included metric",
+            json!([{"IncludeMetrics": [], "AdditionalStatistics": ["p99"]}]),
+            "IncludeMetrics less than 1",
+        ),
+        (
+            "neither member carries an entry",
+            json!([{"IncludeMetrics": [], "AdditionalStatistics": []}]),
+            // The members are judged in the order the structure declares them, so the first
+            // empty one is the one the refusal names.
+            "IncludeMetrics less than 1",
+        ),
+        (
+            "the second configuration of two",
+            json!([
+                {"IncludeMetrics": [one_pair()], "AdditionalStatistics": ["p99"]},
+                {"IncludeMetrics": [one_pair()], "AdditionalStatistics": []},
+            ]),
+            "AdditionalStatistics less than 1",
+        ),
+    ];
+
+    for (case, configurations, expected) in cases {
+        for format in OUTPUT_FORMATS {
+            let router = build_router();
+            let case = format!("{case} with {format}");
+            let request = configured_request("floored-statistics", format, configurations.clone());
+
+            let (status, body) = call(&router, "PutMetricStream", &request).await;
+            assert_eq!(
+                (status, error_code(&body).as_str(), error_message(&body)),
+                (400, "InvalidParameterValueException", expected.to_string()),
+                "case {case:?}: expected a 400 InvalidParameterValueException naming the empty \
+                 member, got {status} {body}"
+            );
+
+            let (get_status, get_body) = call(
+                &router,
+                "GetMetricStream",
+                &json!({"Name": "floored-statistics"}),
+            )
+            .await;
+            assert_eq!(
+                (get_status, error_code(&get_body).as_str()),
+                (404, "ResourceNotFoundException"),
+                "case {case:?}: a refused PutMetricStream must persist nothing, got {get_status} \
+                 {get_body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_empty_metric_names_list_on_a_filter_is_normalised_away_instead() {
+    // The contrast the rule above turns on: a filter's `MetricNames` is NOT required, and "if
+    // you omit this parameter, all metrics in the namespace are included or excluded"
+    // (`MetricStreamFilter$MetricNames`) — which is exactly what an empty list selects. So an
+    // empty list there is stored as the omitted member rather than refused, whichever of the
+    // two filter members carries it.
+    for member in ["IncludeFilters", "ExcludeFilters"] {
+        let router = build_router();
+        let mut request = put_request("normalised-filter", "json");
+        request[member] = json!([{"Namespace": "MyApp", "MetricNames": []}]);
+
+        ok(&router, "PutMetricStream", &request).await;
+        let stored = ok(
+            &router,
+            "GetMetricStream",
+            &json!({"Name": "normalised-filter"}),
+        )
+        .await;
+        assert_eq!(
+            stored.get(member),
+            Some(&json!([{"Namespace": "MyApp"}])),
+            "case {member:?}: an empty MetricNames list must be stored as the omitted member, \
+             got {stored}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_percentile_is_an_additional_statistic_only_strictly_inside_the_distribution() {
+    // The rule: the member names the statistics a stream does not send anyway — "a metric
+    // stream always sends the MAX, MIN, SUM, and SAMPLECOUNT statistics for each metric that is
+    // streamed" (`PutMetricStreamInput$StatisticsConfigurations`) — and `p0` is the MIN of the
+    // window while `p100` is its MAX, so the percentiles it admits are the ones strictly
+    // between them, in every output format. Rows walk the interval: both ends (in both the
+    // integral and the fractional spelling), one step inside each end, the middle, and a
+    // percentile past the top, which names no percentile at all.
+    let cases: Vec<(&str, &str, bool)> = vec![
+        ("the bottom of the distribution", "p0", false),
+        ("the bottom, spelled with a fraction", "p0.0", false),
+        ("the top of the distribution", "p100", false),
+        ("the top, spelled with a fraction", "p100.0", false),
+        ("past the top", "p101", false),
+        ("one step above the bottom", "p0.1", true),
+        ("the middle", "p50", true),
+        ("one step below the top", "p99.9", true),
+    ];
+
+    for (case, statistic, admitted) in cases {
+        for format in OUTPUT_FORMATS {
+            let router = build_router();
+            let case = format!("{case} ({statistic}) with {format}");
+            let request = statistics_request("interval-statistics", format, &[statistic]);
+
+            let (status, body) = call(&router, "PutMetricStream", &request).await;
+            if admitted {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: a percentile inside the distribution must be stored, got \
+                     {status} {body}"
+                );
+                let stored = ok(
+                    &router,
+                    "GetMetricStream",
+                    &json!({"Name": "interval-statistics"}),
+                )
+                .await;
+                assert_eq!(
+                    stored.get("StatisticsConfigurations"),
+                    request.get("StatisticsConfigurations"),
+                    "case {case:?}: the configuration must round-trip, got {stored}"
+                );
+            } else {
+                assert_eq!(
+                    (status, error_code(&body).as_str(), error_message(&body)),
+                    (
+                        400,
+                        "InvalidParameterValueException",
+                        format!("Unsupported statistic {statistic} for selected OutputFormat"),
+                    ),
+                    "case {case:?}: expected the refusal to name the statistic in CloudWatch's \
+                     sentence, got {status} {body}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refused_percentile_leaves_the_stored_statistics_untouched() {
+    // The upsert path of the interval rule: a stream already streaming a percentile keeps the
+    // configuration it has when a later put names one of the ends.
+    let router = build_router();
+    let live = statistics_request("interval-upsert", "json", &["p99"]);
+    ok(&router, "PutMetricStream", &live).await;
+
+    for statistic in ["p0", "p100", "p0.0"] {
+        let (status, body) = call(
+            &router,
+            "PutMetricStream",
+            &statistics_request("interval-upsert", "json", &[statistic]),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterValueException"),
+            "case {statistic:?}: expected a 400 InvalidParameterValueException, got {status} \
+             {body}"
+        );
+        let stored = ok(
+            &router,
+            "GetMetricStream",
+            &json!({"Name": "interval-upsert"}),
+        )
+        .await;
+        assert_eq!(
+            stored.get("StatisticsConfigurations"),
+            live.get("StatisticsConfigurations"),
+            "case {statistic:?}: a refused put must leave the stored statistics untouched, got \
+             {stored}"
+        );
     }
 }
 

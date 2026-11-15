@@ -16,7 +16,9 @@ use ::chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use ::chrono_tz::Tz;
 use ::serde_json::{Map, Value};
 
-use crate::ops::types::{AlarmHistoryItem, GetAlarmMuteRuleOutput, Schedule, Tag};
+use crate::ops::types::{
+    AlarmHistoryItem, GetAlarmMuteRuleOutput, ReportedAlarmMuteRule, Schedule, Tag,
+};
 
 /// The identity of one alarm mute rule: the Region it lives in and its name.
 ///
@@ -70,18 +72,25 @@ pub const ALARM_MUTE_RULE_ACTIVE: &str = "ACTIVE";
 /// expiration date and will no longer become active" (`GetAlarmMuteRule`).
 pub const ALARM_MUTE_RULE_EXPIRED: &str = "EXPIRED";
 
-/// A mute rule whose schedule opens ONE window: "Indicates whether the mute rule is one-time or
-/// recurring. Valid values are ONE_TIME or RECURRING." (`GetAlarmMuteRuleOutput$MuteType`), and
-/// an `at` expression is the form documented "For one-time mute windows"
-/// (`Schedule$Expression`).
-pub const MUTE_TYPE_ONE_TIME: &str = "ONE_TIME";
+/// A mute rule whose schedule opens ONE window: an `at` expression is the form documented "For
+/// one-time mute windows" (`Schedule$Expression`).
+///
+/// `MuteType` is an unconstrained string in the model
+/// (`smithy_query(query="shape",shape="MuteType")`) and its member prose names the two kinds of
+/// window in prose capitals ("Indicates whether the mute rule is one-time or recurring. Valid
+/// values are ONE_TIME or RECURRING.", `GetAlarmMuteRuleOutput$MuteType`), so the TOKEN is the one
+/// the service emits: measured against `monitoring` in us-west-2, a read of a one-time rule
+/// reports `one-time` and a read of a recurring rule `recurring`, on the single read and in a
+/// listing summary alike.
+pub const MUTE_TYPE_ONE_TIME: &str = "one-time";
 
 /// A mute rule whose schedule opens a window per occurrence — the `cron` expression form,
-/// documented "For recurring mute windows" (`Schedule$Expression`).
-pub const MUTE_TYPE_RECURRING: &str = "RECURRING";
+/// documented "For recurring mute windows" (`Schedule$Expression`), in the token the service emits
+/// ([`MUTE_TYPE_ONE_TIME`]).
+pub const MUTE_TYPE_RECURRING: &str = "recurring";
 
-/// A stored alarm mute rule: the modelled shape its reader returns, plus the tags the write
-/// accepted (no member of that shape carries them).
+/// A stored alarm mute rule: the modelled shape its reader returns, plus the creation identity and
+/// the tags the write accepted (no member of that shape carries either).
 ///
 /// Held as [`GetAlarmMuteRuleOutput`] itself rather than as a parallel record, so every member
 /// `PutAlarmMuteRule` accepts round-trips through `GetAlarmMuteRule` without a field-by-field
@@ -92,6 +101,11 @@ pub const MUTE_TYPE_RECURRING: &str = "RECURRING";
 pub struct StoredAlarmMuteRule {
     /// The rule as its reader reports it, with `Status` left unset.
     pub configuration: GetAlarmMuteRuleOutput,
+    /// The identity of the write that CREATED this rule, as every read of it reports the rule's
+    /// creation identity ([`super::alarm_creation_id`]). A write that replaces the configuration of
+    /// a rule that already exists keeps it; a rule deleted and written again is created afresh and
+    /// carries a new one.
+    pub creation_id: String,
     /// The tags the rule carries.
     pub tags: Vec<Tag>,
 }
@@ -103,6 +117,16 @@ impl StoredAlarmMuteRule {
         let mut reported = self.configuration.clone();
         reported.status = Some(alarm_mute_rule_status(&self.configuration, now).to_string());
         reported
+    }
+
+    /// The rule as a READ of it answers with: the modelled shape [`Self::reported`] builds, and
+    /// the `CreationId` of the write that created it beside it — the member the model does not
+    /// declare and CloudWatch reports on every read ([`ReportedAlarmMuteRule`]).
+    pub fn read(&self, now: f64) -> ReportedAlarmMuteRule {
+        ReportedAlarmMuteRule {
+            rule: self.reported(now),
+            creation_id: Some(self.creation_id.clone()),
+        }
     }
 
     /// Whether this rule applies to the alarm `alarm_name`: "The list of alarm names that this
@@ -384,9 +408,31 @@ fn schedule_form(expression: &str) -> Option<ScheduleForm> {
         .map(|schedule| ScheduleForm::Recurring(Box::new(schedule)))
 }
 
-/// The zone a schedule is evaluated in: the one it names, or UTC when it names none ("If you
-/// don't specify a time zone, UTC is used by default.", `Schedule$Timezone`). `None` for a value
-/// that names no zone at all.
+/// The zone a schedule with no `Timezone` of its own is evaluated in: "If you don't specify a time
+/// zone, UTC is used by default." (`Schedule$Timezone`).
+///
+/// The default is what the SCHEDULE means, not what a reader guesses, so a write materialises it
+/// onto the schedule it stores ([`scheduled_in_its_timezone`]) and every reader of the rule reports
+/// the zone its windows are actually read in.
+pub const DEFAULT_SCHEDULE_TIMEZONE: &str = "UTC";
+
+/// `schedule` as a write stores it: the schedule as submitted, carrying the zone it is evaluated in
+/// even when the request named none ([`DEFAULT_SCHEDULE_TIMEZONE`]).
+pub fn scheduled_in_its_timezone(schedule: &Schedule) -> Schedule {
+    Schedule {
+        expression: schedule.expression.clone(),
+        duration: schedule.duration.clone(),
+        timezone: Some(
+            schedule
+                .timezone
+                .clone()
+                .unwrap_or_else(|| DEFAULT_SCHEDULE_TIMEZONE.to_string()),
+        ),
+    }
+}
+
+/// The zone a schedule is evaluated in: the one it names, or UTC when it names none
+/// ([`DEFAULT_SCHEDULE_TIMEZONE`]). `None` for a value that names no zone at all.
 fn schedule_timezone(timezone: Option<&str>) -> Option<Tz> {
     match timezone {
         None => Some(Tz::UTC),

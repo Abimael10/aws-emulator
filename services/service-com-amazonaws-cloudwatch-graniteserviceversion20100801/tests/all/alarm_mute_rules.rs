@@ -72,6 +72,18 @@ fn stamp(value: &Value, member: &str) -> Option<f64> {
     value.get(member).and_then(Value::as_f64)
 }
 
+/// The `Rule` a read of the rule `request` wrote reports: the schedule as written, carrying the
+/// zone its windows are read in — "If you don't specify a time zone, UTC is used by default."
+/// (`Schedule$Timezone`), which the write materialises onto the schedule it stores, so every
+/// reader reports the zone the rule is actually evaluated in.
+fn scheduled_in_its_timezone(request: &Value) -> Value {
+    let mut rule = request["Rule"].clone();
+    if rule["Schedule"].get("Timezone").is_none() {
+        rule["Schedule"]["Timezone"] = json!("UTC");
+    }
+    rule
+}
+
 /// The rule `name` names in `REGION`, read back through the implemented reader.
 async fn stored_rule(router: &MultiServiceRouter, name: &str) -> Value {
     ok(router, "GetAlarmMuteRule", &json!({"AlarmMuteRuleName": name})).await
@@ -179,9 +191,9 @@ async fn every_mute_rule_configuration_round_trips_through_get_alarm_mute_rule()
         );
         assert_eq!(
             read.get("Rule"),
-            request.get("Rule"),
+            Some(&scheduled_in_its_timezone(&request)),
             "case {case:?}: expected the stored schedule {:?}, got {read}",
-            request.get("Rule")
+            scheduled_in_its_timezone(&request)
         );
         assert_eq!(
             read.get("Description"),
@@ -223,10 +235,12 @@ async fn every_mute_rule_configuration_round_trips_through_get_alarm_mute_rule()
             .as_str()
             .unwrap_or_default()
             .to_string();
+        // The token a read reports the kind of window in is the one the service emits, which is
+        // not the spelling the member's prose uses (`crate::state::MUTE_TYPE_ONE_TIME`).
         let expected_mute_type = if expression.starts_with("at(") {
-            "ONE_TIME"
+            "one-time"
         } else {
-            "RECURRING"
+            "recurring"
         };
         assert_eq!(
             text(&read, "MuteType").as_deref(),
@@ -1005,5 +1019,65 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         listed_arns(&listed).len(),
         4,
         "case \"after the refusals\": every stored rule must still be listed, got {listed}"
+    );
+}
+
+#[tokio::test]
+async fn a_read_reports_the_zone_the_rules_windows_are_read_in() {
+    // The rule: "If you don't specify a time zone, UTC is used by default." (`Schedule$Timezone`)
+    // — the zone is what the schedule MEANS, so a read of the rule reports the zone its windows
+    // are read in whether or not the write named one. Rows differ along which zone the write
+    // named: none, the default named outright, and two zones on either side of it (one of them
+    // `Asia/Tokyo`, which no row of the round-trip table above names).
+    let router = build_router();
+    let cases: Vec<(&str, Option<&str>, &str)> = vec![
+        ("no zone at all", None, "UTC"),
+        ("the default named outright", Some("UTC"), "UTC"),
+        ("a zone behind UTC", Some("America/Los_Angeles"), "America/Los_Angeles"),
+        ("a zone ahead of UTC", Some("Asia/Tokyo"), "Asia/Tokyo"),
+    ];
+
+    for (case, named, expected) in cases {
+        let name = format!("zoned-{}", case.replace(' ', "-"));
+        let request = json!({
+            "Name": &name,
+            "Rule": {"Schedule": schedule("cron(0 2 * * *)", "PT1H", named)},
+        });
+        ok(&router, "PutAlarmMuteRule", &request).await;
+
+        let read = stored_rule(&router, &name).await;
+        assert_eq!(
+            read["Rule"]["Schedule"]["Timezone"].as_str(),
+            Some(expected),
+            "case {case:?}: expected the schedule to read back in {expected:?}, got {read}"
+        );
+        // Nothing else of the schedule is rewritten by materialising the zone.
+        assert_eq!(
+            (
+                read["Rule"]["Schedule"]["Expression"].as_str(),
+                read["Rule"]["Schedule"]["Duration"].as_str(),
+            ),
+            (Some("cron(0 2 * * *)"), Some("PT1H")),
+            "case {case:?}: expected the submitted expression and duration, got {read}"
+        );
+    }
+
+    // An update that names no zone leaves the rule evaluated in the default, not in the zone the
+    // configuration it replaced named.
+    let name = "zoned-a-zone-ahead-of-UTC";
+    ok(
+        &router,
+        "PutAlarmMuteRule",
+        &json!({
+            "Name": name,
+            "Rule": {"Schedule": schedule("cron(0 2 * * *)", "PT1H", None)},
+        }),
+    )
+    .await;
+    let read = stored_rule(&router, name).await;
+    assert_eq!(
+        read["Rule"]["Schedule"]["Timezone"].as_str(),
+        Some("UTC"),
+        "case \"an update naming no zone\": expected the default zone, got {read}"
     );
 }
