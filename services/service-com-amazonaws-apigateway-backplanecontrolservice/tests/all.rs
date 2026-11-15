@@ -52,7 +52,6 @@ mod test_invoke_stage_grant_differential;
 // Logs at once.
 #[path = "all/stage_scoped_lambda_permission.rs"]
 mod stage_scoped_lambda_permission;
-// Declared here, at the head, for the reason the entry at the top of this file records: which
 // GRANTS on one function admit a deployed stage's request — every half of the method ARN a
 // grant may be narrowed by — spans API Gateway, AWS Lambda and Amazon CloudWatch Logs at once,
 // and reuses the suite above's wiring and per-leg check.
@@ -83,12 +82,13 @@ mod stage_access_log_record_rendering;
 // records: it spans API Gateway, AWS IAM and Amazon CloudWatch Logs at once.
 #[path = "all/stage_access_log_absent_destination.rs"]
 mod stage_access_log_absent_destination;
-// WHICH method setting gates the execution log of a request the stage served: the entry keyed
-// by the method it reached, and only then the stage-wide one. Declared beside the suites above
-// for the reason the entry at the top of this file records: it spans API Gateway, AWS Lambda
-// and Amazon CloudWatch Logs at once.
-#[path = "all/stage_method_level_logging_level.rs"]
-mod stage_method_level_logging_level;
+// WHICH PATH that record names for the request it answered: the stage-qualified path the
+// client asked for, carrying nothing of the endpoint it reached this emulator by, beside the
+// template the request matched. Declared beside the suites above for the reason the entry at
+// the top of this file records: it spans API Gateway, AWS IAM and Amazon CloudWatch Logs at
+// once.
+#[path = "all/stage_access_log_request_path.rs"]
+mod stage_access_log_request_path;
 #[path = "all/stage_proxy_run_logs.rs"]
 mod stage_proxy_run_logs;
 #[path = "all/stage_trace_context.rs"]
@@ -760,3 +760,9 @@ mod domain_name_delete_cascade;
 // REFUSES leaves behind — nothing, in any collection of the account.
 #[path = "all/refused_control_plane_writes.rs"]
 mod refused_control_plane_writes;
+// WHICH method setting gates the execution log of a request the stage served: the entry keyed
+// by the method it reached, and only then the stage-wide one. Declared beside the suites above
+// for the reason the entry at the top of this file records: it spans API Gateway, AWS Lambda
+// and Amazon CloudWatch Logs at once.
+#[path = "all/stage_method_level_logging_level.rs"]
+mod stage_method_level_logging_level;

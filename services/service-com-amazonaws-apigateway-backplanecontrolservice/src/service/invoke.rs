@@ -1778,6 +1778,11 @@ async fn serving<Eng: Send + Sync + 'static>(
                         &stage.stage_name,
                         verb,
                         matched_path,
+                        // The path the CLIENT addressed within the api, which
+                        // `$context.path` reports stage-qualified: the template
+                        // `matched_path` carries a parameter's name, and the path asked for
+                        // carries its value.
+                        &resource_path,
                         req,
                         request_id,
                         SystemTime::now(),
@@ -3448,9 +3453,8 @@ fn passed_through(
     // to come back in through the claim: re-entry is what carries `hop`, the count this
     // function is bounded by, and what lets what THIS plane did with the request — the
     // endpoint it delivered it through — travel with it as an argument rather than on the
-    // wire. Deciding that on the stored spelling would let an expansion that resolves onto
-    // this plane's own address leave as an onward request and arrive back through the claim
-    // with the count reset, which is a chain nothing then bounds.
+    // wire. So the question is put below, once the request is built, against the host and
+    // path it will be CLAIMED under.
     let Some(host) = authority_of(&addressed) else {
         return Some(PassedThrough::Unserved(UnservedIntegration {
             refusal: API_CONFIGURATION_ERROR,
@@ -3459,8 +3463,6 @@ fn passed_through(
                 .to_string(),
         }));
     };
-    let within_this_plane = endpoint_labels(host).is_some()
-        || split_execute_api_prefix(path_of(&addressed)).is_some();
     let mut passed = RtRequest::new(SdkBody::from(request_payload(req)));
     if passed
         .set_uri(onward_uri(&addressed, req.uri(), &mapped.querystring).as_str())
@@ -3554,9 +3556,26 @@ fn passed_through(
             }));
         }
     }
+    // WHICH of the two the request is passed on as, decided on the request as it will
+    // actually be CLAIMED — after the integration's own mapped headers, which have the last
+    // word over the `host` set above. A service reads an onward request's endpoint off that
+    // header, so a request whose final host or path names a stage of THIS plane re-enters
+    // this plane's own serving, where `hop` travels with it; deciding it on the address
+    // before the mappings were applied would let a mapping onto `host` send the request out
+    // over the transport and back in through the claim with the count reset, which is a
+    // chain nothing then bounds.
+    let within_this_plane = {
+        let claimed_host = passed.headers().get("host").unwrap_or(host);
+        endpoint_labels(claimed_host).is_some()
+            || split_execute_api_prefix(path_of(passed.uri())).is_some()
+    };
     Some(if within_this_plane {
         PassedThrough::Request(Box::new(passed))
     } else {
+        // Passed on over the IN-PROCESS transport, which dispatches it back into this same
+        // emulator ([`onward_endpoint`]): no socket is opened, no name is resolved and no
+        // address this configuration named is dialled, so the endpoint the `uri` names is
+        // reached only if a service of this emulator CLAIMS it.
         PassedThrough::Onward(Box::new(passed))
     })
 }
@@ -4210,27 +4229,33 @@ fn request_host_of(req: &RtRequest) -> Option<String> {
 /// format). The instants are `now`'s, in the units each member documents: `requestTime` in
 /// the Common Log Format the access log writes it in and `requestTimeEpoch` in milliseconds.
 ///
+/// `resource_path` is the TEMPLATE the deployment matched, which `$context.resourcePath`
+/// names, and `request_path` is the path within the api the CLIENT addressed, which
+/// `$context.path` names together with the stage ([`stage_qualified_path`]) — the two differ
+/// for a parameterised resource, and only the second is what was asked for.
+///
 /// What the method's AUTHORIZATION published is added by the caller, once the authorizer has
 /// decided: a user pool's claims under `authorizer.claims.<name>` (the member path a
 /// template reads a signed-in user by, `$context.authorizer.claims.sub`) and a custom
 /// authorizer's own values under `authorizer.<key>`. A method whose authorization publishes
 /// none adds no member, so such a reference stays unrendered.
+#[allow(clippy::too_many_arguments)]
 fn call_context(
     api_id: &str,
     stage: &str,
     verb: &str,
     resource_path: &str,
+    request_path: &str,
     req: &RtRequest,
     request_id: &str,
     now: SystemTime,
 ) -> BTreeMap<String, String> {
-    let uri = req.uri();
     let mut context: BTreeMap<String, String> = [
         ("apiId", api_id.to_string()),
         ("stage", stage.to_string()),
         ("httpMethod", verb.to_string()),
         ("resourcePath", resource_path.to_string()),
-        ("path", path_of(uri).to_string()),
+        ("path", stage_qualified_path(stage, request_path)),
         ("accountId", ::engine::emulator_account_id().to_string()),
         ("requestId", request_id.to_string()),
         ("extendedRequestId", request_id.to_string()),
@@ -4253,6 +4278,31 @@ fn call_context(
         context.insert("identity.userAgent".to_string(), agent.to_string());
     }
     context
+}
+
+/// The path the api's OWN endpoint carries for a call of `stage` that addressed
+/// `request_path` within the api: the stage segment and then that path.
+///
+/// `$context.path` is "the request path" — "for a non-proxy request URL of
+/// `https://{rest-api-id}.execute-api.{region}.amazonaws.com/{stage-name}/root/child`, the
+/// `$context.path` value is `/{stage-name}/root/child`" — so it is the path the api is
+/// reached at, which carries the stage and NOTHING of the endpoint a client happened to
+/// reach this emulator by: the addressings this plane is claimed under
+/// ([`resolve`]) name the api in the host or ahead of the stage in the path, and neither is
+/// part of the path the api serves. A client that cannot resolve the api's own invoke host
+/// therefore reads the same value as one that can.
+///
+/// `pub(super)` because a PROXY integration's event reports that same path under
+/// `requestContext.path` ([`lambda_proxy`]) — one reading, so the record a stage logs and the
+/// event its function is handed cannot name one request's path two ways.
+///
+/// `request_path` is the api-relative path as this plane's ONE reader of an invoke path
+/// resolved it ([`split_stage`]), which drops empty segments: a target spelled `/{stage}//x`
+/// or `/{stage}/x/` names the same resource of the deployment as `/{stage}/x`, and this
+/// emulator reports that resolved path rather than keeping each spelling of it — AWS
+/// documents the value for the plain form only.
+pub(super) fn stage_qualified_path(stage: &str, request_path: &str) -> String {
+    format!("/{stage}{request_path}")
 }
 
 /// The request header the caller's user agent travels in, which `$context.identity.userAgent`

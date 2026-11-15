@@ -1292,3 +1292,17 @@ mod zz_probe_whole_emulator;
 // `all/all_rs_is_a_canonical_declaration_list.rs` (one pair per suite, sorted, no other
 // line). The build-time layout check fails the build for a suite file no `mod` names, and
 // for a suite left at the top level of `tests/`.
+// Single integration-test target for the router.
+// Put a new suite at `tests/all/<name>.rs` and declare it below with a
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted into the sorted list: one pair
+// per suite and NO other line, so two branches landing at once insert two lines in two
+// places and have no prose to duplicate, re-word or mistype.
+// A suite no `mod` names compiles nowhere and its tests never run; a suite left at the top
+// level of `tests/` fails the build; a suite declared twice is `E0428`; and a comment past
+// the first declaration is what `all/all_rs_is_a_canonical_declaration_list.rs` reports.
+// EVERY comment in this file is an ORDINARY one, this block included, and that is
+// lands past the declarations — which is what concurrent landings appending to this file
+// kept producing — is `E0753` and compiles no suite of this target.
+// What a suite covers, and why it lives in THIS target rather than in a service crate's
+// own, belongs in that suite's own module header, where it is read beside the test it
+// explains; `all/appended_notes.rs` keeps the notes this file had collected.

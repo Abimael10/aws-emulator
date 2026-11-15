@@ -265,6 +265,10 @@ fn planned<Eng: Send + Sync + 'static>(
         stage_name,
         verb,
         matched_path,
+        // What the CLIENT addressed within the api, which `$context.path` reports
+        // stage-qualified: a parameterised resource's template is `matched_path`, and the
+        // path asked for is this.
+        &resource_path,
         req,
         request_id,
         ::std::time::SystemTime::now(),

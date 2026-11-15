@@ -26,8 +26,8 @@
 //! two parameter names) and what does not (its SigV4 credential, in both the header and the
 //! presigned-query form), the private connection the integration is carried over (none, one
 //! this account does not hold, one still provisioning, one provisioned) and a chain that
-//! leads back to itself — through the stored `uri`, and through the address a mapped path
-//! parameter expands it to.
+//! leads back to itself — through the stored `uri`, through the address a mapped path
+//! parameter expands it to, and through the `host` a mapped header sets.
 
 use serde_json::{json, Value};
 
@@ -771,6 +771,83 @@ async fn a_chain_whose_loop_is_made_by_an_expanded_path_parameter_is_bounded() {
     let served = invoke_front(&gateway, &api, &[("x-loop-to", &loop_to)]).await;
     assert_served(
         "an expanded address naming this plane's own stage",
+        &served,
+        &Expect::NotPerformed,
+    );
+}
+
+/// The same bound holds for a loop made by the HOST the onward request carries: the `uri`
+/// names a host outside this emulator, and the integration maps a header the CALLER sent onto
+/// `host` — the header a service claiming an onward request reads its endpoint off, and the
+/// one a mapping has the last word over. A request whose mapped host names a stage of THIS
+/// plane is served by RE-ENTERING it, which is what carries the hop count, so the chain is
+/// bounded instead of leaving as an onward request and coming back in through the claim with
+/// the count reset.
+#[tokio::test]
+async fn a_chain_whose_loop_is_made_by_a_mapped_host_header_is_bounded() {
+    let gateway = Gateway::new();
+    // A SIBLING api deployed to a stage of the same name, serving its root `GET`: the mapped
+    // host that names a stage of this plane without naming the api under test.
+    let (sibling, sibling_root) = create_api(&gateway, "passed-through-mapped-host-sibling").await;
+    put_method(
+        &gateway,
+        &sibling,
+        &sibling_root,
+        "GET",
+        json!({ "authorizationType": "NONE" }),
+    )
+    .await;
+    mock_integration(&gateway, &sibling, &sibling_root).await;
+    deploy(&gateway, &sibling, FRONT_STAGE).await;
+
+    let (api, root) = create_api(&gateway, "passed-through-mapped-host-loop").await;
+    put_method(
+        &gateway,
+        &api,
+        &root,
+        "GET",
+        json!({
+            "authorizationType": "NONE",
+            "requestParameters": { "method.request.header.x-send-to": false },
+        }),
+    )
+    .await;
+    put_integration(
+        &gateway,
+        &api,
+        &root,
+        "GET",
+        json!({
+            "type": "HTTP_PROXY",
+            "httpMethod": "GET",
+            // A host nothing in this emulator serves — so the stored spelling names no
+            // endpoint of this plane — on the path of the stage this api is deployed to.
+            // WHICH endpoint the onward request reaches is the mapped host below.
+            "uri": format!("https://backend.example.com/{FRONT_STAGE}/"),
+            "requestParameters": {
+                "integration.request.header.host": "method.request.header.x-send-to",
+            },
+        }),
+    )
+    .await;
+    deploy(&gateway, &api, FRONT_STAGE).await;
+
+    // 1. The mapped host names ANOTHER api's stage of this plane: not a loop, so the request
+    //    is served there and that api's own answer comes back. This is what tells "the mapped
+    //    host decided the endpoint" from "every mapping onto host is refused".
+    let served = invoke_front(&gateway, &api, &[("x-send-to", &api_host(&sibling))]).await;
+    assert_served(
+        "a mapped host naming another api's stage of this plane",
+        &served,
+        &Expect::PassedThrough,
+    );
+
+    // 2. The same mapping naming the api's OWN stage, which is the loop: every hop finds this
+    //    same integration again, so the chain reaches the bound and is answered through the
+    //    gateway response.
+    let served = invoke_front(&gateway, &api, &[("x-send-to", &api_host(&api))]).await;
+    assert_served(
+        "a mapped host naming this plane's own stage",
         &served,
         &Expect::NotPerformed,
     );

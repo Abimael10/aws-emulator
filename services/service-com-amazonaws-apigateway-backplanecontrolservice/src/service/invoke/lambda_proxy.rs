@@ -871,10 +871,12 @@ fn request_context(call: &MethodRequest, stage: &str) -> Value {
     );
     reported.insert("httpMethod".to_string(), json!(proxy.http_method));
     // The path API Gateway reports is the one the api's own endpoint carries: the stage and
-    // then the resource path, whichever addressing the client reached this emulator by.
+    // then the resource path, whichever addressing the client reached this emulator by
+    // ([`super::stage_qualified_path`], the same reading the stage's access-log
+    // `$context.path` is rendered from).
     reported.insert(
         "path".to_string(),
-        json!(format!("/{stage}{}", proxy.request_path)),
+        json!(super::stage_qualified_path(stage, &proxy.request_path)),
     );
     reported.insert(
         "accountId".to_string(),
