@@ -201,6 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // made due is gone, so this read materialises that removal first and then reports
         // the modelled not-found for it, exactly as every other read of one does.
         store.expire_deleted_target_groups(now);
+        // So is a deregistration: a target whose connection draining has run out is no
+        // longer registered, so this read materialises its removal too — the removal was
+        // owed at this instant whether or not anybody listed the group.
+        store.expire_drained_targets(now);
         let Some(group) = store.target_groups.get(&id) else {
             return Err(not_found(&input.target_group_identifier));
         };
@@ -279,16 +283,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 break;
             }
             page_ends_at = target.sequence;
+            // Derived from the stored records and the clock, so a status is never a health
+            // this service did not measure, and `reasonCode` — "the code for why the
+            // target status is what it is" — is the one that says which case the status it
+            // is reported beside is.
+            let health = store.target_health(group, target, now);
             items.push(TargetSummary {
                 id: Some(target.id.clone()),
                 port: target.port,
-                // Derived from the stored records and the clock, so a status is never a
-                // health this service did not measure.
-                status: Some(store.target_status(group, target, now).to_string()),
-                // `reasonCode` is "the code for why the target status is what it is"; the
-                // model states no code, and this service has no reason to report beyond
-                // the status itself.
-                reason_code: None,
+                status: Some(health.status.to_string()),
+                reason_code: health.reason_code.map(str::to_string),
             });
         }
 

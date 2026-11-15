@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deregisters targets from a persisted target group: each target the group holds leaves
+//! its record — after the connection draining `TargetStatus` documents, where the group's
+//! targets are reached over connections — so `ListTargets` stops reporting it, and is
+//! reported under `successful`. A target the group holds no registration of is reported on
+//! its own under `unsuccessful`.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +114,39 @@ impl From<DeregisterTargetsErrorModeled> for DeregisterTargetsError {
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted target group, built by the
+/// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
+/// not-found message over the submitted identifier, and the kind's resource-type token.
+fn not_found(identifier: &str) -> DeregisterTargetsError {
+    DeregisterTargetsErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        crate::state::ResourceKind::TargetGroup,
+        identifier,
+    ))
+    .into()
+}
+
+/// HTTP 400 for a value a documented SERVICE RULE of this operation refuses — a rule the
+/// model carries no constraint trait for — reported over the bare member the rule
+/// constrains by the service's shared construction
+/// ([`crate::state::service_rule_exception`]).
+fn refused(violation: &crate::state::ServiceRuleViolation) -> DeregisterTargetsError {
+    DeregisterTargetsErrorModeled::ValidationException(crate::state::service_rule_exception(
+        violation,
+    ))
+    .into()
+}
+
+/// HTTP 409 for a deregistration against a target group whose asynchronous deletion is
+/// already under way: the record is still readable but no longer takes writes.
+fn conflict(target_group_id: &str, message: String) -> DeregisterTargetsError {
+    DeregisterTargetsErrorModeled::ConflictException(crate::state::conflict(
+        crate::state::ResourceKind::TargetGroup,
+        target_group_id,
+        message,
+    ))
+    .into()
+}
+
 /// The `DeregisterTargets` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -154,18 +183,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterTargets"))
+        let _ = ctx;
+        // A deregistration carries at most the number of targets `targets`' own modelled
+        // `@length(1, 100)` admits. Checked FIRST — before the state lock is taken and
+        // before any per-target work — so the count a caller chose can never decide how
+        // much work this operation does, or how long it holds the store. The boundary
+        // refuses an over-long list before this handler runs, so this reports the same
+        // violation it would.
+        if let Err(violation) = crate::state::check_target_count(
+            crate::state::TARGETS_MEMBER,
+            input.targets.len(),
+            crate::state::MAX_TARGETS_PER_REGISTRATION,
+        ) {
+            return Err(DeregisterTargetsErrorModeled::ValidationException(
+                crate::state::validation_exception(&[violation]),
+            )
+            .into());
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeregisterTargetsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // `targetGroupIdentifier` is modelled as either the bare id or the target
+        // group's ARN.
+        let Some(id) = crate::state::id_from_identifier(
+            &input.target_group_identifier,
+            crate::state::PREFIX_TARGET_GROUP,
+        ) else {
+            return Err(not_found(&input.target_group_identifier));
+        };
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A delete is asynchronous: a target group whose removal the clock has already
+        // made due is gone, so this deregistration materialises that removal first and
+        // then reports the modelled not-found for it.
+        store.expire_deleted_target_groups(now);
+        // So is a deregistration of a target: one whose connection draining has run out is
+        // already gone before this call looks at what the group holds.
+        store.expire_drained_targets(now);
+        let Some(group) = store.target_groups.get(&id) else {
+            return Err(not_found(&input.target_group_identifier));
+        };
+        if group.deleting_at.is_some() {
+            // The record is readable until the clock removes it, but a write against a
+            // resource whose deletion is under way conflicts with its current state.
+            return Err(conflict(
+                &id,
+                format!("TargetGroup {id} deletion is in progress."),
+            ));
+        }
+
+        // Which target each entry names follows the target group's TYPE, the same way a
+        // registration's does (`Target`'s `id`), and the port it is reached on is the one
+        // the request sent or the group's own configured port — so a deregistration names
+        // exactly the targets a registration stored. A target of a form this service does
+        // not accept at all is input the WHOLE request is malformed in.
+        let mut requested: Vec<(String, Option<i32>)> = Vec::with_capacity(input.targets.len());
+        let mut seen: std::collections::HashSet<(String, Option<i32>)> =
+            std::collections::HashSet::with_capacity(input.targets.len());
+        let group_type = group.group_type.clone();
+        for target in &input.targets {
+            crate::state::check_target_id(&group.group_type, &target.id)
+                .map_err(|violation| refused(&violation))?;
+            let port = crate::state::effective_target_port(group, target.port);
+            if seen.insert((target.id.clone(), port)) {
+                requested.push((target.id.clone(), port));
+            }
+        }
+
+        // The one removal path: a target the group holds leaves its record here, after the
+        // connection draining its type owes it. What it answers is the targets the group
+        // HELD, which is what tells the two members of this response apart.
+        let Some(deregistered) = store.deregister_targets(&id, &requested, now) else {
+            return Err(not_found(&input.target_group_identifier));
+        };
+        let held: std::collections::HashSet<(String, Option<i32>)> = deregistered
+            .into_iter()
+            .map(|target| (target.id, target.port))
+            .collect();
+
+        let mut successful: Vec<Target> = Vec::new();
+        let mut unsuccessful: Vec<TargetFailure> = Vec::new();
+        for (target, port) in requested {
+            if held.contains(&(target.clone(), port)) {
+                // "The targets that were successfully deregistered": the registration this
+                // call removed from the target group's record (or started draining out of
+                // it), read off what the removal answered.
+                successful.push(Target { id: target, port });
+                continue;
+            }
+            // "The targets that the operation couldn't deregister": a target this group
+            // holds no registration of is not a target this call deregistered, so it is
+            // reported per target with the `failureCode` and `failureMessage` the model
+            // carries for one — the same per-target channel a registration reports a
+            // target it cannot register in.
+            unsuccessful.push(TargetFailure {
+                failure_message: Some(crate::state::not_registered_message(
+                    &group_type,
+                    &target,
+                    &id,
+                )),
+                id: Some(target),
+                port,
+                failure_code: Some(crate::state::TARGET_FAILURE_TARGET_NOT_FOUND.to_string()),
+            });
+        }
+
+        Ok(DeregisterTargetsOutput {
+            successful: Some(successful),
+            unsuccessful: Some(unsuccessful),
+        })
     }
 }

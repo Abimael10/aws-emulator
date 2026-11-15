@@ -57,16 +57,22 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const POLL_DEADLINE: Duration = Duration::from_secs(120);
 
 /// A Lambda function ARN — what a target of a `LAMBDA` target group is ("If the target
-/// group type is `LAMBDA`, this is the ARN of a Lambda function", `Target`'s `id`).
-/// Whether the function exists is Lambda's state, not this service's.
-const A_LAMBDA: &str = "arn:aws:lambda:us-west-2:123456789012:function:order-handler";
+/// group type is `LAMBDA`, this is the ARN of a Lambda function", `Target`'s `id`). In the
+/// CALLER's own account ([`state::account_id`]), which is what this service registers a
+/// target of; a function of another account is reported per target (see the
+/// `per_target_failures_and_deregistration` suite, which pins that the account here is the
+/// caller's). Whether the function exists is Lambda's state, not this service's.
+pub(crate) const A_LAMBDA: &str =
+    "arn:aws:lambda:us-west-2:000000000000:function:order-handler";
 
 /// A second, distinct Lambda function ARN; see [`A_LAMBDA`].
-const ANOTHER_LAMBDA: &str = "arn:aws:lambda:us-west-2:123456789012:function:refund-handler";
+pub(crate) const ANOTHER_LAMBDA: &str =
+    "arn:aws:lambda:us-west-2:000000000000:function:refund-handler";
 
-/// An Application Load Balancer ARN — what a target of an `ALB` target group is.
-const AN_ALB: &str =
-    "arn:aws:elasticloadbalancing:us-west-2:123456789012:loadbalancer/app/edge/50dc6c495c0c9188";
+/// An Application Load Balancer ARN — what a target of an `ALB` target group is, in the
+/// caller's own account; see [`A_LAMBDA`].
+pub(crate) const AN_ALB: &str =
+    "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/edge/50dc6c495c0c9188";
 
 /// One row of the registration table: the case, the target-group type, the config the
 /// group is created with, the targets the registration sends, and the (id, port) pairs
@@ -93,7 +99,7 @@ type StatusCase = (
 
 /// The config an `IP` or `INSTANCE` target group cannot be created without, over `HTTP`
 /// with no port, so the port a target gets is the one the protocol documents.
-fn vpc_config(protocol: &str, port: Option<i64>) -> serde_json::Value {
+pub(crate) fn vpc_config(protocol: &str, port: Option<i64>) -> serde_json::Value {
     let mut config = serde_json::json!({ "protocol": protocol, "vpcIdentifier": A_VPC });
     if let Some(port) = port {
         config["port"] = serde_json::json!(port);
@@ -102,7 +108,7 @@ fn vpc_config(protocol: &str, port: Option<i64>) -> serde_json::Value {
 }
 
 /// `POST /targetgroups/{targetGroupIdentifier}/registertargets`.
-async fn register_targets(
+pub(crate) async fn register_targets(
     lattice: &Lattice,
     identifier: &str,
     targets: serde_json::Value,
@@ -118,7 +124,7 @@ async fn register_targets(
 
 /// `POST /targetgroups/{targetGroupIdentifier}/listtargets`, with the query members and
 /// the `targets` filter this case sends.
-async fn list_targets(
+pub(crate) async fn list_targets(
     lattice: &Lattice,
     identifier: &str,
     query: &[(&str, String)],
@@ -141,7 +147,7 @@ async fn list_targets(
 }
 
 /// Create a target group that must succeed, answering its id and ARN.
-async fn a_target_group(
+pub(crate) async fn a_target_group(
     lattice: &Lattice,
     name: &str,
     group_type: &str,
@@ -162,7 +168,7 @@ async fn a_target_group(
 
 /// The (id, port) pairs a member of a response carries, sorted so two answers compare by
 /// content rather than by order.
-fn pairs_of(case: &str, answer: &Answer, member: &str) -> Vec<(String, Option<i64>)> {
+pub(crate) fn pairs_of(case: &str, answer: &Answer, member: &str) -> Vec<(String, Option<i64>)> {
     let entries = answer.body[member].as_array().cloned().unwrap_or_else(|| {
         panic!(
             "case {case:?}: expected the member {member} to be a list, got {}",
@@ -187,7 +193,7 @@ fn pairs_of(case: &str, answer: &Answer, member: &str) -> Vec<(String, Option<i6
 
 /// The (id, port) pairs `ListTargets` reports for `identifier`, with no filter and no
 /// paging.
-async fn listed_pairs(
+pub(crate) async fn listed_pairs(
     lattice: &Lattice,
     case: &str,
     identifier: &str,
@@ -224,7 +230,7 @@ async fn only_target_status(lattice: &Lattice, case: &str, identifier: &str) -> 
 
 /// A listener of `service_identifier` whose default action forwards to `target_group_id`,
 /// so something routes to that target group.
-async fn forward_to(
+pub(crate) async fn forward_to(
     lattice: &Lattice,
     service_identifier: &str,
     name: &str,

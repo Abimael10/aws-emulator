@@ -13,10 +13,23 @@
 //! The DNS NAME a response ANNOUNCES in a `DnsEntry` is read in the `announced_dns` child
 //! module, which every operation that serializes one builds its entry through
 //! ([`announced_dns_entry`]).
+//!
+//! What a registered target REPORTS, which targets a registration ADMITS and what a
+//! deregistration does to the stored records live in the `targets` child module, which the
+//! three operations of the target slice share ([`target_health`](
+//! ComAmazonawsVpclatticeMercurycontrolplaneState::target_health), [`check_target_owner`],
+//! [`deregister_targets`](ComAmazonawsVpclatticeMercurycontrolplaneState::deregister_targets)).
 
 mod announced_dns;
+mod targets;
 
 pub use announced_dns::{announced_dns_entry, announced_dns_name, AnnouncedService};
+pub use targets::{
+    check_target_owner, connections_drain, not_registered_message, TargetHealth, TargetRejection,
+    HEALTH_CHECK_MEMBER, TARGET_DRAINING_TIME, TARGET_FAILURE_INVALID_TARGET,
+    TARGET_FAILURE_TARGET_NOT_FOUND, TARGET_REASON_HEALTH_CHECK_DISABLED,
+    TARGET_REASON_HEALTH_CHECK_NOT_SUPPORTED, TARGET_STATUS_DRAINING,
+};
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -688,12 +701,7 @@ impl TargetGroup {
     /// the target group" (`TargetStatus`) — rather than a health the service never
     /// measured.
     pub fn health_checks_apply(&self) -> bool {
-        config_member_supported(&self.group_type, "healthCheck")
-            && self
-                .config
-                .health_check
-                .as_ref()
-                .is_none_or(|check| check.enabled != Some(false))
+        self.health_check_unavailable_reason().is_none()
     }
 
     /// How long a target of this group reports `INITIAL` before its first health checks
@@ -725,9 +733,16 @@ pub struct RegisteredTarget {
     pub port: Option<i32>,
     /// The instant the clock owes this target the end of its initial health checking, so
     /// a read reports `INITIAL` before it and `HEALTHY` from then on
-    /// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::target_status`]). Stored, never
+    /// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::target_health`]). Stored, never
     /// slept for.
     pub healthy_at: SystemTime,
+    /// The instant the clock owes this target's REMOVAL, set by the deregistration that
+    /// started it
+    /// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::deregister_targets`]); `None`
+    /// for a target no deregistration has touched. A record with a due instant reports
+    /// `DRAINING` until it passes and is then gone
+    /// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::expire_drained_targets`]).
+    pub draining_at: Option<SystemTime>,
     /// Registration order, so a listing pages deterministically. See [`encode_cursor`].
     pub sequence: u64,
 }
@@ -1071,8 +1086,20 @@ pub const TARGET_ID_MEMBER: &str = "id";
 const TARGET_ID_FORM: &[(&str, TargetIdForm)] = &[
     (TYPE_INSTANCE, TargetIdForm::InstanceId),
     (TYPE_IP, TargetIdForm::IpAddress),
-    (TYPE_LAMBDA, TargetIdForm::Arn("lambda")),
-    (TYPE_ALB, TargetIdForm::Arn("elasticloadbalancing")),
+    (
+        TYPE_LAMBDA,
+        TargetIdForm::Arn {
+            service: "lambda",
+            label: "Lambda",
+        },
+    ),
+    (
+        TYPE_ALB,
+        TargetIdForm::Arn {
+            service: "elasticloadbalancing",
+            label: "Application Load Balancer",
+        },
+    ),
 ];
 
 /// The form a target's `id` has to have; see [`TARGET_ID_FORM`].
@@ -1082,8 +1109,13 @@ enum TargetIdForm {
     InstanceId,
     /// An IP address, of either family.
     IpAddress,
-    /// An ARN of the named AWS service.
-    Arn(&'static str),
+    /// An ARN of the named AWS service, which a failure names the target by with `label`
+    /// (`Target`'s `id`: "the ARN of a Lambda function", "the ARN of an Application Load
+    /// Balancer").
+    Arn {
+        service: &'static str,
+        label: &'static str,
+    },
 }
 
 impl TargetIdForm {
@@ -1097,7 +1129,7 @@ impl TargetIdForm {
             Self::IpAddress => id.parse::<std::net::IpAddr>().is_ok(),
             // `arn:<partition>:<service>:<region>:<account>:<resource…>`, so the service
             // is the third colon-separated field of the ARN.
-            Self::Arn(service) => {
+            Self::Arn { service, .. } => {
                 let mut fields = id.split(':');
                 fields.next() == Some("arn")
                     && fields.next().is_some_and(|partition| !partition.is_empty())
@@ -1112,7 +1144,7 @@ impl TargetIdForm {
         match self {
             Self::InstanceId => "an instance ID".to_string(),
             Self::IpAddress => "an IP address".to_string(),
-            Self::Arn(service) => format!("an {service} ARN"),
+            Self::Arn { service, .. } => format!("an {service} ARN"),
         }
     }
 }
@@ -1782,8 +1814,22 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
             .collect();
         let mut registered: Vec<RegisteredTarget> = Vec::with_capacity(requested.len());
         let mut added: Vec<RegisteredTarget> = Vec::new();
+        let mut restored: Vec<(String, Option<i32>)> = Vec::new();
         for pair in requested {
             if let Some(existing) = held.get(pair) {
+                if existing.draining_at.is_some() {
+                    // A target whose deregistration is still draining is REGISTERED again
+                    // by this call: the drain stops and its first health checks start
+                    // over, so what it reports is the registration this call made and not
+                    // the one it replaced.
+                    let mut record = existing.clone();
+                    record.draining_at = None;
+                    record.healthy_at = healthy_at;
+                    held.insert(pair.clone(), record.clone());
+                    restored.push(pair.clone());
+                    registered.push(record);
+                    continue;
+                }
                 registered.push(existing.clone());
                 continue;
             }
@@ -1791,6 +1837,7 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
                 id: pair.0.clone(),
                 port: pair.1,
                 healthy_at,
+                draining_at: None,
                 sequence: self.next_sequence(),
             };
             held.insert(pair.clone(), record.clone());
@@ -1798,6 +1845,16 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
             registered.push(record);
         }
         let group = self.target_groups.get_mut(target_group_id)?;
+        let restored: std::collections::HashSet<(&str, Option<i32>)> = restored
+            .iter()
+            .map(|(id, port)| (id.as_str(), *port))
+            .collect();
+        for target in &mut group.targets {
+            if restored.contains(&(target.id.as_str(), target.port)) {
+                target.draining_at = None;
+                target.healthy_at = healthy_at;
+            }
+        }
         group.targets.extend(added);
         Some(registered)
     }
@@ -1823,35 +1880,6 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
             .iter()
             .filter(|(id, port)| !held.contains(&(id.as_str(), *port)))
             .count()
-    }
-
-    /// The `TargetStatus` of one registered target of `group` at `now`.
-    ///
-    /// Each branch is the status whose OWN documentation describes the state the stored
-    /// records are in (`smithy_query(query="shape",shape="TargetStatus")`): `UNUSED`
-    /// while no listener or rule routes to the target group ("Target group is not used in
-    /// a service", derived from the stored listener and rule records exactly as
-    /// [`Self::service_arns_using`] derives the service list), `UNAVAILABLE` where the
-    /// group runs no health checks at all ("Health checks are unavailable for the target
-    /// group"), and otherwise `INITIAL` until the stored due instant of the target's
-    /// first health checks passes ("Initial health checks on the target are being
-    /// performed") and `HEALTHY` from then on. A pure function of stored state and the
-    /// clock, so reading it changes nothing a later caller sees.
-    pub fn target_status(
-        &self,
-        group: &TargetGroup,
-        target: &RegisteredTarget,
-        now: SystemTime,
-    ) -> &'static str {
-        if self.service_arns_using(&group.id).is_empty() {
-            TARGET_STATUS_UNUSED
-        } else if !group.health_checks_apply() {
-            TARGET_STATUS_UNAVAILABLE
-        } else if now < target.healthy_at {
-            TARGET_STATUS_INITIAL
-        } else {
-            TARGET_STATUS_HEALTHY
-        }
     }
 
     /// Drop every listener of `service_id`, releasing its name and token records.

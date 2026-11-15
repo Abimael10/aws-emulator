@@ -3,7 +3,9 @@
 //! @op RegisterTargets
 //! Registers targets with a persisted target group: each target the group's type admits
 //! is stored on the target-group record and reported under `successful`, so
-//! `ListTargets` reports exactly what this operation stored.
+//! `ListTargets` reports exactly what this operation stored. A target of the right shape
+//! that this service cannot register is reported on its own under `unsuccessful`, with the
+//! accepted targets still stored.
 //!
 //! ## Shape of an operation
 //!
@@ -243,6 +245,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // made due is gone, so this registration materialises that removal first and then
         // reports the modelled not-found for it.
         store.expire_deleted_target_groups(now);
+        // So is a deregistration: a target whose connection draining has run out is no
+        // longer registered, so it frees the room it held before this call counts what it
+        // would store.
+        store.expire_drained_targets(now);
         let Some(group) = store.target_groups.get(&id) else {
             return Err(not_found(&input.target_group_identifier));
         };
@@ -261,12 +267,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Lambda function. If the target group type is ALB, this is the ARN of an
         // Application Load Balancer" (`Target`'s `id`) — and the port it is reached on is
         // the one the registration sent or the group's own configured port, except where a
-        // port does not apply to the target at all. Both are settled before anything is
-        // stored, so a refused registration leaves every target already registered
-        // exactly as it was.
+        // port does not apply to the target at all. A target of a form this service does
+        // not accept at all is input the WHOLE request is malformed in, so it is still the
+        // modelled 400 and nothing is stored.
+        //
+        // A target of the right form that this service cannot REGISTER is a different
+        // thing: the model carries `unsuccessful` (`TargetFailureList`) beside
+        // `successful` for exactly that, so it is reported per target
+        // ([`crate::state::check_target_owner`]) and the targets this call does admit are
+        // still stored. Both passes finish before anything is stored, so a refused
+        // registration leaves every target already registered exactly as it was.
         let mut requested: Vec<(String, Option<i32>)> = Vec::with_capacity(input.targets.len());
         let mut seen: std::collections::HashSet<(String, Option<i32>)> =
             std::collections::HashSet::with_capacity(input.targets.len());
+        let mut unsuccessful: Vec<TargetFailure> = Vec::new();
         for target in &input.targets {
             crate::state::check_target_id(&group.group_type, &target.id)
                 .map_err(|violation| refused(&violation))?;
@@ -274,17 +288,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // One call naming the same target twice registers it once: a target is its id
             // together with the port it is reached on. Membership is a set lookup, so the
             // pass over the submitted list is linear in its length.
-            if seen.insert((target.id.clone(), port)) {
-                requested.push((target.id.clone(), port));
+            if !seen.insert((target.id.clone(), port)) {
+                continue;
             }
+            if let Err(rejection) = crate::state::check_target_owner(&group.group_type, &target.id)
+            {
+                unsuccessful.push(TargetFailure {
+                    // The target the failure is about, as the request submitted it, on the
+                    // port it would have been reached on.
+                    id: Some(target.id.clone()),
+                    port,
+                    failure_code: Some(rejection.failure_code),
+                    failure_message: Some(rejection.failure_message),
+                });
+                continue;
+            }
+            requested.push((target.id.clone(), port));
         }
 
-        // The maximum number of targets this target group holds. For a type whose own
-        // documentation states one — "If it's a Lambda target, you can only have one
-        // target in a target group" (this operation's own documentation) — a registration
-        // past it is input the service does not accept, refused over the `targets` member;
-        // for a type that documents none it is this emulator's own ceiling, which is what
-        // the modelled `ServiceQuotaExceededException` reports.
+        // The maximum number of targets this target group holds, counted over the targets
+        // this call would really STORE — a target reported under `unsuccessful` is not one
+        // of them. For a type whose own documentation states one — "If it's a Lambda
+        // target, you can only have one target in a target group" (this operation's own
+        // documentation) — a registration past it is input the service does not accept,
+        // refused over the `targets` member; for a type that documents none it is this
+        // emulator's own ceiling, which is what the modelled
+        // `ServiceQuotaExceededException` reports.
         let documented = crate::state::documented_target_maximum(&group.group_type);
         let group_type = group.group_type.clone();
         let ceiling = group.target_ceiling();
@@ -314,13 +343,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(RegisterTargetsOutput {
             successful: Some(successful),
-            // Every target this service refuses, it refuses for the whole call: a target
-            // reaching here is of the form its target group's type demands and inside the
-            // number of targets that group holds, and whether the instance, address,
-            // function or load balancer it names exists is the owning service's state,
-            // which this operation is not modelled to consult. So no individual target
-            // fails, and the member reports the empty list rather than being left absent.
-            unsuccessful: Some(Vec::new()),
+            // The targets this service accepted the shape of but could not register, one
+            // entry each with the `failureCode` and `failureMessage` the model carries for
+            // them — the empty list when every submitted target was stored.
+            unsuccessful: Some(unsuccessful),
         })
     }
 }
