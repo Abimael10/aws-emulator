@@ -80,6 +80,8 @@ mod pagination_window;
 mod point_in_time_recovery_window;
 #[path = "all/read_responses_serve_always_present_members.rs"]
 mod read_responses_serve_always_present_members;
+#[path = "all/refusal_fault_templates.rs"]
+mod refusal_fault_templates;
 #[path = "all/refusal_sentences.rs"]
 mod refusal_sentences;
 #[path = "all/region_scoped_page_tokens.rs"]
