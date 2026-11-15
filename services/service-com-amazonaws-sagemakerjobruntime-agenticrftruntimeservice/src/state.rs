@@ -719,8 +719,9 @@ pub const EMPTY_BODY_MESSAGE: &str = "Body must carry the inference request payl
 ///
 /// Each operation renders this as one of its OWN modelled errors — a quota as
 /// its `ServiceQuotaExceededException`, anything else as its
-/// `ValidationException` — so the decision lives here and only the error enum
-/// is named at the handler.
+/// `ValidationException` — through [`SamplingRefusal::into_modelled_error`], the
+/// one place that branch is written: the decision lives here, beside the flag it
+/// reads, and only the error enum is named at the handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SamplingRefusal {
     message: String,
@@ -755,6 +756,28 @@ impl SamplingRefusal {
     #[must_use]
     pub fn into_message(self) -> String {
         self.message
+    }
+
+    /// Report this refusal as one of the calling operation's OWN modelled
+    /// errors: a quota through `quota`, anything else through `invalid`, each
+    /// handed the sentence to report.
+    ///
+    /// The branch itself lives HERE, beside the flag that decides it, so a
+    /// sampling operation hands this its two error constructors and names
+    /// nothing but its own enum — neither of them can come to report a
+    /// non-quota refusal as something else while this module still owns which
+    /// refusal is which.
+    #[must_use]
+    pub fn into_modelled_error<E>(
+        self,
+        quota: impl FnOnce(String) -> E,
+        invalid: impl FnOnce(String) -> E,
+    ) -> E {
+        if self.quota {
+            quota(self.message)
+        } else {
+            invalid(self.message)
+        }
     }
 }
 

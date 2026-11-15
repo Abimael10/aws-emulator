@@ -67,6 +67,9 @@ mod rollout_resolution_is_one_path;
 #[path = "all/sampling_path_is_shared.rs"]
 mod sampling_path_is_shared;
 
+#[path = "all/sampling_refusal_is_rendered_once.rs"]
+mod sampling_refusal_is_rendered_once;
+
 #[path = "all/served_turn_reports_the_job.rs"]
 mod served_turn_reports_the_job;
 

@@ -125,6 +125,14 @@ fn validation(message: String) -> SampleWithResponseStreamError {
         .into()
 }
 
+/// This operation's own modelled 402 `ServiceQuotaExceededException`.
+fn quota_exceeded(message: String) -> SampleWithResponseStreamError {
+    SampleWithResponseStreamErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException { message },
+    )
+    .into()
+}
+
 pub struct SampleWithResponseStream<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
@@ -204,18 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             },
         )
-        .map_err(|refusal| {
-            if refusal.is_quota() {
-                SampleWithResponseStreamErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: refusal.into_message(),
-                    },
-                )
-                .into()
-            } else {
-                validation(refusal.into_message())
-            }
-        })?;
+        // The SAME decision `Sample` reports a refusal through — whether a
+        // refusal is a quota is settled once, beside the flag, by
+        // `crate::state::SamplingRefusal::into_modelled_error` — so all this
+        // operation adds is the pair of its OWN modelled errors.
+        .map_err(|refusal| refusal.into_modelled_error(quota_exceeded, validation))?;
 
         Ok(SampleWithResponseStreamOutput {
             content_type: Some(turn.content_type),

@@ -119,6 +119,12 @@ fn validation(message: String) -> SampleError {
     SampleErrorModeled::ValidationException(ValidationException { message }).into()
 }
 
+/// This operation's own modelled 402 `ServiceQuotaExceededException`.
+fn quota_exceeded(message: String) -> SampleError {
+    SampleErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException { message })
+        .into()
+}
+
 /// The `Sample` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -204,16 +210,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             },
         )
-        .map_err(|refusal| {
-            if refusal.is_quota() {
-                SampleErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
-                    message: refusal.into_message(),
-                })
-                .into()
-            } else {
-                validation(refusal.into_message())
-            }
-        })?;
+        // WHICH refusal is a quota is decided once, by the shared path that
+        // answers it (`crate::state::SamplingRefusal::into_modelled_error`); all
+        // this operation adds is the pair of its OWN modelled errors the
+        // sentence is reported through.
+        .map_err(|refusal| refusal.into_modelled_error(quota_exceeded, validation))?;
 
         Ok(SampleOutput {
             content_type: Some(turn.content_type),
