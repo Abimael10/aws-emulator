@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSnapshotAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSnapshotAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSnapshotAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE `SnapshotAttributeName` attribute of one EBS snapshot of the account-visible
+//! inventory, read off the stores that hold that snapshot: `createVolumePermission` is who may
+//! create a volume from it ([`crate::state::snapshot_is_public`]), and `productCodes` the
+//! Marketplace codes it is billed through
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::snapshot_product_codes`]). A pure read: it
+//! writes nothing, so two calls in a row report the same thing.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +70,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{
+    EXECUTABLE_BY_ALL, INVALID_SNAPSHOT_ID_MALFORMED,
+    SNAPSHOT_ATTRIBUTE_CREATE_VOLUME_PERMISSION, SNAPSHOT_ATTRIBUTE_PRODUCT_CODES,
+    dry_run_operation, echoed_resource_id, invalid_snapshot_id_not_found, require_service_state,
+    snapshot_id_is_well_formed, snapshot_is_public, unknown_attribute_parameter_value,
+    visible_snapshot,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,18 +146,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSnapshotAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSnapshotAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSnapshotAttribute"))
+        // `ctx` carries request metadata only; this operation reads none of it — the snapshot
+        // is named by id. The stores are reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "You can specify only one attribute at a time" — `Attribute` is one
+        // `SnapshotAttributeName`, and the response carries only the member it names. The
+        // modelled enum constraint is already refused by the request walk before this handler
+        // runs, so this is the same belt-and-braces check `DescribeVolumeAttribute` and
+        // `DescribeImageAttribute` keep: without it an attribute no result member corresponds
+        // to would be answered with a response carrying no attribute at all.
+        let attribute = input.attribute.as_str();
+        if !SNAPSHOT_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
+            return Err(unknown_attribute_parameter_value(attribute));
+        }
+
+        // A value that is no snapshot id EC2 could have ISSUED is refused BEFORE the inventory
+        // is looked at — a request the service cannot read as an id at all is a different
+        // cause from one naming a snapshot nobody holds, which is the ordering
+        // `DescribeVolumeAttribute` keeps for its own id.
+        if !snapshot_id_is_well_formed(&input.snapshot_id) {
+            return Err(snapshot_id_is_not_an_issued_id(&input.snapshot_id));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        // A read, and only a read: the guard is taken to report what the stores hold. The
+        // `pending` -> `completed` move the clock owes a snapshot is DERIVED by the projection
+        // the resolution answers with rather than written, so this read changes nothing a
+        // later caller sees.
+        let store = state.lock();
+        // ONE instant per clock for the whole answer, the way the inventory's own report reads
+        // them: the monotonic one the account's records measure their due transitions against,
+        // and the wall-clock one the direct-API side compares its timeouts against.
+        let now = ::std::time::Instant::now();
+        let observed = ::std::time::SystemTime::now();
+        let account = ::engine::emulator_account_id();
+
+        // "Describes the specified attribute of the specified snapshot": the snapshot first,
+        // since every member of the response is a fact of it, resolved against the whole
+        // account-visible inventory ([`visible_snapshot`]) — a well-formed id no side of it
+        // holds a snapshot for is the not-found cause, in the crate's one wording for it.
+        let snapshot = visible_snapshot(&store, &*self.engine, &input.snapshot_id, now, observed)
+            .ok_or_else(|| invalid_snapshot_id_not_found(&input.snapshot_id))?;
+
+        // The request is one that would have succeeded, so a dry run stops HERE, having
+        // resolved the snapshot and reported nothing: "If you have the required permissions,
+        // the error response is DryRunOperation" (`DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        Ok(DescribeSnapshotAttributeOutput {
+            // "The ID of the EBS snapshot" the attribute belongs to, read off the resolved
+            // record rather than echoed from the request.
+            snapshot_id: snapshot.snapshot_id.clone(),
+            // Each member of the result reports the attribute of the same name, so only the
+            // one the request named is filled in. The member asked about is always REPORTED,
+            // as the list the snapshot carries, EMPTY or not — a snapshot nobody has shared is
+            // one whose create volume permissions are none, which is a different answer from
+            // "this snapshot has no such attribute" — the way `DescribeVolumeAttribute`
+            // reports a volume's product codes.
+            create_volume_permissions: (attribute == SNAPSHOT_ATTRIBUTE_CREATE_VOLUME_PERMISSION)
+                .then(|| create_volume_permissions(&snapshot, account)),
+            product_codes: (attribute == SNAPSHOT_ATTRIBUTE_PRODUCT_CODES)
+                .then(|| store.snapshot_product_codes(&snapshot, account)),
+        })
     }
 }
+
+/// "The name of the group" a PUBLIC snapshot's create volume permission names
+/// (`CreateVolumePermission$Group`, "the group to be added or removed. The possible value is
+/// `all`"): the `PermissionGroup` enum's only member (the generated catalog
+/// [`PERMISSION_GROUP_VALUES`]), which is the same term `DescribeSnapshots` selects public
+/// snapshots with through its `RestorableByUserIds` member. DEFINED as that one
+/// ([`EXECUTABLE_BY_ALL`]), so the group a permission reports and the term that selects on it
+/// cannot drift apart — the same definition `DescribeImageAttribute` gives an AMI's public
+/// launch permission.
+const CREATE_VOLUME_PERMISSION_GROUP_ALL: &str = EXECUTABLE_BY_ALL;
+
+/// "The users and groups that have the permissions for creating volumes from the snapshot"
+/// (`DescribeSnapshotAttributeResult$CreateVolumePermissions`), out of what the stores hold
+/// about `snapshot`.
+///
+/// A PUBLIC snapshot ([`snapshot_is_public`]) is one every account may create a volume from,
+/// and that permission is the one AWS reports as a GROUP rather than as an account — the
+/// `PermissionGroup` enum's single member ([`CREATE_VOLUME_PERMISSION_GROUP_ALL`]). A snapshot
+/// of the calling account carries NONE: the owner's own permission is implicit ("an Amazon Web
+/// Services account has implicit create volume permissions for all snapshots it owns",
+/// `DescribeSnapshots`) and so is not one of the permissions this attribute lists, and an
+/// explicit per-account or public permission is granted through `ModifySnapshotAttribute`,
+/// which is still a scaffold, so no stored snapshot carries one — the same reading
+/// `DescribeSnapshots`' `RestorableByUserIds` matcher gives the same stores.
+fn create_volume_permissions(
+    snapshot: &crate::state::SnapshotView,
+    account: &str,
+) -> Vec<CreateVolumePermission> {
+    if !snapshot_is_public(snapshot, account) {
+        return Vec::new();
+    }
+    vec![CreateVolumePermission {
+        group: Some(CREATE_VOLUME_PERMISSION_GROUP_ALL.to_string()),
+        ..CreateVolumePermission::default()
+    }]
+}
+
+/// Refuse a value that is no snapshot id of the form EC2 ISSUES: HTTP 400
+/// [`INVALID_SNAPSHOT_ID_MALFORMED`], in the sentence this operation's PARAMETER layer words
+/// every value it rejects with.
+///
+/// The CODE is the snapshot's own malformed-id code, and the WORDING is this operation's: the
+/// fixed text `Value ( `, ` ) for parameter `, the name that layer gives the member that
+/// carried it ([`SNAPSHOT_PARAMETER`]), and ` is invalid. ` around the value the request sent,
+/// which is the only part that varies. That layer appends a reason after the period, and a
+/// value it could not read as an id has none to add, so the message ends with the separating
+/// space and nothing after it — the same form [`crate::ops::create_snapshot`] carries for the
+/// volume id of a create, and the same spacing and member case, as the recorded
+/// `DescribeSnapshotAttribute` call behind
+/// `issues/.../20261023T102725Z-ec2-describesnapshotattribute-stub.md` carries them.
+///
+/// It lives in this file rather than in `crate::state` because this is the only operation
+/// recorded answering a snapshot id in this class — EC2 answers an id it cannot read in the
+/// wording of the LAYER that read it, and the same crate's `DescribeSnapshots` refuses an
+/// entry of its id LIST at the parameter layer under `InvalidParameterValue`
+/// ([`crate::state::SNAPSHOT_IDS_PARAMETER`]) while a fast snapshot restore reports
+/// [`crate::state::unresolvable_snapshot_id`]'s own sentence.
+///
+/// The echoed value is cut to length by [`echoed_resource_id`], the ceiling this crate holds
+/// every refusal that quotes a caller-chosen value to.
+fn snapshot_id_is_not_an_issued_id<E>(snapshot_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SNAPSHOT_ID_MALFORMED,
+        400,
+        format!(
+            "Value ( {} ) for parameter {SNAPSHOT_PARAMETER} is invalid. ",
+            echoed_resource_id(snapshot_id)
+        ),
+    )
+}
+
+/// The name EC2's parameter layer gives `DescribeSnapshotAttributeRequest$SnapshotId` in the
+/// refusal above: the resource the member names, in the case that layer spells it — the same
+/// layer calls `DescribeSnapshots`' id LIST `snapshotId`
+/// ([`crate::state::SNAPSHOT_IDS_PARAMETER`]), so neither the case nor the plurality is
+/// derivable from the member's own name and each is taken from the recorded refusal.
+const SNAPSHOT_PARAMETER: &str = "SNAPSHOT";

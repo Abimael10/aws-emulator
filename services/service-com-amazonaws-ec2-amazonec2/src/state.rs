@@ -2174,6 +2174,13 @@ pub use direct_api_snapshots::*;
 pub mod published_snapshots;
 pub use published_snapshots::*;
 
+/// The ATTRIBUTES of one snapshot of the account-visible inventory — which snapshot an id
+/// names across the three sides that hold one, whether every account may create a volume from
+/// it, and the Marketplace codes it is billed through — in a module of its own, re-exported so
+/// a handler reaches them as `crate::state::<item>` like every other primitive here.
+pub mod snapshot_attributes;
+pub use snapshot_attributes::*;
+
 /// The ACM certificates the account holds, as the EC2 operations that take a certificate ARN
 /// resolve one: the certificate is ACM's resource, so this ASKS that service over the
 /// emulator's in-process callback instead of keeping a second copy of it. In a module of its

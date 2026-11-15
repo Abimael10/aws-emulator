@@ -602,9 +602,13 @@ fn owner_matches(snapshot: &SnapshotView, term: &str, account: &str) -> bool {
 /// snapshots it owns"): public and explicit permissions on a snapshot of the account are
 /// granted through `ModifySnapshotAttribute`, which is still a scaffold, so no snapshot of
 /// the account carries one and none can be reported for one.
+///
+/// WHICH snapshots are public is the ONE test [`crate::state::snapshot_is_public`] holds, so
+/// this narrowing and the create volume permissions `DescribeSnapshotAttribute` reports for
+/// one snapshot cannot disagree about it.
 fn restorable_by_matches(snapshot: &SnapshotView, term: &str, account: &str) -> bool {
     if term == RESTORABLE_BY_ALL {
-        return snapshot.owner_id.as_deref() != Some(account);
+        return crate::state::snapshot_is_public(snapshot, account);
     }
     let user = if term == crate::state::OWNER_SELF {
         account

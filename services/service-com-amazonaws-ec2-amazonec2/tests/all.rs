@@ -19,6 +19,13 @@
 // address carries no public DNS name. Declared beside `prefix_lists` for the reason the note
 // above gives: the sorted neighbourhood and the tail of this file are where every new ec2
 // suite inserts its lines.
+// `DescribeSnapshotAttribute`: the one attribute a read reports of a snapshot of each side of
+// the account-visible inventory — who may create a volume from it and the Marketplace codes it
+// is billed through — plus what it refuses. Declared beside `prefix_lists` for the reason the
+// note above gives: the sorted neighbourhood and the tail of this file are where every new ec2
+// suite inserts its lines.
+#[path = "all/snapshot_attributes.rs"]
+mod snapshot_attributes;
 // Which resource ids a tagging call resolves, over the taggable resource kinds beside the
 // few the other tag suites drive: the write reads back through the resource's own describe
 // and through `DescribeTags`, and an id that names nothing is refused in its kind's words.

@@ -1404,3 +1404,12 @@ mod lambda_in_function_assumed_role_session;
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs` check both rules, for this file
 // and for every service crate's `tests/all.rs`, so check there rather than leaving a note
 // here.
+//! Single integration-test target for the router: one `#[path]`/`mod` pair per suite.
+//! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list sorted.
+//! A suite no `mod` names compiles nowhere and its tests never run, and a suite left at the
+//! top level of `tests/` fails the build. Declare each suite exactly ONCE: this is one crate
+//! root, so a second `mod` for the same name is `E0428`. THIS BLOCK IS THE ONLY PLACE AN
+//! INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE: past the first item one is `E0753` and
+//! compiles no suite of this target, so add a declaration below, never a note about one.
+//! every service crate's `tests/all.rs`. What a suite covers belongs in that suite's own
+//! module header; the notes earlier landings appended here live in `all/appended_notes.rs`.
