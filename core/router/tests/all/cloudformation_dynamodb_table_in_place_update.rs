@@ -81,7 +81,15 @@ fn build_router() -> MultiServiceRouter {
 }
 
 /// Call one Amazon DynamoDB operation over its own awsJson1_0 wire.
-async fn dynamodb(router: &MultiServiceRouter, operation: &str, request: &Value) -> (u16, Value) {
+///
+/// `pub(crate)` for the reason [`wait_for_stack_status`] is: every suite that deploys a
+/// table through CloudFormation and then uses it needs exactly this caller, and a suite that
+/// writes its own drifts from the others.
+pub(crate) async fn dynamodb(
+    router: &MultiServiceRouter,
+    operation: &str,
+    request: &Value,
+) -> (u16, Value) {
     let http_request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -98,7 +106,7 @@ async fn dynamodb(router: &MultiServiceRouter, operation: &str, request: &Value)
 }
 
 /// What `DescribeTable` reports for `name`, with the HTTP status it answered.
-async fn described_table(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
+pub(crate) async fn described_table(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
     dynamodb(router, "DescribeTable", &json!({"TableName": name})).await
 }
 

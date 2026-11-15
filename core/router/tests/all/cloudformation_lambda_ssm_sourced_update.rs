@@ -150,7 +150,14 @@ async fn cloudformation(
 }
 
 /// Call one Systems Manager operation over its awsJson1_1 wire.
-async fn ssm(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+///
+/// `pub(crate)` so a suite that reads a parameter a stack wrote calls this one rather than
+/// adding another copy: a suite that writes its own drifts from the others.
+pub(crate) async fn ssm(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")

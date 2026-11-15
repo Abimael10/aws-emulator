@@ -1510,3 +1510,5 @@ mod zz_probe_whole_emulator;
 // Single integration-test target for the router: the declaration list, and nothing else.
 #[path = "all/cloudformation_http_api_lambda_invoke_permission.rs"]
 mod cloudformation_http_api_lambda_invoke_permission;
+#[path = "all/cloudformation_generated_table_name_resolves_in_dynamodb.rs"]
+mod cloudformation_generated_table_name_resolves_in_dynamodb;
