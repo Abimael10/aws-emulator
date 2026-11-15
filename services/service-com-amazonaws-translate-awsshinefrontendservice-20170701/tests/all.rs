@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/batch_translation_jobs.rs"]
 mod batch_translation_jobs;
+#[path = "all/document_not_found_status.rs"]
+mod document_not_found_status;
 #[path = "all/document_translation.rs"]
 mod document_translation;
 #[path = "all/not_found_status.rs"]

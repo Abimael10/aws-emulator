@@ -25,13 +25,13 @@ use crate::terminology_lifecycle::{
 };
 
 /// Unformatted text (`smithy_query shape=Document member=ContentType`).
-const CONTENT_TYPE_PLAIN: &str = "text/plain";
+pub(crate) const CONTENT_TYPE_PLAIN: &str = "text/plain";
 
 /// HTML content (same member).
-const CONTENT_TYPE_HTML: &str = "text/html";
+pub(crate) const CONTENT_TYPE_HTML: &str = "text/html";
 
 /// A Word document (same member).
-const CONTENT_TYPE_WORD: &str =
+pub(crate) const CONTENT_TYPE_WORD: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
 /// The documented size limit on one synchronous translation's document, in
@@ -41,12 +41,12 @@ const MAX_DOCUMENT_BYTES: usize = 100 * 1024;
 
 /// A paragraph of English, long enough for the statistical detector the service
 /// resolves `auto` with to place it.
-const ENGLISH_TEXT: &str = "The quick brown fox jumps over the lazy dog while the gardener \
-                            waters the roses in the early morning light.";
+pub(crate) const ENGLISH_TEXT: &str = "The quick brown fox jumps over the lazy dog while the \
+                                      gardener waters the roses in the early morning light.";
 
 /// The same, in French.
-const FRENCH_TEXT: &str = "Le rapide renard brun saute par-dessus le chien paresseux pendant \
-                           que le jardinier arrose les roses tôt le matin.";
+pub(crate) const FRENCH_TEXT: &str = "Le rapide renard brun saute par-dessus le chien paresseux \
+                                     pendant que le jardinier arrose les roses tôt le matin.";
 
 /// The name the tests import [`EN_FR_CSV`] under.
 const TERMS: &str = "doc-terms";
@@ -57,7 +57,7 @@ fn blob(content: &[u8]) -> String {
     aws_smithy_types::base64::encode(content)
 }
 
-fn document_body(
+pub(crate) fn document_body(
     content: &[u8],
     content_type: &str,
     source: &str,
@@ -110,7 +110,7 @@ fn word_document_part(paragraphs: &[&str]) -> String {
 /// A Word document carrying `paragraphs`, as a real Office Open XML package:
 /// the archive format is the `zip` crate's, here and in the handler that reads
 /// it back.
-fn word_document(paragraphs: &[&str]) -> Vec<u8> {
+pub(crate) fn word_document(paragraphs: &[&str]) -> Vec<u8> {
     let mut buffer = Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
