@@ -63,7 +63,10 @@
 //! build, and it is stored keyed by its own ARN, which carries the [`normalized_name`]:
 //! "Pipeline names must be unique to your account in each Amazon Web Services Region.
 //! Image Builder generates the pipeline ARN from a normalized form of the name"
-//! (`CreateImagePipeline`'s `name`). Two of the members a pipeline read reports are NOT
+//! (`CreateImagePipeline`'s `name`) — so `UpdateImagePipeline` REPLACES that record under
+//! the same key, exactly as an infrastructure configuration's update does
+//! ([`ComAmazonawsImagebuilderImagebuilderState::replace_image_pipeline`]).
+//! Two of the members a pipeline read reports are NOT
 //! held on the record: the date of its last run and the status of that run are read from
 //! the newest image build version that names the pipeline as its source
 //! ([`ComAmazonawsImagebuilderImagebuilderState::image_pipeline_view`]), so what a read
@@ -152,6 +155,10 @@ pub use image_pipeline_listing::*;
 /// How an UPDATE of an infrastructure configuration replaces the stored record.
 mod infrastructure_configuration_update;
 pub use infrastructure_configuration_update::*;
+
+/// How an UPDATE of an image pipeline replaces the stored record.
+mod image_pipeline_update;
+pub use image_pipeline_update::*;
 
 /// How a resource this store holds is forgotten. The module adds methods to this service's
 /// state rather than items of its own, so there is nothing to re-export from it.
@@ -3472,34 +3479,10 @@ pub fn image_pipeline_request_fingerprint(input: &CreateImagePipelineInput) -> S
         "imageScanningConfiguration",
         image_scanning_fingerprint(input.image_scanning_configuration.as_ref()),
     );
-    fields.insert(
-        "schedule",
-        input.schedule.as_ref().map_or_else(
-            || ABSENT.to_string(),
-            |schedule| {
-                group(&[
-                    text(schedule.schedule_expression.as_deref()),
-                    text(schedule.timezone.as_deref()),
-                    text(schedule.pipeline_execution_start_condition.as_deref()),
-                    schedule.auto_disable_policy.as_ref().map_or_else(
-                        || ABSENT.to_string(),
-                        |policy| number(Some(policy.failure_count)),
-                    ),
-                ])
-            },
-        ),
-    );
+    fields.insert("schedule", schedule_fingerprint(input.schedule.as_ref()));
     fields.insert(
         "loggingConfiguration",
-        input.logging_configuration.as_ref().map_or_else(
-            || ABSENT.to_string(),
-            |logging| {
-                group(&[
-                    text(logging.image_log_group_name.as_deref()),
-                    text(logging.pipeline_log_group_name.as_deref()),
-                ])
-            },
-        ),
+        pipeline_logging_fingerprint(input.logging_configuration.as_ref()),
     );
     fields.insert("workflows", workflows_fingerprint(input.workflows.as_deref()));
     fields

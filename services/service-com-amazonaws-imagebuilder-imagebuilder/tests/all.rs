@@ -41,6 +41,8 @@ mod image_creation;
 mod image_packages;
 #[path = "all/image_pipeline_execution.rs"]
 mod image_pipeline_execution;
+#[path = "all/image_pipeline_update.rs"]
+mod image_pipeline_update;
 #[path = "all/image_read.rs"]
 mod image_read;
 #[path = "all/infrastructure_configuration.rs"]

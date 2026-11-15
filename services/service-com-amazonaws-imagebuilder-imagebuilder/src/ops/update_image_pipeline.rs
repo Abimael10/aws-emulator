@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateImagePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateImagePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateImagePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces one stored image pipeline's entire configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -151,6 +143,8 @@
 //!   processed the request. Retrying the request may succeed.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unable to process your request
 //!   at this time.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   "At least one of the resources referenced by your request does not exist."
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -166,7 +160,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `UpdateImagePipelineError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#UpdateImagePipeline")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors` for the reason
+// `CreateImagePipeline` widens it in: the pipeline this request replaces, and every
+// resource the replacement references — the infrastructure configuration, the recipe, a
+// distribution configuration, a workflow — may name nothing stored, this SERVICE models
+// that shape for exactly that case (`com.amazonaws.imagebuilder#ResourceNotFoundException`,
+// HTTP 404, "At least one of the resources referenced by your request does not exist",
+// declared in `types/shared_types.rs`), and this operation's own `errors` list omits it. So
+// a reference that resolves to nothing is reported MISSING rather than dressed up as an
+// invalid request, which is a different claim a client branches on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#UpdateImagePipeline",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateImagePipelineErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
@@ -175,6 +182,7 @@ pub enum UpdateImagePipelineErrorModeled {
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
     InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -230,18 +238,242 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateImagePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateImagePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateImagePipeline"))
+        // Every modelled constraint on this input — the ARN patterns, the string lengths,
+        // the tag-map bounds, the `PipelineStatus` enum — has been refused by the
+        // centralized walk before this body runs, so what is checked here is only what the
+        // model cannot say.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateImagePipelineErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // "You must specify exactly one recipe for your image, using either a
+        // containerRecipeArn or an imageRecipeArn" — the same rule, read the same way, as
+        // the create's: the model can say neither that one of the two is required nor that
+        // they exclude each other, and the two halves of it are DIFFERENT failures. A
+        // request that named NONE of the group is missing a required parameter
+        // (`crate::state::MISSING_PARAMETERS_CODE`), naming the members it could have
+        // carried; one that named BOTH carries a combination that cannot hold together,
+        // which is the modelled invalid-request class.
+        if input.image_recipe_arn.is_none() && input.container_recipe_arn.is_none() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MISSING_PARAMETERS_CODE,
+                crate::state::MISSING_PARAMETERS_STATUS,
+                crate::state::missing_parameters_message(&crate::state::PIPELINE_RECIPE_MEMBERS),
+            ));
+        }
+        if input.image_recipe_arn.is_some() && input.container_recipe_arn.is_some() {
+            return Err(refused(crate::state::exactly_one_recipe_message()));
+        }
+
+        // "You must also specify executionRole when you provide workflows."
+        if input.workflows.is_some() && input.execution_role.is_none() {
+            return Err(refused(
+                crate::state::workflows_without_execution_role_message(),
+            ));
+        }
+
+        let fingerprint = crate::state::image_pipeline_update_fingerprint(&input);
+
+        // The idempotency check, the lookup, the reference resolution and the replacement
+        // happen under ONE lock, so concurrent updates are serialized: the pipeline one of
+        // them stores is the one every later read reports.
+        let mut store = state.lock();
+
+        // "If you retry a request with the same client token, Image Builder returns the
+        // original response without running the operation again" — so a retry answers with
+        // the ORIGINAL response, down to its `requestId`, and does NOT write again. The
+        // same token carrying different settings is the modelled mismatch instead.
+        if let Some(receipt) = store.image_pipeline_update_receipt(&region, &input.client_token) {
+            if receipt.fingerprint != fingerprint {
+                return Err(
+                    UpdateImagePipelineErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(UpdateImagePipelineOutput {
+                request_id: Some(receipt.request_id.clone()),
+                client_token: Some(receipt.client_token.clone()),
+                image_pipeline_arn: Some(receipt.arn.clone()),
+            });
+        }
+
+        // The pipeline this request names has to exist to be replaced, and a regional
+        // endpoint reaches only its own Region's pipelines, so an ARN naming none is
+        // reported MISSING.
+        let Some(stored) = store.image_pipeline(&input.image_pipeline_arn, &region).cloned() else {
+            return Err(missing(&input.image_pipeline_arn));
+        };
+
+        // "The recipe must be the same type, image or container, as the pipeline's current
+        // recipe" — a pipeline holds exactly one of the two references, so the replacement
+        // has to fill the same one
+        // ([`crate::state::ImagePipelineRecord::admits_recipe_kind`]).
+        if !stored.admits_recipe_kind(
+            input.image_recipe_arn.as_deref(),
+            input.container_recipe_arn.as_deref(),
+        ) {
+            return Err(refused(crate::state::recipe_kind_mismatch_message()));
+        }
+
+        // Every resource the replacement references has to BE a stored resource of this
+        // Region, as it does for the create, so a reference naming nothing is reported
+        // MISSING rather than stored.
+        if store
+            .infrastructure_configuration(&input.infrastructure_configuration_arn, &region)
+            .is_none()
+        {
+            return Err(missing(&input.infrastructure_configuration_arn));
+        }
+
+        // The platform a pipeline reports is "inherited from the recipe that the pipeline
+        // uses", so the replacement's recipe is what the replaced record's platform is read
+        // from — resolved the way every versioned reference of this service is, so a
+        // pipeline may hold a wildcard version and each of its runs builds the newest
+        // recipe that reference reaches.
+        let platform = match input
+            .image_recipe_arn
+            .as_deref()
+            .or(input.container_recipe_arn.as_deref())
+        {
+            Some(reference) => match store.resolve_built_recipe(reference, &region) {
+                Some(built) => Some(built.platform),
+                None => return Err(missing(reference)),
+            },
+            // Refused above: exactly one of the two is named.
+            None => None,
+        };
+
+        if let Some(reference) = &input.distribution_configuration_arn {
+            if store.distribution_configuration(reference, &region).is_none() {
+                return Err(missing(reference));
+            }
+        }
+        // How many references a request names is the caller's to choose and each one is a
+        // lookup against the store, so the references are resolved through the one bounded
+        // path this store has for them.
+        match store.unresolved_workflow(
+            input
+                .workflows
+                .iter()
+                .flatten()
+                .map(|configuration| configuration.workflow_arn.as_str()),
+            &region,
+        ) {
+            crate::state::WorkflowReferences::AllResolved => {}
+            crate::state::WorkflowReferences::Unresolved(reference) => {
+                return Err(missing(reference))
+            }
+            crate::state::WorkflowReferences::TooMany => {
+                return Err(refused(crate::state::too_many_request_workflows_message()))
+            }
+        }
+
+        let request_id = crate::state::new_request_id();
+        let client_token = input.client_token.clone();
+        let arn = stored.arn.clone();
+
+        // The REPLACEMENT: "UpdateImagePipeline does not support selective updates. The
+        // request replaces the pipeline's entire configuration, so include every setting
+        // that you want to keep. Any optional property that you omit is removed or reset to
+        // its default." So every setting comes from this request, with the defaults the
+        // service documents filled in where it omitted one, and the three members an update
+        // request cannot carry are the stored record's: the name the ARN was derived from,
+        // the pipeline's own tags, and the instant it was created.
+        store.replace_image_pipeline(
+            crate::state::ImagePipelineRecord {
+                arn: arn.clone(),
+                region,
+                name: stored.name,
+                description: input.description,
+                platform,
+                enhanced_image_metadata_enabled: input
+                    .enhanced_image_metadata_enabled
+                    .unwrap_or(crate::state::DEFAULT_ENHANCED_IMAGE_METADATA_ENABLED),
+                image_recipe_arn: input.image_recipe_arn,
+                container_recipe_arn: input.container_recipe_arn,
+                infrastructure_configuration_arn: input.infrastructure_configuration_arn,
+                distribution_configuration_arn: input.distribution_configuration_arn,
+                // The create stores "a default configuration with image tests enabled"
+                // when a request carries no test settings, and an omitted property of an
+                // update is "reset to its default", so a replacement that omits them
+                // stores that same configuration and a read then reports it.
+                image_tests_configuration: ImageTestsConfiguration {
+                    image_tests_enabled: Some(
+                        input
+                            .image_tests_configuration
+                            .as_ref()
+                            .and_then(|configuration| configuration.image_tests_enabled)
+                            .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_ENABLED),
+                    ),
+                    timeout_minutes: Some(
+                        input
+                            .image_tests_configuration
+                            .as_ref()
+                            .and_then(|configuration| configuration.timeout_minutes)
+                            .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_TIMEOUT_MINUTES),
+                    ),
+                },
+                // "Because the update replaces the entire configuration, omitting this
+                // property removes any existing schedule" (`schedule`).
+                schedule: input.schedule,
+                // "Defaults to ENABLED when omitted. To keep a pipeline disabled, include
+                // this property set to DISABLED in your update request" (`status`).
+                status: input
+                    .status
+                    .unwrap_or_else(|| crate::state::PIPELINE_STATUS_ENABLED.to_string()),
+                // The pipeline's own tags are not a parameter of this request, so the
+                // replacement keeps the ones the resource carries; they are changed through
+                // `TagResource` and `UntagResource`.
+                tags: stored.tags,
+                image_tags: input.image_tags.map(crate::state::into_ordered_tags),
+                image_scanning_configuration: input.image_scanning_configuration,
+                execution_role: input.execution_role,
+                workflows: input.workflows,
+                logging_configuration: input.logging_configuration,
+                date_created: stored.date_created,
+                // This request IS the last update, so its instant is the one every later
+                // read reports as `dateUpdated`.
+                date_updated: Some(crate::state::iso8601(::std::time::SystemTime::now())),
+            },
+            &client_token,
+            fingerprint,
+            request_id.clone(),
+        );
+
+        Ok(UpdateImagePipelineOutput {
+            request_id: Some(request_id),
+            client_token: Some(client_token),
+            image_pipeline_arn: Some(arn),
+        })
     }
 }
+
+/// The refusal an ARN naming no resource of the calling Region is answered with — the
+/// pipeline this request replaces and every resource the replacement references alike.
+fn missing(reference: &str) -> UpdateImagePipelineError {
+    UpdateImagePipelineErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::required_resource_not_found_message(reference)),
+    })
+    .into()
+}
+
+/// The refusal a request whose parameters cannot hold together is answered with: the
+/// modelled invalid-request class, carrying the rule it broke. The create of a pipeline
+/// answers a request naming more workflows than this emulator resolves for one request
+/// with the modelled quota class, which this operation's model does not declare, so that
+/// request is refused here as the invalid request it is.
+fn refused(message: String) -> UpdateImagePipelineError {
+    UpdateImagePipelineErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
