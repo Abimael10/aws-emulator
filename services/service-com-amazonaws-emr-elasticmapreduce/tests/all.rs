@@ -15,6 +15,8 @@
 mod auto_scaling_policy;
 #[path = "all/auto_termination_policy.rs"]
 mod auto_termination_policy;
+#[path = "all/auto_termination_policy_convergence.rs"]
+mod auto_termination_policy_convergence;
 #[path = "all/block_public_access.rs"]
 mod block_public_access;
 #[path = "all/cluster_defaults.rs"]

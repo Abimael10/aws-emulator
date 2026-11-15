@@ -2358,3 +2358,13 @@ mod cloudformation_provisions_glue_table_optimizers;
 // landings appended live in `all/appended_notes.rs`.
 // `all/all_rs_is_a_canonical_declaration_list.rs` check those rules — the first two for
 // here is an ORDINARY one, this block included: an inner doc comment (`//`) is legal only
+// `mod <name>;` pair into the sorted list below — one pair per suite and no other line, so
+// two branches landing at once insert two lines in two places and have no prose to
+// Every comment in this file is an ordinary one, this header included, and that is
+// past the declarations compiles no suite of this target, and with none anywhere a merge of
+// two landings cannot leave one there. A suite no `mod` here names is compiled nowhere and
+// its tests never run; a suite left at the top level of `tests/` fails the build; and a
+// suite declared twice compiles neither copy. The `all/all_rs_*` suites pin those rules
+// rather than restating them here, beside `all/every_suite_file_is_declared.rs`.
+// crate, belongs in that suite's own module header, where it is read beside the test it
+// explains. A note about THIS file belongs in `all/appended_notes.rs`.

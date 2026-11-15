@@ -33,11 +33,17 @@ use crate::job_flow_lifecycle::{minimal_request, Emr};
 /// idle time in seconds after which the cluster automatically terminates. You can specify
 /// a minimum of 60 seconds and a maximum of 604800 seconds (seven days)."
 /// (`smithy_query(query="doc", shape="AutoTerminationPolicy", member="IdleTimeout")`.)
-const IDLE_TIMEOUT_BOUNDS: [i64; 2] = [60, 604800];
+///
+/// `pub(crate)` so a sibling suite holds the member to the same two numbers rather than
+/// copying them.
+pub(crate) const IDLE_TIMEOUT_BOUNDS: [i64; 2] = [60, 604800];
 
 /// The policy `GetAutoTerminationPolicy` reports for `cluster_id` — `Value::Null` when
 /// the cluster carries none, and the attached structure (possibly empty) otherwise.
-async fn policy(emr: &Emr, case: &str, cluster_id: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite reads a policy back through the SAME reporting call
+/// rather than its own copy of it.
+pub(crate) async fn policy(emr: &Emr, case: &str, cluster_id: &str) -> Value {
     let (status, payload) = emr
         .call("GetAutoTerminationPolicy", json!({ "ClusterId": cluster_id }))
         .await;
@@ -52,7 +58,9 @@ async fn policy(emr: &Emr, case: &str, cluster_id: &str) -> Value {
 }
 
 /// `PutAutoTerminationPolicy` with the policy member the row carries.
-async fn put(emr: &Emr, case: &str, cluster_id: &str, policy: &Value) {
+///
+/// `pub(crate)` for the reason [`policy`] is.
+pub(crate) async fn put(emr: &Emr, case: &str, cluster_id: &str, policy: &Value) {
     let body = if policy.is_null() {
         // The member is optional, so a row of `null` is a request that carries NO policy
         // member at all rather than one carrying an empty policy.
