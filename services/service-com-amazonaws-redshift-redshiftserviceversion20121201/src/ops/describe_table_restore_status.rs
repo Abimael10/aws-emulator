@@ -163,7 +163,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// materialises the `IN_PROGRESS` -> `SUCCEEDED` transition a restore already
     /// owed at this instant — due whether or not anybody called.
     ///
-    /// Both selectors are resolved before anything is reported, each with the
+    /// One of the two selectors has to be there: a request naming neither says
+    /// nothing about which restores to report and is refused on the parameter
+    /// combination, before any state is read.
+    ///
+    /// Both selectors are then resolved before anything is reported, each with the
     /// resource's own modelled fault: a `ClusterIdentifier` naming no cluster of
     /// this account is `ClusterNotFoundFault`, and a `TableRestoreRequestId` this
     /// account made no restore under is `TableRestoreNotFoundFault`.
@@ -176,6 +180,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A read needs nothing from the request beyond its deserialized input.
         let _ = ctx;
+
+        // The two members that say WHICH restore requests are being reported. An
+        // empty value names no cluster and no request, so it counts as not
+        // supplied — the way every other locator of this service treats one.
+        let cluster_identifier = input
+            .cluster_identifier
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let wanted_request_id = input
+            .table_restore_request_id
+            .as_deref()
+            .filter(|value| !value.is_empty());
+
+        // Both members are optional in the model, but one of them is what says
+        // which restores the report is OF, so a request naming neither cannot be
+        // served and is refused on the PARAMETER COMBINATION — decided on the
+        // request alone, before the store is reached. The model expresses no
+        // required combination, so the rule comes from what the service answers:
+        // HTTP 400 with this wholly fixed sentence, naming the two members that
+        // may stand alone or together. The sentence is what the caller has to fix
+        // the request from, so it is never answered as an empty page: that would
+        // read as "this cluster has no table restores".
+        if cluster_identifier.is_none() && wanted_request_id.is_none() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                st::MISSING_TABLE_RESTORE_FILTER,
+            ));
+        }
+
         let Some(state) = st::service_state(&*self.engine) else {
             return Err(
                 DescribeTableRestoreStatusErrorModeled::DependentServiceUnavailableFault(
@@ -194,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name this account holds no cluster under names no restore either, and
         // that resource's own fault says so — resolved BEFORE the records are
         // walked, like every other cluster-scoped operation of this service.
-        if let Some(cluster_identifier) = input.cluster_identifier.as_deref() {
+        if let Some(cluster_identifier) = cluster_identifier {
             if store.cluster(cluster_identifier).is_none() {
                 return Err(DescribeTableRestoreStatusErrorModeled::ClusterNotFoundFault(
                     ClusterNotFoundFault {
@@ -210,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The identifier of the table restore request to return status for": one
         // this account made no restore under names nothing, which is the
         // operation's own modelled fault.
-        if let Some(request_id) = input.table_restore_request_id.as_deref() {
+        if let Some(request_id) = wanted_request_id {
             if store.table_restore(request_id).is_none() {
                 return Err(
                     DescribeTableRestoreStatusErrorModeled::TableRestoreNotFoundFault(
@@ -229,15 +261,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cluster and a request id reports that restore only when it is a restore
         // of that cluster.
         let matched: Vec<&st::StoredTableRestore> = store
-            .table_restores_of(input.cluster_identifier.as_deref())
+            .table_restores_of(cluster_identifier)
             .into_iter()
             .filter(|stored| {
-                input
-                    .table_restore_request_id
-                    .as_deref()
-                    .is_none_or(|wanted| {
-                        stored.status.table_restore_request_id.as_deref() == Some(wanted)
-                    })
+                wanted_request_id.is_none_or(|wanted| {
+                    stored.status.table_restore_request_id.as_deref() == Some(wanted)
+                })
             })
             .collect();
 

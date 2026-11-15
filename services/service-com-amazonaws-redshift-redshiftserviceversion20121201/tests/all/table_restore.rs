@@ -272,6 +272,151 @@ async fn a_restored_table_holds_the_rows_the_snapshot_captured() {
     );
 }
 
+/// The sentence the service answers an unscoped `DescribeTableRestoreStatus`
+/// with, spelled out here rather than read off the implementation's own constant:
+/// the wording is a requirement, so the check has to fail if it drifts.
+///
+/// Wholly fixed text naming the two input members that scope the read; nothing of
+/// the request appears in it.
+const UNSCOPED_RESTORE_STATUS_MESSAGE: &str =
+    "You must supply one or both of the ClusterIdentifier and TableRestoreRequestId parameters.";
+
+/// A `DescribeTableRestoreStatus` read that names NEITHER of the two members
+/// that say which restores it is a report of is refused on the parameter
+/// COMBINATION, before any state is read — never served as an empty page, which a
+/// client reads as "this cluster has no table restores".
+///
+/// The rows differ along what a request can carry while still naming neither
+/// selector: nothing at all, each pagination member alone, both of them, and a
+/// selector that IS present but empty — an empty value names no cluster and no
+/// request, so it scopes nothing. The second half is the other side of the rule:
+/// naming either selector gets PAST the combination check, so the same request is
+/// then answered by the lookup (or served).
+///
+/// The input's members are
+/// `smithy_query(query="operation", operation="DescribeTableRestoreStatus")` —
+/// `ClusterIdentifier`, `TableRestoreRequestId`, `MaxRecords` and `Marker`, of
+/// which only the first two scope the read.
+#[tokio::test]
+async fn an_unscoped_restore_status_read_is_refused_on_the_parameter_combination() {
+    let emulator = Emulator::new();
+    let cluster = "unscoped-restore-cluster";
+    let created = emulator.create_minimal(cluster).await;
+    assert_eq!(
+        created.status, 200,
+        "the cluster the served rows name must be created, got {} with body {}",
+        created.status, created.body
+    );
+
+    // (case, the read's members)
+    let unscoped: Vec<(&str, Params)> = vec![
+        ("no members at all", vec![]),
+        ("only a page size", vec![("MaxRecords", "20")]),
+        ("only a marker", vec![("Marker", "0")]),
+        (
+            "only the pagination pair",
+            vec![("MaxRecords", "20"), ("Marker", "0")],
+        ),
+        ("an empty cluster identifier", vec![("ClusterIdentifier", "")]),
+        (
+            "an empty request identifier",
+            vec![("TableRestoreRequestId", "")],
+        ),
+        (
+            "both selectors empty, beside a page size",
+            vec![
+                ("ClusterIdentifier", ""),
+                ("TableRestoreRequestId", ""),
+                ("MaxRecords", "20"),
+            ],
+        ),
+    ];
+
+    for (case, members) in unscoped {
+        let answer = emulator
+            .call("DescribeTableRestoreStatus", &members)
+            .await;
+        assert_refused(case, &answer, 400, "InvalidParameterCombination");
+        assert_eq!(
+            answer.text("Type").as_deref(),
+            Some("Sender"),
+            "case {case}: expected a sender fault, got {:?} with body {}",
+            answer.text("Type"),
+            answer.body
+        );
+        assert_eq!(
+            answer.text("Message").as_deref(),
+            Some(UNSCOPED_RESTORE_STATUS_MESSAGE),
+            "case {case}: expected the message {UNSCOPED_RESTORE_STATUS_MESSAGE:?}, got {:?}",
+            answer.text("Message")
+        );
+        assert!(
+            all_text(&answer.body, "TableRestoreRequestId").is_empty(),
+            "case {case}: a refused read must report no restore request, got body {}",
+            answer.body
+        );
+    }
+
+    // (case, the read's members, the status, the error code — or None when the
+    // read is served)
+    let scoped: Vec<(&str, Params, u16, Option<&str>)> = vec![
+        (
+            "a cluster this account holds",
+            vec![("ClusterIdentifier", cluster)],
+            200,
+            None,
+        ),
+        (
+            "a cluster this account holds, beside a page size",
+            vec![("ClusterIdentifier", cluster), ("MaxRecords", "20")],
+            200,
+            None,
+        ),
+        (
+            "a cluster this account does not hold",
+            vec![("ClusterIdentifier", "nowhere-cluster")],
+            404,
+            Some("ClusterNotFound"),
+        ),
+        (
+            "a request identifier nothing minted",
+            vec![("TableRestoreRequestId", "nowhere-request")],
+            400,
+            Some("TableRestoreNotFoundFault"),
+        ),
+        (
+            "both selectors named, neither resolving",
+            vec![
+                ("ClusterIdentifier", "nowhere-cluster"),
+                ("TableRestoreRequestId", "nowhere-request"),
+            ],
+            404,
+            Some("ClusterNotFound"),
+        ),
+    ];
+
+    for (case, members, status, code) in scoped {
+        let answer = emulator
+            .call("DescribeTableRestoreStatus", &members)
+            .await;
+        match code {
+            Some(code) => assert_refused(case, &answer, status, code),
+            None => assert_eq!(
+                answer.status, status,
+                "case {case}: expected status {status}, got {} with body {}",
+                answer.status, answer.body
+            ),
+        }
+        assert_ne!(
+            answer.error_code().as_deref(),
+            Some("InvalidParameterCombination"),
+            "case {case}: a read that names a selector must get past the combination \
+             check, got body {}",
+            answer.body
+        );
+    }
+}
+
 /// A restore whose names resolve to nothing is refused with the fault that names
 /// the resource, and creates no table — for a table spanning each name the
 /// request carries.

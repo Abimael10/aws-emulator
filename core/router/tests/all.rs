@@ -1536,3 +1536,18 @@ mod lambda_in_function_assumed_role_session;
 //! `all/all_rs_is_a_canonical_declaration_list.rs` check those three rules, for this file and
 #[path = "all/cloudformation_creates_an_ecs_capacity_provider.rs"]
 mod cloudformation_creates_an_ecs_capacity_provider;
+//! This file is a DECLARATION LIST and nothing else: one
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite under `tests/all/`,
+//! sorted by name, with no prose between the pairs. Put a new suite at
+//! `tests/all/<name>.rs` and insert its pair in order.
+//! * A suite no `mod` names compiles nowhere and its tests never run, and a suite left
+//!   at the top level of `tests/` fails the build.
+//! * Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the
+//!   same name is `E0428` and fails every suite in this target.
+//! * `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of
+//!   this file: every declaration carries its own `#[path = "all/<name>.rs"]`.
+//! * THIS HEADER IS THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS FILE.
+//!   Past the first item one is `E0753` and compiles no suite of this target.
+//! service crate, belongs in that suite's own module doc, where it is read with the test
+//! it describes. `all/all_rs_declares_each_suite_once.rs`,
+//! `all/all_rs_is_a_canonical_declaration_list.rs` check these rules.

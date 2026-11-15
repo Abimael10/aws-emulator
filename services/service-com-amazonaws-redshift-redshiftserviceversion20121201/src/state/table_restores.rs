@@ -132,6 +132,20 @@ pub fn table_restore_not_found_message(request_id: &str) -> String {
     format!("The specified TableRestoreRequestId value {request_id} was not found.")
 }
 
+/// What the table-restore read answers a request that names NEITHER of the two
+/// optional members that say which restore requests to report.
+///
+/// Wholly fixed: nothing of the request appears in it. It names the two members
+/// of the input shape (`smithy_query(query="operation",
+/// operation="DescribeTableRestoreStatus")` — `ClusterIdentifier` and
+/// `TableRestoreRequestId`) and states the rule the service enforces: either
+/// member alone will do, and so will both together, because each one NARROWS the
+/// report — so a caller is not told to pick exactly one when the service accepts
+/// both. Worded as the sibling refusal of an unscoped read is
+/// (`MISSING_EXCHANGE_STATUS_FILTER`).
+pub const MISSING_TABLE_RESTORE_FILTER: &str = "You must supply one or both of the \
+     ClusterIdentifier and TableRestoreRequestId parameters.";
+
 /// A fresh `TableRestoreRequestId`.
 ///
 /// "The unique identifier for the table restore request"
