@@ -151,7 +151,7 @@ async fn the_catalog_is_reported_with_every_version_and_its_support_status() {
     // Rows hand-written from the catalog Amazon MSK publishes (the Developer
     // Guide's "Supported Apache Kafka versions" list, and the rows the service
     // itself publishes) — entries of several SHAPES (three numbers, a fourth
-    // component, the `.tiered` and `.link` spellings, the `.x` patch name and the
+    // component, the `.tiered` spelling, the `.x` patch name and the
     // `.kraft` metadata-mode lines) and both support statuses, so the table spans
     // the class rather than one example. Each row is the status SEQUENCE published
     // for that version, in published order: one status for a version published
@@ -168,7 +168,6 @@ async fn the_catalog_is_reported_with_every_version_and_its_support_status() {
         ("3.6.0.1", &["DEPRECATED"]),
         ("3.7.x", &["ACTIVE"]),
         ("3.7.x.kraft", &["ACTIVE"]),
-        ("3.8.link", &["DEPRECATED"]),
         ("3.9.x", &["DEPRECATED", "ACTIVE"]),
         ("3.9.x.kraft", &["ACTIVE"]),
         ("4.0.x.kraft", &["ACTIVE"]),

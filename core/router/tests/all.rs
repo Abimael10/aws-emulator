@@ -1761,3 +1761,19 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // what the notes landings had appended to this file, and
 // `all/declaration_roots_are_canonical_and_complete.rs` pin that rule here and in every
 // service crate's `tests/all.rs`.
+// Single integration-test target for the router: the canonical DECLARATION LIST of its
+// file under `tests/all/`, sorted by name, and no other line: no prose between the pairs, no
+// blank line, and nothing after the last pair. Two branches landing at once then insert two
+// lines in two places and have no prose to duplicate, re-word or mistype. Put a new suite at
+// and why it drives the assembled router rather than one service crate, belongs in that
+// suite's own module header, beside the test it explains.
+// Every comment here is an ORDINARY comment, this header included: an inner doc comment is
+// legal only ahead of the first item, so one past the declarations compiles no suite of this
+// target at all, and with none anywhere in the file there is no such line for a merge to
+// leave there. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to
+// a sibling of this file, which the layout check refuses: the `#[path]` above each `mod` is
+// what points it into `tests/all/`. A file no `mod` here names is compiled nowhere and its
+// tests never run, and a name declared twice fails every suite in this target.
+// The `all/all_rs_*` suites, `all/every_suite_file_is_declared.rs` and the
+// `all/declaration_roots_*` suites pin all of that, for this file and for every service
+// crate's `tests/all.rs`, so a note about those rules belongs there rather than here.

@@ -49,11 +49,17 @@ pub const KAFKA_VERSION_VARIANT_TIERED: &str = "tiered";
 /// Source: the Amazon MSK Developer Guide, "Supported Apache Kafka versions"
 /// (<https://docs.aws.amazon.com/msk/latest/developerguide/supported-kafka-versions.html>),
 /// which lists the versions MSK offers, the variants it offers them in (the
-/// `.kraft` metadata-mode lines, the `.tiered` storage line, the `.link` line)
-/// and the ones it has deprecated, together with the catalog the service itself
-/// publishes, which this table reproduces ROW FOR ROW. A deprecated version is
-/// still a valid SOURCE version — a cluster already running it can be upgraded
-/// away from it — but never a target.
+/// `.kraft` metadata-mode lines, the `.tiered` storage line) and the ones it has
+/// deprecated, together with the catalog the service itself publishes, which this
+/// table reproduces ROW FOR ROW. A deprecated version is still a valid SOURCE
+/// version — a cluster already running it can be upgraded away from it — but
+/// never a target.
+///
+/// Nothing outside that catalog belongs here: a version string the service does
+/// not publish names no broker software, so this table holds EXACTLY the versions
+/// MSK publishes and no spelling of its own. Every version gate reads this table
+/// ([`kafka_version_index`]), so an entry the service does not publish would be
+/// accepted by a create and advertised as retryable by a refusal.
 ///
 /// A row is a version together with ONE status the service publishes it under,
 /// and a version may be published on MORE THAN ONE row: the guide lists a
@@ -111,7 +117,6 @@ pub const KAFKA_VERSION_CATALOG: &[KafkaVersionEntry] = &[
     KafkaVersionEntry { version: "3.7.x.kraft", status: KAFKA_VERSION_ACTIVE },
     KafkaVersionEntry { version: "3.8.x", status: KAFKA_VERSION_ACTIVE },
     KafkaVersionEntry { version: "3.8.x.kraft", status: KAFKA_VERSION_ACTIVE },
-    KafkaVersionEntry { version: "3.8.link", status: KAFKA_VERSION_DEPRECATED },
     // The deprecation row of a version the catalog also publishes as offered,
     // ahead of the row offering it and beside it: the LAST row the catalog
     // publishes for a version carries the status the service offers that version
@@ -329,11 +334,96 @@ pub fn kafka_version_status(version: &str) -> Option<&'static str> {
     published
 }
 
+/// The order Amazon MSK names the Apache Kafka versions in when the
+/// unsupported-version refusal below reports which versions ARE valid.
+///
+/// That sequence is the service's OWN: it is not sorted by release, and it is
+/// not the order the catalog publishes its rows in ([`KAFKA_VERSION_CATALOG`],
+/// which `ListKafkaVersions` pages and which ascends by release) — it names the
+/// newest KRaft releases and the variant lines first and the oldest release
+/// last. So the refusal's list has an order of its own, recorded here as the
+/// service states it in that message, rather than being assumed to be the
+/// catalog's.
+///
+/// Source: the sequence the service itself renders in this refusal. It is an
+/// ORDER and not a second catalog: which versions the refusal names is still
+/// read from [`KAFKA_VERSION_CATALOG`] ([`valid_kafka_versions`]), so a version
+/// the catalog gains or loses is gained or lost in the refusal too, and a name
+/// here that the catalog does not publish names nothing.
+const KAFKA_VERSION_VALID_VALUE_ORDER: &[&str] = &[
+    "4.2.x.kraft",
+    "4.1.x.kraft",
+    "2.8.2.tiered",
+    "4.0.x.kraft",
+    "2.4.1.1",
+    "3.3.2",
+    "3.5.1",
+    "3.6.0",
+    "3.1.1",
+    "3.2.0",
+    "3.3.1",
+    "3.4.0",
+    "2.1.0",
+    "3.7.x",
+    "3.8.x",
+    "2.6.2",
+    "2.7.1",
+    "2.8.0",
+    "2.6.3",
+    "2.7.2",
+    "2.8.1",
+    "2.5.1",
+    "2.6.0",
+    "2.6.1",
+    "2.7.0",
+    "3.6.0.1",
+    "3.9.x",
+    "2.3.1",
+    "2.4.1",
+    "3.7.x.kraft",
+    "2.2.1",
+    "3.8.x.kraft",
+    "3.9.x.kraft",
+    "1.1.1",
+];
+
+/// The versions the unsupported-version refusal reports as valid, in the order
+/// the service names them in that message.
+///
+/// The SET is the catalog's ([`catalogued_kafka_versions`]) — exactly the set the
+/// gate this refusal comes from admits ([`kafka_version_index`]), each version
+/// once — and the ORDER is the service's published sequence for this list
+/// ([`KAFKA_VERSION_VALID_VALUE_ORDER`]). A catalogued version that sequence does
+/// not name follows the ones it does, in catalog order, so a version the catalog
+/// gains is still advertised as retryable; a name in the sequence the catalog
+/// does not publish is dropped, so the list never offers a version the gate
+/// refuses.
+///
+/// Derived once, like [`catalogued_kafka_versions`]: both factors are constants.
+pub fn valid_kafka_versions() -> &'static [&'static str] {
+    static ORDERED: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        let published = catalogued_kafka_versions();
+        let mut ordered: Vec<&'static str> = KAFKA_VERSION_VALID_VALUE_ORDER
+            .iter()
+            .filter(|version| published.contains(*version))
+            .copied()
+            .collect();
+        ordered.extend(
+            published
+                .iter()
+                .filter(|version| !KAFKA_VERSION_VALID_VALUE_ORDER.contains(*version))
+                .copied(),
+        );
+        ordered
+    });
+    &ORDERED
+}
+
 /// The sentence Amazon MSK answers a request naming an Apache Kafka version it
 /// does not offer with: the fixed text `Unsupported KafkaVersion [`, `].
 /// Valid values: [`, `]`, around two variable parts — the rejected version,
 /// taken verbatim from the request, and the versions that ARE valid, read from
-/// [`catalogued_kafka_versions`] in the catalog's published order.
+/// [`valid_kafka_versions`] in the order the service publishes that list.
 ///
 /// The listed set is exactly the set the check this refusal comes from admits
 /// ([`kafka_version_index`]): every version the catalog publishes, a deprecated
@@ -349,7 +439,7 @@ pub fn kafka_version_status(version: &str) -> Option<&'static str> {
 pub fn unsupported_kafka_version_message(rejected: &str) -> String {
     format!(
         "Unsupported KafkaVersion [{rejected}]. Valid values: [{}]",
-        catalogued_kafka_versions().join(", ")
+        valid_kafka_versions().join(", ")
     )
 }
 

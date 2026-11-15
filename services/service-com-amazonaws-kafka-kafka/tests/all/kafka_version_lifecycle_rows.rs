@@ -117,12 +117,12 @@ async fn a_version_published_under_two_statuses_is_served_on_both_rows() {
     // — one offered row, one deprecated row, two rows (the offering one last) —
     // across the
     // version spellings the catalog uses, and includes versions neither this rule
-    // nor its report was derived from (`2.3.1`, `3.7.x.kraft`).
+    // nor its report was derived from (`2.3.1`, `3.7.x.kraft`, `2.8.2.tiered`).
     let expected: &[(&str, &[&str])] = &[
         ("2.3.1", &["DEPRECATED"]),
+        ("2.8.2.tiered", &["DEPRECATED"]),
         ("3.6.0", &["ACTIVE"]),
         ("3.7.x.kraft", &["ACTIVE"]),
-        ("3.8.link", &["DEPRECATED"]),
         ("3.9.x", &["DEPRECATED", "ACTIVE"]),
         ("4.2.x.kraft", &["DEPRECATED", "ACTIVE"]),
     ];

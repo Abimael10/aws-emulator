@@ -87,6 +87,8 @@ mod configuration_revisions;
 mod configuration_server_properties;
 #[path = "all/configuration_state_reporting.rs"]
 mod configuration_state_reporting;
+#[path = "all/configuration_version_valid_values.rs"]
+mod configuration_version_valid_values;
 #[path = "all/connectivity_update.rs"]
 mod connectivity_update;
 #[path = "all/create_and_update_input_gates.rs"]

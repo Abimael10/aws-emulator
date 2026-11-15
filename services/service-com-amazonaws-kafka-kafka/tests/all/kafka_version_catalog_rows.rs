@@ -184,7 +184,6 @@ async fn a_version_with_an_active_row_is_the_offered_version_set() {
         ("3.1.1", false),
         ("3.6.0", true),
         ("3.6.0.1", false),
-        ("3.8.link", false),
         ("3.8.x.kraft", true),
         ("3.9.x", true),
         ("4.2.x.kraft", true),

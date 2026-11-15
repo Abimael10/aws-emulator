@@ -19,7 +19,7 @@
 //! Each suite asserts that rule over a TABLE whose rows differ along what the rule
 //! generalises over: where the source sits in the catalog (oldest, deprecated, the
 //! newest), how many components its version string has, which line it is on (plain
-//! ZooKeeper, `.tiered`, `.kraft`, `.link`), whether it has a KRaft version of its
+//! ZooKeeper, `.tiered`, `.kraft`), whether it has a KRaft version of its
 //! own release, whether it is terminal, and whether the catalog lists it at all.
 //! The expected target lists are written out by hand from the catalog and are then
 //! cross-checked against the catalog itself, so neither the handler nor its helper
@@ -244,7 +244,7 @@ fn the_catalog_is_published_in_ascending_release_order() {
 /// Rows: the oldest catalogued version, a deprecated four-component version, the
 /// `.tiered` spelling, the version at the active boundary, a four-component patch
 /// of it, the `.x` versions below and at the release the KRaft crossing is offered
-/// at, a KRaft source, the `.link` line (terminal), the newest offered KRaft
+/// at, a KRaft source, the newest offered KRaft
 /// version and the version the catalog publishes both an offered and a deprecated
 /// row for. The expected lists are written out from the catalog documented in
 /// `src/state.rs`.
@@ -293,8 +293,6 @@ async fn compatible_targets_are_the_upgrades_the_catalog_permits() {
         ("4.1.x.kraft", versions(&["4.2.x.kraft"])),
         // The newest KRaft version the catalog publishes: nothing to upgrade to.
         ("4.2.x.kraft", Vec::new()),
-        // A line of its own with no newer member: terminal.
-        ("3.8.link", Vec::new()),
     ];
 
     for (index, (version, expected)) in rows.iter().enumerate() {

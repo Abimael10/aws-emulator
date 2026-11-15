@@ -17,8 +17,11 @@ use serde_json::{json, Value};
 
 // The service's own version catalogue, so the suite and the handler cannot
 // disagree about which Apache Kafka versions exist; it is the same list
-// `ListKafkaVersions` reports.
-use service_com_amazonaws_kafka_kafka::state::KAFKA_VERSION_CATALOG;
+// `ListKafkaVersions` reports. `valid_kafka_versions` is that same set in the
+// order the service names it in the unsupported-version refusal, whose ORDER is
+// pinned independently of the code under test in
+// `crate::configuration_version_valid_values`.
+use service_com_amazonaws_kafka_kafka::state::{valid_kafka_versions, KAFKA_VERSION_CATALOG};
 
 // The router harness, the signing region, the account id and the URI encoder
 // every suite of this crate shares, so this one adds only its own rule and its
@@ -526,25 +529,20 @@ async fn kafka_versions_must_name_versions_the_service_publishes() {
         );
         // The message is the service's template over the FIRST uncatalogued
         // entry and the versions that ARE valid: fixed text, the rejected
-        // version verbatim from the request, and the catalogue in its published
-        // order — exactly the set this check admits, deprecated entries
-        // included, since a configuration may name a version clusters still
-        // run, and each version named once however many rows the catalogue
-        // publishes it under.
+        // version verbatim from the request, and the catalogue in the order the
+        // service publishes this list in — exactly the set this check admits,
+        // deprecated entries included, since a configuration may name a version
+        // clusters still run, and each version named once however many rows the
+        // catalogue publishes it under. That ORDER is pinned against a
+        // hand-written sequence in `crate::configuration_version_valid_values`.
         let message = reply.at("/message").as_str().unwrap_or_default();
         let first_unknown = versions
             .iter()
             .find(|entry| !KAFKA_VERSION_CATALOG.iter().any(|row| row.version == **entry))
             .unwrap_or_else(|| panic!("case {case}: the row names no uncatalogued version"));
-        let mut catalogued: Vec<&str> = Vec::new();
-        for row in KAFKA_VERSION_CATALOG {
-            if !catalogued.contains(&row.version) {
-                catalogued.push(row.version);
-            }
-        }
         let expected = format!(
             "Unsupported KafkaVersion [{first_unknown}]. Valid values: [{}]",
-            catalogued.join(", ")
+            valid_kafka_versions().join(", ")
         );
         assert_eq!(
             message, expected,
