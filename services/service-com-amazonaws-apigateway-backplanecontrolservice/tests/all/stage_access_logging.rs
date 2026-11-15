@@ -118,7 +118,11 @@ impl Answered {
 
 /// The three services this rule spans, over ONE engine, as `core/router/src/lib.rs` mounts
 /// them.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because every sibling suite about what a stage LOGS spans the same three
+/// services ([`crate::stage_method_level_logging_level`]): one mounting, so two suites cannot
+/// disagree about which services are on the engine.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite exercises the services, not SigV4: the control-plane calls carry a credential
@@ -384,7 +388,10 @@ async fn wait_until_active(router: &MultiServiceRouter) {
 
 /// Install the account's CloudWatch role, which is what API Gateway writes the account's
 /// logs as.
-async fn install_account_role(router: &MultiServiceRouter) {
+///
+/// `pub(crate)` for the reason [`emulator`] gives: it is the same prerequisite for every
+/// suite that asserts a delivered record.
+pub(crate) async fn install_account_role(router: &MultiServiceRouter) {
     apigw(
         router,
         "UpdateAccount",

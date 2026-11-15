@@ -1794,3 +1794,23 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 // crate's own, belongs in that suite's own module header, where it is read beside the test
 // it explains — never here, where one note per suite buries the list this file exists to be.
 // every service crate's `tests/all.rs`, so check there rather than leaving a note below.
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair, inserted in its sorted position. The
+//! list holds the pairs and NOTHING else, so two branches landing at once insert two lines
+//! in two places and have no prose to duplicate, re-word or mistype.
+//! Three rules bind this file, each pinned by a suite of its own:
+//! * a suite no `mod` names compiles nowhere and its tests never run (the crate's build
+//!   script fails the build for one), and a suite left at the top level of `tests/` is a
+//!   test target of its own, which the layout check refuses;
+//! * declare each suite exactly ONCE — this is one crate root, so a second `mod` for the
+//!   same name is `E0428` and fails every suite in this target
+//! * an inner doc comment (`//!`) is legal only BEFORE the first item, so THIS header is
+//!   the only place one may stand: past the first item it is `E0753` and also fails every
+//!   suite in this target (`all/all_rs_inner_doc_comments_precede_the_first_item.rs`).
+//! `all/all_rs_is_a_canonical_declaration_list.rs` pins the shape itself — pairs, sorted,
+//! no other line — so what goes below is a declaration, never a note about one. What a
+//! suite covers, and why it lives in this cross-service target rather than in one service
+//! crate's own, belongs in that suite's own module doc, where it is read beside the test it
+//! explains; `all/appended_notes.rs` keeps the notes earlier landings had appended here.
+//! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING
+//! of this file (`tests/<name>.rs`): the `#[path]` attribute is what points each module
+//! into `tests/all/`.

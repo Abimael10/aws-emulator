@@ -83,6 +83,12 @@ mod stage_access_log_record_rendering;
 // records: it spans API Gateway, AWS IAM and Amazon CloudWatch Logs at once.
 #[path = "all/stage_access_log_absent_destination.rs"]
 mod stage_access_log_absent_destination;
+// WHICH method setting gates the execution log of a request the stage served: the entry keyed
+// by the method it reached, and only then the stage-wide one. Declared beside the suites above
+// for the reason the entry at the top of this file records: it spans API Gateway, AWS Lambda
+// and Amazon CloudWatch Logs at once.
+#[path = "all/stage_method_level_logging_level.rs"]
+mod stage_method_level_logging_level;
 #[path = "all/stage_proxy_run_logs.rs"]
 mod stage_proxy_run_logs;
 #[path = "all/stage_trace_context.rs"]
