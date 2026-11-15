@@ -433,8 +433,10 @@ pub const AGENT_RUNTIME_VERSION_UNSPECIFIED: &str = "null";
 /// asked for — a request that named none is reported with
 /// [`AGENT_RUNTIME_VERSION_UNSPECIFIED`].
 ///
-/// Shared by the handlers rather than written per operation, so one runtime
-/// cannot be reported missing in two different sentences by two operations.
+/// This is the sentence the runtime LOOKUP paths answer with — the ones that
+/// resolve a runtime, or one version of it, to report or to remove it. A request
+/// that asks to CHANGE a runtime is refused in its own sentence instead, which
+/// [`agent_runtime_not_found_on_update`] words.
 pub fn agent_runtime_not_found(
     agent_runtime_id: &str,
     version: Option<&str>,
@@ -444,6 +446,24 @@ pub fn agent_runtime_not_found(
             "Agent with agentId: {agent_runtime_id}, accountId: {}, and version: {} not found!",
             ::engine::emulator_account_id(),
             version.unwrap_or(AGENT_RUNTIME_VERSION_UNSPECIFIED)
+        )),
+    }
+}
+
+/// The modelled not-found error for an agent runtime an UPDATE could not
+/// resolve, which this control plane words in its own shorter sentence rather
+/// than through the lookup template [`agent_runtime_not_found`] builds: the id
+/// the request named, in single quotes, and the remedy ("Agent '<id>' was not
+/// found. Please check the agent ID and try again.").
+///
+/// The sentence around the one value is fixed, and `agent_runtime_id` — the id
+/// the request's path carried — is its only variable part: an update addresses
+/// the runtime by id alone, so the sentence names neither the account the lookup
+/// ran in nor any version, both of which the request never asked for.
+pub fn agent_runtime_not_found_on_update(agent_runtime_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Agent '{agent_runtime_id}' was not found. Please check the agent ID and try again."
         )),
     }
 }

@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How this control plane WORDS the two refusals that are about a resource rather than
-//! about the request's members, end to end over HTTP.
+//! How this control plane WORDS the refusals that are about a resource rather than about
+//! the request's members, end to end over HTTP.
 //!
 //! `bedrock-agentcore-control` is one endpoint in front of several AgentCore services, one
-//! per resource family, and the families do not word these refusals alike. Two rules are
+//! per resource family, and the families do not word these refusals alike. Three rules are
 //! under test, each asserted over a SET of operations and identifiers rather than over the
 //! one request a report happened to cite:
 //!
 //! 1. A REQUEST FOR A RESOURCE THAT IS NOT THERE is refused with the operation's modelled
 //!    `ResourceNotFoundException` (HTTP 404 for every operation below:
-//!    `smithy_query(query="operation", operation="…")`), worded in the sentence its
-//!    resource family words a missing resource in. The sentence's fixed text never varies
-//!    with the asking operation, so a family's read, update and delete of a missing
-//!    resource all answer alike; its variable parts are filled from the request and from
-//!    this service's own state — never with the operation's verb. The gateway family's
-//!    sentence states the failed RETRIEVE whatever was asked for and echoes no identifier
-//!    at all; the runtime family's names the agent, the account the lookup ran in
+//!    `smithy_query(query="operation", operation="…")`), worded in the sentence the service
+//!    words for THAT path — never in another path's sentence; its variable parts are filled
+//!    from the request and from this service's own state, and carry no value the request
+//!    never named. Where a family words every path alike, its read, update and delete of a
+//!    missing resource all answer the same text: the gateway family's sentence states the
+//!    failed RETRIEVE whatever was asked for and echoes no identifier at all; the runtime
+//!    family's lookup paths name the agent, the account the lookup ran in
 //!    (`engine::emulator_account_id`) and the version asked for, spelling `null` for a
 //!    request that named no version; the harness family's names the agent by name; and the
 //!    memory family's names the operation that was asking and the id it could not retrieve.
@@ -30,6 +30,14 @@
 //!    screaming-snake token the wire's `GatewayStatus` enum carries. The rows differ along
 //!    the operation refused and along which transient status the gateway is in, so neither
 //!    the operation nor one named status can be what the sentence is keyed to.
+//! 3. THE RUNTIME FAMILY'S UPDATE PATH is one path that is worded on its own, which is why
+//!    rule 1 is a sentence per path and not one sentence per family: an
+//!    `UpdateAgentRuntime` against a runtime this service does not hold is refused
+//!    "Agent '<agentRuntimeId>' was not found. Please check the agent ID and try again." —
+//!    the id from the request path as the one variable part, and neither the account nor a
+//!    version, neither of which an update asks for. Its rows differ along the identifier,
+//!    along whether the runtime never existed or was created and then deleted, and along
+//!    what else the request carried.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -229,15 +237,6 @@ async fn a_missing_resource_is_worded_in_its_familys_own_sentence() {
             uri: "/runtimes/a_runtime2-0123456789/?version=2".to_string(),
             body: None,
             message: agent_not_found("a_runtime2-0123456789", Some("2")),
-        },
-        Row {
-            // An update addresses the runtime, not one of its versions, so it asked for
-            // no version at all.
-            case: "UpdateAgentRuntime on an unknown runtime",
-            method: "PUT",
-            uri: "/runtimes/missingruntime-abcdefghij/".to_string(),
-            body: Some(runtime_update_body()),
-            message: agent_not_found("missingruntime-abcdefghij", None),
         },
         Row {
             case: "GetHarness on an unknown harness",
@@ -487,6 +486,159 @@ async fn an_operation_a_gateways_status_cannot_serve_is_refused_in_one_sentence(
             refused.message, expected,
             "case {case:?}: expected {expected:?}, got {:?}",
             refused.message
+        );
+    }
+}
+
+/// The runtime family's UPDATE sentence for `id`: the id in single quotes and the remedy,
+/// with no account and no version in it.
+fn agent_not_found_on_update(id: &str) -> String {
+    format!("Agent '{id}' was not found. Please check the agent ID and try again.")
+}
+
+/// RULE 3: an `UpdateAgentRuntime` against a runtime that is not there is refused in the
+/// update path's own sentence, whatever the id and whatever else the request carried.
+#[tokio::test]
+async fn an_update_of_a_missing_runtime_is_worded_in_the_update_sentence() {
+    let router = router();
+
+    // Ids inside `AgentRuntimeId`'s modelled pattern
+    // `^[a-zA-Z][a-zA-Z0-9_]{0,99}-[a-zA-Z0-9]{10}$`
+    // (`smithy_query(query="operation", operation="UpdateAgentRuntime")`), differing in
+    // length, in case and in whether they carry underscores or digits; one row carries
+    // the optional members too, and one appends a version query the update never asks
+    // for, so neither the body's shape nor a query can be what the sentence is keyed to.
+    // (case, the id, the query string appended to the path, the request body)
+    let rows: Vec<(&str, &str, &str, Value)> = vec![
+        (
+            "an id nothing ever created",
+            "missingruntime-abcdefghij",
+            "",
+            runtime_update_body(),
+        ),
+        (
+            "another id, with an underscore and digits",
+            "a_runtime2-0123456789",
+            "",
+            runtime_update_body(),
+        ),
+        (
+            "the shortest id the pattern allows",
+            "A-0000000000",
+            "",
+            runtime_update_body(),
+        ),
+        (
+            "a request carrying the optional members as well",
+            "LongRuntimeName_probe-ZZZZ999999",
+            "",
+            json!({
+                "agentRuntimeArtifact": container_artifact("optional"),
+                "roleArn": ROLE_ARN,
+                "description": "a change nothing can take",
+                "environmentVariables": {"STAGE": "probe"},
+            }),
+        ),
+        (
+            "a version query an update never asks for",
+            "queryprobe-abcdefghij",
+            "?version=4",
+            runtime_update_body(),
+        ),
+    ];
+
+    for (case, id, query, body) in rows {
+        let answer = send(&router, "PUT", &format!("/runtimes/{id}/{query}"), Some(&body)).await;
+        assert_eq!(
+            (answer.status, answer.code.as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected 404 ResourceNotFoundException, got {} {:?} ({})",
+            answer.status,
+            answer.code,
+            answer.body
+        );
+        let expected = agent_not_found_on_update(id);
+        assert_eq!(
+            answer.message, expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.message
+        );
+        assert!(
+            !answer.message.contains(::engine::emulator_account_id())
+                && !answer.message.contains("version"),
+            "case {case:?}: the update sentence names neither the account nor a version, \
+             got {:?}",
+            answer.message
+        );
+    }
+}
+
+/// RULE 3 beside RULE 1 on ONE id: a runtime that was created and then deleted is reported
+/// missing by the read path in the lookup sentence and by the update path in the update
+/// sentence, so the two paths are distinguishable by text.
+#[tokio::test]
+async fn the_read_and_the_update_path_word_one_dead_runtime_differently() {
+    let router = router();
+
+    for (case, name) in [
+        ("a runtime deleted whole", "deadRuntime"),
+        ("another runtime deleted whole", "deadRuntime2"),
+    ] {
+        let created = send(
+            &router,
+            "PUT",
+            "/runtimes/",
+            Some(&json!({
+                "agentRuntimeName": name,
+                "agentRuntimeArtifact": container_artifact("v1"),
+                "roleArn": ROLE_ARN,
+                "networkConfiguration": {"networkMode": "PUBLIC"},
+            })),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: setup CreateAgentRuntime must succeed, got {} ({})",
+            created.status, created.body
+        );
+        let id = text(&created.body, "agentRuntimeId");
+
+        let deleted = send(&router, "DELETE", &format!("/runtimes/{id}/"), None).await;
+        assert_eq!(
+            deleted.status, 202,
+            "case {case:?}: setup DeleteAgentRuntime must succeed, got {} ({})",
+            deleted.status, deleted.body
+        );
+
+        let read = send(&router, "GET", &format!("/runtimes/{id}/"), None).await;
+        let expected_read = agent_not_found(&id, None);
+        assert_eq!(
+            (read.status, read.message.as_str()),
+            (404, expected_read.as_str()),
+            "case {case:?}: the read path answers {expected_read:?} with 404, got {} {:?}",
+            read.status,
+            read.message
+        );
+
+        let updated = send(
+            &router,
+            "PUT",
+            &format!("/runtimes/{id}/"),
+            Some(&runtime_update_body()),
+        )
+        .await;
+        let expected_update = agent_not_found_on_update(&id);
+        assert_eq!(
+            (updated.status, updated.message.as_str()),
+            (404, expected_update.as_str()),
+            "case {case:?}: the update path answers {expected_update:?} with 404, got {} {:?}",
+            updated.status,
+            updated.message
+        );
+        assert_ne!(
+            read.message, updated.message,
+            "case {case:?}: the two paths must not answer one sentence, both said {:?}",
+            read.message
         );
     }
 }
