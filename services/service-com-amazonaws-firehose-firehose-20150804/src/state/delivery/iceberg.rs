@@ -322,6 +322,9 @@ pub(super) async fn commit_buffer<Eng: Send + Sync + 'static>(
                     ICEBERG_MALFORMED_FIELD,
                     now,
                     None,
+                    // A row this table does not hold was judged by the commit and by no data
+                    // transformation, so no function is named beside the failure.
+                    None,
                     &faults,
                     None,
                 ),

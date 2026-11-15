@@ -13901,6 +13901,7 @@ dependencies = [
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-iam",
  "aws-sdk-kms",
+ "aws-sdk-lambda",
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",

@@ -32,6 +32,11 @@ aws-sdk-iam = { version = "1", default-features = false }
 # `BucketARN` is resolved with `HeadBucket` before `UpdateDestination` rewrites a stream's
 # destination. Only the generated client is needed — the emulator supplies the transport.
 aws-sdk-s3 = { version = "1", default-features = false }
+# The AWS SDK for Lambda, driven over the same in-process callback: a destination whose
+# `ProcessingConfiguration` names a `Lambda` processor hands each buffer to that function
+# and delivers what it returns. Only the generated client is needed — the emulator supplies
+# the transport.
+aws-sdk-lambda = { version = "1", default-features = false }
 # The AWS SDK for KMS, driven over the same in-process callback: the `KeyARN` an encrypted
 # stream names is resolved with `DescribeKey` before the stream is reported as encrypted
 # under it.

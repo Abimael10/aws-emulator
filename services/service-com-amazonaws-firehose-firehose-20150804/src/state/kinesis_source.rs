@@ -137,7 +137,12 @@ pub fn has_kinesis_source(stream: &DeliveryStream) -> bool {
 }
 
 /// The `KinesisStreamARN` this stream's stored source description names, if it names one.
-fn source_arn(stream: &DeliveryStream) -> Option<&str> {
+///
+/// `pub(crate)` because the delivery of a stream's buffer names that source too: the
+/// invocation of a destination's data transformation carries the Kinesis data stream feeding
+/// the Firehose stream beside the Firehose stream itself
+/// (`crate::state::delivery::lambda_processor`).
+pub(crate) fn source_arn(stream: &DeliveryStream) -> Option<&str> {
     stream
         .source
         .as_ref()?

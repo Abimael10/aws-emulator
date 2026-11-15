@@ -89,6 +89,8 @@ mod kinesis_source_fan_out;
 mod kinesis_source_ingestion;
 #[path = "all/kms_key_resolution.rs"]
 mod kms_key_resolution;
+#[path = "all/lambda_transform_delivery.rs"]
+mod lambda_transform_delivery;
 #[path = "all/legacy_s3_destination_mirror.rs"]
 mod legacy_s3_destination_mirror;
 #[path = "all/nested_schema_conversion.rs"]

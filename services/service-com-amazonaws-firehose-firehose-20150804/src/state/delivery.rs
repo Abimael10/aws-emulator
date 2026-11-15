@@ -26,8 +26,13 @@
 //! * IN WHICH ZONE — every time field of that location, and of the object's own name, is
 //!   the delivery's instant as the zone `CustomTimeZone` names reads it ("The time zone
 //!   you prefer. UTC is the default." — [`time_zone`]).
-//! * WHAT — the buffered records' data, concatenated in arrival order, encoded as
-//!   `CompressionFormat` asks ([`compressed`]).
+//! * WHAT — the buffered records' data, as the destination's own data processing left it —
+//!   including the transformation the Lambda function its `ProcessingConfiguration` names
+//!   returns for each record ([`lambda_processor`]) — concatenated in arrival order and
+//!   encoded as `CompressionFormat` asks ([`compressed`]). A record that processing dropped
+//!   reaches no destination, and one it could not place goes to the error output instead.
+//!   The records a destination BACKS UP are the source records, not the processed ones, so
+//!   the backup location is the one copy of what the producer sent ([`plain_target`]).
 //! * UNDER WHICH KEY — the `AWSKMSKeyARN` of `EncryptionConfiguration`'s
 //!   `KMSEncryptionConfig`, "the encryption key" the destination's objects are encrypted at
 //!   rest with ([`kms_key_arn`], [`object_encryption`]).
@@ -110,6 +115,9 @@ pub mod format_conversion;
 /// The delivery of a buffer to an Apache Iceberg table of the Data Catalog, and the commit
 /// that makes the delivered rows part of that table.
 pub mod iceberg;
+/// The data transformation a destination's `ProcessingConfiguration` asks for by naming a
+/// Lambda function, and what that function's verdict does to each record.
+pub mod lambda_processor;
 /// The delivery of a buffer to a destination in Splunk.
 pub mod splunk;
 /// The zone a destination's time fields are rendered in.
@@ -496,8 +504,9 @@ impl DeliveryFailure {
 /// The failure of a record whose PARTITION KEYS could not be determined: the
 /// `MetadataExtraction` program derived none for it (unreadable JSON, a program that does
 /// not compile, an output that is not an object of scalars), or the destination's prefix
-/// names a key nothing produced — including a `partitionKeyFromLambda` key, which only a
-/// Lambda data transformation supplies and this emulator runs none.
+/// names a key nothing produced — including a `partitionKeyFromLambda` key, which only the
+/// metadata a Lambda data transformation returns beside a record supplies and which this
+/// expansion reads no value from ([`expand_prefix`]).
 const METADATA_EXTRACTION_FAILED: DeliveryFailure = DeliveryFailure {
     output_type: "metadata-extraction-failed",
     error_code: "DynamicPartitioning.MetadataExtractionFailed",
@@ -722,6 +731,12 @@ pub struct S3Target {
     /// `DataFormatConversionConfiguration` asks for ([`format_conversion`]) — and `None`
     /// where the records are delivered as the producer's own bytes.
     pub conversion: Option<format_conversion::FormatConversion>,
+    /// The data transformation in force for this location: the Lambda function the
+    /// destination's enabled `ProcessingConfiguration` names ([`lambda_processor`]), whose
+    /// verdict decides what each record is delivered as and whether it is delivered at all.
+    /// `None` for a location whose processing names no such processor — including every
+    /// BACKUP location, which takes the source records.
+    pub lambda: Option<lambda_processor::LambdaTransform>,
 }
 
 /// One HTTP endpoint destination a stream's buffer is delivered to, with everything the
@@ -777,6 +792,10 @@ pub struct PendingDelivery {
     /// The stream's ARN, which the delivery request to an HTTP endpoint names as the
     /// source the records came from.
     pub source_arn: String,
+    /// The ARN of the Kinesis data stream feeding this stream, which the invocation of a
+    /// data transformation names beside the Firehose stream ([`lambda_processor`]). `None`
+    /// for a stream fed by direct puts, which is fed by no other stream.
+    pub kinesis_source_arn: Option<String>,
     /// The stream's `VersionId`, which a delivered object's name carries.
     pub version_id: u64,
     /// The buffered records, in arrival order.
@@ -910,6 +929,10 @@ fn plain_target(config: &S3DestinationConfiguration) -> Option<S3Target> {
         // Nor a `DataFormatConversionConfiguration`: only an EXTENDED Amazon S3 destination
         // carries one, so a location read through here delivers the records' own bytes.
         conversion: None,
+        // And no data transformation, for the reason this location runs no pipeline at all:
+        // what a backup location holds is the record as the producer sent it, which is the
+        // only copy of the pre-transformation bytes there is.
+        lambda: None,
     })
 }
 
@@ -922,6 +945,7 @@ fn processing_target(
     Some(S3Target {
         append_delimiter: appends_delimiter(processing),
         cloudwatch_logs: CloudWatchLogsPipeline::of(processing),
+        lambda: lambda_processor::LambdaTransform::of(processing),
         ..plain_target(config)?
     })
 }
@@ -1038,6 +1062,9 @@ pub fn s3_targets(config: &DestinationConfigKind) -> Vec<S3Target> {
                     time_zone: DeliveryTimeZone::of(config.custom_time_zone.as_deref()),
                     conversion: format_conversion::FormatConversion::of(
                         config.data_format_conversion_configuration.as_ref(),
+                    ),
+                    lambda: lambda_processor::LambdaTransform::of(
+                        config.processing_configuration.as_ref(),
                     ),
                 });
             }
@@ -1471,6 +1498,8 @@ pub fn take_due(
         due.push(PendingDelivery {
             stream: stream.name.clone(),
             source_arn: stream.arn.clone(),
+            kinesis_source_arn: crate::state::kinesis_source::source_arn(stream)
+                .map(str::to_string),
             version_id: stream.version_id,
             records,
             targets,
@@ -1674,7 +1703,7 @@ pub async fn deliver_due<Eng: Send + Sync + 'static>(
         // A delivery this emulator could not WORK OUT right now — an encoder that refused
         // the body — is owed again, exactly like one the destination could not take:
         // nothing of it is written and nothing of it is lost.
-        let Some(mut objects) = objects_of(engine, &delivery, now).await else {
+        let Some(mut objects) = objects_of(engine, hop, &delivery, now).await else {
             let mut store = state.lock();
             restore(&mut store, delivery, now);
             continue;
@@ -2093,6 +2122,9 @@ fn backup_object(
             &records,
             failure,
             now,
+            None,
+            // The records a destination never took are not records a data transformation
+            // judged, so no function is named beside the failure.
             None,
             &BTreeMap::new(),
             reported_message.as_deref(),
@@ -2633,9 +2665,11 @@ fn delivery_region(stream_arn: &str) -> Option<&str> {
 /// `engine` is the one shared engine every mounted service reaches its state through: a
 /// location whose destination converts its data format reads the bound Glue table's columns
 /// out of the Data Catalog through it ([`format_conversion`]). This service's own store is
-/// NOT locked here, so the two are never held at once.
+/// NOT locked here, so the two are never held at once. `hop` is how a location whose data
+/// processing names a Lambda function reaches that function ([`lambda_processor`]).
 async fn objects_of<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    hop: &DeliveryHop,
     delivery: &PendingDelivery,
     now: SystemTime,
 ) -> Option<Vec<DeliveredObject>> {
@@ -2685,6 +2719,24 @@ async fn objects_of<Eng: Send + Sync + 'static>(
                     .or_default()
                     .extend(unprocessable);
             }
+            // The destination's data TRANSFORMATION, over what its other processors left:
+            // the function named by its `ProcessingConfiguration` is handed these records
+            // and what it answers for each one is what this location receives. A record it
+            // dropped is delivered nowhere, and one it could not place goes to the error
+            // output under the code that says so. An invocation that reached no verdict at
+            // all leaves the whole delivery owed again rather than writing the bytes the
+            // function was asked to replace.
+            let processed = match target.lambda.as_ref() {
+                None => processed,
+                Some(transform) => {
+                    let transformed =
+                        lambda_processor::transform(hop, delivery, transform, processed).await?;
+                    for (record, failure) in transformed.failed {
+                        failed.entry(failure).or_default().push(record);
+                    }
+                    transformed.records
+                }
+            };
             let Some(conversion) = target.conversion.as_ref() else {
                 let body = concatenated(&processed, target.append_delimiter);
                 // A group whose every record the processing dropped or could not read leaves
@@ -2746,6 +2798,15 @@ async fn objects_of<Eng: Send + Sync + 'static>(
                 .as_ref()
                 .filter(|_| failure.output_type == FORMAT_CONVERSION_FAILED_OUTPUT_TYPE)
                 .map(format_conversion::FormatConversion::data_catalog_table);
+            // A record the destination's data TRANSFORMATION did not place names the
+            // function that judged it, which is what a consumer of the error output
+            // diagnoses such a failure by; a record that failed for any other reason was
+            // judged by no function.
+            let lambda_arn = target
+                .lambda
+                .as_ref()
+                .filter(|_| lambda_processor::reports_the_function(failure))
+                .map(lambda_processor::LambdaTransform::function_arn);
             bodies.push((
                 prefix,
                 ObjectBody::Records(error_payload(
@@ -2753,6 +2814,7 @@ async fn objects_of<Eng: Send + Sync + 'static>(
                     failure,
                     now,
                     catalog_table.as_ref(),
+                    lambda_arn,
                     &faults,
                     // These records were judged by this emulator's own delivery and not by a
                     // destination that reported anything about them, so each document states
@@ -3532,7 +3594,9 @@ fn concatenated(processed: &[(&StoredRecord, Vec<u8>)], append_delimiter: bool) 
 /// `catalog_table` is the Data Catalog table the failure was measured against, which the
 /// document of a record the destination's data format conversion failed on names beside the
 /// failure itself ([`format_conversion::FormatConversion::data_catalog_table`]); a failure
-/// of any other kind was not measured against a table and names none. `faults` carries, by
+/// of any other kind was not measured against a table and names none. `lambda_arn` is the
+/// function the destination's data TRANSFORMATION invoked, which the document of a record
+/// that transformation did not place names for the same reason. `faults` carries, by
 /// record id, the code and the message of ONE record where the failure is a statement about
 /// that record, which is what its own document names instead of the failure class's.
 /// `reported_message` is what the DESTINATION said about a refusal of the whole buffer,
@@ -3543,6 +3607,7 @@ fn error_payload(
     failure: DeliveryFailure,
     now: SystemTime,
     catalog_table: Option<&::serde_json::Value>,
+    lambda_arn: Option<&str>,
     faults: &BTreeMap<String, RecordFault>,
     reported_message: Option<&str>,
 ) -> Vec<u8> {
@@ -3561,6 +3626,7 @@ fn error_payload(
                 failure,
                 now,
                 catalog_table,
+                lambda_arn,
                 faults.get(&record.record_id).or(reported.as_ref()),
             )
             .to_string()
@@ -3581,14 +3647,16 @@ fn error_payload(
 /// attempts the record cost ([`attempts_made`]). A record the destination's data format
 /// conversion failed on also names the Data Catalog table that conversion reads
 /// its columns from (`dataCatalogTable`), because WHICH schema the record did not match is
-/// what a consumer of that failure diagnoses it by. The code and the message are `fault`'s
-/// where the failure is a statement about THIS record's own data, and the failure class's
-/// where it is about the whole group.
+/// what a consumer of that failure diagnoses it by, and a record the destination's data
+/// transformation did not place names the function that judged it (`lambdaARN`) for the same
+/// reason. The code and the message are `fault`'s where the failure is a statement about
+/// THIS record's own data, and the failure class's where it is about the whole group.
 fn error_envelope(
     record: &StoredRecord,
     failure: DeliveryFailure,
     now: SystemTime,
     catalog_table: Option<&::serde_json::Value>,
+    lambda_arn: Option<&str>,
     fault: Option<&RecordFault>,
 ) -> ::serde_json::Value {
     let mut envelope = ::serde_json::json!({
@@ -3605,6 +3673,9 @@ fn error_envelope(
         members.insert(reported_message.to_string(), message.into());
         if let Some(table) = catalog_table {
             members.insert("dataCatalogTable".to_string(), table.clone());
+        }
+        if let Some(function_arn) = lambda_arn {
+            members.insert("lambdaARN".to_string(), function_arn.into());
         }
     }
     envelope
@@ -3786,11 +3857,12 @@ fn object_name(delivery: &PendingDelivery, now: SystemTime, zone: DeliveryTimeZo
 ///   `<pattern>` ([`format_timestamp`]).
 /// * `firehose:error-output-type` — why the record is in the error output.
 /// * `firehose:random-string` — a value unique to this object.
-/// * `partitionKeyFromLambda:<name>` — the keys a Lambda data transformation returned.
-///   This emulator runs no transformation, so there are none and the record's partition
-///   keys could not be determined, rather than it landing under a prefix with a value
-///   invented for it — and in an error output prefix, as above, it is carried through as
-///   written.
+/// * `partitionKeyFromLambda:<name>` — the keys a Lambda data transformation returned
+///   beside a record. The transformation this delivery runs
+///   ([`lambda_processor`]) reads no partition keys out of its answer, so there are none
+///   and the record's partition keys could not be determined, rather than it landing under
+///   a prefix with a value invented for it — and in an error output prefix, as above, it is
+///   carried through as written.
 ///
 /// "The \"YYYY/MM/DD/HH\" time format prefix is automatically used for delivered Amazon S3
 /// files" (`Prefix`), so a prefix carrying no expression at all gets it appended; one that
