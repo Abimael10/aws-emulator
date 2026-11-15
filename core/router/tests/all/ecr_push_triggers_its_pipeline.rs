@@ -24,6 +24,11 @@
 //! own digest), whether the repository the push names is the one the pattern names, and
 //! whether the target's role carries the grant the invocation needs.
 //!
+//! Every "nothing was started" half is paired with a delivery that WAS observed on the same
+//! wiring — a sibling rule's pipeline, a later push of the named repository, or the same
+//! repository once a rule references it — so an absence is attributable to the
+//! configuration under test rather than to a delivery path that carries nothing at all.
+//!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built — and the
 //! requests driven — on a sized thread. Nothing here sleeps for an execution to finish: it
 //! POLLS the reporting operations, exactly as a client does.
@@ -419,14 +424,50 @@ impl Emulator {
         pipeline_arn: &str,
         role_arn: &str,
     ) {
+        self.pipeline_rule(case, rule, repository, Some(tag), pipeline_arn, role_arn);
+    }
+
+    /// Put a rule matching a push to `repository`, whatever tag it carries, on the default
+    /// bus, with `pipeline_arn` as its target under `role_arn`.
+    ///
+    /// The REPOSITORY is the only thing this pattern filters on, which is the dimension the
+    /// suites below vary: a rule names the repository whose pushes it reacts to, and a push
+    /// to any other repository is not an event it matches.
+    fn rule_for_repository(
+        &self,
+        case: &str,
+        rule: &str,
+        repository: &str,
+        pipeline_arn: &str,
+        role_arn: &str,
+    ) {
+        self.pipeline_rule(case, rule, repository, None, pipeline_arn, role_arn);
+    }
+
+    /// The one place a rule of this suite and its pipeline target are wired: a rule matching
+    /// a push to `repository` — of `tag`, where the row filters on one — with `pipeline_arn`
+    /// as its target under `role_arn`.
+    fn pipeline_rule(
+        &self,
+        case: &str,
+        rule: &str,
+        repository: &str,
+        tag: Option<&str>,
+        pipeline_arn: &str,
+        role_arn: &str,
+    ) {
+        let mut detail = json!({
+            "action-type": ["PUSH"],
+            "result": ["SUCCESS"],
+            "repository-name": [repository],
+        });
+        if let Some(tag) = tag {
+            detail["image-tag"] = json!([tag]);
+        }
         let pattern = json!({
             "source": ["aws.ecr"],
             "detail-type": ["ECR Image Action"],
-            "detail": {
-                "action-type": ["PUSH"],
-                "repository-name": [repository],
-                "image-tag": [tag],
-            },
+            "detail": detail,
         })
         .to_string();
         self.events_ok(
@@ -447,6 +488,36 @@ impl Emulator {
             Some(0),
             "case {case:?}: the pipeline target must be accepted, got {targeted}"
         );
+    }
+}
+
+/// Watch `pipeline` for the whole absence window and fail the moment an execution appears
+/// beyond `baseline`.
+///
+/// A POLL loop rather than one wait: the reporting operation is re-read throughout the
+/// window, so an execution that is started at any point in it is reported against the
+/// configuration under test instead of only being noticed if it survives to the end.
+fn nothing_started(
+    emulator: &Emulator,
+    case: &str,
+    pipeline: &str,
+    baseline: &BTreeSet<String>,
+    what: &str,
+) {
+    let deadline = Instant::now() + NOTHING_STARTED_WINDOW;
+    // Read at least once, whatever the window is, so no configuration passes this check
+    // without the reporting operation having been asked at all.
+    loop {
+        let ids = emulator.execution_ids(case, pipeline);
+        assert_eq!(
+            &ids, baseline,
+            "case {case:?}: {what} must start no execution of {pipeline}, got {ids:?} against \
+             the baseline {baseline:?}"
+        );
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -574,13 +645,14 @@ fn a_matched_push_starts_the_pipeline_and_records_the_pushed_image_digest() {
 
             if !matched {
                 // Nothing the rule does not match starts an execution: the set of
-                // executions is unchanged after a window in which one would have appeared.
-                std::thread::sleep(NOTHING_STARTED_WINDOW);
-                let ids = emulator.execution_ids(row, pipeline);
-                assert_eq!(
-                    ids, baseline,
-                    "case {row:?}: a push the rule's filter does not match must start no \
-                     execution, got {ids:?} against the baseline {baseline:?}"
+                // executions is WATCHED for the absence window and stays the baseline
+                // throughout it.
+                nothing_started(
+                    &emulator,
+                    row,
+                    pipeline,
+                    &baseline,
+                    "a push the rule's filter does not match",
                 );
                 continue;
             }
@@ -695,14 +767,201 @@ fn a_target_role_without_the_start_permission_starts_nothing() {
             !started.is_empty(),
             "case {case:?}: the correctly permissioned rule must start an execution"
         );
-        // And the rule whose role withholds the call started nothing, after a window in
-        // which it would have.
-        std::thread::sleep(NOTHING_STARTED_WINDOW);
-        let ids = emulator.execution_ids(case, withheld);
+        // And the rule whose role withholds the call started nothing, throughout a window
+        // in which it would have.
+        nothing_started(
+            &emulator,
+            case,
+            withheld,
+            &withheld_baseline,
+            "a target role that allows no codepipeline:StartPipelineExecution",
+        );
+    });
+}
+
+/// A rule names the REPOSITORY whose pushes it reacts to: a push to that repository starts
+/// one execution of the targeted pipeline, and a push to any other repository — one no rule
+/// references — starts nothing, however much its name resembles the one the rule names.
+///
+/// The rows differ along the repository the push names and how it relates to the one the
+/// pattern names: the named one itself, an unrelated name, a name that extends it, a name it
+/// extends, and the same name inside a namespace path. The closing row pushes the named
+/// repository again, so every unmatched push of the table is followed by a delivery that was
+/// observed to arrive: an execution any of them had started would be in the final set.
+#[test]
+fn only_a_push_to_the_repository_the_rule_names_starts_its_pipeline() {
+    on_a_sized_thread(|| {
+        let emulator = Emulator::new();
+        let case = "a rule scoped to one repository";
+        let named = "scoped-orders";
+        let tag = "latest";
+        let bucket = "ecr-scope-artifacts";
+        let pipeline = "ecr-scope";
+
+        // (case, the repository the push names, whether the rule's pattern names it)
+        let rows: [(&str, &str, bool); 6] = [
+            ("the repository the rule names", named, true),
+            ("a repository no rule references", "scoped-payments", false),
+            // A pattern value matches a repository name whole, not as a prefix or a suffix
+            // of one: neither of the two neighbours below is the repository it names.
+            ("a repository whose name extends the named one", "scoped-orders-staging", false),
+            ("a repository whose name the named one extends", "scoped", false),
+            // A repository name may hold `/` (`project-a/nginx` in `CreateRepository`'s own
+            // documentation), and such a name is its own repository rather than the one its
+            // last segment spells.
+            ("the named name inside a namespace path", "team/scoped-orders", false),
+            ("the repository the rule names, pushed again", named, true),
+        ];
+
+        emulator.bucket(bucket);
+        // Each repository of the table once: two rows push to the repository the rule names.
+        for repository in rows
+            .iter()
+            .map(|(_, repository, _)| *repository)
+            .collect::<BTreeSet<&str>>()
+        {
+            emulator.ecr_ok(
+                case,
+                "CreateRepository",
+                &json!({ "repositoryName": repository }),
+            );
+        }
+        let pipeline_role = emulator.role("ecr-scope-pipeline-role", PIPELINE_TRUST);
+        emulator.pipeline(case, pipeline, &pipeline_role, bucket, named, tag);
+        // `CreatePipeline` starts an execution of its own, before any image is pushed.
+        emulator.drained(case, pipeline);
+
+        let target_role = emulator.role("ecr-scope-events-role", EVENTS_TRUST);
+        emulator.allow(
+            "ecr-scope-events-role",
+            "codepipeline:StartPipelineExecution",
+            &pipeline_arn(pipeline),
+        );
+        emulator.rule_for_repository(
+            case,
+            "ecr-scope-rule",
+            named,
+            &pipeline_arn(pipeline),
+            &target_role,
+        );
+
+        let before_the_table = emulator.execution_ids(case, pipeline);
+        let mut baseline = before_the_table.clone();
+        let mut matched_pushes = 0usize;
+        for (index, (row, repository, matched)) in rows.into_iter().enumerate() {
+            let manifest = manifest_of(&format!("{row}-{index}"));
+            let digest = emulator.push(row, repository, &manifest, tag);
+            assert_eq!(
+                digest,
+                manifest_digest(&manifest),
+                "case {row:?}: the registry must store the manifest under the digest of its \
+                 own bytes, got {digest}"
+            );
+
+            if !matched {
+                nothing_started(
+                    &emulator,
+                    row,
+                    pipeline,
+                    &baseline,
+                    "a push to a repository the rule's pattern does not name",
+                );
+                continue;
+            }
+
+            let started = emulator.started_execution(row, pipeline, &baseline);
+            matched_pushes += 1;
+            // The execution the push started is an execution FOR the image it pushed, which
+            // is what makes it that push's execution and not an unrelated run.
+            let execution = emulator.execution(row, pipeline, &started);
+            assert_eq!(
+                artifact_revision(&execution).as_deref(),
+                Some(digest.as_str()),
+                "case {row:?}: the execution the push started must report the digest the \
+                 push stored ({digest}), got {execution}"
+            );
+            baseline = emulator.execution_ids(row, pipeline);
+        }
+
+        // Exactly the matched rows started executions. Every unmatched push was made before
+        // the closing matched one, whose delivery was observed to arrive, so an execution
+        // any of them had started would be in this set.
+        let ids = emulator.execution_ids(case, pipeline);
+        let started: BTreeSet<String> = ids.difference(&before_the_table).cloned().collect();
         assert_eq!(
-            ids, withheld_baseline,
-            "case {case:?}: a target role that allows no codepipeline:StartPipelineExecution \
-             must start no execution, got {ids:?} against the baseline {withheld_baseline:?}"
+            started.len(),
+            matched_pushes,
+            "case {case:?}: expected {matched_pushes} execution(s), one per push to the \
+             repository the rule names, got {started:?}"
+        );
+    });
+}
+
+/// The absence is attributable to the RULE: the very repository whose push started nothing
+/// starts an execution of the same pipeline, under the same role, once a rule references it
+/// — so a client can tell a correctly wired topology that filtered the push out from an
+/// emulator that delivers nothing at all.
+#[test]
+fn a_repository_starts_its_pipeline_once_a_rule_references_it() {
+    on_a_sized_thread(|| {
+        let emulator = Emulator::new();
+        let case = "a repository no rule references yet";
+        let repository = "unwired-orders";
+        let tag = "latest";
+        let bucket = "ecr-unwired-artifacts";
+        let pipeline = "ecr-unwired";
+
+        emulator.bucket(bucket);
+        emulator.ecr_ok(
+            case,
+            "CreateRepository",
+            &json!({ "repositoryName": repository }),
+        );
+        let pipeline_role = emulator.role("ecr-unwired-pipeline-role", PIPELINE_TRUST);
+        emulator.pipeline(case, pipeline, &pipeline_role, bucket, repository, tag);
+        emulator.drained(case, pipeline);
+
+        // No rule references the repository, so the push it serves starts nothing.
+        let baseline = emulator.execution_ids(case, pipeline);
+        emulator.push(case, repository, &manifest_of("before-the-rule"), tag);
+        nothing_started(
+            &emulator,
+            case,
+            pipeline,
+            &baseline,
+            "a push to a repository no rule references",
+        );
+
+        // The same repository, the same pipeline and the same push, now with a rule that
+        // references it: one execution, for the image the push stored.
+        let target_role = emulator.role("ecr-unwired-events-role", EVENTS_TRUST);
+        emulator.allow(
+            "ecr-unwired-events-role",
+            "codepipeline:StartPipelineExecution",
+            &pipeline_arn(pipeline),
+        );
+        emulator.rule_for_repository(
+            case,
+            "ecr-unwired-rule",
+            repository,
+            &pipeline_arn(pipeline),
+            &target_role,
+        );
+        let digest = emulator.push(case, repository, &manifest_of("after-the-rule"), tag);
+        let started = emulator.started_execution(case, pipeline, &baseline);
+        let ids = emulator.execution_ids(case, pipeline);
+        let new: BTreeSet<String> = ids.difference(&baseline).cloned().collect();
+        assert_eq!(
+            new.len(),
+            1,
+            "case {case:?}: expected the one execution the referenced push started, got {new:?}"
+        );
+        let execution = emulator.execution(case, pipeline, &started);
+        assert_eq!(
+            artifact_revision(&execution).as_deref(),
+            Some(digest.as_str()),
+            "case {case:?}: the execution must report the digest the push stored ({digest}), \
+             got {execution}"
         );
     });
 }

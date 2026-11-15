@@ -6892,3 +6892,15 @@ mod all_rs_is_a_canonical_declaration_list;
 //! about one — not even as an ordinary comment: the notes concurrent landings had appended
 //! here live in `all/appended_notes.rs`, and the rules they repeat are these lines.
 //! file (`tests/<name>.rs`) — which the layout check refuses. The `#[path]` is what points
+//! Put a new suite at `tests/all/<name>.rs` and declare it below, sorted: one
+//! `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite and NOTHING ELSE, so a
+//! landing has one place to insert and nothing to keep consistent. A suite that is not
+//! declared here compiles nowhere and its tests never run; a suite left at the top level
+//! of `tests/` fails the build; and a suite declared twice is `E0428`, which fails every
+//! THESE HEADER LINES ARE THE ONLY PLACE AN INNER DOC COMMENT (`//!`) MAY STAND IN THIS
+//! FILE: past the first item one is `E0753` and compiles no suite of this target. Leave no
+//! note further down — not about a suite, not about a collision, not about this rule.
+//! writing a note here; `all/appended_notes.rs` holds the notes earlier landings left.
+//! WHY a suite lives in this target rather than in one service crate's own — it drives more
+//! where it is read beside the test it describes and stays current when the suite moves.
+//! This file is the declaration list and nothing else.
