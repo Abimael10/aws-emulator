@@ -210,13 +210,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.next_token.as_deref(),
             input.max_results,
         )
+        // One cursor codec, one refusal (see `crate::state::invalid_cursor`).
         .map_err(|_| {
-            ListAccountRolesErrorModeled::InvalidRequestException(InvalidRequestException {
-                message: Some(
-                    "nextToken is not a page token this operation issued for this listing"
-                        .to_string(),
-                ),
-            })
+            ListAccountRolesErrorModeled::InvalidRequestException(crate::state::invalid_cursor())
         })?;
 
         Ok(ListAccountRolesOutput {

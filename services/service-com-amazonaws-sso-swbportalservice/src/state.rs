@@ -27,8 +27,9 @@
 //! ([`store_unavailable`], and [`store_unavailable_response`] for those same seams),
 //! stamping an expiry without risking an overflow panic ([`expiry_after`]),
 //! ending the minted role credentials the clock has made spent
-//! ([`end_expired_credentials`]), and cutting a sorted listing into a page with an opaque
-//! cursor ([`page_of`]).
+//! ([`end_expired_credentials`]), cutting a sorted listing into a page with an opaque
+//! cursor ([`page_of`]), and wording the refusal when the `nextToken` presented to such a
+//! listing is not one it issued ([`invalid_cursor`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -634,6 +635,31 @@ pub struct Page<T> {
 /// not a cursor at all, or one scoped to a different listing or a different session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidCursor;
+
+/// The message this service refuses a `nextToken` no listing of its own issued with.
+///
+/// One constant for the whole service, for the same reason [`INVALID_SESSION_MESSAGE`] is
+/// one: the cursor codec is one codec ([`encode_cursor`] / [`decode_cursor`]), so every
+/// paginated operation says the same thing about a token that is not its output, and
+/// nothing about the rejected token reaches the text. The Smithy model types
+/// `InvalidRequestException$message` as an optional `ErrorDescription` without stating a
+/// text, so the service states this one.
+pub const INVALID_CURSOR_MESSAGE: &str =
+    "nextToken is not a page token this operation issued for this listing";
+
+/// The one refusal every paginated operation answers an [`InvalidCursor`] with: the
+/// modelled 400 `InvalidRequestException`, worded by [`INVALID_CURSOR_MESSAGE`].
+///
+/// Both paginated handlers map the `InvalidCursor` that [`page_of`] hands back through
+/// HERE — wrapping it in their own operation's error enum — rather than classifying and
+/// wording it themselves, so neither the class nor the sentence can drift between the two
+/// listings, exactly as [`unauthorized_session`] holds the authentication refusal to one
+/// value.
+pub fn invalid_cursor() -> crate::ops::types::InvalidRequestException {
+    crate::ops::types::InvalidRequestException {
+        message: Some(INVALID_CURSOR_MESSAGE.to_string()),
+    }
+}
 
 /// The version stamped into a cursor, so a token minted by an older encoding is
 /// refused rather than silently misread.

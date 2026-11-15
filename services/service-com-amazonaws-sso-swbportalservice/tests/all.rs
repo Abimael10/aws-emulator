@@ -31,6 +31,8 @@ mod page_token_spelling;
 mod portal_session;
 #[path = "all/route_path_agreement.rs"]
 mod route_path_agreement;
+#[path = "all/shared_cursor_refusal.rs"]
+mod shared_cursor_refusal;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/store_unreachable_refusal.rs"]
