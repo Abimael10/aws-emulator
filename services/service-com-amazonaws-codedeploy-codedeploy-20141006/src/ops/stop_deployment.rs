@@ -268,7 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the way that deployment found it, from the one place an alias is written
         // (`state::lambda_traffic_shift`). Called with this store unlocked, and a
         // no-op for a stop that rolled nothing back.
-        crate::state::lambda_traffic_shift::apply_due_shifts(&*self.engine);
+        crate::state::lambda_traffic_shift::apply_due_shifts(
+            &*self.engine,
+            crate::state::now_ms(),
+        );
         // A rollback the stop created is a deployment of its own, in flight from
         // here: it owes its own alias restoration and its terminal status whether
         // or not anybody calls CodeDeploy again.

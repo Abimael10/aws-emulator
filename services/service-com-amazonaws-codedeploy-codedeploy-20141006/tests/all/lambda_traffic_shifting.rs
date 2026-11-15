@@ -26,6 +26,13 @@
 //! Every alias here is created through `CreateAlias` and read through `GetAlias`,
 //! and every alarm through `PutMetricAlarm`/`SetAlarmState`: the operations a
 //! client calls, so nothing reaches into any service's store.
+//!
+//! The setup below — a function with published versions and an alias, an AppSpec
+//! that shifts it, a Lambda deployment group under a traffic routing
+//! configuration, and the alias sampling that watches a shift happen — is
+//! `pub(crate)` because `tests/all/alarm_blocked_lambda_release.rs` is about the
+//! same alias under the same shifts; there is one such harness in this target,
+//! not one per suite.
 
 use std::time::{Duration, Instant};
 
@@ -40,7 +47,7 @@ const SERVICE_ROLE: &str = "arn:aws:iam::123456789012:role/CodeDeployRole";
 const EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/LambdaExecution";
 
 /// The alias every deployment here shifts traffic on.
-const ALIAS: &str = "live";
+pub(crate) const ALIAS: &str = "live";
 
 /// How long a deployment that walks a traffic-shift window is given to reach a
 /// terminal status, and how often the alias is sampled while it does.
@@ -48,22 +55,22 @@ const ALIAS: &str = "live";
 /// Long enough for the window of every configuration below (each states a
 /// one-minute interval, so each increment is held for this emulator's own span per
 /// configured minute) and for the increments of the longest ladder among them.
-const WINDOW_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const WINDOW_DEADLINE: Duration = Duration::from_secs(30);
 /// See [`WINDOW_DEADLINE`]: fine enough to observe every increment of a shift
 /// whose increments are held for whole seconds.
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(40);
+pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_millis(40);
 
 /// The `ErrorCode` a deployment its alarms stopped reports
 /// (`smithy_query(query="shape",shape="ErrorCode")` carries it).
-const ALARM_ACTIVE: &str = "ALARM_ACTIVE";
+pub(crate) const ALARM_ACTIVE: &str = "ALARM_ACTIVE";
 
 /// The `DeploymentCreator` of a deployment CodeDeploy created to roll another one
 /// back (`smithy_query(query="shape",shape="DeploymentCreator")`).
-const CREATOR_ROLLBACK: &str = "codeDeployRollback";
+pub(crate) const CREATOR_ROLLBACK: &str = "codeDeployRollback";
 
 /// What one alias reports at an instant: the version it invokes, and the weights
 /// its routing configuration carries.
-type AliasReading = (String, Vec<(String, f64)>);
+pub(crate) type AliasReading = (String, Vec<(String, f64)>);
 
 /// Create a function named `name` and publish `versions` versions of it, then
 /// point a `live` alias at version 1.
@@ -71,7 +78,7 @@ type AliasReading = (String, Vec<(String, f64)>);
 /// The deployment package is a blob uploaded inline: nothing here invokes the
 /// function, so what the archive holds is immaterial — only the VERSIONS it is
 /// published as are, because those are what an alias and a traffic shift name.
-async fn function_with_versions(emulator: &Emulator, name: &str, versions: usize) {
+pub(crate) async fn function_with_versions(emulator: &Emulator, name: &str, versions: usize) {
     emulator
         .lambda_ok(
             "CreateFunction",
@@ -141,7 +148,7 @@ async fn wait_until_active(emulator: &Emulator, name: &str) {
 }
 
 /// What the alias of `function` reports right now.
-async fn alias_reading(emulator: &Emulator, function: &str) -> AliasReading {
+pub(crate) async fn alias_reading(emulator: &Emulator, function: &str) -> AliasReading {
     let reported = emulator
         .lambda_ok(
             "GetAlias",
@@ -175,7 +182,7 @@ async fn alias_reading(emulator: &Emulator, function: &str) -> AliasReading {
 
 /// An `appSpecContent` revision shifting `alias` of `function` from
 /// `current_version` to `target_version`, in the AppSpec reference's own spelling.
-fn appspec_revision(
+pub(crate) fn appspec_revision(
     function: &str,
     alias: &str,
     current_version: &str,
@@ -191,7 +198,7 @@ fn appspec_revision(
 
 /// A `trafficRoutingConfig` of `kind` shifting `percentage` every `interval`
 /// minutes; `AllAtOnce` carries neither increment configuration.
-fn traffic_routing(kind: &str, percentage: i64, interval: i64) -> Value {
+pub(crate) fn traffic_routing(kind: &str, percentage: i64, interval: i64) -> Value {
     match kind {
         "TimeBasedCanary" => json!({
             "type": kind,
@@ -208,7 +215,7 @@ fn traffic_routing(kind: &str, percentage: i64, interval: i64) -> Value {
 /// Create a deployment configuration of `name` carrying `routing`, an application
 /// and one Lambda deployment group of it carrying `extras`, answering the group's
 /// name.
-async fn lambda_group(
+pub(crate) async fn lambda_group(
     emulator: &Emulator,
     application: &str,
     routing: Option<Value>,
@@ -276,7 +283,7 @@ async fn create_deployment(
 /// Sample the alias of `function` until `deployment` reaches a terminal status,
 /// answering every distinct reading observed in order, and that terminal
 /// `deploymentInfo`.
-async fn readings_until_terminal(
+pub(crate) async fn readings_until_terminal(
     emulator: &Emulator,
     function: &str,
     deployment: &str,

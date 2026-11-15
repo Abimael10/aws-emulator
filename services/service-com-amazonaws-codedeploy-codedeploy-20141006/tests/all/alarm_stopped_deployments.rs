@@ -44,11 +44,15 @@ const CREATOR_ROLLBACK: &str = "codeDeployRollback";
 /// The `StateValue` values a CloudWatch alarm carries, as that service's own
 /// model lists them (`smithy_query(query="shape",shape="StateValue")`: OK |
 /// ALARM | INSUFFICIENT_DATA).
-const STATE_ALARM: &str = "ALARM";
+///
+/// `pub(crate)` with [`alarm_at`]: `tests/all/alarm_blocked_lambda_release.rs`
+/// drives the same gate from the same alarm states, so one place says how an
+/// alarm is created and forced.
+pub(crate) const STATE_ALARM: &str = "ALARM";
 /// See [`STATE_ALARM`].
-const STATE_OK: &str = "OK";
+pub(crate) const STATE_OK: &str = "OK";
 /// See [`STATE_ALARM`].
-const STATE_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
+pub(crate) const STATE_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
 
 /// Create an application and one deployment group of it carrying `extras`,
 /// answering the group's name.
@@ -82,7 +86,7 @@ async fn group_with(
 /// The alarm watches a metric nothing publishes into, so its state is whatever
 /// `SetAlarmState` last forced — which is how the alarm gate is driven without
 /// depending on any metric data.
-async fn alarm_at(emulator: &Emulator, name: &str, state_value: &str) {
+pub(crate) async fn alarm_at(emulator: &Emulator, name: &str, state_value: &str) {
     emulator
         .cloudwatch_ok(
             "PutMetricAlarm",
@@ -120,8 +124,12 @@ fn alarm_configuration(enabled: bool, ignore_poll_alarm_failure: bool, alarms: &
     })
 }
 
-/// Create a deployment of `revision`, answering the id CodeDeploy minted.
-async fn create_deployment(
+/// Create a deployment of `revision` carrying `extras`, answering the id
+/// CodeDeploy minted.
+///
+/// `pub(crate)` with [`alarm_at`]: `tests/all/alarm_blocked_lambda_release.rs`
+/// creates its deployments the same way.
+pub(crate) async fn create_deployment(
     emulator: &Emulator,
     application: &str,
     group: &str,
@@ -151,7 +159,10 @@ async fn deployment_info(emulator: &Emulator, deployment_id: &str) -> Value {
 }
 
 /// The ids `ListDeployments` answers for one deployment group.
-async fn listed_deployments(emulator: &Emulator, application: &str, group: &str) -> Vec<String> {
+///
+/// `pub(crate)` with [`alarm_at`]: the sibling suite reads the rollback deployment
+/// off the same list.
+pub(crate) async fn listed_deployments(emulator: &Emulator, application: &str, group: &str) -> Vec<String> {
     emulator
         .ok(
             "ListDeployments",

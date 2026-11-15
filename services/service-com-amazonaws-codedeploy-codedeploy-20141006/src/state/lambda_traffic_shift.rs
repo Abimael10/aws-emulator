@@ -38,7 +38,7 @@ use crate::ops::types::ErrorInformation;
 use super::lambda_alias::{AliasMove, Unresolved};
 use super::traffic_shift;
 use super::{
-    deployment_is_terminal, now_ms, service_state, ComAmazonawsCodedeployCodedeploy20141006State,
+    deployment_is_terminal, service_state, ComAmazonawsCodedeployCodedeploy20141006State,
     Deployment, DEPLOYMENT_STATUS_FAILED, DEPLOYMENT_STATUS_IN_PROGRESS,
 };
 
@@ -103,11 +103,16 @@ struct Claim {
 ///
 /// A store holding no deployment that owes an increment costs one read of this
 /// store and no Lambda lock at all.
-pub fn apply_due_shifts<Eng: Send + Sync + 'static>(engine: &Eng) {
+///
+/// `now` is the instant of the whole pass this is one stage of: the alarm gate
+/// ([`super::alarm_gate::poll_alarms`]) is an EARLIER stage of the same pass, so
+/// an increment is carried out only for a deployment that gate found still
+/// running at that same instant. Reading the clock again here would move the alias
+/// of a deployment whose gate had fallen due in between.
+pub fn apply_due_shifts<Eng: Send + Sync + 'static>(engine: &Eng, now: i64) {
     let Some(state) = service_state(engine) else {
         return;
     };
-    let now = now_ms();
     let (claimed, restores) = {
         let mut store = state.lock();
         (

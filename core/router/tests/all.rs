@@ -2479,3 +2479,8 @@ mod declaration_roots_are_canonical_and_complete;
 // none anywhere, no merge of two landings can leave one past the first item.
 // declaration into `tests/all/`. Three suites pin the shape above rather than have it
 // restated here: `all/all_rs_declares_each_suite_once.rs`,
+//! `mod <name>;` pair into the sorted list below. The list holds those pairs and no other
+//! line, so two branches landing at once insert two lines in two places and have no prose to
+//! duplicate, re-word or mistype — and what a suite covers, and why it drives the assembled
+//! router rather than one service crate, belongs in that suite's own module header.
+//! `all/all_rs_is_a_canonical_declaration_list.rs` pin that shape; the notes earlier landings

@@ -65,7 +65,7 @@ use crate::ops::types::ErrorInformation;
 
 use super::service_role::{iam_state, IamState};
 use super::{
-    alarm_gate, deployment_is_terminal, now_ms, rollback, service_state,
+    alarm_gate, deployment_is_terminal, rollback, service_state,
     ComAmazonawsCodedeployCodedeploy20141006State, Deployment, DEPLOYMENT_STATUS_FAILED,
     DEPLOYMENT_STATUS_IN_PROGRESS,
 };
@@ -138,11 +138,14 @@ struct Denial {
 ///
 /// A store holding no deployment that reaches another service costs one read of this
 /// store and no IAM lock at all.
-pub fn refuse_unauthorized_deployments<Eng: Send + Sync + 'static>(engine: &Eng) {
+///
+/// `now` is the instant of the whole pass this is one stage of, handed in by
+/// [`super::with_state`] so every stage of that pass asks what was due at ONE
+/// instant; see that function.
+pub fn refuse_unauthorized_deployments<Eng: Send + Sync + 'static>(engine: &Eng, now: i64) {
     let Some(state) = service_state(engine) else {
         return;
     };
-    let now = now_ms();
     let pending = {
         let store = state.lock();
         preflights(&store, now)

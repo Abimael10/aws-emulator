@@ -4534,29 +4534,36 @@ pub fn with_state<Eng: Send + Sync + 'static, R>(
     body: impl FnOnce(&mut ComAmazonawsCodedeployCodedeploy20141006State) -> R,
 ) -> Option<R> {
     let state = service_state(engine)?;
+    // ONE instant for the whole pass, read before its first stage: the stages
+    // below are ORDERED — what a deployment's revision declares, then whether its
+    // role authorizes it, then the alarms, then the traffic, then the status — and
+    // each may only act on what was due at the instant the stage before it asked
+    // about. A later stage reading the clock again would act on a transition an
+    // earlier stage had not seen fall due yet, which is how a deployment the
+    // alarms stopped could still have moved its alias.
+    let now = now_ms();
     // The revision of every deployment that has reached for one is resolved
     // FIRST: what a fetched AppSpec declares is what the deployment performs, so
     // it is read before the role is asked about those calls and before any
     // traffic moves — and a deployment whose revision cannot be located fails
     // here, having done nothing.
-    s3_revision::resolve_due_revisions(engine);
+    s3_revision::resolve_due_revisions(engine, now);
     // The service role the deployments in flight run as is consulted next: a
     // deployment its role does not authorize must have no effect at all, so it is
     // failed before any alarm is polled and before any traffic moves.
-    service_role_permissions::refuse_unauthorized_deployments(engine);
+    service_role_permissions::refuse_unauthorized_deployments(engine, now);
     // The alarm gate reads CloudWatch's own alarm store, so it runs with THIS
     // store unlocked — the two are never held at once — and BEFORE the clock
     // settles anything: a deployment the alarms had already stopped must not
     // reach a successful outcome at the instant its stop was owed.
-    alarm_gate::poll_alarms(engine);
+    alarm_gate::poll_alarms(engine, now);
     // The traffic shift writes AWS Lambda's own function store, with this store
     // unlocked for the same reason, and runs after the gate and before the clock:
     // a deployment the alarms stopped shifts no traffic, and no deployment is
     // given a successful outcome before the increments its revision and its
     // configuration described have happened.
-    lambda_traffic_shift::apply_due_shifts(engine);
+    lambda_traffic_shift::apply_due_shifts(engine, now);
     let mut guard = state.lock();
-    let now = now_ms();
     guard.ensure_seeded(now);
     guard.advance_clock(now);
     let answered = body(&mut guard);

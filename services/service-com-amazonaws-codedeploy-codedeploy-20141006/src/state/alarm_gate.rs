@@ -53,7 +53,7 @@ use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwat
 use crate::ops::types::{AlarmConfiguration, ErrorInformation};
 
 use super::{
-    deployment_is_terminal, now_ms, rollback, service_state,
+    deployment_is_terminal, rollback, service_state,
     ComAmazonawsCodedeployCodedeploy20141006State, Deployment, DeploymentGroup,
     DEPLOYMENT_CREATOR_ROLLBACK, DEPLOYMENT_STATUS_IN_PROGRESS, DEPLOYMENT_STATUS_STOPPED,
 };
@@ -122,11 +122,17 @@ impl Stop {
 /// and the stops written under this one again — the two stores are never held at
 /// once. A store holding no deployment with an armed gate costs one read and no
 /// CloudWatch lock at all.
-pub fn poll_alarms<Eng: Send + Sync + 'static>(engine: &Eng) {
+///
+/// `now` is the instant of the whole pass this is one stage of, handed in by
+/// [`super::with_state`]: the traffic a deployment shifts is carried out by a
+/// LATER stage of that same pass, so both stages have to ask what was due at ONE
+/// instant — a shift reading the clock again would move the alias of a deployment
+/// whose gate fell due in between, and that deployment is then stopped having
+/// moved traffic.
+pub fn poll_alarms<Eng: Send + Sync + 'static>(engine: &Eng, now: i64) {
     let Some(state) = service_state(engine) else {
         return;
     };
-    let now = now_ms();
     let armed = {
         let store = state.lock();
         armed_gates(&store, now)
