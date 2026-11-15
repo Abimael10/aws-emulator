@@ -214,6 +214,8 @@ mod recorder_discovers_iam_roles;
 mod recorder_discovers_iam_managed_policies;
 #[path = "all/conformance_pack_deletion.rs"]
 mod conformance_pack_deletion;
+#[path = "all/delete_conformance_pack_resources.rs"]
+mod delete_conformance_pack_resources;
 #[path = "all/custom_lambda_rule_evaluation.rs"]
 mod custom_lambda_rule_evaluation;
 #[path = "all/pack_rule_evaluates_a_recorded_resource.rs"]

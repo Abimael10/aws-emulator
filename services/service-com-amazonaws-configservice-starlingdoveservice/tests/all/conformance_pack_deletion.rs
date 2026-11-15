@@ -16,10 +16,10 @@
 //! deployed, whether another pack is standing beside it, which read is used to show the
 //! pack is gone, and whether the name names a pack at all.
 
-use serde_json::{json, Value};
+use serde_json::json;
 use service_com_amazonaws_configservice_starlingdoveservice::state::conformance_pack_rule_name;
 
-use crate::conformance_pack_rule_evaluation::Emulator;
+use crate::conformance_pack_rule_evaluation::{error_code, Emulator};
 
 /// The error code every read of a pack this account does not hold answers with.
 const NO_SUCH_PACK: &str = "NoSuchConformancePackException";
@@ -44,14 +44,6 @@ fn template(declared: &[&str]) -> String {
         ));
     }
     body
-}
-
-/// `body`'s error code, as the awsJson envelope carries it.
-fn error_code(body: &Value) -> String {
-    body["__type"]
-        .as_str()
-        .map(|wire| wire.rsplit('#').next().unwrap_or(wire).to_string())
-        .unwrap_or_else(|| format!("<no __type in {body}>"))
 }
 
 /// Deploy `pack` from a template declaring `declared`, wait for the deployment the clock

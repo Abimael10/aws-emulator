@@ -191,6 +191,15 @@ impl Emulator {
     }
 }
 
+/// `body`'s error code, as the awsJson envelope carries it — the one reader the suites that
+/// share this harness read a refusal's code through.
+pub(crate) fn error_code(body: &Value) -> String {
+    body["__type"]
+        .as_str()
+        .map(|wire| wire.rsplit('#').next().unwrap_or(wire).to_string())
+        .unwrap_or_else(|| format!("<no __type in {body}>"))
+}
+
 /// The password policy a row puts in force, as the members
 /// `UpdateAccountPasswordPolicy` takes.
 #[derive(Debug, Clone, Copy, Default)]
