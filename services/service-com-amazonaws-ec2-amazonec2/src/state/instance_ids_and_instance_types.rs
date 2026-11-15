@@ -67,10 +67,11 @@ pub fn untaggable_resource_id<E>(resource_id: &str) -> crate::scaffolded::Scaffo
     }
     /// The not-found refusal of one taggable kind, as the catalogue below holds it.
     type NotFound<E> = fn(&str) -> crate::scaffolded::Scaffolded<E>;
-    let kinds: [(&str, NotFound<E>); 12] = [
+    let kinds: [(&str, NotFound<E>); 27] = [
         ("vpc", invalid_vpc_id_not_found),
         ("subnet", invalid_subnet_id_not_found),
         ("sg", invalid_group_not_found),
+        (SECURITY_GROUP_RULE_ID_PREFIX, invalid_security_group_rule_id_not_found),
         ("eni", invalid_network_interface_id_not_found),
         ("vol", invalid_volume_id_not_found),
         ("snap", invalid_snapshot_id_not_found),
@@ -84,6 +85,50 @@ pub fn untaggable_resource_id<E>(resource_id: &str) -> crate::scaffolded::Scaffo
         // carries that other sentence, which names none of them).
         ("lt", specified_launch_template_id_not_found),
         ("ami", invalid_ami_id_not_found),
+        (KEY_PAIR_ID_PREFIX, invalid_key_pair_id_not_found),
+        (CAPACITY_BLOCK_ID_PREFIX, invalid_capacity_block_id_not_found),
+        (
+            CAPACITY_MANAGER_DATA_EXPORT_ID_PREFIX,
+            invalid_capacity_manager_data_export_id_not_found,
+        ),
+        (
+            DECLARATIVE_POLICIES_REPORT_ID_PREFIX,
+            invalid_declarative_policies_report_id_not_found,
+        ),
+        (IMAGE_USAGE_REPORT_ID_PREFIX, invalid_image_usage_report_id_not_found),
+        (
+            INSTANCE_EVENT_WINDOW_ID_PREFIX,
+            invalid_instance_event_window_id_not_found,
+        ),
+        (LOCAL_GATEWAY_ID_PREFIX, invalid_local_gateway_id_not_found),
+        (
+            TRAFFIC_MIRROR_TARGET_ID_PREFIX,
+            invalid_traffic_mirror_target_id_not_found,
+        ),
+        (
+            VERIFIED_ACCESS_INSTANCE_ID_PREFIX,
+            invalid_verified_access_instance_id_not_found,
+        ),
+        (VPN_CONCENTRATOR_ID_PREFIX, invalid_vpn_concentrator_id_not_found),
+        // The id prefixes the crate spells WITH the separator, so that what is matched here
+        // is the prefix alone ([`prefixed_id_is_well_formed`] reads the separator itself).
+        (
+            INSTANCE_CONNECT_ENDPOINT_ID_PREFIX.trim_end_matches('-'),
+            invalid_instance_connect_endpoint_id_not_found,
+        ),
+        // The kinds whose own not-found refusal takes something other than the one id: the
+        // flow-log family refuses the whole batch of ids it could not resolve, which for a
+        // tagging call is the single id it named, and the prefix-list resolver family names
+        // no id in its sentence at all.
+        (FLOW_LOG_ID_PREFIX, |id| {
+            invalid_flow_log_id_not_found(&[id.to_string()])
+        }),
+        (IPAM_PREFIX_LIST_RESOLVER_ID_PREFIX, |_| {
+            invalid_ipam_prefix_list_resolver_id_not_found()
+        }),
+        (IPAM_PREFIX_LIST_RESOLVER_TARGET_ID_PREFIX, |_| {
+            invalid_ipam_prefix_list_resolver_target_id_not_found()
+        }),
     ];
     for (prefix, not_found) in kinds {
         if prefixed_id_is_well_formed(prefix, resource_id) {

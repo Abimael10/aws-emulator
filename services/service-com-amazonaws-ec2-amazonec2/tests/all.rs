@@ -19,6 +19,13 @@
 // address carries no public DNS name. Declared beside `prefix_lists` for the reason the note
 // above gives: the sorted neighbourhood and the tail of this file are where every new ec2
 // suite inserts its lines.
+// Which resource ids a tagging call resolves, over the taggable resource kinds beside the
+// few the other tag suites drive: the write reads back through the resource's own describe
+// and through `DescribeTags`, and an id that names nothing is refused in its kind's words.
+// Declared beside `prefix_lists` for the reason the note above gives: the sorted
+// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/taggable_resource_kinds.rs"]
+mod taggable_resource_kinds;
 #[path = "all/read_optional_members.rs"]
 mod read_optional_members;
 #[path = "all/prefix_lists.rs"]

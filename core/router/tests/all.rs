@@ -6927,3 +6927,10 @@ mod all_rs_is_a_canonical_declaration_list;
 //! leaving a note below. Add a declaration, not a note about one.
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING of it
 //! (`tests/<name>.rs`), which the layout check refuses: the `#[path]` line is what points
+// (Everything that stood from here to the end of this file was remnant: copies of this
+// file's own header that concurrent landings appended into the tail — illegal as `//!`
+// past the first item — and bookkeeping notes about duplicate declarations that are
+// already gone. They are pruned rather than re-typed: the rules stand in the module doc
+// at the HEAD of this file, where an inner doc comment is legal, and the two guard
+// suites check both halves of them. Declare a new suite with its `#[path]` line and a
+// note about the suite itself.)
