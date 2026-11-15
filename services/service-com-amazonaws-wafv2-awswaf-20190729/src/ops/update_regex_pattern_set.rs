@@ -224,8 +224,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the SAME token are serialized: the first rotates the token, and the next
         // then finds the token it carries stale.
         let mut state = state.lock();
+        // The namespace this request addresses: a REGIONAL pattern set is resolved in
+        // the region of the endpoint the call reached
+        // (`crate::state::namespace_region`).
+        let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
 
-        let Some(entry) = state.regex_pattern_set_mut(&input.scope, &input.name, &input.id) else {
+        let Some(entry) =
+            state.regex_pattern_set_mut(&input.scope, &region, &input.name, &input.id)
+        else {
             crate::state::audit(
                 "UpdateRegexPatternSet",
                 &input.scope,

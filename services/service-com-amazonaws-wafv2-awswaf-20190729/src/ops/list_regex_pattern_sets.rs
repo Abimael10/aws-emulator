@@ -190,12 +190,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        // Only this scope's regex pattern sets — a scope is a namespace — in a stable
-        // order so a marker names the same position on every call.
+        // Only the pattern sets of the namespace this listing addresses — this scope
+        // in the region the call reached (`crate::state::namespace_region`) — in a
+        // stable order so a marker names the same position on every call.
+        let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
         let mut entries: Vec<&crate::state::RegexPatternSetEntry> = state
             .regex_pattern_sets
             .values()
-            .filter(|entry| entry.scope == input.scope)
+            .filter(|entry| entry.scope == input.scope && entry.region == region)
             .collect();
         entries.sort_by(|left, right| set_name(left).cmp(set_name(right)));
 

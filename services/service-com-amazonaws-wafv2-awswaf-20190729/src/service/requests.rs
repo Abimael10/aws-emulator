@@ -36,6 +36,17 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The region whose NAMESPACE a request naming `scope` addresses: the region every
+/// resource of that namespace is stored under and reached through.
+///
+/// [`crate::state::namespace_region`] over the region this request was signed for —
+/// the reading every operation that stores or resolves a scoped resource keys the
+/// store by, so a create and a later read of the same resource agree on which
+/// namespace it lives in.
+pub fn namespace_region(scope: &str, parts: &::http::request::Parts) -> String {
+    crate::state::namespace_region(scope, &request_region(parts)).to_string()
+}
+
 /// The ONE region endpoint that serves the CLOUDFRONT scope.
 ///
 /// "To work with CloudFront, you must also specify the Region US East (N.

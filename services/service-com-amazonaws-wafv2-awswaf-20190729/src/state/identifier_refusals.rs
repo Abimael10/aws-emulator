@@ -56,6 +56,18 @@ pub fn critical_information_missing(request_shape: &str, members: &[(&str, Optio
 /// [`critical_information_missing`].
 const ABSENT_MEMBER_VALUE: &str = "null";
 
+/// The sentence WAF answers a request that addresses a resource of an account it
+/// cannot resolve for the caller: entirely fixed text, naming no value the request
+/// carried.
+///
+/// An ARN names the account that owns the resource, and WAF resolves it for the
+/// account the call was made for; an ARN naming any other account names an account
+/// this caller has none of, which is a question about WHOSE resource it is rather
+/// than about whether that resource exists — so it travels with the
+/// account-unresolvable code ([`crate::scaffolded::UNRECOGNIZED_CLIENT_CODE`]) and
+/// not as a not-found.
+pub const NO_ACCOUNT_FOUND_MESSAGE: &str = "No account found for the given parameters";
+
 #[cfg(test)]
 mod tests {
     use super::*;

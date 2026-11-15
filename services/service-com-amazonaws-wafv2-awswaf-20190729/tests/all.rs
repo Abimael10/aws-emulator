@@ -37,6 +37,8 @@ mod entity_description_form;
 mod exception_messages;
 #[path = "all/firewall_manager_rule_groups.rs"]
 mod firewall_manager_rule_groups;
+#[path = "all/foreign_account_arn.rs"]
+mod foreign_account_arn;
 #[path = "all/forwarded_ip_set_reference.rs"]
 mod forwarded_ip_set_reference;
 #[path = "all/get_web_acl_for_resource.rs"]
@@ -103,6 +105,8 @@ mod parameter_validation;
 mod permission_policy;
 #[path = "all/published_managed_rule_catalog.rs"]
 mod published_managed_rule_catalog;
+#[path = "all/rate_based_aggregation_keys.rs"]
+mod rate_based_aggregation_keys;
 #[path = "all/rate_based_statement_managed_keys.rs"]
 mod rate_based_statement_managed_keys;
 #[path = "all/rate_based_window_recovery.rs"]
@@ -121,6 +125,8 @@ mod regex_pattern_set_listing;
 mod regex_pattern_set_updates;
 #[path = "all/regex_syntax_validation.rs"]
 mod regex_syntax_validation;
+#[path = "all/resource_region_partition.rs"]
+mod resource_region_partition;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/resource_untagging.rs"]
@@ -147,6 +153,8 @@ mod rule_group_updates;
 mod sampled_requests;
 #[path = "all/sampled_rule_provenance.rs"]
 mod sampled_rule_provenance;
+#[path = "all/saved_document_one_of_settings.rs"]
+mod saved_document_one_of_settings;
 #[path = "all/settlement_records.rs"]
 mod settlement_records;
 #[path = "all/state_roundtrip.rs"]

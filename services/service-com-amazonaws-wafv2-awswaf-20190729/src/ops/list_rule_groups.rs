@@ -180,12 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        // Only this scope's rule groups, in a stable order so a marker names the
-        // same position on every call.
+        // Only the rule groups of the namespace this listing addresses — this scope in
+        // the region the call reached (`crate::state::namespace_region`) — in a stable
+        // order so a marker names the same position on every call.
+        let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
         let mut entries: Vec<&crate::state::RuleGroupEntry> = state
             .rule_groups
             .values()
-            .filter(|entry| entry.scope == input.scope)
+            .filter(|entry| entry.scope == input.scope && entry.region == region)
             .collect();
         entries.sort_by(|left, right| left.rule_group.name.cmp(&right.rule_group.name));
 

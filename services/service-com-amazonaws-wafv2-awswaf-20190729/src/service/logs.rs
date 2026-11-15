@@ -914,6 +914,7 @@ mod tests {
     fn web_acl_entry(scope: &str, region: &str, path: &str) -> WebAclEntry {
         WebAclEntry {
             scope: scope.to_string(),
+            region: region.to_string(),
             web_acl: crate::ops::types::WebACL {
                 name: "guard".to_string(),
                 id: "1111".to_string(),
@@ -1080,6 +1081,7 @@ mod tests {
         for (case, scope, resource, expected) in rows {
             let entry = WebAclEntry {
                 scope: scope.to_string(),
+                region: "us-west-2".to_string(),
                 web_acl: crate::ops::types::WebACL {
                     name: "guard".to_string(),
                     id: "1111".to_string(),

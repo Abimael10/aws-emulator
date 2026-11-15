@@ -1814,3 +1814,10 @@ mod cloudformation_creates_an_ecs_capacity_provider;
 //! `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING
 //! of this file (`tests/<name>.rs`): the `#[path]` attribute is what points each module
 //! into `tests/all/`.
+//! Single integration-test target for the router: a canonical declaration list.
+//! This file holds its module doc, then one `#[path = "all/<name>.rs"]` / `mod <name>;`
+//! pair per suite, sorted by name, and NO other line. Put a new suite at
+//! `tests/all/<name>.rs` and insert its pair into the sorted list. What a suite covers,
+//! and why it belongs to this cross-service target rather than to one service crate's
+//! own, is stated in that suite's own module doc, where it is read beside the test it
+//! explains; the notes earlier landings appended here live in `all/appended_notes.rs`.

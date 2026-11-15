@@ -408,8 +408,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = state.lock();
+        // The namespace this request addresses: a REGIONAL web ACL is resolved in the
+        // region of the endpoint the call reached, the global namespace at the one
+        // endpoint that serves it (`crate::state::namespace_region`).
+        let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
 
-        let Some(entry) = state.web_acl(&input.scope, &input.name, &input.id) else {
+        let Some(entry) = state.web_acl(&input.scope, &region, &input.name, &input.id) else {
             crate::state::audit(
                 "UpdateWebACL",
                 &input.scope,
@@ -489,7 +493,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let rule_group_capacities = state.rule_group_capacities(&input.scope);
         // The checks above hold an immutable borrow, so the entry is resolved again —
         // by the same triple, under the same lock — to write through.
-        let Some(entry) = state.web_acl_mut(&input.scope, &input.name, &input.id) else {
+        let Some(entry) = state.web_acl_mut(&input.scope, &region, &input.name, &input.id) else {
             return Err(UpdateWebACLErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
                     message: Some("the wafv2 store is unavailable".to_string()),

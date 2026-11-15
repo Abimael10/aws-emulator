@@ -248,7 +248,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.name.as_deref(),
                 input.id.as_deref(),
             ) {
-                (Some(scope), Some(name), Some(id)) => state.web_acl(scope, name, id),
+                (Some(scope), Some(name), Some(id)) => state.web_acl(
+                    scope,
+                    &crate::service::requests::namespace_region(scope, ctx.parts()),
+                    name,
+                    id,
+                ),
                 // The incomplete triple was refused above, so this arm states that
                 // invariant rather than guarding a case a request can still reach.
                 _ => None,
@@ -284,10 +289,10 @@ const GET_WEB_ACL_REQUEST_SHAPE: &str = "GetWebACLRequest";
 /// `Ok(())` when `arn` is an ARN this request may use to address a web ACL, else the
 /// refusal WAF answers for it.
 ///
-/// An ARN identifies a resource completely — the region whose endpoint serves it, its
-/// namespace, its kind, its name and its id — so WAF reads all of that off the value
-/// before it resolves anything, and the ways it can be unusable are two different
-/// refusals.
+/// An ARN identifies a resource completely — the account that owns it, the region whose
+/// endpoint serves it, its namespace, its kind, its name and its id — so WAF reads all of
+/// that off the value before it resolves anything, and the ways it can be unusable are
+/// three different refusals.
 ///
 /// Three of them are the invalid-parameter refusal naming the ARN (`Field` RESOURCE_ARN,
 /// `Reason` the ARN sentence, `Parameter` the value exactly as supplied) — the ARN that
@@ -302,8 +307,16 @@ const GET_WEB_ACL_REQUEST_SHAPE: &str = "GetWebACLRequest";
 ///   disagree about which namespace to look in, and it is the ARN that carries the
 ///   answer, so WAF reports the ARN rather than the scope.
 ///
-/// The last is a different class: an ARN of the right form naming a resource of another
-/// KIND is a resource this request may not address at all — the "corresponds to a
+/// An ARN naming another ACCOUNT is judged ahead of all of those, and is not about the
+/// ARN's own form at all: WAF resolves an ARN for the account the call was made for, so an
+/// ARN whose account segment is another account names an account it cannot resolve for
+/// this caller, and the refusal is the account-unresolvable one
+/// (`crate::state::NO_ACCOUNT_FOUND_MESSAGE`) rather than anything about the resource —
+/// which is what lets a client re-target its credentials instead of concluding its web ACL
+/// was deleted.
+///
+/// The last is a different class again: an ARN of the right form naming a resource of
+/// another KIND is a resource this request may not address at all — the "corresponds to a
 /// resource with which a web ACL can't be associated" half of that doc — and WAF answers
 /// it with the access-denied code and a sentence naming the request shape and the ARN
 /// (`crate::state::invalid_arn_for_request`), a code this service's model does not
@@ -323,6 +336,11 @@ fn judge_web_acl_arn(
     };
     if !crate::state::is_wafv2_resource_arn(arn) {
         return Err(unusable_arn());
+    }
+    if crate::state::arn_names_another_account(arn) {
+        return Err(crate::scaffolded::Scaffolded::unrecognized_client(
+            crate::state::NO_ACCOUNT_FOUND_MESSAGE,
+        ));
     }
     if crate::state::arn_resource_region(arn) != Some(request_region) {
         return Err(unusable_arn());

@@ -185,7 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let state = state.lock();
-        let Some(entry) = state.ip_set(&input.scope, &input.name, &input.id) else {
+        let Some(entry) = state.ip_set(
+            &input.scope,
+            &crate::service::requests::namespace_region(&input.scope, ctx.parts()),
+            &input.name,
+            &input.id,
+        ) else {
             return Err(GetIPSetErrorModeled::WAFNonexistentItemException(
                 crate::state::nonexistent_item_exception(),
             )

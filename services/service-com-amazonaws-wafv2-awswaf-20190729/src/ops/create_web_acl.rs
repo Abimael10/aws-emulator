@@ -400,7 +400,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let region = crate::service::requests::request_region(ctx.parts());
+        // The region whose namespace this web ACL lands in: a REGIONAL web ACL
+        // belongs to the region of the endpoint that created it, while a
+        // CLOUDFRONT-scoped one belongs to the one global namespace whatever endpoint
+        // minted it (`crate::state::namespace_region`). It is what the web ACL is
+        // stored under, and what its ARN carries.
+        let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
         let mut state = state.lock();
 
         // Every reference the rule tree carries must name an entity this service
@@ -449,7 +454,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateWebACLErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
-        let name_key = (input.scope.clone(), input.name.clone());
+        let name_key = crate::state::name_key(&input.scope, &region, &input.name);
         if state.web_acl_names.contains_key(&name_key) {
             crate::state::audit(
                 "CreateWebACL",
@@ -464,7 +469,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if state.web_acls_in_scope(&input.scope) >= crate::state::MAX_WEB_ACLS_PER_SCOPE {
+        if state.web_acls_in_scope(&input.scope, &region) >= crate::state::MAX_WEB_ACLS_PER_SCOPE
+            || state.region_partitions_exhausted(&input.scope, &region)
+        {
             crate::state::audit(
                 "CreateWebACL",
                 &input.scope,
@@ -543,6 +550,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (input.scope.clone(), id.clone()),
             crate::state::WebAclEntry {
                 scope: input.scope.clone(),
+                region: region.clone(),
                 web_acl,
                 lock_token,
                 tags: input.tags.unwrap_or_default(),

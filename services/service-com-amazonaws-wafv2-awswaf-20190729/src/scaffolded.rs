@@ -223,6 +223,18 @@ pub const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 /// must not read them as a credential problem to re-sign.
 pub const ACCESS_DENIED_STATUS: u16 = 400;
 
+/// The wire error code WAF answers a request that names an account it cannot resolve
+/// for the caller — an ARN whose account segment is not the calling account's. It is
+/// what a client branches on to re-target its credentials or its account, and this
+/// service's model declares no such shape.
+pub const UNRECOGNIZED_CLIENT_CODE: &str = "UnrecognizedClientException";
+
+/// The HTTP status of that refusal: 403, the status of the identity class this code
+/// belongs to — the call was well formed, but the account it names is not one these
+/// credentials resolve. A client that re-signs for the right account is then making a
+/// different call, which is why it must not read this as a bad parameter to correct.
+pub const UNRECOGNIZED_CLIENT_STATUS: u16 = 403;
+
 /// One refusal this service states with an error code its model does not declare.
 ///
 /// It carries its own wire code, HTTP status and message precisely because the shape is
@@ -245,6 +257,17 @@ impl UnmodeledRefusal {
         Self {
             code: ACCESS_DENIED_CODE,
             status: ACCESS_DENIED_STATUS,
+            message: message.into(),
+        }
+    }
+
+    /// The refusal of a request naming an account WAF cannot resolve for the caller:
+    /// [`UNRECOGNIZED_CLIENT_CODE`] at [`UNRECOGNIZED_CLIENT_STATUS`], carrying
+    /// `message` — which the wording this service owns (`crate::state`) composes.
+    pub fn unrecognized_client(message: impl Into<String>) -> Self {
+        Self {
+            code: UNRECOGNIZED_CLIENT_CODE,
+            status: UNRECOGNIZED_CLIENT_STATUS,
             message: message.into(),
         }
     }
@@ -321,6 +344,16 @@ impl<E> Scaffolded<E> {
     /// how they travel, because the code is not a shape this service's model declares.
     pub fn access_denied(message: impl Into<String>) -> Self {
         Self::Unmodeled(UnmodeledRefusal::access_denied(message))
+    }
+
+    /// Refuse the request the way WAF refuses one that names an account it cannot
+    /// resolve for the caller: [`UNRECOGNIZED_CLIENT_CODE`] at
+    /// [`UNRECOGNIZED_CLIENT_STATUS`], carrying `message`.
+    ///
+    /// The verdict and the wording both live in `crate::state`; this constructor is only
+    /// how they travel, because the code is not a shape this service's model declares.
+    pub fn unrecognized_client(message: impl Into<String>) -> Self {
+        Self::Unmodeled(UnmodeledRefusal::unrecognized_client(message))
     }
 }
 

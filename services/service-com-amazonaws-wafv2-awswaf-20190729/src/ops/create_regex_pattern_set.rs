@@ -235,13 +235,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let region = crate::service::requests::request_region(ctx.parts());
+        // The region whose namespace this pattern set lands in: a REGIONAL set
+        // belongs to the region of the endpoint that created it, a CLOUDFRONT-scoped
+        // one to the one global namespace (`crate::state::namespace_region`).
+        let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
         let mut state = state.lock();
 
         // `Name` is the set's identity within its scope ("You cannot change the name
         // after you create the set"), so a second create under a name the scope
         // already holds is the duplicate the modelled exception describes.
-        let name_key = (input.scope.clone(), input.name.clone());
+        let name_key = crate::state::name_key(&input.scope, &region, &input.name);
         if state.regex_pattern_set_names.contains_key(&name_key) {
             crate::state::audit(
                 "CreateRegexPatternSet",
@@ -256,8 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if state.regex_pattern_sets_in_scope(&input.scope)
+        if state.regex_pattern_sets_in_scope(&input.scope, &region)
             >= crate::state::MAX_REGEX_PATTERN_SETS_PER_SCOPE
+            || state.region_partitions_exhausted(&input.scope, &region)
         {
             crate::state::audit(
                 "CreateRegexPatternSet",
@@ -311,6 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.regex_pattern_sets.insert(
             (input.scope.clone(), id.clone()),
             crate::state::RegexPatternSetEntry {
+                region: region.clone(),
                 scope: input.scope.clone(),
                 regex_pattern_set,
                 lock_token,

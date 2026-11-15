@@ -261,7 +261,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // report is about ONE rate-based rule instance and every part of that triple
         // has to resolve in the requested scope. A `Name`/`Scope`/`Id` triple that
         // describes no stored web ACL names no web ACL at all.
-        let Some(entry) = state.web_acl(&input.scope, &input.web_acl_name, &input.web_acl_id) else {
+        let Some(entry) = state.web_acl(
+            &input.scope,
+            &crate::service::requests::namespace_region(&input.scope, ctx.parts()),
+            &input.web_acl_name,
+            &input.web_acl_id,
+        ) else {
             return Err(
                 GetRateBasedStatementManagedKeysErrorModeled::WAFNonexistentItemException(
                     crate::state::nonexistent_item_exception(),

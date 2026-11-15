@@ -316,7 +316,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let region = crate::service::requests::request_region(ctx.parts());
+        // The region whose namespace this rule group lands in: a REGIONAL group
+        // belongs to the region of the endpoint that created it, a CLOUDFRONT-scoped
+        // one to the one global namespace (`crate::state::namespace_region`).
+        let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
         let mut state = state.lock();
 
         // Every reference the rule tree carries must name an entity this service
@@ -365,7 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You cannot change the name of a rule group after you create it"
         // (`Name`'s doc), and a scope is a namespace, so a name already taken in
         // this scope is a duplicate.
-        let name_key = (input.scope.clone(), input.name.clone());
+        let name_key = crate::state::name_key(&input.scope, &region, &input.name);
         if state.rule_group_names.contains_key(&name_key) {
             crate::state::audit(
                 "CreateRuleGroup",
@@ -380,7 +383,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if state.rule_groups_in_scope(&input.scope) >= crate::state::MAX_RULE_GROUPS_PER_SCOPE {
+        if state.rule_groups_in_scope(&input.scope, &region)
+            >= crate::state::MAX_RULE_GROUPS_PER_SCOPE
+            || state.region_partitions_exhausted(&input.scope, &region)
+        {
             crate::state::audit(
                 "CreateRuleGroup",
                 &input.scope,
@@ -492,6 +498,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.rule_groups.insert(
             (input.scope.clone(), id.clone()),
             crate::state::RuleGroupEntry {
+                region: region.clone(),
                 scope: input.scope.clone(),
                 rule_group,
                 lock_token,

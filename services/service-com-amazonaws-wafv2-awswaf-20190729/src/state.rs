@@ -482,6 +482,8 @@ pub const PLATFORM_NOT_VALID_REASON: &str = "the platform names the device platf
 pub struct WebAclEntry {
     /// The scope the web ACL was created in.
     pub scope: String,
+    /// The region whose namespace holds this web ACL ([`namespace_region`]).
+    pub region: String,
     /// Exactly what `GetWebACL` answers with.
     pub web_acl: WebACL,
     /// The current optimistic-lock token, rotated on every successful mutation.
@@ -495,6 +497,8 @@ pub struct WebAclEntry {
 pub struct IpSetEntry {
     /// The scope the IP set was created in.
     pub scope: String,
+    /// The region whose namespace holds this IP set ([`namespace_region`]).
+    pub region: String,
     /// Exactly what `GetIPSet` answers with.
     pub ip_set: IPSet,
     /// The current optimistic-lock token, rotated on every successful mutation.
@@ -509,6 +513,8 @@ pub struct IpSetEntry {
 pub struct RegexPatternSetEntry {
     /// The scope the regex pattern set was created in.
     pub scope: String,
+    /// The region whose namespace holds this pattern set ([`namespace_region`]).
+    pub region: String,
     /// Exactly what `GetRegexPatternSet` answers with.
     pub regex_pattern_set: RegexPatternSet,
     /// The current optimistic-lock token, rotated on every successful mutation.
@@ -522,6 +528,8 @@ pub struct RegexPatternSetEntry {
 pub struct RuleGroupEntry {
     /// The scope the rule group was created in.
     pub scope: String,
+    /// The region whose namespace holds this rule group ([`namespace_region`]).
+    pub region: String,
     /// Exactly what `GetRuleGroup` answers with.
     pub rule_group: RuleGroup,
     /// The current optimistic-lock token, rotated on every successful mutation.
@@ -963,18 +971,43 @@ pub fn monetization_window(
 /// every other status "the client is not charged" or "content is not served".
 pub const SETTLEMENT_STATUS_SETTLED: &str = "SETTLED";
 
+/// How wide an amount this service reads as a quantity of money: its significant
+/// digits, and how far its decimal point may sit from them.
+///
+/// An amount arrives as text, and a decimal written in exponent notation says in a
+/// few characters how many digits it has (`1e2000000000` is one digit and a scale of
+/// two billion). Writing such a value at the currency's scale would materialise every
+/// one of those digits, so the magnitude is bounded HERE, where the text becomes a
+/// number, rather than at each place that renders one. The bound is the precision of
+/// a 128-bit fixed decimal — far wider than any quantity of a currency whose smallest
+/// unit is a millionth of a token — so no amount a client can mean falls outside it.
+const MAX_MONETIZATION_AMOUNT_DIGITS: u64 = 38;
+
+/// `true` when `value` is a quantity of money this service can read and report: at
+/// most [`MAX_MONETIZATION_AMOUNT_DIGITS`] significant digits, with its decimal point
+/// no further than that from them.
+fn is_readable_monetization_amount(value: &::bigdecimal::BigDecimal) -> bool {
+    let scale = value.as_bigint_and_exponent().1;
+    let digits = i64::try_from(MAX_MONETIZATION_AMOUNT_DIGITS).unwrap_or(i64::MAX);
+    value.digits() <= MAX_MONETIZATION_AMOUNT_DIGITS && scale.saturating_abs() <= digits
+}
+
 /// The quantity a monetization amount spells, as the exact decimal it is.
 ///
 /// `MonetizationAmountValue` is a STRING in the model and an amount is a quantity
 /// of money, so it is read as a decimal rather than as a float: a sum of amounts
 /// has to come to exactly the figure the operands spell, which a binary float
 /// cannot do. A value that spells no number counts as nothing, which keeps one
-/// unreadable transaction from deciding a whole query's answer.
+/// unreadable transaction from deciding a whole query's answer — and so does one
+/// that spells a number no quantity of this currency could be
+/// ([`is_readable_monetization_amount`]).
 pub fn monetization_amount(amount: &str) -> ::bigdecimal::BigDecimal {
     amount
         .trim()
         .parse::<::bigdecimal::BigDecimal>()
-        .unwrap_or_else(|_| ::bigdecimal::BigDecimal::from(0))
+        .ok()
+        .filter(is_readable_monetization_amount)
+        .unwrap_or_else(|| ::bigdecimal::BigDecimal::from(0))
 }
 
 /// How many fractional digits a `MonetizationAmountValue` is written to.
@@ -1101,26 +1134,43 @@ pub enum ResourceRef {
     },
 }
 
+/// The key a resource NAME is unique under: `(Scope, Region, Name)`.
+///
+/// A name identifies a resource WITHIN the namespace that holds it, and a namespace
+/// is a scope in a region ([`namespace_region`]): "the names you provide are unique
+/// within the scope and Region" is what makes the same name free to reuse in another
+/// region for an unrelated resource, each with its own id and an ARN naming its own
+/// region. Built with [`name_key`] so every resource kind keys its names alike.
+pub type NameKey = (String, String, String);
+
+/// The [`NameKey`] of `name` in the namespace `(scope, region)`.
+pub fn name_key(scope: &str, region: &str, name: &str) -> NameKey {
+    (scope.to_string(), region.to_string(), name.to_string())
+}
+
 /// Per-service state for com-amazonaws-wafv2-awswaf-20190729. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWafv2Awswaf20190729State {
-    /// Web ACLs by `(Scope, Id)`.
+    /// Web ACLs by `(Scope, Id)`. An `Id` is minted unique, so it names one web
+    /// ACL across every region; which region's namespace holds it is the entry's
+    /// own `region` ([`WebAclEntry`]), and a lookup resolves both
+    /// ([`Self::web_acl`]).
     pub web_acls: HashMap<(String, String), WebAclEntry>,
-    /// `(Scope, Name)` → `Id`: duplicate-name detection and Name+Id lookup.
-    pub web_acl_names: HashMap<(String, String), String>,
-    /// IP sets by `(Scope, Id)`.
+    /// [`NameKey`] → `Id`: duplicate-name detection and Name+Id lookup.
+    pub web_acl_names: HashMap<NameKey, String>,
+    /// IP sets by `(Scope, Id)`. See [`Self::web_acls`].
     pub ip_sets: HashMap<(String, String), IpSetEntry>,
-    /// `(Scope, Name)` → `Id`: duplicate-name detection and Name+Id lookup.
-    pub ip_set_names: HashMap<(String, String), String>,
-    /// Regex pattern sets by `(Scope, Id)`.
+    /// [`NameKey`] → `Id`: duplicate-name detection and Name+Id lookup.
+    pub ip_set_names: HashMap<NameKey, String>,
+    /// Regex pattern sets by `(Scope, Id)`. See [`Self::web_acls`].
     pub regex_pattern_sets: HashMap<(String, String), RegexPatternSetEntry>,
-    /// `(Scope, Name)` → `Id`: duplicate-name detection and Name+Id lookup.
-    pub regex_pattern_set_names: HashMap<(String, String), String>,
-    /// Rule groups by `(Scope, Id)`.
+    /// [`NameKey`] → `Id`: duplicate-name detection and Name+Id lookup.
+    pub regex_pattern_set_names: HashMap<NameKey, String>,
+    /// Rule groups by `(Scope, Id)`. See [`Self::web_acls`].
     pub rule_groups: HashMap<(String, String), RuleGroupEntry>,
-    /// `(Scope, Name)` to `Id`, for rule groups: duplicate-name detection and
+    /// [`NameKey`] → `Id`, for rule groups: duplicate-name detection and
     /// Name+Id lookup.
-    pub rule_group_names: HashMap<(String, String), String>,
+    pub rule_group_names: HashMap<NameKey, String>,
     /// Managed rule sets by `(Scope, Id)`. See [`ManagedRuleSetEntry`].
     pub managed_rule_sets: HashMap<(String, String), ManagedRuleSetEntry>,
     /// The mobile SDK releases this account holds, by
@@ -1318,12 +1368,18 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     }
 
     /// The web ACL stored under `(scope, id)`, but only when it is also the one
-    /// called `name`. WAFv2's Get/Update/Delete take Name, Scope AND Id together,
-    /// and a triple that does not describe one stored resource names no resource
-    /// at all.
-    pub fn web_acl(&self, scope: &str, name: &str, id: &str) -> Option<&WebAclEntry> {
+    /// called `name` AND lives in `region`. WAFv2's Get/Update/Delete take Name,
+    /// Scope AND Id together, and a triple that does not describe one stored
+    /// resource names no resource at all.
+    ///
+    /// `region` is the region whose namespace the CALL addresses
+    /// ([`namespace_region`]): a REGIONAL web ACL belongs to the region it was
+    /// created in, so another region's endpoint resolves nothing by the same
+    /// triple, while the one global namespace is reached from the one endpoint that
+    /// serves it.
+    pub fn web_acl(&self, scope: &str, region: &str, name: &str, id: &str) -> Option<&WebAclEntry> {
         let entry = self.web_acls.get(&(scope.to_string(), id.to_string()))?;
-        (entry.web_acl.name == name).then_some(entry)
+        (entry.web_acl.name == name && entry.region == region).then_some(entry)
     }
 
     /// The requests recorded for the web ACL `(scope, id)`, in whatever order they
@@ -1347,74 +1403,131 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     }
 
     /// [`Self::web_acl`], mutably.
-    pub fn web_acl_mut(&mut self, scope: &str, name: &str, id: &str) -> Option<&mut WebAclEntry> {
+    pub fn web_acl_mut(
+        &mut self,
+        scope: &str,
+        region: &str,
+        name: &str,
+        id: &str,
+    ) -> Option<&mut WebAclEntry> {
         let entry = self.web_acls.get_mut(&(scope.to_string(), id.to_string()))?;
-        (entry.web_acl.name == name).then_some(entry)
+        (entry.web_acl.name == name && entry.region == region).then_some(entry)
     }
 
     /// The IP set stored under `(scope, id)` when it is also the one called
-    /// `name`. See [`Self::web_acl`].
-    pub fn ip_set(&self, scope: &str, name: &str, id: &str) -> Option<&IpSetEntry> {
+    /// `name` in `region`. See [`Self::web_acl`].
+    pub fn ip_set(&self, scope: &str, region: &str, name: &str, id: &str) -> Option<&IpSetEntry> {
         let entry = self.ip_sets.get(&(scope.to_string(), id.to_string()))?;
-        (entry.ip_set.name == name).then_some(entry)
+        (entry.ip_set.name == name && entry.region == region).then_some(entry)
     }
 
     /// [`Self::ip_set`], mutably.
-    pub fn ip_set_mut(&mut self, scope: &str, name: &str, id: &str) -> Option<&mut IpSetEntry> {
+    pub fn ip_set_mut(
+        &mut self,
+        scope: &str,
+        region: &str,
+        name: &str,
+        id: &str,
+    ) -> Option<&mut IpSetEntry> {
         let entry = self.ip_sets.get_mut(&(scope.to_string(), id.to_string()))?;
-        (entry.ip_set.name == name).then_some(entry)
+        (entry.ip_set.name == name && entry.region == region).then_some(entry)
     }
 
-    /// Drop a web ACL and every index entry that pointed at it.
+    /// Drop the web ACL `(scope, region, name, id)` names and every index entry that
+    /// pointed at it, or `None` when that key names no stored web ACL.
+    ///
+    /// The key is the WHOLE key [`Self::web_acl`] resolves, so the entry a delete
+    /// removes is exactly the entry its caller read and checked the lock token of: a
+    /// removal keyed on less than that — on the id alone, say — could reach an entry
+    /// of a namespace the request was never resolved against.
     ///
     /// A logging configuration belongs to the web ACL its `ResourceArn` names and
     /// has no identity of its own, so it goes with the web ACL: a configuration left
     /// behind would be one a listing of the scope could not report (it resolves the
     /// ARN to a web ACL) while a read of the dead ARN still answered it, and it would
     /// attach itself to the next web ACL minted under the same ARN.
-    pub fn remove_web_acl(&mut self, scope: &str, id: &str) -> Option<WebAclEntry> {
+    pub fn remove_web_acl(
+        &mut self,
+        scope: &str,
+        region: &str,
+        name: &str,
+        id: &str,
+    ) -> Option<WebAclEntry> {
+        self.web_acl(scope, region, name, id)?;
         let entry = self.web_acls.remove(&(scope.to_string(), id.to_string()))?;
-        self.web_acl_names
-            .remove(&(entry.scope.clone(), entry.web_acl.name.clone()));
+        self.web_acl_names.remove(&name_key(
+            &entry.scope,
+            &entry.region,
+            &entry.web_acl.name,
+        ));
         self.arn_index.remove(&entry.web_acl.arn);
         self.logging_configurations
             .retain(|(resource_arn, _), _| resource_arn != &entry.web_acl.arn);
         Some(entry)
     }
 
-    /// Drop an IP set and every index entry that pointed at it.
-    pub fn remove_ip_set(&mut self, scope: &str, id: &str) -> Option<IpSetEntry> {
+    /// Drop the IP set `(scope, region, name, id)` names and every index entry that
+    /// pointed at it. The key is the whole key [`Self::ip_set`] resolves — see
+    /// [`Self::remove_web_acl`].
+    pub fn remove_ip_set(
+        &mut self,
+        scope: &str,
+        region: &str,
+        name: &str,
+        id: &str,
+    ) -> Option<IpSetEntry> {
+        self.ip_set(scope, region, name, id)?;
         let entry = self.ip_sets.remove(&(scope.to_string(), id.to_string()))?;
-        self.ip_set_names
-            .remove(&(entry.scope.clone(), entry.ip_set.name.clone()));
+        self.ip_set_names.remove(&name_key(
+            &entry.scope,
+            &entry.region,
+            &entry.ip_set.name,
+        ));
         self.arn_index.remove(&entry.ip_set.arn);
         Some(entry)
     }
 
-    /// Drop a rule group and every index entry that pointed at it.
-    pub fn remove_rule_group(&mut self, scope: &str, id: &str) -> Option<RuleGroupEntry> {
+    /// Drop the rule group `(scope, region, name, id)` names and every index entry
+    /// that pointed at it. The key is the whole key [`Self::rule_group`] resolves —
+    /// see [`Self::remove_web_acl`].
+    pub fn remove_rule_group(
+        &mut self,
+        scope: &str,
+        region: &str,
+        name: &str,
+        id: &str,
+    ) -> Option<RuleGroupEntry> {
+        self.rule_group(scope, region, name, id)?;
         let entry = self.rule_groups.remove(&(scope.to_string(), id.to_string()))?;
-        self.rule_group_names
-            .remove(&(entry.scope.clone(), entry.rule_group.name.clone()));
+        self.rule_group_names.remove(&name_key(
+            &entry.scope,
+            &entry.region,
+            &entry.rule_group.name,
+        ));
         self.arn_index.remove(&entry.rule_group.arn);
         Some(entry)
     }
 
-    /// Drop a regex pattern set and every index entry that pointed at it.
+    /// Drop the regex pattern set `(scope, region, name, id)` names and every index
+    /// entry that pointed at it. The key is the whole key
+    /// [`Self::regex_pattern_set`] resolves — see [`Self::remove_web_acl`].
     ///
     /// `RegexPatternSet$Name` and `$ARN` are modelled as optional, so an entry
     /// whose stored shape carries neither leaves no index key behind to remove.
     pub fn remove_regex_pattern_set(
         &mut self,
         scope: &str,
+        region: &str,
+        name: &str,
         id: &str,
     ) -> Option<RegexPatternSetEntry> {
+        self.regex_pattern_set(scope, region, name, id)?;
         let entry = self
             .regex_pattern_sets
             .remove(&(scope.to_string(), id.to_string()))?;
-        if let Some(name) = entry.regex_pattern_set.name.clone() {
+        if let Some(name) = entry.regex_pattern_set.name.as_deref() {
             self.regex_pattern_set_names
-                .remove(&(entry.scope.clone(), name));
+                .remove(&name_key(&entry.scope, &entry.region, name));
         }
         if let Some(arn) = entry.regex_pattern_set.arn.as_deref() {
             self.arn_index.remove(arn);
@@ -1422,84 +1535,127 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         Some(entry)
     }
 
-    /// How many web ACLs this scope already holds. See [`MAX_WEB_ACLS_PER_SCOPE`].
-    pub fn web_acls_in_scope(&self, scope: &str) -> usize {
+    /// How many web ACLs this namespace already holds — the scope in the one region
+    /// `region` names, since a quota is per region as well as per scope. See
+    /// [`MAX_WEB_ACLS_PER_SCOPE`] and [`namespace_region`].
+    pub fn web_acls_in_scope(&self, scope: &str, region: &str) -> usize {
         self.web_acls
-            .keys()
-            .filter(|(stored_scope, _)| stored_scope == scope)
+            .values()
+            .filter(|entry| entry.scope == scope && entry.region == region)
             .count()
     }
 
-    /// How many IP sets this scope already holds. See [`MAX_IP_SETS_PER_SCOPE`].
-    pub fn ip_sets_in_scope(&self, scope: &str) -> usize {
+    /// `true` when storing a resource of `scope` in `region` would partition that
+    /// scope's store into more regions than [`MAX_REGIONS_PER_SCOPE`] allows — the
+    /// bound that keeps a per-region store from growing without limit when the region
+    /// is a value the caller chooses. A region the scope already holds a resource in
+    /// is never refused, so the bound limits the PARTITIONS and not the resources.
+    pub fn region_partitions_exhausted(&self, scope: &str, region: &str) -> bool {
+        let mut regions: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for stored in self
+            .web_acls
+            .values()
+            .map(|entry| (&entry.scope, &entry.region))
+            .chain(self.ip_sets.values().map(|entry| (&entry.scope, &entry.region)))
+            .chain(
+                self.rule_groups
+                    .values()
+                    .map(|entry| (&entry.scope, &entry.region)),
+            )
+            .chain(
+                self.regex_pattern_sets
+                    .values()
+                    .map(|entry| (&entry.scope, &entry.region)),
+            )
+            .filter(|(stored_scope, _)| stored_scope.as_str() == scope)
+        {
+            regions.insert(stored.1.as_str());
+        }
+        !regions.contains(region) && regions.len() >= MAX_REGIONS_PER_SCOPE
+    }
+
+    /// How many IP sets this namespace already holds. See [`MAX_IP_SETS_PER_SCOPE`]
+    /// and [`Self::web_acls_in_scope`].
+    pub fn ip_sets_in_scope(&self, scope: &str, region: &str) -> usize {
         self.ip_sets
-            .keys()
-            .filter(|(stored_scope, _)| stored_scope == scope)
+            .values()
+            .filter(|entry| entry.scope == scope && entry.region == region)
             .count()
     }
 
     /// The regex pattern set stored under `(scope, id)` when it is also the one
-    /// called `name`. See [`Self::web_acl`].
+    /// called `name` in `region`. See [`Self::web_acl`].
     pub fn regex_pattern_set(
         &self,
         scope: &str,
+        region: &str,
         name: &str,
         id: &str,
     ) -> Option<&RegexPatternSetEntry> {
         let entry = self
             .regex_pattern_sets
             .get(&(scope.to_string(), id.to_string()))?;
-        (entry.regex_pattern_set.name.as_deref() == Some(name)).then_some(entry)
+        (entry.regex_pattern_set.name.as_deref() == Some(name) && entry.region == region)
+            .then_some(entry)
     }
 
     /// [`Self::regex_pattern_set`], mutably.
     pub fn regex_pattern_set_mut(
         &mut self,
         scope: &str,
+        region: &str,
         name: &str,
         id: &str,
     ) -> Option<&mut RegexPatternSetEntry> {
         let entry = self
             .regex_pattern_sets
             .get_mut(&(scope.to_string(), id.to_string()))?;
-        (entry.regex_pattern_set.name.as_deref() == Some(name)).then_some(entry)
+        (entry.regex_pattern_set.name.as_deref() == Some(name) && entry.region == region)
+            .then_some(entry)
     }
 
-    /// How many regex pattern sets this scope already holds. See
-    /// [`MAX_REGEX_PATTERN_SETS_PER_SCOPE`].
-    pub fn regex_pattern_sets_in_scope(&self, scope: &str) -> usize {
+    /// How many regex pattern sets this namespace already holds. See
+    /// [`MAX_REGEX_PATTERN_SETS_PER_SCOPE`] and [`Self::web_acls_in_scope`].
+    pub fn regex_pattern_sets_in_scope(&self, scope: &str, region: &str) -> usize {
         self.regex_pattern_sets
-            .keys()
-            .filter(|(stored_scope, _)| stored_scope == scope)
+            .values()
+            .filter(|entry| entry.scope == scope && entry.region == region)
             .count()
     }
 
     /// The rule group stored under `(scope, id)` when it is also the one called
-    /// `name`. See [`Self::web_acl`].
-    pub fn rule_group(&self, scope: &str, name: &str, id: &str) -> Option<&RuleGroupEntry> {
+    /// `name` in `region`. See [`Self::web_acl`].
+    pub fn rule_group(
+        &self,
+        scope: &str,
+        region: &str,
+        name: &str,
+        id: &str,
+    ) -> Option<&RuleGroupEntry> {
         let entry = self.rule_groups.get(&(scope.to_string(), id.to_string()))?;
-        (entry.rule_group.name == name).then_some(entry)
+        (entry.rule_group.name == name && entry.region == region).then_some(entry)
     }
 
     /// [`Self::rule_group`], mutably.
     pub fn rule_group_mut(
         &mut self,
         scope: &str,
+        region: &str,
         name: &str,
         id: &str,
     ) -> Option<&mut RuleGroupEntry> {
         let entry = self
             .rule_groups
             .get_mut(&(scope.to_string(), id.to_string()))?;
-        (entry.rule_group.name == name).then_some(entry)
+        (entry.rule_group.name == name && entry.region == region).then_some(entry)
     }
 
-    /// How many rule groups this scope already holds. See
-    /// [`MAX_RULE_GROUPS_PER_SCOPE`].
-    pub fn rule_groups_in_scope(&self, scope: &str) -> usize {
+    /// How many rule groups this namespace already holds. See
+    /// [`MAX_RULE_GROUPS_PER_SCOPE`] and [`Self::web_acls_in_scope`].
+    pub fn rule_groups_in_scope(&self, scope: &str, region: &str) -> usize {
         self.rule_groups
-            .keys()
-            .filter(|(stored_scope, _)| stored_scope == scope)
+            .values()
+            .filter(|entry| entry.scope == scope && entry.region == region)
             .count()
     }
 
@@ -2143,11 +2299,27 @@ fn logging_configuration_key(resource_arn: &str, log_scope: Option<&str>) -> (St
 /// its capacity is computed, and so before any later walk sees it.
 pub const MAX_STATEMENT_NESTING_DEPTH: u32 = 10;
 
-/// The most web ACLs this service stores per scope: WAF's published quota is 100
-/// web ACLs per Region per scope, and reaching it answers the modelled
-/// `WAFLimitsExceededException` the way the real service does — which is also what
-/// keeps the store from growing without limit.
+/// The most web ACLs this service stores per scope AND per region: WAF's published
+/// quota is 100 web ACLs per Region per scope, which is exactly how this store
+/// counts them ([`ComAmazonawsWafv2Awswaf20190729State::web_acls_in_scope`]), and
+/// reaching it answers the modelled `WAFLimitsExceededException` the way the real
+/// service does — which is also what keeps the store from growing without limit,
+/// beside [`MAX_REGIONS_PER_SCOPE`], which bounds how many regions it is partitioned
+/// into.
 pub const MAX_WEB_ACLS_PER_SCOPE: usize = 100;
+
+/// The most regions ONE scope's store is partitioned into before a create answers
+/// the modelled `WAFLimitsExceededException`.
+///
+/// Not a figure WAF publishes: its per-Region quotas (above) bound a real account
+/// because AWS serves a fixed set of Regions. This emulator reads the region off the
+/// request's own credential scope ([`namespace_region`]) and checks it against no
+/// list, so the store is partitioned by a value the CALLER chooses — and without this
+/// bound a caller could name a region it has never used on every create and grow the
+/// store past every per-region bound. So it is chosen, the way
+/// [`MAX_REGEX_PATTERN_SETS_PER_SCOPE`] is: above the number of Regions any one
+/// client spans, and small enough for a test to reach.
+pub const MAX_REGIONS_PER_SCOPE: usize = 32;
 
 /// The most IP sets this service stores per scope; see [`MAX_WEB_ACLS_PER_SCOPE`].
 /// WAF's published quota is 100 IP sets per Region per scope.
@@ -2958,12 +3130,24 @@ pub fn protected_resource_type(arn: &str) -> Option<&'static str> {
         .map(|form| form.resource_type)
 }
 
-/// The region segment of a scope's ARNs.
+/// The region whose namespace holds a resource of `scope` created at, or addressed
+/// from, an endpoint in `request_region` — which is also the region segment of that
+/// resource's ARN.
 ///
-/// A CLOUDFRONT-scoped resource is always reached through one endpoint — "API and
-/// SDKs - For all calls, use the Region endpoint us-east-1" (the `Scope` member
-/// doc) — so its ARN carries that region whatever the caller signed for.
-fn arn_region<'a>(scope: &str, request_region: &'a str) -> &'a str {
+/// A REGIONAL resource belongs to ONE region: it is "regional" because it lives in
+/// the region of the endpoint that created it, and its ARN carries that region
+/// (`arn:aws:wafv2:<region>:<account>:regional/<kind>/<name>/<id>`,
+/// [`resource_arn`]). A CLOUDFRONT-scoped resource belongs to the one global
+/// namespace, always reached through one endpoint — "API and SDKs - For all calls,
+/// use the Region endpoint us-east-1" (the `Scope` member doc) — so its ARN carries
+/// that region whatever the caller signed for, and every endpoint that may name the
+/// global scope addresses the same namespace.
+///
+/// So this is what PARTITIONS the store: a resource is stored under the region this
+/// answers for its create, and a later call reaches it only when this answers the
+/// same region for that call's scope and endpoint (see
+/// [`ComAmazonawsWafv2Awswaf20190729State::web_acl`] and [`name_key`]).
+pub fn namespace_region<'a>(scope: &str, request_region: &'a str) -> &'a str {
     if scope == SCOPE_CLOUDFRONT {
         DEFAULT_REGION
     } else {
@@ -2992,7 +3176,7 @@ pub fn resource_arn(
 ) -> String {
     ::engine::emulator_arn(
         "wafv2",
-        arn_region(scope, request_region),
+        namespace_region(scope, request_region),
         &format!("{}/{kind}/{name}/{id}", scope_path(scope)),
     )
 }
@@ -3680,6 +3864,27 @@ pub fn arn_resource_region(value: &str) -> Option<&str> {
         return None;
     }
     value.split(':').nth(3)
+}
+
+/// The ACCOUNT segment of a wafv2 resource ARN, or `None` when `value` is not one at
+/// all.
+///
+/// Same layout as [`arn_resource_kind`], so the account is the ARN's fifth
+/// colon-separated field. A resource belongs to the account that created it, and WAF
+/// resolves an ARN for the CALLER's account: an ARN naming another account names an
+/// account WAF cannot resolve for this caller (see
+/// [`crate::scaffolded::UNRECOGNIZED_CLIENT_CODE`]).
+pub fn arn_account(value: &str) -> Option<&str> {
+    if !is_wafv2_resource_arn(value) {
+        return None;
+    }
+    value.split(':').nth(4)
+}
+
+/// `true` when `value` is a wafv2 resource ARN whose account segment is not the
+/// account this emulator serves — the account every call it answers is made for.
+pub fn arn_names_another_account(value: &str) -> bool {
+    arn_account(value).is_some_and(|account| account != ::engine::emulator_account_id())
 }
 
 /// This service's Smithy namespace, for the shadow member schemas below.

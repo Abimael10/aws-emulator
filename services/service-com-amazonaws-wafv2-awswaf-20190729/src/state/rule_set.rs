@@ -13,7 +13,9 @@
 //! and what WAF makes of it ([`invalid_parameter_exception`]).
 
 use super::*;
-use crate::ops::types::{CustomResponseBody, DefaultAction, RuleActionOverride};
+use crate::ops::types::{
+    CustomResponseBody, DefaultAction, RateBasedStatement, RuleActionOverride,
+};
 
 /// The `ParameterExceptionField` value naming one rule of a rule list
 /// (`smithy_query(query="shape",shape="ParameterExceptionField")` lists `RULE`).
@@ -23,6 +25,231 @@ pub const FIELD_RULE: &str = "RULE";
 /// The `ParameterExceptionField` value naming a `CustomResponse`
 /// (`CUSTOM_RESPONSE`, as the enum spells it). See [`FIELD_RESOURCE_ARN`].
 pub const FIELD_CUSTOM_RESPONSE: &str = "CUSTOM_RESPONSE";
+
+/// The `ParameterExceptionField` value naming a web ACL's `DefaultAction`
+/// (`DEFAULT_ACTION`). See [`FIELD_RESOURCE_ARN`].
+pub const FIELD_DEFAULT_ACTION: &str = "DEFAULT_ACTION";
+
+/// The `ParameterExceptionField` value naming a rule's `Action` (`RULE_ACTION`).
+/// See [`FIELD_RESOURCE_ARN`].
+pub const FIELD_RULE_ACTION: &str = "RULE_ACTION";
+
+/// The `ParameterExceptionField` value naming a rule's `OverrideAction`
+/// (`OVERRIDE_ACTION`). See [`FIELD_RESOURCE_ARN`].
+pub const FIELD_OVERRIDE_ACTION: &str = "OVERRIDE_ACTION";
+
+/// The `ParameterExceptionField` value naming a `ForwardedIPConfig`
+/// (`FORWARDED_IP_CONFIG`). See [`FIELD_RESOURCE_ARN`].
+pub const FIELD_FORWARDED_IP_CONFIG: &str = "FORWARDED_IP_CONFIG";
+
+/// The `ParameterExceptionField` value naming a rate-based statement's `CustomKeys`
+/// (`CUSTOM_KEYS`). See [`FIELD_RESOURCE_ARN`].
+pub const FIELD_CUSTOM_KEYS: &str = "CUSTOM_KEYS";
+
+/// The `ParameterExceptionField` value naming a `ScopeDownStatement` (`SCOPE_DOWN`,
+/// as the enum spells it). See [`FIELD_RESOURCE_ARN`].
+pub const FIELD_SCOPE_DOWN: &str = "SCOPE_DOWN";
+
+/// The shape name a refusal about a web ACL's default action carries in
+/// `Parameter`: the setting the one-of is, as the model names it.
+const PARAMETER_DEFAULT_ACTION: &str = "DefaultAction";
+
+/// The shape name a refusal about one rule's action setting carries in `Parameter`.
+const PARAMETER_RULE: &str = "Rule";
+
+/// The shape name a refusal about a rate-based statement's aggregation carries in
+/// `Parameter`: the statement whose `AggregateKeyType` asked for the absent member.
+const PARAMETER_RATE_BASED_STATEMENT: &str = "RateBasedStatement";
+
+/// One `AggregateKeyType` that requires a companion member of the same statement:
+/// the setting, the `ParameterExceptionField` naming the member it requires, the
+/// `ErrorReason` its absence earns, and how the statement says it is configured.
+struct AggregateKeyCompanion {
+    /// The `RateBasedStatementAggregateKeyType` value.
+    aggregate_key_type: &'static str,
+    /// The [`FIELD_RESOURCE_ARN`]-style token naming the required member.
+    field: &'static str,
+    /// The reason WAF gives for that member's absence.
+    reason: &'static str,
+    /// `true` when the statement carries the member this setting requires.
+    configured: fn(&RateBasedStatement) -> bool,
+}
+
+/// The `AggregateKeyType` values that each require a companion member of the same
+/// statement, and the member each one requires
+/// (`smithy_query(query="shape",shape="RateBasedStatement")`, member
+/// `AggregateKeyType`): `FORWARDED_IP` — "you must specify the header to use in the
+/// `ForwardedIPConfig` property"; `CUSTOM_KEYS` — "you must specify the aggregate
+/// keys in the `CustomKeys` property"; `CONSTANT` — "you must configure the
+/// `ScopeDownStatement` property". `IP` aggregates on the request origin's own
+/// address and requires nothing, so it is not listed.
+///
+/// `CustomKeys` is `@length(min 0)`, so a list that is present and EMPTY specifies no
+/// aggregate key either and counts as unconfigured.
+const AGGREGATE_KEY_COMPANIONS: &[AggregateKeyCompanion] = &[
+    AggregateKeyCompanion {
+        aggregate_key_type: "FORWARDED_IP",
+        field: FIELD_FORWARDED_IP_CONFIG,
+        reason: REQUIRED_FIELD_MISSING_REASON,
+        configured: |statement| statement.forwarded_ip_config.is_some(),
+    },
+    AggregateKeyCompanion {
+        aggregate_key_type: "CUSTOM_KEYS",
+        field: FIELD_CUSTOM_KEYS,
+        reason: MISSING_CONDITION_REASON,
+        configured: |statement| {
+            statement
+                .custom_keys
+                .as_deref()
+                .is_some_and(|keys| !keys.is_empty())
+        },
+    },
+    AggregateKeyCompanion {
+        aggregate_key_type: "CONSTANT",
+        field: FIELD_SCOPE_DOWN,
+        reason: REQUIRED_FIELD_MISSING_REASON,
+        configured: |statement| statement.scope_down_statement.is_some(),
+    },
+];
+
+/// The `ErrorReason` WAF carries when a setting that is a one-of — a structure whose
+/// members are alternatives, or two members of which exactly one may be set — names
+/// none of them or several, as the recorded WAF responses word it.
+///
+/// One sentence for the whole class: the `Field` member names the setting at fault,
+/// so the reason does not have to.
+pub const EXACTLY_ONE_VALUE_REASON: &str =
+    "You have used none or multiple values for a field that requires exactly one value.";
+
+/// The `ErrorReason` WAF carries when a parameter leaves out a member that parameter's
+/// own settings require, as the recorded WAF responses word it.
+pub const REQUIRED_FIELD_MISSING_REASON: &str = "A required field is missing from the parameter.";
+
+/// The `ErrorReason` WAF carries when a parameter carries none of a set of members it
+/// needs at least one of, as the recorded WAF responses word it.
+pub const MISSING_CONDITION_REASON: &str = "You are missing at-least one of condition \
+     between some parameters or all parameters of object.";
+
+/// How many of a one-of's alternatives are set, over the `present` flags of its
+/// members.
+///
+/// A one-of is satisfied by exactly ONE: "the default action must be a terminating
+/// action" for `DefaultAction`, "you must specify either this `Action` setting or the
+/// rule `OverrideAction` setting, but not both" for a rule's two action settings —
+/// so none and several are the same failure, which is why they carry one reason
+/// ([`EXACTLY_ONE_VALUE_REASON`]).
+fn alternatives_set(present: &[bool]) -> usize {
+    present.iter().filter(|set| **set).count()
+}
+
+/// The refusal a `DefaultAction` earns when it does not name exactly one of the
+/// alternatives it declares, or `None` when it names exactly one.
+///
+/// `DefaultAction` is "the action that you want WAF to perform when a web request
+/// doesn't match any of the rules in the `WebACL`", and it "must be a terminating
+/// action" — a structure of exactly the two alternatives `Block` and `Allow`
+/// (`smithy_query(query="shape",shape="DefaultAction")`). A web ACL whose default
+/// action names neither has nothing to do with a request that matches no rule, and
+/// one that names both has two things to do, so the save is refused rather than
+/// stored.
+pub fn default_action_refusal(action: &DefaultAction) -> Option<WAFInvalidParameterException> {
+    (alternatives_set(&[action.block.is_some(), action.allow.is_some()]) != 1).then(|| {
+        invalid_parameter_exception(
+            FIELD_DEFAULT_ACTION,
+            PARAMETER_DEFAULT_ACTION,
+            EXACTLY_ONE_VALUE_REASON,
+        )
+    })
+}
+
+/// The refusal a rule earns from the action settings it carries, or `None` when it
+/// carries exactly one action of exactly one kind.
+///
+/// Three one-ofs, judged outermost first:
+///
+/// * the pair `Action`/`OverrideAction` — "you must specify either this `Action`
+///   setting or the rule `OverrideAction` setting, but not both" (`Rule$Action`), so
+///   a rule setting neither has no answer for a request it matches and one setting
+///   both has two; the refusal names the RULE, the setting both of them live in;
+/// * the `RuleAction` a rule does set, which is "the action that WAF should take on a
+///   web request when it matches a rule's statement" — one of the alternatives
+///   `smithy_query(query="shape",shape="RuleAction")` declares;
+/// * the `OverrideAction` a rule does set, which is `Count` or `None`.
+fn rule_action_refusal(rule: &Rule) -> Option<WAFInvalidParameterException> {
+    if alternatives_set(&[rule.action.is_some(), rule.override_action.is_some()]) != 1 {
+        return Some(invalid_parameter_exception(
+            FIELD_RULE,
+            PARAMETER_RULE,
+            EXACTLY_ONE_VALUE_REASON,
+        ));
+    }
+    if let Some(action) = rule.action.as_ref() {
+        if alternatives_set(&[
+            action.block.is_some(),
+            action.allow.is_some(),
+            action.count.is_some(),
+            action.captcha.is_some(),
+            action.challenge.is_some(),
+            action.monetize.is_some(),
+        ]) != 1
+        {
+            return Some(invalid_parameter_exception(
+                FIELD_RULE_ACTION,
+                "RuleAction",
+                EXACTLY_ONE_VALUE_REASON,
+            ));
+        }
+    }
+    if let Some(override_action) = rule.override_action.as_ref() {
+        if alternatives_set(&[
+            override_action.count.is_some(),
+            override_action.none.is_some(),
+        ]) != 1
+        {
+            return Some(invalid_parameter_exception(
+                FIELD_OVERRIDE_ACTION,
+                "OverrideAction",
+                EXACTLY_ONE_VALUE_REASON,
+            ));
+        }
+    }
+    None
+}
+
+/// The refusal a rate-based statement anywhere in `rules` earns when its
+/// `AggregateKeyType` asks for a companion member the statement does not carry, or
+/// `None` when every one of them is configured.
+///
+/// `RateBasedStatement$AggregateKeyType` is `@required` and is the aggregation itself
+/// — what the counts are kept per — and three of its four settings are configured by
+/// another member of the same statement ([`AGGREGATE_KEY_COMPANIONS`]). A statement
+/// whose setting names a companion it does not carry has no aggregation key WAF could
+/// count by, so the save is refused rather than stored for an evaluation to guess at.
+/// `CustomKeys` is `@length(min 0)`, so a list that is present and EMPTY specifies no
+/// aggregate key either and is the same refusal as its absence.
+///
+/// Walked over the whole tree with an explicit worklist, like every other statement
+/// judgement of a save ([`nested_statements`]), so a rate-based statement nested in a
+/// logical statement or in another statement's scope-down is judged too.
+pub fn rate_based_aggregation_refusal(rules: &[Rule]) -> Option<WAFInvalidParameterException> {
+    let mut pending: Vec<&Statement> = rules.iter().map(|rule| &rule.statement).collect();
+    while let Some(statement) = pending.pop() {
+        if let Some(rate_based) = statement.rate_based_statement.as_deref() {
+            if let Some(companion) = AGGREGATE_KEY_COMPANIONS.iter().find(|companion| {
+                rate_based.aggregate_key_type == companion.aggregate_key_type
+                    && !(companion.configured)(rate_based)
+            }) {
+                return Some(invalid_parameter_exception(
+                    companion.field,
+                    PARAMETER_RATE_BASED_STATEMENT,
+                    companion.reason,
+                ));
+            }
+        }
+        pending.extend(nested_statements(statement));
+    }
+    None
+}
 
 /// The `ErrorReason` WAF carries when one value appears twice where it may appear
 /// once, as the recorded WAF responses word it.
@@ -249,14 +476,17 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         None
     }
 
-    /// The refusal a rule set earns from the preconditions WAF resolves ACROSS the
-    /// whole list, or `None` when it earns none.
+    /// The refusal a rule set earns from the preconditions WAF resolves over the
+    /// SAVED DOCUMENT, or `None` when it earns none.
     ///
     /// Run by every operation that SAVES a rule list, before anything is written, so
-    /// a refused save stores nothing and rotates no lock token: two rules sharing a
-    /// name, two sharing a priority, a custom-response reference the document's own
-    /// map does not define, and an override naming no rule of the customer-owned
-    /// group it overrides.
+    /// a refused save stores nothing and rotates no lock token: a setting that is a
+    /// one-of naming none or several of its alternatives (the document's own
+    /// `DefaultAction`, and each rule's action settings), a rate-based statement
+    /// whose aggregation names a companion member it does not carry, two rules
+    /// sharing a name, two sharing a priority, a custom-response reference the
+    /// document's own map does not define, and an override naming no rule of the
+    /// customer-owned group it overrides.
     ///
     /// `default_action` is the document's own default action where it has one (a web
     /// ACL does, a rule group does not), and `custom_response_bodies` is the map the
@@ -267,6 +497,17 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         default_action: Option<&DefaultAction>,
         custom_response_bodies: Option<&HashMap<String, CustomResponseBody>>,
     ) -> Option<WAFInvalidParameterException> {
+        // The one-ofs first: each is a judgement about ONE setting of the document,
+        // made before anything is read across the list.
+        if let Some(refusal) = default_action.and_then(default_action_refusal) {
+            return Some(refusal);
+        }
+        if let Some(refusal) = rules.iter().find_map(rule_action_refusal) {
+            return Some(refusal);
+        }
+        if let Some(refusal) = rate_based_aggregation_refusal(rules) {
+            return Some(refusal);
+        }
         if let Some(name) = duplicate_rule_name(rules) {
             return Some(invalid_parameter_exception(
                 FIELD_RULE,

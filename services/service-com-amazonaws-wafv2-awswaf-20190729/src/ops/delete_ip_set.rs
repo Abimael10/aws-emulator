@@ -191,8 +191,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = state.lock();
+        // The namespace this delete addresses, read ONCE: the same key resolves the
+        // entry below and removes it, so the IP set this call deletes is the one it
+        // resolved and checked the lock token of.
+        let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
 
-        let Some(entry) = state.ip_set(&input.scope, &input.name, &input.id) else {
+        let Some(entry) = state.ip_set(&input.scope, &region, &input.name, &input.id) else {
             crate::state::audit(
                 "DeleteIPSet",
                 &input.scope,
@@ -236,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        state.remove_ip_set(&input.scope, &input.id);
+        state.remove_ip_set(&input.scope, &region, &input.name, &input.id);
         crate::state::audit(
             "DeleteIPSet",
             &input.scope,

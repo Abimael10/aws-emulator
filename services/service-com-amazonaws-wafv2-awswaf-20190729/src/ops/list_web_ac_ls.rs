@@ -205,13 +205,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let state = state.lock();
-
-        // Only this scope's web ACLs, in a stable order so a marker names the same
-        // position on every call.
+        // Only the web ACLs of the namespace this listing addresses — this scope in
+        // the region the call reached (`crate::state::namespace_region`), since a
+        // REGIONAL web ACL belongs to the region it was created in and the global
+        // namespace is listed at the one endpoint that serves it — in a stable order
+        // so a marker names the same position on every call.
+        let region = crate::service::requests::namespace_region(scope, ctx.parts());
         let mut entries: Vec<&crate::state::WebAclEntry> = state
             .web_acls
             .values()
-            .filter(|entry| entry.scope == scope)
+            .filter(|entry| entry.scope == scope && entry.region == region)
             .collect();
         entries.sort_by(|left, right| left.web_acl.name.cmp(&right.web_acl.name));
 

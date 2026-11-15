@@ -201,6 +201,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // An ARN names the account that owns the resource, and WAF resolves it for
+            // the account the call was made FOR, so an ARN naming another account
+            // names an account it cannot resolve for this caller — the
+            // account-unresolvable refusal rather than anything about the resource,
+            // which is what lets a client re-target its account instead of concluding
+            // the rule group was deleted. The same judgement `GetWebACL` makes about
+            // the ARN it is handed.
+            if crate::state::arn_names_another_account(arn) {
+                return Err(crate::scaffolded::Scaffolded::unrecognized_client(
+                    crate::state::NO_ACCOUNT_FOUND_MESSAGE,
+                ));
+            }
             match state.arn_index.get(arn) {
                 Some(crate::state::ResourceRef::RuleGroup { scope, id }) => {
                     state.rule_groups.get(&(scope.clone(), id.clone()))
@@ -217,7 +229,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.name.as_deref(),
                 input.id.as_deref(),
             ) {
-                (Some(scope), Some(name), Some(id)) => state.rule_group(scope, name, id),
+                (Some(scope), Some(name), Some(id)) => state.rule_group(
+                    scope,
+                    &crate::service::requests::namespace_region(scope, ctx.parts()),
+                    name,
+                    id,
+                ),
                 _ => {
                     return Err(GetRuleGroupErrorModeled::WAFInvalidParameterException(
                         crate::state::invalid_parameter_exception(

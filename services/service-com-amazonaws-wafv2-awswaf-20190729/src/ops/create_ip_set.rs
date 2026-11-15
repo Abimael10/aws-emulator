@@ -255,10 +255,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let region = crate::service::requests::request_region(ctx.parts());
+        // The region whose namespace this IP set lands in: a REGIONAL set belongs to
+        // the region of the endpoint that created it, a CLOUDFRONT-scoped one to the
+        // one global namespace (`crate::state::namespace_region`).
+        let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
         let mut state = state.lock();
 
-        let name_key = (input.scope.clone(), input.name.clone());
+        let name_key = crate::state::name_key(&input.scope, &region, &input.name);
         if state.ip_set_names.contains_key(&name_key) {
             crate::state::audit(
                 "CreateIPSet",
@@ -273,7 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if state.ip_sets_in_scope(&input.scope) >= crate::state::MAX_IP_SETS_PER_SCOPE {
+        if state.ip_sets_in_scope(&input.scope, &region) >= crate::state::MAX_IP_SETS_PER_SCOPE
+            || state.region_partitions_exhausted(&input.scope, &region)
+        {
             crate::state::audit(
                 "CreateIPSet",
                 &input.scope,
@@ -331,6 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (input.scope.clone(), id.clone()),
             crate::state::IpSetEntry {
                 scope: input.scope.clone(),
+                region: region.clone(),
                 ip_set,
                 lock_token,
                 tags: input.tags.unwrap_or_default(),

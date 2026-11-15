@@ -200,8 +200,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = state.lock();
+        // The namespace this delete addresses: a REGIONAL web ACL is resolved in the
+        // region of the endpoint the call reached
+        // (`crate::state::namespace_region`), and the same key resolves the entry
+        // below and removes it, so the web ACL this call deletes is the one it
+        // resolved and checked the lock token of.
+        let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
 
-        let Some(entry) = state.web_acl(&input.scope, &input.name, &input.id) else {
+        let Some(entry) = state.web_acl(&input.scope, &region, &input.name, &input.id) else {
             crate::state::audit(
                 "DeleteWebACL",
                 &input.scope,
@@ -248,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        state.remove_web_acl(&input.scope, &input.id);
+        state.remove_web_acl(&input.scope, &region, &input.name, &input.id);
         crate::state::audit(
             "DeleteWebACL",
             &input.scope,

@@ -186,7 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let state = state.lock();
-        let Some(entry) = state.regex_pattern_set(&input.scope, &input.name, &input.id) else {
+        let Some(entry) = state.regex_pattern_set(
+            &input.scope,
+            &crate::service::requests::namespace_region(&input.scope, ctx.parts()),
+            &input.name,
+            &input.id,
+        ) else {
             return Err(GetRegexPatternSetErrorModeled::WAFNonexistentItemException(
                 crate::state::nonexistent_item_exception(),
             )

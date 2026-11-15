@@ -322,8 +322,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = state.lock();
+        // The namespace this request addresses: a REGIONAL rule group is resolved in
+        // the region of the endpoint the call reached
+        // (`crate::state::namespace_region`).
+        let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
 
-        let Some(entry) = state.rule_group(&input.scope, &input.name, &input.id) else {
+        let Some(entry) = state.rule_group(&input.scope, &region, &input.name, &input.id) else {
             crate::state::audit(
                 "UpdateRuleGroup",
                 &input.scope,
@@ -433,7 +437,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The checks above hold an immutable borrow, so the entry is resolved again —
         // by the same triple, under the same lock — to write through.
-        let Some(entry) = state.rule_group_mut(&input.scope, &input.name, &input.id) else {
+        let Some(entry) = state.rule_group_mut(&input.scope, &region, &input.name, &input.id)
+        else {
             return Err(UpdateRuleGroupErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
                     message: Some("the wafv2 store is unavailable".to_string()),
