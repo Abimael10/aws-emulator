@@ -54,6 +54,7 @@ pub mod describe_shared_directories_types;
 pub mod describe_snapshots_types;
 pub mod describe_trusts_types;
 pub mod describe_update_directory_types;
+pub mod directory_limits_wire;
 pub mod disable_ca_enrollment_policy_types;
 pub mod disable_client_authentication_types;
 pub mod disable_directory_data_access_types;
@@ -176,6 +177,8 @@ pub use describe_snapshots_types::*;
 pub use describe_trusts_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_update_directory_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use directory_limits_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use disable_ca_enrollment_policy_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

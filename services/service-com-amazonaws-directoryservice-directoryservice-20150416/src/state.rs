@@ -4283,6 +4283,16 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// comparison of the two — so the report says exactly when a further create of that
     /// category is refused with `DirectoryLimitExceededException`, which is what that
     /// error's own documentation points at this operation for.
+    ///
+    /// The flag for IDENTITY-POOL directories is reported beside them
+    /// ([`crate::ops::types::directory_limits_wire`] is where that member is declared, and
+    /// why): such a directory belongs to an identity pool, is created through the identity
+    /// service rather than through any operation of this one, and is none of the
+    /// `DirectoryType`s this model declares — every one of which counts towards one of the
+    /// three counters above or towards none at all ([`DirectoryLimitCategory::of`]) — so no
+    /// directory the account can hold here counts towards that allowance, the allowance is
+    /// untouched and the flag is off. It is REPORTED rather than omitted, because a client
+    /// reading every limit flag off the answer has to find a boolean there.
     pub fn directory_limits(&self) -> DirectoryLimits {
         let cloud_only = self.category_report(DirectoryLimitCategory::CloudOnly);
         let microsoft_ad = self.category_report(DirectoryLimitCategory::CloudOnlyMicrosoftAd);
@@ -4297,6 +4307,10 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             connected_directories_limit: Some(connected.limit),
             connected_directories_current_count: Some(connected.current_count),
             connected_directories_limit_reached: connected.limit_reached,
+            // The identity-pool flag: the account holds no directory that counts towards
+            // that allowance (see the note above), so the allowance is untouched and the
+            // flag is off — reported rather than omitted.
+            identity_pool_directories_limit_reached: false,
         }
     }
 

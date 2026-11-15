@@ -22,14 +22,15 @@
 //!   way Active Directory compares account names: a second create of the same name in any
 //!   case is refused with `EntityAlreadyExistsException`, while the same name in another
 //!   directory is admitted and gets its own SID;
-//! * a create needs a directory that is in service: one still being built by the
-//!   transition its create owes is refused with `DirectoryUnavailableException`, and the
-//!   same call succeeds once that transition has fallen due;
+//! * a create needs a directory that can service the join: one the store does not hold,
+//!   and one still being built by the transition its create owes, are both refused with
+//!   `DirectoryUnavailableException`, and the same call succeeds once that transition has
+//!   fallen due;
 //! * a named `OrganizationalUnitDistinguishedName` must be a distinguished name of the
 //!   directory's own domain — over a table of DN forms — and anything else is refused with
 //!   `InvalidParameterException`;
 //! * the `DirectoryId` is resolved in the store, an id no directory is stored under is
-//!   refused with `EntityDoesNotExistException` over a table of well-formed ids, a request
+//!   refused with `DirectoryUnavailableException` over a table of well-formed ids, a request
 //!   the MODEL refuses never reaches that resolution, and the operation never answers the
 //!   scaffold's `NotImplemented`;
 //! * one directory holds at most the guarded number of accounts, and that guard is
@@ -658,7 +659,9 @@ async fn the_directory_id_is_resolved_in_the_store() {
         "the stored directory",
     )
     .await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    // Polled rather than slept: the rows below need a directory that SERVES, which is a
+    // condition to wait for and not a span of time.
+    crate::harness::poll_until_in_service(&router, &stored, "the stored directory").await;
 
     for (absent, class) in ABSENT_DIRECTORY_IDS {
         refused(
@@ -669,7 +672,7 @@ async fn the_directory_id_is_resolved_in_the_store() {
                 "ComputerName": "anywhere",
                 "Password": join_password(16)
             }),
-            "EntityDoesNotExistException",
+            "DirectoryUnavailableException",
             class,
         )
         .await;
@@ -727,7 +730,7 @@ async fn the_directory_id_is_resolved_in_the_store() {
         );
         let wire_type = parsed["__type"].as_str().unwrap_or_default().to_string();
         assert!(
-            !wire_type.contains("EntityDoesNotExistException")
+            !wire_type.contains("DirectoryUnavailableException")
                 && !wire_type.contains("EntityAlreadyExistsException"),
             "case {class:?}: the input is refused before the directory is resolved, got \
              {parsed}"

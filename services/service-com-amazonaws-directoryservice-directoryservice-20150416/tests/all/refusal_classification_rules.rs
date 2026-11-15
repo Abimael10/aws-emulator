@@ -13,8 +13,8 @@
 //!
 //! * a constraint broken by a list's ELEMENTS is stated once at the LIST member — the entries
 //!   of that member the constraint refused, the member's own path with no element position in
-//!   it, and the element shape's whole constraint set nested inside
-//!   `Member must satisfy constraint: [ … ]`;
+//!   it, and the element shape's whole constraint set, closed by the requirement that an
+//!   entry be present at all, nested inside `Member must satisfy constraint: [ … ]`;
 //! * a directory and an account that are not shared are named UNQUOTED in the not-shared
 //!   refusal, under the capitalised `Account:` label;
 //! * a multi-Region call is refused by the EDITION gate first (a directory that does not
@@ -642,9 +642,14 @@ struct ElementCase {
 fn one_element_error(quoted: &str, path: &str, requirements: &str) -> String {
     format!(
         "1 validation error detected: Value '[{quoted}]' at '{path}' failed to satisfy \
-         constraint: Member must satisfy constraint: [{requirements}]"
+         constraint: Member must satisfy constraint: [{requirements}, {ENTRY_PRESENT}]"
     )
 }
+
+/// The requirement the nested set CLOSES with: no list of this model is `@sparse`, so an
+/// entry has to be there as well as satisfy its element shape, and the clause states that
+/// beside the constraints the shape declares.
+const ENTRY_PRESENT: &str = "Member must not be null";
 
 /// The `@pattern` each element shape under test declares, read off the model
 /// (`smithy_query(query="shape", shape="DnsIpAddrs,DirectoryIds,DomainControllerIds,CidrIps,TagKeys")`).
@@ -856,7 +861,7 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
         message.contains(&format!(
             "Value '[999.999.999.999]' at 'dnsIpAddrs' failed to satisfy constraint: Member \
              must satisfy constraint: [Member must satisfy regular expression pattern: \
-             {IP_ADDR_PATTERN}]"
+             {IP_ADDR_PATTERN}, {ENTRY_PRESENT}]"
         )),
         "case {case:?}: expected the list clause among them, got {message:?}"
     );
@@ -873,7 +878,9 @@ async fn a_constraint_a_lists_elements_break_is_stated_at_the_list_member() {
         "a well-formed list",
     )
     .await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    // Polled rather than slept: the call below needs a directory that SERVES, which is a
+    // condition to wait for and not a span of time.
+    crate::harness::poll_until_in_service(&router, &served, "a well-formed list").await;
     let (status, parsed) = call(
         &router,
         "CreateConditionalForwarder",

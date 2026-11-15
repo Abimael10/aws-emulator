@@ -13,7 +13,7 @@
 //! not tied to a slice of the service.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_directoryservice_directoryservice_20150416::state::TRANSITION_SPAN;
@@ -53,6 +53,99 @@ pub(crate) async fn delete_directory_and_wait(
     )
     .await;
     tokio::time::sleep(PAST_THE_TEARDOWN).await;
+}
+
+/// The stage the reporting operation gives for `directory_id`, or `None` once the account
+/// holds no record for it.
+pub(crate) async fn reported_stage(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+) -> Option<String> {
+    let answer = ok(
+        router,
+        "DescribeDirectories",
+        json!({ "DirectoryIds": [directory_id] }),
+        case,
+    )
+    .await;
+    answer["DirectoryDescriptions"]
+        .as_array()
+        .and_then(|page| page.first().cloned())
+        .map(|described| described["Stage"].as_str().unwrap_or_default().to_string())
+}
+
+/// The stage a directory serves its callers in, as `DescribeDirectories` reports it.
+pub(crate) const STAGE_ACTIVE: &str = "Active";
+
+/// How long a polled stage may take to advance before a case fails: far longer than any
+/// span this service publishes, and well inside what a client's waiter allows, so a loaded
+/// machine does not decide the outcome.
+const POLL_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How often a poll asks.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Wait until `directory_id` REPORTS itself in service, by polling the reporting operation
+/// the way a client with a waiter does.
+///
+/// The CONDITION is what is waited for rather than a span of time, so a case that needs a
+/// serving directory does not depend on how fast the host runs: the poll asks again until
+/// the stage it reads is the serving one, or until a deadline far beyond any span this
+/// service publishes has passed.
+pub(crate) async fn poll_until_in_service(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+) {
+    poll_until(
+        router,
+        directory_id,
+        case,
+        "report itself in service",
+        |observed| observed == Some(STAGE_ACTIVE),
+    )
+    .await;
+}
+
+/// Wait until the account holds NO record for `directory_id`, by polling the same reporting
+/// operation — the condition a case about a deleted directory waits for.
+pub(crate) async fn poll_until_absent(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+) {
+    poll_until(router, directory_id, case, "leave the store", |observed| {
+        observed.is_none()
+    })
+    .await;
+}
+
+/// Poll the reporting operation for `directory_id` until the stage it reports satisfies
+/// `settled`, or fail naming the case, what was waited for and the last stage observed.
+///
+/// THE one polling loop of this harness, so every condition a suite waits for is bounded
+/// the same way and no case waits a fixed span instead.
+async fn poll_until(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+    awaited: &str,
+    settled: impl Fn(Option<&str>) -> bool,
+) {
+    let started = Instant::now();
+    loop {
+        let observed = reported_stage(router, directory_id, case).await;
+        if settled(observed.as_deref()) {
+            return;
+        }
+        assert!(
+            started.elapsed() < POLL_DEADLINE,
+            "case {case:?}: expected {directory_id} to {awaited} within {POLL_DEADLINE:?}, \
+             last observed {observed:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// A router with just this service mounted on a fresh engine.

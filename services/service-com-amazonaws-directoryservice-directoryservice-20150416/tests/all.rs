@@ -41,6 +41,8 @@ mod computer_account_unavailable_wording;
 mod computer_attributes;
 #[path = "all/computer_conflict_diagnostic.rs"]
 mod computer_conflict_diagnostic;
+#[path = "all/computer_join_directory_refusal.rs"]
+mod computer_join_directory_refusal;
 #[path = "all/computers.rs"]
 mod computers;
 #[path = "all/conditional_forwarder_deletion.rs"]
@@ -61,6 +63,8 @@ mod directory_deletion;
 mod directory_dns_addresses;
 #[path = "all/directory_lifecycle.rs"]
 mod directory_lifecycle;
+#[path = "all/directory_limit_members.rs"]
+mod directory_limit_members;
 #[path = "all/directory_limits.rs"]
 mod directory_limits;
 #[path = "all/directory_network_release.rs"]

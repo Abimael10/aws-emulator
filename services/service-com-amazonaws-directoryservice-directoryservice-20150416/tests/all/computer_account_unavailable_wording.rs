@@ -9,14 +9,13 @@
 //!
 //! The rules under test, each over a TABLE of inputs rather than one call:
 //!
-//! * a computer account is created in the directory's own domain, and a directory that is
-//!   still being built has no domain to create it in — so `CreateComputer` against one is
-//!   refused with the modelled `DirectoryUnavailableException` worded in the directory-LOOKUP
+//! * a computer account is created in the directory's own domain, and a directory the
+//!   service does not hold — or holds but is still building — has no domain to create it in
+//!   — so `CreateComputer` against either is refused with the modelled
+//!   `DirectoryUnavailableException` worded in the directory-LOOKUP
 //!   family's sentence, the quoted id the request sent and that no such directory is there,
 //!   with the request-id suffix every refusal of this service carries and that same id in the
-//!   response's `x-amzn-requestid` header. The class is what separates this failure from an
-//!   id that resolves to no directory at all, which is answered with
-//!   `EntityDoesNotExistException` in the same sentence. The family-NEUTRAL sentence
+//!   response's `x-amzn-requestid` header. The family-NEUTRAL sentence
 //!   (`Operation could not be performed because directory <id> is unavailable.`) belongs to
 //!   the operations whose family states none of its own, which
 //!   `tests/all/refusal_wording.rs` is what asserts;
@@ -101,7 +100,7 @@ async fn answered(
     (status, code, message, header)
 }
 
-/// RULE: `CreateComputer` on a directory that is not in service is refused
+/// RULE: `CreateComputer` on a directory that cannot service the join is refused
 /// `DirectoryUnavailableException` in the directory-lookup family's sentence, and the same
 /// call is admitted once the stage chain its create owed has run out.
 #[tokio::test]
@@ -190,9 +189,10 @@ async fn a_computer_account_write_on_a_directory_being_built_is_refused_as_no_su
             row.case
         );
 
-        // The id that resolves to NO directory is answered in the same sentence under the
-        // other class, so what tells a caller the two apart is the error the SDK types —
-        // and neither sentence says where in its build a directory is.
+        // An id that resolves to NO directory is answered the same way: neither has a
+        // domain the join could be performed in, so the class and the sentence are one —
+        // and neither says where in its build a directory is or whether a record for it is
+        // held at all. Each refusal still reports its OWN request id.
         let (absent_status, absent_code, absent_message, absent_header) =
             answered(&router, create_computer(ABSENT_DIRECTORY_ID), row.case).await;
         assert_eq!(
@@ -201,8 +201,8 @@ async fn a_computer_account_write_on_a_directory_being_built_is_refused_as_no_su
             row.case
         );
         assert!(
-            absent_code.contains("EntityDoesNotExistException"),
-            "case {:?}: expected EntityDoesNotExistException for an absent id, got \
+            absent_code.contains("DirectoryUnavailableException"),
+            "case {:?}: expected DirectoryUnavailableException for an absent id, got \
              {absent_code:?}",
             row.case
         );

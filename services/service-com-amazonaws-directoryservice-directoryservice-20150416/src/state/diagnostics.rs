@@ -69,17 +69,19 @@ pub fn directory_unavailable(directory_id: &str) -> String {
     format!("Operation could not be performed because directory {directory_id} is unavailable.")
 }
 
-/// The `DirectoryUnavailableException` message a computer-account write on a directory
-/// that is not in service is refused with.
+/// The `DirectoryUnavailableException` message a computer-account write whose directory
+/// cannot service the join is refused with.
 ///
 /// Directory Service words this one in the directory-LOOKUP family's sentence
 /// ([`no_such_directory`]) rather than the family-neutral [`directory_unavailable`] one: a
-/// computer account is created in the directory's own domain, and a directory that is still
-/// being built has no domain to create it in, so the join path reports the directory as one
-/// it does not have — under the modelled `DirectoryUnavailableException`, which is what
-/// tells the caller to wait for the directory rather than to fix the id it sent.
-/// `CreateComputer` states it; the family-neutral sentence is what every operation whose
-/// family states none of its own says. [`refusal`] appends the request id, once.
+/// computer account is created in the directory's own domain, and a directory the service
+/// does not hold — or holds but is still building — has no domain to create it in, so the
+/// join path reports the directory as one it does not have, under the modelled
+/// `DirectoryUnavailableException`, which is what tells the caller to wait for the
+/// directory rather than to fix the id it sent. `CreateComputer` states it for both, so
+/// the diagnostic says neither where in its build a directory is nor whether a record for
+/// it is held at all; the family-neutral sentence is what every operation whose family
+/// states none of its own says. [`refusal`] appends the request id, once.
 pub fn computer_directory_unavailable(directory_id: &str) -> String {
     no_such_directory(directory_id)
 }

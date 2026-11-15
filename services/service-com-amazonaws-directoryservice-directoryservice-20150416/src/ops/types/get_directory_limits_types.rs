@@ -22,17 +22,7 @@ pub struct GetDirectoryLimitsOutput {
     pub directory_limits: Option<DirectoryLimits>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.directoryservice#DirectoryLimits")]
-#[derive(Debug, Clone, Default)]
-pub struct DirectoryLimits {
-    pub cloud_only_directories_limit: Option<i32>,
-    pub cloud_only_directories_current_count: Option<i32>,
-    pub cloud_only_directories_limit_reached: bool,
-    pub cloud_only_microsoft_ad_limit: Option<i32>,
-    pub cloud_only_microsoft_ad_current_count: Option<i32>,
-    pub cloud_only_microsoft_ad_limit_reached: bool,
-    pub connected_directories_limit: Option<i32>,
-    pub connected_directories_current_count: Option<i32>,
-    pub connected_directories_limit_reached: bool,
-}
+// `DirectoryLimits` is declared in `types::directory_limits_wire`, whose module header says
+// why its schema and codec are written out instead of derived: a Directory Service limits
+// answer carries one flag this model does not declare.
 

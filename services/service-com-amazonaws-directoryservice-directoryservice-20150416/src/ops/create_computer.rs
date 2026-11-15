@@ -17,10 +17,16 @@
 //! account of one directory shares it) plus the next RID of that directory's pool
 //! ([`crate::state::FIRST_COMPUTER_RID`]), which is what makes it unique. The name is
 //! unique within the directory, compared case-insensitively the way Active Directory
-//! compares account names, and the directory must be in service — a directory still being
-//! built by the transition its create owes is answered with the modelled
-//! `DirectoryUnavailableException`, exactly as `AddIpRoutes` and
-//! `EnableDirectoryDataAccess` answer it.
+//! compares account names.
+//!
+//! The join is performed BY the directory, in its own domain, so a `DirectoryId` that
+//! resolves to no directory serving a domain — one the store does not hold at all, and one
+//! still being built by the transition its create owes — is answered with the modelled
+//! `DirectoryUnavailableException` ([`directory_unavailable`]): there is no domain to
+//! create the account in either way, and the class is what tells a caller to wait for the
+//! directory rather than to stop using the id. `EntityDoesNotExistException`, which this
+//! operation also models, is the class for an entity the join could not find WITHIN a
+//! directory, not for the directory that serves it.
 //!
 //! The service models no read of a computer account (there is no Describe/List for one in
 //! this model), so the create is the only operation that reports one; a second create of
@@ -182,33 +188,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.advance_clock(now);
 
-        // The account is created IN a directory, so the directory is resolved first: an
-        // id naming none is the modelled "specified entity could not be found".
+        // The account is created IN the directory's own domain, so the directory that
+        // serves that domain is resolved first: an id the store does not hold names no
+        // domain the join could be performed in, which is the modelled refusal for a
+        // directory that cannot service the call ([`directory_unavailable`]).
         let directory = store
             .directories
             .get_mut(&input.directory_id)
-            .ok_or_else(|| {
-                CreateComputerErrorModeled::EntityDoesNotExistException(crate::state::refusal(
-                    crate::state::no_such_directory(&input.directory_id),
-                ))
-            })?;
+            .ok_or_else(|| directory_unavailable(&input.directory_id))?;
 
-        // Creating a computer object writes into the directory itself, so it needs a
-        // directory that is in service: one still being built by the transition its create
-        // owes is unavailable, which is the modelled refusal for exactly that. The
-        // diagnostic is this family's own
-        // ([`crate::state::computer_directory_unavailable`]) — the quoted id the request
-        // asked for and that the directory the join needs is not one the service has, with
-        // nothing about the stage its build has reached.
+        // The same refusal for a directory the store DOES hold but that is not in service:
+        // one still being built by the transition its create owes has no domain to create
+        // the account in yet. One class and one diagnostic for both, so neither says where
+        // in its build a directory is nor whether the service holds a record for it.
         if directory.stage != crate::state::STAGE_ACTIVE {
-            return Err(
-                CreateComputerErrorModeled::DirectoryUnavailableException(
-                    crate::state::refusal(crate::state::computer_directory_unavailable(
-                        &input.directory_id,
-                    )),
-                )
-                .into(),
-            );
+            return Err(directory_unavailable(&input.directory_id));
         }
 
         // `OrganizationalUnitDistinguishedName` is "the fully-qualified distinguished name
@@ -330,6 +324,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             computer: Some(computer),
         })
     }
+}
+
+/// Refuse the request with the modelled `DirectoryUnavailableException`: the directory the
+/// request named cannot service the join, whether the store holds no record for it or holds
+/// one that is not in service yet.
+///
+/// THE one place this operation builds that refusal, so the two branches that take it cannot
+/// drift in class or in wording. The diagnostic is the computer-account family's
+/// ([`crate::state::computer_directory_unavailable`]) — the quoted id the request asked for
+/// and that the directory the join needs is not one the service has, with nothing about the
+/// stage its build has reached.
+fn directory_unavailable(directory_id: &str) -> CreateComputerError {
+    CreateComputerErrorModeled::DirectoryUnavailableException(crate::state::refusal(
+        crate::state::computer_directory_unavailable(directory_id),
+    ))
+    .into()
 }
 
 /// Refuse the request with the modelled `InvalidParameterException`, naming the member

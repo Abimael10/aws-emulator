@@ -25,7 +25,9 @@
 //! ([`::service_common::validation_message::aws_validation_refusal_over_elements_stating`]);
 //! what is this service's own is the ORDER its own validator lists an enum's value set in
 //! ([`super::stated_enum_values`] states the same order for a clause about a plain member),
-//! and which entries the clause quotes ([`offending_entries`]).
+//! which entries the clause quotes ([`offending_entries`]), and that the nested set closes
+//! with the requirement that an entry be PRESENT
+//! ([`element_set_in_the_services_own_order`]).
 //!
 //! WHY THE ENTRIES AND NOT THE WHOLE LIST. The services that state this clause do not agree
 //! on its value half — `cloudformation`'s copy of this rule quotes the whole list as
@@ -237,11 +239,13 @@ fn offending_entries(violations: &[Violation]) -> HashMap<String, String> {
 
 /// The requirement a clause stated at `collection` nests: the element shape's whole declared
 /// constraint set, with an enum's value set listed in the order this SERVICE lists it
-/// ([`super::stated_enum_values`]).
+/// ([`super::stated_enum_values`]), closing with the requirement that an entry be PRESENT.
 ///
-/// The set itself is the one the shared reading of the schema produces
-/// ([`element_constraint_set`]) — the model's, constraint for constraint — and only the ORDER
-/// an enum's values are listed in is this service's. A collection the operation's input
+/// The constraints themselves are the ones the shared reading of the schema produces
+/// ([`element_constraint_set`]) — the model's, constraint for constraint — and what this
+/// service adds to them is the ORDER an enum's values are listed in and the closing
+/// not-null requirement every entry of a list that is not `@sparse` carries. A collection
+/// the operation's input
 /// declares ITSELF is looked up by its whole path; one inside a structure that input nests is
 /// looked up by its OWN member name on the structures this service nests ([`NESTED_SHAPES`]),
 /// since that is the schema codegen attached its element constraints to. `None` where no
@@ -261,7 +265,7 @@ fn element_set_in_the_services_own_order(
         let nested = collection.rsplit('.').next()?;
         element_constraint_set(NESTED_SHAPES, nested)
     })?;
-    let requirements: Vec<String> = declared
+    let mut requirements: Vec<String> = declared
         .into_iter()
         .map(|kind| {
             let kind = match kind {
@@ -273,6 +277,14 @@ fn element_set_in_the_services_own_order(
             requirement(kind)
         })
         .collect();
+    // ...and, last, that an element be PRESENT at all. A Smithy list admits a null entry
+    // only where it is declared `@sparse`, which no list of this model is, so every entry
+    // of every such member has to be there as well as satisfy its shape — and the set a
+    // clause nests states that requirement beside the ones the element shape declares,
+    // whichever of them the request broke. The sentence is the framework's own for an
+    // absent member ([`requirement`]), so one wording serves both the clause about a
+    // member nothing filled and this nested requirement.
+    requirements.push(requirement(ViolationKind::MissingRequiredMember));
     Some(element_set_requirement(&requirements))
 }
 

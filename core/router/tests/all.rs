@@ -1988,3 +1988,17 @@ mod zz_probe_whole_emulator;
 // `all/all_rs_declares_each_suite_once.rs` and `all/every_suite_file_is_declared.rs` —
 // for this root and for every service crate's `tests/all.rs`.
 // above each `mod` is what points it into `tests/all/`.
+// sorted by name, and no other line. Two branches landing at once then insert two lines
+// Written with ORDINARY comments throughout, header included: an inner doc comment
+// (`//!`) is legal only before the first item, so a re-typed or merged copy of a header
+// line that lands past the first declaration is `E0753` and compiles no suite of this
+// target at all. With no `//!` line anywhere in this file there is no such line to copy.
+// `all/all_rs_carries_no_inner_doc_comment.rs` pins that, and
+// `all/every_suite_file_is_declared.rs` pin the shape, the one declaration per suite and
+// the declaration of every suite file.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair into the sorted list
+// below. What that suite covers, and why it drives the assembled router rather than one
+// service crate, belongs in that suite's OWN module doc, where it is read beside the test
+// The `#[path]` attribute above each `mod` is what points it into `tests/all/`: this file
+// is a test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of it
+// (`tests/<name>.rs`), which the layout check refuses.
