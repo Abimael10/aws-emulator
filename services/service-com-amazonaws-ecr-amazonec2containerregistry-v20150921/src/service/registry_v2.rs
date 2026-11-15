@@ -219,6 +219,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             return registry_error(500, "UNKNOWN", "the ecr repository store is unavailable");
         };
         let now = ::std::time::SystemTime::now();
+        // Which registry the client addressed: the Region of the endpoint it DIALLED, and
+        // for an endpoint naming none (this emulator's own socket) the Region the
+        // credential it presents was issued for — a `docker login` credential is obtained
+        // per registry.
+        let dialled = crate::state::dialled_registry_region(request_authority(req));
 
         // The credential this registry minted, or the challenge a client answers by
         // fetching one. The expiries the clock has already made due are written down
@@ -227,11 +232,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let Some(password) = presented_password(req) else {
             return unauthorized(req);
         };
-        let principal_arn = {
+        let (principal_arn, region) = {
             let mut store = state.lock();
             store.reclaim_expired_registry_credentials(now);
             match store.honoured_registry_credential(&password, now) {
-                Some(honoured) => honoured.principal_arn.clone(),
+                Some(honoured) => (
+                    honoured.principal_arn.clone(),
+                    dialled.unwrap_or_else(|| honoured.region.clone()),
+                ),
                 None => return unauthorized(req),
             }
         };
@@ -241,16 +249,34 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             RegistryV2Target::Manifest {
                 repository_name,
                 reference,
-            } => self.serve_manifest(&state, req, repository_name, reference, &principal_arn, now),
+            } => self.serve_manifest(
+                &state,
+                req,
+                &AddressedRepository {
+                    region: &region,
+                    name: repository_name,
+                },
+                reference,
+                &principal_arn,
+                now,
+            ),
             RegistryV2Target::Blob {
                 repository_name,
                 digest,
-            } => serve_blob(&state, req, repository_name, digest),
+            } => serve_blob(
+                &state,
+                req,
+                &AddressedRepository {
+                    region: &region,
+                    name: repository_name,
+                },
+                digest,
+            ),
             RegistryV2Target::Unserved => registry_unsupported(),
         }
     }
 
-    /// Serve the manifest `reference` addresses in `repository_name` — and, for a `GET`,
+    /// Serve the manifest `reference` addresses in `repository` — and, for a `GET`,
     /// cache what a pull through cache rule covers and record the pull it is.
     ///
     /// The reference is a digest when it is written as content is addressed
@@ -272,7 +298,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             crate::state::ComAmazonawsEcrAmazonec2containerregistryV20150921State,
         >,
         req: &RtRequest,
-        repository_name: &str,
+        repository: &AddressedRepository<'_>,
         reference: &str,
         principal_arn: &str,
         now: ::std::time::SystemTime,
@@ -286,23 +312,24 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             // cached.
             let mut store = state.lock();
             let held = store
-                .repository(repository_name)
+                .repository(repository.region, repository.name)
                 .is_ok_and(|repo| repo.lookup_image(&identifier).is_ok());
             // A `GET` of a manifest IS the pull, and the first pull of a reference a rule
             // covers is what caches the upstream image. A reference addressing a digest names
             // CONTENT an import has none to match against, so only a tag is cached; a rule
             // that covers nothing here, or one the upstream cannot be reached through, leaves
-            // the refusals below to answer.
+            // the refusals below to answer. The copy is cached in the registry this pull
+            // addresses, which is the Region the endpoint dialled names.
             if !held && req.method() == "GET" {
                 crate::state::registry_pull::import_covered_image(
                     &mut store,
-                    &cache_repository_region(req),
-                    repository_name,
+                    repository.region,
+                    repository.name,
                     identifier.image_tag.as_deref(),
                     now,
                 );
             }
-            let Ok(repo) = store.repository(repository_name) else {
+            let Ok(repo) = store.repository(repository.region, repository.name) else {
                 return registry_error(404, "NAME_UNKNOWN", NAME_UNKNOWN_MESSAGE);
             };
             let Ok(image) = repo.lookup_image(&identifier) else {
@@ -328,12 +355,16 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         // rest of the image is fetched from, so it is what ECR records a pull time and a
         // pull count for. A `HEAD` reports on the manifest without transferring it.
         if req.method() == "GET" {
-            state
-                .lock()
-                .record_image_pull(repository_name, &image_digest, principal_arn, now);
+            state.lock().record_image_pull(
+                repository.region,
+                repository.name,
+                &image_digest,
+                principal_arn,
+                now,
+            );
             // Published with no store lock held, into the CloudWatch store rather than
             // this one.
-            crate::state::pull_metrics::count_repository_pull(&*self.engine, repository_name);
+            crate::state::pull_metrics::count_repository_pull(&*self.engine, repository.name);
         }
 
         let content_type = media_type
@@ -348,7 +379,17 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
-/// Serve the blob `digest` addresses in `repository_name`.
+/// The repository a registry request addresses: the name its path names, in the registry of
+/// the Region the request resolved to (the endpoint it dialled, else the Region the
+/// credential it presents was issued for).
+struct AddressedRepository<'a> {
+    /// The Region of the registry holding it.
+    region: &'a str,
+    /// The repository's name, as the path spells it.
+    name: &'a str,
+}
+
+/// Serve the blob `digest` addresses in `repository`.
 ///
 /// A blob is in a repository because a layer upload against it was COMPLETED, which is the
 /// record this reads (`crate::state::Repo::layer_blobs`) and the same record the layer
@@ -359,11 +400,11 @@ fn serve_blob(
         crate::state::ComAmazonawsEcrAmazonec2containerregistryV20150921State,
     >,
     req: &RtRequest,
-    repository_name: &str,
+    repository: &AddressedRepository<'_>,
     digest: &str,
 ) -> RtResponse {
     let store = state.lock();
-    let Ok(repo) = store.repository(repository_name) else {
+    let Ok(repo) = store.repository(repository.region, repository.name) else {
         return registry_error(404, "NAME_UNKNOWN", NAME_UNKNOWN_MESSAGE);
     };
     // A digest this repository holds no blob under addresses no content here, whether it
@@ -443,26 +484,6 @@ fn accepted_media_types(req: &RtRequest) -> Option<Vec<String>> {
         }
     }
     (!accepted.is_empty()).then_some(accepted)
-}
-
-/// The Region the cache repository a pull through cache rule's first pull CREATES records
-/// in its ARN.
-///
-/// A registry request carries no SigV4 credential scope to read a Region out of — what
-/// authorises one is a Basic credential — so it is the Region the registry HOST the client
-/// dialled names, read through the one reading of that host this service states
-/// (`crate::state::registry_pull::host_region`), on the endpoint read through this crate's
-/// one reading of a request's own ([`super::request_authority`], which also covers an HTTP/2
-/// request carrying its authority on the URI). A client that reached this registry at any
-/// other address — the emulator's own socket, which names no Region — gets this registry's
-/// default one. A Region is a label the repository's ARN carries rather than an address: one
-/// endpoint serves every Region here
-/// (`crate::state::announced_registry_endpoint`).
-fn cache_repository_region(req: &RtRequest) -> String {
-    let authority = super::request_authority(req).to_ascii_lowercase();
-    let host = authority.split(':').next().unwrap_or_default();
-    crate::state::registry_pull::host_region(host)
-        .unwrap_or_else(|| crate::state::DEFAULT_REGION.to_string())
 }
 
 /// The `docker login` password a request presents, or `None` when it presents no Basic

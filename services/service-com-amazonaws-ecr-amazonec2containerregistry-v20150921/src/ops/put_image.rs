@@ -209,8 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
 
-        // The Region this push is published to EventBridge in: the one the request was
-        // signed for, read before anything is stored.
+        // The Region this push is published to EventBridge in, and the Region whose
+        // registry holds the repository it addresses: the one the request was signed for,
+        // read before anything is stored.
         let region = crate::state::request_region(ctx.parts());
 
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
@@ -250,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is written under its lock, which the helper below holds for its own
         // body alone: the guard is not `Send`, and the publication that follows is awaited.
         let (output, pushed, scan) =
-            Self::store_pushed_image(&state, &input, digest, now, planned_signings)?;
+            Self::store_pushed_image(&state, &input, &region, digest, now, planned_signings)?;
         // The push STORED an image, so the registry publishes the image action it
         // performed, with the store's lock released — EventBridge delivers the event to the
         // rules that match it, and a target of one may call back into this service.
@@ -285,6 +286,7 @@ impl<Eng> PutImage<Eng> {
             crate::state::ComAmazonawsEcrAmazonec2containerregistryV20150921State,
         >,
         input: &PutImageInput,
+        region: &str,
         digest: String,
         now: ::std::time::SystemTime,
         planned_signings: Vec<crate::state::signing::ImageSigning>,
@@ -309,7 +311,7 @@ impl<Eng> PutImage<Eng> {
         // it is stored. See [`crate::state::MAX_REGISTRY_CALLER_BYTES`].
         let manifest_bytes = {
             let repo = store
-                .repository(&input.repository_name)
+                .repository(region, &input.repository_name)
                 .map_err(fault_error)?;
             if repo.images.contains_key(&digest) {
                 0
@@ -336,7 +338,7 @@ impl<Eng> PutImage<Eng> {
         let planned_replications = store.planned_replications(&input.repository_name, now);
 
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(region, &input.repository_name)
             .map_err(fault_error)?;
 
         // A manifest is only pushable once every blob it references is in the
@@ -512,7 +514,7 @@ impl<Eng> PutImage<Eng> {
         // (`ImageScanningConfiguration$scanOnPush`): the scan the stored image is owed is
         // started here, on the image this push has just put in the repository, and the run
         // it records is what the caller arms the completion's publication for.
-        let scan = store.start_scan_on_push(&input.repository_name, &digest, now);
+        let scan = store.start_scan_on_push(region, &input.repository_name, &digest, now);
         Ok((output, pushed, scan))
     }
 }

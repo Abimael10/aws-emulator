@@ -239,9 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
 
-        // Request metadata is used for the audit record only: the upload is held in
-        // this registry's state, not in the signing region.
+        // Request metadata: the audit record below, and the Region whose registry holds
+        // the repository the upload was opened against.
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
 
         // "If you do not specify a registry, the default registry is assumed" — and the
         // only registry served here is this emulator's own.
@@ -253,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The part goes into a layer of a repository, so there has to be one: a part for
         // a repository that does not exist is refused rather than kept.
         store
-            .repository(&input.repository_name)
+            .repository(&region, &input.repository_name)
             .map_err(|fault| refusal("no such repository", &caller_akid, fault_error(fault)))?;
 
         // The bytes the registry already holds, read before the upload is borrowed for
@@ -266,7 +267,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An upload id is only valid for the repository it was issued for, so an id this
         // registry never handed out and one opened against another repository are the
         // same refusal.
-        let Some(upload) = store.upload_mut(&input.repository_name, &input.upload_id) else {
+        let Some(upload) = store.upload_mut(&region, &input.repository_name, &input.upload_id)
+        else {
             return Err(refusal(
                 "no such upload",
                 &caller_akid,

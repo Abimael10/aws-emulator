@@ -61,6 +61,11 @@ pub const MAX_REGISTRY_CREDENTIALS: usize = 1_000;
 /// module docs) — so nothing that reads this state reads the secret the caller was handed.
 #[derive(Debug, Clone)]
 pub struct RegistryCredential {
+    /// The Region of the registry the token was issued for: `docker login` credentials are
+    /// obtained per registry, and an Amazon ECR registry is one account's in one Region, so
+    /// a pull presenting this credential addresses that Region's registry when the endpoint
+    /// it dialled names none itself (`crate::state::dialled_registry_region`).
+    pub region: String,
     /// When `GetAuthorizationToken` issued it.
     pub issued_at: SystemTime,
     /// When it stops being honoured: `issued_at` plus the published token lifetime.
@@ -96,6 +101,7 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     pub fn record_registry_credential(
         &mut self,
         password: &str,
+        region: &str,
         issued_at: SystemTime,
         expires_at: SystemTime,
         principal_arn: &str,
@@ -115,6 +121,7 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
         self.registry_credentials.insert(
             registry_credential_key(password),
             RegistryCredential {
+                region: region.to_string(),
                 issued_at,
                 expires_at,
                 principal_arn: principal_arn.to_string(),
@@ -166,6 +173,7 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// time is written down, which is exactly what the exclusion means.
     pub fn record_image_pull(
         &mut self,
+        region: &str,
         repository_name: &str,
         image_digest: &str,
         principal_arn: &str,
@@ -175,8 +183,8 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
             return;
         }
         if let Some(image) = self
-            .repositories
-            .get_mut(repository_name)
+            .repository_mut(region, repository_name)
+            .ok()
             .and_then(|repo| repo.images.get_mut(image_digest))
         {
             image.last_recorded_pull_time = Some(now);

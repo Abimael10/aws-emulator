@@ -192,7 +192,11 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     let caller = caller(engine, ctx);
     // The document the repository SHARES itself with, read before the decision and released
     // again: the gate holds no lock while it reads the IAM and STS stores.
-    let shared = repository_policy(engine, repository_name);
+    let shared = repository_policy(
+        engine,
+        &crate::state::request_region(ctx.parts()),
+        repository_name,
+    );
 
     let request = iam::Request::new(&action, &resource, &caller.principals);
     let identity = iam::identity_decision(&caller.documents, &request);
@@ -257,13 +261,14 @@ pub fn denied_on_repository<Eng: Send + Sync + 'static, E>(
 /// of whether it exists.
 fn repository_policy<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    region: &str,
     repository_name: &str,
 ) -> Option<String> {
     let state = crate::state::service_state(engine)?;
     let store = state.lock();
     store
-        .repositories
-        .get(repository_name)
+        .repository(region, repository_name)
+        .ok()
         .and_then(|repository| repository.policy_text.clone())
 }
 

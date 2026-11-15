@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetLifecyclePolicyPreviewErrorModeled::ServerException(
@@ -254,11 +254,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| crate::state::ANY_TAG_STATUS.to_string());
 
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // The guard is mutable only so the clock-owed IN_PROGRESS -> COMPLETE transition
         // can be written down; nothing else about the preview changes on a read.
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(&region, &input.repository_name)
             .map_err(fault_error)?;
         repo.settle_lifecycle_preview(now);
 

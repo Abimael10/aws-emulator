@@ -49,6 +49,26 @@ pub fn announced_registry_endpoint(
     })
 }
 
+/// The Region of the registry a request to one of this registry's own DATA-PLANE endpoints
+/// DIALLED: the Region named by the `<accountId>.dkr.ecr.<region>.amazonaws.com` endpoint it
+/// was addressed to, read through the one reading of that host this service states
+/// (`super::registry_pull::host_region`), and `None` for an endpoint that names no Region —
+/// this emulator's own socket, which serves every Region's registry.
+///
+/// A data-plane request carries no SigV4 credential scope of its own — a registry client
+/// presents the `docker login` credential as HTTP Basic authorization — so the endpoint it
+/// dialled is what says which Region's registry it addresses, exactly as an image reference
+/// does for an in-process pull (`super::registry_pull::parse_reference`). Where the endpoint
+/// names none, the credential presented does: a `docker login` credential is obtained per
+/// registry (`super::registry_v2::RegistryCredential::region`).
+///
+/// `authority` is the endpoint the request arrived on, host and optional port.
+pub fn dialled_registry_region(authority: &str) -> Option<String> {
+    let authority = authority.to_ascii_lowercase();
+    let host = authority.split(':').next().unwrap_or_default();
+    super::registry_pull::host_region(host)
+}
+
 /// `<registry endpoint>/<name>` — the URI a client pushes to and pulls from, announced at
 /// `registry_endpoint` ([`announced_registry_endpoint`]).
 ///

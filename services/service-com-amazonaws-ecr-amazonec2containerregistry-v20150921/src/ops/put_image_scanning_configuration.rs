@@ -194,17 +194,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // Nothing about this update depends on request metadata: the setting is stored
-        // on a repository that already carries the region of its own creation.
-        let _ = ctx;
+        // The Region the call was signed for names the registry holding the repository
+        // the setting is stored on.
+        let region = crate::state::request_region(ctx.parts());
 
         // `registryId` names the registry holding the repository; this emulator serves
-        // exactly one registry — its own account's.
+        // exactly one registry per Region — its own account's.
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
         let mut store = state.lock();
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(&region, &input.repository_name)
             .map_err(fault_error)?;
 
         // The whole setting is replaced, not merged: `imageScanningConfiguration` is a

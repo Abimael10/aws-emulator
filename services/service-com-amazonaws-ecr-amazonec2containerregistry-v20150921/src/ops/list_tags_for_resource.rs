@@ -162,14 +162,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        // This operation reads nothing out of the request beyond the resource it names.
-        let _ = ctx;
+        // The Region the call was signed for names the registry the ARN is resolved in:
+        // an Amazon ECR registry is one account's in one Region.
+        let region = crate::state::request_region(ctx.parts());
 
         // The ARN says WHICH repository; the store says whether it exists.
         let name = crate::state::repository_name_from_arn(&input.resource_arn)
             .map_err(fault_error)?;
         let store = state.lock();
-        let repository = store.repository(&name).map_err(fault_error)?;
+        let repository = store.repository(&region, &name).map_err(fault_error)?;
 
         // The tags as stored. A repository carrying none reports an empty list rather
         // than omitting the member: "the tags for the resource" is still the answer.

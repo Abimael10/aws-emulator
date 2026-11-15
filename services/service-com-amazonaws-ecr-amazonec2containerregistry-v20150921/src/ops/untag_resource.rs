@@ -174,8 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        // The resource is named by the ARN in the body, so no request metadata is read.
-        let _ = ctx;
+        // The resource is named by the ARN in the body, and the Region the call was
+        // signed for names the registry that ARN is resolved in.
+        let region = crate::state::request_region(ctx.parts());
 
         // A key no caller may name — one in the reserved namespace, or one longer than a
         // tag key may be — is refused before any repository is resolved.
@@ -184,7 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::repository_name_from_arn(&input.resource_arn).map_err(fault_error)?;
 
         let mut store = state.lock();
-        let repo = store.repository_mut(&name).map_err(fault_error)?;
+        let repo = store
+            .repository_mut(&region, &name)
+            .map_err(fault_error)?;
         repo.remove_tag_keys(&input.tag_keys);
 
         Ok(UntagResourceOutput {})

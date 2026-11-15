@@ -35,6 +35,8 @@ mod consumable_resource_updates;
 mod consumable_resources;
 #[path = "all/enum_membership_refusals.rs"]
 mod enum_membership_refusals;
+#[path = "all/fargate_job_definition_contract.rs"]
+mod fargate_job_definition_contract;
 #[path = "all/identifier_and_capacity_rules.rs"]
 mod identifier_and_capacity_rules;
 #[path = "all/job_attempt_records.rs"]

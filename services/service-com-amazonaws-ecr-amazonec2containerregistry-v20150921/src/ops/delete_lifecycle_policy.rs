@@ -185,13 +185,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
         let mut store = state.lock();
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(&region, &input.repository_name)
             .map_err(fault_error)?;
         // `take` is the removal and the report in one step: what comes back is the policy
         // that was in place, and the repository is left carrying none.

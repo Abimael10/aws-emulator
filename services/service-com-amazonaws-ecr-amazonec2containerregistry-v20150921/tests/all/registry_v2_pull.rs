@@ -782,6 +782,7 @@ async fn only_an_honoured_credential_reaches_a_repository() {
     let issued_at = SystemTime::now() - Duration::from_secs(60 * 60 * 24);
     state_handle.lock().record_registry_credential(
         expired_password,
+        crate::wire::REGION,
         issued_at,
         issued_at + Duration::from_secs(60),
         "arn:aws:iam::000000000000:root",

@@ -159,9 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // Nothing here is regional or registry-scoped: the request names only repository
-        // names, and every repository this emulator holds is in its own registry.
-        let _ = ctx;
+        // The request names only repository names, and a name addresses the repository of
+        // that name in the registry of the Region the call was signed for: an Amazon ECR
+        // registry is one account's in one Region.
+        let region = crate::state::request_region(ctx.parts());
 
         let store = state.lock();
 
@@ -172,9 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut scanning_configurations = Vec::with_capacity(input.repository_names.len());
         let mut failures = Vec::new();
         for name in &input.repository_names {
-            match store.repositories.get(name) {
-                Some(repo) => scanning_configurations.push(repo.to_scanning_configuration()),
-                None => failures.push(RepositoryScanningConfigurationFailure {
+            match store.repository(&region, name) {
+                Ok(repo) => scanning_configurations.push(repo.to_scanning_configuration()),
+                Err(_) => failures.push(RepositoryScanningConfigurationFailure {
                     repository_name: Some(name.clone()),
                     failure_code: Some(REPOSITORY_NOT_FOUND_FAILURE.to_string()),
                     failure_reason: Some(REPOSITORY_NOT_FOUND_FAILURE.to_string()),

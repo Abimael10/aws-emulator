@@ -302,6 +302,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let artifact_types = filter.artifact_types.unwrap_or_default();
 
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // The subject is addressed inside one repository, so the repository has to exist
         // before anything can refer to anything: an unknown one is refused with
@@ -309,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // NOT a refusal — this operation models no image-not-found error, and nothing
         // refers to an image that is not there, which is an empty list.
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(&region, &input.repository_name)
             .map_err(fault_error)?;
         // A restore the clock has already made due is written down before the artifacts
         // are reported, so this read reports the status each one was already in.

@@ -227,9 +227,23 @@ pub async fn given_layer(
     repository: &str,
     content: &[u8],
 ) -> String {
-    let opened = ok(
+    given_layer_in_region(router, case, REGION, repository, content).await
+}
+
+/// The same push sequence as [`given_layer`], made against `region`: a repository lives in
+/// the registry of ONE Region, so a suite that created it in another Region pushes its
+/// layers there too.
+pub async fn given_layer_in_region(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    repository: &str,
+    content: &[u8],
+) -> String {
+    let opened = ok_in_region(
         router,
         case,
+        region,
         "InitiateLayerUpload",
         &serde_json::json!({"repositoryName": repository}),
     )
@@ -239,9 +253,10 @@ pub async fn given_layer(
         .unwrap_or_else(|| panic!("case {case:?}: InitiateLayerUpload must hand back an uploadId"))
         .to_string();
     let last = i64::try_from(content.len()).expect("a test layer fits in an i64") - 1;
-    ok(
+    ok_in_region(
         router,
         case,
+        region,
         "UploadLayerPart",
         &serde_json::json!({
             "repositoryName": repository,
@@ -254,9 +269,10 @@ pub async fn given_layer(
         }),
     )
     .await;
-    let completed = ok(
+    let completed = ok_in_region(
         router,
         case,
+        region,
         "CompleteLayerUpload",
         &serde_json::json!({
             "repositoryName": repository,

@@ -87,6 +87,9 @@ const PUBLICATION_LOOKS: usize = 8;
 /// decided anywhere but on the image.
 #[derive(Debug, Clone)]
 pub struct StartedScan {
+    /// The Region of the registry holding that repository: a repository's identity is its
+    /// account, its Region and its name ([`super::repository_key`]).
+    pub region: String,
     /// The repository holding the image the run examines.
     pub repository_name: String,
     /// The content digest of that image's manifest.
@@ -207,11 +210,10 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// are Amazon Inspector's continuous ones, which this registry does not run, so a
     /// registry configured for enhanced scanning starts no basic scan of its own on a push.
     #[must_use]
-    pub fn image_is_scanned_on_push(&self, repository_name: &str) -> bool {
+    pub fn image_is_scanned_on_push(&self, region: &str, repository_name: &str) -> bool {
         if self
-            .repositories
-            .get(repository_name)
-            .is_some_and(super::Repo::scans_on_push)
+            .repository(region, repository_name)
+            .is_ok_and(super::Repo::scans_on_push)
         {
             return true;
         }
@@ -261,6 +263,7 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// run it recorded.
     pub fn start_scan_on_push(
         &mut self,
+        region: &str,
         repository_name: &str,
         digest: &str,
         now: SystemTime,
@@ -268,11 +271,11 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
         // The registry-wide budget spans every repository, so it is read before one
         // repository is borrowed for writing — and so is the standing instruction that
         // decides whether this push is scanned at all.
-        if !self.image_is_scanned_on_push(repository_name) {
+        if !self.image_is_scanned_on_push(region, repository_name) {
             return None;
         }
         let scans_started = self.basic_scans_started_within(super::BASIC_SCAN_INTERVAL, now);
-        let repo = self.repositories.get_mut(repository_name)?;
+        let repo = self.repository_mut(region, repository_name).ok()?;
         let image = repo.images.get(digest)?;
         // An image already scanned inside its window is not scanned again: "a basic image
         // scan can only be started once per 24 hours on an individual image. This limit
@@ -306,6 +309,7 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
         // for the instant that record states and never for a second computation of it.
         let scan = repo.images.get(digest)?.scan.as_ref()?;
         Some(StartedScan {
+            region: region.to_string(),
             repository_name: repository_name.to_string(),
             image_digest: digest.to_string(),
             started_at: scan.started_at,
@@ -326,7 +330,9 @@ pub fn completed_run(
     started: &StartedScan,
     now: SystemTime,
 ) -> Option<ScanCompletion> {
-    let repo = store.repositories.get(&started.repository_name)?;
+    let repo = store
+        .repository(&started.region, &started.repository_name)
+        .ok()?;
     let image = repo.images.get(&started.image_digest)?;
     let scan = image.scan.as_ref()?;
     if scan.started_at != started.started_at || !scan.is_complete(now) {
@@ -430,8 +436,8 @@ fn running_run(
     now: SystemTime,
 ) -> bool {
     store
-        .repositories
-        .get(&started.repository_name)
+        .repository(&started.region, &started.repository_name)
+        .ok()
         .and_then(|repo| repo.images.get(&started.image_digest))
         .and_then(|image| image.scan.as_ref())
         .is_some_and(|scan| scan.started_at == started.started_at && !scan.is_complete(now))

@@ -143,7 +143,9 @@ pub fn registry_image_digest<Eng: Send + Sync + 'static>(
     let reference = ecr_store::registry_pull::parse_reference(&addressed)?;
     let registry = ecr_store::service_state(engine)?;
     let held = registry.lock();
-    let repository = held.repositories.get(&reference.repository_name)?;
+    let repository = held
+        .repository(&reference.region, &reference.repository_name)
+        .ok()?;
     // Whichever way the reference addressed the image: a tag through the repository's own
     // tag index, a digest through the images it holds — so a digest that names nothing
     // pushed resolves to nothing.

@@ -172,16 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         // `registryId` names the registry holding the repository; this emulator serves
-        // exactly one registry — its own account's.
+        // exactly one registry per Region — its own account's.
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
         // A read: the stored record answers it, and nothing in the store changes.
         let store = state.lock();
         let repo = store
-            .repository(&input.repository_name)
+            .repository(&region, &input.repository_name)
             .map_err(fault_error)?;
         let Some(policy_text) = repo.policy_text.clone() else {
             return Err(

@@ -238,8 +238,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
 
-        // Request metadata is used for the audit record only: the upload is held in
-        // this registry's state, not in the signing region.
+        // Request metadata is used for the audit record below; the Region it was signed
+        // for is what names the registry the upload and its repository belong to.
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
         // "If you do not specify a registry, the default registry is assumed" — and the
@@ -247,17 +247,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_registry(input.registry_id.as_ref())
             .map_err(|fault| refusal("another registry", &caller_akid, fault_error(fault)))?;
 
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
         // The blob is registered on a repository, so there has to be one.
         store
-            .repository(&input.repository_name)
+            .repository(&region, &input.repository_name)
             .map_err(|fault| refusal("no such repository", &caller_akid, fault_error(fault)))?;
 
         // An upload id is only valid for the repository it was issued for, so an id this
         // registry never handed out, one opened against another repository, and one a
         // previous completion already closed are the same refusal.
-        let Some(upload) = store.upload_mut(&input.repository_name, &input.upload_id) else {
+        let Some(upload) = store.upload_mut(&region, &input.repository_name, &input.upload_id)
+        else {
             return Err(refusal(
                 "no such upload",
                 &caller_akid,
@@ -324,7 +326,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record of, the completion is refused rather than registering another.
         // See [`crate::state::MAX_LAYERS_PER_REPOSITORY`].
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(&region, &input.repository_name)
             .map_err(|fault| refusal("no such repository", &caller_akid, fault_error(fault)))?;
         if !repo.layer_blobs.contains_key(&digest)
             && repo.layer_blobs.len() >= crate::state::MAX_LAYERS_PER_REPOSITORY

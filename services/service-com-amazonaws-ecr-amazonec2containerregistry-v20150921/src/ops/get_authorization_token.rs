@@ -211,8 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pull time of an image pulled with it is withheld exactly when that principal is
         // excluded from pull time recording.
         let principal_arn = crate::state::authorization::caller(&*self.engine, ctx).arn;
+        // The token is for the registry of the Region the call was made against: an Amazon
+        // ECR registry is one account's in one Region, so a pull presenting this credential
+        // addresses that Region's registry.
         state.lock().record_registry_credential(
             &password,
+            &crate::state::request_region(ctx.parts()),
             issued_at,
             expires_at,
             &principal_arn,

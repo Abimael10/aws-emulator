@@ -176,9 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        // Nothing about tagging depends on request metadata: the resource is named by
-        // the ARN in the body, and this registry's repositories are keyed by name.
-        let _ = ctx;
+        // The resource is named by the ARN in the body, and the Region the call was
+        // signed for names the registry that ARN is resolved in.
+        let region = crate::state::request_region(ctx.parts());
 
         // What the request asks for is refused before any repository is resolved: an
         // unusable key or value is a bad request whether or not the resource exists.
@@ -187,7 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::repository_name_from_arn(&input.resource_arn).map_err(fault_error)?;
 
         let mut store = state.lock();
-        let repo = store.repository_mut(&name).map_err(fault_error)?;
+        let repo = store
+            .repository_mut(&region, &name)
+            .map_err(fault_error)?;
         // The limit is on the tags the resource ends up carrying, so it is checked
         // against what this repository already holds.
         crate::state::check_tag_count(&repo.tags, &input.tags).map_err(fault_error)?;

@@ -253,13 +253,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly one registry — its own account's.
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
+        let region = crate::state::request_region(ctx.parts());
+
         // The repository the policy is for is resolved FIRST: a policy for a repository
         // that does not exist is reported as the missing repository, whatever else is
         // wrong with the document. The store is released again before the document's
         // principals are resolved, which is a call out to IAM.
         state
             .lock()
-            .repository(&input.repository_name)
+            .repository(&region, &input.repository_name)
             .map_err(fault_error)?;
 
         crate::state::validate_resource_policy(
@@ -295,7 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the repository already carries stays as it was.
         if let Some(fault) = crate::state::unresolved_policy_principal(
             ctx,
-            &crate::state::request_region(ctx.parts()),
+            &region,
             &input.policy_text,
         )
         .await
@@ -305,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(&region, &input.repository_name)
             .map_err(fault_error)?;
         // The policy replaces whatever the repository carried: one repository holds one
         // policy, and it is stored in the canonical IAM-policy rendering ECR echoes an

@@ -691,8 +691,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             return download_error(404, "NoSuchKey", DOWNLOAD_NOT_FOUND_MESSAGE);
         }
         let held = store
-            .repositories
-            .get(&grant.repository_name)
+            .repository(&grant.region, &grant.repository_name)
+            .ok()
             .and_then(|repo| repo.layer_blobs.get(&grant.layer_digest));
         let Some(blob) = held else {
             return download_error(404, "NoSuchKey", DOWNLOAD_NOT_FOUND_MESSAGE);

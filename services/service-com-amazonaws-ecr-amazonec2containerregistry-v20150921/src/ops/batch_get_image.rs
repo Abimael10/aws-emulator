@@ -281,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut refusal: Option<BatchGetImageErrorModeled> = None;
         for id in &input.image_ids {
             let held = store
-                .repository(&input.repository_name)
+                .repository(&region, &input.repository_name)
                 .is_ok_and(|repo| repo.lookup_image(id).is_ok());
             if held {
                 continue;
@@ -335,7 +335,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refusal.into());
         }
         let repo = store
-            .repository(&input.repository_name)
+            .repository(&region, &input.repository_name)
             .map_err(fault_error)?;
 
         let mut images = Vec::new();

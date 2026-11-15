@@ -200,9 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_exclusion_filters(&input.image_tag_mutability, &filters)
             .map_err(fault_error)?;
 
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(&region, &input.repository_name)
             .map_err(fault_error)?;
 
         // A put REPLACES the configuration: the setting and the filters this request
@@ -219,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = Self::NAME,
             repository = %repo.name,
             registry_id = %repo.registry_id,
-            region = %crate::state::request_region(ctx.parts()),
+            region = %region,
             previous_image_tag_mutability = %previous,
             image_tag_mutability = %repo.image_tag_mutability,
             exclusion_filters = repo.image_tag_mutability_exclusion_filters.len(),

@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
         // The document's own schema is a parameter constraint, so it is checked before
@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(&region, &input.repository_name)
             .map_err(fault_error)?;
 
         // A put REPLACES the policy. What is stored is the document as ECR reports it:

@@ -173,13 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
         let mut store = state.lock();
         let repo = store
-            .repository(&input.repository_name)
+            .repository(&region, &input.repository_name)
             .map_err(fault_error)?;
 
         // "If true, deleting the repository force deletes the contents of the
@@ -199,7 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The repository the caller gets back is the one that was stored, including the
         // images' own removal: the record and every image in it leaves the store.
-        let removed = store.repositories.remove(&input.repository_name);
+        let removed = store
+            .repositories
+            .remove(&crate::state::repository_key(&region, &input.repository_name));
         let Some(removed) = removed else {
             return Err(DeleteRepositoryErrorModeled::ServerException(ServerException {
                 message: Some(format!(

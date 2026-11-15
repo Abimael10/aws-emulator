@@ -826,8 +826,7 @@ fn seed_findings(
     let state = state::service_state(engine).expect("the ecr store is reachable");
     let mut store = state.lock();
     let image = store
-        .repositories
-        .get_mut(repository)
+        .repository_mut(crate::wire::REGION, repository)
         .expect("the seeded repository was created over the wire")
         .images
         .get_mut(digest)

@@ -264,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = input.repository_name;
         let mut store = state.lock();
 
-        if store.repositories.contains_key(&name) {
+        if store.repositories.contains_key(&crate::state::repository_key(&region, &name)) {
             return Err(
                 CreateRepositoryErrorModeled::RepositoryAlreadyExistsException(
                     RepositoryAlreadyExistsException {
@@ -295,6 +295,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut repo = crate::state::Repo {
             arn: crate::state::repository_arn(&region, &name),
+            // The registry this repository belongs to is this account's IN THIS REGION:
+            // the Region is part of the repository's identity, so it is stored with it
+            // and keys it ([`crate::state::repository_key`]).
+            region: region.clone(),
             registry_id: crate::state::registry_id().to_string(),
             name: name.clone(),
             created_at: now,
@@ -328,7 +332,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let repository =
             repo.to_repository(&crate::state::announced_registry_endpoint(ctx));
-        store.repositories.insert(name, repo);
+        store
+            .repositories
+            .insert(crate::state::repository_key(&region, &name), repo);
 
         Ok(CreateRepositoryOutput {
             repository: Some(repository),

@@ -253,9 +253,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| ANY_IMAGE_STATUS_FILTER.to_string());
 
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(&region, &input.repository_name)
             .map_err(fault_error)?;
         // A restore the clock has already made due is written down before the images are
         // reported, so this read reports the status the image was already in.

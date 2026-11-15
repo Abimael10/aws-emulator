@@ -4907,3 +4907,8 @@ mod appended_notes;
 //! (`//!`) is legal only BEFORE the first item, so these lines are the only place one
 //! may stand — a note written with `//!` further down this file is `E0753` and compiles
 //! nothing, so keep what you have to say about a suite in that suite's own header.
+//! `#[path]` / `mod` pair, keeping the list sorted — nothing else belongs in this file, so
+//! a landing has one place to insert and nothing to keep consistent.
+//! this header is the only place one may stand: past it a `//!` line is `E0753` and
+//! compiles no suite of this target, so a note further down must be an ordinary `//`
+//! comment. `all/all_rs_declares_each_suite_once.rs` and

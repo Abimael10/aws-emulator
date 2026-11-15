@@ -186,13 +186,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
         let store = state.lock();
         let repo = store
-            .repository(&input.repository_name)
+            .repository(&region, &input.repository_name)
             .map_err(fault_error)?;
         let policy = repo.lifecycle_policy.as_ref().ok_or_else(|| {
             fault_error(crate::state::Fault::LifecyclePolicyNotFound(

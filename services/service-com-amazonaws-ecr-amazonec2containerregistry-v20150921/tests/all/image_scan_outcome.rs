@@ -332,8 +332,7 @@ async fn a_run_that_examined_its_image_reports_the_status_whose_findings_are_rea
         let state = state::service_state(&*engine).expect("the ecr store is reachable");
         let mut store = state.lock();
         let image = store
-            .repositories
-            .get_mut(repository)
+            .repository_mut(crate::wire::REGION, repository)
             .expect("the repository was created over the wire")
             .images
             .get_mut(&digest)

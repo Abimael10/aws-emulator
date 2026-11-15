@@ -452,7 +452,7 @@ async fn the_part_past_the_upload_byte_cap_is_refused() {
         let store = state::service_state(&*engine).expect("the ecr store");
         let mut store = store.lock();
         let upload = store
-            .upload_mut(repository_name, &upload_id)
+            .upload_mut(crate::wire::REGION, repository_name, &upload_id)
             .expect("the upload just opened");
         let mut received = Vec::with_capacity(state::MAX_LAYER_UPLOAD_BYTES);
         received.resize(seeded, 0_u8);

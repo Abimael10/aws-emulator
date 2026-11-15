@@ -19,7 +19,9 @@
 //! to `numNodes` ("This node index value must be fewer than the number of nodes"); and
 //! the `ResourceRequirement$value` pairing of `VCPU` with `MEMORY` for a definition that
 //! runs on Fargate, which binds to every container-properties object the same way the
-//! execution role does.
+//! execution role does. The members such a definition may NOT state — the deprecated
+//! `vcpus`/`memory` reservations and the other EC2-only container members — are refused by
+//! the same traversal ([`crate::state::fargate_unsupported_member_refusal`]).
 //!
 //! What IS stored is normalised first: an environment variable stated with an empty value
 //! says nothing about the name it carries, so AWS Batch keeps no such variable and neither
@@ -459,6 +461,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .find_map(|requirements| crate::state::fargate_reservation_refusal(requirements))
             {
+                return Err(client_exception(&detail));
+            }
+        }
+
+        // THE EC2-ONLY MEMBERS: a container that runs on Fargate may not state a member the
+        // model documents as unsupported there — the deprecated `vcpus`/`memory`
+        // reservations ("use resourceRequirements", "not supported for jobs running on
+        // Fargate resources") among them. Like the execution role and the reservation
+        // catalogue above, the rule binds to every container-properties object the
+        // definition carries ([`crate::state::fargate_unsupported_member_refusal`]).
+        if on_fargate {
+            if let Some(detail) = crate::state::fargate_unsupported_member_refusal(
+                input.container_properties.as_ref(),
+                input.node_properties.as_ref(),
+                input.ecs_properties.as_ref(),
+            ) {
                 return Err(client_exception(&detail));
             }
         }

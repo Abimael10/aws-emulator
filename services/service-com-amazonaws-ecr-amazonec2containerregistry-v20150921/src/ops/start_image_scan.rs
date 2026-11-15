@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.basic_scans_started_within(crate::state::BASIC_SCAN_INTERVAL, now);
 
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(&region, &input.repository_name)
             .map_err(fault_error)?;
         let registry_id = repo.registry_id.clone();
         let repository_name = repo.name.clone();
@@ -352,6 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&image_id_digest)
             .and_then(|image| image.scan.as_ref())
             .map(|scan| crate::state::scan_events::StartedScan {
+                region: region.clone(),
                 repository_name: repository_name.clone(),
                 image_digest: image_id_digest.clone(),
                 started_at: scan.started_at,

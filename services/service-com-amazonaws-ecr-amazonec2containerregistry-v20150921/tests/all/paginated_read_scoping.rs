@@ -105,8 +105,7 @@ fn given_push_instant(
     let state = state::service_state(engine).expect("the ecr store is reachable");
     let mut store = state.lock();
     store
-        .repositories
-        .get_mut(repository)
+        .repository_mut(crate::wire::REGION, repository)
         .expect("the repository was created over the wire")
         .images
         .get_mut(digest)

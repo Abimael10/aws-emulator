@@ -214,7 +214,9 @@ pub fn resolve_image_source<Eng: Send + Sync + 'static>(
         return ImageResolution::Unknown;
     };
     let registry = ecr.lock();
-    let Some(repository) = registry.repositories.get(reference.repository) else {
+    // The repository is resolved in the registry of the function's own Region: an Amazon
+    // ECR registry is one account's in one Region.
+    let Ok(repository) = registry.repository(region, reference.repository) else {
         return ImageResolution::Missing;
     };
     // The digest is the registry's own, for whichever way the reference addressed the

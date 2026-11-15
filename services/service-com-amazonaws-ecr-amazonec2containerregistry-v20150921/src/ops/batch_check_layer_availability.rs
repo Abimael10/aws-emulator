@@ -194,9 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         let repo = store
-            .repository(&input.repository_name)
+            .repository(&region, &input.repository_name)
             .map_err(fault_error)?;
         // The repository's blobs, resolved once for the whole batch.
         let held = repo.layers();

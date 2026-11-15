@@ -198,22 +198,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(fault_error)?;
 
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
 
-        // Every requested name must name a repository: ECR refuses the whole call
-        // rather than reporting the ones it could find.
+        // Every requested name must name a repository OF THIS REGION's registry: ECR
+        // refuses the whole call rather than reporting the ones it could find.
         for name in &wanted {
-            store.repository(name).map_err(fault_error)?;
+            store.repository(&region, name).map_err(fault_error)?;
         }
 
-        // Keyed by name, which is the order the store holds them in, so a page boundary
-        // means the same thing on the next call.
+        // Keyed by name, which is the order the store holds one Region's repositories in,
+        // so a page boundary means the same thing on the next call.
         let candidates: Vec<(String, Repository)> = store
-            .repositories
-            .iter()
-            .filter(|(name, _)| wanted.is_empty() || wanted.contains(name))
-            .map(|(name, repo)| {
-                (name.clone(), repo.to_repository(&registry_endpoint))
+            .repositories_in(&region)
+            .filter(|repo| wanted.is_empty() || wanted.contains(&repo.name))
+            .map(|repo| {
+                (
+                    repo.name.clone(),
+                    repo.to_repository(&registry_endpoint),
+                )
             })
             .collect();
 

@@ -228,9 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let to_archive = input.target_storage_class == ARCHIVE_TARGET_STORAGE_CLASS;
 
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(&region, &input.repository_name)
             .map_err(fault_error)?;
         // A restore the clock has already made due is written down first, so a transition
         // decided here starts from the status the image was already in.

@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than the batch maximum, was already refused at the boundary. The store is written
         // under its lock, which the helper below holds for its own body alone: the guard is
         // not `Send`, and the publication that follows is awaited.
-        let (output, removals) = Self::delete_images(&state, &input, now)?;
+        let (output, removals) = Self::delete_images(&state, &input, &region, now)?;
         // One image action per delete this batch really performed, published with the
         // store's lock released, for the reason `PutImage` gives: a rule's target may call
         // back into this service.
@@ -218,6 +218,7 @@ impl<Eng> BatchDeleteImage<Eng> {
             crate::state::ComAmazonawsEcrAmazonec2containerregistryV20150921State,
         >,
         input: &BatchDeleteImageInput,
+        region: &str,
         now: ::std::time::SystemTime,
     ) -> Result<
         (
@@ -228,7 +229,7 @@ impl<Eng> BatchDeleteImage<Eng> {
     > {
         let mut store = state.lock();
         let repo = store
-            .repository_mut(&input.repository_name)
+            .repository_mut(region, &input.repository_name)
             .map_err(fault_error)?;
 
         let mut deleted = Vec::new();

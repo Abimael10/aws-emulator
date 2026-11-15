@@ -534,8 +534,8 @@ async fn the_published_completion_is_read_back_out_of_the_stored_run() {
     let started = {
         let store = state.lock();
         let image = store
-            .repositories
-            .get(row.repository)
+            .repository(crate::wire::REGION, row.repository)
+            .ok()
             .and_then(|repo| repo.images.get(&digest))
             .unwrap_or_else(|| panic!("case {case:?}: the push must have stored the image"));
         let scan = image
@@ -543,6 +543,7 @@ async fn the_published_completion_is_read_back_out_of_the_stored_run() {
             .as_ref()
             .unwrap_or_else(|| panic!("case {case:?}: the push must have started a scan"));
         StartedScan {
+            region: crate::wire::REGION.to_string(),
             repository_name: row.repository.to_string(),
             image_digest: digest.clone(),
             started_at: scan.started_at,
@@ -651,8 +652,8 @@ async fn a_push_announces_only_the_scan_it_starts() {
     let first = {
         let store = state.lock();
         store
-            .repositories
-            .get(row.repository)
+            .repository(crate::wire::REGION, row.repository)
+            .ok()
             .and_then(|repo| repo.images.get(&digest))
             .and_then(|image| image.scan.clone())
             .unwrap_or_else(|| panic!("case {case:?}: the push must have started a scan"))
@@ -661,9 +662,12 @@ async fn a_push_announces_only_the_scan_it_starts() {
     // A push that finds that run STILL GOING starts nothing and announces nothing: the run
     // was armed by the push that started it, and announcing it twice would report one run
     // twice.
-    let while_running = state
-        .lock()
-        .start_scan_on_push(row.repository, &digest, first.started_at);
+    let while_running = state.lock().start_scan_on_push(
+        crate::wire::REGION,
+        row.repository,
+        &digest,
+        first.started_at,
+    );
     assert!(
         while_running.is_none(),
         "case {case:?}: a run still going must not be announced again, got {while_running:?}"
@@ -672,9 +676,12 @@ async fn a_push_announces_only_the_scan_it_starts() {
     // And once that run has FINISHED — polled for, never slept for — a push of the same
     // image still starts no second run inside its window, so it announces nothing either.
     settled_scan(&router, case, row.repository, &digest).await;
-    let after_finishing = state
-        .lock()
-        .start_scan_on_push(row.repository, &digest, first.complete_due_at);
+    let after_finishing = state.lock().start_scan_on_push(
+        crate::wire::REGION,
+        row.repository,
+        &digest,
+        first.complete_due_at,
+    );
     assert!(
         after_finishing.is_none(),
         "case {case:?}: an image already scanned inside its window must not be scanned or \
@@ -682,8 +689,8 @@ async fn a_push_announces_only_the_scan_it_starts() {
     );
     let carried = state
         .lock()
-        .repositories
-        .get(row.repository)
+        .repository(crate::wire::REGION, row.repository)
+        .ok()
         .and_then(|repo| repo.images.get(&digest))
         .and_then(|image| image.scan.clone())
         .unwrap_or_else(|| panic!("case {case:?}: the image must still carry its run"));
@@ -702,9 +709,12 @@ async fn a_push_announces_only_the_scan_it_starts() {
         tag: Some("v1"),
     };
     let other_digest = given_pushed_image(&router, &unscanned).await;
-    let nothing = state
-        .lock()
-        .start_scan_on_push(unscanned.repository, &other_digest, first.complete_due_at);
+    let nothing = state.lock().start_scan_on_push(
+        crate::wire::REGION,
+        unscanned.repository,
+        &other_digest,
+        first.complete_due_at,
+    );
     assert!(
         nothing.is_none(),
         "case {case:?}: a repository that is not scanned on push announces nothing, got \

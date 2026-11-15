@@ -174,7 +174,7 @@ pub fn serve_pull<Eng: Send + Sync + 'static>(
     };
     let mut store = state.lock();
     let identifier = reference.identifier();
-    if let Some(repository) = store.repositories.get(&reference.repository_name) {
+    if let Ok(repository) = store.repository(&reference.region, &reference.repository_name) {
         if repository.lookup_image(&identifier).is_ok() {
             return Ok(());
         }
@@ -265,13 +265,13 @@ fn not_found_message(
     reference: &RegistryReference,
 ) -> String {
     let identifier = reference.identifier();
-    match store.repositories.get(&reference.repository_name) {
-        None => repository_not_found_message(&reference.repository_name),
+    match store.repository(&reference.region, &reference.repository_name) {
+        Err(_) => repository_not_found_message(&reference.repository_name),
         // Only reached for a reference the resolution above did NOT answer, so the
         // resolution here is what words why. A repository that resolves it after all is
         // worded as this registry words an identifier that names no image of it, so no
         // branch reports anything but a sentence.
-        Some(repository) => repository.resolve_image(&identifier).err().map_or_else(
+        Ok(repository) => repository.resolve_image(&identifier).err().map_or_else(
             || not_within_repository("image", &repository.name, &repository.registry_id),
             |fault| fault.message().to_string(),
         ),
@@ -313,8 +313,8 @@ fn withheld_pull<Eng: Send + Sync + 'static>(
     let shared = service_state(engine).and_then(|state| {
         let store = state.lock();
         store
-            .repositories
-            .get(&reference.repository_name)
+            .repository(&reference.region, &reference.repository_name)
+            .ok()
             .and_then(|repository| repository.policy_text.clone())
     });
     // Every spelling a repository policy may name this role by: the role itself and the
@@ -422,8 +422,8 @@ pub fn service_pull_denied_by_repository_policy<Eng: Send + Sync + 'static>(
     let document = service_state(engine).and_then(|state| {
         let store = state.lock();
         store
-            .repositories
-            .get(repository_name)
+            .repository(region, repository_name)
+            .ok()
             .and_then(|repository| repository.policy_text.clone())
     })?;
     let principals = [principal.to_string()];
@@ -517,15 +517,15 @@ pub fn import_covered_image(
         return CacheImport::Unavailable(reason);
     }
     let upstream = upstream_reference(&rule, repository_name, tag);
-    match store.repositories.get(repository_name) {
+    match store.repository(region, repository_name) {
         // A cached copy the registry has no room for is not cached at all.
-        None if store.repositories.len() >= MAX_REPOSITORIES => {
+        Err(_) if store.repositories.len() >= MAX_REPOSITORIES => {
             return CacheImport::AtCapacity(format!(
                 "this registry already holds the maximum of {MAX_REPOSITORIES} repositories, \
                  so no cache repository is created for '{repository_name}'"
             ))
         }
-        Some(repository)
+        Ok(repository)
             if repository.images.len() >= MAX_IMAGES_PER_REPOSITORY
                 || repository.tag_index.len() >= MAX_TAGS_PER_REPOSITORY
                 || repository.layer_blobs.len() >= MAX_IMPORTED_BLOBS_PER_REPOSITORY =>
@@ -542,7 +542,7 @@ pub fn import_covered_image(
     let config_digest = content_digest(config.as_bytes());
     let repository = store
         .repositories
-        .entry(repository_name.to_string())
+        .entry(repository_key(region, repository_name))
         .or_insert_with(|| cache_repository(region, repository_name, now));
     // The configuration document the imported manifest describes is held as the blob it
     // describes, under the digest of its own bytes, so the manifest references nothing the
@@ -625,6 +625,7 @@ fn upstream_reference(rule: &PullThroughCacheRule, repository_name: &str, tag: &
 fn cache_repository(region: &str, name: &str, now: SystemTime) -> Repo {
     Repo {
         arn: repository_arn(region, name),
+        region: region.to_string(),
         registry_id: registry_id().to_string(),
         name: name.to_string(),
         created_at: now,
@@ -872,8 +873,7 @@ mod tests {
         // The repository at its blob cap: a further pull is the one this bound is about, a
         // client asking for tag after tag.
         let repository = store
-            .repositories
-            .get_mut(repository_name)
+            .repository_mut("us-east-1", repository_name)
             .expect("the cached repository");
         for index in 0..MAX_IMPORTED_BLOBS_PER_REPOSITORY {
             let digest = format!("sha256:{index:064x}");
@@ -903,8 +903,7 @@ mod tests {
             "case {case:?}: expected no image to be cached"
         );
         let repository = store
-            .repositories
-            .get(repository_name)
+            .repository("us-east-1", repository_name)
             .expect("the cached repository");
         let after = (
             repository.layer_blobs.len(),

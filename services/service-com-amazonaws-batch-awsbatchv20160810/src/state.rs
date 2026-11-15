@@ -74,12 +74,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod array_jobs;
+mod fargate;
 mod input_rules;
 mod job_definition_projection;
 mod job_logs;
 mod placement;
 
 pub use array_jobs::*;
+pub use fargate::*;
 pub use input_rules::*;
 pub use job_definition_projection::*;
 pub use job_logs::*;

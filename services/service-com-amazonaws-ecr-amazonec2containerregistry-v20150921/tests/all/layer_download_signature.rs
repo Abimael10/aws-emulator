@@ -28,7 +28,9 @@ use serde_json::json;
 use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::{state, EmulatedService};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{emulator_with_engine, given_layer, ok, ok_in_region, REGION};
+use crate::wire::{
+    emulator_with_engine, given_layer, given_layer_in_region, ok, ok_in_region, REGION,
+};
 
 /// The path space this registry publishes layer downloads under
 /// (`state::LAYER_DOWNLOAD_PATH_PREFIX`), spelled out here so a change to it has to be
@@ -238,7 +240,7 @@ async fn every_announced_download_url_is_presigned() {
             &json!({"repositoryName": repository}),
         )
         .await;
-        let digest = given_layer(&router, case, repository, &content).await;
+        let digest = given_layer_in_region(&router, case, region, repository, &content).await;
         let answer = ok_in_region(
             &router,
             case,

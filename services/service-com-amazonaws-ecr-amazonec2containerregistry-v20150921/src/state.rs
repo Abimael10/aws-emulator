@@ -1011,6 +1011,10 @@ pub const MAX_LAYERS_PER_REPOSITORY: usize = 10_000;
 /// client was told to send, when it was opened — plus the layer bytes received so far.
 #[derive(Debug, Clone)]
 pub struct LayerUpload {
+    /// The Region of the registry the upload was opened against: a repository's identity
+    /// is its account, its Region and its name ([`repository_key`]), so an upload id issued
+    /// for one Region's repository is not valid for another's of the same name.
+    pub region: String,
     /// The repository the upload was opened against. An upload id is only valid for
     /// the repository it was issued for, so every later call names both.
     pub repository_name: String,
@@ -1146,6 +1150,10 @@ pub const MAX_LAYER_DOWNLOAD_GRANTS: usize = 10_000;
 /// capabilities over one copy of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerDownloadGrant {
+    /// The Region of the registry whose repository this grant serves: a repository's
+    /// identity is its account, its Region and its name ([`repository_key`]), so a grant
+    /// names the Region too.
+    pub region: String,
     /// The repository whose blob this grant serves. A blob is per-repository, so the
     /// grant names the repository as well as the digest.
     pub repository_name: String,
@@ -1162,8 +1170,14 @@ pub struct LayerDownloadGrant {
 impl LayerDownloadGrant {
     /// The grant for one layer of one repository, minted at `now` and valid from then for
     /// [`LAYER_DOWNLOAD_URL_TTL`].
-    pub fn issued(repository_name: &str, layer_digest: &str, now: SystemTime) -> Self {
+    pub fn issued(
+        region: &str,
+        repository_name: &str,
+        layer_digest: &str,
+        now: SystemTime,
+    ) -> Self {
         Self {
+            region: region.to_string(),
             repository_name: repository_name.to_string(),
             layer_digest: layer_digest.to_string(),
             issued_at: now,
@@ -2089,6 +2103,16 @@ pub fn evaluate_lifecycle_policy(
 #[derive(Debug, Clone)]
 pub struct Repo {
     pub name: String,
+    /// The Region of the registry that holds this repository, which is the Region the
+    /// create was addressed to.
+    ///
+    /// An Amazon ECR registry is one account's IN ONE REGION, and a repository's identity
+    /// is the `(account, Region, name)` triple its ARN and its pull URI name: a name taken
+    /// in one Region is free in another, and only a request addressed to this Region's
+    /// endpoint reaches this repository. Kept on the record as well as in the key
+    /// ([`repository_key`]) so anything holding a `&Repo` knows which registry it came
+    /// from.
+    pub region: String,
     pub registry_id: String,
     pub arn: String,
     pub created_at: SystemTime,
@@ -2735,9 +2759,11 @@ const ACCOUNT_ID_LEN: usize = 12;
 /// Per-service state for com-amazonaws-ecr-amazonec2containerregistry-v20150921. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
-    /// Repositories by name. A `BTreeMap` so every listing — and therefore every
-    /// pagination token — has one deterministic order.
-    pub repositories: BTreeMap<String, Repo>,
+    /// Repositories by the `(Region, name)` pair that identifies one ([`repository_key`]).
+    /// A `BTreeMap` so every listing — and therefore every pagination token — has one
+    /// deterministic order, and the pair orders by Region then name, so one Region's
+    /// repositories are a contiguous run of it.
+    pub repositories: BTreeMap<(String, String), Repo>,
     /// This registry's pull through cache rules, by `ecrRepositoryPrefix` — the key AWS
     /// addresses a rule by, as [`normalize_prefix`] spells it. `CreatePullThroughCacheRule`
     /// is the only operation that adds one; `UpdatePullThroughCacheRule`,
@@ -2818,18 +2844,30 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
 }
 
 impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
-    /// The repository `name`, or [`Fault::RepositoryNotFound`].
-    pub fn repository(&self, name: &str) -> Result<&Repo, Fault> {
+    /// The repository `name` of the registry in `region`, or [`Fault::RepositoryNotFound`].
+    pub fn repository(&self, region: &str, name: &str) -> Result<&Repo, Fault> {
         self.repositories
-            .get(name)
+            .get(&repository_key(region, name))
             .ok_or_else(|| Fault::RepositoryNotFound(repository_not_found_message(name)))
     }
 
-    /// The repository `name` for mutation, or [`Fault::RepositoryNotFound`].
-    pub fn repository_mut(&mut self, name: &str) -> Result<&mut Repo, Fault> {
+    /// The repository `name` of the registry in `region`, for mutation, or
+    /// [`Fault::RepositoryNotFound`].
+    pub fn repository_mut(&mut self, region: &str, name: &str) -> Result<&mut Repo, Fault> {
         self.repositories
-            .get_mut(name)
+            .get_mut(&repository_key(region, name))
             .ok_or_else(|| Fault::RepositoryNotFound(repository_not_found_message(name)))
+    }
+
+    /// Every repository the registry in `region` holds, in name order.
+    ///
+    /// What a read addressed to one Region's endpoint can see: a repository of another
+    /// Region's registry is not in that registry at all, so no read of it reports one.
+    pub fn repositories_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Repo> + 'a {
+        self.repositories
+            .iter()
+            .filter(move |((held, _), _)| held == region)
+            .map(|(_, repo)| repo)
     }
 
     /// The in-flight upload `upload_id` addresses, for mutation, or `None` when this
@@ -2839,12 +2877,13 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// be found, or the specified upload ID is not valid for this repository").
     pub fn upload_mut(
         &mut self,
+        region: &str,
         repository_name: &str,
         upload_id: &str,
     ) -> Option<&mut LayerUpload> {
         self.uploads
             .get_mut(upload_id)
-            .filter(|upload| upload.repository_name == repository_name)
+            .filter(|upload| upload.region == region && upload.repository_name == repository_name)
     }
 
     /// Drop every layer download grant whose window has closed as of `now`.
@@ -2868,6 +2907,7 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// how many it has ever asked for.
     pub fn issue_layer_download_grant(
         &mut self,
+        region: &str,
         repository_name: &str,
         layer_digest: &str,
         now: SystemTime,
@@ -2876,7 +2916,7 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
         if self.layer_download_grants.len() >= MAX_LAYER_DOWNLOAD_GRANTS {
             return None;
         }
-        let grant = LayerDownloadGrant::issued(repository_name, layer_digest, now);
+        let grant = LayerDownloadGrant::issued(region, repository_name, layer_digest, now);
         let token = mint_hex(LAYER_DOWNLOAD_TOKEN_BYTES);
         self.layer_download_grants
             .insert(token.clone(), grant.clone());
@@ -3581,6 +3621,18 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// `arn:aws:ecr:<region>:<registry id>:repository/<name>`.
 pub fn repository_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("ecr", region, &format!("repository/{name}"))
+}
+
+/// How the store keys one repository: the Region of the registry holding it, then its
+/// name.
+///
+/// An Amazon ECR registry is one account's in ONE Region — the Region is in a repository's
+/// ARN and in its pull URI — so the pair is what identifies a repository and what a
+/// collision is judged on: `CreateRepository` for a name another Region already holds
+/// creates a repository, and a read addressed to one Region sees only that Region's.
+/// This emulator serves exactly one account ([`registry_id`]), so the account is implied.
+pub fn repository_key(region: &str, name: &str) -> (String, String) {
+    (region.to_string(), name.to_string())
 }
 
 

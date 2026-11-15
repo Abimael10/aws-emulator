@@ -246,8 +246,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: the store is locked immutably, so reporting a scan cannot change what a
         // later caller sees.
         let store = state.lock();
+        let region = crate::state::request_region(ctx.parts());
         let repo = store
-            .repository(&input.repository_name)
+            .repository(&region, &input.repository_name)
             .map_err(fault_error)?;
         let stored = repo.resolve_image(&input.image_id).map_err(fault_error)?;
 

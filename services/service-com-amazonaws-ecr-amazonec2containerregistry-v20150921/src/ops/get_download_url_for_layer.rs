@@ -254,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A layer belongs to a repository, so there has to be one.
         let repo = store
-            .repository(&input.repository_name)
+            .repository(&region, &input.repository_name)
             .map_err(|fault| refusal("no such repository", &caller_akid, fault_error(fault)))?;
 
         // A download is of content this repository HOLDS: blobs are per-repository, so a
@@ -283,6 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation is for — "retrieves the pre-signed Amazon S3 download URL" — so no
         // repository, image or layer a later caller reads is touched.
         let Some((token, grant)) = store.issue_layer_download_grant(
+            &region,
             &input.repository_name,
             &input.layer_digest,
             now,

@@ -101,6 +101,8 @@ mod published_registry_address;
 mod refusal_message_sources;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/registry_is_region_scoped.rs"]
+mod registry_is_region_scoped;
 #[path = "all/registry_policy.rs"]
 mod registry_policy;
 #[path = "all/registry_replication_configuration.rs"]
