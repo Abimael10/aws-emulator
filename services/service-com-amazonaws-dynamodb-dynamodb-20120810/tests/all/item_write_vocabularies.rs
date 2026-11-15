@@ -889,13 +889,15 @@ async fn partiql_dml_and_the_classic_api_share_one_item_store() {
     )
     .await;
     assert_eq!(
-        status, 400,
-        "case DELETE of an absent item: expected HTTP 400, got {status} {body}"
+        status, 200,
+        "case DELETE of an absent item: a delete addressed by key is idempotent, so \
+         expected HTTP 200, got {status} {body}"
     );
     assert_eq!(
-        error_code(&body),
-        "ConditionalCheckFailedException",
-        "case DELETE of an absent item: expected ConditionalCheckFailedException, got {body}"
+        body,
+        json!({"Items": []}),
+        "case DELETE of an absent item: nothing was removed, so no image is reported, got \
+         {body}"
     );
     let (status, body) = call(
         &router,

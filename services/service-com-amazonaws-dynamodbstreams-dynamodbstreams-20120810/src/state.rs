@@ -970,6 +970,16 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
         }
     }
 
+    /// A new shard, opened at the position the stream's counter stands at.
+    ///
+    /// The shard's `StartingSequenceNumber` is the position the shard OPENS at, and it is
+    /// consumed by the shard itself: a record's `SequenceNumber` sorts strictly after the
+    /// starting sequence number of the shard that carries it, because the range a shard
+    /// advertises opens BEFORE its first record ("The starting sequence number for the
+    /// stream records contained within a shard" — `SequenceNumberRange`). That is what lets
+    /// a consumer check a record off against the shard's own bounds and resume strictly
+    /// after a checkpoint; a record sharing the shard's opening number would order with it
+    /// instead.
     fn new_shard(
         &mut self,
         stream_arn: &str,
@@ -978,10 +988,12 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
     ) -> StoredShard {
         let ordinal = self.next_shard_ordinal;
         self.next_shard_ordinal += 1;
+        let opens_at = self.next_sequence_number;
+        self.next_sequence_number += 1;
         StoredShard {
             shard_id: shard_id(stream_arn, ordinal, at),
             parent_shard_id,
-            starting_sequence_number: format_sequence_number(self.next_sequence_number),
+            starting_sequence_number: format_sequence_number(opens_at),
             ending_sequence_number: None,
             records: VecDeque::new(),
             trimmed: 0,

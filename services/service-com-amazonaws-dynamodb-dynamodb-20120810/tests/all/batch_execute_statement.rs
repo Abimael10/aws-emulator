@@ -312,11 +312,21 @@ fn write_table() -> Vec<WriteRow> {
             stored: None,
         },
         WriteRow {
+            // A delete addressed by KEY is idempotent, so a slot that removes nothing is
+            // a served slot rather than a failed condition; what the clause states
+            // BESIDES the key is still a condition, which the next row covers.
             case: "DELETE of a key nothing holds",
             statement: "DELETE FROM stock WHERE pk = 'vanished'",
-            code: Some("ConditionalCheckFailed"),
+            code: None,
             key: "vanished",
             stored: None,
+        },
+        WriteRow {
+            case: "DELETE whose non-key predicate the stored item does not satisfy",
+            statement: "DELETE FROM stock WHERE pk = 'guarded' AND count = 77",
+            code: Some("ConditionalCheckFailed"),
+            key: "guarded",
+            stored: Some(json!({"pk": {"S": "guarded"}, "count": {"N": "4"}})),
         },
         WriteRow {
             case: "UPDATE whose REMOVE clause drops an attribute",
@@ -336,6 +346,7 @@ async fn every_write_statement_lands_in_the_store_and_reports_into_its_own_slot(
         json!({"pk": {"S": "held"}, "count": {"N": "1"}}),
         json!({"pk": {"S": "kept"}, "count": {"N": "0"}}),
         json!({"pk": {"S": "doomed"}, "count": {"N": "2"}}),
+        json!({"pk": {"S": "guarded"}, "count": {"N": "4"}}),
         json!({"pk": {"S": "noted"}, "count": {"N": "3"}, "note": {"S": "drop me"}}),
     ] {
         ok(&router, "PutItem", json!({"TableName": "stock", "Item": item})).await;

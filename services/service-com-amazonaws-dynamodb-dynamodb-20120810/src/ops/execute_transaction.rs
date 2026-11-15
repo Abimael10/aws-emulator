@@ -802,10 +802,13 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                 }
             }
             crate::state::PartiqlStatement::Delete(delete) => {
-                let condition = crate::state::parsed_condition(&delete.filter).map_err(lift)?;
-                let key = {
+                let (key, condition) = {
                     let table = store.active_table(region, &name, now).map_err(lift)?;
-                    crate::state::singleton_key(table, &delete.filter).map_err(lift)?
+                    (
+                        crate::state::singleton_key(table, &delete.filter).map_err(lift)?,
+                        crate::state::parsed_delete_condition(table, &delete.filter)
+                            .map_err(lift)?,
+                    )
                 };
                 let before = store
                     .active_table(region, &name, now)
@@ -813,12 +816,16 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     .items
                     .get(&key)
                     .cloned();
-                let satisfied = before
+                // See [`crate::ops::execute_statement`]: the key the clause pins
+                // ADDRESSES the item, so only what the clause states besides it is the
+                // condition this delete is held to — read against the item as it stands,
+                // no item included.
+                let satisfied = condition
                     .as_ref()
-                    .map(|item| condition.evaluate(Some(item)))
+                    .map(|condition| condition.evaluate(before.as_ref()))
                     .transpose()
                     .map_err(lift)?
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 // A delete removes every attribute of the item, so the `MODIFIED OLD`
                 // projection of what it changed IS the item as it stood — both OLD forms
                 // report that item.

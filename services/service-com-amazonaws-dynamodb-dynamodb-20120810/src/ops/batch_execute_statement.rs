@@ -796,21 +796,26 @@ fn delete_item(
     requested_capacity: Option<&str>,
     return_old_on_failure: bool,
 ) -> Result<SlotOutcome, SlotFailure> {
-    let condition = crate::state::parsed_condition(&delete.filter)?;
-    let key = {
+    let (key, condition) = {
         let table = store.active_table(region, name, now)?;
-        crate::state::singleton_key(table, &delete.filter)?
+        (
+            crate::state::singleton_key(table, &delete.filter)?,
+            crate::state::parsed_delete_condition(table, &delete.filter)?,
+        )
     };
     let before = store
         .active_table(region, name, now)?
         .items
         .get(&key)
         .cloned();
-    let satisfied = before
+    // See [`crate::ops::execute_statement`]: the key the clause pins ADDRESSES the item,
+    // so only what the clause states besides it is the condition this delete is held to —
+    // read against the item as it stands, no item included.
+    let satisfied = condition
         .as_ref()
-        .map(|item| condition.evaluate(Some(item)))
+        .map(|condition| condition.evaluate(before.as_ref()))
         .transpose()?
-        .unwrap_or(false);
+        .unwrap_or(true);
     if !satisfied {
         // See [`update_item`]: the refused slot writes nothing and is metered all the same
         // ([`crate::state::charge_refused_conditional_write`]).

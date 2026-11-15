@@ -229,7 +229,10 @@ async fn a_table_name_the_ttl_reader_cannot_address_is_refused_as_the_table_read
             "an ARN naming another resource type",
             format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:backup/{present}"),
             "ValidationException",
-            format!("Invalid resource type in 'arn:aws:dynamodb:{REGION}:{ACCOUNT}:backup/{present}'"),
+            format!(
+                "Value 'arn:aws:dynamodb:{REGION}:{ACCOUNT}:backup/{present}' at \
+                 'tableName' failed to satisfy constraint: Invalid resource type"
+            ),
         ),
         (
             "an index sub-resource ARN",

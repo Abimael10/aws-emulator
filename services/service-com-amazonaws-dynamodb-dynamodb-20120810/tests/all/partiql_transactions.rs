@@ -136,9 +136,9 @@ struct CancelRow {
 
 /// The rows differ in HOW one statement fails (a key an `INSERT` would replace, an
 /// `UPDATE` of a key holding no item, a further predicate the stored item does not
-/// satisfy, a `DELETE` of a key holding no item), in WHICH position in the list fails,
-/// in which of the two tables that statement addresses, and in how many statements the
-/// transaction carries.
+/// satisfy, a `DELETE` whose further predicate it does not satisfy), in WHICH position in
+/// the list fails, in which of the two tables that statement addresses, and in how many
+/// statements the transaction carries.
 fn cancel_table() -> Vec<CancelRow> {
     vec![
         CancelRow {
@@ -167,14 +167,19 @@ fn cancel_table() -> Vec<CancelRow> {
             codes: vec!["None", "ConditionalCheckFailed", "None"],
         },
         CancelRow {
-            case: "a DELETE of a key that holds no item, alone",
-            statements: vec![statement("DELETE FROM audit WHERE id = 'absent'")],
+            // A delete addressed by KEY is idempotent, so a key that holds no item
+            // cancels nothing; what the clause states BESIDES the key is the condition,
+            // and that is what a cancelled delete fails on.
+            case: "a DELETE whose non-key predicate the stored item does not satisfy, alone",
+            statements: vec![statement(
+                "DELETE FROM audit WHERE id = 'e1' AND note = 'closed'",
+            )],
             codes: vec!["ConditionalCheckFailed"],
         },
         CancelRow {
             case: "two statements that both fail, in two tables",
             statements: vec![
-                statement("DELETE FROM accounts WHERE id = 'absent'"),
+                statement("DELETE FROM accounts WHERE id = 'a1' AND balance = 999"),
                 statement("INSERT INTO audit VALUE {'id': 'e1', 'note': 'replaced'}"),
             ],
             codes: vec!["ConditionalCheckFailed", "ConditionalCheckFailed"],

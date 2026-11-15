@@ -585,8 +585,8 @@ pub fn policy_revision_mismatch_message(
 /// nothing of the document or the resource it was offered for.
 pub fn policy_too_large_message() -> String {
     format!(
-        "One or more parameter values were invalid: Policy size exceeds the maximum allowed \
-         size of {MAX_RESOURCE_POLICY_BYTES} bytes"
+        "One or more parameter values were invalid: Maximum policy size of \
+         {MAX_RESOURCE_POLICY_BYTES} bytes exceeded"
     )
 }
 

@@ -187,6 +187,8 @@ mod partiql_query_expression_continuation;
 mod partiql_query_form_parse_defects;
 #[path = "all/partiql_refusal_wording.rs"]
 mod partiql_refusal_wording;
+#[path = "all/partiql_returned_images.rs"]
+mod partiql_returned_images;
 #[path = "all/partiql_statement_boundaries.rs"]
 mod partiql_statement_boundaries;
 #[path = "all/partiql_statement_defect_classes.rs"]
@@ -251,6 +253,8 @@ mod resource_policy_principal_admission;
 mod resource_policy_principal_unique_ids;
 #[path = "all/resource_policy_revision_tokens.rs"]
 mod resource_policy_revision_tokens;
+#[path = "all/resource_policy_size_bound.rs"]
+mod resource_policy_size_bound;
 #[path = "all/resource_policy_stored_version_round_trip.rs"]
 mod resource_policy_stored_version_round_trip;
 #[path = "all/response_request_id.rs"]

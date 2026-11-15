@@ -31,6 +31,8 @@ mod sequence_number_positions;
 mod service_enforced_parameter_bounds;
 #[path = "all/shard_page_cursor.rs"]
 mod shard_page_cursor;
+#[path = "all/shard_sequence_bounds.rs"]
+mod shard_sequence_bounds;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_consumer.rs"]

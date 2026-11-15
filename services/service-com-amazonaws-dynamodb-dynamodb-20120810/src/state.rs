@@ -3718,12 +3718,17 @@ pub const TABLE_NAME_MEMBER_PATH: &str = "tableName";
 const TABLE_RESOURCE_TYPE: &str = "table";
 
 /// The refusal an ARN of this service that names a resource of ANOTHER KIND earns: the
-/// type is what is wrong with the value, so the clause states that over the ARN the
-/// request sent, with no member path and no constraint — this is the service's own ARN
-/// reader rather than a bound on the member.
-fn invalid_resource_type(arn: &str) -> RequestError {
-    refused(format!("Invalid resource type in '{arn}'"))
+/// TYPE is what is wrong with the value, so the requirement the clause states is that —
+/// reported, like every other way this member refuses a value, as the member it came in,
+/// the value the request sent and the constraint that value broke ([`invalid_member`]).
+fn invalid_resource_type(member: &str, arn: &str) -> RequestError {
+    invalid_member(member, Some(arn), INVALID_RESOURCE_TYPE_REQUIREMENT)
 }
+
+/// The requirement phrase an ARN naming a resource of another kind fails: fixed text,
+/// stating the FIELD of the ARN that is wrong rather than any form the value should have
+/// taken — the resource type is wrong whatever the rest of the ARN says.
+const INVALID_RESOURCE_TYPE_REQUIREMENT: &str = "Invalid resource type";
 
 /// The `TableName` member accepts a bare table name or the table's ARN ("You can
 /// also provide the Amazon Resource Name (ARN) of the table in this parameter" —
@@ -3794,7 +3799,7 @@ pub fn resolve_table_name_of(member: &str, table_name: &str) -> Result<String, R
                 None => (*resource, ""),
             };
             if resource_type != TABLE_RESOURCE_TYPE {
-                return Err(invalid_resource_type(table_name));
+                return Err(invalid_resource_type(member, table_name));
             }
             // The resource NAME of a table's ARN is the table name, so it is held to
             // the table name's own form — and a value spelled as an ARN that breaks it

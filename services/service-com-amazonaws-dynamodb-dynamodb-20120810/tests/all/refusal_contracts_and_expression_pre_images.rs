@@ -1078,8 +1078,11 @@ async fn a_table_is_addressed_by_its_arn_wherever_a_name_does() {
         .await;
         assert_eq!(
             stated,
-            format!("1 validation error detected: Invalid resource type in '{case}'"),
-            "case {case:?}: expected the resource-type sentence, got {stated:?}"
+            format!(
+                "1 validation error detected: Value '{case}' at 'tableName' failed to \
+                 satisfy constraint: Invalid resource type"
+            ),
+            "case {case:?}: expected the resource-type constraint clause, got {stated:?}"
         );
     }
 

@@ -2615,6 +2615,68 @@ pub fn parsed_condition(predicate: &Predicate) -> Result<ParsedCondition, Reques
     )
 }
 
+/// The CONDITION a `DELETE`'s `WHERE` clause states: everything in that clause EXCEPT
+/// the equalities that address the item, or `None` when it states nothing else.
+///
+/// A single-item delete is addressed BY ITS PRIMARY KEY: the equalities on the key
+/// attributes say which item the statement is about, not what must hold of that item, so
+/// they are not part of the condition the delete is held to. What is left is that
+/// condition, and it is evaluated against the item as it stands — including against NO
+/// item, which is the one state a key that holds nothing can be in. That is what makes a
+/// delete addressed by key idempotent ("Unless you specify conditions, the DeleteItem is
+/// an idempotent operation; running it multiple times on the same item or attribute does
+/// not result in an error response" — the `DeleteItem` doc): a key holding no item is
+/// nothing to remove rather than a condition that failed, and the statement reports no
+/// image because it removed none.
+///
+/// Only the equalities the TOP-LEVEL conjunction states are addressing, exactly as
+/// [`pinned_equalities`] reads them — a term inside an `OR` requires nothing, so it stays
+/// part of the condition.
+pub fn parsed_delete_condition(
+    table: &Table,
+    predicate: &Predicate,
+) -> Result<Option<ParsedCondition>, RequestError> {
+    let addressing: Vec<&str> = table
+        .key_schema
+        .iter()
+        .map(|element| element.attribute_name.as_str())
+        .collect();
+    without_addressing(predicate, &addressing)
+        .as_ref()
+        .map(parsed_condition)
+        .transpose()
+}
+
+/// `predicate` with the top-level equalities on the attributes in `addressing` dropped,
+/// or `None` when that leaves nothing: those terms ADDRESS the item rather than state a
+/// condition on it ([`parsed_delete_condition`]).
+///
+/// The walk descends only into the conjunctions the PARSE produced, and the parser has
+/// already held the statement's nesting to [`MAX_STATEMENT_DEPTH`], so how deep this
+/// recurses is bounded by that ceiling rather than by whatever a caller sent.
+fn without_addressing(predicate: &Predicate, addressing: &[&str]) -> Option<Predicate> {
+    match predicate {
+        Predicate::All(branches) => {
+            let mut kept: Vec<Predicate> = branches
+                .iter()
+                .filter_map(|branch| without_addressing(branch, addressing))
+                .collect();
+            match kept.len() {
+                0 => None,
+                1 => kept.pop(),
+                _ => Some(Predicate::All(kept)),
+            }
+        }
+        Predicate::Compare(left, CompareOp::Equal, right) => {
+            match equality(left, right) {
+                Some((attribute, _)) if addressing.contains(&attribute.as_str()) => None,
+                _ => Some(predicate.clone()),
+            }
+        }
+        other => Some(other.clone()),
+    }
+}
+
 /// The statement's `SET`/`REMOVE` clauses as the parsed `UpdateExpression` the item
 /// API applies, so one implementation decides what each action does to an item.
 pub fn parsed_update(clauses: &[UpdateClause]) -> Result<ParsedUpdate, RequestError> {

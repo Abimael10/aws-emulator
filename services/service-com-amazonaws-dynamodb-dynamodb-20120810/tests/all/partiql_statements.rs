@@ -981,8 +981,11 @@ fn refusal_table() -> Vec<RefusalRow> {
             code: "ConditionalCheckFailedException",
         },
         RefusalRow {
-            case: "a DELETE of a key that holds no item",
-            statement: "DELETE FROM items WHERE pk = 'absent'",
+            // A delete addressed by KEY is idempotent, so a key that holds no item is
+            // not a refusal at all (`partiql_returned_images`); what the CONDITION
+            // beside the key states is still held to the stored item.
+            case: "a DELETE whose non-key predicate the stored item does not satisfy",
+            statement: "DELETE FROM items WHERE pk = 'r' AND n = 99",
             parameters: Value::Null,
             code: "ConditionalCheckFailedException",
         },

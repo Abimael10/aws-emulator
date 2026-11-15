@@ -27,7 +27,8 @@
 //!    more parameter values were invalid: ARNs must start with 'arn:': <value>` — while a
 //!    well-formed ARN that addresses no table of this endpoint is refused by the member it
 //!    was sent in, and an ARN of this service that names a resource of another KIND is
-//!    refused by that type: `Invalid resource type in '<arn>'`.
+//!    refused by that type: the clause states the constraint `Invalid resource type` over
+//!    that member and that value.
 //! 6. A reserved word is an attribute name only in an expression that PARSES: an
 //!    expression the grammar cannot complete is the syntax error it is, reported at the
 //!    token the parse stopped at, and only a complete expression earns the reserved-word
@@ -647,8 +648,10 @@ async fn a_table_arn_naming_another_kind_of_resource_is_refused_by_its_type() {
             ),
         ] {
             let (code, stated) = refusal(&router, case, operation, request).await;
-            let expected =
-                format!("1 validation error detected: Invalid resource type in '{arn}'");
+            let expected = format!(
+                "1 validation error detected: Value '{arn}' at 'tableName' failed to \
+                 satisfy constraint: Invalid resource type"
+            );
             assert_eq!(
                 (code.as_str(), stated.as_str()),
                 ("ValidationException", expected.as_str()),

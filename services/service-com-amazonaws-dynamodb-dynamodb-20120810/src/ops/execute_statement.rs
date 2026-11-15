@@ -22,9 +22,13 @@
 //! * `INSERT` is a put that must not replace: an item whose primary key is already
 //!   stored is the modelled `DuplicateItemException`.
 //! * `UPDATE` and `DELETE` are SINGLETON writes: the `WHERE` clause must pin every
-//!   key attribute by equality, and a predicate the stored item does not satisfy —
-//!   including a key that holds no item — is `ConditionalCheckFailedException`,
-//!   carrying that item when `ReturnValuesOnConditionCheckFailure=ALL_OLD`.
+//!   key attribute by equality, and what it states BESIDES those equalities is the
+//!   condition the write is held to — a predicate the stored item does not satisfy is
+//!   `ConditionalCheckFailedException`, carrying that item when
+//!   `ReturnValuesOnConditionCheckFailure=ALL_OLD`. An `UPDATE` changes an item that is
+//!   there, so a key holding none fails that way too; a `DELETE` addressed by key is
+//!   idempotent, so a key holding none is served with no image removed
+//!   ([`crate::state::parsed_delete_condition`]).
 //!   `RETURNING (ALL|MODIFIED) (OLD|NEW) *` reports the item through `Items`.
 //! * `SELECT` reads the table, or one of its indexes when the statement qualifies the
 //!   source with `table.index`, holds every candidate to the whole `WHERE` clause,
@@ -858,10 +862,12 @@ fn delete_item(
     input: &ExecuteStatementInput,
     return_old_on_failure: bool,
 ) -> Result<ExecuteStatementOutput, ExecuteStatementError> {
-    let condition = crate::state::parsed_condition(&delete.filter).map_err(lift)?;
-    let key = {
+    let (key, condition) = {
         let table = store.active_table(region, name, now).map_err(lift)?;
-        crate::state::singleton_key(table, &delete.filter).map_err(lift)?
+        (
+            crate::state::singleton_key(table, &delete.filter).map_err(lift)?,
+            crate::state::parsed_delete_condition(table, &delete.filter).map_err(lift)?,
+        )
     };
     let before = store
         .active_table(region, name, now)
@@ -869,12 +875,15 @@ fn delete_item(
         .items
         .get(&key)
         .cloned();
-    let satisfied = before
+    // What the clause states BESIDES the key it addresses is the condition this delete is
+    // held to, read against the item as it stands — no item included, which is the one
+    // state a key that holds nothing can be in ([`crate::state::parsed_delete_condition`]).
+    let satisfied = condition
         .as_ref()
-        .map(|item| condition.evaluate(Some(item)))
+        .map(|condition| condition.evaluate(before.as_ref()))
         .transpose()
         .map_err(lift)?
-        .unwrap_or(false);
+        .unwrap_or(true);
     if !satisfied {
         // See [`update_item`]: the refused statement writes nothing and is metered all the
         // same ([`crate::state::charge_refused_conditional_write`]).

@@ -1052,8 +1052,8 @@ async fn a_policy_document_this_emulator_cannot_honour_is_refused_not_stored() {
     assert_eq!(
         message_of(&body),
         format!(
-            "One or more parameter values were invalid: Policy size exceeds the maximum \
-             allowed size of {MAX_RESOURCE_POLICY_BYTES} bytes"
+            "One or more parameter values were invalid: Maximum policy size of \
+             {MAX_RESOURCE_POLICY_BYTES} bytes exceeded"
         ),
         "case a document past {MAX_RESOURCE_POLICY_BYTES} bytes: the refusal names the limit, \
          got {body}"
