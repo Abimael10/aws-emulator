@@ -58,6 +58,12 @@
 //! wire error code `AccessDenied` (HTTP 403), which belongs to the authorization layer in
 //! front of the service and so is declared by no shape of this model either. It is
 //! [`Scaffolded::AccessDenied`], built with [`Scaffolded::access_denied`].
+//!
+//! A request the caller MAY make but that names a resource this service is not allowed to use —
+//! a KMS key whose own policy grants this service nothing — is answered with the same code in
+//! the REQUEST's class (HTTP 400), because what was denied is the service's use of that resource
+//! rather than the caller's authority to ask: [`Scaffolded::DeniedRequest`], built with
+//! [`Scaffolded::denied_request`].
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -213,6 +219,16 @@ pub enum Scaffolded<E> {
     /// not exist", which is why it is its own variant beside the refusals below. The payload
     /// is the same single `message`.
     AccessDenied(ValidationException),
+    /// The request named a resource this service may not USE: the same wire error code
+    /// `AccessDenied`, with the status the request's own class carries (HTTP 400).
+    ///
+    /// What such a request is refused for is not the caller's authority to ask — that is
+    /// [`Scaffolded::AccessDenied`] and its 403 — but a precondition on a resource it named,
+    /// whose owner withholds this service's use of it: a customer managed KMS key whose key
+    /// policy grants this service's principal nothing, and one no cryptographic operation can be
+    /// performed under, which AWS is recorded refusing under this one code rather than under two
+    /// distinct ones. The payload is the same single `message`, which names what to repair.
+    DeniedRequest(ValidationException),
     /// The request was refused as invalid in CloudWatch's own wording: HTTP 400 with the
     /// wire error code `ValidationError`.
     ///
@@ -278,6 +294,15 @@ impl<E> Scaffolded<E> {
     pub fn access_denied(message: impl Into<String>) -> Self {
         Self::AccessDenied(ValidationException::new(message))
     }
+
+    /// Refuse the request for a resource this service may not use: HTTP 400 `AccessDenied`.
+    ///
+    /// See the [`Self::DeniedRequest`] variant for why the status differs from the
+    /// authorization layer's. The message states what about the named resource withholds the
+    /// request, in the words AWS states that refusal in.
+    pub fn denied_request(message: impl Into<String>) -> Self {
+        Self::DeniedRequest(ValidationException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -286,6 +311,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::AccessDenied(e) => write!(f, "{e}"),
+            Self::DeniedRequest(e) => write!(f, "{e}"),
             Self::ValidationError(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
@@ -300,6 +326,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::AccessDenied(e) => e.source(),
+            Self::DeniedRequest(e) => e.source(),
             Self::ValidationError(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
@@ -315,7 +342,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
-            Self::AccessDenied(e) | Self::ValidationError(e) | Self::ValidationException(e) => e,
+            Self::AccessDenied(e)
+            | Self::DeniedRequest(e)
+            | Self::ValidationError(e)
+            | Self::ValidationException(e) => e,
         }
     }
 
@@ -326,9 +356,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // The `<Code>` / `__type` on the wire comes from `shape_name` below, not from
             // this schema, so every refusal renders its one `message` member through the
             // same synthetic shape and they differ only in the code.
-            Self::AccessDenied(_) | Self::ValidationError(_) | Self::ValidationException(_) => {
-                &VALIDATION_EXCEPTION_SCHEMA
-            }
+            Self::AccessDenied(_)
+            | Self::DeniedRequest(_)
+            | Self::ValidationError(_)
+            | Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
 
@@ -340,7 +371,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
-            Self::AccessDenied(_) => "AccessDenied",
+            // One code for both: what differs between them is the status, not the class a
+            // client branches on.
+            Self::AccessDenied(_) | Self::DeniedRequest(_) => "AccessDenied",
             Self::ValidationError(_) => "ValidationError",
             Self::ValidationException(_) => "ValidationException",
         }
@@ -357,6 +390,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // "The client is not authorized to perform the requested operation" is a 403
             // wherever this service's siblings model it.
             Self::AccessDenied(_) => 403,
+            // The refusal of a resource the request named, which is a fault of the request.
+            Self::DeniedRequest(_) => 400,
             Self::ValidationError(_) | Self::ValidationException(_) => 400,
         }
     }
@@ -371,9 +406,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // Same reason: the synthetic shapes carry no `awsQueryError` trait, so the
             // `<Code>` falls through to `shape_name` above — which is already the code the
             // service answers.
-            Self::AccessDenied(_) | Self::ValidationError(_) | Self::ValidationException(_) => {
-                None
-            }
+            Self::AccessDenied(_)
+            | Self::DeniedRequest(_)
+            | Self::ValidationError(_)
+            | Self::ValidationException(_) => None,
         }
     }
 }

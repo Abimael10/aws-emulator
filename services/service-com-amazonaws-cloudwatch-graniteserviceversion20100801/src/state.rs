@@ -127,6 +127,13 @@ pub mod metric_widget;
 /// the metric updates this store takes.
 pub mod metric_stream_export;
 
+/// Whether the customer managed key a dataset association names can be used by this service at
+/// all: the preconditions AWS KMS's own account of that key decides.
+pub mod dataset_kms_key;
+
+/// The one in-process KMS client this service asks another service's facts about a key through.
+pub(crate) mod kms_in_process;
+
 /// The usage telemetry this service publishes about its own API: the `CallCount` series every
 /// served call is counted into.
 pub mod usage;

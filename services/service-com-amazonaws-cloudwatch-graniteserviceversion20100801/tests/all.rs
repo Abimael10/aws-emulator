@@ -99,6 +99,8 @@ mod dashboard_body_byte_fidelity;
 mod dashboard_body_validation;
 #[path = "all/dashboards.rs"]
 mod dashboards;
+#[path = "all/dataset_kms_key_preconditions.rs"]
+mod dataset_kms_key_preconditions;
 #[path = "all/datasets.rs"]
 mod datasets;
 #[path = "all/delete_insight_rules.rs"]
@@ -285,3 +287,5 @@ mod stop_metric_streams;
 mod unit_read_identity;
 #[path = "all/usage_call_count.rs"]
 mod usage_call_count;
+#[path = "all/widget_payload_limit.rs"]
+mod widget_payload_limit;

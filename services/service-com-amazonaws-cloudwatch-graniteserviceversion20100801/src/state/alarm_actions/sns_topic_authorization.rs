@@ -161,7 +161,7 @@ async fn key_refusal(
     master_key_id: &str,
     context: &[(String, String)],
 ) -> Option<String> {
-    let client = kms_client(callback, region);
+    let client = crate::state::kms_in_process::client(callback, region);
     let KeyCondition::Judged { key_arn, policy } = key_condition(&client, master_key_id).await
     else {
         return None;
@@ -343,42 +343,19 @@ async fn key_condition(client: &::aws_sdk_kms::Client, master_key_id: &str) -> K
     }
 }
 
-/// Note that KMS did not state the key's facts, and so that the key decides nothing here. Worth
-/// a line to an operator, because a deployment with no KMS to ask is one where this half of the
-/// decision does not run; the stored value is rendered in its escaped `Debug` form, so an
-/// identifier carrying a newline cannot forge a log line.
+/// Note that KMS did not state the key's facts, and so that the key decides nothing here
+/// ([`crate::state::kms_in_process::unstated_key`], the one note both readers of a key's facts
+/// leave behind).
 fn unjudged_key<E: ::std::error::Error + 'static, R: ::std::fmt::Debug>(
     master_key_id: &str,
     failure: &::aws_sdk_kms::error::SdkError<E, R>,
 ) -> KeyCondition {
-    ::tracing::warn!(
-        kms_key = ?master_key_id,
-        error = %::aws_smithy_types::error::display::DisplayErrorContext(failure),
-        "this alarm action's topic names an encryption key KMS did not state its facts for, so \
-         the key decides nothing here and the publish answers for it"
-    );
+    crate::state::kms_in_process::unstated_key(master_key_id, failure, UNJUDGED_KEY_NOTE);
     KeyCondition::Unjudged
 }
 
-/// A KMS client over the in-process callback into this same emulator, addressed in `region`.
-fn kms_client(
-    callback: &::smithy_server_runtime::EmbeddedEmulator,
-    region: &str,
-) -> ::aws_sdk_kms::Client {
-    let config = ::aws_sdk_kms::Config::builder()
-        .behavior_version(::aws_sdk_kms::config::BehaviorVersion::latest())
-        .http_client(callback.http_client())
-        .credentials_provider(callback.aws_credentials_provider())
-        .region(::aws_sdk_kms::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://kms.{region}.amazonaws.com"))
-        // The transport is in-process: there is nothing to retry, time out or watch for a
-        // stalled stream, and each of those would need a sleep implementation this client is
-        // not given. The same goes for caching the identity: the credentials are handed over
-        // directly.
-        .retry_config(::aws_sdk_kms::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_kms::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_kms::config::IdentityCache::no_cache())
-        .stalled_stream_protection(::aws_sdk_kms::config::StalledStreamProtectionConfig::disabled())
-        .build();
-    ::aws_sdk_kms::Client::from_conf(config)
-}
+/// What an operator is told when KMS stated nothing about a topic's key: this half of the
+/// decision did not run, so the publish itself answers for the key.
+const UNJUDGED_KEY_NOTE: &str =
+    "this alarm action's topic names an encryption key KMS did not state its facts for, so the \
+     key decides nothing here and the publish answers for it";

@@ -38,12 +38,21 @@ pub const WIDGET_MEMBER: &str = "MetricWidget";
 /// The member of the definition that names the metrics the graph is of.
 const METRICS_MEMBER: &str = "metrics";
 
-/// "Up to 100 KB uncompressed payload." (`GetMetricWidgetImage`) — the definition is the
-/// payload of the call, so a document past that is refused before it is parsed.
-pub const MAX_WIDGET_BYTES: usize = 100 * 1024;
+/// "Up to 100 KB uncompressed payload." (`GetMetricWidgetImage`) — the limit is on the CALL's
+/// payload, so it is enforced on the request's own body before it is routed to the operation
+/// (`crate::service`'s payload gate) rather than on the definition after it is read.
+pub const MAX_PAYLOAD_BYTES: usize = 100 * 1024;
 
 /// "As many as 100 metrics in the graph." (`GetMetricWidgetImage`)
 pub const MAX_WIDGET_METRICS: usize = 100;
+
+/// What CloudWatch refuses a `MetricWidget` that is not a JSON OBJECT with.
+///
+/// The sentence names the definition by the property the request reader reads it from rather
+/// than by the request member's own casing, and says nothing about the document's contents: a
+/// payload that is no JSON at all and one that is JSON but not an object are the same failure to
+/// a caller, which is that the definition could not be read.
+const BAD_JSON_CONTENT: &str = "MetricWidget property 'metricWidget' has a bad JSON content";
 
 /// The graph's width in pixels when the definition names none: "width — The width of the
 /// graph in pixels. The default is 600." (the metric widget structure reference
@@ -174,18 +183,13 @@ impl MetricWidget {
     /// parameter sentences beside it), because that path is what locates the node a caller
     /// repairs.
     pub fn parse(document: &str, now: f64) -> Result<Self, String> {
-        if document.len() > MAX_WIDGET_BYTES {
-            return Err(format!(
-                "The field {WIDGET_MEMBER} must not be larger than {MAX_WIDGET_BYTES} bytes"
-            ));
-        }
         let widget = ::serde_json::from_str::<Value>(document)
             .ok()
             .and_then(|parsed| match parsed {
                 Value::Object(members) => Some(members),
                 _ => None,
             })
-            .ok_or_else(|| format!("The field {WIDGET_MEMBER} must be a valid JSON object"))?;
+            .ok_or_else(|| BAD_JSON_CONTENT.to_string())?;
 
         let width = pixels(&widget, "width", DEFAULT_WIDTH)?;
         let height = pixels(&widget, "height", DEFAULT_HEIGHT)?;

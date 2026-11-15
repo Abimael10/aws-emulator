@@ -1481,3 +1481,21 @@ mod zz_probe_whole_emulator;
 // above each `mod` is what points it into `tests/all/`. What a suite covers, and why it
 // drives the assembled router rather than one service crate, belongs in that suite's own
 // module header, where it is read beside the test it explains.
+// Single integration-test target for the router: the DECLARATION LIST, and nothing else.
+// Add a suite by putting it at `tests/all/<name>.rs` and inserting its
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair into the sorted list below — one pair per
+// file under `tests/all/` and no other line. What a suite covers, and why it drives the
+// assembled router rather than one service crate, belongs in that suite's own module header,
+// where it is read beside the test it explains; `all/appended_notes.rs` records what the notes
+// concurrent landings had appended to this file said.
+// This is the one file in the target whose breakage compiles no suite at all, so its own
+// suites pin the shape above: a name declared twice is `E0428`, an inner doc comment past the
+// first item is `E0753`, a file no `mod` names is compiled nowhere, and anything in the list
+// but declaration pairs is a report — `all/all_rs_declares_each_suite_once.rs`,
+// `all/every_suite_file_is_declared.rs` check them, for this file and for every service
+// EVERY comment in this file is an ORDINARY `//` one, this header included: with no inner doc
+// comment anywhere, no merge of two landings can leave one past the first item.
+// sibling of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is
+// what points each declaration into `tests/all/`. Some of the files below are shared harnesses
+// rather than suites (`query_wire`, `eks_wire`, `cloudformation_stack_clock`) and some are
+// probes; every one of them is declared.

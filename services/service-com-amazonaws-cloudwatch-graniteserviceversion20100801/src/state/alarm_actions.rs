@@ -92,8 +92,9 @@ pub mod sns_topic_authorization;
 const SNS_ARN_NAMESPACE: &str = "sns";
 
 /// The service principal this service executes an alarm action as: the identity a target
-/// topic's own policy decides the publish for.
-const CLOUDWATCH_SERVICE_PRINCIPAL: &str = "cloudwatch.amazonaws.com";
+/// topic's own policy decides the publish for, and the one a KEY's own policy decides this
+/// service's use of that key for ([`super::dataset_kms_key`]).
+pub(crate) const CLOUDWATCH_SERVICE_PRINCIPAL: &str = "cloudwatch.amazonaws.com";
 
 /// The most characters an SNS `Subject` may carry: "Subjects must be ASCII text that begins
 /// with a letter, number, or punctuation mark; must not include line breaks or control

@@ -64,8 +64,10 @@ const DECRYPT: &str = "kms:Decrypt";
 ///
 /// KMS is mounted beside the three the alarm-action suites need because an ENCRYPTED topic's
 /// key, its manager and its key policy are KMS's own facts: the decision is taken on the
-/// document `PutKeyPolicy` left on the key rather than on anything this suite holds.
-fn emulator_with_kms() -> Emulator {
+/// document `PutKeyPolicy` left on the key rather than on anything this suite holds. Shared with
+/// the suite that drives the OTHER decision this service takes over a key
+/// (`dataset_kms_key_preconditions`), so one emulator mounts KMS beside CloudWatch once.
+pub(crate) fn emulator_with_kms() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signature verification is the emulator's concern, not this service's.
@@ -90,7 +92,7 @@ fn emulator_with_kms() -> Emulator {
 }
 
 /// One `awsJson1_1` call against AWS KMS, which must answer 200.
-async fn kms(emulator: &Emulator, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn kms(emulator: &Emulator, case: &str, operation: &str, body: &Value) -> Value {
     let (status, parsed) = kms_call(emulator, operation, body).await;
     assert_eq!(
         status, 200,
@@ -144,7 +146,7 @@ async fn given_key(emulator: &Emulator, case: &str) -> String {
 }
 
 /// Replace the key's own policy, the way its owner does.
-async fn set_key_policy(emulator: &Emulator, case: &str, key_arn: &str, document: &str) {
+pub(crate) async fn set_key_policy(emulator: &Emulator, case: &str, key_arn: &str, document: &str) {
     kms(
         emulator,
         case,
@@ -190,7 +192,7 @@ async fn a_grant_cannot_name_the_service_principal_an_alarm_action_publishes_as(
 /// The statement every key policy keeps: "Enable IAM User Permissions", the one a new key
 /// carries, which names this account's root and is what keeps the key manageable — AWS's own
 /// key-policy examples add a service statement BESIDE it rather than in place of it.
-fn account_root_statement() -> Value {
+pub(crate) fn account_root_statement() -> Value {
     json!({
         "Sid": "EnableIAMUserPermissions",
         "Effect": "Allow",
@@ -202,7 +204,7 @@ fn account_root_statement() -> Value {
 
 /// One key-policy statement: a key policy's `Resource` element is `*`, which means the key the
 /// policy is attached to.
-fn key_statement(effect: &str, principal: Value, actions: Value, extra: Value) -> Value {
+pub(crate) fn key_statement(effect: &str, principal: Value, actions: Value, extra: Value) -> Value {
     let mut written = json!({
         "Sid": format!("{effect}SealingStatement"),
         "Effect": effect,
@@ -217,7 +219,7 @@ fn key_statement(effect: &str, principal: Value, actions: Value, extra: Value) -
 }
 
 /// A whole key policy carrying `statements` beside the statement a new key already has.
-fn key_policy(statements: Vec<Value>) -> String {
+pub(crate) fn key_policy(statements: Vec<Value>) -> String {
     let mut all = vec![account_root_statement()];
     all.extend(statements);
     json!({"Version": "2012-10-17", "Id": "key-policy-1", "Statement": all}).to_string()

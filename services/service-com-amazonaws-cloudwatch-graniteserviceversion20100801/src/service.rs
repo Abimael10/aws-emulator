@@ -112,11 +112,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The operations whose ANSWER this file owns a part of — the one whose accepted response
     /// carries something its body cannot ([`ReportingDroppedEntities`]), the four metric
     /// operations a namespace is submitted to, whose request values are judged by what this
-    /// service enforces ([`JudgingTheValuesThisServiceEnforces`]), and the metric-stream writer
+    /// service enforces ([`JudgingTheValuesThisServiceEnforces`]), the metric-stream writer
     /// whose own parameter-value rules are judged ahead of the boundary walk
-    /// ([`RefusingAValueFirst`]). Each is built from the SAME shared engine
-    /// as the generated table's and keyed by the routing key the protocol resolves, so the
-    /// operation served is the modelled one, and each is METERED ([`Metering`]) like every
+    /// ([`RefusingAValueFirst`]), and the widget renderer whose per-call PAYLOAD limit is judged
+    /// on the body the client sent ([`RefusingAnOversizedPayload`]). Each is built from the SAME
+    /// shared engine as the generated table's and keyed by the routing key the protocol resolves,
+    /// so the operation served is the modelled one, and each is METERED ([`Metering`]) like every
     /// other operation of this service and answers a failure under the class this
     /// `awsQueryCompatible` service names it under ([`QueryCompatibleErrors`]).
     overridden: OperationRoutingTable,
@@ -206,6 +207,22 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 RefusingAValueFirst::new(
                     crate::ops::put_metric_stream::PutMetricStream::new(Arc::clone(&engine)),
                     crate::ops::put_metric_stream::parameter_value_refusal,
+                ),
+            ),
+        );
+        // `GetMetricWidgetImage` publishes a per-call PAYLOAD limit ("Up to 100 KB uncompressed
+        // payload"), which is a bound on the request's own body rather than on any member's
+        // value, so it is judged on the way in and answered in the transport layer's own class
+        // ([`RefusingAnOversizedPayload`]).
+        overridden.add_operation(
+            "GetMetricWidgetImage",
+            served(
+                &engine,
+                RefusingAnOversizedPayload::new(
+                    crate::ops::get_metric_widget_image::GetMetricWidgetImage::new(Arc::clone(
+                        &engine,
+                    )),
+                    crate::state::metric_widget::MAX_PAYLOAD_BYTES,
                 ),
             ),
         );
@@ -1339,6 +1356,115 @@ fn refusal_response(
             &crate::scaffolded::VALIDATION_EXCEPTION_SCHEMA,
             &refused.code,
             REFUSAL_STATUS,
+        )
+        .ok()
+}
+
+/// One modelled operation, served so that a request whose PAYLOAD is larger than that
+/// operation's documented per-call limit is refused before anything reads it.
+///
+/// Such a limit is on the call's own payload rather than on any member's value — "Up to 100 KB
+/// uncompressed payload" (`GetMetricWidgetImage`) — so it is decided where the request's body is
+/// still the body the client sent, ahead of the deserialize -> validate -> handle sequence: a
+/// caller that sent too much learns the size it sent and the size it may send, instead of a
+/// refusal of whichever member happened to carry the bulk. The class is the transport's own
+/// ([`ENTITY_TOO_LARGE_CODE`]) and so belongs to no shape of this service's model, which is why
+/// the refusal is worded here rather than in the operation.
+///
+/// Nothing else is re-implemented: a request inside the limit is handed to the generated
+/// [`ErasedOperation::run`], which owns the whole per-request sequence and every modelled error.
+struct RefusingAnOversizedPayload<O> {
+    operation: O,
+    /// The most bytes of payload the wrapped operation documents for ONE call.
+    limit: usize,
+}
+
+impl<O> RefusingAnOversizedPayload<O> {
+    /// Wrap the operation, already constructed from the shared engine, with the payload limit
+    /// its own documentation publishes.
+    fn new(operation: O, limit: usize) -> Self {
+        Self { operation, limit }
+    }
+}
+
+impl<O> ErasedOperation for RefusingAnOversizedPayload<O>
+where
+    O: ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // The protocol is read, used and dropped inside this one statement:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused = payload_size(req)
+                .filter(|sent| *sent > self.limit)
+                .and_then(|sent| {
+                    let protocol = svc.definition().wire_protocol(req).protocol();
+                    entity_too_large_response(protocol, sent, self.limit)
+                });
+            match refused {
+                Some(response) => response,
+                None => self.operation.run(svc, req, ctx).await,
+            }
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not change
+    /// which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// How many bytes of payload `req` carries, or `None` when this layer cannot tell.
+///
+/// The body the client sent, as it was sent: an error-bodied request is built in memory by the
+/// transport, so its bytes are readable here, and a request whose body is not (a streamed one)
+/// is measured by the length it advertised. A request that states neither is not judged against
+/// the limit at all, which leaves it to the operation.
+fn payload_size(req: &aws_smithy_runtime_api::http::Request) -> Option<usize> {
+    if let Some(bytes) = req.body().bytes() {
+        return Some(bytes.len());
+    }
+    req.headers()
+        .get(CONTENT_LENGTH_HEADER)
+        .and_then(|advertised| advertised.trim().parse().ok())
+}
+
+/// The header a client advertises the length of its body in.
+const CONTENT_LENGTH_HEADER: &str = "content-length";
+
+/// The wire error code a payload past the limit of the call it was sent to is refused with: the
+/// class of the transport layer in front of the service, which no shape of this model declares.
+const ENTITY_TOO_LARGE_CODE: &str = "RequestEntityTooLarge";
+
+/// The status that class carries ("Content Too Large" in the HTTP semantics).
+const ENTITY_TOO_LARGE_STATUS: u16 = 413;
+
+/// A payload of `sent` bytes refused against the `limit` bytes one call carries, in this
+/// service's own error envelope.
+///
+/// The sentence is built from the two sizes that decided the refusal — the one the client sent
+/// and the one it may send — so a caller splitting its request knows by how much; `None` when
+/// the envelope cannot be built, which leaves the request to the operation.
+fn entity_too_large_response(
+    protocol: &dyn ServerHttpProtocol,
+    sent: usize,
+    limit: usize,
+) -> Option<aws_smithy_runtime_api::http::Response> {
+    protocol
+        .serialize_error(
+            &crate::scaffolded::ValidationException::new(format!(
+                "Request size {sent} exceeded {limit} bytes"
+            )),
+            &crate::scaffolded::VALIDATION_EXCEPTION_SCHEMA,
+            ENTITY_TOO_LARGE_CODE,
+            ENTITY_TOO_LARGE_STATUS,
         )
         .ok()
 }

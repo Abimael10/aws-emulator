@@ -544,20 +544,14 @@ async fn every_documented_view_renders_the_graph_of_the_same_series() {
 /// naming the member of the definition that has to change.
 ///
 /// The rows span the classes a definition can be wrong in: a payload that is not a widget
-/// document, a payload past the published size, a document naming no metric or more metrics
-/// than one graph holds, a size, a granularity, a window, an entry and an image format outside
-/// the values their members take.
+/// document, a document naming no metric or more metrics than one graph holds, a size, a
+/// granularity, a window, an entry and an image format outside the values their members take.
+/// A payload past the published per-call SIZE is refused by the transport layer instead, in its
+/// own class (`widget_payload_limit`).
 #[tokio::test]
 async fn a_definition_this_service_cannot_render_is_refused() {
     let router = build_router();
 
-    // "Up to 100 KB uncompressed payload." (`GetMetricWidgetImage`) — a document past it,
-    // built by padding a member the renderer ignores rather than by repeating a metric.
-    let oversized = {
-        let mut widget = widget_over(METRIC, &json!({}));
-        merge(&mut widget, &json!({"title": "t".repeat(100 * 1024)}));
-        widget.to_string()
-    };
     // "As many as 100 metrics in the graph." (`GetMetricWidgetImage`) — one entry past it.
     let too_many_metrics = json!({
         "metrics": (1..=101)
@@ -567,16 +561,11 @@ async fn a_definition_this_service_cannot_render_is_refused() {
     .to_string();
 
     // (the case, the request body, the message the refusal must carry)
-    let rows: [(&str, Value, &str); 14] = [
+    let rows: [(&str, Value, &str); 13] = [
         (
             "a payload that is not JSON",
             json!({"MetricWidget": "not a document"}),
-            "The field MetricWidget must be a valid JSON object",
-        ),
-        (
-            "a payload larger than one call carries",
-            json!({"MetricWidget": oversized}),
-            "The field MetricWidget must not be larger than 102400 bytes",
+            "MetricWidget property 'metricWidget' has a bad JSON content",
         ),
         (
             "more metrics than one graph holds",
@@ -586,7 +575,7 @@ async fn a_definition_this_service_cannot_render_is_refused() {
         (
             "a payload that is a JSON array",
             json!({"MetricWidget": "[]"}),
-            "The field MetricWidget must be a valid JSON object",
+            "MetricWidget property 'metricWidget' has a bad JSON content",
         ),
         (
             "a document naming no metrics",
