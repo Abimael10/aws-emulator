@@ -391,7 +391,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// on an Elastic IP address's `domain-name` attribute reaching that record
     /// ([`Self::apply_due_ptr_record_updates`]), and a `processing` Reserved Instances
     /// modification reaching `fulfilled` with the purchases it mints
-    /// ([`Self::fulfill_due_reserved_instances_modifications`]).
+    /// ([`Self::fulfill_due_reserved_instances_modifications`]), and a purchase whose upfront
+    /// payment has settled — or whose queued purchase time has come — reaching `active`
+    /// ([`Self::activate_due_reserved_instances`]).
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         // The one clock-owed REMOVAL: a recycled AMI whose retention period has run out was
@@ -1931,6 +1933,12 @@ impl ComAmazonawsEc2Amazonec2State {
         self.materialize_due_spot_fleet_requests(now);
         self.expire_due_store_image_tasks(now);
         self.fulfill_due_reserved_instances_modifications(now);
+        // The purchases the clock has put into effect: one whose upfront payment has settled,
+        // and one that was queued for a purchase time that has now come. Each was owed
+        // `active` at its own WALL-clock instant whether or not anybody called again, and
+        // after the modifications above, so a purchase a fulfilment has just minted is read in
+        // the state that fulfilment gave it.
+        self.activate_due_reserved_instances(SystemTime::now());
     }
 
     /// The kernel and RAM disk an instance launched from `image_id` runs when its launch
@@ -2062,22 +2070,31 @@ impl ComAmazonawsEc2Amazonec2State {
     /// attached to no subnet at all and reports none — which is also what keeps it out of a
     /// `subnet-id` or `vpc-id` filtered enumeration of a network it no longer occupies.
     pub fn instance_subnet_id(&self, instance: &InstanceRecord) -> Option<String> {
+        self.instance_subnet_id_of(
+            instance,
+            &self.instance_network_interfaces(&instance.instance_id),
+        )
+    }
+
+    /// The same subnet, read off interfaces a caller has ALREADY projected.
+    ///
+    /// Finding an instance's interfaces is a scan of the interface store, so a caller that
+    /// reads them once per instance — and charges that scan to its match budget
+    /// ([`Self::instance_matches`]) — passes the slice here rather than paying for the
+    /// projection again per filter, which is what would multiply the stored-instance and
+    /// stored-interface ceilings by the filter count.
+    pub fn instance_subnet_id_of(
+        &self,
+        instance: &InstanceRecord,
+        attached: &[InstanceNetworkInterface],
+    ) -> Option<String> {
         if instance.state == InstanceStateName::Terminated {
             return None;
         }
         if let Some(subnet_id) = instance.subnet_id.clone() {
             return Some(subnet_id);
         }
-        self.instance_network_interfaces(&instance.instance_id)
-            .into_iter()
-            .find(|interface| {
-                interface
-                    .attachment
-                    .as_ref()
-                    .and_then(|attachment| attachment.device_index)
-                    == Some(PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX)
-            })
-            .and_then(|interface| interface.subnet_id)
+        primary_network_interface_of(attached).and_then(|interface| interface.subnet_id.clone())
     }
 
     /// The VPC the instance `instance` runs in: the VPC of its own subnet.
@@ -2088,8 +2105,21 @@ impl ComAmazonawsEc2Amazonec2State {
     /// instance whose subnet this store does not hold is in no VPC this store knows, and
     /// reports none rather than an invented id.
     pub fn instance_vpc_id(&self, instance: &InstanceRecord) -> Option<String> {
+        self.instance_vpc_id_of(
+            instance,
+            &self.instance_network_interfaces(&instance.instance_id),
+        )
+    }
+
+    /// The same VPC, read off interfaces a caller has ALREADY projected
+    /// ([`Self::instance_subnet_id_of`] gives the reason).
+    pub fn instance_vpc_id_of(
+        &self,
+        instance: &InstanceRecord,
+        attached: &[InstanceNetworkInterface],
+    ) -> Option<String> {
         self.subnets
-            .get(&self.instance_subnet_id(instance)?)?
+            .get(&self.instance_subnet_id_of(instance, attached)?)?
             .vpc_id
             .clone()
     }
@@ -2147,20 +2177,24 @@ impl ComAmazonawsEc2Amazonec2State {
     /// the instance is in no security group any more and the launch's own list is not a
     /// fallback for one.
     pub fn instance_security_groups(&self, instance: &InstanceRecord) -> Vec<GroupIdentifier> {
+        self.instance_security_groups_of(
+            instance,
+            &self.instance_network_interfaces(&instance.instance_id),
+        )
+    }
+
+    /// The same groups, read off interfaces a caller has ALREADY projected
+    /// ([`Self::instance_subnet_id_of`] gives the reason).
+    pub fn instance_security_groups_of(
+        &self,
+        instance: &InstanceRecord,
+        attached: &[InstanceNetworkInterface],
+    ) -> Vec<GroupIdentifier> {
         if instance.state == InstanceStateName::Terminated {
             return Vec::new();
         }
-        let primary = self
-            .instance_network_interfaces(&instance.instance_id)
-            .into_iter()
-            .find(|interface| {
-                interface
-                    .attachment
-                    .as_ref()
-                    .and_then(|attachment| attachment.device_index)
-                    == Some(PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX)
-            })
-            .and_then(|interface| interface.groups)
+        let primary = primary_network_interface_of(attached)
+            .and_then(|interface| interface.groups.clone())
             .filter(|groups| !groups.is_empty());
         primary.unwrap_or_else(|| {
             instance
@@ -2347,8 +2381,11 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// `attached` is the instance's own network interfaces, which the caller projects once
     /// per instance ([`Self::instance_matches`]) because finding them is a scan of the
-    /// interface store; a caller whose filters name none of the
-    /// [`NETWORK_INTERFACE_FILTER_PREFIX`] family passes an empty slice.
+    /// interface store; a caller whose filters read none of them
+    /// ([`filter_reads_network_interfaces`]) passes an empty slice. Every name that reads an
+    /// interface \u2014 the [`NETWORK_INTERFACE_FILTER_PREFIX`] family directly, and
+    /// `instance.group-id`, `instance.group-name`, `subnet-id` and `vpc-id` through the
+    /// primary one \u2014 is answered off that slice rather than projecting again per filter.
     pub fn filter_values(
         &self,
         reservation: &ReservationRecord,
@@ -2381,13 +2418,13 @@ impl ComAmazonawsEc2Amazonec2State {
             // instance report carries ([`Self::instance_security_groups`]), so a filter and
             // a report cannot disagree about which groups an instance is in.
             "instance.group-id" => Some(
-                self.instance_security_groups(instance)
+                self.instance_security_groups_of(instance, attached)
                     .into_iter()
                     .filter_map(|group| group.group_id)
                     .collect(),
             ),
             "instance.group-name" => Some(
-                self.instance_security_groups(instance)
+                self.instance_security_groups_of(instance, attached)
                     .into_iter()
                     .filter_map(|group| group.group_name)
                     .collect(),
@@ -2477,14 +2514,14 @@ impl ComAmazonawsEc2Amazonec2State {
                     .collect(),
             ),
             "reservation-id" => single(Some(instance.reservation_id.clone())),
-            "subnet-id" => single(self.instance_subnet_id(instance)),
+            "subnet-id" => single(self.instance_subnet_id_of(instance, attached)),
             // "vpc-id - The ID of the VPC that the instance is running in"
             // (`DescribeInstancesRequest$Filters`), read off the same projection the
             // instance report carries ([`Self::instance_vpc_id`]), so a filter and a report
             // cannot disagree about one instance's VPC. An instance in no VPC this store
             // knows holds no value for it, so a filter naming one selects only instances
             // that are in one.
-            "vpc-id" => single(self.instance_vpc_id(instance)),
+            "vpc-id" => single(self.instance_vpc_id_of(instance, attached)),
             "tag-key" => Some(instance.tags.keys().cloned().collect()),
             // The `network-interface.*` family: the members of the interfaces attached to
             // this instance, each read off the SAME projection the instance report carries
@@ -2668,9 +2705,18 @@ impl ComAmazonawsEc2Amazonec2State {
         // THIS instance holds (an index lookup, [`Self::instance_network_interfaces`]),
         // and each one is charged to the same budget, so the product of stored instances,
         // stored interfaces and filters stays bounded.
+        //
+        // EVERY filter that reads an interface is counted here, including the four that
+        // reach one INDIRECTLY — `instance.group-id` and `instance.group-name` through the
+        // instance's primary interface, `subnet-id` and `vpc-id` through the subnet that
+        // interface is in ([`filter_reads_network_interfaces`]) — because each of those
+        // projections is the same scan, and leaving one out of this pre-projection is what
+        // would let a request repeating that filter name multiply the stored-instance and
+        // stored-interface ceilings by the filter count, unmetered. `filter_values` reads
+        // all four off the slice this projects.
         let needs_interfaces = filters
             .iter()
-            .any(|filter| filter.name.starts_with(NETWORK_INTERFACE_FILTER_PREFIX));
+            .any(|filter| filter_reads_network_interfaces(&filter.name));
         let attached = if needs_interfaces {
             let held = self.instance_network_interfaces(&instance.instance_id);
             if !budget.spend_steps(u64::try_from(held.len()).unwrap_or(u64::MAX)) {
@@ -2681,6 +2727,12 @@ impl ComAmazonawsEc2Amazonec2State {
             Vec::new()
         };
         filters.iter().all(|filter| {
+            // One step per FILTER as well as per candidate, so the filter count cannot
+            // multiply this instance's projections for free however many filters one
+            // request carries.
+            if !budget.spend() {
+                return false;
+            }
             let Some(held) = self.filter_values(reservation, instance, &filter.name, &attached)
             else {
                 return false;
@@ -2691,6 +2743,41 @@ impl ComAmazonawsEc2Amazonec2State {
             })
         })
     }
+}
+
+/// The interface at device index 0 of `attached`: an instance's PRIMARY network interface,
+/// which is the one whose subnet it is placed in and whose security groups it reports.
+///
+/// The ONE reading of that interface out of a projected list, shared by every value read off
+/// it ([`ComAmazonawsEc2Amazonec2State::instance_subnet_id_of`],
+/// [`ComAmazonawsEc2Amazonec2State::instance_security_groups_of`]).
+fn primary_network_interface_of(
+    attached: &[InstanceNetworkInterface],
+) -> Option<&InstanceNetworkInterface> {
+    attached.iter().find(|interface| {
+        interface
+            .attachment
+            .as_ref()
+            .and_then(|attachment| attachment.device_index)
+            == Some(PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX)
+    })
+}
+
+/// Whether the filter `name` reads one of the instance's network interfaces.
+///
+/// The `network-interface.*` family reads them directly; `instance.group-id`,
+/// `instance.group-name`, `subnet-id` and `vpc-id` reach one through the instance's primary
+/// interface. The ONE list of those names, because
+/// [`ComAmazonawsEc2Amazonec2State::instance_matches`] uses it to project and CHARGE the
+/// interfaces once per instance and
+/// [`ComAmazonawsEc2Amazonec2State::filter_values`] then reads them off that slice: a name
+/// missing here would be answered off an empty slice instead.
+fn filter_reads_network_interfaces(name: &str) -> bool {
+    name.starts_with(NETWORK_INTERFACE_FILTER_PREFIX)
+        || matches!(
+            name,
+            "instance.group-id" | "instance.group-name" | "subnet-id" | "vpc-id"
+        )
 }
 
 /// One `DescribeInstances` filter: its name and its values parsed ONCE into

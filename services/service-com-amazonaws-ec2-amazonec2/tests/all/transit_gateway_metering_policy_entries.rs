@@ -839,6 +839,61 @@ async fn a_value_outside_the_policy_id_form_is_named_malformed() {
     );
 }
 
+/// A WELL-FORMED metering policy id the account holds no policy for is refused as NOT FOUND —
+/// the other half of that pair — in the sentence AWS words this resource's own refusal with,
+/// which spells out the ID the request sent: `Transit Gateway Metering Policy Id <id> was
+/// deleted or does not exist.`
+///
+/// Asserted on the message as well as the code, because the message is what a caller (and any
+/// log or golden-output matcher) reads, and over every operation that resolves such an id, so
+/// one resource answers one sentence. The ids differ along what the rule generalises over: the
+/// long form and the short form of the id, and a value the account held nothing under at all.
+#[tokio::test]
+async fn a_well_formed_policy_id_the_account_does_not_hold_is_named_not_found() {
+    let (router, _engine, metering_policy_id, _attachment_ids) = seeded().await;
+
+    for named in [
+        "tgw-mp-0123456789abcdef0",
+        "tgw-mp-fffffffffffffffff",
+        "tgw-mp-01234567",
+    ] {
+        assert_ne!(
+            named, metering_policy_id,
+            "the rows must name ids the account does not hold"
+        );
+        for (action, params) in [
+            (
+                ACTION,
+                vec![
+                    param("TransitGatewayMeteringPolicyId", named),
+                    param("PolicyRuleNumber", "1"),
+                    param("MeteredAccount", payer_type("transit-gateway-owner")),
+                ],
+            ),
+            (GET, vec![param("TransitGatewayMeteringPolicyId", named)]),
+        ] {
+            let case = format!("{action} naming {named:?}");
+            let (status, body) = invoke(&router, action, &params).await;
+            assert_eq!(
+                status, REFUSAL_STATUS,
+                "case {case:?}: expected HTTP {REFUSAL_STATUS}, got {status} with body {body}"
+            );
+            let code = error_code(&body);
+            assert_eq!(
+                code, INVALID_TRANSIT_GATEWAY_METERING_POLICY_ID_NOT_FOUND,
+                "case {case:?}: expected the not-found refusal, got {code:?} in {body}"
+            );
+            let expected =
+                format!("Transit Gateway Metering Policy Id {named} was deleted or does not exist.");
+            let message = error_message(&body);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?} in {body}"
+            );
+        }
+    }
+}
+
 /// One rule number names one entry of one policy: a second create at a number the policy
 /// already holds an entry at is refused, the entry it holds is untouched, and the same number
 /// is free in ANOTHER policy.

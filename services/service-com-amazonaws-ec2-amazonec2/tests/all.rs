@@ -2395,6 +2395,7 @@ mod id_screening_verdicts;
 // The instance metadata service one instance's guest reads itself from: the published
 // categories, the signed identity document its agents register the machine with, the IMDSv2
 // token form, and what it publishes nothing for. Declared at the tail of this file, which is
+// where every new ec2 suite lands.
 #[path = "all/instance_guest_metadata_service.rs"]
 mod instance_guest_metadata_service;
 #[path = "all/taggable_resource_kinds.rs"]
@@ -2415,6 +2416,14 @@ mod associate_capacity_reservation_billing_owner;
 // ones with it, the second delete and the dry run it refuses without writing anything. Declared at
 #[path = "all/delete_ipam.rs"]
 mod delete_ipam;
+// What `PurchaseReservedInstancesOffering` buys: the Reserved Instance it stores out of the
+// terms the offering its id carries was published with, the `payment-pending` or `queued`
+// state it waits in with the clock owing it `active`, the round trip back through
+// `DescribeReservedInstances` — and the offering-id form, the dry-run verdict, the count and
+// the limit price it refuses without buying anything. Declared at the tail of this file,
+// which is where every new ec2 suite lands.
+#[path = "all/purchase_reserved_instances_offering.rs"]
+mod purchase_reserved_instances_offering;
 // What `DeleteTransitGatewayMeteringPolicyEntry` records: the entry the metering policy the
 // request names holds at the rule number it names taken OUT of the store and reported in the
 // state its catalog gives one a delete has removed, with every other member exactly as it was

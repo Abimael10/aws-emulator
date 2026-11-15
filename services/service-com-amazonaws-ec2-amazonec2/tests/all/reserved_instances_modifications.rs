@@ -31,6 +31,10 @@
 //!   being modified, are all refused with HTTP 400 `InvalidInput` naming the member and what
 //!   was wrong with it; a configuration this service cannot read at all is refused with the
 //!   code EC2 answers for that parameter, and nothing is stored either way.
+//! * A target configuration must say which axis of the purchase it modifies — its
+//!   Availability Zone, its network platform or the scope the reservations apply at — and one
+//!   that names none of them is refused `MissingParameter` BEFORE any `reservedInstancesIds`
+//!   entry is resolved, so that refusal and the id's own cannot collapse into one.
 //! * A repeated `ClientToken` answers with the modification the first call recorded rather
 //!   than recording a second, and the same token carrying a different request is refused as
 //!   an idempotency mismatch.
@@ -126,6 +130,11 @@ type ConfigurationCase = (
 /// The form fields for a whole `TargetConfigurations` list, as ec2Query flattens it:
 /// `<prefix>.<N>.<Member>`, each member under its own `@ec2QueryName` (`InstanceCount`,
 /// `InstanceType`, `AvailabilityZone`).
+///
+/// A row that names no Availability Zone is a configuration of REGIONAL scope, and says so:
+/// a configuration has to state which axis of the purchase it modifies, so one that names no
+/// zone carries `Scope=Region` (the `scope` enum's other member) rather than leaving the axis
+/// unsaid — which this operation refuses with `MissingParameter`.
 fn target_params(targets: &[TargetRow]) -> Vec<Param> {
     targets
         .iter()
@@ -142,11 +151,15 @@ fn target_params(targets: &[TargetRow]) -> Vec<Param> {
                     instance_type,
                 ));
             }
-            if let Some(zone) = zone {
-                fields.push(param(
+            match zone {
+                Some(zone) => fields.push(param(
                     &format!("{TARGETS}.{position}.AvailabilityZone"),
                     zone,
-                ));
+                )),
+                None => fields.push(param(
+                    &format!("{TARGETS}.{position}.Scope"),
+                    RESERVED_INSTANCE_SCOPE_REGION,
+                )),
             }
             fields
         })
@@ -585,7 +598,7 @@ async fn the_clock_fulfils_a_modification_by_replacing_the_purchases_it_named() 
         assert_eq!(
             error_message(&body),
             format!(
-                "Invalid value for 'reservedInstancesIds'. Reserved Instance {} is in the \
+                " Invalid value for 'reservedInstancesIds'. Reserved Instance {} is in the \
                  '{RESERVED_INSTANCE_STATE_RETIRED}' state.",
                 seeded[0]
             ),
@@ -789,7 +802,7 @@ async fn an_id_the_account_holds_no_reserved_instance_for_is_refused() {
         assert_eq!(
             error_message(&body),
             format!(
-                "Invalid value for 'reservedInstancesIds'. Reserved Instance {unknown} is not \
+                " Invalid value for 'reservedInstancesIds'. Reserved Instance {unknown} is not \
                  found."
             ),
             "case {case:?}: the refusal must name the member and the id, got {body}"
@@ -842,7 +855,7 @@ async fn a_reserved_instance_that_is_not_in_effect_cannot_be_modified() {
         assert_eq!(
             error_message(&body),
             format!(
-                "Invalid value for 'reservedInstancesIds'. Reserved Instance {id} is in the \
+                " Invalid value for 'reservedInstancesIds'. Reserved Instance {id} is in the \
                  '{state}' state."
             ),
             "case {case:?}: the refusal must name the member, the id and the held state, \
@@ -925,7 +938,7 @@ async fn the_reserved_instances_of_one_request_must_be_interchangeable() {
         );
         assert_eq!(
             error_message(&body),
-            "Invalid value for 'reservedInstancesIds'. The Reserved Instances to be modified \
+            " Invalid value for 'reservedInstancesIds'. The Reserved Instances to be modified \
              must be identical, except for Availability Zone, network platform, and instance \
              type.",
             "case {case:?}: the refusal must name the member and the rule, got {body}"
@@ -1141,6 +1154,110 @@ async fn a_target_configuration_this_service_cannot_read_is_refused() {
             error_code(&body),
             *code,
             "case {case:?}: expected the code {code}, got {body}"
+        );
+        assert_eq!(
+            stored_count(&engine),
+            0,
+            "case {case:?}: a refused request records nothing, the store holds {} \
+             modifications",
+            stored_count(&engine)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The scope axis a target configuration modifies
+// ---------------------------------------------------------------------------
+
+/// The rule: a target configuration must say WHICH axis of the purchase it modifies — its
+/// Availability Zone (by name or by id), its network platform, or the scope the reservations
+/// apply at — and one that names none of them is refused `MissingParameter`, before any
+/// `reservedInstancesIds` entry is resolved.
+///
+/// The rows differ along the member that states the axis, so the table spans the whole of what
+/// the rule generalises over: each of the four members on its own, two of them together, and
+/// the configuration that states none. The members are
+/// `ReservedInstancesConfiguration`'s own
+/// (`smithy_query(query="shape",shape="ReservedInstancesConfiguration")`).
+///
+/// Every row names an id the account holds NO Reserved Instance for, which is what pins the
+/// ORDER: a configuration that states its axis gets as far as the id lookup and is refused
+/// `InvalidInput` for the id, while one that states none is refused for the configuration
+/// instead — so the two refusal classes cannot collapse into one.
+#[tokio::test]
+async fn a_target_configuration_must_name_the_scope_axis_it_modifies() {
+    // (case, the fields of the one target configuration beside its count, the code it carries)
+    let cases: &[ConfigurationCase] = &[
+        (
+            "a configuration naming neither a zone nor a platform nor a scope",
+            &[],
+            MISSING_PARAMETER,
+        ),
+        (
+            "a configuration naming an Availability Zone",
+            &[("AvailabilityZone", "us-east-1b")],
+            INVALID_INPUT,
+        ),
+        (
+            "a configuration naming an Availability Zone id",
+            &[("AvailabilityZoneId", "use1-az1")],
+            INVALID_INPUT,
+        ),
+        (
+            "a configuration naming a network platform",
+            &[("Platform", "EC2-VPC")],
+            INVALID_INPUT,
+        ),
+        (
+            "a configuration of Regional scope",
+            &[("Scope", RESERVED_INSTANCE_SCOPE_REGION)],
+            INVALID_INPUT,
+        ),
+        (
+            "a configuration naming a platform and a zone",
+            &[("Platform", "EC2-VPC"), ("AvailabilityZone", "us-east-1a")],
+            INVALID_INPUT,
+        ),
+        (
+            "an instance type alone states no axis",
+            &[("InstanceType", "t3.micro")],
+            MISSING_PARAMETER,
+        ),
+    ];
+
+    // A well-formed Reserved Instances id — the hyphenated UUID form — the account holds no
+    // purchase under, so the id lookup is what a configuration that DOES state its axis
+    // reaches.
+    let unheld = "1a2b3c4d-1234-5678-9abc-1234567890ab";
+
+    for (case, fields, code) in cases {
+        let (router, engine) = super::ec2_query::emulator();
+        let mut params = indexed("ReservedInstancesId", &[unheld]);
+        params.push(param(&format!("{TARGETS}.1.InstanceCount"), "1"));
+        for (name, value) in *fields {
+            params.push(param(&format!("{TARGETS}.1.{name}"), value));
+        }
+
+        let (status, body) =
+            super::ec2_query::call(&router, REGION, "ModifyReservedInstances", &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            *code,
+            "case {case:?}: expected the code {code}, got {body}"
+        );
+        let expected = if *code == MISSING_PARAMETER {
+            "The request must contain the parameter  AvailabilityZone".to_string()
+        } else {
+            format!(" Invalid value for 'reservedInstancesIds'. Reserved Instance {unheld} is not found.")
+        };
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case:?}: expected {expected:?}, got {body}"
         );
         assert_eq!(
             stored_count(&engine),

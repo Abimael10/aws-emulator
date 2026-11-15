@@ -2204,3 +2204,20 @@ mod cloudformation_provisions_glue_table_optimizers;
 // past the declarations is `E0753` and compiles no suite of this target. With none
 // the top level of `tests/` fails the build; and a second `mod` for one name is `E0428`.
 // Three suites of this target pin the rules above rather than restating them:
+// This file is the licence line, this header, and then one
+// by name, with no other line between or after the pairs. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair where its name sorts.
+// deliberate: an inner doc comment (`//!`) and an inner attribute (`#![..]`) are legal only
+// BEFORE the first item, so one appended past the declarations is `E0753` and compiles no
+// suite of this target — which is what concurrent landings appending notes to this file kept
+// producing. With none anywhere in the file, no merge of two landings can leave one past the
+// A suite no `mod` here names is compiled nowhere and its tests never run (this crate's
+// build-time layout check refuses it), a suite left at the top level of `tests/` is a test
+// target of its own, which that check refuses too, and a suite declared twice is `E0428`,
+// which compiles neither copy. The guard suites under `tests/all/` pin those rules, for this
+// file and for every service crate's `tests/all.rs`, so check there rather than leaving a
+// note here.
+// WHAT a suite covers, and WHY it drives the assembled router rather than one service crate,
+// is stated in that suite's OWN module doc, where it is read beside the test it explains; a
+// note about this file belongs in `all/appended_notes.rs`, declared below like any other
+// file because the layout check wants a declaration for every file under `tests/all/`.

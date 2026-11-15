@@ -17,7 +17,9 @@
 //! reached through `materialize_due_transitions`, so the new purchases exist from the
 //! instant the fulfilment fell due whether or not anybody called again.
 //!
-//! What this file holds is this operation's own validation: a `reservedInstancesIds` entry
+//! What this file holds is this operation's own validation: a target configuration must say
+//! which axis of the purchase it modifies (its Availability Zone, its network platform or
+//! the scope the reservations apply at), a `reservedInstancesIds` entry
 //! must name a Reserved Instance this account holds and that is in effect, those purchases
 //! must be interchangeable with each other ("identical, except for Availability Zone,
 //! network platform, and instance type"), and the target configurations must together
@@ -90,11 +92,20 @@ use crate::state::{
     MAX_STORED_BYTES, MAX_STORED_RESERVED_INSTANCES, MAX_STORED_RESERVED_INSTANCES_MODIFICATIONS,
     RESERVED_INSTANCE_SCOPE_REGION, RESERVED_INSTANCE_SCOPE_ZONE, RESERVED_INSTANCE_STATE_ACTIVE,
     ReservedInstancesIdentity, ReservedInstancesModificationSpec, availability_zones_in_region,
-    idempotent_parameter_mismatch, invalid_input, invalid_parameter_combination,
+    echoed_resource_id, idempotent_parameter_mismatch, invalid_input, invalid_parameter_combination,
     invalid_parameter_value, missing_parameter, reserved_instances_identity,
     reserved_instances_limit_exceeded, reserved_instances_modification_payload_bytes,
     reserved_instances_not_active, reserved_instances_not_found, reserved_instances_not_identical,
 };
+
+/// The sentence EC2 answers a target configuration that names no scope axis with.
+///
+/// The FIXED text of this operation's `MissingParameter`, with the member it reports missing
+/// — `AvailabilityZone` — as its only variable part, which is why it is one constant rather
+/// than a format string: the two spaces the service puts between "parameter" and the member
+/// name are its own, so the sentence is reproduced as the service words it rather than tidied
+/// into the single space the other missing-parameter refusals of this crate carry.
+const MISSING_SCOPE_AXIS_MESSAGE: &str = "The request must contain the parameter  AvailabilityZone";
 
 /// One target configuration as a value that can be COMPARED with another, so a replayed
 /// `ClientToken` can be told from a different request carrying the same token.
@@ -259,6 +270,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             asked_instance_count = asked_instance_count.saturating_add(i64::from(instance_count));
             let named_zone =
                 target.availability_zone.is_some() || target.availability_zone_id.is_some();
+            // A target configuration must say WHICH axis of the purchase it is modifying.
+            // `ReservedInstancesConfiguration` describes the modified Reserved Instances by
+            // their Availability Zone (by name or by id), their network platform and the
+            // `Scope` that says whether the reservations apply to a Region or to one zone
+            // (`smithy_query(query="shape",shape="ReservedInstancesConfiguration")`), so a
+            // configuration naming none of them describes no modified purchase at all — and
+            // the parameter EC2 reports missing is the Availability Zone.
+            //
+            // Asked of EVERY configuration here, with the other checks that read nothing but
+            // the request itself, so it is answered BEFORE any `reservedInstancesIds` entry is
+            // resolved: a request that carries a scope-less configuration AND names a purchase
+            // the account does not hold is told about the configuration, which is the order
+            // this operation's recorded contract shows.
+            if !named_zone && target.platform.is_none() && target.scope.is_none() {
+                return Err(missing_parameter(MISSING_SCOPE_AXIS_MESSAGE));
+            }
             // The two contradictions a configuration can carry. Every OTHER value of these
             // members is already refused before this handler runs: `Scope` targets the
             // modelled `scope` enum and `InstanceType` the `InstanceType` enum, so the
@@ -285,14 +312,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(zone_name) = target.availability_zone.as_deref() {
                 if !zones.iter().any(|zone| zone.zone_name == zone_name) {
                     return Err(invalid_parameter_value(format!(
-                        "Invalid availability zone: [{zone_name}]"
+                        "Invalid value '{zone}' for AvailabilityZone.",
+                        zone = echoed_resource_id(zone_name)
                     )));
                 }
             }
             if let Some(zone_id) = target.availability_zone_id.as_deref() {
                 if !zones.iter().any(|zone| zone.zone_id == zone_id) {
                     return Err(invalid_parameter_value(format!(
-                        "Invalid availability zone: [{zone_id}]"
+                        "Invalid value '{zone}' for AvailabilityZoneId.",
+                        zone = echoed_resource_id(zone_id)
                     )));
                 }
             }

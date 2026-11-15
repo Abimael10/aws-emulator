@@ -60,6 +60,14 @@ pub const RESERVED_INSTANCE_STATE_QUEUED_DELETED: &str = "queued-deleted";
 /// `active` member.
 pub const RESERVED_INSTANCE_STATE_ACTIVE: &str = "active";
 
+/// A purchase whose upfront payment has not been processed yet: the `ReservedInstanceState`
+/// enum's `payment-pending` member
+/// (`smithy_query(query="shape",shape="ReservedInstanceState")`), which is where a purchase
+/// `PurchaseReservedInstancesOffering` has just made sits until its payment settles — one
+/// [`TRANSITION_DELAY`] later, through
+/// [`ComAmazonawsEc2Amazonec2State::activate_due_reserved_instances`].
+pub const RESERVED_INSTANCE_STATE_PAYMENT_PENDING: &str = "payment-pending";
+
 /// A Reserved Instance whose term this account no longer holds: the
 /// `ReservedInstanceState` enum's `retired` member. Where a fulfilled modification leaves
 /// the purchases it was asked to change
@@ -313,6 +321,62 @@ impl ComAmazonawsEc2Amazonec2State {
             .insert(reserved_instances_id.clone(), reserved_instances);
         Some(reserved_instances_id)
     }
+
+    /// Store a purchase a caller has just made, and record the instant the clock owes it
+    /// [`RESERVED_INSTANCE_STATE_ACTIVE`] — `None` when the store is already at its ceiling,
+    /// exactly as [`Self::insert_reserved_instances`] answers.
+    ///
+    /// A purchase is NOT in effect from the instant it is made: its upfront payment has to be
+    /// processed ([`RESERVED_INSTANCE_STATE_PAYMENT_PENDING`]), and one scheduled for a future
+    /// date is [`RESERVED_INSTANCE_STATE_QUEUED`] until that date comes. `active_at` is when
+    /// that is over — the settlement instant for the first, the purchase time the request
+    /// named for the second — and it is RECORDED beside the record rather than slept for, so a
+    /// caller reading the purchase straight after buying it sees the state EC2 answers it in
+    /// and [`Self::activate_due_reserved_instances`] applies the move whether or not anybody
+    /// calls again.
+    pub fn insert_purchased_reserved_instances(
+        &mut self,
+        spec: ReservedInstancesSpec,
+        active_at: SystemTime,
+    ) -> Option<String> {
+        let reserved_instances_id = self.insert_reserved_instances(spec)?;
+        self.reserved_instances_activations
+            .insert(reserved_instances_id.clone(), active_at);
+        Some(reserved_instances_id)
+    }
+
+    /// Put every purchase whose activation the clock has made due into effect.
+    ///
+    /// Called by [`Self::materialize_due_transitions`], which is what a reporting operation
+    /// may call: the move was owed at the instant recorded in
+    /// [`Self::reserved_instances_activations`] whether or not anybody asked again.
+    ///
+    /// Only a purchase still waiting on it moves — one that is
+    /// [`RESERVED_INSTANCE_STATE_PAYMENT_PENDING`] or [`RESERVED_INSTANCE_STATE_QUEUED`] — so
+    /// a queued purchase a delete has cancelled
+    /// ([`RESERVED_INSTANCE_STATE_QUEUED_DELETED`]), and one a fulfilled modification has
+    /// retired, are left where they are. The entry is dropped either way, which is what stops
+    /// a later sweep applying the same move twice.
+    pub fn activate_due_reserved_instances(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .reserved_instances_activations
+            .iter()
+            .filter(|(_, active_at)| now >= **active_at)
+            .map(|(reserved_instances_id, _)| reserved_instances_id.clone())
+            .collect();
+        for reserved_instances_id in due {
+            self.reserved_instances_activations
+                .remove(&reserved_instances_id);
+            if let Some(purchase) = self.reserved_instances.get_mut(&reserved_instances_id) {
+                let held = purchase.state.as_deref().unwrap_or_default();
+                if held == RESERVED_INSTANCE_STATE_PAYMENT_PENDING
+                    || held == RESERVED_INSTANCE_STATE_QUEUED
+                {
+                    purchase.state = Some(RESERVED_INSTANCE_STATE_ACTIVE.to_string());
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -386,9 +450,22 @@ pub fn invalid_input<E>(message: impl Into<String>) -> Scaffolded<E> {
 /// Refuse a `reservedInstancesIds` entry the account holds no Reserved Instance for: HTTP
 /// 400 [`INVALID_INPUT`], naming the member and the id the request asked about.
 pub fn reserved_instances_not_found<E>(reserved_instances_id: &str) -> Scaffolded<E> {
+    invalid_reserved_instances_ids_value(format!(
+        "Reserved Instance {reserved_instances_id} is not found."
+    ))
+}
+
+/// Refuse a `reservedInstancesIds` entry this operation cannot act on: HTTP 400
+/// [`INVALID_INPUT`], naming the member and then `reason`.
+///
+/// The ONE wording of that member's refusals, because the sentence has a shape of its own: the
+/// service opens it with a SPACE before `Invalid`, as the recorded refusal of an unknown
+/// Reserved Instance shows, so every refusal of this member is worded that way rather than
+/// having the space tidied off one of them.
+fn invalid_reserved_instances_ids_value<E>(reason: impl AsRef<str>) -> Scaffolded<E> {
     invalid_input(format!(
-        "Invalid value for 'reservedInstancesIds'. \
-         Reserved Instance {reserved_instances_id} is not found."
+        " Invalid value for 'reservedInstancesIds'. {reason}",
+        reason = reason.as_ref()
     ))
 }
 
@@ -399,9 +476,8 @@ pub fn reserved_instances_not_found<E>(reserved_instances_id: &str) -> Scaffolde
 /// purchase has not been made yet, and a retired one is over — so the state is what the
 /// caller has to act on, and it comes from this store rather than from the request.
 pub fn reserved_instances_not_active<E>(reserved_instances_id: &str, state: &str) -> Scaffolded<E> {
-    invalid_input(format!(
-        "Invalid value for 'reservedInstancesIds'. \
-         Reserved Instance {reserved_instances_id} is in the '{state}' state."
+    invalid_reserved_instances_ids_value(format!(
+        "Reserved Instance {reserved_instances_id} is in the '{state}' state."
     ))
 }
 
@@ -451,10 +527,9 @@ pub fn reserved_instances_identity(
 /// [`INVALID_INPUT`], in the operation's own words for the rule
 /// ([`reserved_instances_identity`] is what they are compared by).
 pub fn reserved_instances_not_identical<E>() -> Scaffolded<E> {
-    invalid_input(
-        "Invalid value for 'reservedInstancesIds'. The Reserved Instances to be modified \
-         must be identical, except for Availability Zone, network platform, and instance \
-         type.",
+    invalid_reserved_instances_ids_value(
+        "The Reserved Instances to be modified must be identical, except for Availability \
+         Zone, network platform, and instance type.",
     )
 }
 
@@ -1025,6 +1100,49 @@ pub fn invalid_reserved_instances_offering_id<E>(offering_id: &str) -> Scaffolde
             id = echoed_resource_id(offering_id)
         ),
     )
+}
+
+/// Refuse something that is not a `ReservedInstancesOfferingId` at all: HTTP 400
+/// `InvalidParameterValue`, in the sentence this operation was RECORDED answering such a
+/// value with: the member's own name in the quotes, the value the request sent after `for`,
+/// and a full stop. That order is the service's own and is reproduced rather than tidied into
+/// the `Invalid value '<value>' for <member>.` the other members of this module are refused
+/// with ([`reported_reserved_instances_id_unreadable`]).
+///
+/// Answered BEFORE the id is resolved and before the permission preflight the `DryRun` flag
+/// asks, because a value outside the id form names no offering in ANY account: that is what
+/// tells it apart from a well-formed id this service publishes no offering under
+/// ([`invalid_reserved_instances_offering_id`]), the other half of the pair. Only the first
+/// [`MAX_ECHOED_RESOURCE_ID_CHARS`] characters of the value are quoted
+/// ([`echoed_resource_id`]).
+pub fn unreadable_reserved_instances_offering_id<E>(offering_id: &str) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Invalid value 'ReservedInstancesOfferingId' for {id}.",
+        id = echoed_resource_id(offering_id)
+    ))
+}
+
+/// Whether `id` is a well-formed `ReservedInstancesOfferingId`.
+///
+/// Either form an offering id of this API takes: the hyphenated UUID AWS issues its own
+/// offering ids in — the same form a Reserved Instances id takes
+/// ([`reserved_instances_id_is_well_formed`]) — or the `<prefix>-<hex>` form of the ids THIS
+/// service derives its offerings' from ([`encode_reserved_instances_offering_id`]), which is
+/// what `DescribeReservedInstancesOfferings` reports and so what a caller that searched the
+/// catalog buys with. Anything else is a value no operation can read as an offering id
+/// ([`unreadable_reserved_instances_offering_id`]).
+///
+/// Only the FORM, never whether an offering exists: an id that is well formed and names no
+/// offering this service publishes is the other refusal
+/// ([`invalid_reserved_instances_offering_id`]).
+pub fn reserved_instances_offering_id_is_well_formed(id: &str) -> bool {
+    reserved_instances_id_is_well_formed(id)
+        || id
+            .strip_prefix(RESERVED_INSTANCES_OFFERING_ID_PREFIX)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|payload| {
+                !payload.is_empty() && payload.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
 }
 
 /// The id prefix a Reserved Instances offering id carries, in the `<prefix>-<payload>` form

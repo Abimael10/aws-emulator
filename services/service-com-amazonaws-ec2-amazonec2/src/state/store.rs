@@ -1728,6 +1728,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Reserved Instances id live in [`reserved_instances`], the submodule every operation
     /// that reaches this store shares.
     pub reserved_instances: BTreeMap<String, crate::ops::types::ReservedInstances>,
+    /// When the clock owes a purchase of [`Self::reserved_instances`] the `active` state, by
+    /// `ReservedInstancesId`: the instant a `payment-pending` purchase's payment settles, and
+    /// the purchase time a `queued` one was scheduled for. A purchase that is already in
+    /// effect carries no entry.
+    ///
+    /// `PurchaseReservedInstancesOffering` is its writer
+    /// ([`Self::insert_purchased_reserved_instances`]) and
+    /// [`Self::activate_due_reserved_instances`] is the one place an entry is applied and
+    /// dropped, so the move is RECORDED rather than slept for and a caller reading straight
+    /// after the purchase still sees the state EC2 answers it in. A wall-clock instant rather
+    /// than a monotonic one, because the purchase time a queued purchase waits for is a date
+    /// the request named.
+    pub reserved_instances_activations: HashMap<String, SystemTime>,
     /// Every Reserved Instances modification the account has asked for, by
     /// `ReservedInstancesModificationId`, as the modelled
     /// [`crate::ops::types::ReservedInstancesModification`] shape plus the move the clock
@@ -3648,6 +3661,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A fresh account has bought nothing, so it holds no Reserved Instances and has
             // asked for no modification of one.
             reserved_instances: BTreeMap::new(),
+            reserved_instances_activations: HashMap::new(),
             reserved_instances_modifications: BTreeMap::new(),
             reserved_instances_modification_client_tokens: HashMap::new(),
             // A fresh account has put nothing up for sale in the Reserved Instance

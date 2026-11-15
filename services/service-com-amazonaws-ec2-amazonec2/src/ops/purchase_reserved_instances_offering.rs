@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PurchaseReservedInstancesOffering
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PurchaseReservedInstancesOffering`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PurchaseReservedInstancesOffering::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: buys the offering the request names and answers with the
+//! `ReservedInstancesId` the purchase was stored under. This is the ONLY file to touch for
+//! this operation.
+//!
+//! An offering is not a stored resource — its terms travel inside its id
+//! ([`crate::state::decode_reserved_instances_offering_id`]), which is what
+//! `DescribeReservedInstancesOfferings` reports — so what a purchase stores is read off those
+//! terms: the instance type, the Availability Zone and so the scope, the product description,
+//! the offering class and type, the term and the prices, with only how many reservations it
+//! holds coming from the request. The purchase is then a Reserved Instance of
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::reserved_instances`], which is what
+//! `DescribeReservedInstances` reports and what `ModifyReservedInstances`,
+//! `CreateReservedInstancesListing` and the exchange operations act on.
+//!
+//! A purchase is NOT in effect from the instant it is made: its upfront payment has to be
+//! processed ([`crate::state::RESERVED_INSTANCE_STATE_PAYMENT_PENDING`]), and one the request
+//! scheduled for a future `PurchaseTime` is
+//! [`crate::state::RESERVED_INSTANCE_STATE_QUEUED`] until that date comes. Either move is
+//! RECORDED rather than slept for
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::insert_purchased_reserved_instances`]) and
+//! applied by `materialize_due_transitions`, so it happens whether or not anybody calls
+//! again.
+//!
+//! The two refusals this operation answers before anything is bought are the form of the
+//! `ReservedInstancesOfferingId`
+//! ([`crate::state::reserved_instances_offering_id_is_well_formed`]) and the permission
+//! question the `DryRun` flag asks, in that order: a value outside the id form names no
+//! offering in any account, while the flag is answered for a well-formed id whether or not
+//! this service publishes an offering under it.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +170,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PurchaseReservedInstancesOffering` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PurchaseReservedInstancesOfferingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PurchaseReservedInstancesOffering"))
+        use crate::state;
+
+        // A Reserved Instance is reported in an Availability Zone of the Region the request
+        // was signed for, so the offering's zone is read against that Region.
+        let region = state::request_region(ctx.parts());
+
+        // "The number of Reserved Instances to purchase" ($InstanceCount): a purchase that
+        // holds no reservation is not a purchase at all, and a count below one is a fact of
+        // the VALUE, refused before anything is looked up — the same refusal
+        // `CreateReservedInstancesListing` answers its own count with.
+        if input.instance_count < 1 {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{count}' for instanceCount. It must be at least 1",
+                count = input.instance_count
+            )));
+        }
+
+        // "Specifies the limit price on the total order (instanceCount * price)"
+        // (`ReservedInstanceLimitPrice$Amount`): a limit below nothing is no limit on an
+        // order, which is a fact of the value rather than of the offering, so it is read here
+        // with the rest of the request's own shape. The currency is the modelled
+        // `CurrencyCodeValues` enum, so the boundary validator has already refused any
+        // spelling outside it.
+        if let Some(amount) = input.limit_price.as_ref().and_then(|limit| limit.amount) {
+            if amount < 0.0 {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value '{amount}' for limitPrice. It must not be negative"
+                )));
+            }
+        }
+
+        // A value outside the id form names no offering in ANY account, so it is refused
+        // before the offering is resolved and before the permission preflight below: that is
+        // what tells it apart from a well-formed id this service publishes no offering under.
+        let offering_id = input.reserved_instances_offering_id.as_str();
+        if !state::reserved_instances_offering_id_is_well_formed(offering_id) {
+            return Err(state::unreadable_reserved_instances_offering_id(offering_id));
+        }
+
+        // The permission question, answered once the request's own shape has been read and
+        // before the offering is resolved or anything is written: "checks whether you have the
+        // required permissions for the action, WITHOUT ACTUALLY MAKING THE REQUEST … if you
+        // have the required permissions, the error response is DryRunOperation" ($DryRun). So
+        // a probe carrying a well-formed id this service publishes no offering under is still
+        // answered `DryRunOperation`, and a probe that would have succeeded buys nothing.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Every offering id carries the terms of the offering it names, so resolving the id is
+        // how the term, the prices, the zone and the product the purchase holds are recovered.
+        // A well-formed value this service never reported an offering under names no offering
+        // at all, and neither does one whose zone is in another Region: the zones of a Region
+        // are facts of that Region, so such an id names nothing a purchase signed for THIS
+        // Region could buy.
+        let Some(terms) = state::decode_reserved_instances_offering_id(offering_id) else {
+            return Err(state::invalid_reserved_instances_offering_id(offering_id));
+        };
+        if let Some(zone_name) = terms.availability_zone.as_deref() {
+            if !state::availability_zones_in_region(&region)
+                .iter()
+                .any(|zone| zone.zone_name == zone_name)
+            {
+                return Err(state::invalid_reserved_instances_offering_id(offering_id));
+            }
+        }
+
+        // "Specified for Reserved Instance Marketplace offerings to limit the total order and
+        // ensure that the Reserved Instances are not purchased at unexpected prices"
+        // ($LimitPrice), the total order being "instanceCount * price": an order above the
+        // limit the request set is one the caller asked NOT to be made, so it is refused
+        // rather than bought. Both sides are measured by the one measure of what a purchase is
+        // worth ([`crate::state::reserved_instances_value`]), and the same tolerance an
+        // exchange compares values with covers the cents a float cannot hold exactly.
+        let total_order = state::reserved_instances_value(terms.fixed_price, input.instance_count);
+        if let Some(amount) = input.limit_price.as_ref().and_then(|limit| limit.amount) {
+            if total_order > amount + state::RESERVED_INSTANCES_VALUE_TOLERANCE {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value for 'limitPrice'. The total order comes to {order}, above \
+                     the limit price of {limit}",
+                    order = state::reserved_instances_value_text(total_order),
+                    limit = state::reserved_instances_value_text(amount),
+                )));
+            }
+        }
+
+        // The wall clock the purchase is written against, read ONCE so the record it stores
+        // and the move the clock owes it see one instant.
+        let now = ::std::time::SystemTime::now();
+
+        // "The time at which to purchase the Reserved Instance, in UTC format … If you do not
+        // specify a purchase time, the default is the current time" ($PurchaseTime). A time
+        // still ahead QUEUES the purchase — "to queue a purchase for a future date and time,
+        // specify a purchase time" — so the term starts then and the purchase is `queued`
+        // until it does; a time that has already passed is the default, a purchase made now,
+        // whose upfront payment is what it waits on instead.
+        let purchase_time = input.purchase_time.map(state::date_time_to_system_time);
+        let queued_until = purchase_time.filter(|at| *at > now);
+        let (purchase_state, started_at, active_at) = match queued_until {
+            Some(at) => (state::RESERVED_INSTANCE_STATE_QUEUED, at, at),
+            None => {
+                let settles_at = now.checked_add(state::TRANSITION_DELAY).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::internal_error(
+                        "the clock cannot represent the instant this purchase's payment settles",
+                    )
+                })?;
+                (
+                    state::RESERVED_INSTANCE_STATE_PAYMENT_PENDING,
+                    now,
+                    settles_at,
+                )
+            }
+        };
+
+        // Everything about the purchase comes from the OFFERING, through the one construction
+        // of a Reserved Instance out of an offering's terms this crate has, with only the
+        // state it starts in replaced: a purchase waits on its payment or on its purchase
+        // time, where the Reserved Instance an exchange mints is in effect at once.
+        let mut spec = state::reserved_instances_spec_for_offering(
+            &terms,
+            &region,
+            input.instance_count,
+            started_at,
+        );
+        spec.state = purchase_state.to_string();
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // Every move the clock already owed is applied before anything is read or written, so
+        // the purchase this call stores is written beside the store a caller would see.
+        store.materialize_due_transitions();
+
+        // The store's ceiling is asked BEFORE anything is written, the way every other writer
+        // of this store asks its own: nothing here reclaims a Reserved Instance, so the count
+        // ceiling is what bounds the store.
+        if !store.has_reserved_instances_capacity(1) {
+            return Err(state::reserved_instances_limit_exceeded(format!(
+                "This emulator holds {max} Reserved Instances, which is as many as it stores",
+                max = state::MAX_STORED_RESERVED_INSTANCES
+            )));
+        }
+        let reserved_instances_id = store
+            .insert_purchased_reserved_instances(spec, active_at)
+            .ok_or_else(|| {
+                // Unreachable: the capacity check above covered this one record and the store
+                // is locked throughout. Kept so a purchase that stored nothing can never read
+                // as a 200 over an id that names no Reserved Instance.
+                state::reserved_instances_limit_exceeded(format!(
+                    "This emulator holds {max} Reserved Instances, which is as many as it \
+                     stores",
+                    max = state::MAX_STORED_RESERVED_INSTANCES
+                ))
+            })?;
+
+        Ok(PurchaseReservedInstancesOfferingOutput {
+            // "The IDs of the purchased Reserved Instances" ($ReservedInstancesId), minted by
+            // the store so it is unique within a run and never taken from the request.
+            reserved_instances_id: Some(reserved_instances_id),
+        })
     }
 }
+
