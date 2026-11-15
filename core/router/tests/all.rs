@@ -1383,3 +1383,23 @@ mod s3_notification_granted_function_writes_back_into_the_bucket;
 // `declaration_roots_*` and `every_suite_file_is_declared` suites pin all of it.
 #[path = "all/cloudformation_asg_launch_fault_diagnosis.rs"]
 mod cloudformation_asg_launch_fault_diagnosis;
+// cross-service suite under `tests/all/`, and nothing else. Put a new suite at
+// `tests/all/<name>.rs` and insert ONE `#[path = "all/<name>.rs"]` / `mod <name>;` pair into
+// the list below, in the one place its name sorts to; what that suite covers, and why it
+// header, and a note about THIS file in `all/appended_notes.rs`, declared below like any
+// other file. The list holds those pairs and no other line — no prose between them and
+// nothing after the last one — so two branches landing at once insert two lines in two
+// places and have no prose to duplicate, re-word or mistype. Every comment here is an
+// ORDINARY `//` one, this header included, and the inner attribute below stands ahead of the
+// first item: an inner doc comment and an inner attribute are legal only there, so one
+// written past the declarations compiles no suite of this target at all. A suite file no
+// `mod` names is compiled nowhere, a name declared twice compiles neither copy, and a bare
+// `mod` would resolve to a sibling of this crate root, which the layout check refuses — the
+// `#[path]` above each `mod` is what points it into `tests/all/`. The `all/all_rs_*`,
+// `all/declaration_roots_*` and `all/every_suite_file_is_declared.rs` suites pin all of
+// that, for this file and for every service crate's `tests/all.rs`, so check there rather
+// The lint allowed below is for the suite files this root compiles: a module header that
+// wraps a paragraph without the indentation `clippy::doc_lazy_continuation` asks of a doc
+// list item is a note rather than a build failure.
+#[path = "all/apigateway_cognito_authorizer_spares_the_proxy_lambda.rs"]
+mod apigateway_cognito_authorizer_spares_the_proxy_lambda;
