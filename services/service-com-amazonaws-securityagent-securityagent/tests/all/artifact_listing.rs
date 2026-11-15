@@ -17,7 +17,11 @@
 //! * a page holds at most `maxResults` summaries and `nextToken` resumes exactly where
 //!   the page ended, so paging reaches every artifact once whatever the page size;
 //! * a space the account does not hold has no artifacts to list, and a page request the
-//!   service cannot act on is refused rather than served.
+//!   service cannot act on is refused rather than served;
+//! * listing is REPORTING, so no listing — paged any way, repeated any number of times,
+//!   its walk abandoned mid-cursor — changes what a later caller sees;
+//! * a summary is a projection of the stored record, so its members are the ones the
+//!   artifact's own readers report for that id.
 //!
 //! Each case asserts a rule over a TABLE of inputs: the rows differ along the number of
 //! artifacts uploaded, the page size asked for (one, several, the exact count, past the
@@ -39,7 +43,7 @@ const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist
 /// One artifact as a summary reports it: the three members `ArtifactSummary` declares
 /// (`smithy_query(query="shape",shape="ArtifactSummary")` — `artifactId`, `fileName`,
 /// `artifactType`, each `@required`).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Summary {
     artifact_id: String,
     file_name: String,
@@ -220,15 +224,8 @@ async fn a_listing_reports_the_stored_artifacts_of_the_named_space() {
         "case \"a space holding no artifact\": expected an empty listing, got {empty:?}"
     );
 
-    let mut expected = Vec::new();
-    for (file_name, artifact_type) in uploads() {
-        let artifact_id = add_artifact(&router, &space, file_name, artifact_type, file_name).await;
-        expected.push(Summary {
-            artifact_id,
-            file_name: file_name.to_string(),
-            artifact_type: artifact_type.to_string(),
-        });
-    }
+    // The same seeding step the sibling cases use, so the suite holds one spelling of it.
+    let expected = seed(&router, &space).await;
     // One artifact of ANOTHER space, which no page of this space's listing may carry.
     let elsewhere = add_artifact(&router, &other, "elsewhere.txt", "TXT", "another space").await;
 
@@ -452,4 +449,269 @@ async fn a_listing_the_service_cannot_serve_is_refused() {
         1,
         "case \"the space that exists\": expected its one artifact, got {listed:?}"
     );
+}
+
+/// The artifacts of one space, seeded from [`uploads`], as the summaries a listing of the
+/// space must report — in the order the ids were minted in.
+async fn seed(router: &MultiServiceRouter, agent_space_id: &str) -> Vec<Summary> {
+    let mut stored = Vec::new();
+    for (file_name, artifact_type) in uploads() {
+        let artifact_id = add_artifact(router, agent_space_id, file_name, artifact_type, file_name)
+            .await;
+        stored.push(Summary {
+            artifact_id,
+            file_name: file_name.to_string(),
+            artifact_type: artifact_type.to_string(),
+        });
+    }
+    stored
+}
+
+/// RULE: listing the artifacts of an agent space is REPORTING
+/// (`smithy_query(query="operation",operation="ListArtifacts")`: `@readonly`), so no
+/// listing changes what a later caller sees — however it is paged, however many times it
+/// is repeated, and whether its walk is finished or abandoned with a cursor in hand: the
+/// same summaries come back, every artifact still reads back with the bytes it was
+/// uploaded with, and the space's artifact slots stay unconsumed.
+#[tokio::test]
+async fn a_listing_reports_without_changing_what_a_later_caller_sees() {
+    let router = emulator();
+    let space = create_agent_space(&router, "reported-space", "the space being listed").await;
+    let stored = seed(&router, &space).await;
+
+    let baseline = list_all(&router, &space, None, "the store before any repeated listing").await;
+    assert_eq!(
+        baseline, stored,
+        "case \"the store before any repeated listing\": expected the uploads {stored:?}, got \
+         {baseline:?}"
+    );
+
+    // (case, the page size each walk asks for) — the rows differ along the size, which is
+    // what decides how many calls one walk takes and how many cursors it mints: one at a
+    // time, several, the exact count, past the count, past the service's ceiling, and the
+    // default (`maxResults` absent).
+    let sizes: Vec<(String, Option<i32>)> = vec![
+        ("one summary per page".to_string(), Some(1)),
+        ("two summaries per page".to_string(), Some(2)),
+        ("the exact count".to_string(), Some(baseline.len() as i32)),
+        ("one past the count".to_string(), Some(baseline.len() as i32 + 1)),
+        (
+            "past the service's page ceiling".to_string(),
+            Some(MAX_PAGE_SIZE + 10),
+        ),
+        ("the default page size".to_string(), None),
+    ];
+
+    for (case, page_size) in sizes {
+        // The same walk, three times over: a repeated listing reports the same records,
+        // so reporting them consumed nothing.
+        for round in 1..=3 {
+            let walk = format!("{case}, walk {round}");
+            let listed = list_all(&router, &space, page_size, &walk).await;
+            assert_eq!(
+                listed, baseline,
+                "case {walk:?}: expected the listing to still report {baseline:?}, got {listed:?}"
+            );
+        }
+
+        // A walk ABANDONED after its first page: the cursor it minted names a resume point
+        // in the store and nothing in the listing, so replaying it answers the same page
+        // twice, and never finishing the walk removes nothing.
+        let first = list_page(&router, &space, page_size, None).await;
+        assert_eq!(
+            first.status, 200,
+            "case {case:?}: expected the first page to answer 200, got {} ({}) with {}",
+            first.status, first.error_code, first.body
+        );
+        if let Some(token) = member(&first.body, "nextToken") {
+            let mut replays = Vec::new();
+            for round in 1..=2 {
+                let replay = format!("{case}, the abandoned cursor replayed {round}");
+                let page = list_page(&router, &space, page_size, Some(&token)).await;
+                assert_eq!(
+                    page.status, 200,
+                    "case {replay:?}: expected the resumed page to answer 200, got {} ({}) \
+                     with {}",
+                    page.status, page.error_code, page.body
+                );
+                replays.push((summaries(&page.body, &replay), member(&page.body, "nextToken")));
+            }
+            assert_eq!(
+                replays[0], replays[1],
+                "case {case:?}: expected a replayed cursor to answer the same page, got {:?} \
+                 then {:?}",
+                replays[0], replays[1]
+            );
+        }
+
+        let after = format!("{case}, the store after the walks");
+        let listed = list_all(&router, &space, None, &after).await;
+        assert_eq!(
+            listed, baseline,
+            "case {after:?}: expected the store to still hold {baseline:?}, got {listed:?}"
+        );
+    }
+
+    // Every listed artifact still reads back with the bytes it was uploaded with: the
+    // listings reported the records rather than touching them.
+    for summary in &baseline {
+        let read = ok(
+            &router,
+            "GetArtifact",
+            &json!({"agentSpaceId": &space, "artifactId": &summary.artifact_id}),
+            &summary.file_name,
+        )
+        .await;
+        let contents = read
+            .get("artifact")
+            .and_then(|artifact| artifact.get("contents"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: the read carries no artifact contents: {read}",
+                    summary.file_name
+                )
+            })
+            .to_string();
+        let expected = aws_smithy_types::base64::encode(summary.file_name.as_bytes());
+        assert_eq!(
+            contents, expected,
+            "case {:?}: expected the uploaded bytes {expected:?} to still read back, got \
+             {contents:?}",
+            summary.file_name
+        );
+    }
+
+    // The space's artifact slots were not consumed either: a further upload still succeeds
+    // and the listing then reports exactly it beside the baseline.
+    let case = "an upload after the listings";
+    let added = add_artifact(&router, &space, "after-the-listings.txt", "TXT", case).await;
+    let grown = list_all(&router, &space, None, case).await;
+    let mut expected = baseline.clone();
+    expected.push(Summary {
+        artifact_id: added,
+        file_name: "after-the-listings.txt".to_string(),
+        artifact_type: "TXT".to_string(),
+    });
+    assert_eq!(
+        grown, expected,
+        "case {case:?}: expected the listing to report {expected:?}, got {grown:?}"
+    );
+}
+
+/// RULE: a summary is a projection of the one STORED artifact record, so every member it
+/// reports is the member the artifact's own readers report for that id: `fileName` as
+/// `BatchGetArtifactMetadata` and `GetArtifact` report it, and `artifactType` as the
+/// `type` of the artifact `GetArtifact` answers.
+#[tokio::test]
+async fn a_summary_projects_the_record_the_artifact_reads_project() {
+    let router = emulator();
+    let space = create_agent_space(&router, "projected-space", "the space being listed").await;
+    seed(&router, &space).await;
+
+    // (case, the page size the summaries are collected with) — the rows differ along the
+    // size, so the rule holds for a summary read off a first page, a resumed page and a
+    // single whole page alike.
+    let sizes: [(&str, Option<i32>); 3] = [
+        ("one summary per page", Some(1)),
+        ("three summaries per page", Some(3)),
+        ("the default page size", None),
+    ];
+
+    for (case, page_size) in sizes {
+        let listed = list_all(&router, &space, page_size, case).await;
+        assert!(
+            !listed.is_empty(),
+            "case {case:?}: expected the seeded artifacts to be listed, got {listed:?}"
+        );
+
+        // One metadata read of every listed id, so the comparison is against the batch
+        // reader's own answer rather than a second listing.
+        let ids: Vec<String> = listed
+            .iter()
+            .map(|summary| summary.artifact_id.clone())
+            .collect();
+        let metadata = ok(
+            &router,
+            "BatchGetArtifactMetadata",
+            &json!({"agentSpaceId": &space, "artifactIds": ids}),
+            case,
+        )
+        .await;
+        let items = metadata
+            .get("artifactMetadataList")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the batch read carries no artifactMetadataList: {metadata}")
+            })
+            .clone();
+        assert_eq!(
+            items.len(),
+            listed.len(),
+            "case {case:?}: expected metadata for each of the {} listed artifacts, got {items:?}",
+            listed.len()
+        );
+
+        for summary in &listed {
+            let item = items
+                .iter()
+                .find(|item| {
+                    member(item, "artifactId").as_deref() == Some(summary.artifact_id.as_str())
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: the batch read reports no metadata for {:?}: {items:?}",
+                        summary.artifact_id
+                    )
+                });
+            assert_eq!(
+                member(item, "fileName").as_deref(),
+                Some(summary.file_name.as_str()),
+                "case {case:?}: the summary of {:?} reports fileName {:?}, the metadata read \
+                 reports {:?}",
+                summary.artifact_id,
+                summary.file_name,
+                member(item, "fileName")
+            );
+            assert_eq!(
+                member(item, "agentSpaceId").as_deref(),
+                Some(space.as_str()),
+                "case {case:?}: the metadata of {:?} must name the listed space {space:?}, got \
+                 {:?}",
+                summary.artifact_id,
+                member(item, "agentSpaceId")
+            );
+
+            let read = ok(
+                &router,
+                "GetArtifact",
+                &json!({"agentSpaceId": &space, "artifactId": &summary.artifact_id}),
+                case,
+            )
+            .await;
+            assert_eq!(
+                member(&read, "fileName").as_deref(),
+                Some(summary.file_name.as_str()),
+                "case {case:?}: the summary of {:?} reports fileName {:?}, the read reports {:?}",
+                summary.artifact_id,
+                summary.file_name,
+                member(&read, "fileName")
+            );
+            let artifact = read.get("artifact").cloned().unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the read of {:?} carries no artifact: {read}",
+                    summary.artifact_id
+                )
+            });
+            assert_eq!(
+                member(&artifact, "type").as_deref(),
+                Some(summary.artifact_type.as_str()),
+                "case {case:?}: the summary of {:?} reports artifactType {:?}, the read reports \
+                 type {:?}",
+                summary.artifact_id,
+                summary.artifact_type,
+                member(&artifact, "type")
+            );
+        }
+    }
 }
