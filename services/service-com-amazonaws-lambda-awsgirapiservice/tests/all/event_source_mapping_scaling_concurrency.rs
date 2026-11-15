@@ -291,7 +291,11 @@ async fn one_pass_hands_over_as_many_batches_as_the_configured_concurrency_admit
 
 /// The highest `ConcurrentExecutions` datapoint CloudWatch reports for `function`, which is
 /// the greatest concurrency that function was SEEN to hold.
-async fn observed_concurrency(router: &MultiServiceRouter, case: &str, function: &str) -> f64 {
+pub(crate) async fn observed_concurrency(
+    router: &MultiServiceRouter,
+    case: &str,
+    function: &str,
+) -> f64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs_f64())

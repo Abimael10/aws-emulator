@@ -639,6 +639,7 @@ mod tests {
             function_name: "consume".to_string(),
             invoke_identity_arn: None,
             batch_size: MAX_RECORDS_PER_BATCH,
+            in_flight_batches: 1,
             filters: Vec::new(),
             reports_batch_item_failures: false,
             attempts_allowed: Some(2),

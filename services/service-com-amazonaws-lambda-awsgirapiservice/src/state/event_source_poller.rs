@@ -75,6 +75,18 @@
 //!   ([`super::event_source_authorization`]) — the records stay in the shard until the grant
 //!   is in place, which is the same question the call that WIRED the pair together was
 //!   refused for, and again the rule [`crate::state::sqs_poller`] holds a queue mapping to.
+//! * ONE SHARD IS PROCESSED AS MANY BATCHES AT ONCE AS THE MAPPING ASKS FOR.
+//!   `ParallelizationFactor` is "the number of batches to process from each shard
+//!   concurrently", so a pass takes that many batches off ONE shard and hands them to the
+//!   function TOGETHER ([`in_flight_batches_per_shard`]): the invocations really are in
+//!   flight at the same instant, which is the only way the setting is observable. A mapping
+//!   configuring none processes the one batch per shard it always did. Concurrency is not
+//!   allowed to reorder what a client may rely on: the records of one partition key are
+//!   handed over in ONE of those batches, in shard order ([`concurrent_batches`]), so only
+//!   records of different keys are in flight beside each other. The shard still has ONE
+//!   position, so it reads on from past the run of records at the head of what the pass read
+//!   that the pass handled — a record a batch did not take, or one its invocation did not
+//!   process, is where the next read starts.
 //!
 //! Each pass reads what the shard holds and hands it over at once, so a mapping that
 //! configures a `MaximumBatchingWindowInSeconds` above the stream default of 0 is not
@@ -155,9 +167,57 @@ const FAILURE_LOG_INTERVAL: u32 = 20;
 /// record.
 const MAX_RECORDS_PER_BATCH: i32 = 1_000;
 
+/// The most records this emulator reads for ONE shard in one pass, whatever `BatchSize` and
+/// `ParallelizationFactor` come to together ([`read_window`]).
+///
+/// This is the EMULATOR's bound, like [`MAX_RECORDS_PER_BATCH`] and for the same reason: every
+/// record a pass read is held in memory until the batches it routed them to have been handed
+/// over. A mapping whose two settings multiply past it reads fewer batches at once, which is
+/// less concurrency and never a dropped record.
+const MAX_RECORDS_PER_PASS: usize = 1_000;
+
 /// The most pages of a stream's shard listing one pass walks, so a stream cannot keep the
 /// poller in its shard listing.
 const MAX_SHARD_PAGES: usize = 10;
+
+/// The batches of ONE shard a mapping that configures no `ParallelizationFactor` has in
+/// flight: the one batch per shard this poller has always handed over per pass.
+const ONE_BATCH_PER_SHARD: usize = 1;
+
+/// The range `ParallelizationFactor` admits, from the member's own
+/// `@range(min: 1, max: 10)`: the value is read inside it however it got into the store.
+const MIN_PARALLELIZATION_FACTOR: i32 = 1;
+/// See [`MIN_PARALLELIZATION_FACTOR`].
+const MAX_PARALLELIZATION_FACTOR: i32 = 10;
+
+/// How many batches of ONE shard a mapping may have in flight at one instant, which is how
+/// many invocations of its function a pass over that shard hands over concurrently.
+///
+/// "(Kinesis and DynamoDB Streams only) The number of batches to process from each shard
+/// concurrently" (`ParallelizationFactor`) is what a mapping configuring one asks for: that
+/// many batches are read off the shard and handed over together, read inside the range the
+/// member admits ([`MIN_PARALLELIZATION_FACTOR`]). A mapping configuring none keeps this
+/// poller's own cadence of [`ONE_BATCH_PER_SHARD`], which is what it has always handed over
+/// per pass.
+///
+/// Two further bounds hold whatever a mapping configures, because neither is the mapping's
+/// to raise — the function's own reservation and the runs this process can hold at once —
+/// and they are the same two a queue source's concurrency is held to, so both sources read
+/// them in one place ([`super::sqs_poller::batches_in_flight`]).
+///
+/// Never zero: a pass always hands over the one batch it would have handed over anyway.
+pub(crate) fn in_flight_batches_per_shard(
+    parallelization_factor: Option<i32>,
+    reserved_concurrent_executions: Option<i32>,
+) -> usize {
+    let Some(configured) = parallelization_factor else {
+        return ONE_BATCH_PER_SHARD;
+    };
+    super::sqs_poller::batches_in_flight(
+        configured.clamp(MIN_PARALLELIZATION_FACTOR, MAX_PARALLELIZATION_FACTOR),
+        reserved_concurrent_executions,
+    )
+}
 
 /// Start the in-process poller for the event source mapping `uuid` names, if one is not
 /// already running for it.
@@ -305,6 +365,9 @@ struct ShardSourcedMapping {
     /// How many records one batch holds at most, from `BatchSize`, clamped to what this
     /// emulator reads in one go ([`MAX_RECORDS_PER_BATCH`]).
     batch_size: i32,
+    /// How many batches of ONE shard the mapping has in flight at once, from
+    /// `ParallelizationFactor` ([`in_flight_batches_per_shard`]).
+    in_flight_batches: usize,
     /// The patterns the mapping's `FilterCriteria` carry, which decide which records of a
     /// batch the function is invoked with ([`admitted_of`]); empty for a mapping carrying no
     /// criteria, which admits every record.
@@ -677,6 +740,15 @@ fn run_of(
         function_name: mapping.function_name.clone(),
         invoke_identity_arn,
         batch_size: mapping.batch_size.clamp(1, MAX_RECORDS_PER_BATCH),
+        // "The number of batches to process from each shard concurrently", held to what the
+        // function's own concurrency admits ([`in_flight_batches_per_shard`]).
+        in_flight_batches: in_flight_batches_per_shard(
+            mapping.parallelization_factor,
+            store
+                .functions
+                .get(&mapping.function_name)
+                .and_then(|function| function.reserved_concurrent_executions),
+        ),
         filters: super::event_source_filter::patterns_of(mapping.filter_criteria.as_ref()),
         reports_batch_item_failures: super::reports_batch_item_failures(
             &mapping.function_response_types,
@@ -690,13 +762,17 @@ fn run_of(
     })
 }
 
-/// Read one batch from each shard of the mapped stream and hand each to the function.
+/// Read what each shard of the mapped stream holds and hand it to the function.
 ///
-/// Each shard is read on its own — "Process multiple batches from each shard"
-/// (`ParallelizationFactor`) is per shard, and a shard's position is its own — so a batch
-/// one shard could not deliver does not stop the others from being read on this pass.
+/// Each shard is read on its own — a shard's position is its own — so a batch one shard
+/// could not deliver does not stop the others from being read on this pass. What ONE shard
+/// yields is as many batches as the mapping may have in flight for it, "the number of
+/// batches to process from each shard concurrently" (`ParallelizationFactor`): they are read
+/// one after another from the position the shard is at ([`read_window`]) and handed to the
+/// function TOGETHER ([`concurrent_batches`]), so a mapping configured for several of them
+/// really has several invocations running at the same instant.
 ///
-/// Every batch read is metered before it is handed over, because the age it meters is a
+/// Every batch read is metered before anything is handed over, because the age it meters is a
 /// property of the READ: it is how long the newest record of the batch had been in the
 /// shard at the instant Lambda took it off, whatever the invocation then comes to.
 ///
@@ -714,8 +790,8 @@ async fn move_batches(
     uuid: &str,
     run: &ShardSourcedMapping,
 ) -> Outcome {
-    let shards = match shard_ids(callback, &mut work.clients, run).await {
-        Ok(shards) => shards,
+    let listed = match shard_ids(callback, &mut work.clients, run).await {
+        Ok(listed) => listed,
         Err(detail) => {
             return Outcome::Failed {
                 detail,
@@ -731,26 +807,30 @@ async fn move_batches(
     // Whether what failed was the FUNCTION's processing of a batch this pass handed over,
     // rather than something the pass could not do at all (see [`Outcome::Failed`]).
     let mut undelivered = false;
-    for shard in shards {
+    for shard in &listed.shards {
+        let shard = shard.as_str();
         let cursor = run
             .cursors
-            .get(&shard)
+            .get(shard)
             .cloned()
             .unwrap_or_else(|| run.initial_cursor.clone());
-        let records = match read_batch(callback, &mut work.clients, run, &shard, &cursor).await {
+        let read = match read_window(callback, &mut work.clients, run, shard, &cursor).await {
             // "If the shard has been closed, the shard iterator can't return more data":
             // such a shard has no position left to read from.
             Ok(None) => continue,
-            Ok(Some(records)) => records,
+            Ok(Some(read)) => read,
             Err(detail) => {
                 failure = Some(detail);
                 continue;
             }
         };
-        let Some(last) = records.last() else {
+        // The records the pass read off this shard, in the order the shard holds them: the
+        // batches it read, one after the other.
+        let records: Vec<ShardRecord> = read.concat();
+        if records.is_empty() {
             continue;
-        };
-        // The grant is asked about once more now that the batch is in hand, because the
+        }
+        // The grant is asked about once more now that the records are in hand, because the
         // policies in force on the role decide this pass at the instant it acts rather than
         // at the instant it started: a grant taken away while this pass was reading means
         // nothing is handed over, nothing is metered and the shard's position does not move,
@@ -759,60 +839,86 @@ async fn move_batches(
             failure = Some(detail);
             continue;
         }
-        // Every record of the batch, by the identifier a report of this source names one by:
+        // Every record read, by the identifier a report of this source names one by:
         // "the sequence number of the data record in the shard".
         let sequence_numbers: Vec<String> = records
             .iter()
             .map(|record| record.sequence_number.clone())
             .collect();
-        metrics.publish_iterator_age(
-            &run.function_name,
-            iterator_age_millis(last.arrived_at.as_ref(), SystemTime::now()),
-        );
-        // What the mapping's criteria admit of the batch, decided before anything is handed
-        // over: a record no pattern matches is not handed to the function at all, and the
-        // shard still reads on past it ([`admitted_of`]).
+        // One age per BATCH read, because the age is a property of that read: a pass that
+        // took several batches off one shard meters each of them.
+        for batch in &read {
+            if let Some(last) = batch.last() {
+                metrics.publish_iterator_age(
+                    &run.function_name,
+                    iterator_age_millis(last.arrived_at.as_ref(), SystemTime::now()),
+                );
+            }
+        }
+        // What the mapping's criteria admit of what was read, decided before anything is
+        // handed over: a record no pattern matches is not handed to the function at all, and
+        // the shard still reads on past it ([`admitted_of`]).
         let admitted = admitted_of(&criteria, run, &records);
         let Some(invoking) = admitted.invoking() else {
-            // The criteria admitted nothing of this batch, so there is no invocation to make
-            // for it: the pass handled the whole batch by discarding what the filter
-            // rejected, which is a pass that came to no problem, and the shard reads on from
-            // past those records so the ones behind them are delivered.
+            // The criteria admitted nothing of what was read, so there is no invocation to
+            // make for it: the pass handled it all by discarding what the filter rejected,
+            // which is a pass that came to no problem, and the shard reads on from past
+            // those records so the ones behind them are delivered.
             checkpoint(
                 state,
                 uuid,
                 run,
-                &shard,
+                shard,
                 sequence_numbers.last().cloned(),
                 super::LAST_PROCESSING_RESULT_OK,
             );
-            work.attempts.remove(&shard);
+            work.attempts.remove(shard);
             delivered = true;
             continue;
         };
-        // The function can only report about the records it was HANDED, so the report is read
-        // against those ([`super::batch_item_failures`]).
-        let invoking_sequence_numbers: Vec<String> = invoking
+        // The batches of this shard that are in flight together.
+        let batches = concurrent_batches(
+            invoking,
+            &grouping_keys(run, listed.partition_key_attribute.as_deref(), invoking),
+            run.in_flight_batches,
+            batch_records(run),
+        );
+        // What each of them is handed over as, and the records it is the function's report
+        // about ([`super::batch_item_failures`]): a function can only report about the
+        // records it was HANDED.
+        let handing: Vec<(Value, Vec<String>)> = batches
             .iter()
-            .map(|record| record.sequence_number.clone())
+            .map(|batch| {
+                (
+                    batch_event(batch),
+                    batch
+                        .iter()
+                        .map(|record| record.sequence_number.clone())
+                        .collect(),
+                )
+            })
             .collect();
-        let payload = batch_event(invoking);
-        let attempt = hand_over_batch(
-            callback,
-            &mut work.clients,
-            run,
-            &payload,
-            &invoking_sequence_numbers,
-        )
-        .await;
-        // The mapping reads on from past the records the attempt processed, and the attempt
-        // is reported as what the mapping last came to. A shard has ONE position, so what it
-        // reads on from is the run of records at the head of the batch the attempt
-        // processed: the first record its function reported it did not process is where the
-        // next read starts, whatever the report says about the records behind that one. A
-        // record the criteria REJECTED is consumed by the pass itself, so it counts as handled
-        // for that position — a batch the function took every admitted record of is read past
-        // whole.
+        // The client every attempt of this pass is made through, resolved ONCE: the
+        // invocations below are in flight together, so none of them may hold the working
+        // state the client is built on.
+        let client = work.clients.lambda(callback, &run.region).clone();
+        // CONCURRENTLY: each batch this shard yielded is handed to the function while the
+        // others are, which is what `ParallelizationFactor` asks for.
+        let attempt = merged_attempt(
+            ::futures_util::future::join_all(
+                handing
+                    .iter()
+                    .map(|(payload, invoked)| hand_over_batch(&client, run, payload, invoked)),
+            )
+            .await,
+        );
+        // The mapping reads on from past the records the pass processed, and the attempt at
+        // the head of what it read is reported as what the mapping last came to. A shard has
+        // ONE position, so what it reads on from is the run of records at the head that were
+        // processed: the first record its function reported it did not process — or one no
+        // batch of this pass took — is where the next read starts, whatever became of the
+        // records behind that one. A record the criteria REJECTED is consumed by the pass
+        // itself, so it counts as handled for that position.
         let through = attempt
             .failure
             .is_none()
@@ -825,20 +931,20 @@ async fn move_batches(
                 state,
                 uuid,
                 run,
-                &shard,
+                shard,
                 Some(sequence_number),
                 super::LAST_PROCESSING_RESULT_OK,
             );
             // The shard has moved on, so the attempts the batch it was at had are spent on
             // nothing further: the next batch starts its own count.
-            work.attempts.remove(&shard);
+            work.attempts.remove(shard);
             delivered = true;
             continue;
         }
-        // Nothing at the head of the batch was processed: the cursor stays where it was, so
-        // this batch is read again — until the mapping's `MaximumRetryAttempts` is spent on
-        // it — and the failed attempt is what the mapping last came to. Each shard is read on
-        // its own, so the other shards of the stream are still read on this pass.
+        // Nothing at the head was processed: the cursor stays where it was, so those records
+        // are read again — until the mapping's `MaximumRetryAttempts` is spent on them — and
+        // the failed attempt is what the mapping last came to. Each shard is read on its own,
+        // so the other shards of the stream are still read on this pass.
         let detail = attempt.failure.clone().unwrap_or_else(|| {
             format!(
                 "{} reported the first record of the batch it was handed as one it did not \
@@ -846,12 +952,31 @@ async fn move_batches(
                 run.function_arn
             )
         });
+        // The batch the attempts are spent on, and whose records are given up on once they
+        // are: the one holding the shard's own next record, which is the batch the position
+        // waits on.
+        let given_up = batches.first().map_or(&[][..], Vec::as_slice);
+        let given_up_sequence_numbers = handing
+            .first()
+            .map_or(&[][..], |(_, invoked)| invoked.as_slice());
+        // Where the shard reads on from once that batch is given up on: past the run of
+        // records at the head that are accounted for — what this pass handled, plus the
+        // records of the batch it gave up on — so a record no batch of this pass was handed
+        // is never read past.
+        let accounted: Vec<String> = admitted
+            .handled(&attempt.processed)
+            .into_iter()
+            .chain(given_up_sequence_numbers.iter().cloned())
+            .collect();
         let failed = failed_attempt(
             state,
             uuid,
             run,
-            &shard,
-            &sequence_numbers,
+            shard,
+            &GivenUpBatch {
+                sequence_numbers: given_up_sequence_numbers,
+                discarded_through: checkpointed_through(&sequence_numbers, &accounted).as_deref(),
+            },
             &mut work.attempts,
             detail,
         );
@@ -864,10 +989,11 @@ async fn move_batches(
                 policies,
                 &failure_destination::FailedBatch {
                     run,
-                    shard: &shard,
+                    shard,
                     // The batch the mapping gave up on is the one it HANDED OVER: a record
-                    // its criteria rejected was never the function's to process.
-                    records: invoking,
+                    // its criteria rejected was never the function's to process, and one no
+                    // batch of this pass took was never handed over at all.
+                    records: given_up,
                     attempts,
                     answered: attempt.answered.as_ref(),
                 },
@@ -887,26 +1013,159 @@ async fn move_batches(
     }
 }
 
+/// How many records ONE batch of this mapping holds at most, as a count of records.
+fn batch_records(run: &ShardSourcedMapping) -> usize {
+    usize::try_from(run.batch_size).unwrap_or(ONE_BATCH_PER_SHARD).max(1)
+}
+
+/// Read what one pass takes off `shard`: the batches the mapping may have in flight for one
+/// shard ([`in_flight_batches_per_shard`]), each read at the position the one before it
+/// ended at, in the order the shard holds them.
+///
+/// `None` for a shard that has no position left to read from. Reading stops early at the
+/// first batch the shard did not fill, because a shard that handed over less than a batch
+/// has nothing more waiting — so a mapping with no backlog reads exactly the one batch a
+/// serial pass would, and one draining a backlog reads as many as it may hand over at once.
+/// It also stops once the pass holds [`MAX_RECORDS_PER_PASS`] records, so what one pass holds
+/// in memory is bounded whatever `BatchSize` and `ParallelizationFactor` come to together.
+async fn read_window(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    run: &ShardSourcedMapping,
+    shard: &str,
+    cursor: &ShardCursor,
+) -> Result<Option<Vec<Vec<ShardRecord>>>, String> {
+    let mut read: Vec<Vec<ShardRecord>> = Vec::new();
+    let mut held = 0usize;
+    let mut at = cursor.clone();
+    for _ in 0..run.in_flight_batches.max(ONE_BATCH_PER_SHARD) {
+        let Some(batch) = read_batch(callback, clients, run, shard, &at).await? else {
+            // "If the shard has been closed, the shard iterator can't return more data":
+            // such a shard has no position left to read from.
+            return Ok((!read.is_empty()).then_some(read));
+        };
+        let Some(last) = batch.last() else {
+            break;
+        };
+        at = ShardCursor::AfterSequenceNumber(last.sequence_number.clone());
+        let filled = batch.len() >= batch_records(run);
+        held = held.saturating_add(batch.len());
+        read.push(batch);
+        if !filled || held >= MAX_RECORDS_PER_PASS {
+            break;
+        }
+    }
+    Ok(Some(read))
+}
+
+/// The partition key of each of `records`, in the same order — what decides which of a pass's
+/// concurrent batches each record is handed over in ([`concurrent_batches`]).
+fn grouping_keys(
+    run: &ShardSourcedMapping,
+    partition_key_attribute: Option<&str>,
+    records: &[ShardRecord],
+) -> Vec<String> {
+    records
+        .iter()
+        .map(|record| match run.source {
+            ShardSource::Kinesis => kinesis_stream::partition_key(&record.envelope),
+            ShardSource::DynamoDbStream => {
+                dynamodb_stream::partition_key(&record.envelope, partition_key_attribute)
+            }
+        })
+        .collect()
+}
+
+/// Route `records` — what one pass read off ONE shard and its criteria admitted, in shard
+/// order, each with its partition key in `keys` — to the batches the mapping has in flight
+/// for that shard.
+///
+/// `ParallelizationFactor` is "the number of batches to process from each shard
+/// concurrently", so `lanes` is how many batches may be in flight and `batch_size` is how
+/// many records one of them holds. The routing is what keeps concurrency from reordering
+/// anything a client may rely on: the records of ONE partition key all go to the SAME batch,
+/// in shard order, so two records of one key are never in flight beside each other, while
+/// records of different keys are. A key is given the next batch in turn as it first appears,
+/// so the keys a pass read are spread over the batches rather than crowding one of them.
+///
+/// A record that would overflow its batch ends the routing: it and everything behind it are
+/// left for a later pass, so a record is never handed over ahead of one the shard holds
+/// before it. The answer holds no empty batch, and for a mapping with one batch in flight it
+/// is exactly the one batch the pass read.
+fn concurrent_batches(
+    records: &[ShardRecord],
+    keys: &[String],
+    lanes: usize,
+    batch_size: usize,
+) -> Vec<Vec<ShardRecord>> {
+    let lanes = lanes.max(ONE_BATCH_PER_SHARD);
+    let mut batches: Vec<Vec<ShardRecord>> = vec![Vec::new(); lanes];
+    let mut routed: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut taken = 0usize;
+    for (record, key) in records.iter().zip(keys) {
+        let next = taken % lanes;
+        let lane = *routed.entry(key.as_str()).or_insert_with(|| {
+            taken = taken.saturating_add(1);
+            next
+        });
+        if batches[lane].len() >= batch_size.max(1) {
+            break;
+        }
+        batches[lane].push(record.clone());
+    }
+    batches.retain(|batch| !batch.is_empty());
+    batches
+}
+
+/// What the batches one pass had in flight for ONE shard came to, as the shard's own
+/// position is decided from.
+///
+/// The records PROCESSED are every record any of those batches processed, since each of them
+/// reports about the records it was handed. What the pass came to is the attempt on the batch
+/// holding the shard's own next record — the first of what it read — because that is the
+/// attempt the shard's position waits on: records behind a batch that did not process its
+/// own are read again whatever the other batches came to.
+fn merged_attempt(attempts: Vec<Attempt>) -> Attempt {
+    let processed: Vec<String> = attempts
+        .iter()
+        .flat_map(|attempt| attempt.processed.iter().cloned())
+        .collect();
+    match attempts.into_iter().next() {
+        Some(head) => Attempt {
+            processed,
+            answered: head.answered,
+            failure: head.failure,
+        },
+        None => Attempt {
+            processed,
+            answered: None,
+            failure: None,
+        },
+    }
+}
+
 /// Record one FAILED attempt at the batch `sequence_numbers` names on `shard`, and answer
 /// what the attempt came to for the one log line a failing mapping writes.
 ///
 /// What the attempt came to is reported as the mapping's `LastProcessingResult` either way.
 /// The cursor stays where it was — so the same batch is read again — until the mapping has
 /// spent on this batch every attempt it allows: "Discard records after the specified number
-/// of retries" (`MaximumRetryAttempts`), at which point the shard is read on from PAST the
-/// batch, so the records behind the ones that were discarded are delivered. A mapping
-/// carrying the infinite default discards nothing and keeps trying
-/// ([`attempts_allowed`]).
+/// of retries" (`MaximumRetryAttempts`), at which point the shard is read on from
+/// `discarded_through` — as far past the batch as the records ACCOUNTED FOR reach — so the
+/// records behind the ones that were discarded are delivered, and one no batch of the pass
+/// was handed is not read past. A mapping carrying the infinite default discards nothing and
+/// keeps trying ([`attempts_allowed`]).
 fn failed_attempt(
     state: &::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
     uuid: &str,
     run: &ShardSourcedMapping,
     shard: &str,
-    sequence_numbers: &[String],
+    batch: &GivenUpBatch<'_>,
     attempts: &mut BTreeMap<String, BatchAttempts>,
     detail: String,
 ) -> FailedAttempt {
-    let (Some(head), Some(tail)) = (sequence_numbers.first(), sequence_numbers.last()) else {
+    let sequence_numbers = batch.sequence_numbers;
+    let Some(head) = sequence_numbers.first() else {
         return FailedAttempt {
             detail,
             discarded: None,
@@ -941,7 +1200,9 @@ fn failed_attempt(
         uuid,
         run,
         shard,
-        discarded.then(|| tail.clone()),
+        discarded
+            .then(|| batch.discarded_through.map(str::to_string))
+            .flatten(),
         super::LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED,
     );
     if discarded {
@@ -958,6 +1219,18 @@ fn failed_attempt(
         detail: format!("{detail}, so {shard} reads the same batch again"),
         discarded: None,
     }
+}
+
+/// The batch one failed attempt of a pass was at, as [`failed_attempt`] accounts for it: the
+/// records it held, and where the shard reads on from once the mapping gives them up.
+struct GivenUpBatch<'pass> {
+    /// The records of the batch the attempt was at, by sequence number, in the order the
+    /// shard holds them.
+    sequence_numbers: &'pass [String],
+    /// Where the shard reads on from once this batch is discarded: as far past it as the
+    /// records the pass accounted for reach, and `None` when that is nowhere, which leaves
+    /// the position where it was.
+    discarded_through: Option<&'pass str>,
 }
 
 /// What one failed attempt at a batch came to: the sentence it is logged with, and — when
@@ -991,18 +1264,34 @@ fn batch_event(records: &[ShardRecord]) -> Value {
     })
 }
 
-/// Every open and closed shard of the mapped stream, in the order the stream reports them
-/// — through the listing the source's own data plane publishes.
+/// Every open and closed shard of the mapped stream, in the order the stream reports them,
+/// and how the records of one shard are grouped into the concurrent batches of a pass —
+/// through the listing the source's own data plane publishes.
 async fn shard_ids(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
     run: &ShardSourcedMapping,
-) -> Result<Vec<String>, String> {
+) -> Result<StreamShards, String> {
     match run.source {
         ShardSource::Kinesis => kinesis_stream::shard_ids(callback, clients, run).await,
         ShardSource::DynamoDbStream => dynamodb_stream::shard_ids(callback, clients, run).await,
     }
 }
+
+/// What a stream's own listing says about reading it: its shards, and the attribute a record
+/// of it carries its partition key under for the sources that report one apart from the
+/// record.
+pub(super) struct StreamShards {
+    /// Every open and closed shard, in the order the stream reports them.
+    pub(super) shards: Vec<String>,
+    /// The attribute of a record's key that is the PARTITION key of the item it changed, for
+    /// a source whose records carry the whole key: a DynamoDB table's stream reports the key
+    /// schema of the table it is on, whose `HASH` element names that attribute. `None` for a
+    /// source whose record carries its partition key directly (a Kinesis record does), and
+    /// for a listing that reported no key schema to read it from.
+    pub(super) partition_key_attribute: Option<String>,
+}
+
 
 /// The records one batch holds: what `shard` has at `cursor`, up to the mapping's batch
 /// size, each already rendered as the envelope its own source hands a record over as.
@@ -1077,13 +1366,12 @@ fn iterator_age_millis(
 /// its function's report of which of them failed to be read, which is what
 /// `FunctionResponseTypes` says (see [`super::batch_item_failures`]).
 async fn hand_over_batch(
-    callback: &smithy_server_runtime::EmbeddedEmulator,
-    clients: &mut Clients,
+    client: &::aws_sdk_lambda::Client,
     run: &ShardSourcedMapping,
     payload: &Value,
     sequence_numbers: &[String],
 ) -> Attempt {
-    let answered = match invoke_function(callback, clients, run, payload).await {
+    let answered = match invoke_function(client, run, payload).await {
         Ok(answered) => answered,
         // The invocation was not made at all, so there is nothing it answered.
         Err(detail) => {
@@ -1149,13 +1437,11 @@ fn checkpointed_through(sequence_numbers: &[String], processed: &[String]) -> Op
 /// Hand one batch to the function, synchronously, as a stream event source's invocation is,
 /// and answer with everything the invocation reported about it.
 async fn invoke_function(
-    callback: &smithy_server_runtime::EmbeddedEmulator,
-    clients: &mut Clients,
+    client: &::aws_sdk_lambda::Client,
     run: &ShardSourcedMapping,
     payload: &Value,
 ) -> Result<Answered, String> {
-    let answer = clients
-        .lambda(callback, &run.region)
+    let answer = client
         .invoke()
         .function_name(&run.function_arn)
         .payload(::aws_sdk_lambda::primitives::Blob::new(
@@ -1267,6 +1553,146 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{batch_event, checkpointed_through, iterator_age_millis, ShardRecord};
+
+    /// A record carrying `sequence_number`, as the poller routes one.
+    fn record(sequence_number: &str) -> ShardRecord {
+        ShardRecord {
+            sequence_number: sequence_number.to_string(),
+            arrived_at: None,
+            envelope: ::serde_json::json!({ "eventID": sequence_number }),
+        }
+    }
+
+    /// RULE: `ParallelizationFactor` is how many batches of one shard a mapping has in
+    /// flight, held to what the function's own reservation and this process's run capacity
+    /// admit; a mapping configuring none has one.
+    ///
+    /// The rows differ along what the rule generalises over: the value configured (none, each
+    /// end of the published range, one inside it, and values outside it either way), and what
+    /// the function reserves.
+    #[test]
+    fn the_batches_one_shard_yields_are_what_the_mapping_configures() {
+        let host = i64::from(crate::state::execution::MAX_CONCURRENT_RUNS);
+        // (case, `ParallelizationFactor`, `ReservedConcurrentExecutions`, the batches)
+        let rows: Vec<(&str, Option<i32>, Option<i32>, usize)> = vec![
+            ("none-configured", None, None, 1),
+            ("the-published-minimum", Some(1), None, 1),
+            ("inside-the-published-range", Some(4), None, 4),
+            (
+                "the-published-maximum",
+                Some(10),
+                None,
+                usize::try_from(host.min(10)).unwrap_or(1),
+            ),
+            ("below-the-published-range", Some(0), None, 1),
+            (
+                "above-the-published-range",
+                Some(1_000),
+                None,
+                usize::try_from(host.min(10)).unwrap_or(1),
+            ),
+            ("a-reservation-below-it", Some(6), Some(2), 2),
+            ("a-reservation-above-it", Some(2), Some(50), 2),
+            ("a-reservation-of-none", Some(3), Some(0), 1),
+        ];
+        for (case, configured, reserved, expected) in rows {
+            let actual = super::in_flight_batches_per_shard(configured, reserved);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: a mapping configuring {configured:?} with a reservation of \
+                 {reserved:?} must have {expected} batch(es) of one shard in flight, got \
+                 {actual}"
+            );
+        }
+    }
+
+    /// RULE: the records one pass read off a shard are routed to the batches the mapping has
+    /// in flight — the records of ONE partition key to the SAME batch, in shard order, each
+    /// batch holding at most the mapping's `BatchSize` — and a record that would overflow its
+    /// batch, and everything behind it, is left for a later pass.
+    ///
+    /// The rows differ along what the rule generalises over: how many batches may be in
+    /// flight, how large one is, how many keys the records carry and how they are spread over
+    /// them.
+    #[test]
+    fn the_records_of_one_key_are_routed_to_one_batch() {
+        // One row: its case, the (sequence number, partition key) of each record read, how
+        // many batches may be in flight, how large one is, and the batches the records must be
+        // routed to, each by the sequence numbers it holds.
+        type Row<'row> = (
+            &'row str,
+            Vec<(&'row str, &'row str)>,
+            usize,
+            usize,
+            Vec<Vec<&'row str>>,
+        );
+        let rows: Vec<Row<'_>> = vec![
+            (
+                "one batch in flight takes the whole read",
+                vec![("1", "a"), ("2", "b"), ("3", "c")],
+                1,
+                3,
+                vec![vec!["1", "2", "3"]],
+            ),
+            (
+                "two batches over records of two keys",
+                vec![("1", "a"), ("2", "b"), ("3", "a"), ("4", "b")],
+                2,
+                2,
+                vec![vec!["1", "3"], vec!["2", "4"]],
+            ),
+            (
+                "the keys are spread over the batches in turn",
+                vec![("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")],
+                2,
+                1,
+                vec![vec!["1"], vec!["2"]],
+            ),
+            (
+                "records of one key alone fill one batch",
+                vec![("1", "a"), ("2", "a"), ("3", "a")],
+                3,
+                1,
+                vec![vec!["1"]],
+            ),
+            (
+                "more batches in flight than keys read",
+                vec![("1", "a"), ("2", "b")],
+                4,
+                10,
+                vec![vec!["1"], vec!["2"]],
+            ),
+            (
+                "a batch that fills ends the routing",
+                vec![("1", "a"), ("2", "a"), ("3", "b")],
+                2,
+                1,
+                vec![vec!["1"]],
+            ),
+        ];
+        for (case, read, lanes, batch_size, expected) in rows {
+            let records: Vec<ShardRecord> = read
+                .iter()
+                .map(|(sequence_number, _)| record(sequence_number))
+                .collect();
+            let keys: Vec<String> = read.iter().map(|(_, key)| (*key).to_string()).collect();
+            let batches = super::concurrent_batches(&records, &keys, lanes, batch_size);
+            let routed: Vec<Vec<String>> = batches
+                .iter()
+                .map(|batch| {
+                    batch
+                        .iter()
+                        .map(|record| record.sequence_number.clone())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                routed, expected,
+                "case {case:?}: {read:?} read into {lanes} batch(es) of {batch_size} must be \
+                 routed to {expected:?}, got {routed:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_shard_reads_on_from_the_processed_run_at_the_head_of_the_batch() {

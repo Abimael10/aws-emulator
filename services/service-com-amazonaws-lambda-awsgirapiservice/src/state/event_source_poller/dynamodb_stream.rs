@@ -38,19 +38,26 @@
 //! members of its own, so the record the function receives is already the document a pattern
 //! names fields in (see [`super::filter_event`]).
 
-use super::{Clients, ShardRecord, ShardSourcedMapping, MAX_SHARD_PAGES};
+use ::serde_json::Value;
+
+use super::{Clients, ShardRecord, ShardSourcedMapping, StreamShards, MAX_SHARD_PAGES};
 use crate::state::ShardCursor;
 
-/// Every shard of the mapped stream, in the order the stream describes them.
+/// Every shard of the mapped stream, in the order the stream describes them, and the
+/// attribute the table's key schema names as the partition key of every item in it.
 ///
 /// `DescribeStream` pages its shards, so the pages are followed — bounded by
-/// [`MAX_SHARD_PAGES`], because the count is the table's and not this pass's.
+/// [`MAX_SHARD_PAGES`], because the count is the table's and not this pass's. The key schema
+/// is the one the description reports ("The key attribute(s) of the stream's DynamoDB
+/// table"), whose `HASH` element is the partition key a record of this stream is grouped by
+/// ([`partition_key`]).
 pub(super) async fn shard_ids(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
     run: &ShardSourcedMapping,
-) -> Result<Vec<String>, String> {
+) -> Result<StreamShards, String> {
     let mut shards: Vec<String> = Vec::new();
+    let mut partition_key_attribute: Option<String> = None;
     let mut after: Option<String> = None;
     for _ in 0..MAX_SHARD_PAGES {
         let mut request = clients
@@ -70,6 +77,17 @@ pub(super) async fn shard_ids(
         let Some(description) = answer.stream_description else {
             break;
         };
+        partition_key_attribute = partition_key_attribute.or_else(|| {
+            description
+                .key_schema
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|element| {
+                    element.key_type == ::aws_sdk_dynamodbstreams::types::KeyType::Hash
+                })
+                .map(|element| element.attribute_name.clone())
+        });
         shards.extend(
             description
                 .shards
@@ -84,7 +102,31 @@ pub(super) async fn shard_ids(
             break;
         }
     }
-    Ok(shards)
+    Ok(StreamShards {
+        shards,
+        partition_key_attribute,
+    })
+}
+
+/// The PARTITION KEY of one record of this source: the value its item's key carries under
+/// `attribute`, which is what the stream's key schema names as that key.
+///
+/// A record of a DynamoDB stream carries the whole key of the item it changed (`Keys`), so
+/// the partition key is the one attribute of it the schema names. A record whose key does not
+/// carry that attribute, and every record of a listing that reported no schema to read it
+/// from, is grouped by its WHOLE key instead — the finest grouping that still keeps the
+/// records of one item together, since the key identifies the item.
+pub(super) fn partition_key(envelope: &Value, attribute: Option<&str>) -> String {
+    let Some(keys) = envelope
+        .get("dynamodb")
+        .and_then(|record| record.get("Keys"))
+    else {
+        return String::new();
+    };
+    attribute
+        .and_then(|attribute| keys.get(attribute))
+        .unwrap_or(keys)
+        .to_string()
 }
 
 /// One batch off `shard` at `cursor`, each record already rendered as the envelope Lambda

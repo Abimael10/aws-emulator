@@ -2368,3 +2368,16 @@ mod cloudformation_provisions_glue_table_optimizers;
 // rather than restating them here, beside `all/every_suite_file_is_declared.rs`.
 // crate, belongs in that suite's own module header, where it is read beside the test it
 // explains. A note about THIS file belongs in `all/appended_notes.rs`.
+// deliberate: an inner doc comment is legal only before the first item, so a re-typed or
+// merged copy of one landing past the declarations is `E0753` and compiles no suite of this
+// target. With no inner doc comment anywhere in the file there is no such line to copy
+// (`all/all_rs_carries_no_inner_doc_comment.rs`).
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair into the sorted list below. The list holds
+// those pairs and NO other line — not a blank one, not a note — so two branches landing at
+// once insert two lines in two places and have no prose to duplicate, re-word or mistype.
+// belongs in that suite's own module header.
+// `all/every_suite_file_is_declared.rs` pin that shape, for this root and for every service
+// crate's `tests/all.rs`, so check there rather than leaving a note here: a suite no `mod`
+// names compiles nowhere, and a second `mod` for one name is `E0428` — either fails EVERY
+// suite of this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves
+// each module into `tests/all/`.

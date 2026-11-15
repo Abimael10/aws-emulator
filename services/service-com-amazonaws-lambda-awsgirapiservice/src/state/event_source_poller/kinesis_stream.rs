@@ -19,7 +19,7 @@ use std::borrow::Cow;
 
 use ::serde_json::{json, Value};
 
-use super::{Clients, ShardRecord, ShardSourcedMapping, MAX_SHARD_PAGES};
+use super::{Clients, ShardRecord, ShardSourcedMapping, StreamShards, MAX_SHARD_PAGES};
 use crate::state::ShardCursor;
 
 /// The `eventSource` a Kinesis record envelope reports, and the `eventName` each record
@@ -33,11 +33,14 @@ const KINESIS_SCHEMA_VERSION: &str = "1.0";
 const KINESIS_EVENT_VERSION: &str = "1.0";
 
 /// Every open and closed shard of the mapped stream, in the order the stream reports them.
+///
+/// A record of this source carries its own partition key, so the listing reports no
+/// attribute to read one from ([`partition_key`]).
 pub(super) async fn shard_ids(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
     run: &ShardSourcedMapping,
-) -> Result<Vec<String>, String> {
+) -> Result<StreamShards, String> {
     let mut shards: Vec<String> = Vec::new();
     let mut next_token: Option<String> = None;
     for _ in 0..MAX_SHARD_PAGES {
@@ -66,7 +69,22 @@ pub(super) async fn shard_ids(
             None => break,
         }
     }
-    Ok(shards)
+    Ok(StreamShards {
+        shards,
+        partition_key_attribute: None,
+    })
+}
+
+/// The PARTITION KEY of one record of this source: "Identifies which shard in the stream the
+/// data record is assigned to" (`Record$PartitionKey`), which the record itself carries, so
+/// grouping the records of a pass by it needs nothing of the stream's listing.
+pub(super) fn partition_key(envelope: &Value) -> String {
+    envelope
+        .get("kinesis")
+        .and_then(|record| record.get("partitionKey"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// One batch off `shard` at `cursor`, each record already rendered as the envelope Lambda
@@ -244,6 +262,7 @@ mod tests {
             function_name: "consume".to_string(),
             invoke_identity_arn: Some("arn:aws:iam::000000000000:role/consume".to_string()),
             batch_size: MAX_RECORDS_PER_BATCH,
+            in_flight_batches: 1,
             filters: Vec::new(),
             reports_batch_item_failures: false,
             attempts_allowed: None,

@@ -715,7 +715,25 @@ pub fn in_flight_batches(
     let Some(configured) = maximum_concurrency else {
         return ONE_BATCH_PER_PASS;
     };
-    let configured = configured.clamp(MIN_SOURCE_CONCURRENCY, MAX_SOURCE_CONCURRENCY);
+    batches_in_flight(
+        configured.clamp(MIN_SOURCE_CONCURRENCY, MAX_SOURCE_CONCURRENCY),
+        reserved_concurrent_executions,
+    )
+}
+
+/// How many batches a mapping that asks for `configured` of them really has in flight: that
+/// many, less whatever the two bounds above leave it — the function's own reservation and the
+/// runs this process can hold at once — and never fewer than the one batch a pass hands over
+/// anyway.
+///
+/// `configured` is already inside the range of the member that asked for it, because WHICH
+/// member that is differs per source: a queue mapping asks through
+/// `ScalingConfig$MaximumConcurrency` ([`in_flight_batches`]) and a shard mapping through
+/// `ParallelizationFactor`
+/// ([`super::event_source_poller::in_flight_batches_per_shard`]). Everything past that range
+/// is the same question for both, so both sources read it here.
+#[must_use]
+pub fn batches_in_flight(configured: i32, reserved_concurrent_executions: Option<i32>) -> usize {
     let reserved = reserved_concurrent_executions.unwrap_or(i32::MAX);
     let host = i32::try_from(super::execution::MAX_CONCURRENT_RUNS).unwrap_or(i32::MAX);
     usize::try_from(configured.min(reserved).min(host))
