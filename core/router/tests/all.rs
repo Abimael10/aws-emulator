@@ -1381,3 +1381,5 @@ mod s3_notification_granted_function_writes_back_into_the_bucket;
 // suite covers belongs in that suite's own module header, and a note about this file in
 // `all/appended_notes.rs`, declared below like any other suite. The `all_rs_*`,
 // `declaration_roots_*` and `every_suite_file_is_declared` suites pin all of it.
+#[path = "all/cloudformation_asg_launch_fault_diagnosis.rs"]
+mod cloudformation_asg_launch_fault_diagnosis;
