@@ -10,8 +10,8 @@
 //! handler echoing its own input.
 //!
 //! The tables span the resource planes this crate serves (geofence collection,
-//! tracker, route calculator, and the geofence held under a collection) and, for the
-//! tag map, the sizes and shapes `TagMap` admits
+//! tracker, route calculator, map, and the geofence held under a collection) and,
+//! for the tag map, the sizes and shapes `TagMap` admits
 //! (`smithy_query(query="shape",shape="TagMap")`: map `@length max 50`, `TagKey`
 //! `@length 1..128`, `TagValue` `@length 0..256`). The collection the issue report
 //! replays is one row of each table.
@@ -34,9 +34,20 @@ struct Plane {
     read_path: fn(&str) -> String,
 }
 
-/// The three control-plane resources this crate creates, reads and tags.
+/// The four control-plane resources this crate creates, reads and tags.
 fn tagged_planes() -> Vec<Plane> {
     vec![
+        Plane {
+            case: "map",
+            phrase: "Map",
+            create_path: "/maps/v0/maps",
+            // `Configuration` is required, and `VectorEsriStreets` is one of the
+            // styles the `MapConfiguration$Style` catalog publishes.
+            create_body: |name| {
+                json!({ "MapName": name, "Configuration": { "Style": "VectorEsriStreets" } })
+            },
+            read_path: |name| format!("/maps/v0/maps/{name}"),
+        },
         Plane {
             case: "geofence collection",
             phrase: "Geofence collection",
@@ -255,7 +266,7 @@ async fn a_name_already_held_is_refused_with_the_services_own_sentence() {
 /// the name itself becomes free to create again.
 ///
 /// The table is every resource plane of this crate whose delete is implemented
-/// (geofence collection, tracker, route calculator); the names differ along the
+/// (map, geofence collection, tracker, route calculator); the names differ along the
 /// punctuation `ResourceName`'s `^[-._\w]+$` admits. The calculator the issue report
 /// replays is one row.
 #[tokio::test]

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
+use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -41,6 +42,23 @@ pub fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     (router, engine)
+}
+
+/// The RFC 3986 unreserved set: every other byte is percent-encoded.
+const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+/// Percent-encode a value the way an SDK encodes one it puts in a single-segment
+/// `@httpLabel` or an `@httpQuery` value, so an ARN's `:` and `/` cannot be mistaken
+/// for path or query structure.
+///
+/// Here rather than in one suite because every suite that addresses a resource by ARN
+/// needs the same encoding.
+pub fn encode(value: &str) -> String {
+    percent_encode(value.as_bytes(), UNRESERVED).to_string()
 }
 
 /// What the emulator answered.

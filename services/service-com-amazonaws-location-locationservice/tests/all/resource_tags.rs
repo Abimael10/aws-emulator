@@ -26,14 +26,13 @@
 
 use std::collections::BTreeMap;
 
-use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_location_locationservice::state;
 
 // The one HTTP harness this crate's suites share, declared from `tests/all.rs`.
-use crate::harness::{call, emulator, Answer, ACCOUNT, REGION};
+use crate::harness::{call, emulator, encode, Answer, ACCOUNT, REGION};
 
 /// The style a test map is created with, from the `MapConfiguration$Style` catalog.
 const MAP_STYLE: &str = "VectorEsriStreets";
@@ -130,20 +129,6 @@ const TAGGABLE_KINDS: &[TaggableKind] = &[
         describe_path: calculator_path,
     },
 ];
-
-/// The RFC 3986 unreserved set: every other byte is percent-encoded.
-const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'~');
-
-/// Percent-encode a value the way an SDK encodes one it puts in a single-segment
-/// `@httpLabel` or an `@httpQuery` value, so an ARN's `:` and `/` cannot be mistaken
-/// for path or query structure.
-fn encode(value: &str) -> String {
-    percent_encode(value.as_bytes(), UNRESERVED).to_string()
-}
 
 /// `TagResource`: `POST /tags/{ResourceArn}` with the map in the body.
 async fn tag(router: &MultiServiceRouter, arn: &str, tags: Value) -> Answer {

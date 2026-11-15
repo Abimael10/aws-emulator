@@ -25,6 +25,8 @@ mod geofences;
 mod harness;
 #[path = "all/listing_entry_members.rs"]
 mod listing_entry_members;
+#[path = "all/map_deletion.rs"]
+mod map_deletion;
 #[path = "all/map_sprites.rs"]
 mod map_sprites;
 #[path = "all/map_style_document.rs"]
