@@ -7,8 +7,10 @@
 //! restJson1 request — and asserts the response BODY, not just the status.
 //!
 //! The rule under test: `StartAppAssessment` assesses the application's CURRENT
-//! RELEASE against the resiliency policy that application names — any other
-//! `appVersion` is refused with the modelled 400 — and records an assessment that
+//! RELEASE against the resiliency policy that application names — the draft, the
+//! one other version an application has, is refused with the modelled 400, and a
+//! label that addresses no version of it with the modelled 404 — and records an
+//! assessment that
 //! PINS the published snapshot it graded (its publish sequence number, not the
 //! moving alias). Assessing takes time, so the call answers the non-terminal
 //! `Pending` and none of the verdict; one `ASSESSMENT_SPAN` later the assessment
@@ -23,6 +25,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+
+// The sentence an app-version refusal of an assessment states, from the module that
+// owns this crate's shared test harness, so there is ONE literal of it in the tests.
+use super::application_lifecycle::invalid_app_version_sentence as invalid_app_version;
 use service_com_amazonaws_resiliencehub_awsresiliencehub::state::{
     ComAmazonawsResiliencehubAwsresiliencehubState, ASSESSMENT_SPAN, ASSESSMENT_STATUS_PENDING,
     ASSESSMENT_STATUS_SUCCESS, DRAFT_APP_VERSION, RELEASE_APP_VERSION,
@@ -751,11 +757,12 @@ async fn an_assessment_pins_the_published_version_it_graded() {
     }
 }
 
-/// Only the release alias is assessable: the draft, a superseded number and a label
-/// the application never had are each refused with the modelled 400 naming the one
-/// version this operation assesses, while an application that has published nothing
-/// has no release to assess and an application that does not exist is the modelled
-/// 404.
+/// Only the release alias is assessable: the draft is a version the application
+/// HAS, so it is refused with the modelled 400 naming the one version this
+/// operation assesses, while a label that addresses no version of the application
+/// at all — a superseded number, a number nothing minted, a label of another shape,
+/// the alias in another case, or the alias before any publish — is the modelled
+/// 404, as is an application that does not exist.
 #[tokio::test]
 async fn only_the_current_release_is_assessable() {
     let (router, _engine) = emulator();
@@ -767,27 +774,54 @@ async fn only_the_current_release_is_assessable() {
     .await;
 
     // An application with nothing published has no release to assess.
-    let unpublished = create_an_app(&router, "unpublished-app", Some(&policy_arn)).await;
-    start_assessment(&router, &unpublished, RELEASE_APP_VERSION, "no-release")
-        .await
-        .refused(
-            "the release alias before any publish",
-            404,
-            "ResourceNotFoundException",
-        );
+    let unpublished_name = "unpublished-app";
+    let unpublished = create_an_app(&router, unpublished_name, Some(&policy_arn)).await;
+    let refused = start_assessment(&router, &unpublished, RELEASE_APP_VERSION, "no-release").await;
+    refused.refused(
+        "the release alias before any publish",
+        404,
+        "ResourceNotFoundException",
+    );
+    assert_eq!(
+        refused.body["message"].as_str(),
+        Some(
+            invalid_app_version(RELEASE_APP_VERSION, unpublished_name, &unpublished).as_str()
+        ),
+        "case \"the release alias before any publish\": the refusal must state the \
+         precondition and name the application, got {:?}",
+        refused.body
+    );
 
-    let app_arn = create_an_app(&router, "refusal-app", Some(&policy_arn)).await;
+    let app_name = "refusal-app";
+    let app_arn = create_an_app(&router, app_name, Some(&policy_arn)).await;
     add_a_component(&router, &app_arn, "compute-tier").await;
     add_a_resource(&router, &app_arn, "bucket", "compute-tier").await;
     publish(&router, &app_arn, None).await;
     add_a_resource(&router, &app_arn, "second-bucket", "compute-tier").await;
     publish(&router, &app_arn, None).await;
 
-    // The rows differ along the form of the rejected label: the draft, a superseded
-    // publish number, a number no publish minted, a label of another shape, and the
-    // alias in another case.
+    // The draft is a version this application HAS — it is just not the one an
+    // assessment grades.
+    let refused = start_assessment(&router, &app_arn, DRAFT_APP_VERSION, "refused-run").await;
+    refused.refused("the draft", 400, "ValidationException");
+    assert_eq!(
+        refused.body["message"].as_str(),
+        Some(
+            format!(
+                "AppAssessment version {DRAFT_APP_VERSION} is invalid, must be \
+                 {RELEASE_APP_VERSION}"
+            )
+            .as_str()
+        ),
+        "case \"the draft\": the refusal must name the version asked for and the one \
+         version that is assessable, got {:?}",
+        refused.body
+    );
+
+    // The rows differ along the form of a label that addresses no version: a
+    // superseded publish number, a number no publish minted, a label of another
+    // shape, and the alias in another case.
     let rows: &[(&str, &str)] = &[
-        ("the draft", DRAFT_APP_VERSION),
         ("a superseded publish number", "1"),
         ("a publish number nothing minted", "99"),
         ("a label the application never had", "v1"),
@@ -796,15 +830,12 @@ async fn only_the_current_release_is_assessable() {
 
     for (case, app_version) in rows {
         let refused = start_assessment(&router, &app_arn, app_version, "refused-run").await;
-        refused.refused(case, 400, "ValidationException");
+        refused.refused(case, 404, "ResourceNotFoundException");
         assert_eq!(
             refused.body["message"].as_str(),
-            Some(
-                format!("AppAssessment version {app_version} is invalid, must be {RELEASE_APP_VERSION}")
-                    .as_str()
-            ),
-            "case {case:?}: the refusal must name the version asked for and the one version \
-             that is assessable, got {:?}",
+            Some(invalid_app_version(app_version, app_name, &app_arn).as_str()),
+            "case {case:?}: the refusal must state the precondition and name the \
+             application, got {:?}",
             refused.body
         );
     }

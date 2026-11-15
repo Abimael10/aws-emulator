@@ -160,6 +160,22 @@ pub(crate) fn required_objectives(seconds: i64) -> Value {
     })
 }
 
+/// The sentence this service states when an assessment is asked for at an
+/// `appVersion` that addresses no version of the application — written out here as
+/// AWS words it, so a suite asserting it does not compare the implementation
+/// against itself. The slots are the label the request asked for, the stored
+/// application's name and the `appArn` the request carried.
+pub(crate) fn invalid_app_version_sentence(
+    app_version: &str,
+    app_name: &str,
+    app_arn: &str,
+) -> String {
+    format!(
+        "Invalid app version {app_version} for App {app_name} ({app_arn}). \
+         App version has to be draft or release."
+    )
+}
+
 /// A resiliency policy to point applications at, and its ARN.
 pub(crate) async fn create_a_policy(router: &MultiServiceRouter, policy_name: &str) -> String {
     let reply = post(

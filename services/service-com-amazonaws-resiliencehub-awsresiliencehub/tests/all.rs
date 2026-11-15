@@ -33,6 +33,8 @@ mod app_version_template;
 mod application_lifecycle;
 #[path = "all/assessment_score_breakdown.rs"]
 mod assessment_score_breakdown;
+#[path = "all/assessment_version_precondition.rs"]
+mod assessment_version_precondition;
 #[path = "all/input_validation_refusals.rs"]
 mod input_validation_refusals;
 #[path = "all/list_app_versions.rs"]

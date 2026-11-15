@@ -1650,6 +1650,26 @@ pub fn app_version_not_found_message(app_arn: &str, app_version: &str) -> String
     format!("App version {app_version} not found for appArn {app_arn}")
 }
 
+/// The `ResourceNotFoundException` message for a request to ASSESS an application
+/// at an `appVersion` label that addresses no version of it — neither the
+/// application's draft nor a release a publish has frozen.
+///
+/// A DIFFERENT sentence from [`app_version_not_found_message`], because the
+/// service states this refusal differently where an assessment is what could not
+/// be started: it names the application by the `name` it is stored under as well
+/// as by the ARN the request carried, and states the precondition the label has to
+/// satisfy — the two labels an assessment addresses a version by — which is what
+/// tells a caller that the remedy is to publish rather than to create the
+/// application. The FIXED text is the whole sentence around the three slots; the
+/// VARIABLE parts are the `appVersion` the request asked for, the stored
+/// application's name and the request's `appArn`.
+pub fn invalid_app_version_message(app_version: &str, app_name: &str, app_arn: &str) -> String {
+    format!(
+        "Invalid app version {app_version} for App {app_name} ({app_arn}). \
+         App version has to be {DRAFT_APP_VERSION} or {RELEASE_APP_VERSION}."
+    )
+}
+
 /// The `ResourceNotFoundException` message for a `resourceArn` this service holds
 /// no taggable resource under — the refusal the tagging operations state, which
 /// address an application, a resiliency policy or an assessment alike by the one

@@ -604,56 +604,44 @@ struct Addressed {
     target: &'static str,
     /// The request members beyond `appArn` and `appVersion`.
     extra: Value,
-    /// Whether this operation addresses a version other than the release alias
-    /// (`StartAppAssessment` assesses only the current release, so it judges the
-    /// label before it resolves it).
-    any_version: bool,
 }
 
-/// Every operation that resolves an app version, with the input it needs.
+/// Every operation that READS at an app version, with the input it needs.
+///
+/// `StartAppAssessment` is not one of them: it states its own sentence for an
+/// `appVersion` that addresses no version — naming the application and the
+/// precondition the label has to satisfy — which `app_assessment` asserts.
 fn addressed_operations() -> Vec<Addressed> {
     vec![
         Addressed {
             operation: "DescribeAppVersionTemplate",
             target: "/describe-app-version-template",
             extra: json!({}),
-            any_version: true,
         },
         Addressed {
             operation: "ListAppVersionResources",
             target: "/list-app-version-resources",
             extra: json!({}),
-            any_version: true,
         },
         Addressed {
             operation: "DescribeAppVersionResource",
             target: "/describe-app-version-resource",
             extra: json!({"resourceName": "only-bucket"}),
-            any_version: true,
         },
         Addressed {
             operation: "DescribeAppVersionAppComponent",
             target: "/describe-app-version-app-component",
             extra: json!({"id": "storage"}),
-            any_version: true,
         },
         Addressed {
             operation: "ResolveAppVersionResources",
             target: "/resolve-app-version-resources",
             extra: json!({}),
-            any_version: true,
         },
         Addressed {
             operation: "DescribeAppVersionResourcesResolutionStatus",
             target: "/describe-app-version-resources-resolution-status",
             extra: json!({}),
-            any_version: true,
-        },
-        Addressed {
-            operation: "StartAppAssessment",
-            target: "/start-app-assessment",
-            extra: json!({"assessmentName": "an-assessment"}),
-            any_version: false,
         },
     ]
 }
@@ -680,26 +668,18 @@ async fn an_app_version_the_application_does_not_have_is_refused_with_one_senten
     // the top of `EntityVersion`'s pattern `^\S{1,50}$`, and the release alias
     // before anything is published.
     let versions = [
-        ("a sequence number nothing minted", "99", true),
-        ("a versionName, not a version", "v1", true),
+        ("a sequence number nothing minted", "99"),
+        ("a versionName, not a version", "v1"),
         (
             "a 50-character version",
             "v999999999999999999999999999999999999999999999999",
-            true,
         ),
-        (
-            "the release alias before any publish",
-            "release",
-            false,
-        ),
+        ("the release alias before any publish", "release"),
     ];
 
-    for (version_case, app_version, only_any_version) in versions {
+    for (version_case, app_version) in versions {
         let expected = format!("App version {app_version} not found for appArn {app_arn}");
         for addressed in addressed_operations() {
-            if only_any_version && !addressed.any_version {
-                continue;
-            }
             let case = format!("{} / {version_case}", addressed.operation);
             let mut request = json!({"appArn": app_arn, "appVersion": app_version});
             for (member, value) in addressed.extra.as_object().into_iter().flatten() {

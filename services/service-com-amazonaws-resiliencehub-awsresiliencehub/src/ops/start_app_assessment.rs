@@ -10,8 +10,12 @@
 //! edit to either cannot change what a finished assessment reports. Assessing takes
 //! time, so the call answers the assessment it STARTED — the non-terminal
 //! `Pending` — and the terminal status, the verdict and the score are what a read
-//! finds one [`crate::state::ASSESSMENT_SPAN`] later. Any `appVersion` other than
-//! the release alias is refused with the modelled `ValidationException`.
+//! finds one [`crate::state::ASSESSMENT_SPAN`] later. An `appVersion` label that
+//! addresses no version of the application — one that is neither the draft label
+//! nor the release alias, or the alias of an application that has published
+//! nothing — is refused with the modelled `ResourceNotFoundException`, and the
+//! draft, which does address a version but is not assessable, with the modelled
+//! `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -188,20 +192,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that path has to resolve: recording an assessment of an unknown version
         // would make a later read report an assessment of something that does not
         // exist.
-        if !store.apps.contains_key(&input.app_arn) {
+        let Some(app) = store.apps.get(&input.app_arn) else {
             return Err(app_not_found(&input.app_arn));
+        };
+        // An assessment addresses an app version by one of TWO labels — the
+        // application's draft or its current release — and the release alias
+        // addresses a version only once a publish has frozen one under it. A label
+        // that is neither, or the alias of an application that has published
+        // nothing, addresses no version of this application, which is what the
+        // invalid-app-version refusal states.
+        let addresses_a_version = matches!(
+            input.app_version.as_str(),
+            crate::state::DRAFT_APP_VERSION | crate::state::RELEASE_APP_VERSION
+        ) && store.app_version_exists(&input.app_arn, &input.app_version);
+        if !addresses_a_version {
+            return Err(invalid_app_version(
+                &input.app_version,
+                &app.name,
+                &input.app_arn,
+            ));
         }
-        // Only the application's current RELEASE is assessable: every other version
-        // is either the draft, which the next write changes, or a snapshot the
-        // release has already superseded, so a verdict on it would be a verdict on
-        // something that is not the application as it stands. The label is judged
-        // before it is resolved, so the refusal is the same whether or not the
-        // application has such a version.
+        // Of the two, only the current RELEASE is assessable: the draft is the
+        // version the next write changes, so a verdict on it would be a verdict on
+        // something that is not the application as it stands.
         if input.app_version != crate::state::RELEASE_APP_VERSION {
             return Err(version_not_assessable(&input.app_version));
-        }
-        if !store.app_version_exists(&input.app_arn, &input.app_version) {
-            return Err(app_version_not_found(&input.app_arn, &input.app_version));
         }
 
         // A replayed `@idempotencyToken` answers the assessment its first call
@@ -551,12 +566,21 @@ fn app_not_found(app_arn: &str) -> StartAppAssessmentError {
     .into()
 }
 
-/// A 404 for an `appVersion` the application does not have.
-fn app_version_not_found(app_arn: &str, app_version: &str) -> StartAppAssessmentError {
+/// A 404 for an `appVersion` label that addresses no version of the application an
+/// assessment was asked for — neither its draft nor a frozen release. The refusal
+/// names the label, the application (by its stored name and the ARN the request
+/// carried) and the precondition the label has to satisfy; see
+/// [`crate::state::invalid_app_version_message`].
+fn invalid_app_version(
+    app_version: &str,
+    app_name: &str,
+    app_arn: &str,
+) -> StartAppAssessmentError {
     StartAppAssessmentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::app_version_not_found_message(
-            app_arn,
+        message: Some(crate::state::invalid_app_version_message(
             app_version,
+            app_name,
+            app_arn,
         )),
         resource_id: Some(app_version.to_string()),
         resource_type: Some("AppVersion".to_string()),
