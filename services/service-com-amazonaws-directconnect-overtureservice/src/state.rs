@@ -110,6 +110,21 @@ pub fn virtual_interface_name_is_valid(name: &str) -> bool {
 /// mode's port speeds are always in the same order.
 pub const DEDICATED_PORT_SPEEDS: [&str; 4] = ["100G", "1G", "10G", "400G"];
 
+/// `known` narrowed to the members `present` names, in `known`'s OWN order.
+///
+/// The one narrowing every catalog-wide list is published through
+/// ([`catalog_port_speeds`], [`published_providers`]): the order comes from the
+/// catalog-wide list rather than from the per-location one, a member repeated in
+/// `present` is published once, and a name `known` does not carry is dropped rather
+/// than published.
+fn narrowed_in_order(known: &[&str], present: &[&str]) -> Vec<String> {
+    known
+        .iter()
+        .filter(|member| present.contains(*member))
+        .map(|member| (*member).to_string())
+        .collect()
+}
+
 /// `available` narrowed to the speeds a dedicated connection can be ordered at, in
 /// [`DEDICATED_PORT_SPEEDS`] order.
 ///
@@ -117,11 +132,7 @@ pub const DEDICATED_PORT_SPEEDS: [&str; 4] = ["100G", "1G", "10G", "400G"];
 /// its speeds in that one order, without repeats, and a speed
 /// [`DEDICATED_PORT_SPEEDS`] does not name is dropped rather than published.
 pub fn catalog_port_speeds(available: &[&str]) -> Vec<String> {
-    DEDICATED_PORT_SPEEDS
-        .iter()
-        .filter(|known| available.contains(*known))
-        .map(|known| (*known).to_string())
-        .collect()
+    narrowed_in_order(&DEDICATED_PORT_SPEEDS, available)
 }
 
 /// The port speeds MAC Security (MACsec) is offered on, at a location that offers
@@ -564,97 +575,132 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
     }
 }
 
-/// The service providers a facility publishes in `availableProviders`.
+/// Which Direct Connect delivery partners deliver at one place: MEMBERSHIP only,
+/// because the order a location publishes them in is not a property of the place.
 ///
-/// A list PER FACILITY rather than one catalog-wide list: `availableProviders` is
-/// "the name of the service provider for the location", and which Direct Connect
-/// delivery partners have presence at a facility is a property of that facility — a
-/// carrier hotel reaches nearly every partner, a single-tenant data centre a handful.
-type ProviderList = &'static [&'static str];
+/// A list PER LOCATION rather than one catalog-wide list: `availableProviders` is
+/// "the name of the service provider for the location", and which partners deliver
+/// there is a property of that demarcation — a carrier hotel's meet-me room reaches
+/// nearly every partner, a single-tenant data centre a handful. The ORDER comes from
+/// [`DIRECT_CONNECT_PROVIDERS`] through [`published_providers`], so no location can
+/// publish two partners in an order another location contradicts.
+type ProviderPresence = &'static [&'static str];
 
-/// The Direct Connect delivery partners this catalog draws `availableProviders`
-/// from, named the way AWS reports them: the partner's company name
-/// (`Equinix, Inc.`, `Zayo Group`, `Lumen Technologies`), not a shortened trade name
-/// (`Equinix`, `Zayo`).
+/// The Direct Connect delivery partners this catalog draws `availableProviders` from,
+/// in the order AWS publishes them.
 ///
-/// Source: the AWS Direct Connect delivery-partner list, as the recorded
-/// `DescribeLocations` response spells it — one carrier-hotel facility there carries
-/// roughly thirty entries, among them `Equinix, Inc.`, `Megaport`, `Zayo Group`,
-/// `CenturyLink`, `AT&T`, `PacketFabric` and `Arelion`.
-pub const DIRECT_CONNECT_PROVIDERS: [&str; 30] = [
-    "AT&T",
-    "Arelion",
-    "BT",
-    "CenturyLink",
-    "Cogent Communications",
-    "Cologix",
-    "Colt Technology Services",
-    "Comcast Business",
-    "Console Connect by PCCW Global",
-    "CoreSite",
-    "Cox Business",
-    "Crown Castle",
-    "Digital Realty",
-    "Equinix, Inc.",
-    "Flexential",
-    "GTT Communications",
-    "Internet2",
-    "Lumen Technologies",
-    "Megaport",
-    "NTT Communications",
-    "Orange Business Services",
-    "PacketFabric",
-    "Rogers Communications",
-    "Sify Technologies",
-    "Tata Communications",
+/// Two things the roster fixes, both of them observable in `availableProviders`:
+///
+/// * the SPELLING. The names are the trade forms AWS prints — `Colt`, `GTT`,
+///   `Comcast`, `Console Connect`, `Equinix, Inc.` — not the expanded company names
+///   (`Colt Technology Services`, `GTT Communications`, `Comcast Business`,
+///   `Console Connect by PCCW Global`), because the string a client reads here is the
+///   one it carries forward as `CreateConnection$providerName`.
+/// * the ORDER. A partner list comes back in the catalog's own order, which is
+///   neither alphabetical nor lexicographic, so the roster is written in that order
+///   and every location's list is rendered by narrowing it ([`published_providers`])
+///   rather than by sorting.
+///
+/// Source: a recorded `DescribeLocations` response for one carrier-hotel demarcation
+/// in `us-west-2` prints the first thirty of these names, in exactly this order, and
+/// that is where the roster's spellings and its order come from
+/// ([`EQUINIX_SEATTLE_PROVIDERS`] is that recorded list). A partner that demarcation
+/// does not reach — `Tata Communications` — follows them: it is a delivery partner of
+/// the public catalog, and its place in the roster is CATALOGUED rather than recorded.
+/// `Location$availableProviders` ("the name of the service provider for the
+/// location", `ProviderList`, via `smithy_query(query="shape",shape="Location")`)
+/// constrains neither the names nor their order, so both are catalog data.
+pub const DIRECT_CONNECT_PROVIDERS: [&str; 31] = [
+    "Pureport",
+    "Beanfield Metroconnect",
+    "ePLDT",
+    "Datapipe",
     "Telstra",
+    "Colt",
     "Verizon",
-    "Vodafone",
-    "Windstream",
-    "Zayo Group",
-];
-
-/// What a carrier hotel publishes: every partner in
-/// [`DIRECT_CONNECT_PROVIDERS`], because that is what a meet-me room in one reaches.
-const CARRIER_HOTEL_PROVIDERS: ProviderList = &DIRECT_CONNECT_PROVIDERS;
-
-/// The partners present at the Pacific Northwest facilities that are not carrier
-/// hotels.
-const PACIFIC_NORTHWEST_PROVIDERS: ProviderList = &[
-    "Arelion",
-    "Cologix",
-    "Equinix, Inc.",
-    "Flexential",
-    "Lumen Technologies",
+    "Console Connect",
+    "Internet2",
+    "Transtelco",
     "Megaport",
+    "GTT",
+    "Layer42",
+    "Allstream",
+    "Equinix, Inc.",
+    "Zayo Group",
+    "Masergy",
+    "CenturyLink",
+    "AT&T",
+    "IX Reach",
+    "Comcast",
+    "Sprint",
+    "XO Communications",
+    "HopOne",
+    "RCN",
     "PacketFabric",
-    "Zayo Group",
-];
-
-/// The partners present at a single-operator metro data centre.
-const METRO_PROVIDERS: ProviderList =
-    &["Cologix", "Lumen Technologies", "Megaport", "Zayo Group"];
-
-/// The partners present at the European facilities.
-const EUROPEAN_PROVIDERS: ProviderList = &[
+    "Telus",
     "Arelion",
-    "BT",
-    "Colt Technology Services",
-    "Equinix, Inc.",
-    "GTT Communications",
-    "Megaport",
-    "Orange Business Services",
-    "Vodafone",
+    "China Mobile International",
+    "Epsilon",
+    "Tata Communications",
 ];
 
-/// The partners present at the Asia Pacific facilities.
-const ASIA_PACIFIC_PROVIDERS: ProviderList = &[
-    "Console Connect by PCCW Global",
-    "Equinix, Inc.",
-    "Megaport",
-    "NTT Communications",
-    "Tata Communications",
+/// A location's `availableProviders`: [`DIRECT_CONNECT_PROVIDERS`] narrowed to the
+/// partners `present` where it is published, in the roster's order.
+///
+/// Narrowing the roster rather than copying `present` is what gives every location ONE
+/// published order (the catalog's, not alphabetical) and drops any name that is not a
+/// delivery partner of this catalog, so a location can neither publish a provider the
+/// catalog does not know nor publish two partners in an order another location
+/// contradicts. A name repeated in `present` is published once, because a partner
+/// delivers at a place or does not.
+pub fn published_providers(present: &[&str]) -> Vec<String> {
+    narrowed_in_order(&DIRECT_CONNECT_PROVIDERS, present)
+}
+
+/// What the Seattle carrier hotel's own meet-me room publishes: every partner on the
+/// roster, because a cross connect there reaches all of them.
+///
+/// CATALOGUED, not recorded: no recorded response for this demarcation is available
+/// here, and the recording the roster comes from is for the colocation partner's cage
+/// in the same building ([`EQUINIX_SEATTLE_PROVIDERS`]), which publishes its own list.
+const WESTIN_BUILDING_PROVIDERS: ProviderPresence = &DIRECT_CONNECT_PROVIDERS;
+
+/// What the colocation partner's cage inside that carrier hotel publishes: the
+/// building's partners it cross-connects to, which is the roster bar one.
+///
+/// Source: the recorded `DescribeLocations` response for the `EqSe2-EQ` demarcation
+/// in `us-west-2`, which prints exactly these names in exactly this order.
+const EQUINIX_SEATTLE_PROVIDERS: ProviderPresence = &[
+    "Pureport",
+    "Beanfield Metroconnect",
+    "ePLDT",
+    "Datapipe",
     "Telstra",
+    "Colt",
+    "Verizon",
+    "Console Connect",
+    "Internet2",
+    "Transtelco",
+    "Megaport",
+    "GTT",
+    "Layer42",
+    "Allstream",
+    "Equinix, Inc.",
+    "Zayo Group",
+    "Masergy",
+    "CenturyLink",
+    "AT&T",
+    "IX Reach",
+    "Comcast",
+    "Sprint",
+    "XO Communications",
+    "HopOne",
+    "RCN",
+    "PacketFabric",
+    "Telus",
+    "Arelion",
+    "China Mobile International",
+    "Epsilon",
 ];
 
 /// One row of the catalog: the demarcation ONE colocation partner offers at a
@@ -677,6 +723,14 @@ struct CatalogLocationRow {
     /// Whether MAC Security is offered here at all; which of [`Self::port_speeds`]
     /// carry it is [`mac_sec_port_speeds`].
     offers_mac_sec: bool,
+    /// The partners reachable at THIS demarcation when they are not the whole
+    /// facility's list ([`CatalogFacility::providers`]).
+    ///
+    /// A cross connect is ordered to one partner's patch panel, so two demarcations
+    /// in the same building can publish different partner lists: the carriers that
+    /// have a presence in a facility's own meet-me room are not exactly those that
+    /// cross-connect at a colocation partner's cage inside it.
+    providers: Option<ProviderPresence>,
 }
 
 /// One colocation facility, and every partner demarcation AWS publishes a location
@@ -688,8 +742,11 @@ struct CatalogFacility {
     building: &'static str,
     /// The Region whose `DescribeLocations` answers these locations.
     region: &'static str,
-    /// The providers reachable at this facility.
-    providers: ProviderList,
+    /// The delivery partners with presence at this facility, which every demarcation
+    /// at it publishes unless its own row names a list
+    /// ([`CatalogLocationRow::providers`]). Published in
+    /// [`DIRECT_CONNECT_PROVIDERS`] order by [`published_providers`].
+    providers: ProviderPresence,
     /// The partner demarcations at this facility.
     locations: &'static [CatalogLocationRow],
 }
@@ -704,34 +761,77 @@ struct CatalogFacility {
 /// `locationCode` (`EqSe2-EQ`, `EqSe2-WBE`) and a `locationName` that names the
 /// building and then the partner's site.
 ///
+/// Each facility's [`CatalogFacility::providers`] (or a demarcation's own
+/// [`CatalogLocationRow::providers`]) names the delivery partners that deliver there,
+/// from the roster [`DIRECT_CONNECT_PROVIDERS`] holds: a carrier hotel reaches nearly
+/// the whole roster, a metro or single-operator site the handful of carriers present
+/// in it.
+///
+/// WHICH of these lists is recorded: `EqSe2-EQ`'s ([`EQUINIX_SEATTLE_PROVIDERS`]) and
+/// that alone. Every other location's partner membership is CATALOGUED — written from
+/// the public facility and delivery-partner lists under the rule above — so a later
+/// fixer holding a recording for one of these facilities should refine that row's
+/// membership rather than read it as a recorded fact. The spellings and the published
+/// ORDER are recorded for all of them, because both come from the one roster.
+///
 /// What is derived rather than written down: a row's `locationCode`, its
 /// `locationName`, the order of its port speeds ([`catalog_port_speeds`]), its MACsec
-/// speeds ([`mac_sec_port_speeds`]) and its one billing mode
-/// ([`ComAmazonawsDirectconnectOvertureserviceState::location_output`]) — so no two
-/// of those can disagree with a row's own speeds.
+/// speeds ([`mac_sec_port_speeds`]), its one billing mode
+/// ([`ComAmazonawsDirectconnectOvertureserviceState::location_output`]) and the order
+/// of its providers ([`published_providers`]) — so no two of those can disagree with a
+/// row's own speeds, and no facility publishes partners in an order another
+/// contradicts.
 ///
 /// The rows deliberately span the class: facilities with one partner and with
 /// several, port-speed sets with and without 100G and 400G, demarcations with and
-/// without MACsec, carrier hotels reaching every provider and metro sites reaching a
-/// handful, in several Regions.
+/// without MACsec, carrier hotels reaching the whole partner roster and metro sites
+/// reaching a handful, in several Regions.
 const BUILT_IN_FACILITIES: &[CatalogFacility] = &[
     CatalogFacility {
         code: "EqDC2",
         building: "Equinix DC2, Ashburn, VA",
         region: "us-east-1",
-        providers: CARRIER_HOTEL_PROVIDERS,
+        providers: &[
+            "Pureport",
+            "Datapipe",
+            "Telstra",
+            "Colt",
+            "Verizon",
+            "Console Connect",
+            "Internet2",
+            "Megaport",
+            "GTT",
+            "Allstream",
+            "Equinix, Inc.",
+            "Zayo Group",
+            "Masergy",
+            "CenturyLink",
+            "AT&T",
+            "IX Reach",
+            "Comcast",
+            "Sprint",
+            "XO Communications",
+            "HopOne",
+            "RCN",
+            "PacketFabric",
+            "Arelion",
+            "China Mobile International",
+            "Epsilon",
+        ],
         locations: &[
             CatalogLocationRow {
                 partner_code: "EQ",
                 partner_site: "Equinix, DC2, Ashburn, VA",
                 port_speeds: &["1G", "10G", "100G"],
                 offers_mac_sec: true,
+                providers: None,
             },
             CatalogLocationRow {
                 partner_code: "DRT",
                 partner_site: "Digital Realty, IAD38, Ashburn, VA",
                 port_speeds: &["1G", "10G"],
                 offers_mac_sec: false,
+                providers: None,
             },
         ],
     },
@@ -739,31 +839,63 @@ const BUILT_IN_FACILITIES: &[CatalogFacility] = &[
         code: "CSDC1",
         building: "CoreSite DC1, Reston, VA",
         region: "us-east-1",
-        providers: METRO_PROVIDERS,
+        providers: &[
+            "Internet2",
+            "Megaport",
+            "Zayo Group",
+            "CenturyLink",
+            "AT&T",
+            "PacketFabric",
+            "Arelion",
+        ],
         locations: &[CatalogLocationRow {
             partner_code: "CS",
             partner_site: "CoreSite, DC1, Reston, VA",
             port_speeds: &["1G", "10G"],
             offers_mac_sec: false,
+            providers: None,
         }],
     },
     CatalogFacility {
         code: "EqCh2",
         building: "Equinix CH2, Chicago, IL",
         region: "us-east-2",
-        providers: CARRIER_HOTEL_PROVIDERS,
+        providers: &[
+            "Datapipe",
+            "Telstra",
+            "Colt",
+            "Verizon",
+            "Console Connect",
+            "Internet2",
+            "Megaport",
+            "GTT",
+            "Allstream",
+            "Equinix, Inc.",
+            "Zayo Group",
+            "CenturyLink",
+            "AT&T",
+            "IX Reach",
+            "Comcast",
+            "Sprint",
+            "PacketFabric",
+            "Telus",
+            "Arelion",
+            "Epsilon",
+        ],
         locations: &[
             CatalogLocationRow {
                 partner_code: "EQ",
                 partner_site: "Equinix, CH2, Chicago, IL",
                 port_speeds: &["1G", "10G", "100G"],
                 offers_mac_sec: true,
+                providers: None,
             },
             CatalogLocationRow {
                 partner_code: "CL",
                 partner_site: "Cologix, CHI1, Chicago, IL",
                 port_speeds: &["1G", "10G", "100G", "400G"],
                 offers_mac_sec: true,
+                providers: None,
             },
         ],
     },
@@ -771,19 +903,21 @@ const BUILT_IN_FACILITIES: &[CatalogFacility] = &[
         code: "EqSe2",
         building: "Westin Building Exchange, Seattle, WA",
         region: "us-west-2",
-        providers: CARRIER_HOTEL_PROVIDERS,
+        providers: WESTIN_BUILDING_PROVIDERS,
         locations: &[
             CatalogLocationRow {
                 partner_code: "EQ",
                 partner_site: "Equinix, SE2, Seattle, WA",
                 port_speeds: &["1G", "10G", "100G"],
                 offers_mac_sec: true,
+                providers: Some(EQUINIX_SEATTLE_PROVIDERS),
             },
             CatalogLocationRow {
                 partner_code: "WBE",
                 partner_site: "Westin Building Exchange, Seattle, WA",
                 port_speeds: &["1G", "10G", "100G", "400G"],
                 offers_mac_sec: true,
+                providers: None,
             },
         ],
     },
@@ -791,19 +925,38 @@ const BUILT_IN_FACILITIES: &[CatalogFacility] = &[
         code: "EqSe3",
         building: "Equinix SE3, Seattle, WA",
         region: "us-west-2",
-        providers: PACIFIC_NORTHWEST_PROVIDERS,
+        providers: &[
+            "Telstra",
+            "Colt",
+            "Verizon",
+            "Console Connect",
+            "Internet2",
+            "Megaport",
+            "GTT",
+            "Allstream",
+            "Equinix, Inc.",
+            "Zayo Group",
+            "CenturyLink",
+            "AT&T",
+            "Comcast",
+            "PacketFabric",
+            "Telus",
+            "Arelion",
+        ],
         locations: &[
             CatalogLocationRow {
                 partner_code: "EQ",
                 partner_site: "Equinix, SE3, Seattle, WA",
                 port_speeds: &["1G", "10G", "100G"],
                 offers_mac_sec: true,
+                providers: None,
             },
             CatalogLocationRow {
                 partner_code: "CL",
                 partner_site: "Cologix, SEA1, Seattle, WA",
                 port_speeds: &["1G", "10G"],
                 offers_mac_sec: false,
+                providers: None,
             },
         ],
     },
@@ -811,31 +964,53 @@ const BUILT_IN_FACILITIES: &[CatalogFacility] = &[
         code: "FlexHB1",
         building: "Flexential Hillsboro, Hillsboro, OR",
         region: "us-west-2",
-        providers: PACIFIC_NORTHWEST_PROVIDERS,
+        providers: &[
+            "Megaport",
+            "Zayo Group",
+            "CenturyLink",
+            "AT&T",
+            "PacketFabric",
+            "Telus",
+            "Arelion",
+        ],
         locations: &[CatalogLocationRow {
             partner_code: "FLX",
             partner_site: "Flexential, HIL1, Hillsboro, OR",
             port_speeds: &["1G", "10G", "100G", "400G"],
             offers_mac_sec: true,
+            providers: None,
         }],
     },
     CatalogFacility {
         code: "Pittock",
         building: "Pittock Block, Portland, OR",
         region: "us-west-2",
-        providers: METRO_PROVIDERS,
+        providers: &[
+            "Colt",
+            "Megaport",
+            "Zayo Group",
+            "CenturyLink",
+            "AT&T",
+            "IX Reach",
+            "Comcast",
+            "PacketFabric",
+            "Telus",
+            "Arelion",
+        ],
         locations: &[
             CatalogLocationRow {
                 partner_code: "PB",
                 partner_site: "Pittock Block, Portland, OR",
                 port_speeds: &["1G", "10G"],
                 offers_mac_sec: false,
+                providers: None,
             },
             CatalogLocationRow {
                 partner_code: "OPX",
                 partner_site: "Opus Interactive, Pittock Block, Portland, OR",
                 port_speeds: &["1G", "10G", "100G"],
                 offers_mac_sec: true,
+                providers: None,
             },
         ],
     },
@@ -843,67 +1018,116 @@ const BUILT_IN_FACILITIES: &[CatalogFacility] = &[
         code: "SUPERNAP8",
         building: "Switch SUPERNAP 8, Las Vegas, NV",
         region: "us-west-2",
-        providers: METRO_PROVIDERS,
+        providers: &[
+            "Megaport",
+            "Zayo Group",
+            "CenturyLink",
+            "AT&T",
+            "PacketFabric",
+        ],
         locations: &[CatalogLocationRow {
             partner_code: "SW",
             partner_site: "Switch, SUPERNAP 8, Las Vegas, NV",
             port_speeds: &["1G", "10G", "100G"],
             offers_mac_sec: true,
+            providers: None,
         }],
     },
     CatalogFacility {
         code: "T5PDX",
         building: "T5@Portland, Hillsboro, OR",
         region: "us-west-2",
-        providers: PACIFIC_NORTHWEST_PROVIDERS,
+        providers: &["Megaport", "Zayo Group", "CenturyLink", "PacketFabric"],
         locations: &[CatalogLocationRow {
             partner_code: "T5",
             partner_site: "T5 Data Centers, Hillsboro, OR",
             port_speeds: &["1G", "10G", "100G"],
             offers_mac_sec: true,
+            providers: None,
         }],
     },
     CatalogFacility {
         code: "TierPointSEA",
         building: "TierPoint Seattle, Seattle, WA",
         region: "us-west-2",
-        providers: METRO_PROVIDERS,
+        providers: &["Zayo Group", "CenturyLink", "AT&T", "Comcast"],
         locations: &[CatalogLocationRow {
             partner_code: "TP",
             partner_site: "TierPoint, Seattle, WA",
             port_speeds: &["1G", "10G"],
             offers_mac_sec: false,
+            providers: None,
         }],
     },
     CatalogFacility {
         code: "EqSV5",
         building: "Equinix SV5, San Jose, CA",
         region: "us-west-1",
-        providers: CARRIER_HOTEL_PROVIDERS,
+        providers: &[
+            "Pureport",
+            "ePLDT",
+            "Telstra",
+            "Colt",
+            "Verizon",
+            "Console Connect",
+            "Internet2",
+            "Transtelco",
+            "Megaport",
+            "GTT",
+            "Layer42",
+            "Equinix, Inc.",
+            "Zayo Group",
+            "CenturyLink",
+            "AT&T",
+            "IX Reach",
+            "Comcast",
+            "PacketFabric",
+            "Arelion",
+            "China Mobile International",
+            "Epsilon",
+        ],
         locations: &[CatalogLocationRow {
             partner_code: "EQ",
             partner_site: "Equinix, SV5, San Jose, CA",
             port_speeds: &["1G", "10G", "100G"],
             offers_mac_sec: true,
+            providers: None,
         }],
     },
     CatalogFacility {
         code: "EqLD5",
         building: "Equinix LD5, Slough, UK",
         region: "eu-west-2",
-        providers: EUROPEAN_PROVIDERS,
+        providers: &[
+            "Telstra",
+            "Colt",
+            "Verizon",
+            "Console Connect",
+            "Megaport",
+            "GTT",
+            "Equinix, Inc.",
+            "Zayo Group",
+            "Masergy",
+            "CenturyLink",
+            "IX Reach",
+            "Arelion",
+            "China Mobile International",
+            "Epsilon",
+        ],
         locations: &[
             CatalogLocationRow {
                 partner_code: "EQ",
                 partner_site: "Equinix, LD5, Slough, UK",
                 port_speeds: &["1G", "10G", "100G", "400G"],
                 offers_mac_sec: true,
+                providers: None,
             },
             CatalogLocationRow {
                 partner_code: "THN",
                 partner_site: "Telehouse, North Two, London, UK",
                 port_speeds: &["1G", "10G"],
                 offers_mac_sec: false,
+                providers: None,
             },
         ],
     },
@@ -911,19 +1135,35 @@ const BUILT_IN_FACILITIES: &[CatalogFacility] = &[
         code: "EqFR5",
         building: "Equinix FR5, Frankfurt, DE",
         region: "eu-central-1",
-        providers: EUROPEAN_PROVIDERS,
+        providers: &[
+            "Telstra",
+            "Colt",
+            "Verizon",
+            "Console Connect",
+            "Megaport",
+            "GTT",
+            "Equinix, Inc.",
+            "Zayo Group",
+            "Masergy",
+            "CenturyLink",
+            "IX Reach",
+            "Arelion",
+            "Epsilon",
+        ],
         locations: &[
             CatalogLocationRow {
                 partner_code: "EQ",
                 partner_site: "Equinix, FR5, Frankfurt, DE",
                 port_speeds: &["1G", "10G", "100G"],
                 offers_mac_sec: true,
+                providers: None,
             },
             CatalogLocationRow {
                 partner_code: "ITX",
                 partner_site: "Interxion, FRA6, Frankfurt, DE",
                 port_speeds: &["1G", "10G"],
                 offers_mac_sec: false,
+                providers: None,
             },
         ],
     },
@@ -931,31 +1171,57 @@ const BUILT_IN_FACILITIES: &[CatalogFacility] = &[
         code: "EqSG2",
         building: "Equinix SG2, Singapore",
         region: "ap-southeast-1",
-        providers: ASIA_PACIFIC_PROVIDERS,
+        providers: &[
+            "ePLDT",
+            "Telstra",
+            "Colt",
+            "Console Connect",
+            "Megaport",
+            "Equinix, Inc.",
+            "IX Reach",
+            "Arelion",
+            "China Mobile International",
+            "Epsilon",
+        ],
         locations: &[CatalogLocationRow {
             partner_code: "EQ",
             partner_site: "Equinix, SG2, Singapore",
             port_speeds: &["1G", "10G"],
             offers_mac_sec: false,
+            providers: None,
         }],
     },
     CatalogFacility {
         code: "EqTY2",
         building: "Equinix TY2, Tokyo, JP",
         region: "ap-northeast-1",
-        providers: ASIA_PACIFIC_PROVIDERS,
+        providers: &[
+            "ePLDT",
+            "Telstra",
+            "Colt",
+            "Console Connect",
+            "Megaport",
+            "Equinix, Inc.",
+            "Masergy",
+            "IX Reach",
+            "Arelion",
+            "China Mobile International",
+            "Epsilon",
+        ],
         locations: &[
             CatalogLocationRow {
                 partner_code: "EQ",
                 partner_site: "Equinix, TY2, Tokyo, JP",
                 port_speeds: &["1G", "10G", "100G"],
                 offers_mac_sec: true,
+                providers: None,
             },
             CatalogLocationRow {
                 partner_code: "NTT",
                 partner_site: "NTT Communications, Otemachi, Tokyo, JP",
                 port_speeds: &["1G", "10G", "100G", "400G"],
                 offers_mac_sec: true,
+                providers: None,
             },
         ],
     },
@@ -981,11 +1247,12 @@ pub fn built_in_location_catalog() -> BTreeMap<String, LocationRecord> {
                     location_name: format!("{} | {}", facility.building, row.partner_site),
                     region: facility.region.to_string(),
                     available_port_speeds: catalog_port_speeds(row.port_speeds),
-                    available_providers: facility
-                        .providers
-                        .iter()
-                        .map(|provider| (*provider).to_string())
-                        .collect(),
+                    // The demarcation's own partner list where its row names one,
+                    // else the facility's; either way narrowed to the roster, so one
+                    // published order covers the whole catalog.
+                    available_providers: published_providers(
+                        row.providers.unwrap_or(facility.providers),
+                    ),
                     offers_mac_sec: row.offers_mac_sec,
                 },
             );

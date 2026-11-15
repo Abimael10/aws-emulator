@@ -22,21 +22,26 @@
 //!   speeds, so the list differs between locations;
 //! * `availableMacSecPortSpeeds` is that same list narrowed to the speeds MACsec is
 //!   offered on, or empty where it is not offered;
+//! * `availableProviders` is the Direct Connect delivery-partner roster narrowed to
+//!   the partners that deliver at THAT location, published in the roster's own
+//!   (non-alphabetical) order and named in the trade forms AWS prints (`Colt`,
+//!   `GTT`, `Comcast`, `Console Connect`), never an expanded company name;
 //! * `availableBillingModes` holds exactly one entry, the usage-based mode, on the
 //!   location's own port speeds and with no `includedRegions`.
 //!
 //! The tables span the class the rule generalises over: every Region the catalog
 //! holds (and one it holds none in), facilities with one partner and with several,
-//! port-speed sets with and without 100G and 400G, and demarcations with and without
-//! MACsec.
+//! port-speed sets with and without 100G and 400G, demarcations with and without
+//! MACsec, and partner lists from a whole-roster carrier hotel down to a handful at a
+//! metro site.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_directconnect_overtureservice::state::{
-    built_in_location_catalog, catalog_port_speeds, ComAmazonawsDirectconnectOvertureserviceState,
-    LocationRecord, DEDICATED_PORT_SPEEDS, DIRECT_CONNECT_PROVIDERS, MAC_SEC_PORT_SPEEDS,
-    USAGE_BILLING_MODE,
+    built_in_location_catalog, catalog_port_speeds, published_providers,
+    ComAmazonawsDirectconnectOvertureserviceState, LocationRecord, DEDICATED_PORT_SPEEDS,
+    DIRECT_CONNECT_PROVIDERS, MAC_SEC_PORT_SPEEDS, USAGE_BILLING_MODE,
 };
 
 use crate::connection_and_virtual_interface_lifecycle::Emulator;
@@ -254,15 +259,24 @@ async fn a_location_the_issue_did_not_cite_renders_every_modeled_member() {
     let (status, locations) = describe_locations(&dx).await;
     assert_eq!(status, 200, "expected 200, got {status} with {locations:?}");
 
+    // The Frankfurt facility's own delivery partners, in the catalog's published
+    // order (`DIRECT_CONNECT_PROVIDERS`), named in the trade forms AWS prints
+    // ("Colt", "GTT") rather than the expanded company names. Both of its
+    // demarcations are reached through the same building, so both publish this list.
     let providers = json!([
-        "Arelion",
-        "BT",
-        "Colt Technology Services",
-        "Equinix, Inc.",
-        "GTT Communications",
+        "Telstra",
+        "Colt",
+        "Verizon",
+        "Console Connect",
         "Megaport",
-        "Orange Business Services",
-        "Vodafone",
+        "GTT",
+        "Equinix, Inc.",
+        "Zayo Group",
+        "Masergy",
+        "CenturyLink",
+        "IX Reach",
+        "Arelion",
+        "Epsilon",
     ]);
     assert_eq!(
         locations,
@@ -508,3 +522,258 @@ async fn an_empty_catalog_answers_200_with_an_empty_list() {
         "an empty catalog answers an empty list, got {locations:?}"
     );
 }
+
+/// Whether `providers` is the delivery-partner roster NARROWED: every name is a
+/// partner the catalog knows, and they come in the roster's own order.
+///
+/// Walking one iterator over the roster is what makes this an order check and not a
+/// membership check: a list that names two partners in the opposite order to the
+/// roster runs the iterator past the second one and fails.
+fn in_published_order(providers: &[&str]) -> bool {
+    let mut roster = DIRECT_CONNECT_PROVIDERS.iter();
+    providers
+        .iter()
+        .all(|provider| roster.any(|known| known == provider))
+}
+
+/// The `availableProviders` of the location `code` names, as strings.
+fn providers_of(locations: &[Value], code: &str) -> Vec<String> {
+    locations
+        .iter()
+        .find(|location| location["locationCode"] == json!(code))
+        .and_then(|location| location["availableProviders"].as_array().cloned())
+        .map(|providers| {
+            providers
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_locations_providers_are_the_roster_narrowed_in_published_order() {
+    // The derivation every location's `availableProviders` is built by. The rows
+    // differ along what the rule generalises over: which partners, how many, the
+    // order they are written in, repeats, a name no delivery partner carries, and
+    // none at all.
+    //
+    // Source for the names and the order expected back:
+    // `DIRECT_CONNECT_PROVIDERS`, the delivery-partner roster in the order a
+    // recorded `DescribeLocations` response prints it. `Location$availableProviders`
+    // ("The name of the service provider for the location", `ProviderList`, via
+    // smithy_query shape="Location") constrains neither the names nor their order,
+    // so the roster is what fixes both.
+    let rows: &[(&str, &[&str], &[&str])] = &[
+        ("one", &["Megaport"], &["Megaport"]),
+        (
+            "written-alphabetically",
+            &["AT&T", "Colt", "Megaport", "Telstra"],
+            &["Telstra", "Colt", "Megaport", "AT&T"],
+        ),
+        (
+            "written-reversed",
+            &["Epsilon", "PacketFabric", "Internet2"],
+            &["Internet2", "PacketFabric", "Epsilon"],
+        ),
+        (
+            "repeated",
+            &["Colt", "Megaport", "Colt"],
+            &["Colt", "Megaport"],
+        ),
+        (
+            "expanded-company-name-is-not-a-partner",
+            &["Megaport", "Colt Technology Services"],
+            &["Megaport"],
+        ),
+        ("all-unknown", &["Hooli Telecom"], &[]),
+        ("none", &[], &[]),
+    ];
+
+    for (case, present, expected) in rows {
+        let published = published_providers(present);
+        assert_eq!(
+            published, *expected,
+            "case {case:?}: expected {expected:?} from {present:?}, got {published:?}"
+        );
+    }
+
+    // The whole roster narrows to the whole roster, in its own order.
+    let whole: Vec<&str> = DIRECT_CONNECT_PROVIDERS.to_vec();
+    let published = published_providers(&whole);
+    assert_eq!(
+        published, whole,
+        "case \"whole-roster\": expected {whole:?}, got {published:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_location_publishes_its_own_partners_in_the_catalogs_order() {
+    let catalog = built_in_location_catalog();
+    let regions: BTreeSet<&str> = catalog
+        .values()
+        .map(|location| location.region.as_str())
+        .collect();
+
+    let mut lists: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for region in regions {
+        let dx = Emulator::in_region(region);
+        let (status, locations) = describe_locations(&dx).await;
+        assert_eq!(
+            status, 200,
+            "case {region:?}: expected 200, got {status} with {locations:?}"
+        );
+
+        for location in &locations {
+            let case = location["locationCode"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let providers: Vec<&str> = location["availableProviders"]
+                .as_array()
+                .map(|providers| providers.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            assert!(
+                in_published_order(&providers),
+                "case {case:?}: a location publishes its partners in the catalog's order ({DIRECT_CONNECT_PROVIDERS:?}), got {providers:?}"
+            );
+            lists.insert(
+                case,
+                providers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    // Per location, not catalog-wide: the catalog must publish several different
+    // partner lists rather than one shared superset.
+    let distinct: BTreeSet<&Vec<String>> = lists.values().collect();
+    assert!(
+        distinct.len() > 3,
+        "which partners deliver somewhere is per-location data, so the catalog must publish several different lists, got {} distinct of {}",
+        distinct.len(),
+        lists.len()
+    );
+    // Two demarcations in ONE building are two locations, and a cross connect is
+    // ordered to one partner's patch panel, so their lists need not agree.
+    assert_ne!(
+        lists.get("EqSe2-EQ"),
+        lists.get("EqSe2-WBE"),
+        "case \"EqSe2\": the demarcations in one building publish their own partner lists, got {:?}",
+        lists.get("EqSe2-EQ")
+    );
+    // Published order, not sorted order: at least one location's list is not
+    // alphabetical, which an alphabetised catalog could never answer.
+    assert!(
+        lists.values().any(|providers| {
+            let mut sorted = providers.clone();
+            sorted.sort();
+            sorted != *providers
+        }),
+        "the catalog publishes AWS's order, which is not alphabetical, got {lists:?}"
+    );
+
+    // The spelling: the trade form AWS prints is published, the expanded company
+    // name is not. Rows from the forms a recorded `DescribeLocations` response
+    // prints, each against the expanded name it never prints.
+    let spellings: &[(&str, &str)] = &[
+        ("Colt", "Colt Technology Services"),
+        ("GTT", "GTT Communications"),
+        ("Comcast", "Comcast Business"),
+        ("Console Connect", "Console Connect by PCCW Global"),
+        ("CenturyLink", "Lumen Technologies"),
+        ("Equinix, Inc.", "Equinix"),
+        ("Arelion", "Telia Carrier"),
+    ];
+    for (printed, expanded) in spellings {
+        assert!(
+            lists
+                .values()
+                .any(|providers| providers.iter().any(|provider| provider == printed)),
+            "case {printed:?}: the catalog publishes the partner under the name AWS prints, got {lists:?}"
+        );
+        assert!(
+            lists
+                .values()
+                .all(|providers| providers.iter().all(|provider| provider != expanded)),
+            "case {expanded:?}: no location publishes a name AWS does not print for that partner, got {lists:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_seattle_demarcations_publish_the_partners_each_one_reaches() {
+    // Three locations of one Region spelled out, spanning the class: the colocation
+    // partner's cage inside a carrier hotel (the demarcation a recorded
+    // `DescribeLocations` response for us-west-2 publishes these thirty partners
+    // for, in this order), the carrier hotel's own meet-me room in the SAME
+    // building, which reaches every partner on the roster, and a metro site in the
+    // same Region, which reaches a handful.
+    let dx = Emulator::in_region("us-west-2");
+    let (status, locations) = describe_locations(&dx).await;
+    assert_eq!(status, 200, "expected 200, got {status} with {locations:?}");
+
+    let equinix_seattle: Vec<String> = [
+        "Pureport",
+        "Beanfield Metroconnect",
+        "ePLDT",
+        "Datapipe",
+        "Telstra",
+        "Colt",
+        "Verizon",
+        "Console Connect",
+        "Internet2",
+        "Transtelco",
+        "Megaport",
+        "GTT",
+        "Layer42",
+        "Allstream",
+        "Equinix, Inc.",
+        "Zayo Group",
+        "Masergy",
+        "CenturyLink",
+        "AT&T",
+        "IX Reach",
+        "Comcast",
+        "Sprint",
+        "XO Communications",
+        "HopOne",
+        "RCN",
+        "PacketFabric",
+        "Telus",
+        "Arelion",
+        "China Mobile International",
+        "Epsilon",
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    let answered = providers_of(&locations, "EqSe2-EQ");
+    assert_eq!(
+        answered, equinix_seattle,
+        "case \"EqSe2-EQ\": expected the partners published for that demarcation, got {answered:?}"
+    );
+
+    // The meet-me room in the same building, spelled out rather than compared against
+    // the roster constant the implementation itself narrows: its list is the cage's
+    // thirty plus the one partner that delivers in the building but not at that cage,
+    // in the catalog's order.
+    let westin_building: Vec<String> = equinix_seattle
+        .iter()
+        .cloned()
+        .chain(["Tata Communications".to_string()])
+        .collect();
+    let answered = providers_of(&locations, "EqSe2-WBE");
+    assert_eq!(
+        answered, westin_building,
+        "case \"EqSe2-WBE\": the carrier hotel's own meet-me room publishes every partner that delivers in the building, got {answered:?}"
+    );
+
+    let answered = providers_of(&locations, "TierPointSEA-TP");
+    assert_eq!(
+        answered,
+        vec!["Zayo Group", "CenturyLink", "AT&T", "Comcast"],
+        "case \"TierPointSEA-TP\": a metro site publishes the carriers that deliver there, got {answered:?}"
+    );
+}
+
