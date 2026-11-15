@@ -32,77 +32,15 @@
 use serde_json::{json, Value};
 
 use crate::identity_based_authorization::{
-    call_as, error_code, error_message, given_role_policy, given_secret, given_session,
-    router_with_identity, session_arn, ACCESS_DENIED, ACCESS_DENIED_STATUS, ACCOUNT_KEY_ID,
-    SECRET_VALUE, SESSION_KEY_ID,
+    allow_reads_of, allow_the_service, call_as, deny_read_of, error_code, error_message,
+    errors_of, given_role_policy, given_secret, given_session, refusal_of_the_read,
+    resource_policy_denying_reads, router_with_identity, session_arn, ACCESS_DENIED,
+    ACCESS_DENIED_STATUS, ACCOUNT_KEY_ID, IDENTITY_DENY_CLAUSE, NO_READ_GRANT_CLAUSE,
+    RESOURCE_DENY_CLAUSE, SECRET_VALUE, SESSION_KEY_ID,
 };
 
 /// The three secrets a case holds, so a withheld one can sit first, in the middle or last.
 const SECRETS: [&str; 3] = ["batch-first", "batch-middle", "batch-last"];
-
-/// A document allowing every action of this service on every resource, which the rows that
-/// withhold a read with something OTHER than a missing grant put in force.
-fn allow_the_service() -> Value {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Action": "secretsmanager:*",
-            "Resource": "*",
-        }],
-    })
-}
-
-/// A document allowing the batched read on everything and the single read on `readable`
-/// only, so every other secret's read falls to IAM's default deny.
-fn allow_reads_of(readable: &[String]) -> Value {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": ["secretsmanager:BatchGetSecretValue", "secretsmanager:ListSecrets"],
-                "Resource": "*",
-            },
-            {
-                "Effect": "Allow",
-                "Action": "secretsmanager:GetSecretValue",
-                "Resource": readable,
-            },
-        ],
-    })
-}
-
-/// A document allowing every action of this service beside an explicit deny of the single
-/// read of `denied`, so that one read meets IAM's explicit deny.
-fn deny_read_of(denied: &str) -> Value {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [
-            { "Effect": "Allow", "Action": "secretsmanager:*", "Resource": "*" },
-            {
-                "Effect": "Deny",
-                "Action": "secretsmanager:GetSecretValue",
-                "Resource": denied,
-            },
-        ],
-    })
-}
-
-/// A resource-based policy denying every principal the single read, as a secret is locked
-/// down with: "By default, public policies aren't blocked"
-/// (`PutResourcePolicyRequest$BlockPublicPolicy`), so the wildcard principal is admitted.
-fn resource_policy_denying_reads() -> Value {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Deny",
-            "Principal": { "AWS": "*" },
-            "Action": ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue"],
-            "Resource": "*",
-        }],
-    })
-}
 
 /// The `SecretValues` of a batched read, as (ARN, SecretString) pairs in the order answered.
 fn values_of(answer: &Value, case: &str) -> Vec<(String, String)> {
@@ -120,49 +58,17 @@ fn values_of(answer: &Value, case: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The `Errors` of a batched read, as (SecretId, ErrorCode, Message) triples.
-fn errors_of(answer: &Value, case: &str) -> Vec<(String, String, String)> {
-    answer
-        .get("Errors")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("case {case:?}: no Errors in {answer}"))
-        .iter()
-        .map(|entry| {
-            (
-                entry["SecretId"].as_str().unwrap_or_default().to_string(),
-                entry["ErrorCode"].as_str().unwrap_or_default().to_string(),
-                entry["Message"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
-}
-
-/// IAM's refusal sentence for the single read of `supplied`, closed with `reason`.
-fn refusal_of_the_read(supplied: &str, reason: &str) -> String {
-    format!(
-        "User: {} is not authorized to perform: secretsmanager:GetSecretValue on resource: \
-         {supplied} {reason}",
-        session_arn()
-    )
-}
-
 /// THE RULE per entry: whichever policy withholds the read of ONE selected secret, the call
 /// is a 200 that answers the others and reports that one in `Errors`, carrying the id the
 /// request supplied, the common access-denied code and IAM's own sentence.
 #[tokio::test]
 async fn a_secret_the_caller_may_not_read_is_one_errors_entry_inside_a_two_hundred() {
-    // The clauses IAM closes a refusal of the single read with.
-    const NO_GRANT: &str = "because no identity-based policy allows the \
-                            secretsmanager:GetSecretValue action";
-    const IDENTITY_DENY: &str = "with an explicit deny in an identity-based policy";
-    const RESOURCE_DENY: &str = "with an explicit deny in a resource-based policy";
-
     // (what withholds the read, the clause it refuses with, whether it is attached to the
     // secret rather than to the identity)
     let withholdings: [(&str, &str, bool); 3] = [
-        ("no statement allowing the read", NO_GRANT, false),
-        ("an explicit deny in an identity-based policy", IDENTITY_DENY, false),
-        ("an explicit deny in the secret's own policy", RESOURCE_DENY, true),
+        ("no statement allowing the read", NO_READ_GRANT_CLAUSE, false),
+        ("an explicit deny in an identity-based policy", IDENTITY_DENY_CLAUSE, false),
+        ("an explicit deny in the secret's own policy", RESOURCE_DENY_CLAUSE, true),
     ];
     // Where the withheld secret sits in the batch.
     for withheld_at in 0..SECRETS.len() {
@@ -197,7 +103,7 @@ async fn a_secret_the_caller_may_not_read_is_one_errors_entry_inside_a_two_hundr
                     status, 200,
                     "case {withholding:?}: the policy must attach, got {status} {attached}"
                 );
-            } else if reason == IDENTITY_DENY {
+            } else if reason == IDENTITY_DENY_CLAUSE {
                 given_role_policy(&engine, Some(&deny_read_of(&withheld_arn)));
             } else {
                 given_role_policy(&engine, Some(&allow_reads_of(&readable)));

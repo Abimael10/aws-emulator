@@ -59,9 +59,13 @@ const REGION: &str = "us-west-2";
 /// Errors" table names it.
 pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
 
+/// The status this service answers a client fault with: awsJson1_1 discriminates a failure by
+/// the error type in the body, so every refusal travels with the ordinary client-error status.
+pub(crate) const CLIENT_ERROR_STATUS: u16 = 400;
+
 /// The status this service answers that refusal with: awsJson1_1 discriminates a failure by
 /// the error type in the body, so a denial travels with the ordinary client-error status.
-pub(crate) const ACCESS_DENIED_STATUS: u16 = 400;
+pub(crate) const ACCESS_DENIED_STATUS: u16 = CLIENT_ERROR_STATUS;
 
 /// The access key id of the account's own published credential, as every other suite in this
 /// crate signs with it: a key neither STS nor IAM holds a record for, which is the position
@@ -303,6 +307,92 @@ pub(crate) fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, document: 
             )]),
         );
     }
+}
+
+/// The clauses IAM closes a refusal of the single read of one secret with: no statement
+/// allowing it, a `Deny` in the caller's own policies, and a `Deny` in the secret's.
+pub(crate) const NO_READ_GRANT_CLAUSE: &str =
+    "because no identity-based policy allows the secretsmanager:GetSecretValue action";
+pub(crate) const IDENTITY_DENY_CLAUSE: &str = "with an explicit deny in an identity-based policy";
+pub(crate) const RESOURCE_DENY_CLAUSE: &str = "with an explicit deny in a resource-based policy";
+
+/// A document allowing every action of this service on every resource, which a case that
+/// withholds one read with something OTHER than a missing grant puts in force.
+pub(crate) fn allow_the_service() -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{ "Effect": "Allow", "Action": "secretsmanager:*", "Resource": "*" }],
+    })
+}
+
+/// A document allowing the batched read and the listing on everything and the single read on
+/// `readable` only, so every other secret's read falls to IAM's default deny.
+pub(crate) fn allow_reads_of(readable: &[String]) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["secretsmanager:BatchGetSecretValue", "secretsmanager:ListSecrets"],
+                "Resource": "*",
+            },
+            { "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": readable },
+        ],
+    })
+}
+
+/// A document allowing every action of this service beside an explicit deny of the single read
+/// of `denied`, so that one read meets IAM's explicit deny.
+pub(crate) fn deny_read_of(denied: &str) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            { "Effect": "Allow", "Action": "secretsmanager:*", "Resource": "*" },
+            { "Effect": "Deny", "Action": "secretsmanager:GetSecretValue", "Resource": denied },
+        ],
+    })
+}
+
+/// A resource-based policy denying every principal the reads, as a secret is locked down with:
+/// "By default, public policies aren't blocked"
+/// (`PutResourcePolicyRequest$BlockPublicPolicy`), so the wildcard principal is admitted.
+pub(crate) fn resource_policy_denying_reads() -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny",
+            "Principal": { "AWS": "*" },
+            "Action": ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue"],
+            "Resource": "*",
+        }],
+    })
+}
+
+/// IAM's refusal sentence for the single read of `supplied`, closed with `reason`.
+pub(crate) fn refusal_of_the_read(supplied: &str, reason: &str) -> String {
+    format!(
+        "User: {} is not authorized to perform: secretsmanager:GetSecretValue on resource: \
+         {supplied} {reason}",
+        session_arn()
+    )
+}
+
+/// The `Errors` of a batched read, as (SecretId, ErrorCode, Message) triples in the order they
+/// were reported.
+pub(crate) fn errors_of(answer: &Value, case: &str) -> Vec<(String, String, String)> {
+    answer
+        .get("Errors")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: no Errors in {answer}"))
+        .iter()
+        .map(|entry| {
+            (
+                entry["SecretId"].as_str().unwrap_or_default().to_string(),
+                entry["ErrorCode"].as_str().unwrap_or_default().to_string(),
+                entry["Message"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
 }
 
 /// A policy allowing `actions` on every resource.

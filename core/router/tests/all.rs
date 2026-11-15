@@ -1240,3 +1240,17 @@ mod zz_opensearch_fgac_probe;
 mod zz_probe;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
+// Single integration-test target for the router: the declaration list of its cross-service
+// suites, and nothing else.
+// One `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
+// name, and no other line, so two branches landing at once insert two lines in two places and
+// have no prose to duplicate, re-word or mistype. A suite no `mod` names compiles nowhere and
+// its tests never run; a suite left at the top level of `tests/` fails the build; a second
+// `mod` for one name is `E0428`; and an inner doc comment or inner attribute past the first
+// item does not compile. Each of those fails every suite in this target, which is why EVERY
+// comment in this file is an ordinary `//` one, this header included, and why nothing at all
+// stands after the last pair.
+// `tests/all.rs` is a test-target crate root, so a bare `mod` would resolve to a sibling of
+// this file, which the layout check refuses: the `#[path]` above each declaration is what
+// points it into `tests/all/`. What a suite covers belongs in that suite's own module header,
+// and a note about this file belongs in `all/appended_notes.rs`.
