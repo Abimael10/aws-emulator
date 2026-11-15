@@ -6,6 +6,18 @@
 
 use super::*;
 
+/// An S3 Tables store for a case that removes a bucket: the managed table bucket is reached
+/// through it, and a bucket carrying no metadata configuration has no table in it either way.
+fn tables_store() -> ::service_com_amazonaws_s3tables_s3tablebuckets::state::ComAmazonawsS3tablesS3tablebucketsState
+{
+    ::service_com_amazonaws_s3tables_s3tablebuckets::state::ComAmazonawsS3tablesS3tablebucketsState::default()
+}
+
+/// The instant a removal is made at, fixed rather than read off the clock: what a removal
+/// reports depends on the metadata configuration the bucket carries, and a bucket carrying
+/// none is the same at every instant — so nothing here turns on how fast the host runs.
+const AT: SystemTime = SystemTime::UNIX_EPOCH;
+
 /// An object of `size` bytes, with everything else at its empty value.
 fn object(size: usize) -> Object {
     let body = vec![b'x'; size];
@@ -869,16 +881,17 @@ fn a_removal_reports_what_it_released_and_frees_the_byte_budget() {
         "the delete released the bytes the refused write needed"
     );
 
-    assert!(
-        store.remove_bucket("one", SystemTime::now()),
-        "bucket one exists"
-    );
+    let mut tables = tables_store();
+    let mut managed = ManagedTableBucket::new(&mut tables, "us-east-1");
+    let removal = store.remove_bucket("one", AT);
+    store.release_removed_metadata_tables(&removal, &mut managed);
+    assert!(removal.held, "bucket one exists");
     assert!(
         store.bucket("one").is_none(),
         "a removed bucket is no longer held"
     );
     assert!(
-        !store.remove_bucket("one", SystemTime::now()),
+        !store.remove_bucket("one", AT).held,
         "bucket one is already gone"
     );
     assert_eq!(

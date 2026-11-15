@@ -3863,12 +3863,6 @@ pub const METADATA_TABLE_BUCKET_NAME: &str = "aws-s3";
 /// nothing but which of the three they are ([`METADATA_JOURNAL_TABLE_NAME`]).
 pub const METADATA_TABLE_NAMESPACE_PREFIX: &str = "b_";
 
-/// The service namespace of a metadata table's (and its table bucket's) ARN, so one reads
-/// `arn:aws:s3tables:<region>:<account>:bucket/<bucket>` and a table's
-/// `…:bucket/<bucket>/table/<table>` — the two forms every S3 Tables request publishes a
-/// pattern for.
-const METADATA_TABLE_ARN_SERVICE: &str = "s3tables";
-
 /// The name of the JOURNAL table of a metadata configuration
 /// (`JournalTableConfigurationResult$TableName`).
 ///
@@ -4065,15 +4059,42 @@ pub enum MetadataInventoryTableUpdate {
     /// has no room left for ([`MAX_METADATA_NAMESPACE_TABLES`]) — this emulator's own
     /// ceiling, with nothing written.
     NamespaceFull,
+    /// The store that OWNS tables would not take the table this enable provisions, so there
+    /// is none to report: nothing is written, and the caller answers what that store refused
+    /// rather than the ceiling above.
+    TableRefused,
+}
+
+/// What enabling or disabling the ANNOTATION table of a bucket's metadata configuration did —
+/// the outcomes the caller of
+/// [`ComAmazonawsS3Amazons3State::update_metadata_annotation_table`] answers differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataAnnotationTableUpdate {
+    /// Recorded: the state the request named is the configuration's and the table behind it
+    /// followed.
+    Recorded,
+    /// This store holds no such general purpose bucket.
+    NoSuchBucket,
+    /// The bucket carries no metadata configuration, so there is no annotation table of one to
+    /// enable or disable and nothing is written.
+    NoConfiguration,
+    /// The enable would provision a table the managed table bucket has no room for
+    /// ([`MAX_METADATA_NAMESPACE_TABLES`]) — this emulator's own ceiling, with nothing
+    /// written.
+    NamespaceFull,
+    /// The store that OWNS tables would not take the table this enable provisions, so there
+    /// is none to report: nothing is written, and the caller answers what that store refused
+    /// rather than the ceiling above.
+    TableRefused,
 }
 
 /// One table of a bucket's S3 Metadata configuration: its name, and when it falls due to
 /// be in service.
 ///
-/// Nothing here is table CONTENT: the Iceberg table itself is an S3 Tables resource this
-/// service owns no part of. What is recorded is what every reader of the configuration
-/// reports about the table — the name S3 created it under and the status it is in
-/// ([`Self::status_at`]).
+/// Nothing here is the table itself: the Iceberg table is an S3 Tables resource, created in
+/// that service's own store ([`metadata_table_provisioning`]) and resolved there by every
+/// read and delete of it. What is recorded here is what a reader of the CONFIGURATION reports
+/// about it — the name S3 created it under and the status it is in ([`Self::status_at`]).
 #[derive(Debug, Clone)]
 pub struct MetadataTable {
     /// Which of the configuration's three tables this is: one of
@@ -4140,6 +4161,13 @@ impl MetadataTable {
     /// bucket, since the three table names repeat in every bucket's namespace.
     pub fn qualified_name(&self) -> String {
         metadata_qualified_table_name(&self.namespace, &self.name)
+    }
+
+    /// Where this table stands in the managed table bucket and what it folds to — the whole
+    /// of what identifies it there ([`MetadataTableIdentity`]), which is what the store that
+    /// owns tables is asked about it with.
+    pub fn identity(&self) -> MetadataTableIdentity {
+        MetadataTableIdentity::new(&self.namespace, &self.name)
     }
 
     /// The `TableStatus` the table is in at `instant`: `FAILED` for a table that could not
@@ -4335,31 +4363,31 @@ pub fn metadata_qualified_table_name(namespace: &str, table: &str) -> String {
 }
 
 /// The ARN of the managed table bucket a metadata configuration's tables live in, in
-/// `region` — see [`METADATA_TABLE_BUCKET_NAME`] for what it does and does not claim.
+/// `region` — see [`METADATA_TABLE_BUCKET_NAME`] for which bucket that is.
+///
+/// Built by the service that OWNS table buckets, from the Region and the bucket's name, so
+/// the ARN this service publishes for it is the one that store answers to rather than a
+/// second derivation of the same string.
 pub fn metadata_table_bucket_arn(region: &str) -> String {
-    ::engine::emulator_arn(
-        METADATA_TABLE_ARN_SERVICE,
+    ::service_com_amazonaws_s3tables_s3tablebuckets::state::table_bucket_arn(
         region,
-        &format!("bucket/{METADATA_TABLE_BUCKET_NAME}"),
+        METADATA_TABLE_BUCKET_NAME,
     )
 }
 
 /// The ARN of the metadata table `table` of the namespace `namespace` in `region`: the table
 /// bucket's own ARN above with the table's id appended, which is the form every S3 Tables
-/// request publishes for a table ARN.
+/// request publishes for a table ARN — built by that same service, so one table has one ARN
+/// in both of them.
 ///
 /// The id is the table's name qualified by its namespace
 /// ([`metadata_qualified_table_name`]), because a table ARN identifies ONE table of the
 /// table bucket: the last segment of an S3 Tables table ARN is the table's own id rather
 /// than its name, and the bare name repeats in every bucket's namespace.
 pub fn metadata_table_arn(region: &str, namespace: &str, table: &str) -> String {
-    ::engine::emulator_arn(
-        METADATA_TABLE_ARN_SERVICE,
-        region,
-        &format!(
-            "bucket/{METADATA_TABLE_BUCKET_NAME}/table/{}",
-            metadata_qualified_table_name(namespace, table)
-        ),
+    ::service_com_amazonaws_s3tables_s3tablebuckets::state::table_arn(
+        &metadata_table_bucket_arn(region),
+        &metadata_qualified_table_name(namespace, table),
     )
 }
 
@@ -4600,6 +4628,9 @@ mod configuration_tokens;
 mod inline_tagging;
 // What a bucket's stored lifecycle configuration is, and which ones S3 admits.
 mod lifecycle;
+// Where a metadata configuration's tables are really created: the S3 Tables store that owns
+// them.
+pub mod metadata_table_provisioning;
 // The vocabulary a notification document names — its events and its filter rule names — as
 // Amazon S3 rather than the published schema judges it.
 mod notification_document;
@@ -4631,6 +4662,9 @@ pub use bucket::*;
 pub use configuration_tokens::*;
 pub use inline_tagging::*;
 pub use lifecycle::*;
+pub use metadata_table_provisioning::{
+    managing_service_principal, ManagedTableBucket, MetadataTableIdentity,
+};
 pub use notification_document::*;
 pub use object::*;
 pub use read_encryption_headers::*;

@@ -373,6 +373,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // already carries a configuration is the variable part of the envelope.
             .naming_bucket(&input.bucket));
         }
+        // The tables live in the managed table bucket of the Region the general purpose
+        // bucket lives in, and that bucket, its namespace and the tables are S3 TABLES'
+        // records: the store that owns them is taken UNDER this handler's own guard, which is
+        // the lock order [`crate::state::metadata_table_provisioning`] states.
+        let region = bucket.region.clone();
+        let Some(tables) =
+            crate::state::metadata_table_provisioning::metadata_tables_store(&*self.engine)
+        else {
+            // Unreachable beside the guard above, which came from the same engine; a store
+            // that cannot be reached is answered the same way rather than with a table this
+            // create did not make.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateBucketMetadataConfiguration",
+            ));
+        };
+        let mut tables = tables.lock();
+        let mut managed = crate::state::ManagedTableBucket::new(&mut tables, &region);
 
         // The tables are created now and fall due to be in service a span later, so a
         // caller that reads the configuration straight afterwards still sees `CREATING`;
@@ -398,11 +415,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // them.
         let now = ::std::time::SystemTime::now();
         let namespace = crate::state::metadata_table_namespace(&input.bucket);
-        let qualified = |table: &str| crate::state::metadata_qualified_table_name(&namespace, table);
-        let journal_taken =
-            store.metadata_namespace_holds(&qualified(crate::state::METADATA_JOURNAL_TABLE_NAME));
-        let inventory_taken =
-            store.metadata_namespace_holds(&qualified(crate::state::METADATA_INVENTORY_TABLE_NAME));
+        let identity =
+            |table: &str| crate::state::MetadataTableIdentity::new(&namespace, table);
+        let journal_taken = store.metadata_namespace_holds(
+            &identity(crate::state::METADATA_JOURNAL_TABLE_NAME),
+            &managed,
+        );
+        let inventory_taken = store.metadata_namespace_holds(
+            &identity(crate::state::METADATA_INVENTORY_TABLE_NAME),
+            &managed,
+        );
         let journal = match journal_taken {
             false => crate::state::MetadataTable::creating(
                 &namespace,
@@ -478,17 +500,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
         };
 
-        // Every table this create really provisions joins the managed table bucket's
-        // namespace and stays in it for as long as a table stands under its name — a table
-        // that came into service OUTLIVES the configuration that created it, which is what
-        // makes a create whose table name such a table holds report the failure above, whether
-        // that name was taken by another bucket's configuration or by this bucket's own
-        // earlier one. A table that FAILED to be created adds nothing: either the name was
-        // already taken by the table that is there, or no table was created under it.
-        let created: Vec<String> = recorded
+        // Every table this create really provisions is created in the store that OWNS tables
+        // and stays there for as long as a table stands under its name — a table that came
+        // into service OUTLIVES the configuration that created it, which is what makes a
+        // create whose table name such a table holds report the failure above, whether that
+        // name was taken by another bucket's configuration or by this bucket's own earlier
+        // one. A table that FAILED to be created adds nothing: either the name was already
+        // taken by the table that is there, or no table was created under it.
+        let created: Vec<crate::state::MetadataTableIdentity> = recorded
             .tables()
             .filter(|table| table.failure.is_none())
-            .map(crate::state::MetadataTable::qualified_name)
+            .map(crate::state::MetadataTable::identity)
             .collect();
         // The namespace is bounded ([`crate::state::MAX_METADATA_NAMESPACE_TABLES`]): only a
         // configuration carried away before its tables came into service releases their names,
@@ -501,9 +523,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than as an AWS error code, the way this handler's other resource guard does.
         let takes_room = created
             .iter()
-            .filter(|name| !store.metadata_namespace_holds(name))
+            .filter(|identity| !store.metadata_namespace_holds(identity, &managed))
             .count();
-        if takes_room > store.metadata_namespace_room() {
+        if takes_room > store.metadata_namespace_room(&managed) {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "the managed table bucket's namespace holds as many metadata tables as this \
                  emulator records ({})",
@@ -511,10 +533,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         // The ceiling above is the one place that owns the bound: it was measured, under this
-        // same guard, against exactly the names recorded here, so recording them cannot carry
-        // the namespace past the maximum.
-        for name in &created {
-            store.record_metadata_namespace_table(name);
+        // same guard, against exactly the tables created here, so creating them cannot carry
+        // the namespace past the maximum. A table the store that owns tables will not take is
+        // one this create cannot report at all, so the create is refused with nothing
+        // recorded on the bucket — and the tables this call had already created are taken
+        // back, while a table that was already standing there is left exactly as it was.
+        let mut provisioned: Vec<&crate::state::MetadataTableIdentity> = Vec::new();
+        for identity in &created {
+            let stood_before = store.metadata_namespace_holds(identity, &managed);
+            if !store.record_metadata_namespace_table(identity, &mut managed, now) {
+                for created_already in provisioned {
+                    store.forget_metadata_namespace_table(created_already, &mut managed);
+                }
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the managed table bucket cannot take the metadata table {:?} of namespace \
+                     {:?}",
+                    identity.name, identity.namespace
+                )));
+            }
+            if !stood_before {
+                provisioned.push(identity);
+            }
         }
 
         let Some(bucket) = store.bucket_mut(&input.bucket) else {

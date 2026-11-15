@@ -223,6 +223,8 @@ mod listing_resume_markers;
 mod metadata_annotation_table_update_refusals;
 #[path = "all/metadata_table_update_journal_status.rs"]
 mod metadata_table_update_journal_status;
+#[path = "all/metadata_tables_are_s3_tables_resources.rs"]
+mod metadata_tables_are_s3_tables_resources;
 #[path = "all/multipart_checksum_type.rs"]
 mod multipart_checksum_type;
 #[path = "all/multipart_part_checksums.rs"]

@@ -100,6 +100,12 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # `GetMetricStatistics` and the alarm evaluation read — rather than to a second copy of them
 # (`service::request_metrics`).
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The S3 Tables store owns the tables an S3 Metadata configuration is provisioned into: the
+# managed table bucket, the namespace of the general purpose bucket they belong to and the
+# journal, inventory and annotation tables themselves are written into that service's own
+# records, so its reads resolve them and its `DeleteTable`/`DeleteNamespace` remove them
+# (`state::metadata_table_provisioning`).
+service-com-amazonaws-s3tables-s3tablebuckets = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

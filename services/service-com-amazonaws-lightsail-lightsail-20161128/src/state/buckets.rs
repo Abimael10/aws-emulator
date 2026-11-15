@@ -191,7 +191,11 @@ pub fn release_bucket_object_store<Eng: Send + Sync + 'static>(
 ) -> Option<bool> {
     let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
     let mut store = state.lock();
-    Some(store.remove_bucket(name, ::std::time::SystemTime::now()))
+    // What the removal carried off besides the objects — the metadata tables of an S3
+    // Metadata configuration still being created — belongs to Amazon S3 Tables, and this
+    // service reaches no part of that store: a bucket of this service's own carries no such
+    // configuration, so there is nothing of it here to take back.
+    Some(store.remove_bucket(name, ::std::time::SystemTime::now()).held)
 }
 
 /// Record the object versioning of the bucket named `name` in its object store:

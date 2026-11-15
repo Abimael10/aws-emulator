@@ -157,7 +157,7 @@ impl Emulator {
         let state = service_com_amazonaws_s3_amazons3::state::service_state(&*self.engine)
             .expect("the in-memory engine carries the object store");
         let mut store = state.lock();
-        store.remove_bucket(bucket, std::time::SystemTime::now())
+        store.remove_bucket(bucket, std::time::SystemTime::now()).held
     }
 
     /// Record an Amazon SNS topic at `topic_arn` carrying the access policy that lets

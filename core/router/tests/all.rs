@@ -1,5 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: the canonical declaration list of every
+// cross-service suite under `tests/all/`, and nothing else.
+// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
+// suite, sorted by name, and no other line, so two branches landing at once insert two lines
+// in two places and have no prose to duplicate, re-word or mistype.
+// EVERY comment in this file is an ORDINARY `//` one, this header included. An inner doc
+// comment (`//!`) is legal only before the first item, so one appended past the declarations
+// is `E0753` and compiles no suite of this target — which is what had happened here, where
+// the tail had grown hundreds of re-typed copies of this header. With no `//!` anywhere in
+// the file, no merge of two landings can put one past the first item.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod <name>;` would resolve to a
+// sibling of this file, which the layout check refuses: the `#[path]` is what points each
+// declaration into `tests/all/`. Declare each suite exactly ONCE — a second `mod` for one
+// name is `E0428` and fails every suite in this target too.
+// What a suite covers, and why it belongs to this cross-service target rather than to one
+// service crate's own, is stated in that suite's own module header, beside the test it
+// explains; a note about this file itself belongs in `all/appended_notes.rs`.
 // Single integration-test target for the router: the canonical DECLARATION LIST, and
 // nothing else.
 // Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
@@ -1027,6 +1044,8 @@ mod s3_bucket_lifecycle_identity_authorization;
 mod s3_deployed_notification_copies_within_its_bucket;
 #[path = "all/s3_form_post_upload_routes_by_event_bridge_reason.rs"]
 mod s3_form_post_upload_routes_by_event_bridge_reason;
+#[path = "all/s3_metadata_tables_live_in_s3tables.rs"]
+mod s3_metadata_tables_live_in_s3tables;
 #[path = "all/s3_notification_indexes_into_its_opensearch_domain.rs"]
 mod s3_notification_indexes_into_its_opensearch_domain;
 #[path = "all/s3_notification_invokes_its_lambda_target.rs"]

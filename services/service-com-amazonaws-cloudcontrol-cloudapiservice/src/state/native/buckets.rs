@@ -46,6 +46,7 @@ use ::service_com_amazonaws_s3_amazons3::ops::types::BUCKET_VERSIONING_STATUS_VA
 use ::service_com_amazonaws_s3_amazons3::ops::types::SERVER_SIDE_ENCRYPTION_VALUES;
 use ::service_com_amazonaws_s3_amazons3::state as s3;
 use ::service_com_amazonaws_s3_amazons3::state::{BucketEncryptionRule, BucketPublicAccessBlock};
+use ::service_com_amazonaws_s3tables_s3tablebuckets::state as s3tables;
 
 use super::{require_value, text, NativeRefusal, NativeResourceProvider, S3State};
 
@@ -153,13 +154,21 @@ const UNAPPLIED_PROPERTIES: &[&str] = &[
 pub struct BucketProvider {
     /// The owning service's store. A handle, so every answer is read from the live store.
     state: ::engine::ServiceState<S3State>,
+    /// The Amazon S3 Tables store beside it, for the one thing a bucket's deletion reaches
+    /// outside its own service: the metadata tables of an S3 Metadata configuration whose
+    /// creation had not yet fallen due go back to the service that holds them
+    /// ([`s3::ComAmazonawsS3Amazons3State::release_removed_metadata_tables`]).
+    tables: ::engine::ServiceState<s3tables::ComAmazonawsS3tablesS3tablebucketsState>,
 }
 
 impl BucketProvider {
     /// The provider for the Amazon S3 store THIS engine carries, or `None` when it carries
     /// none.
     pub fn for_engine<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<Self> {
-        s3::service_state(engine).map(|state| Self { state })
+        Some(Self {
+            state: s3::service_state(engine)?,
+            tables: s3tables::service_state(engine)?,
+        })
     }
 }
 
@@ -293,7 +302,15 @@ impl NativeResourceProvider for BucketProvider {
             };
             return Err(NativeRefusal::Rejected(message.to_string()));
         }
-        store.remove_bucket(identifier, at);
+        let region = held.region.clone();
+        // The bucket goes, and the metadata tables of its configuration that no caller could
+        // have seen in service go with it — to the service that holds them, which is the only
+        // place they are. That store is taken UNDER this one's guard, the lock order the
+        // owning service states.
+        let removal = store.remove_bucket(identifier, at);
+        let mut tables = self.tables.lock();
+        let mut managed = s3::ManagedTableBucket::new(&mut tables, &region);
+        store.release_removed_metadata_tables(&removal, &mut managed);
         Ok(())
     }
 }

@@ -290,12 +290,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message,
             ));
         }
+        // The managed table bucket the enable provisions into is the one of the Region the
+        // general purpose bucket lives in; a bucket this emulator does not hold is reported by
+        // the state seam below. The store that owns those tables is taken UNDER this
+        // handler's own guard, which is the lock order
+        // [`crate::state::metadata_table_provisioning`] states.
+        let region = store
+            .bucket(&input.bucket)
+            .map(|bucket| bucket.region.clone())
+            .unwrap_or_default();
+        let Some(tables) =
+            crate::state::metadata_table_provisioning::metadata_tables_store(&*self.engine)
+        else {
+            // Unreachable beside the guard above, which came from the same engine.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateBucketMetadataInventoryTableConfiguration",
+            ));
+        };
+        let mut tables = tables.lock();
+        let mut managed = crate::state::ManagedTableBucket::new(&mut tables, &region);
         match store.update_metadata_inventory_table(
             &input.bucket,
             input
                 .inventory_table_configuration
                 .configuration_state
                 .clone(),
+            &mut managed,
             now,
         ) {
             // A table that could not be provisioned — its name already held by the table that
@@ -337,6 +357,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "the managed table bucket's namespace holds as many metadata tables as \
                      this emulator records ({})",
                     crate::state::MAX_METADATA_NAMESPACE_TABLES
+                )));
+            }
+            // The store that OWNS tables would not take the one this enable provisions, so
+            // there is no table to report at all — answered through the same 400 channel,
+            // naming what it refused rather than a ceiling that was not the reason.
+            crate::state::MetadataInventoryTableUpdate::TableRefused => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the managed table bucket cannot take the metadata table {:?} of \
+                     namespace {:?}",
+                    crate::state::METADATA_INVENTORY_TABLE_NAME,
+                    crate::state::metadata_table_namespace(&input.bucket)
                 )));
             }
         }

@@ -340,8 +340,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // either: a metadata table of this bucket that came into service is deleted through
         // the S3 Tables API that owns it, while one still being created leaves nothing behind
         // and frees the name it was being created under — the same rule the configuration
-        // delete reads, at the instant of this call.
-        store.remove_bucket(&input.bucket, ::std::time::SystemTime::now());
+        // delete reads, at the instant of this call. The store that owns those tables is
+        // taken UNDER this handler's own guard, which is the lock order
+        // [`crate::state::metadata_table_provisioning`] states.
+        let region = bucket.region.clone();
+        let Some(tables) =
+            crate::state::metadata_table_provisioning::metadata_tables_store(&*self.engine)
+        else {
+            // Unreachable beside the guard above, which came from the same engine.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBucket"));
+        };
+        let mut tables = tables.lock();
+        let mut managed = crate::state::ManagedTableBucket::new(&mut tables, &region);
+        let removal = store.remove_bucket(&input.bucket, ::std::time::SystemTime::now());
+        store.release_removed_metadata_tables(&removal, &mut managed);
         Ok(DeleteBucketOutput)
     }
 }

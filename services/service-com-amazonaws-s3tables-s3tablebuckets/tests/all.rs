@@ -57,6 +57,8 @@ mod replication_put_outcome;
 mod replication_version_token_preconditions;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/service_managed_table_deletes.rs"]
+mod service_managed_table_deletes;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/table_bucket_encryption.rs"]

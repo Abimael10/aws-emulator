@@ -1401,7 +1401,12 @@ impl Bucket {
     /// `false` is a bucket carrying NO metadata configuration, in which case nothing is
     /// written: there is no configuration to enable a table for, and the caller answers
     /// [`METADATA_CONFIGURATION_NOT_FOUND_CODE`].
-    pub fn update_metadata_annotation_table(
+    ///
+    /// PRIVATE: a table this provisions is a table of the managed table bucket, which the
+    /// STORE reaches, so [`ComAmazonawsS3Amazons3State::update_metadata_annotation_table`] is
+    /// the one way in — it is what creates the table in the service that owns it and what
+    /// takes one back, so the bucket's record and that store cannot be written apart.
+    pub(super) fn update_metadata_annotation_table(
         &mut self,
         configuration_state: String,
         role: Option<String>,

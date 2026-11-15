@@ -260,7 +260,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // either. That is where every other bucket-subresource write in this crate leaves
         // them.
         let now = ::std::time::SystemTime::now();
-        let namespace = crate::state::metadata_table_namespace(&input.bucket);
         let enabling =
             updates.configuration_state == crate::state::METADATA_CONFIGURATION_STATE_ENABLED;
 
@@ -367,21 +366,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Use this operation to enable or disable the annotation table, or to update its
         // associated IAM role" (this operation's own documentation), and nothing else: the
         // journal and inventory sub-resources of the same configuration are left exactly as
-        // they were.
-        if !bucket.update_metadata_annotation_table(
+        // they were. The table an enable provisions is a table of the managed table bucket,
+        // which the store that owns tables holds, so the state seam below is what records both
+        // halves — taking that store UNDER this handler's own guard, which is the lock order
+        // [`crate::state::metadata_table_provisioning`] states.
+        let region = store
+            .bucket(&input.bucket)
+            .map(|held| held.region.clone())
+            .unwrap_or_default();
+        let Some(tables) =
+            crate::state::metadata_table_provisioning::metadata_tables_store(&*self.engine)
+        else {
+            // Unreachable beside the guard above, which came from the same engine.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateBucketMetadataAnnotationTableConfiguration",
+            ));
+        };
+        let mut tables = tables.lock();
+        let mut managed = crate::state::ManagedTableBucket::new(&mut tables, &region);
+        match store.update_metadata_annotation_table(
+            &input.bucket,
             updates.configuration_state.clone(),
             updates.role.clone(),
-            &namespace,
             annotation_failure,
+            &mut managed,
             now,
         ) {
-            // Unreachable: the configuration was read above under this same guard.
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
-                crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
-                crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
-            )
-            .naming_bucket(&input.bucket));
+            crate::state::MetadataAnnotationTableUpdate::Recorded => {}
+            // Unreachable: the bucket and its configuration were both read above under this
+            // same guard.
+            crate::state::MetadataAnnotationTableUpdate::NoSuchBucket
+            | crate::state::MetadataAnnotationTableUpdate::NoConfiguration => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
+                    crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
+                    crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
+                )
+                .naming_bucket(&input.bucket));
+            }
+            // The emulator's own ceiling on the managed table bucket, so it goes out through
+            // the framework's 400 refusal channel rather than as an AWS error code — where the
+            // create that would carry it past the same maximum leaves it.
+            crate::state::MetadataAnnotationTableUpdate::NamespaceFull => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the managed table bucket's namespace holds as many metadata tables as \
+                     this emulator records ({})",
+                    crate::state::MAX_METADATA_NAMESPACE_TABLES
+                )));
+            }
+            // The store that OWNS tables would not take the one this enable provisions, so
+            // there is no table to report at all — answered through the same 400 channel,
+            // naming what it refused rather than a ceiling that was not the reason.
+            crate::state::MetadataAnnotationTableUpdate::TableRefused => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the managed table bucket cannot take the metadata table {:?} of \
+                     namespace {:?}",
+                    crate::state::METADATA_ANNOTATION_TABLE_NAME,
+                    crate::state::metadata_table_namespace(&input.bucket)
+                )));
+            }
         }
 
         // `Unit` output: success is the modelled 200 and an empty body.

@@ -196,6 +196,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // The managed table bucket whose tables this delete may take back is the one of the
+        // Region the general purpose bucket lives in, so that Region is read off the bucket
+        // first; a bucket this emulator does not hold has no tables to take back and is
+        // reported below. The store that owns those tables is taken UNDER this handler's own
+        // guard, which is the lock order
+        // [`crate::state::metadata_table_provisioning`] states.
+        let region = store
+            .bucket(&input.bucket)
+            .map(|bucket| bucket.region.clone())
+            .unwrap_or_default();
+        let Some(tables) =
+            crate::state::metadata_table_provisioning::metadata_tables_store(&*self.engine)
+        else {
+            // Unreachable beside the guard above, which came from the same engine.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteBucketMetadataConfiguration",
+            ));
+        };
+        let mut tables = tables.lock();
+        let mut managed = crate::state::ManagedTableBucket::new(&mut tables, &region);
         // "Deletes an S3 Metadata configuration from a general purpose bucket" (this
         // operation's own documentation): the whole subresource goes, so
         // `GetBucketMetadataConfiguration` reports none again. There is no configuration to
@@ -218,7 +238,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under is free again and the next create provisions afresh under it — the instant
         // this call is made is what decides which of the two a table is in
         // ([`crate::state::MetadataTable::creating_at`]).
-        match store.delete_metadata_configuration(&input.bucket, ::std::time::SystemTime::now()) {
+        match store.delete_metadata_configuration(
+            &input.bucket,
+            &mut managed,
+            ::std::time::SystemTime::now(),
+        ) {
             crate::state::MetadataConfigurationDeletion::Deleted => {}
             // The bucket this emulator does not hold: the model declares no error for this
             // operation, so it is reported through the unmodelled channel with the code and
