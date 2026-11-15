@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair per file under `tests/all/`, sorted by name, and no other line.
+// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
+// pin that shape; `all/appended_prose.rs` keeps what landings had appended here.
 // Single integration-test target for the router: the declaration list, and nothing else.
 //
 // Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per

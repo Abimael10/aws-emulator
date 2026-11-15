@@ -3515,14 +3515,27 @@ pub fn query_results_invalid_token_message() -> String {
     with_sdk_error_envelope("Invalid token for query", ENVELOPE_INVALID_PARAMETER)
 }
 
+/// The sentence CloudWatch Logs states for a `queryDefinitionId` that resolves to no
+/// definition of this account.
+///
+/// Fixed text for the whole class — it carries nothing of the request, not even the id — and
+/// it is the WHOLE sentence: the verdict on the id, and then what a caller does about it on
+/// each of the two calls that may carry the member, which is an UPDATE of a definition (the
+/// id has to name one) or a CREATE (the id is left out, because the service mints it). A
+/// caller cannot tell those two apart from the verdict alone, which is why the service states
+/// both halves.
+const QUERY_DEFINITION_INVALID_ID_MESSAGE: &str = "Query definition id is invalid. If you are \
+     updating query definition, please provide correct query definition id; If you are creating \
+     new query definition, do not use --query-definition-id as a parameter";
+
 /// The refusal CloudWatch Logs answers when the missing resource is a QUERY DEFINITION: the
-/// service states the fixed sentence for the class — it carries nothing of the request, not
-/// even the id — inside the SDK envelope of the `ResourceNotFoundException` it is refused
-/// under ([`with_sdk_error_envelope`]), so the status and the code stated in the text are the
-/// ones the response itself answers with and the only per-run field is the request id.
+/// fixed sentence for the class ([`QUERY_DEFINITION_INVALID_ID_MESSAGE`]) inside the SDK
+/// envelope of the `ResourceNotFoundException` it is refused under
+/// ([`with_sdk_error_envelope`]), so the status and the code stated in the text are the ones
+/// the response itself answers with and the only per-run field is the request id.
 pub fn query_definition_not_found_message() -> String {
     with_sdk_error_envelope(
-        "Query definition id is invalid.",
+        QUERY_DEFINITION_INVALID_ID_MESSAGE,
         ENVELOPE_RESOURCE_NOT_FOUND,
     )
 }

@@ -55,7 +55,7 @@ fn query_id(answer: &Value) -> String {
 /// Every pipeline the query language defines is admitted, whatever stages it carries.
 ///
 /// The rows span what the rule generalises over: how many stages the pipeline carries, which
-/// commands they are, whether a later stage LISTS a field an earlier one produced, and
+/// commands they are, whether a later stage READS a field an earlier one produced, and
 /// whether a stage computes a value with arithmetic or with one of the language's functions.
 #[tokio::test]
 async fn a_pipeline_the_query_language_defines_is_admitted() {
@@ -67,8 +67,11 @@ async fn a_pipeline_the_query_language_defines_is_admitted() {
     let cases: [(&str, &str); 16] = [
         ("one stage", "fields @timestamp, @message"),
         (
-            "a parsed field listed by a later fields command",
-            r"parse @message /lat=(?<lat>\d+)/ | fields @timestamp, lat",
+            // A later stage READS the field the parse produced — it is `fields` that
+            // declares a projection, and a field already declared cannot be declared again
+            // ([`crate::query_compile_rule_refusals`]).
+            "a parsed field read by later stages",
+            r"parse @message /lat=(?<lat>\d+)/ | sort lat desc | display @timestamp, lat",
         ),
         (
             "a parsed field displayed by a later display command",
@@ -92,7 +95,7 @@ async fn a_pipeline_the_query_language_defines_is_admitted() {
             // One `as` clause of a LIST names one field; the name after the comma is the next
             // item of the list, which the stage reads rather than defines.
             "a renamed field beside a field an earlier stage produced",
-            r#"parse @message "svc=* lat=*" as svc, lat | fields lat / 1000 as sec, svc
+            r#"parse @message "svc=* lat=*" as svc, lat | display lat / 1000 as sec, svc
 | sort sec desc | limit 3 | dedup svc | display svc, sec"#,
         ),
         (

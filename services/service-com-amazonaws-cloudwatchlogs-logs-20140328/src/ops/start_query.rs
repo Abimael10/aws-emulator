@@ -354,8 +354,9 @@ fn malformed_statement(query: &str, detail: &str) -> StartQueryError {
     .into()
 }
 
-/// The fixed text a refusal for a query the compiler could not build opens with.
-const COMPILE_ERROR_PREFIX: &str = "Compile Error - ";
+/// The fixed text a refusal for a query the compiler could not build opens with, as the
+/// compiler itself states it ([`crate::state::query_compile::COMPILE_ERROR_PREFIX`]).
+const COMPILE_ERROR_PREFIX: &str = crate::state::query_compile::COMPILE_ERROR_PREFIX;
 
 /// Refuse a SQL statement that filters its groups on an aggregate function expression: the
 /// rule, then the predicate as the pipeline the statement translates to states it, and where

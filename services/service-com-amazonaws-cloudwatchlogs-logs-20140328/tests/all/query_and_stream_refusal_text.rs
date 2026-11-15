@@ -188,7 +188,14 @@ async fn a_query_definition_id_that_is_not_stored_is_refused_in_the_services_wor
         ("an id that is not a UUID at all", "not-a-definition".to_string()),
     ];
 
-    let expected_text = "Query definition id is invalid.";
+    // The WHOLE sentence the service states for an id that resolves to no definition: the
+    // verdict on the id, and then what to do about it on each of the two calls that may
+    // carry the member — an update, which has to name a definition, and a create, which
+    // leaves the id out. Written out here rather than read from the crate, so a sentence
+    // the implementation shortens fails this.
+    let expected_text = "Query definition id is invalid. If you are updating query definition, \
+                         please provide correct query definition id; If you are creating new \
+                         query definition, do not use --query-definition-id as a parameter";
     let mut seen_request_ids: Vec<String> = Vec::new();
     for (case, id) in absent {
         // Both operations that resolve a `queryDefinitionId`: the delete, and the put
@@ -453,11 +460,15 @@ async fn a_nexttoken_a_read_cannot_resume_from_is_refused_with_one_sentence() {
     }
 }
 
-/// A query string that does not compile is refused with the service's PARSER DIAGNOSTIC: the
-/// message names the symbol the compiler stopped on and where that symbol sits in the
-/// submitted string, so two different faults do not read alike and a caller can tell where
-/// the query is wrong. The diagnostic is stated inside the SDK envelope of the refusal it is
-/// answered under, the way every message of this service that carries one states it.
+/// A query string that does not compile ON A SYMBOL is refused with the service's PARSER
+/// DIAGNOSTIC: the message names the symbol the compiler stopped on and where that symbol sits
+/// in the submitted string, so two different faults do not read alike and a caller can tell
+/// where the query is wrong. The diagnostic is stated inside the SDK envelope of the refusal it
+/// is answered under, the way every message of this service that carries one states it.
+///
+/// The faults the compiler states a RULE for rather than a symbol — a regular expression that
+/// does not compile, a field the pipeline already carries — are in
+/// [`crate::query_compile_rule_refusals`].
 #[tokio::test]
 async fn a_query_that_does_not_compile_is_refused_with_the_parsers_diagnostic() {
     let logs = Logs::new();
@@ -490,16 +501,6 @@ async fn a_query_that_does_not_compile_is_refused_with_the_parsers_diagnostic() 
             "a limit that is not a number of log events",
             "fields @message | limit none",
             "none",
-        ),
-        (
-            "a parse regex that does not compile",
-            r"fields @message | parse @message /+/",
-            "/+/",
-        ),
-        (
-            "a field defined twice over by two parse commands",
-            r#"fields @message | parse @message "lat=*" as lat | parse @message "lon=*" as lat"#,
-            "lat",
         ),
         (
             // A query string carries newlines as readily as a console does, and the place

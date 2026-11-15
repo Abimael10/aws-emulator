@@ -17,14 +17,16 @@
 //! * the operand of each stage: a command the language writes with one
 //!   ([`COMMANDS_TAKING_AN_OPERAND`]) is not a command without it, so a query that ends — or
 //!   reaches the next stage separator — before the operand it owes does not compile;
-//! * the regular expression a `parse` or `filter` command carries: it is compiled with the
-//!   `regex` crate, so an expression that is not a regular expression at all — an unclosed
-//!   group, a dangling quantifier — is refused where it stands;
+//! * the regular expression a `parse` or `filter` command carries: it is parsed in the form
+//!   the compiler reads it in ([`regex_diagnostic`]), so an expression that is not a regular
+//!   expression at all — an unclosed group, a dangling quantifier — is refused with the
+//!   compile failure of that expression;
 //! * the ephemeral fields the pipeline defines: a command may not DEFINE a field name an
-//!   earlier command of the same pipeline already defined — whether it defines it with an
-//!   `as` clause or with a named capture group of a `parse` expression — because the two
-//!   definitions would name one field. LISTING a field a stage already produced (`fields
-//!   @timestamp, lat`) defines nothing: it selects it, which is what those commands are for;
+//!   earlier command of the same pipeline already defined — with an `as` clause, with a named
+//!   capture group of a `parse` expression, or by naming it as an item of a `fields`
+//!   projection, which declares the fields of the records that stage produces — because the
+//!   two definitions would name one field. A command that merely READS a field (`display`,
+//!   `stats`, `sort`, `filter`, `dedup`) declares nothing;
 //! * the functions each stage CALLS, which have to be functions the language defines
 //!   ([`functions`]);
 //! * a `limit` command's count, which is a positive integer;
@@ -41,8 +43,8 @@
 //! handler runs — so every scan here is linear or near-linear in at most ten thousand
 //! characters, with no recursion anywhere and no state that outlives one call. The one thing
 //! a query could otherwise grow without a bound of its own is the regular expression it
-//! carries, which is compiled under an explicit size limit ([`MAX_COMPILED_REGEX_BYTES`]) and
-//! never run over any data.
+//! carries, which is PARSED — never built into a matcher here, and never run over any data —
+//! under the parser's own nest limit ([`regex_diagnostic`]).
 //!
 //! [`COMMANDS`] is the closed set of commands the query language defines today. A query
 //! using a command the language adds later is refused here until that command is added to
@@ -53,6 +55,10 @@ use std::collections::BTreeSet;
 
 /// The functions a query may call, and finding a call to one the language does not define.
 mod functions;
+
+/// The form the compiler reads a regular-expression literal in, and the compile failure of one
+/// that is not a regular expression.
+mod regex_diagnostic;
 
 /// Why a query string does not compile, and where in the string the compiler stopped.
 ///
@@ -199,7 +205,27 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
             .take_while(|character| !character.is_whitespace())
             .collect();
         let lowercased = command.to_lowercase();
+        let arguments = &trimmed[command.len()..];
+        let arguments_offset = command_offset + command.chars().count();
         if !COMMANDS.contains(&lowercased.as_str()) {
+            // A query is a PIPELINE of commands, and the compiler stops on the first symbol
+            // that cannot continue the pipeline it has read. A query whose OPENING word is no
+            // command leaves it with no command read at all, so a stage separator standing in
+            // that opening stage is a symbol the query cannot carry — there is nothing before
+            // it for the pipeline to continue from — and that separator is where the compiler
+            // stops. A query that opens with a command IS reading a pipeline, so a later word
+            // that is no command is what it stops on, whether that word opens its own stage or
+            // follows a separator inside one ([`unseparated_command`]).
+            if compiled.commands.is_empty() {
+                if let Some((separator, _, _)) = unseparated_pipe(arguments, arguments_offset) {
+                    return Err(QueryCompileFailure {
+                        message: "The query does not open with a query command.".to_string(),
+                        refusal: None,
+                        start_char_offset: separator,
+                        end_char_offset: separator + 1,
+                    });
+                }
+            }
             return Err(QueryCompileFailure {
                 message: format!("The command {command} is not a valid query command."),
                 refusal: None,
@@ -207,8 +233,6 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
                 end_char_offset: command_offset + command.chars().count(),
             });
         }
-        let arguments = &trimmed[command.len()..];
-        let arguments_offset = command_offset + command.chars().count();
         // A `|` left INSIDE a stage separates this command from a word that is no command of
         // the query language — the split above only separates stages at a command — so the
         // word after it is what the query got wrong.
@@ -251,20 +275,24 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
                 return Err(failure);
             }
         }
+        // A `fields` command DECLARES the fields of the records its stage produces, so an item
+        // of its projection that names an EPHEMERAL field an earlier command of the pipeline
+        // created declares that one field a second time. The fields of the log events
+        // themselves are not declared by naming them: only a name the pipeline itself created
+        // is already defined.
+        for (field, offset) in projected_fields(&lowercased, arguments, arguments_offset) {
+            if compiled.defined_fields.contains(&field) {
+                return Err(already_defined_failure(&field, offset));
+            }
+        }
         // A command DEFINES an ephemeral field by naming it in an `as` clause, or with a named
         // capture group of a `parse` expression — and a field an earlier command of the same
         // pipeline already defined cannot be defined again, because the two definitions would
-        // name one field. A command that LISTS a field (`fields @timestamp, lat`, `display`,
-        // `stats`, `sort`, `filter`) selects or reads the one the pipeline already carries and
-        // defines nothing.
+        // name one field. A command that only READS a field (`display`, `stats`, `sort`,
+        // `filter`, `dedup`) reads the one the pipeline already carries and declares nothing.
         for (field, offset) in defined_fields(&lowercased, arguments, arguments_offset) {
             if !compiled.defined_fields.insert(field.clone()) {
-                return Err(QueryCompileFailure {
-                    message: format!("The field {field} is already defined."),
-                    refusal: None,
-                    start_char_offset: offset,
-                    end_char_offset: offset + field.chars().count(),
-                });
+                return Err(already_defined_failure(&field, offset));
             }
         }
         compiled.stages.push(CompiledStage {
@@ -461,11 +489,39 @@ pub fn split_stages(query: &str, commands: &[&str]) -> Vec<CompiledStage> {
 
 /// The `|` a stage still holds, and the word after it, when that word is no command of the
 /// language — the only way a `|` survives [`split_pipeline`].
+fn unseparated_command(arguments: &str, arguments_offset: usize) -> Option<QueryCompileFailure> {
+    let (_, word_at, word) = unseparated_pipe(arguments, arguments_offset)?;
+    let end_of_arguments = arguments_offset + arguments.chars().count();
+    let (start, end) = if word.is_empty() {
+        // Nothing follows the separator: the compiler ran out of input where a command was
+        // required, so it stopped at the end of what it had read (see the empty-stage branch
+        // of `compile`).
+        (end_of_arguments, end_of_arguments)
+    } else {
+        (word_at, word_at + word.chars().count())
+    };
+    Some(QueryCompileFailure {
+        message: if word.is_empty() {
+            "The query has an empty command.".to_string()
+        } else {
+            format!("The command {word} is not a valid query command.")
+        },
+        refusal: None,
+        start_char_offset: start,
+        end_char_offset: end,
+    })
+}
+
+/// The first `|` of `arguments` that separates no stage — its character offset, the offset of
+/// the word that follows it and that word — or `None` when the stage holds no such separator.
+///
+/// The offsets are absolute, counted from `arguments_offset`. The word is empty when nothing
+/// but blank space follows the separator.
 ///
 /// A `|` inside a regular-expression literal is part of that expression, so the scan skips a
 /// `/…/` literal; a `/` with no closing `/` in the same stage is a division operator rather
-/// than the start of one.
-fn unseparated_command(arguments: &str, arguments_offset: usize) -> Option<QueryCompileFailure> {
+/// than the start of one. So is a `|` inside a quoted string.
+fn unseparated_pipe(arguments: &str, arguments_offset: usize) -> Option<(usize, usize, String)> {
     let characters: Vec<char> = arguments.chars().collect();
     let mut index = 0usize;
     while index < characters.len() {
@@ -500,24 +556,11 @@ fn unseparated_command(arguments: &str, arguments_offset: usize) -> Option<Query
                 .iter()
                 .take_while(|character| !character.is_whitespace())
                 .collect();
-            let (start, end) = if word.is_empty() {
-                // Nothing follows the separator: the compiler ran out of input where a
-                // command was required, so it stopped at the end of what it had read (see
-                // the empty-stage branch of `compile`).
-                (characters.len(), characters.len())
-            } else {
-                (after, after + word.chars().count())
-            };
-            return Some(QueryCompileFailure {
-                message: if word.is_empty() {
-                    "The query has an empty command.".to_string()
-                } else {
-                    format!("The command {word} is not a valid query command.")
-                },
-                refusal: None,
-                start_char_offset: arguments_offset + start,
-                end_char_offset: arguments_offset + end,
-            });
+            return Some((
+                arguments_offset + index,
+                arguments_offset + after,
+                word,
+            ));
         }
         index += 1;
     }
@@ -590,38 +633,30 @@ fn check_regex_pattern(
 }
 
 /// Check one regular-expression literal.
+///
+/// A literal that is not a regular expression at all is refused with the COMPILE FAILURE of
+/// the expression ([`regex_diagnostic`]) rather than as a symbol the parser stopped on: the
+/// literal parses as the literal it is, and what is wrong is inside it — which construct
+/// broke, and at which index of the expression the compiler stopped, is the only thing that
+/// tells the author where to look.
 fn check_one_regex_literal(literal: &RegexLiteral) -> Result<(), QueryCompileFailure> {
-    // The expression comes from the request, so what compiling it may allocate is bounded
-    // here rather than left at the engine's default: the expression is only COMPILED — to
-    // decide whether it is an expression at all — and never run over any data.
-    let compiled = ::regex::RegexBuilder::new(&literal.pattern)
-        .size_limit(MAX_COMPILED_REGEX_BYTES)
-        .build();
-    if let Err(error) = compiled {
-        let unsupported_construct = error.to_string().contains("not supported");
-        if !unsupported_construct {
-            // The text at fault is the literal and the slashes that delimit it: two of them
-            // for a literal a `/` closed, one for a literal that runs to the end of the
-            // command.
-            let slashes = if literal.closed { 2 } else { 1 };
-            return Err(QueryCompileFailure {
-                message: format!(
-                    "The regular expression /{}/ is not valid.",
-                    literal.pattern
-                ),
-                refusal: None,
-                start_char_offset: literal.offset,
-                end_char_offset: literal.offset + literal.pattern.chars().count() + slashes,
-            });
-        }
-    }
-    Ok(())
+    let Some(invalid) = regex_diagnostic::invalid_expression(&literal.pattern) else {
+        return Ok(());
+    };
+    // The text at fault is the literal and the slashes that delimit it: two of them for a
+    // literal a `/` closed, one for a literal that runs to the end of the command.
+    let slashes = if literal.closed { 2 } else { 1 };
+    let detail = invalid.diagnostic();
+    Err(QueryCompileFailure {
+        refusal: Some(format!("{COMPILE_ERROR_PREFIX}{detail}")),
+        message: detail,
+        start_char_offset: literal.offset,
+        end_char_offset: literal.offset + literal.pattern.chars().count() + slashes,
+    })
 }
 
-/// How large a compiled expression this module will build from a request's query string.
-/// THE EMULATOR'S OWN BOUND: the query string is already `@length(0..10000)`, and this caps
-/// what compiling the expression inside it may allocate.
-const MAX_COMPILED_REGEX_BYTES: usize = 1 << 20;
+/// The fixed text a refusal for a query the compiler could not build opens with.
+pub const COMPILE_ERROR_PREFIX: &str = "Compile Error - ";
 
 /// A regular-expression literal a command carries.
 struct RegexLiteral {
@@ -858,6 +893,70 @@ fn defined_fields(
     }
     defined.extend(item_alias_names(arguments, arguments_offset));
     defined
+}
+
+/// The failure a query that names one ephemeral field twice over is refused with: the RULE it
+/// broke, the field's name, and then the marker this service prints where a refusal would
+/// otherwise state the SPAN of the text at fault ([`super::query_admission::NO_SPAN_MARKER`]),
+/// which this class carries none of — the fault is that the pipeline already holds a field of
+/// that name, not that any part of the query string is unreadable.
+///
+/// Such a query PARSES: the duplicated name is a legal name where it stands. Naming a symbol
+/// the compiler stopped on would point the author at a legal token and state no rule at all.
+/// The modelled detail still locates the name inside the query
+/// (`QueryCompileError$location`), which is the structure the model declares for a location
+/// rather than text of the message.
+fn already_defined_failure(field: &str, offset: usize) -> QueryCompileFailure {
+    QueryCompileFailure {
+        message: format!("{EPHEMERAL_FIELD_DEFINED_PREFIX}{field}"),
+        refusal: Some(format!(
+            "{EPHEMERAL_FIELD_DEFINED_PREFIX}{field} {}",
+            super::query_admission::NO_SPAN_MARKER
+        )),
+        start_char_offset: offset,
+        end_char_offset: offset + field.chars().count(),
+    }
+}
+
+/// The fixed text such a refusal opens with, the name the pipeline already carries following
+/// it.
+const EPHEMERAL_FIELD_DEFINED_PREFIX: &str = "Ephemeral field is already defined: ";
+
+/// The fields a stage DECLARES by projecting them, each with the character offset of its name.
+///
+/// Only `fields` declares its projection: it "retrieves the specified fields from log events
+/// for display", so each item of its comma-separated list is a field of the records that stage
+/// produces. An item is a declaration only where it is a BARE NAME — an item that COMPUTES a
+/// value declares the name its own `as` clause gives it ([`defined_fields`]) and reads
+/// whatever fields its expression names.
+fn projected_fields(command: &str, arguments: &str, arguments_offset: usize) -> Vec<(String, usize)> {
+    if command != FIELDS {
+        return Vec::new();
+    }
+    let mut projected: Vec<(String, usize)> = Vec::new();
+    let mut item = String::new();
+    let mut item_at = 0usize;
+    for (index, character) in arguments.chars().enumerate() {
+        if character == ',' {
+            push_projected_item(&mut projected, &item, arguments_offset + item_at);
+            item.clear();
+            item_at = index + 1;
+            continue;
+        }
+        item.push(character);
+    }
+    push_projected_item(&mut projected, &item, arguments_offset + item_at);
+    projected
+}
+
+/// Add `item` to `projected` when it is one bare field name, at the offset that name itself
+/// starts at — the blank space an item opens with is not part of it.
+fn push_projected_item(projected: &mut Vec<(String, usize)>, item: &str, item_offset: usize) {
+    let leading = item.chars().take_while(|character| character.is_whitespace()).count();
+    let name = item.trim();
+    if is_field_name(name) {
+        projected.push((name.to_string(), item_offset + leading));
+    }
 }
 
 /// The named capture groups of `literal`, each with the character offset of its name.

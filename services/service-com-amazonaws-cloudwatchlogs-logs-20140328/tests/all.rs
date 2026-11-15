@@ -247,6 +247,8 @@ mod query_and_stream_refusal_text;
 mod query_cancellation;
 #[path = "all/query_compilation.rs"]
 mod query_compilation;
+#[path = "all/query_compile_rule_refusals.rs"]
+mod query_compile_rule_refusals;
 #[path = "all/query_definitions.rs"]
 mod query_definitions;
 #[path = "all/query_language_admission.rs"]
