@@ -81,6 +81,8 @@ mod imported_key_material;
 mod key_deletion_cancellation;
 #[path = "all/key_last_usage.rs"]
 mod key_last_usage;
+#[path = "all/key_last_usage_monitoring.rs"]
+mod key_last_usage_monitoring;
 #[path = "all/key_last_usage_monotonicity.rs"]
 mod key_last_usage_monotonicity;
 #[path = "all/key_lifecycle.rs"]

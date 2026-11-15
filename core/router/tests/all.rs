@@ -1684,3 +1684,17 @@ mod zz_probe_whole_emulator;
 // `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin all of it.
 #[path = "all/default_vpc_internet_path_runs_ecs_tasks.rs"]
 mod default_vpc_internet_path_runs_ecs_tasks;
+// Single integration-test target for the router: the canonical declaration list of its
+// suite file under `tests/all/`, sorted by name, and no other line — so two branches landing
+// at once insert two lines in two places and have no prose to duplicate, re-word or mistype.
+// EVERY comment here is an ordinary `//` one, this header included: an inner doc comment is
+// legal only before the first item, so one appended past the declarations is `E0753` and
+// compiles no suite of this target. A suite declared twice is `E0428`, and a suite file no
+// declaration names is compiled nowhere. `tests/all.rs` is a test-target crate root, so a
+// bare `mod` would resolve to a sibling of this file, which the layout check refuses: the
+// `#[path]` above each `mod` is what points it into `tests/all/`.
+// belongs in that suite's own module header; a note about this file belongs in
+// `all/appended_notes.rs`, declared below like any other suite.
+// The lint allowed below is for the suite files this root compiles, whose wrapped header
+// paragraphs are prose rather than doc list items. An inner attribute, like an inner doc
+// comment, is legal only before the first item, so it stands here rather than in the list.
