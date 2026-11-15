@@ -122,6 +122,12 @@ mod stage_web_acl_edge;
 // redacted.
 #[path = "all/stage_web_acl_logging.rs"]
 mod stage_web_acl_logging;
+// And where those records arrive when the destination names an Amazon S3 BUCKET rather than a
+// log group: one record per inspected request, in gzipped newline-delimited JSON objects under
+// WAF's published key layout, reproducing the request's headers and its non-terminating
+// matches.
+#[path = "all/stage_web_acl_logging_bucket_delivery.rs"]
+mod stage_web_acl_logging_bucket_delivery;
 // Which DESTINATION those records reach: both published forms of a log-group ARN name the
 // same group, the count of records tracks the requests inspected, and a destination the
 // prefix rule refuses leaves the binding, the records and the stage alone.

@@ -1343,3 +1343,41 @@ mod zz_opensearch_fgac_probe;
 mod zz_probe;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
+// Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
+// `mod <name>;` pair per file under `tests/all/`, sorted by name, and no other line.
+// `all/all_rs_is_a_canonical_declaration_list.rs` and `all/every_suite_file_is_declared.rs`
+// pin that shape; `all/appended_prose.rs` keeps what landings had appended here.
+// Single integration-test target for the router: the declaration list, and nothing else.
+// and NOTHING after the last pair. Put a new suite at `tests/all/<name>.rs` and insert its
+// pair in the one place its name sorts to, so two branches landing at once insert two lines
+// in two places and have no prose to duplicate, re-word or mistype — which is what had gone
+// wrong here: the tail of this file had grown hundreds of re-typed copies of its own header.
+// EVERY comment in this file is an ORDINARY `//` one, this header included. A doc comment of
+// the enclosing module, like an inner attribute, is legal only ahead of the first item, so
+// one left below the list compiles no suite of this target; with none anywhere in the file,
+// no appended, re-typed or merged copy of a line of it can be one. A suite file no `mod`
+// names is compiled nowhere and its tests never run, a suite left at the top level of
+// `tests/` fails the build, and a second `mod` for one name compiles neither copy. This file
+// is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of it
+// What a suite covers, and why it drives the assembled router rather than one service crate,
+// belongs in that suite's OWN module header, where it is read beside the test it explains; a
+// note about THIS file belongs in `all/appended_header_notes.rs`, `all/appended_notes.rs`,
+// `all/appended_notes_tail.rs` or `all/appended_prose.rs`, which hold comments alone and are
+// declared below like any other file. The `all/all_rs_*` suites,
+// `all/every_suite_file_is_declared.rs`, `all/declaration_roots_are_canonical_and_complete.rs`
+// and `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin every rule
+// above, for this file and for every service crate's own `tests/all.rs`, so check there rather
+// Single integration-test target for the router: this header, then one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under `tests/all/`, sorted
+// by name, and no other line — no prose between the pairs, no blank line, and nothing after
+// the last pair. Put a new suite at `tests/all/<name>.rs` and insert its pair where its name
+// sorts to, so two branches landing at once insert two lines in two places and have no prose
+// to duplicate, re-word or mistype.
+// note about THIS file belongs in one of `all/appended_header_notes.rs`,
+// `all/appended_notes.rs`, `all/appended_notes_tail.rs` and `all/appended_prose.rs`, which
+// keep what earlier landings had appended here and are declared below like any other suite.
+// EVERY comment in this file is an ordinary `//` one, this header included: an inner doc
+// The paragraphs above wrap without the indentation `clippy::doc_lazy_continuation` asks of a
+// doc list item; the lint is allowed here so a header line is a header line rather than a
+// build failure. An inner attribute is legal only ahead of the first item, so it stands with
+// this header.
