@@ -82,6 +82,29 @@ pub fn vpc_origin_endpoint_config_quantity_mismatch(
     )
 }
 
+/// Whether `config` fronts the VPC origin `id` names through one of its origins.
+///
+/// An origin reaches a VPC origin through `Origin$VpcOriginConfig`, whose required
+/// `VpcOriginId` is "The VPC origin ID" — so a distribution is associated with the VPC origin
+/// exactly when ONE of the origins of its stored configuration names it there, and a
+/// configuration whose origins all describe an S3 or custom origin is associated with no VPC
+/// origin at all. Read from the STORED configuration, like every other association predicate
+/// of this store ([`references_connection_function`], [`references_key_group`]), so the
+/// listing of the distributions a VPC origin fronts can never disagree with what a read of
+/// those distributions reports. An empty `id` names no VPC origin — none is ever minted — so
+/// it matches nothing.
+pub fn references_vpc_origin(config: &DistributionConfig, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    config
+        .origins
+        .items
+        .iter()
+        .filter_map(|origin| origin.vpc_origin_config.as_ref())
+        .any(|vpc| vpc.vpc_origin_id == id)
+}
+
 /// One CloudFront VPC origin, as this emulator persists it.
 ///
 /// The record is the single source of truth for the VPC origin's id, ARN, status, the

@@ -7533,3 +7533,7 @@ mod events_lambda_target_permission_granted_after_the_rule;
 //! leaving a note here. What a suite covers, and why it belongs to this cross-service target
 //! rather than to one service crate's own, is stated in that suite's own module doc, where it
 //! is read beside the test it describes.
+// (Ends the declaration list: add a new suite's `#[path]`/`mod` pair above, and leave the
+// rules to the header at the top of this file, which is the only place an inner doc comment
+// may stand.)
+// (Nothing below this line but the end of the file.)
