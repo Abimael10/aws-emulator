@@ -46,6 +46,19 @@ pub const SNAPSHOT_SCHEDULE_QUOTA: usize = 10_000;
 /// work one request can ask for.
 pub const MAX_SCHEDULE_DEFINITIONS: usize = 100;
 
+/// How long after the `ModifySnapshotSchedule` call that starts it the change to
+/// a schedule a cluster is associated with falls due.
+///
+/// "Any schedule associated with a cluster is modified asynchronously", so the
+/// change reaches those clusters after the call that asked for it rather than
+/// with it. The span is the emulator's own compression of a duration Amazon
+/// Redshift documents nowhere, and it is the one every other in-place change of
+/// this service settles after ([`PROVISIONING_SPAN`]) — deliberately non-zero,
+/// so the call that asks for the change reports the associations as still being
+/// applied, which is where a client reads that state. The due instant is stored
+/// and nothing ever sleeps for it.
+pub const SNAPSHOT_SCHEDULE_UPDATE_SPAN: Duration = PROVISIONING_SPAN;
+
 /// The member a `ScheduleIdentifier` refusal names.
 pub const SNAPSHOT_SCHEDULE_IDENTIFIER_MEMBER: &str = "ScheduleIdentifier";
 
@@ -419,6 +432,19 @@ pub fn snapshot_schedule_already_exists_message(identifier: &str) -> String {
     )
 }
 
+/// Why a change to a schedule whose last change is still being applied is
+/// refused.
+///
+/// The fixed text is what the model states the fault is
+/// (`smithy_query(query="shape", shape="SnapshotScheduleUpdateInProgressFault")`
+/// — "The specified snapshot schedule is already being updated"), with the
+/// identifier the request named single-quoted inside it, the way this family
+/// words an identifier it reports back in a sentence (see
+/// [`snapshot_schedule_not_found_message`]).
+pub fn snapshot_schedule_update_in_progress_message(identifier: &str) -> String {
+    format!("The specified snapshot schedule '{identifier}' is already being updated.")
+}
+
 /// Why a create past [`SNAPSHOT_SCHEDULE_QUOTA`] is refused.
 pub fn snapshot_schedule_quota_message() -> String {
     format!(
@@ -558,6 +584,19 @@ pub struct StoredSnapshotSchedule {
     /// The tags the create gave the schedule — an empty list when it gave none,
     /// which is what the schedule then carries.
     pub tags: Vec<crate::ops::types::Tag>,
+    /// When the change a `ModifySnapshotSchedule` started finishes being
+    /// applied to the clusters this schedule takes snapshots of, and `None`
+    /// while no change is being applied.
+    ///
+    /// "Any schedule associated with a cluster is modified asynchronously"
+    /// (`smithy_query(query="operation", operation="ModifySnapshotSchedule")`),
+    /// so a schedule a cluster is associated with carries the change for the
+    /// span it takes to reach that cluster ([`SNAPSHOT_SCHEDULE_UPDATE_SPAN`]):
+    /// while it does, the schedule reports its associations as still being
+    /// applied and a second change to it is refused. The due instant is stored
+    /// and nothing ever sleeps for it; the transition is materialised by
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle_snapshot_schedule_updates`].
+    pub update_due: Option<Instant>,
 }
 
 impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
@@ -585,12 +624,19 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// The association is reported as still being applied while the cluster
     /// itself is not serving — the schedule takes snapshots of a cluster only
     /// once that cluster is up — and as active from then on (see
-    /// [`SCHEDULE_ASSOCIATION_STATE_ACTIVE`]). The list is cut at
+    /// [`SCHEDULE_ASSOCIATION_STATE_ACTIVE`]). An association of a schedule
+    /// whose own last change has not reached its clusters yet
+    /// ([`StoredSnapshotSchedule::update_due`]) is still being applied too: the
+    /// schedule the cluster takes snapshots on is not the one the store now
+    /// holds until that change lands. The list is cut at
     /// [`MAX_REPORTED_ASSOCIATED_CLUSTERS`] while the count is not.
     pub fn clusters_associated_to_schedule(
         &self,
         identifier: &str,
     ) -> (Vec<ClusterAssociatedToSchedule>, usize) {
+        let updating = self
+            .snapshot_schedule(identifier)
+            .is_some_and(|schedule| schedule.update_due.is_some());
         let associated = self.clusters.iter().filter(|stored| {
             stored.cluster.snapshot_schedule_identifier.as_deref() == Some(identifier)
         });
@@ -607,7 +653,7 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                 ClusterAssociatedToSchedule {
                     cluster_identifier: stored.cluster.cluster_identifier.clone(),
                     schedule_association_state: Some(
-                        if serving {
+                        if serving && !updating {
                             SCHEDULE_ASSOCIATION_STATE_ACTIVE
                         } else {
                             SCHEDULE_ASSOCIATION_STATE_MODIFYING
@@ -650,6 +696,70 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                 i32::try_from(associated_cluster_count).unwrap_or(i32::MAX),
             ),
             associated_clusters: Some(associated_clusters),
+        }
+    }
+
+    /// One stored schedule as the MODIFY path answers it.
+    ///
+    /// The create path, the read path and this one all answer the same modelled
+    /// `SnapshotSchedule`, which the generated types project once per operation
+    /// — so this projection is filled from the one view above rather than
+    /// computing the derived members a second way, and no two operations can
+    /// report a schedule differently.
+    pub fn modified_snapshot_schedule_view(
+        &self,
+        stored: &StoredSnapshotSchedule,
+        now: SystemTime,
+        next_invocations: usize,
+    ) -> crate::ops::types::ModifySnapshotScheduleOutput {
+        let view = self.snapshot_schedule_view(stored, now, next_invocations);
+        crate::ops::types::ModifySnapshotScheduleOutput {
+            schedule_identifier: view.schedule_identifier,
+            schedule_definitions: view.schedule_definitions,
+            schedule_description: view.schedule_description,
+            tags: view.tags,
+            next_invocations: view.next_invocations,
+            associated_cluster_count: view.associated_cluster_count,
+            associated_clusters: view.associated_clusters,
+        }
+    }
+
+    /// Materialise every schedule change the clock already owes at `now`: a
+    /// change a `ModifySnapshotSchedule` started has reached the clusters the
+    /// schedule is associated with once its span has passed, so from then on
+    /// nothing is being applied and those associations are active again.
+    ///
+    /// Due at this instant whether or not anybody called, which is why a
+    /// reporting operation may apply it: see
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`].
+    pub fn settle_snapshot_schedule_updates(&mut self, now: Instant) {
+        let applied: Vec<String> = self
+            .snapshot_schedules
+            .iter_mut()
+            .filter(|schedule| schedule.update_due.is_some_and(|due| now >= due))
+            .map(|schedule| {
+                schedule.update_due = None;
+                schedule.schedule_identifier.clone()
+            })
+            .collect();
+        if applied.is_empty() {
+            return;
+        }
+        // The cluster's own member and the schedule's view report one
+        // association, so the state the cluster carries leaves `MODIFYING` with
+        // the change — for a cluster that is serving, which is the only cluster
+        // a schedule is taking snapshots of at all.
+        for stored in &mut self.clusters {
+            let takes_the_change = stored
+                .cluster
+                .snapshot_schedule_identifier
+                .as_deref()
+                .is_some_and(|held| applied.iter().any(|identifier| identifier == held))
+                && stored.cluster.cluster_status.as_deref() == Some(STATUS_AVAILABLE);
+            if takes_the_change {
+                stored.cluster.snapshot_schedule_state =
+                    Some(SCHEDULE_ASSOCIATION_STATE_ACTIVE.to_string());
+            }
         }
     }
 }

@@ -200,6 +200,9 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                 stored.succeeded_at = None;
             }
         }
+        // A change to a snapshot schedule has reached the clusters it is
+        // associated with once the modify's span has passed.
+        self.settle_snapshot_schedule_updates(now);
     }
 
     /// Append one raised event to the log this store keeps for an event read.

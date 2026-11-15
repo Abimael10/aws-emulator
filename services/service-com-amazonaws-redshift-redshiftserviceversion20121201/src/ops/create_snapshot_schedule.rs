@@ -304,6 +304,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             schedule_definitions: definitions,
             schedule_description: input.schedule_description.clone(),
             tags,
+            // A schedule a create minted has no change being applied to it:
+            // no cluster is associated with it yet, so there is nothing for a
+            // change to reach.
+            update_due: None,
         };
         let now = ::std::time::SystemTime::now();
 

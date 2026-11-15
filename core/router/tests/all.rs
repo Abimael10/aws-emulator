@@ -1882,3 +1882,20 @@ mod cognito_user_pool_replica_over_a_multi_region_key;
 // This file is a test-target CRATE ROOT, where a bare `mod` would resolve to a sibling of it
 // under `tests/` — which the layout check refuses: the `#[path]` above each `mod` is what
 // points the declaration into `tests/all/`.
+// file under `tests/all/`, sorted by name, and no other line — no prose between the pairs, no
+// lines in two places and have no prose to duplicate, re-word or mistype, which is what had
+// gone wrong here: the tail of this file had grown hundreds of re-typed copies of its own
+// header, many of them inner doc comments past the first item, so no suite of this target
+// compiled at all.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair in sorted position. What that
+// suite covers, and why it drives the assembled router rather than one service crate, belongs
+// in that suite's OWN module header, where it is read beside the test it explains; a note
+// about THIS file belongs in `all/appended_notes.rs`, `all/appended_header_notes.rs`,
+// `all/appended_notes_tail.rs` or `all/appended_prose.rs`, each declared below like any other
+// file, no merge of two landings can leave one past the first item. A suite file no `mod` here
+// names is compiled nowhere and its tests never run (the build-time layout check refuses it);
+// a suite left at the top level of `tests/` fails the build; and a second `mod` for one name
+// is `E0428`. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a
+// SIBLING of this file, which the layout check refuses: the `#[path]` above each `mod` is what
+// points it into `tests/all/`. The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
+// here. Some of the files below are shared harnesses or probes rather than suites; all are

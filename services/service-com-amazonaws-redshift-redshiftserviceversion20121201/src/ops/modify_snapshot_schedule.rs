@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifySnapshotSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifySnapshotSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifySnapshotSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the schedule expressions of a snapshot schedule this service's
+//! store holds and reports the schedule back: the identifier as given, the
+//! definitions just written, the description and the tags the schedule already
+//! carried, the upcoming invocation times COMPUTED from the new definitions,
+//! and the clusters the store holds that are associated with the schedule. A
+//! request naming a schedule this account does not hold is refused with
+//! `SnapshotScheduleNotFoundFault` and writes nothing.
+//!
+//! Every definition is read as the schedule it states BEFORE anything is
+//! written ([`crate::state::parse_schedule_definition`]): a definition nothing
+//! can be computed from is refused with `InvalidScheduleFault`, the one fault
+//! this operation declares for it — so no stored schedule carries a definition
+//! nothing can be computed from.
+//!
+//! "Any schedule associated with a cluster is modified asynchronously": a
+//! schedule a cluster is associated with carries the change for the span it
+//! takes to reach that cluster
+//! ([`crate::state::SNAPSHOT_SCHEDULE_UPDATE_SPAN`]), during which its
+//! associations are reported as still being applied and a second change is
+//! refused with `SnapshotScheduleUpdateInProgressFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +91,8 @@
 //!   schedule.
 //! * `SnapshotScheduleUpdateInProgressFault` (HTTP 400) — The specified snapshot schedule is
 //!   already being updated.
+//! * `DependentServiceUnavailableFault` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): the shared store this service's records live in could not be reached.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -94,12 +108,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ModifySnapshotScheduleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ModifySnapshotSchedule")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ModifySnapshotSchedule",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ModifySnapshotScheduleErrorModeled {
     InvalidScheduleFault(InvalidScheduleFault),
     SnapshotScheduleNotFoundFault(SnapshotScheduleNotFoundFault),
     SnapshotScheduleUpdateInProgressFault(SnapshotScheduleUpdateInProgressFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -136,6 +154,29 @@ impl<Eng> ModifySnapshotSchedule<Eng> {
     }
 }
 
+/// The refusal one DEFINITION of the request dictates, lifted onto this
+/// operation's error channel.
+///
+/// A definition nothing can be computed from is one the schedule cannot be
+/// changed to, and `InvalidScheduleFault` is the ONE fault this operation
+/// declares for it — the create path's separate
+/// `ScheduleDefinitionTypeUnsupportedFault` is not among this operation's
+/// errors — so both refusals the reading makes are answered under it, each
+/// keeping the sentence that says which of the two it is.
+fn definition_refusal(
+    refusal: crate::state::ScheduleDefinitionRefusal,
+) -> ModifySnapshotScheduleError {
+    use crate::state::ScheduleDefinitionRefusal as Refusal;
+
+    let message = match refusal {
+        Refusal::Unsupported(message) | Refusal::Invalid(message) => message,
+    };
+    ModifySnapshotScheduleErrorModeled::InvalidScheduleFault(InvalidScheduleFault {
+        message: Some(message),
+    })
+    .into()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ModifySnapshotSchedule<Eng>
 {
@@ -148,23 +189,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::MODIFY_SNAPSHOT_SCHEDULE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Change the definitions of the snapshot schedule the request names.
+    ///
+    /// A MUTATION: "modifies a snapshot schedule". The DEFINITIONS are the
+    /// schedule's whole record of when it takes snapshots, so what this call
+    /// writes is that list — and the members the response derives from it (the
+    /// upcoming invocations, and the clusters the schedule is associated with)
+    /// are computed from the stored record by the one reading every path of
+    /// this family shares, so a later `DescribeSnapshotSchedules` reports
+    /// exactly what this call reports.
+    ///
+    /// "Any schedule associated with a cluster is modified asynchronously": a
+    /// schedule a cluster is associated with carries the change for the span it
+    /// takes to reach that cluster, and while it does the associations are
+    /// reported as still being applied and a second change is refused with the
+    /// modelled `SnapshotScheduleUpdateInProgressFault`. A schedule no cluster
+    /// is associated with has nothing for the change to reach, so it takes it
+    /// at once.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifySnapshotSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifySnapshotScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifySnapshotSchedule"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ModifySnapshotScheduleErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every definition is read as the schedule it states before the store
+        // is touched at all, so a request carrying one nothing can be computed
+        // from changes nothing. The parsed schedules are not kept: the STORED
+        // definitions are the record, and the invocation times a response
+        // reports are computed from them by the reading every path shares.
+        let definitions = input.schedule_definitions.clone();
+        // How many definitions one schedule may carry: every one of them is
+        // read and evaluated on every request that reports the schedule, so the
+        // number is bounded before any of them is read — the same bound the
+        // create path holds a new schedule to.
+        if definitions.len() > st::MAX_SCHEDULE_DEFINITIONS {
+            return Err(
+                ModifySnapshotScheduleErrorModeled::InvalidScheduleFault(InvalidScheduleFault {
+                    message: Some(st::too_many_schedule_definitions_message(definitions.len())),
+                })
+                .into(),
+            );
+        }
+        for definition in &definitions {
+            if let Err(refusal) = st::parse_schedule_definition(definition) {
+                return Err(definition_refusal(refusal));
+            }
+        }
+
+        let wall = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let now = ::service_common::clock::now(&*self.engine);
+        // The clock already owed these transitions at this instant, so applying
+        // them here shows nothing a later caller could not already have seen —
+        // and whether this schedule's LAST change is still being applied is one
+        // of them.
+        store.settle(now);
+
+        // Only a schedule this account holds can be changed: "a unique
+        // alphanumeric identifier of the schedule to modify".
+        let Some(position) = store
+            .snapshot_schedules
+            .iter()
+            .position(|schedule| schedule.schedule_identifier == input.schedule_identifier)
+        else {
+            return Err(
+                ModifySnapshotScheduleErrorModeled::SnapshotScheduleNotFoundFault(
+                    SnapshotScheduleNotFoundFault {
+                        message: Some(st::snapshot_schedule_not_found_message(
+                            &input.schedule_identifier,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A schedule whose last change has not reached its clusters yet can
+        // take no further change: that change is still being applied, which is
+        // the modelled state fault for this schedule.
+        if store.snapshot_schedules[position].update_due.is_some() {
+            return Err(
+                ModifySnapshotScheduleErrorModeled::SnapshotScheduleUpdateInProgressFault(
+                    SnapshotScheduleUpdateInProgressFault {
+                        message: Some(st::snapshot_schedule_update_in_progress_message(
+                            &input.schedule_identifier,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The change reaches a cluster the schedule takes snapshots of after
+        // this call rather than with it, so a schedule that has such a cluster
+        // carries the change for its span; one that has none has nothing for
+        // the change to reach and is done with it here. The due instant is
+        // taken forward from the instant the clock reads, and never past the
+        // end of its range.
+        let (_, associated) = store.clusters_associated_to_schedule(&input.schedule_identifier);
+        let update_due = (associated > 0)
+            .then(|| now.checked_add(st::SNAPSHOT_SCHEDULE_UPDATE_SPAN))
+            .flatten();
+        let schedule = {
+            let stored = &mut store.snapshot_schedules[position];
+            stored.schedule_definitions = definitions;
+            stored.update_due = update_due;
+            stored.clone()
+        };
+        if update_due.is_some() {
+            // The cluster's own member and the schedule's view report one
+            // association, so a cluster the change has not reached yet reports
+            // it as being applied on both paths.
+            for stored in &mut store.clusters {
+                if stored.cluster.snapshot_schedule_identifier.as_deref()
+                    == Some(input.schedule_identifier.as_str())
+                {
+                    stored.cluster.snapshot_schedule_state =
+                        Some(st::SCHEDULE_ASSOCIATION_STATE_MODIFYING.to_string());
+                }
+            }
+        }
+
+        // The number of upcoming invocations this operation reports is the
+        // service's own — its input carries no member to ask for another — so it
+        // is the one every read of a schedule reports.
+        Ok(store.modified_snapshot_schedule_view(
+            &schedule,
+            wall,
+            st::DEFAULT_REPORTED_NEXT_INVOCATIONS,
+        ))
     }
 }

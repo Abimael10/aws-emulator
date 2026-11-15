@@ -119,6 +119,8 @@ mod modify_cluster_db_revision;
 mod modify_cluster_parameter_group;
 #[path = "all/modify_cluster_snapshot.rs"]
 mod modify_cluster_snapshot;
+#[path = "all/modify_snapshot_schedule.rs"]
+mod modify_snapshot_schedule;
 #[path = "all/multi_az_secondary.rs"]
 mod multi_az_secondary;
 #[path = "all/namespace_registration.rs"]
