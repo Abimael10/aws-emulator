@@ -5,6 +5,11 @@
 //! Mints a challenge password under an existing, active, general-purpose connector and
 //! stores it there, so `GetChallengePassword` reads back exactly what was returned.
 //!
+//! A connector in any other `ConnectorStatus` cannot authenticate a certificate request with
+//! a password, so it has none to hand out: the call is refused 400 `ValidationException` with
+//! the sentence this service words a not-active reference with
+//! ([`crate::state::resources_not_active_message`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -267,14 +272,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A connector that is not yet serving cannot authenticate a certificate request
-        // with a challenge password, so it cannot hand one out either.
+        // with a challenge password, so it cannot hand one out either. The refusal is the
+        // sentence this service words a not-active reference with
+        // (`crate::state::resources_not_active_message`), over the connector the request
+        // named.
         if !connector.is_active() {
             return Err(CreateChallengeErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "Connector {connector_arn} has status {}; it must be {} to create a challenge",
-                    connector.status,
-                    crate::state::STATUS_ACTIVE
-                ),
+                message: crate::state::resources_not_active_message(&connector_arn),
                 reason: Some(crate::state::REASON_INVALID_STATE.to_string()),
             })
             .into());

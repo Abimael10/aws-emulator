@@ -12,9 +12,13 @@
 //!   through the same `MultiServiceRouter` the emulator boots, carrying the SigV4 credential
 //!   scope a handler reads the caller's Region out of, and what came back.
 //! * [`label`]: the `@httpLabel` percent-encoding rule.
-//! * [`assert_tagging_not_found`] and [`assert_tagging_bad_request`]: the two refusals the
-//!   tagging endpoints answer with, which are the tagging layer's own error classes and not
-//!   this service's.
+//! * [`assert_tagging_not_found`], [`assert_tagging_bad_request`] and
+//!   [`assert_tagging_limit_exceeded`]: the refusals the tagging endpoints answer with, which
+//!   are the tagging layer's own error classes and not this service's.
+//! * [`active_private_ca`], [`pending_certificate_private_ca`] and
+//!   [`release_private_ca_clock`]: the private certificate authority a connector links, built
+//!   through Amazon Web Services Private CA's OWN front door and driven to the status a case
+//!   needs, because `CreateConnector` resolves that reference against that service.
 //! * [`set_pending_due`] and the four helpers over it: the clock move, so a case about a
 //!   transient status neither sleeps for the transition span nor races it.
 //!
@@ -214,6 +218,22 @@ pub fn assert_tagging_bad_request(answer: &Answer, case: &str) {
     );
 }
 
+/// Assert `answer` is the refusal those same endpoints answer a write whose RESULTANT tag set
+/// would be over the per-resource ceiling with.
+///
+/// The ceiling belongs to the tagging layer and not to this service's input model, so it is
+/// that layer's own `BadRequestException` class with its own fixed sentence — the literal is
+/// the recorded wire value of that refusal, spelled here rather than read back out of the
+/// implementation.
+pub fn assert_tagging_limit_exceeded(answer: &Answer, case: &str) {
+    assert_tagging_refusal(
+        answer,
+        "BadRequestException",
+        "The resultant tag set must not have more than 50 user tags.",
+        case,
+    );
+}
+
 /// The shape both of the tagging layer's refusals share: the status, its own error code, one
 /// fixed sentence under the lower-case `message` member — no value of the request, and none of
 /// the service error's `Message` / `ResourceId` / `ResourceType` members.
@@ -238,6 +258,256 @@ fn assert_tagging_refusal(answer: &Answer, code: &str, message: &str, case: &str
             "case {case:?}: the tagging layer's refusal carries no {member:?} member, got {:?}",
             answer.body
         );
+    }
+}
+
+/// The template that produces a ROOT CA's own certificate — step 2 of Amazon Web Services
+/// Private CA's documented procedure for creating a root private CA, which is how a case
+/// drives a CA to `ACTIVE`.
+const ROOT_CA_TEMPLATE: &str = "arn:aws:acm-pca:::template/RootCACertificate/V1";
+
+/// A Private CA client for `region` over the router's own in-process callback — the very seam
+/// this service resolves a `CertificateAuthorityArn` through. No socket is opened; the
+/// endpoint URL is only the address that transport routes by.
+pub fn private_ca_client(router: &MultiServiceRouter, region: &str) -> ::aws_sdk_acmpca::Client {
+    let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
+    let config = ::aws_sdk_acmpca::Config::builder()
+        .behavior_version(::aws_sdk_acmpca::config::BehaviorVersion::latest())
+        .region(::aws_sdk_acmpca::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://acm-pca.{region}.amazonaws.com"))
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
+        .retry_config(::aws_sdk_acmpca::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_acmpca::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_acmpca::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_acmpca::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_acmpca::Client::from_conf(config)
+}
+
+/// Make every transition Amazon Web Services Private CA owes come due at once, through that
+/// service's own state.
+///
+/// Strictly a clock move — it rewrites only the due instants (a CA's settle, an issued
+/// certificate's availability), never a status or a stored value — so that service's own
+/// handlers still compute what they report from their own records. A case neither sleeps for
+/// one of those spans nor races it.
+pub fn release_private_ca_clock(engine: &engine::InMemoryEngine) {
+    let shared = service_com_amazonaws_acmpca_acmprivateca::state::service_state(engine)
+        .expect("the private CA service's own state");
+    let mut store = shared.lock();
+    let already_due = SystemTime::now() - ALREADY_DUE;
+    for authority in store.certificate_authorities.values_mut() {
+        authority.settles_at = already_due;
+        for certificate in authority.certificates.values_mut() {
+            certificate.available_at = already_due;
+        }
+    }
+}
+
+/// A private CA of `region`, exactly as Private CA's own `CreateCertificateAuthority` leaves
+/// it: the transition that service owes it is NOT made due, so it is still reported in the
+/// status a create starts it in.
+pub async fn created_private_ca(
+    router: &MultiServiceRouter,
+    region: &str,
+    common_name: &str,
+) -> String {
+    let subject = ::aws_sdk_acmpca::types::Asn1Subject::builder()
+        .common_name(common_name)
+        .build();
+    let configuration = ::aws_sdk_acmpca::types::CertificateAuthorityConfiguration::builder()
+        .key_algorithm(::aws_sdk_acmpca::types::KeyAlgorithm::Rsa2048)
+        .signing_algorithm(::aws_sdk_acmpca::types::SigningAlgorithm::Sha256Withrsa)
+        .subject(subject)
+        .build()
+        .expect("the CA configuration builds");
+    private_ca_client(router, region)
+        .create_certificate_authority()
+        .certificate_authority_configuration(configuration)
+        .certificate_authority_type(::aws_sdk_acmpca::types::CertificateAuthorityType::Root)
+        .send()
+        .await
+        .expect("Private CA must create the certificate authority")
+        .certificate_authority_arn()
+        .expect("Private CA must answer the CA's ARN")
+        .to_string()
+}
+
+/// A private CA of `region`, created through Private CA's own `CreateCertificateAuthority`
+/// and left where that call leaves it: existing, and waiting for the certificate that would
+/// put it in service (`PENDING_CERTIFICATE`).
+pub async fn pending_certificate_private_ca(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    region: &str,
+    common_name: &str,
+) -> String {
+    let arn = created_private_ca(router, region, common_name).await;
+    // The CREATING -> PENDING_CERTIFICATE move that service owes the CA.
+    release_private_ca_clock(engine);
+    arn
+}
+
+/// A private CA of `region` driven all the way to `ACTIVE` through Private CA's own documented
+/// procedure, answering its ARN and the PEM certificate that service then HOLDS for it.
+///
+/// `CreateConnector` admits only a CA that service reports `ACTIVE`, so this is the fixture a
+/// case that needs a connector at all starts from.
+pub async fn active_private_ca(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    region: &str,
+    common_name: &str,
+) -> (String, String) {
+    let arn = pending_certificate_private_ca(router, engine, region, common_name).await;
+    let held = activate_private_ca(router, engine, region, &arn).await;
+    (arn, held)
+}
+
+/// Put the EXISTING private CA `arn` in service: its CSR is signed with the root template and
+/// the certificate is imported back, which is Private CA's own documented procedure for a root
+/// CA. Answers the PEM certificate that service then holds for it.
+///
+/// Separate from [`active_private_ca`] because the precondition a create applies is about the
+/// status at the instant of the call: a case shows that by making the same call before and
+/// after this.
+pub async fn activate_private_ca(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    region: &str,
+    arn: &str,
+) -> String {
+    let client = private_ca_client(router, region);
+    let csr = client
+        .get_certificate_authority_csr()
+        .certificate_authority_arn(arn)
+        .send()
+        .await
+        .expect("Private CA must answer the CA's CSR")
+        .csr()
+        .expect("the CSR is present")
+        .to_string();
+    let certificate_arn = client
+        .issue_certificate()
+        .certificate_authority_arn(arn)
+        .csr(::aws_smithy_types::Blob::new(csr.into_bytes()))
+        .signing_algorithm(::aws_sdk_acmpca::types::SigningAlgorithm::Sha256Withrsa)
+        .template_arn(ROOT_CA_TEMPLATE)
+        .validity(
+            ::aws_sdk_acmpca::types::Validity::builder()
+                .r#type(::aws_sdk_acmpca::types::ValidityPeriodType::Years)
+                .value(10)
+                .build()
+                .expect("the validity builds"),
+        )
+        .send()
+        .await
+        .expect("Private CA must issue the CA's own certificate")
+        .certificate_arn()
+        .expect("Private CA must answer the certificate's ARN")
+        .to_string();
+    // The instant that certificate becomes readable is one that service's clock owes.
+    release_private_ca_clock(engine);
+
+    let certificate = client
+        .get_certificate()
+        .certificate_authority_arn(arn)
+        .certificate_arn(&certificate_arn)
+        .send()
+        .await
+        .expect("Private CA must answer the issued certificate")
+        .certificate()
+        .expect("the certificate is present")
+        .to_string();
+    client
+        .import_certificate_authority_certificate()
+        .certificate_authority_arn(arn)
+        .certificate(::aws_smithy_types::Blob::new(certificate.into_bytes()))
+        .send()
+        .await
+        .expect("Private CA must import the CA's certificate");
+
+    // The certificate the CA now HOLDS, read through its own front door rather than assumed
+    // to be the one that was imported.
+    client
+        .get_certificate_authority_certificate()
+        .certificate_authority_arn(arn)
+        .send()
+        .await
+        .expect("Private CA must answer the CA's own certificate")
+        .certificate()
+        .expect("the certificate is present")
+        .to_string()
+}
+
+/// The status Private CA reports for `arn` — ASKED, never assumed, so a case's expectation
+/// rests on that service's own report of the CA it built.
+pub async fn reported_private_ca_status(
+    router: &MultiServiceRouter,
+    region: &str,
+    arn: &str,
+) -> String {
+    private_ca_client(router, region)
+        .describe_certificate_authority()
+        .certificate_authority_arn(arn)
+        .send()
+        .await
+        .expect("Private CA must describe the certificate authority")
+        .certificate_authority()
+        .and_then(|authority| authority.status())
+        .expect("Private CA must report the CA's status")
+        .as_str()
+        .to_string()
+}
+
+/// Take the private CA `arn` away through Private CA's own front door, all the way to
+/// PERMANENTLY deleted: disabled, deleted, and then its restoration window closed by a clock
+/// move — after which that service holds nothing under the ARN and answers no certificate for
+/// it.
+///
+/// For a case about a connector whose CA is no longer there: `CreateConnector` admits only a
+/// CA that service reports `ACTIVE`, so a connector linking an unreadable CA is one whose CA
+/// went away after it was created.
+pub async fn permanently_delete_private_ca(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    region: &str,
+    arn: &str,
+) {
+    let client = private_ca_client(router, region);
+    // "To delete a CA in the ACTIVE state, you must first disable it"
+    // (`DeleteCertificateAuthority` docs).
+    client
+        .update_certificate_authority()
+        .certificate_authority_arn(arn)
+        .status(::aws_sdk_acmpca::types::CertificateAuthorityStatus::Disabled)
+        .send()
+        .await
+        .expect("Private CA must disable the certificate authority");
+    client
+        .delete_certificate_authority()
+        .certificate_authority_arn(arn)
+        .permanent_deletion_time_in_days(
+            service_com_amazonaws_acmpca_acmprivateca::state::MIN_PERMANENT_DELETION_TIME_IN_DAYS,
+        )
+        .send()
+        .await
+        .expect("Private CA must delete the certificate authority");
+
+    // The end of the restoration period is an instant that service's clock owes: moving it
+    // into the past is a clock move, and that service's own handlers are what then report the
+    // CA as gone.
+    let shared = service_com_amazonaws_acmpca_acmprivateca::state::service_state(engine)
+        .expect("the private CA service's own state");
+    let mut store = shared.lock();
+    let already_due = SystemTime::now() - ALREADY_DUE;
+    for authority in store.certificate_authorities.values_mut() {
+        if authority.restorable_until.is_some() {
+            authority.restorable_until = Some(already_due);
+        }
     }
 }
 

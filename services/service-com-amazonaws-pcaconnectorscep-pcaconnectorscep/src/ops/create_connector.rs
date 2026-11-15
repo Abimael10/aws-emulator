@@ -7,12 +7,18 @@
 //! REFERENCES are resolved against the services that own them before a connector is admitted:
 //! `CertificateAuthorityArn` names a resource Amazon Web Services Private CA owns
 //! ([`crate::service::private_ca`]), and a CA that service reports it does not hold is the
-//! modelled 404 `ResourceNotFoundException` naming that input member, with no record created.
+//! modelled 404 `ResourceNotFoundException` naming that input member, while a CA it holds in
+//! any status other than `ACTIVE` is the modelled 400 `ValidationException` — the CA must be
+//! in service for the connector to issue its certificate from it, which is a precondition of
+//! this call — with no record created either way.
+//!
 //! The connector then starts `CREATING`; the clock owes it the status its creation lands in
 //! (see [`crate::state::TRANSITION_SPAN`]) — `ACTIVE`, or `FAILED` with the reason it failed
-//! for when the private CA it names is not one it could use
-//! ([`crate::state::private_ca_failure_reason`], [`crate::service::private_ca::Resolved`]) or
-//! the `VpcEndpointId` it names is not an endpoint Amazon EC2 holds a resolvable address for
+//! for when the private CA it names is one this endpoint and principal do not resolve
+//! ([`crate::state::private_ca_failure_reason`]), when the permissions in force on the
+//! principal that created it do not allow a certificate to be issued from that CA
+//! ([`crate::service::provisioning_authorization`]), or when the
+//! `VpcEndpointId` it names is not an endpoint Amazon EC2 holds a resolvable address for
 //! ([`crate::service::vpc_endpoint`]).
 //!
 //! ## Shape of an operation
@@ -222,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `CertificateAuthorityArn` references a resource Amazon Web Services Private CA
-        // owns, so whether that CA exists — and whether it is one that could be used at all —
+        // owns, so whether that CA exists — and what status that service reports it in —
         // is that service's own read to answer, and the reference is resolved BEFORE a
         // connector is admitted. A CA that service reports it does not hold is this
         // operation's modelled `ResourceNotFoundException`, naming the input member that
@@ -242,33 +248,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Where the ARN PLACES the CA, decided from the request alone
+        // (`crate::state::private_ca_failure_reason`): a CA that sits in another partition,
+        // Region or account is not one this endpoint and principal resolve, which is reported
+        // on the connector rather than refused here (see below).
+        let private_ca_failure =
+            crate::state::private_ca_failure_reason(&region, &input.certificate_authority_arn);
+
+        // A CA this endpoint DOES resolve, which Private CA reports in any status other than
+        // ACTIVE, is a precondition of this call rather than an outcome of provisioning: a CA
+        // on its way into service cannot issue the connector's certificate yet and one taken
+        // out of service never will, so the call is refused synchronously and no connector
+        // record is left behind. The same request succeeds once that same CA reaches ACTIVE.
+        if private_ca_failure.is_none() && private_ca.is_not_active() {
+            return Err(certificate_authority_not_active(
+                &input.certificate_authority_arn,
+            ));
+        }
+
         // Why the connector's creation does not come up, if it does not: every resource this
-        // call REFERENCES is resolved against the service that owns it, and a reference that
-        // service holds in a form this connector cannot be linked to is reported on the
-        // connector rather than refused here — the status reason's own doc is "Information
-        // about why connector creation failed, if status is FAILED", so the values it carries
-        // are observable only on a connector that was created and then failed. The private CA
-        // is asked about first, it being the resource a connector exists to link:
+        // call REFERENCES is resolved against the service that owns it, and a reference this
+        // connector cannot be linked to for a reason that is not a precondition of the call
+        // is reported on the connector rather than refused here — the status reason's own doc
+        // is "Information about why connector creation failed, if status is FAILED", so the
+        // values it carries are observable only on a connector that was created and then
+        // failed. The private CA is asked about first, it being the resource a connector
+        // exists to link:
         //
-        // * where the ARN PLACES the CA, decided from the request alone
-        //   (`crate::state::private_ca_failure_reason`): a CA that sits in another partition,
-        //   Region or account is not one this endpoint and principal resolve;
-        // * what status Private CA reports the CA in, from the read above: a CA that will not
-        //   issue certificates again is not one a connector can broker through;
+        // * where the ARN places the CA, from the reading above;
+        // * whether the principal that created it may have the connector's own certificate
+        //   issued from that CA — a connector issues it with that principal's permissions, so
+        //   a principal whose policies do not allow it has a connector that cannot come up
+        //   (`crate::service::provisioning_authorization`);
         // * and then, for a connector restricted to one VPC endpoint, what Amazon EC2 holds
         //   under the `VpcEndpointId` the request named — a connector is published at that
         //   endpoint's names, so an id naming no endpoint, or one with no DNS entry to resolve,
         //   is an address nothing answers at.
-        let private_ca_failure =
-            crate::state::private_ca_failure_reason(&region, &input.certificate_authority_arn)
-                .or_else(|| private_ca.failure_reason());
         let creation_failure = match (private_ca_failure, input.vpc_endpoint_id.as_deref()) {
             (Some(reason), _) => Some(reason),
-            (None, None) => None,
-            (None, Some(vpc_endpoint_id)) => {
-                crate::service::vpc_endpoint::resolve(ctx, &region, vpc_endpoint_id)
-                    .await
-                    .failure_reason()
+            (None, vpc_endpoint_id) => {
+                if crate::service::provisioning_authorization::issuance_is_unauthorized(
+                    &*self.engine,
+                    ctx,
+                    &input.certificate_authority_arn,
+                )
+                {
+                    Some(crate::state::REASON_PRIVATECA_ACCESS_DENIED)
+                } else {
+                    match vpc_endpoint_id {
+                        None => None,
+                        Some(vpc_endpoint_id) => {
+                            crate::service::vpc_endpoint::resolve(ctx, &region, vpc_endpoint_id)
+                                .await
+                                .failure_reason()
+                        }
+                    }
+                }
             }
         };
 
@@ -467,6 +502,24 @@ fn certificate_authority_not_found(certificate_authority_arn: &str) -> CreateCon
         MISSING_MEMBER_CERTIFICATE_AUTHORITY_ARN,
         certificate_authority_arn,
     ))
+    .into()
+}
+
+/// Amazon Web Services Private CA holds the certificate authority the request named and
+/// reports it in a status other than `ACTIVE` — HTTP 400 `ValidationException`, which this
+/// operation models, carrying the sentence this service words a not-active reference with
+/// ([`crate::state::resources_not_active_message`]) over the ARN the request supplied.
+///
+/// A precondition of the call, not an outcome of provisioning: nothing is created, and the
+/// same request succeeds once that CA reaches `ACTIVE`.
+fn certificate_authority_not_active(certificate_authority_arn: &str) -> CreateConnectorError {
+    CreateConnectorErrorModeled::ValidationException(ValidationException {
+        message: crate::state::resources_not_active_message(certificate_authority_arn),
+        // "The service doesn't return a reason for every validation exception" (`Reason`'s
+        // own doc), and `ValidationExceptionReason` carries no value for a REFERENCED
+        // resource's status: `INVALID_STATE` is about the connector a call names.
+        reason: None,
+    })
     .into()
 }
 

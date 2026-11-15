@@ -8,9 +8,12 @@
 //! — answers the modelled HTTP 204 with an empty body, and the merged map is what a later
 //! `ListTagsForResource` reports. A request naming an ARN this service holds no record under
 //! answers the tagging layer's own refusal (400 `NotFoundException`, see
-//! [`harness::assert_tagging_not_found`]); a request whose entries are not a caller's to set,
-//! or that would leave the resource carrying more than the per-resource ceiling, answers 400
-//! `ValidationException` and writes nothing.
+//! [`harness::assert_tagging_not_found`]); a request whose entries are not a caller's to set
+//! answers 400 `ValidationException`; and one that would leave the resource carrying more than
+//! the per-resource ceiling answers the tagging layer's own ceiling refusal (400
+//! `BadRequestException`, see [`harness::assert_tagging_limit_exceeded`]) — that ceiling is
+//! the tagging layer's rather than one of this operation's modelled input constraints. Every
+//! refusal writes nothing.
 //!
 //! `Tags` is modelled as a plain `map<String, String>` with no `@length` and no `@pattern` on
 //! the map or on either half of an entry (smithy_query operation=TagResource), so the tagging
@@ -23,7 +26,7 @@
 //! key is new or already present, the characters and scripts the entries use, the number of
 //! entries, and both sides of the per-resource ceiling.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -157,6 +160,20 @@ fn expected_tags(case: &Case) -> BTreeMap<String, String> {
         }
     }
     tags
+}
+
+/// Whether a row's refusal is the tagging layer's CEILING one rather than this service's
+/// input error: decided from the resultant tag set the row's two maps describe, which is the
+/// rule the handler applies — the ceiling is on what the resource ends up carrying, so a batch
+/// that only overwrites keys it already has never reaches it.
+fn over_the_tag_ceiling(case: &Case) -> bool {
+    let keys: BTreeSet<&str> = case
+        .initial
+        .iter()
+        .chain(case.add.iter())
+        .map(|(key, _)| key.as_str())
+        .collect();
+    keys.len() > MAX_TAGS_PER_RESOURCE
 }
 
 /// The rows.
@@ -401,6 +418,9 @@ async fn tag_resource_merges_the_requested_tags_into_the_named_resource() {
                      be empty, got {:?}",
                     String::from_utf8_lossy(&tagged.raw)
                 );
+            } else if over_the_tag_ceiling(&case) {
+                // The ceiling is the tagging layer's, so its own class and fixed sentence.
+                harness::assert_tagging_limit_exceeded(&tagged, &case_name);
             } else {
                 assert_eq!(
                     tagged.status, 400,

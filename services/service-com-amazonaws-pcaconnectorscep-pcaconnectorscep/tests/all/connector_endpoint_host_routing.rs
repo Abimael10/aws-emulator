@@ -575,14 +575,19 @@ async fn a_published_scep_host_is_answered_by_this_service_even_when_it_cannot_s
     let region = "eu-west-1";
     let case = "the plane behind a published host";
     let (router, engine) = router_with_private_ca();
-    // A CA that EXISTS and holds no certificate: the connectors below link a CA their create
-    // resolves, and that CA has nothing to present to a SCEP client.
-    let ca_arn = private_ca(&router, case, region, "scep-host-uncertificated").await;
+    // A CA in service, which is the only kind a create admits, taken away AFTER the connectors
+    // below were created: their create resolved it, and by the time a SCEP client dials them
+    // that service holds no certificate to present.
+    let (ca_arn, _held) = active_private_ca(&router, case, region, "scep-host-uncertificated").await;
 
     let active = active_connector(&router, &engine, case, region, &ca_arn, None).await;
     let active_host = reported_endpoint(&router, case, region, &active).await;
     let creating = creating_connector(&router, case, region, &ca_arn, None).await;
+    // Its transition is held undue for the rest of the case, so the row about a plane that is
+    // not up yet neither races the transition span nor waits for it.
+    harness::hold_pending(&engine, &creating);
     let creating_host = reported_endpoint(&router, case, region, &creating).await;
+    harness::permanently_delete_private_ca(&router, &engine, region, &ca_arn).await;
     // A host of the same published form naming a connector this service does not hold, and one
     // naming this connector in a Region it does not live in.
     let absent_host = scep::state::connector_endpoint(
@@ -596,7 +601,8 @@ async fn a_published_scep_host_is_answered_by_this_service_even_when_it_cannot_s
     // The rows: what the request is, the URL it is sent to, and the status this service
     // answers it. An operation this plane does not implement is a bad request; a host naming
     // no connector of that Region is not found; a connector whose plane is not up yet is
-    // unavailable; and a connector whose private CA holds no certificate has none to present.
+    // unavailable; and a connector whose private CA is no longer there has no certificate to
+    // present.
     let rows: &[(&str, String, u16)] = &[
         (
             "the published host, as published",

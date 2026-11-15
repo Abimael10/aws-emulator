@@ -67,7 +67,9 @@
 //! for every SCEP operation this emulator does not implement — is documented in [`scep`].
 //! Every call this service makes into Amazon Web Services Private CA, on that plane and on
 //! the control plane alike, goes through [`private_ca`], and every question about a VPC
-//! endpoint a connector names goes to Amazon EC2 through [`vpc_endpoint`]; how it words a
+//! endpoint a connector names goes to Amazon EC2 through [`vpc_endpoint`]; whether the caller
+//! may have the connector's own certificate issued from that CA is read where the permissions
+//! are held, through [`provisioning_authorization`]; how it words a
 //! request its own model refused is in [`refusal`].
 //!
 //! ## Two wordings for a value the model does not admit
@@ -85,6 +87,7 @@
 //! input schema and words the two halves through the two functions attached to the door.
 
 pub mod private_ca;
+pub mod provisioning_authorization;
 pub mod refusal;
 pub mod scep;
 pub mod vpc_endpoint;

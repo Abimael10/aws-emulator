@@ -26,7 +26,6 @@
 //! to, the connector's status, and the SCEP operation named.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -36,23 +35,9 @@ use service_com_amazonaws_pcaconnectorscep_pcaconnectorscep as scep;
 
 use crate::harness::{self, label};
 
-/// The template that produces a ROOT CA's own certificate — step 2 of the documented
-/// procedure for creating a root private CA.
-const ROOT_CA_TEMPLATE: &str = "arn:aws:acm-pca:::template/RootCACertificate/V1";
-
 /// The media type a single DER X.509 certificate is served as, which is what RFC 8894
 /// answers `GetCACert` with for a CA holding one certificate.
 const CA_CERTIFICATE_CONTENT_TYPE: &str = "application/x-x509-ca-cert";
-
-/// Long enough that a transition either service owed is due, so the next call settles it.
-fn wait_for_the_clock() {
-    // A test may wait for a due instant; a handler may not. `tokio`'s timer is not in this
-    // workspace's feature set, so the current-thread test runtime parks instead.
-    std::thread::sleep(
-        service_com_amazonaws_acmpca_acmprivateca::state::SETTLE_AFTER
-            + Duration::from_millis(250),
-    );
-}
 
 /// What one call answered: the HTTP status, the response headers and the raw body.
 struct Answer {
@@ -150,45 +135,6 @@ impl Emulator {
         self.dispatch(request).await
     }
 
-    /// One SIGNED private-CA call over that service's awsJson1_1 wire.
-    async fn private_ca_call(&self, region: &str, operation: &str, body: &Value) -> Answer {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri(format!("https://acm-pca.{region}.amazonaws.com/"))
-            .header("host", format!("acm-pca.{region}.amazonaws.com"))
-            .header("content-type", "application/x-amz-json-1.1")
-            .header("x-amz-target", format!("ACMPrivateCA.{operation}"))
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/acm-pca/aws4_request, \
-                     SignedHeaders=host, Signature=abc"
-                ),
-            )
-            .body(bytes::Bytes::from(
-                serde_json::to_vec(body).expect("serialize body"),
-            ))
-            .expect("build request");
-        self.dispatch(request).await
-    }
-
-    /// One private-CA call that must answer 200.
-    async fn private_ca_ok(
-        &self,
-        case: &str,
-        region: &str,
-        operation: &str,
-        body: &Value,
-    ) -> Answer {
-        let answer = self.private_ca_call(region, operation, body).await;
-        assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected {operation} to answer 200, got {} / {:?}",
-            answer.status, answer.json
-        );
-        answer
-    }
-
     /// One UNSIGNED fetch of a published URL, as a SCEP client sends it: the URL is dialled
     /// as it was published, with the `Host` its authority names and no AWS credential at all.
     async fn fetch(&self, url: &str) -> Answer {
@@ -205,114 +151,26 @@ impl Emulator {
         self.dispatch(request).await
     }
 
-    /// A root private CA in `region`, driven all the way to ACTIVE through that service's own
-    /// documented procedure, answering its ARN and the certificate it was activated with.
-    async fn active_private_ca(&self, case: &str, region: &str, common_name: &str) -> (String, String) {
-        let created = self
-            .private_ca_ok(
-                case,
-                region,
-                "CreateCertificateAuthority",
-                &json!({
-                    "CertificateAuthorityConfiguration": {
-                        "KeyAlgorithm": "RSA_2048",
-                        "SigningAlgorithm": "SHA256WITHRSA",
-                        "Subject": {"CommonName": common_name},
-                    },
-                    "CertificateAuthorityType": "ROOT",
-                }),
-            )
-            .await;
-        let ca_arn = created.text("CertificateAuthorityArn", case);
-        wait_for_the_clock();
+    /// A root private CA in `region`, driven all the way to ACTIVE through Private CA's own
+    /// documented procedure (the test crate's one fixture for it,
+    /// [`harness::active_private_ca`]), answering its ARN and the certificate that service
+    /// then HOLDS for it.
+    ///
+    /// A create admits only a CA Private CA reports `ACTIVE`, so this is where every case
+    /// below starts.
+    async fn active_private_ca(&self, region: &str, common_name: &str) -> (String, String) {
+        harness::active_private_ca(&self.router, &self.engine, region, common_name).await
+    }
 
-        let csr = self
-            .private_ca_ok(
-                case,
-                region,
-                "GetCertificateAuthorityCsr",
-                &json!({"CertificateAuthorityArn": ca_arn}),
-            )
-            .await
-            .text("Csr", case);
-        let issued = self
-            .private_ca_ok(
-                case,
-                region,
-                "IssueCertificate",
-                &json!({
-                    "CertificateAuthorityArn": ca_arn,
-                    "Csr": aws_smithy_types::base64::encode(csr.as_bytes()),
-                    "SigningAlgorithm": "SHA256WITHRSA",
-                    "TemplateArn": ROOT_CA_TEMPLATE,
-                    "Validity": {"Type": "YEARS", "Value": 10},
-                }),
-            )
-            .await;
-        let certificate_arn = issued.text("CertificateArn", case);
-        wait_for_the_clock();
-
-        let certificate = self
-            .private_ca_ok(
-                case,
-                region,
-                "GetCertificate",
-                &json!({
-                    "CertificateAuthorityArn": ca_arn,
-                    "CertificateArn": certificate_arn,
-                }),
-            )
-            .await
-            .text("Certificate", case);
-        self.private_ca_ok(
-            case,
-            region,
-            "ImportCertificateAuthorityCertificate",
-            &json!({
-                "CertificateAuthorityArn": ca_arn,
-                "Certificate": aws_smithy_types::base64::encode(certificate.as_bytes()),
-            }),
-        )
-        .await;
-
-        // The certificate the CA now HOLDS, read through its own front door: that read is
-        // what the SCEP plane answers from, so it is what the plane is compared against.
-        let held = self
-            .private_ca_ok(
-                case,
-                region,
-                "GetCertificateAuthorityCertificate",
-                &json!({"CertificateAuthorityArn": ca_arn}),
-            )
-            .await
-            .text("Certificate", case);
-        (ca_arn, held)
+    /// Take that CA away again, through that service's own front door
+    /// ([`harness::permanently_delete_private_ca`]), for the case about a connector whose
+    /// private CA is no longer there to present a certificate.
+    async fn remove_private_ca(&self, region: &str, ca_arn: &str) {
+        harness::permanently_delete_private_ca(&self.router, &self.engine, region, ca_arn).await;
     }
 
     /// Create a connector through a request addressed at `authority`, settle it, and answer
     /// its ARN.
-    /// A private CA in `region` that EXISTS, created through that service's own
-    /// `CreateCertificateAuthority` and left where that call leaves it — holding no
-    /// certificate yet — for a case that needs a connector whose `CertificateAuthorityArn`
-    /// resolves, without needing a CA that can present a certificate.
-    async fn private_ca(&self, case: &str, region: &str, common_name: &str) -> String {
-        self.private_ca_ok(
-            case,
-            region,
-            "CreateCertificateAuthority",
-            &json!({
-                "CertificateAuthorityConfiguration": {
-                    "KeyAlgorithm": "RSA_2048",
-                    "SigningAlgorithm": "SHA256WITHRSA",
-                    "Subject": {"CommonName": common_name},
-                },
-                "CertificateAuthorityType": "ROOT",
-            }),
-        )
-        .await
-        .text("CertificateAuthorityArn", case)
-    }
-
     async fn active_connector(
         &self,
         case: &str,
@@ -475,8 +333,8 @@ fn address_rows() -> Vec<AddressRow> {
 async fn the_published_endpoint_is_an_address_of_the_emulator_the_caller_reached() {
     for row in address_rows() {
         let emulator = Emulator::new();
-        let ca_arn = emulator
-            .private_ca(row.name, row.region, "scep-endpoint-row")
+        let (ca_arn, _held) = emulator
+            .active_private_ca(row.region, "scep-endpoint-row")
             .await;
         let mut request = json!({"CertificateAuthorityArn": ca_arn});
         if let Some(vpce) = row.vpc_endpoint_id {
@@ -586,7 +444,7 @@ async fn get_ca_cert_answers_the_certificate_of_the_connectors_private_ca() {
     for row in round_trip_rows() {
         let emulator = Emulator::new();
         let (ca_arn, ca_certificate) = emulator
-            .active_private_ca(row.name, row.region, row.common_name)
+            .active_private_ca(row.region, row.common_name)
             .await;
 
         let mut request = json!({"CertificateAuthorityArn": ca_arn});
@@ -638,10 +496,10 @@ async fn the_scep_plane_refuses_what_it_cannot_serve() {
     let region = "eu-west-1";
     let authority = "127.0.0.1:9297";
     let emulator = Emulator::new();
-    // A CA that exists and holds no certificate: the connectors below link a private CA their
-    // create resolves, and that CA has nothing to present to a SCEP client.
-    let ca_arn = emulator
-        .private_ca("the plane's refusals", region, "scep-root-uncertificated")
+    // A CA in service, which is the only kind a create admits. It is taken away below, once
+    // both connectors exist, so the plane reaches Private CA and has no certificate to get.
+    let (ca_arn, _held) = emulator
+        .active_private_ca(region, "scep-root-uncertificated")
         .await;
 
     // One connector that never reaches ACTIVE, held mid-creation, and one that does.
@@ -674,6 +532,9 @@ async fn the_scep_plane_refuses_what_it_cannot_serve() {
     let active_endpoint = emulator
         .reported_endpoint("an active connector", authority, region, &active)
         .await;
+    // Both connectors resolved the CA when they were created; it is gone by the time a SCEP
+    // client dials them.
+    emulator.remove_private_ca(region, &ca_arn).await;
     let absent_endpoint = scep::state::local_connector_endpoint(
         authority,
         region,
@@ -683,7 +544,7 @@ async fn the_scep_plane_refuses_what_it_cannot_serve() {
     // The rows: what is wrong with the request, the URL it is sent to, and the status that
     // says so. An unserved operation is a bad request; an address that names no connector is
     // not found; a connector whose plane is not up is unavailable; and a connector whose
-    // private CA holds no certificate has none to present.
+    // private CA is no longer there has no certificate to present.
     let rows: &[(&str, String, u16)] = &[
         (
             "an operation this plane does not serve",
@@ -716,7 +577,7 @@ async fn the_scep_plane_refuses_what_it_cannot_serve() {
             503,
         ),
         (
-            "a connector whose private CA holds no certificate",
+            "a connector whose private CA is no longer there",
             format!("{active_endpoint}?operation=GetCACert"),
             502,
         ),

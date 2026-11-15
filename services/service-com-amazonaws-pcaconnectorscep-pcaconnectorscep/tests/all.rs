@@ -19,6 +19,8 @@ mod challenge_deletion;
 mod challenge_metadata;
 #[path = "all/challenge_password_connector_state.rs"]
 mod challenge_password_connector_state;
+#[path = "all/connector_ca_active_precondition.rs"]
+mod connector_ca_active_precondition;
 #[path = "all/connector_delete_not_found.rs"]
 mod connector_delete_not_found;
 #[path = "all/connector_deletion.rs"]
@@ -33,6 +35,8 @@ mod connector_oidc_parameters;
 mod connector_private_ca_reachability;
 #[path = "all/connector_projection_agreement.rs"]
 mod connector_projection_agreement;
+#[path = "all/connector_provisioning_authorization.rs"]
+mod connector_provisioning_authorization;
 #[path = "all/connector_reference_resolution.rs"]
 mod connector_reference_resolution;
 #[path = "all/connector_scep_endpoint.rs"]

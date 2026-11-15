@@ -5,11 +5,15 @@
 //! A connector is a link between a SCEP endpoint and a private certificate authority that
 //! Private CA — not this service — owns. So every question about that CA is answered by that
 //! service's own API, over the emulator's in-process callback: whether the CA a request
-//! names exists at all and whether it is one a connector could be linked to
+//! names exists at all and whether that service reports it in service
 //! ([`resolve`], which `CreateConnector` resolves its `CertificateAuthorityArn` through
 //! before admitting a connector), and the certificate it holds
 //! (`GetCertificateAuthorityCertificate`, which the SCEP data plane answers `GetCACert`
 //! from).
+//!
+//! Whether the CALLER may have a certificate issued from that CA is a question about the
+//! caller's own permissions rather than about the CA, and it is answered where those are held
+//! ([`super::provisioning_authorization`]).
 //!
 //! NOTHING here opens a socket or leaves the host: the transport is
 //! `ctx.callback().http_client()`, the emulator's in-process channel into its own services,
@@ -32,55 +36,31 @@ pub enum Resolved {
     /// That service answered its own not-found error, which is the one answer that
     /// establishes the CA is absent.
     Absent,
-    /// That service holds the CA, in a status it cannot issue certificates from and does not
-    /// reach `ACTIVE` from on its own ([`ISSUING_IS_OVER_STATUSES`]).
-    Unusable,
-    /// That service holds a CA a connector could be linked to — and equally, the answer when
-    /// the question could not be put at all, because absence and unusability are established
-    /// by the owning service's own read and never inferred from a dependency that did not
-    /// answer.
-    Usable,
+    /// That service holds the CA and reports it in a status other than `ACTIVE`: a CA on its
+    /// way into service, or one taken out of it, is not a CA a connector can broker through.
+    NotActive,
+    /// That service holds a CA it reports `ACTIVE` — and equally, the answer when the
+    /// question could not be put at all, because absence and status are established by the
+    /// owning service's own read and never inferred from a dependency that did not answer.
+    Active,
 }
 
 impl Resolved {
     /// Whether Private CA reports it holds no certificate authority under the ARN asked
-    /// about, which is the one outcome that refuses a `CreateConnector` call outright.
+    /// about, which is one of the two outcomes that refuses a `CreateConnector` call outright.
     pub fn is_absent(self) -> bool {
         self == Self::Absent
     }
 
-    /// The `ConnectorStatusReason` a connector linking this CA fails creation with, or `None`
-    /// when the CA is one it could be linked to.
-    pub fn failure_reason(self) -> Option<&'static str> {
-        match self {
-            // A connector naming an absent CA is refused before any record exists, so there
-            // is no connector left for a status reason to be reported on.
-            Self::Absent | Self::Usable => None,
-            Self::Unusable => Some(crate::state::REASON_PRIVATECA_INVALID_STATE),
-        }
+    /// Whether Private CA reports the CA in a status other than `ACTIVE`, which is the other.
+    pub fn is_not_active(self) -> bool {
+        self == Self::NotActive
     }
 }
 
-/// The statuses a private CA will not issue a certificate in again without being replaced or
-/// deliberately put back in service, which is what makes one a CA a connector cannot link.
-///
-/// `DescribeCertificateAuthority` documents what each status means: `DISABLED` — "your
-/// private CA has been disabled", `EXPIRED` — "your private CA certificate has expired",
-/// `FAILED` — "a failed CA can never return to the pending state. You must create a new CA",
-/// and `DELETED` — "your private CA is within the restoration period, after which it is
-/// permanently deleted". `CREATING` and `PENDING_CERTIFICATE` are deliberately absent: both
-/// are steps on the way to `ACTIVE` in that same list, so a connector created beside a CA
-/// that is still being set up is not one that failed.
-const ISSUING_IS_OVER_STATUSES: [CertificateAuthorityStatus; 4] = [
-    CertificateAuthorityStatus::Disabled,
-    CertificateAuthorityStatus::Expired,
-    CertificateAuthorityStatus::Failed,
-    CertificateAuthorityStatus::Deleted,
-];
-
 /// Resolve `certificate_authority_arn` against Amazon Web Services Private CA: ONE read of
 /// that service, answering both whether it holds the CA and whether the status it reports is
-/// one a connector could be linked to.
+/// the one in which a CA issues certificates.
 pub async fn resolve(
     ctx: &OperationContext<'_>,
     region: &str,
@@ -93,28 +73,28 @@ pub async fn resolve(
         .await;
     let error = match answer {
         // The status is the owning service's own report of the CA, so a CA described without
-        // one says nothing about whether it could be used.
+        // one says nothing about whether it is in service.
         Ok(output) => {
             let status = output
                 .certificate_authority()
                 .and_then(|authority| authority.status());
             return match status {
-                Some(status) if ISSUING_IS_OVER_STATUSES.contains(status) => Resolved::Unusable,
-                _ => Resolved::Usable,
+                None | Some(CertificateAuthorityStatus::Active) => Resolved::Active,
+                Some(_) => Resolved::NotActive,
             };
         }
         Err(error) => error,
     };
     match error.as_service_error() {
         Some(service_error) if service_error.is_resource_not_found_exception() => Resolved::Absent,
-        Some(_) => Resolved::Usable,
+        Some(_) => Resolved::Active,
         None => {
             ::tracing::warn!(
                 certificate_authority = %certificate_authority_arn,
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "the private CA service did not answer whether the certificate authority exists"
             );
-            Resolved::Usable
+            Resolved::Active
         }
     }
 }

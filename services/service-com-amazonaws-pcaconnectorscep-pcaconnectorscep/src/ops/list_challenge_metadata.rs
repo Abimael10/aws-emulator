@@ -5,6 +5,11 @@
 //! Lists the challenge metadata of ONE connector, filtered from state. The summaries model
 //! no password member, so a metadata listing never carries one.
 //!
+//! A connector whose creation FAILED holds nothing a listing can report and is not a
+//! connector any call is served from: the listing is refused 400 `ValidationException`
+//! naming the state it is in ([`crate::state::resource_cannot_be_in_state_message`]) rather
+//! than answered an empty page.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -195,6 +200,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .connector(&region, &input.connector_arn)
             .ok_or_else(|| not_found(&input.connector_arn))?;
 
+        // A connector whose creation FAILED never came up: it minted no challenge and can
+        // mint none, so a listing of its challenges is a call its state does not admit
+        // rather than an empty page a caller could read as "this connector has none yet".
+        //
+        // Only that terminal state, deliberately: a connector still CREATING, or one being
+        // torn down, genuinely holds the challenges this page reports (none yet, or the ones
+        // it minted while it served), so an empty or partial page is the truthful answer
+        // there. `CreateChallenge` refuses both, because MINTING a challenge needs a
+        // connector that is serving, which is a stronger requirement than reading what one
+        // holds.
+        if connector.status == crate::state::STATUS_FAILED {
+            return Err(invalid_state(&input.connector_arn, &connector.status));
+        }
+
         let ordered: Vec<(String, ChallengeMetadataSummary)> = connector
             .challenges
             .iter()
@@ -215,6 +234,18 @@ fn not_found(connector_arn: &str) -> ListChallengeMetadataError {
     ListChallengeMetadataErrorModeled::ResourceNotFoundException(
         crate::state::resource_not_found(crate::state::RESOURCE_TYPE_CONNECTOR, connector_arn),
     )
+    .into()
+}
+
+/// The connector exists in a `ConnectorStatus` this listing cannot be served from — HTTP 400
+/// `ValidationException` carrying the modelled `Reason` for a call a connector's status does
+/// not allow, and the sentence this service words that refusal with, which names the state
+/// the record is in ([`crate::state::resource_cannot_be_in_state_message`]).
+fn invalid_state(connector_arn: &str, status: &str) -> ListChallengeMetadataError {
+    ListChallengeMetadataErrorModeled::ValidationException(ValidationException {
+        message: crate::state::resource_cannot_be_in_state_message(status, connector_arn),
+        reason: Some(crate::state::REASON_INVALID_STATE.to_string()),
+    })
     .into()
 }
 

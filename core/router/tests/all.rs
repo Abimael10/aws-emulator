@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: a canonical declaration list — this header,
+// then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`,
+// sorted by name, and no other line. Put a new suite at `tests/all/<name>.rs` and insert its
+// pair below, in order; what it covers belongs in that suite's own module doc. EVERY comment
+// here is an ORDINARY one, this block included: an inner doc comment (`//!`) is legal only
+// before the first item, so with none anywhere in the file no merge of two landings can put
+// one past the first item, where it is `E0753` and compiles no suite of this target.
 // Single integration-test target for the router: the declaration list, and nothing else.
 //
 // Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
@@ -19,6 +26,9 @@
 // `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
 // `all/all_rs_is_a_canonical_declaration_list.rs`,
 // `all/declaration_roots_are_canonical_and_complete.rs` and
+// `all/every_suite_file_is_declared.rs` check those rules, for this file and for every service
+// crate's `tests/all.rs`; the notes landings had appended to this file's tail live in
+// `all/appended_notes.rs`, declared below like any other module.
 // `all/every_suite_file_is_declared.rs` pin those rules, so check there rather than leaving a
 // note here; `all/appended_notes.rs` records what the notes landings had appended to this file
 // said.

@@ -30,8 +30,8 @@ mod tagging_refusal;
 
 pub use tagging_refusal::{
     TaggingError, TaggingRefusal, TAG_BAD_REQUEST_ERROR_CODE, TAG_BAD_REQUEST_MESSAGE,
-    TAG_BAD_REQUEST_STATUS, TAG_NOT_FOUND_ERROR_CODE, TAG_NOT_FOUND_MESSAGE,
-    TAG_NOT_FOUND_STATUS,
+    TAG_BAD_REQUEST_STATUS, TAG_LIMIT_EXCEEDED_MESSAGE, TAG_NOT_FOUND_ERROR_CODE,
+    TAG_NOT_FOUND_MESSAGE, TAG_NOT_FOUND_STATUS,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service, from the model's
@@ -765,6 +765,36 @@ pub fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNot
     }
 }
 
+/// The opening of every sentence this service refuses a PRECONDITION with: a request whose
+/// input is well-formed but names resources whose state does not admit the call.
+///
+/// The clause that follows says which precondition failed and over which resource; the
+/// builders below are the clauses this service states, so a caller reads one scaffold
+/// whichever precondition refused the call.
+const VALIDATION_ERROR_PREFIX: &str = "Validation error detected: ";
+
+/// The sentence a call is refused with when a resource it names, or references, is not in the
+/// state that lets it be used: the prefix, the fixed clause `"Resource(s) are not active: "`,
+/// the ARN of that resource, and a terminating `.`.
+///
+/// The one place this service words that refusal, for every operation that has such a
+/// precondition — `CreateConnector` over the `CertificateAuthorityArn` it links, and
+/// `CreateChallenge` over the connector it mints a password under — so the two cannot state
+/// one precondition in two sentences.
+pub fn resources_not_active_message(resource_arn: &str) -> String {
+    format!("{VALIDATION_ERROR_PREFIX}Resource(s) are not active: {resource_arn}.")
+}
+
+/// The sentence a call is refused with when the resource it names is in a state the call
+/// cannot be served from at all: the prefix, the fixed clause
+/// `"Resource cannot be in state "`, that state, the ARN, and a terminating `.`.
+///
+/// The variable parts are the `ConnectorStatus` the record is in and the ARN the request
+/// named, both read from state rather than from the request's shape.
+pub fn resource_cannot_be_in_state_message(status: &str, resource_arn: &str) -> String {
+    format!("{VALIDATION_ERROR_PREFIX}Resource cannot be in state {status}: {resource_arn}.")
+}
+
 /// The Region segment every ARN of this service carries, as both `ConnectorArn`'s and
 /// `ChallengeArn`'s own `@pattern` write it (smithy_query: shape ConnectorArn, ChallengeArn):
 /// two or more lower-case words joined by `-`, then a number with no leading zero.
@@ -1047,13 +1077,31 @@ pub fn tag_entry_rejection(key: &str, value: &str) -> Option<String> {
 /// in key order, so the same map is always refused with the same sentence however the
 /// request's own map iterates.
 pub fn tags_rejection<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> Option<String> {
-    let mut entries: Vec<(&str, &str)> = tags.into_iter().collect();
+    let entries: Vec<(&str, &str)> = tags.into_iter().collect();
     if entries.len() > MAX_TAGS_PER_RESOURCE {
         return Some(format!(
             "Tags carries {} entries; a resource may have at most {MAX_TAGS_PER_RESOURCE}",
             entries.len()
         ));
     }
+    tag_entries_rejection(entries)
+}
+
+/// Why the ENTRIES of a request's `Tags` may not be stored, without the count ceiling, or
+/// `None` when every entry is one a caller may set.
+///
+/// The half of [`tags_rejection`] that is about each pair ([`tag_entry_rejection`]) rather
+/// than about how many there are, for the caller that answers the count itself: the tagging
+/// endpoint's ceiling is on the tag set the RESOURCE ends up carrying, which the request's own
+/// entry count does not settle, and it is refused with the tagging layer's own class rather
+/// than with this service's input error.
+///
+/// The entries are walked in key order, so the same map is always refused with the same
+/// sentence however the request's own map iterates.
+pub fn tag_entries_rejection<'a>(
+    tags: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
+    let mut entries: Vec<(&str, &str)> = tags.into_iter().collect();
     entries.sort_unstable();
     entries
         .into_iter()

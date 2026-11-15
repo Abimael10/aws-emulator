@@ -9,13 +9,18 @@
 //! which is one this service's resource operations answer:
 //!
 //! * a `ResourceArn` it cannot PARSE as an ARN — [`TAG_BAD_REQUEST`], the error code
-//!   [`TAG_BAD_REQUEST_ERROR_CODE`] with the sentence [`TAG_BAD_REQUEST_MESSAGE`]; and
+//!   [`TAG_BAD_REQUEST_ERROR_CODE`] with the sentence [`TAG_BAD_REQUEST_MESSAGE`];
 //! * an ARN it parsed and resolved to no resource — [`TAG_NOT_FOUND`], the error code
-//!   [`TAG_NOT_FOUND_ERROR_CODE`] with the sentence [`TAG_NOT_FOUND_MESSAGE`].
+//!   [`TAG_NOT_FOUND_ERROR_CODE`] with the sentence [`TAG_NOT_FOUND_MESSAGE`]; and
+//! * a write that would leave the resource carrying more tags than one may hold —
+//!   [`TAG_LIMIT_EXCEEDED`], the same [`TAG_BAD_REQUEST_ERROR_CODE`] class with the sentence
+//!   [`TAG_LIMIT_EXCEEDED_MESSAGE`]. The ceiling belongs to the tagging layer rather than to
+//!   this service's input model, so it is that layer's class a caller branches on and not the
+//!   `ValidationException` a modelled input constraint is refused with.
 //!
-//! Both carry their sentence under the single lower-case `message` member, and both sentences
-//! are fixed text — the same whichever value was presented, so neither refusal reports a value
-//! the caller sent and neither carries the service error's `ResourceId` / `ResourceType`
+//! Each carries its sentence under the single lower-case `message` member, and each sentence
+//! is fixed text — the same whichever value was presented, so no refusal reports a value
+//! the caller sent and none carries the service error's `ResourceId` / `ResourceType`
 //! members.
 //!
 //! Neither shape is in ANY model — the tagging layer's errors are bound to no operation of
@@ -54,6 +59,18 @@ pub const TAG_BAD_REQUEST_ERROR_CODE: &str = "BadRequestException";
 /// The HTTP status that refusal carries: a request the layer could not parse is a client
 /// error.
 pub const TAG_BAD_REQUEST_STATUS: u16 = 400;
+
+/// The sentence the tagging layer refuses a write over the per-resource tag ceiling with:
+/// fixed text, naming neither the resource, the keys sent nor the count they would reach.
+///
+/// The number in it is [`crate::state::MAX_TAGS_PER_RESOURCE`] — the ceiling this service
+/// enforces — spelled into the sentence, which the assertion below keeps the two agreeing on.
+pub const TAG_LIMIT_EXCEEDED_MESSAGE: &str =
+    "The resultant tag set must not have more than 50 user tags.";
+
+/// The sentence states the ceiling as a word, so it is held to the constant the handlers
+/// enforce: a change to one that is not a change to the other does not compile.
+const _: () = assert!(crate::state::MAX_TAGS_PER_RESOURCE == 50);
 
 /// The `message` member of the tagging layer's not-found shape — lower-case on the wire,
 /// which is the name a client reads the sentence out of.
@@ -146,6 +163,19 @@ pub static TAG_BAD_REQUEST: TaggingRefusalClass = TaggingRefusalClass {
     message_member: &BAD_REQUEST_MESSAGE_MEMBER,
 };
 
+/// The tagging layer's refusal of a write that would leave the resource over the tag ceiling.
+///
+/// The same CLASS as the bad-request one above — the layer states an over-limit tag set as a
+/// bad request about what was asked for, so the error code and status are that class's — with
+/// the layer's own sentence for this cause.
+pub static TAG_LIMIT_EXCEEDED: TaggingRefusalClass = TaggingRefusalClass {
+    error_code: TAG_BAD_REQUEST_ERROR_CODE,
+    http_status: TAG_BAD_REQUEST_STATUS,
+    message: TAG_LIMIT_EXCEEDED_MESSAGE,
+    schema: &TAG_BAD_REQUEST_SCHEMA,
+    message_member: &BAD_REQUEST_MESSAGE_MEMBER,
+};
+
 /// The payload of one of those refusals: the class it belongs to, and the one fixed sentence
 /// that class states, as its single member.
 #[derive(Clone)]
@@ -216,6 +246,13 @@ impl<E> TaggingError<E> {
     /// answers before any resource is looked up.
     pub fn malformed_resource_arn() -> Self {
         Self::Tagging(TaggingRefusal::new(&TAG_BAD_REQUEST))
+    }
+
+    /// The tagging layer's refusal of a write whose RESULTANT tag set would be over the
+    /// per-resource ceiling, answered from the very map the write would have landed on so the
+    /// refused batch leaves nothing behind.
+    pub fn tag_limit_exceeded() -> Self {
+        Self::Tagging(TaggingRefusal::new(&TAG_LIMIT_EXCEEDED))
     }
 }
 

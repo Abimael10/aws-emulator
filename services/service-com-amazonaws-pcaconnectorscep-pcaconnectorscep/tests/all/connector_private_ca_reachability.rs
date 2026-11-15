@@ -345,9 +345,11 @@ async fn only_a_connector_that_came_up_serves_challenges_and_both_can_be_deleted
                 challenge.status,
                 challenge.body
             );
-            assert!(
-                challenge.message().contains(STATUS_FAILED),
-                "case {case:?}: the refusal must name the status the connector is in, got {:?}",
+            assert_eq!(
+                challenge.message(),
+                format!("Validation error detected: Resource(s) are not active: {arn}."),
+                "case {case:?}: the refusal must be the sentence a not-active reference is \
+                 refused with, got {:?}",
                 challenge.message()
             );
         } else {

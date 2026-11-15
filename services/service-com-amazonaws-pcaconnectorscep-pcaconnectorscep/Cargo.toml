@@ -48,12 +48,27 @@ aws-sdk-acmpca = { version = "1", default-features = false, features = ["rt-toki
 # (`DescribeVpcEndpoints`), called over the in-process callback into this same emulator — no
 # network client feature is enabled, so the transport is the emulator's own.
 aws-sdk-ec2 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The IAM and STS stores this service reads the principal a request speaks for, and the
+# identity-based policies in force on it, out of (`service::provisioning_authorization`): a
+# connector issues its own certificate from the private CA with the permissions of the
+# principal that created it, and those two services are where that principal and those
+# policies are held.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [dev-dependencies]
+# IAM client the provisioning-authorization suite drives IAM's own front door with
+# (`PutUserPolicy`, `SimulatePrincipalPolicy`), over the router's own in-process callback.
+aws-sdk-iam = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # The SCEP data-plane suite mounts Amazon Web Services Private CA beside this service on
 # one engine — what the assembled emulator does — because a connector's `GetCACert`
 # answers the certificate that service holds for the CA the connector names.
 service-com-amazonaws-acmpca-acmprivateca = { workspace = true }
+# The provisioning-authorization suite mounts IAM beside this service on the same engine,
+# because the policies that hold a connector back are the ones IAM holds for the calling
+# identity: the suite attaches them through IAM's own front door. (The crate is a dependency
+# above as well, for the store this service reads those policies out of.)
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # The reference-resolution suite mounts Amazon EC2 beside this service on the same engine,
 # because the VPC endpoint a connector is restricted to is a resource EC2 owns: the suite
 # creates its endpoints through EC2's own front door.

@@ -15,6 +15,12 @@
 //! it — is refused 400 `ValidationException` with `Reason` `INVALID_STATE` rather than
 //! answered 204 for a tag the teardown would discard.
 //!
+//! A batch whose RESULTANT tag set would be over the per-resource ceiling
+//! ([`crate::state::MAX_TAGS_PER_RESOURCE`]) is refused whole, with the resource-tagging
+//! layer's own bad-request class ([`crate::state::TaggingError::tag_limit_exceeded`]) — that
+//! ceiling is the tagging layer's and not one of this operation's modelled input constraints
+//! — and not one key of it is applied.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -202,9 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Tags` carries neither a modelled `@length` nor a `@pattern`, on the map or on
         // either half of an entry, so every tagging rule is this handler's to enforce — the
-        // same rules both creates hold a caller to. Checked BEFORE the lookup, so a request
-        // carrying a tag no caller may set is refused for that and writes nothing.
-        if let Some(why) = crate::state::tags_rejection(
+        // same entry rules both creates hold a caller to. Checked BEFORE the lookup, so a
+        // request carrying a tag no caller may set is refused for that and writes nothing.
+        // The per-resource COUNT is not checked here: this endpoint's ceiling is on the tag
+        // set the resource ends up carrying, which is computed from that resource's own map
+        // below.
+        if let Some(why) = crate::state::tag_entries_rejection(
             input
                 .tags
                 .iter()
@@ -247,7 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The ceiling is on what the RESOURCE ends up carrying, not on what one call sends:
         // a key the resource already has takes a new value instead of adding an entry, so
-        // only the keys it does not have yet grow the map.
+        // only the keys it does not have yet grow the map. It is the tagging layer's own
+        // ceiling rather than a modelled input constraint, so it is refused with that layer's
+        // own class and its fixed sentence — and refused BEFORE the merge, so not one key of
+        // the batch is applied.
         let total = target.tags.len()
             + input
                 .tags
@@ -255,11 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|key| !target.tags.contains_key(key.as_str()))
                 .count();
         if total > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(validation(format!(
-                "these tags would leave {resource_arn} with {total} tags; a resource may have \
-                 at most {}",
-                crate::state::MAX_TAGS_PER_RESOURCE
-            )));
+            return Err(tag_limit_exceeded());
         }
 
         // AWS tagging semantics: a tag is a key with ONE value, so a key the resource already
@@ -327,6 +335,18 @@ fn invalid_state(resource_arn: &str, connector_arn: &str, status: &str) -> TagRe
 /// resource ARNs by [`validation`], both before any lookup.
 fn not_found() -> TagResourceError {
     TagResourceError::not_found()
+}
+
+/// The write would leave the resource carrying more tags than one may hold.
+///
+/// A tagging endpoint answers the per-resource ceiling from the resource-tagging layer too,
+/// with that layer's own bad-request class rather than with this operation's modelled
+/// `ValidationException` ([`crate::state::TaggingError::tag_limit_exceeded`]): one fixed
+/// sentence under the lower-case `message` member, naming neither the resource nor the keys
+/// sent. The ceiling is on the RESULTANT set, so it is computed from the resource's own map
+/// and the batch is refused whole.
+fn tag_limit_exceeded() -> TagResourceError {
+    TagResourceError::tag_limit_exceeded()
 }
 
 /// The store is unreachable — a server-side fault, which this operation models as

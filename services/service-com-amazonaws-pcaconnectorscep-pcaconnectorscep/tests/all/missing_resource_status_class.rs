@@ -316,48 +316,10 @@ fn emulator_with_private_ca() -> (MultiServiceRouter, Arc<engine::InMemoryEngine
     (router, engine)
 }
 
-/// One private CA created through Private CA's OWN `CreateCertificateAuthority`, answering the
-/// ARN that service minted for it — so what `CreateConnector` resolves is a CA the owning
-/// service holds, not one this suite made up.
-async fn private_ca(router: &MultiServiceRouter, region: &str, common_name: &str) -> String {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://acm-pca.{region}.amazonaws.com/"))
-        .header("host", format!("acm-pca.{region}.amazonaws.com"))
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", "ACMPrivateCA.CreateCertificateAuthority")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/acm-pca/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(&json!({
-                "CertificateAuthorityConfiguration": {
-                    "KeyAlgorithm": "RSA_2048",
-                    "SigningAlgorithm": "SHA256WITHRSA",
-                    "Subject": {"CommonName": common_name},
-                },
-                "CertificateAuthorityType": "ROOT",
-            }))
-            .expect("serialize body"),
-        ))
-        .expect("build request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let body: Value = serde_json::from_slice(&response.into_body()).unwrap_or(Value::Null);
-    assert_eq!(
-        status, 200,
-        "CreateCertificateAuthority must answer 200, got {status} / {body:?}"
-    );
-    body["CertificateAuthorityArn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected a CertificateAuthorityArn in {body:?}"))
-        .to_string()
-}
-
+/// One private CA created through Private CA's OWN front door and driven to the status a
+/// create requires is the test crate's shared fixture ([`harness::active_private_ca`]), so
+/// what `CreateConnector` resolves is a CA the owning service holds and reports `ACTIVE`, not
+/// one this suite made up.
 async fn create_connector(router: &MultiServiceRouter, request: Value) -> Answer {
     let answer = harness::call(router, REGION, "POST", "/connectors", Some(request)).await;
     assert_eq!(
@@ -470,8 +432,9 @@ async fn create_connector_refuses_a_private_ca_that_does_not_exist() {
     }
 }
 
-/// The other side of the same rule: a `CertificateAuthorityArn` Private CA DOES hold is
-/// admitted, and the connector reads back carrying exactly that ARN.
+/// The other side of the same rule: a `CertificateAuthorityArn` Private CA DOES hold, in the
+/// status a create requires, is admitted, and the connector reads back carrying exactly that
+/// ARN.
 #[tokio::test]
 async fn create_connector_admits_a_private_ca_that_exists() {
     // Rows differ in the Region the CA and the connector live in and in the CA's subject, so
@@ -481,7 +444,7 @@ async fn create_connector_admits_a_private_ca_that_exists() {
         ("another Region, another subject", "us-west-2", "scep-ca-two"),
     ] {
         let (router, engine) = emulator_with_private_ca();
-        let arn = private_ca(&router, region, common_name).await;
+        let (arn, _held) = harness::active_private_ca(&router, &engine, region, common_name).await;
 
         let created = harness::call(
             &router,
