@@ -22,6 +22,17 @@ use super::WEBSOCKET_PROTOCOL_TYPE;
 /// naming anything else names no variable at all.
 pub const SELECTION_EXPRESSION_VARIABLES: &[&str] = &["request", "context", "stagevariables"];
 
+/// The sentence API Gateway refuses a `RouteSelectionExpression` that is no selector with:
+/// the one a WEBSOCKET api's request left out, and one sent with nothing in it.
+///
+/// Fixed text naming the MEMBER, nothing from the request: it is the whole phrase the
+/// service answers, with no requirement restated after it and no member of the model's own
+/// casing — the member is named as the wire spells it
+/// (`CreateApiRequest$RouteSelectionExpression` carries `jsonName`
+/// `routeSelectionExpression`). An expression that IS a selector but names a variable the
+/// service does not evaluate takes [`unexpected_selection_variable_message`] instead.
+pub const INVALID_ROUTE_SELECTION_EXPRESSION: &str = "Invalid routeSelectionExpression";
+
 /// The sentence this service refuses a selection expression that names a variable it
 /// does not evaluate with: fixed text, then the variable reference exactly as the
 /// request wrote it (`$` included).

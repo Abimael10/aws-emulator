@@ -403,6 +403,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      route to update.",
                 ));
             };
+            // The patched key is held to the grammar the api's protocol routes on, and
+            // stored in the form that grammar matches, exactly as a route's own writers hold
+            // theirs (`crate::state::route_key`).
+            if let Err(message) =
+                crate::state::validate_route_key(&updated.protocol_type, &route_key)
+            {
+                return Err(bad_request(&message));
+            }
+            let route_key = crate::state::normalized_route_key(&updated.protocol_type, &route_key);
             // A route key identifies the route within its api, so the quick-create route
             // cannot be moved onto a key another route of the same api already holds.
             if updated

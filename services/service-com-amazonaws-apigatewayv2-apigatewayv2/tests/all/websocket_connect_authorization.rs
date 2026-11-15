@@ -44,7 +44,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::api_lifecycle::{as_str, call, emulator};
+use crate::api_lifecycle::{as_str, call, emulator, mock_integration};
 use crate::websocket_handshake_data_plane::{message, send, Answer, CLIENT_KEY};
 
 /// The status a request whose authorizer was not invoked is refused with; see the module
@@ -167,7 +167,11 @@ async fn deploy(
          created with, got {fetched}"
     );
 
-    let mut route = json!({ "routeKey": "$connect", "authorizationType": authorization_type });
+    let mut route = json!({
+        "routeKey": "$connect",
+        "authorizationType": authorization_type,
+        "target": format!("integrations/{}", mock_integration(emulator, case, &api_id).await)
+    });
     match authorizer {
         RouteAuthorizer::Created => route["authorizerId"] = json!(authorizer_id),
         RouteAuthorizer::None => {}

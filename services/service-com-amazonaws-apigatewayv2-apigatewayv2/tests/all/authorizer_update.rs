@@ -876,7 +876,11 @@ async fn the_connect_authorization_step_reads_the_patched_identity_sources() {
         Some(json!({
             "routeKey": "$connect",
             "authorizationType": "CUSTOM",
-            "authorizerId": authorizer_id
+            "authorizerId": authorizer_id,
+            "target": format!(
+                "integrations/{}",
+                crate::api_lifecycle::mock_integration(&emulator, case, &api_id).await
+            )
         })),
     )
     .await;

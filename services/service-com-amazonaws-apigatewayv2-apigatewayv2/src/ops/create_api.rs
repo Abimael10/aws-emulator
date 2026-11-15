@@ -276,13 +276,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`CreateApi$RouteSelectionExpression`). The modelled `Api` shape requires the
         // member, so a record without one could not be reported at all.
         let route_selection_expression = match input.route_selection_expression.as_deref() {
-            Some(expression) => expression.to_string(),
+            Some(expression) if !expression.trim().is_empty() => expression.to_string(),
             None if is_http => crate::state::HTTP_ROUTE_SELECTION_EXPRESSION.to_string(),
-            None => {
-                return Err(bad_request(
-                    "RouteSelectionExpression is required for WebSocket APIs.",
-                ))
-            }
+            // An api selects its routes with this expression — a WEBSOCKET api always, an
+            // HTTP api with the default this service applies when the request names none —
+            // so an expression the request sent with nothing in it, and one a WEBSOCKET api
+            // was not given at all, is no selector. API Gateway refuses it by NAMING the
+            // member rather than by restating the requirement
+            // (`crate::state::INVALID_ROUTE_SELECTION_EXPRESSION`).
+            _ => return Err(bad_request(crate::state::INVALID_ROUTE_SELECTION_EXPRESSION)),
         };
         // And it names a variable this api's protocol selects a route key with — on a
         // WEBSOCKET api, a field of the message body — so an expression that could never
@@ -330,6 +332,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(
                 "Target is a required property in this context",
             ));
+        }
+        // And the key quick create would mint its route with is written in the grammar the
+        // api's protocol routes on, exactly as a route's own writers' keys are
+        // (`crate::state::route_key`). Weighed only where quick create RUNS — on an api of
+        // the other protocol the member mints no route, so there is no key for the data
+        // plane to fail to match.
+        if is_http {
+            if let Some(route_key) = input.route_key.as_deref() {
+                if let Err(message) =
+                    crate::state::validate_route_key(&input.protocol_type, route_key)
+                {
+                    return Err(bad_request(&message));
+                }
+            }
         }
         // And a `Target` quick create will BUILD from names ONE of the two backends it
         // proxies to: a fully qualified URL or a Lambda function ARN
@@ -594,10 +610,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the route API Gateway manages. `integrations/{IntegrationId}` is the form
             // a route's target takes, so the route resolves to the integration above
             // rather than carrying a backend address of its own.
-            let route_key = input
-                .route_key
-                .clone()
-                .unwrap_or_else(|| DEFAULT_ROUTE_KEY.to_string());
+            let route_key = crate::state::normalized_route_key(
+                crate::state::HTTP_PROTOCOL_TYPE,
+                input
+                    .route_key
+                    .as_deref()
+                    .unwrap_or(crate::state::DEFAULT_ROUTE_KEY),
+            );
             let route_id = stored.mint_route_id();
             stored.routes.insert(
                 route_id.clone(),
@@ -688,9 +707,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The catch-all `RouteKey` quick create uses when the request names none
-/// (`CreateApi$RouteKey`: "If you don't specify a routeKey, a default route of
-/// $default is created").
-const DEFAULT_ROUTE_KEY: &str = "$default";
 

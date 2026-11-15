@@ -87,15 +87,6 @@ async fn mint_family(emulator: &MultiServiceRouter, case: &str, name: &str) -> V
     .await;
     let api_id = as_str(&api, "apiId");
 
-    let route = created(
-        emulator,
-        case,
-        &format!("/v2/apis/{api_id}/routes"),
-        json!({ "routeKey": "$connect" }),
-    )
-    .await;
-    let route_id = as_str(&route, "routeId");
-
     let integration = created(
         emulator,
         case,
@@ -104,6 +95,18 @@ async fn mint_family(emulator: &MultiServiceRouter, case: &str, name: &str) -> V
     )
     .await;
     let integration_id = as_str(&integration, "integrationId");
+
+    // The route fronts that integration: a WEBSOCKET api serves a frame only through the
+    // target of the route that matched it, so a deployment of this api is accepted only
+    // while every route of it names one.
+    let route = created(
+        emulator,
+        case,
+        &format!("/v2/apis/{api_id}/routes"),
+        json!({ "routeKey": "$connect", "target": format!("integrations/{integration_id}") }),
+    )
+    .await;
+    let route_id = as_str(&route, "routeId");
 
     let authorizer = created(
         emulator,
@@ -294,14 +297,6 @@ async fn mint_many(emulator: &MultiServiceRouter, member: &str) -> Vec<String> {
     )
     .await;
     let api_id = as_str(&api, "apiId");
-    let host_route = created(
-        emulator,
-        &case,
-        &format!("/v2/apis/{api_id}/routes"),
-        json!({ "routeKey": "$connect" }),
-    )
-    .await;
-    let host_route_id = as_str(&host_route, "routeId");
     let host_integration = created(
         emulator,
         &case,
@@ -310,6 +305,19 @@ async fn mint_many(emulator: &MultiServiceRouter, member: &str) -> Vec<String> {
     )
     .await;
     let host_integration_id = as_str(&host_integration, "integrationId");
+    // The host route fronts that integration, so this api is deployable: a WEBSOCKET api
+    // serves a frame only through the target of the route that matched it.
+    let host_route = created(
+        emulator,
+        &case,
+        &format!("/v2/apis/{api_id}/routes"),
+        json!({
+            "routeKey": "$connect",
+            "target": format!("integrations/{host_integration_id}")
+        }),
+    )
+    .await;
+    let host_route_id = as_str(&host_route, "routeId");
 
     let mut ids = Vec::with_capacity(SAMPLE);
     for index in 0..SAMPLE {

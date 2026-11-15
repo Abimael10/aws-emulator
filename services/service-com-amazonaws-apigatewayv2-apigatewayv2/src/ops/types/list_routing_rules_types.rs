@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-apigatewayv2-apigatewayv2.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#ListRoutingRulesRequest")]
+// `skip_validation = ["MaxResults"]`: `ListRoutingRulesRequest$MaxResults` targets
+// `MaxResults` (`range` 1..100), but API Gateway does not hold a collection reader's page
+// size to that window at the request boundary — the recorded service SERVES a
+// `maxResults=0` with `200` and the page it has — so the window is the handler's to apply
+// (`crate::state::resolve_max_results` clamps whatever arrives into it) rather than the
+// boundary's to refuse. Without this the framework answers the constraint envelope ("1
+// validation error detected: …") for a request the service answers with a page.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.apigatewayv2#ListRoutingRulesRequest",
+    skip_validation = ["MaxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListRoutingRulesInput {
     pub domain_name: String,

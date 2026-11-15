@@ -137,8 +137,9 @@ use crate::state::{Api, ComAmazonawsApigatewayv2Apigatewayv2State, Stage};
 /// route "API Gateway invokes when a client connects to your API", which is why the
 /// authorization configured on it is what decides a handshake. The other two reserved keys
 /// (`$disconnect`, `$default`) are reached over an ESTABLISHED socket, which this endpoint
-/// never establishes — the api's own socket does ([`transport`]).
-const CONNECT_ROUTE_KEY: &str = "$connect";
+/// never establishes — the api's own socket does ([`transport`]). Re-exported from the one
+/// place the control plane holds the reserved keys.
+use crate::state::route_request_parameters::CONNECT_ROUTE_KEY;
 
 /// The `Connection` field token that asks for a protocol upgrade (RFC 6455 §4.1).
 const UPGRADE_TOKEN: &str = "upgrade";

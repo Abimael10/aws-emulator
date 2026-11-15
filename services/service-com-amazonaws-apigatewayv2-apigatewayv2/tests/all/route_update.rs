@@ -461,7 +461,9 @@ async fn a_route_authorized_by_an_authorizer_is_refused_unless_it_names_one() {
 
             // (2) UpdateRoute: the same requirement, reached as a patch of an open
             // route that names no authorizer.
-            let open_route = json!({ "routeKey": format!("PUT /{route_key}") });
+            let open_route = json!({
+                "routeKey": format!("PUT /open-{authorization_type}-{}", form.label().len())
+            });
             let route_id = create_route(&emulator, &case, &api_id, &open_route).await;
             let (_, before) = get_route(&emulator, &api_id, &route_id).await;
             let (status, updated) = update_route(&emulator, &api_id, &route_id, &members).await;

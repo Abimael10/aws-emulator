@@ -39,6 +39,7 @@ pub mod model_template;
 mod network;
 pub mod paging;
 pub mod parameter_mapping;
+pub mod route_key;
 pub mod route_request_parameters;
 pub mod route_throttle;
 pub mod selection_expression;
@@ -4679,6 +4680,14 @@ pub use paging::first_page_token;
 /// A record a collection reader reports in creation order — see [`paging::CreatedInOrder`].
 pub use paging::CreatedInOrder;
 
+/// The grammar a route key of an api of each protocol is written in, and the form the
+/// service stores an accepted one in — see [`route_key`].
+pub use route_key::{
+    normalized_route_key, route_key_grammar_message, undefined_route_target_message,
+    validate_route_key, DEFAULT_ROUTE_KEY, DISCONNECT_ROUTE_KEY, GREEDY_VARIABLE_POSITION,
+    RESERVED_WEBSOCKET_ROUTE_KEYS, ROUTE_KEY_NOT_FORMATTED_PROPERLY,
+};
+
 /// The variable namespaces a selection expression may read — see
 /// [`selection_expression::SELECTION_EXPRESSION_VARIABLES`].
 pub use selection_expression::SELECTION_EXPRESSION_VARIABLES;
@@ -4702,6 +4711,10 @@ pub use selection_expression::validate_route_selection_expression;
 /// Whether a selection expression names only variables this service evaluates — see
 /// [`selection_expression::validate_selection_expression`].
 pub use selection_expression::validate_selection_expression;
+
+/// The sentence a `RouteSelectionExpression` that is no selector is refused with — see
+/// [`selection_expression::INVALID_ROUTE_SELECTION_EXPRESSION`].
+pub use selection_expression::INVALID_ROUTE_SELECTION_EXPRESSION;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

@@ -88,12 +88,19 @@ async fn create_api(emulator: &MultiServiceRouter, case: &str, request: &Value) 
 }
 
 /// Create one route under `api_id`, so a deployment has something to capture.
+///
+/// The route is wired to a target where the api's protocol requires one for the api to be
+/// deployable at all (`crate::api_lifecycle::deployable_target`).
 async fn create_route(emulator: &MultiServiceRouter, case: &str, api_id: &str, route_key: &str) {
+    let mut request = json!({ "routeKey": route_key });
+    if let Some(target) = crate::api_lifecycle::deployable_target(emulator, case, api_id).await {
+        request["target"] = json!(target);
+    }
     let (status, created) = call(
         emulator,
         "POST",
         &format!("/v2/apis/{api_id}/routes"),
-        Some(json!({ "routeKey": route_key })),
+        Some(request),
     )
     .await;
     assert_eq!(

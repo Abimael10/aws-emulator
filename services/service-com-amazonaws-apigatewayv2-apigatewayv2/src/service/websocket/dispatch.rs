@@ -47,17 +47,20 @@ use crate::state::integration_response_key::{key_matches_status, DEFAULT_SELECTI
 use crate::state::{Api, DeployedConfiguration, Integration, IntegrationResponse, Route};
 
 /// The `RouteKey` of the route that serves the CONNECTION REQUEST: AWS documents `$connect`
-/// as the route "API Gateway invokes when a client connects to your API".
-pub const CONNECT_ROUTE_KEY: &str = "$connect";
+/// as the route "API Gateway invokes when a client connects to your API". Re-exported from
+/// the one place the control plane holds the reserved keys
+/// (`crate::state::route_request_parameters`), so the grammar a route key is written in and
+/// the key this dispatcher matches on cannot drift.
+pub use crate::state::route_request_parameters::CONNECT_ROUTE_KEY;
 
 /// The `RouteKey` of the route that serves the close: "API Gateway invokes [it] when a
-/// client disconnects from your API".
-pub const DISCONNECT_ROUTE_KEY: &str = "$disconnect";
+/// client disconnects from your API" — re-exported from `crate::state::route_key`.
+pub use crate::state::DISCONNECT_ROUTE_KEY;
 
 /// The `RouteKey` that serves every message no other route's key matches: "`$default`, which
 /// API Gateway invokes if the route selection expression cannot be evaluated or if no
-/// matching route is found".
-pub const DEFAULT_ROUTE_KEY: &str = "$default";
+/// matching route is found" — re-exported from `crate::state::route_key`.
+pub use crate::state::DEFAULT_ROUTE_KEY;
 
 /// The media type a mapping template is keyed by when it is keyed by one at all — the key
 /// API Gateway's own console writes for a WebSocket api's templates, and the one a message

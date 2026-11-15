@@ -169,7 +169,11 @@ pub(crate) async fn deploy(
         Some(json!({
             "routeKey": "$connect",
             "authorizationType": "CUSTOM",
-            "authorizerId": authorizer_id
+            "authorizerId": authorizer_id,
+            "target": format!(
+                "integrations/{}",
+                crate::api_lifecycle::mock_integration(emulator, case, &api_id).await
+            )
         })),
     )
     .await;

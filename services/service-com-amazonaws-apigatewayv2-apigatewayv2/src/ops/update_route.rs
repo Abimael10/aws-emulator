@@ -274,7 +274,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // carries is configuration rather than part of its identity. What stays fixed
             // is WHO the route belongs to: `ApiGatewayManaged` is not an input of this
             // operation, so a patched managed route is still reported as managed.
-            updated.route_key = route_key;
+            //
+            // A patched key is held to the grammar the api's protocol routes on, and stored
+            // in the form that grammar matches, exactly as the create's is
+            // (`crate::state::route_key`): a patch cannot leave a route on a key the data
+            // plane could never match.
+            if let Err(message) = crate::state::validate_route_key(&api.protocol_type, &route_key) {
+                return Err(bad_request(&message));
+            }
+            updated.route_key = crate::state::normalized_route_key(&api.protocol_type, &route_key);
         }
         if let Some(target) = input.target {
             updated.target = Some(target);

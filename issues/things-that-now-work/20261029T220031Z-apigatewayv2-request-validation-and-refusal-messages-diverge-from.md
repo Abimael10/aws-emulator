@@ -107,3 +107,48 @@ Replay verdict `mismatch`. Details include `$.message: value_mismatch (expected 
 
 ## Steps to Reproduce
 Replay the corpus. Cause 2: create a domain name then GET /v2/domainnames/{domainName}/routingrules (fixture apigatewayv2-domain-routing-rule-bogus-child-and-bounds step task#5) - 400 instead of 200 with an empty routingRules list. Cause 6: POST the same routeKey twice to /v2/apis/{apiId}/routes (apigatewayv2-http-route-key-grammar#task#7) - 201 instead of 409.
+
+## Resolution
+
+Causes 4, 5 and 6 (the route key): a route key is now held to the grammar the api's
+PROTOCOL routes on and stored in the form that grammar matches, in one place every writer
+shares (`src/state/route_key.rs`, reached by `CreateRoute`, `UpdateRoute` and the
+quick-create key of `CreateApi`/`UpdateApi`). An HTTP api's key is a request line
+(`[HTTP METHOD] /[RESOURCE PATH]`, the method drawn from the one catalog
+`ops::import_api::route_methods` already holds) or `$default`, and its method half is stored
+upper-cased, which is what makes a re-cased key the duplicate it is — the `409` and its
+sentence were already in the tree and now fire for it. A WEBSOCKET api's key is whatever its
+`RouteSelectionExpression` yields for a message, so any non-empty value that does not take
+the reserved `$` prefix is one. Two rules the recordings state and the report did not: a
+GREEDY path variable is only ever the last segment of a key written as a request line
+(`Greedy variables may only be in last position of route key`), and a WEBSOCKET api words
+every route-key refusal with the one clause `The provided route key is not formatted
+properly`, where an HTTP api's goes on to name the protocol and the format.
+
+Cause 7 (the deployment): `CreateDeployment` refuses to publish a WEBSOCKET api one of whose
+routes names no target, naming that route by its id and key. An HTTP api is not held to it —
+API Gateway deploys a route of one with no integration attached.
+
+Cause 2 (the page size): `ListRoutingRules$MaxResults` is off the request boundary
+(`skip_validation` in `src/ops/types/list_routing_rules_types.rs`), because the recorded
+service SERVES a `maxResults` outside the modelled 1..100 window with the page it has. The
+window is still applied — `state::resolve_max_results` clamps whatever arrives into it — so
+one call still costs one bounded page.
+
+Cause 9 (the selection expression): a `RouteSelectionExpression` that is no selector — absent
+on a WEBSOCKET api, or sent with nothing in it — is refused with `Invalid
+routeSelectionExpression`.
+
+Causes 1, 3, 8 and 10 were already resolved in the tree by the time this was picked up
+(`state::ROUTING_RULE_CONDITION_ALTERNATIVES`, `state::paging::MAX_RESULTS_NOT_AN_INTEGER_MESSAGE`,
+`state::ROUTE_RESPONSE_NOT_FOUND_MESSAGE` and
+`state::selection_expression::validate_route_selection_expression`); their fixtures replay
+clean and `tests/all/route_key_grammar.rs` pins what this change added.
+
+The four units that still diverge do so only on causes other open issues own: the
+`stripBasePath` and `integrationResponseSelectionExpression` server defaults
+(`20261029T220031Z-apigatewayv2-responses-omit-defaulted-and-derived-members.md`), the
+account-qualified `domainNameArn`
+(`20261111T014037Z-apigatewayv2-getdomainname-returns-an-account-qualified-domain-arn.md`),
+and the `content-length` of an empty `204`, recorded as a vendored-transport limitation in
+`20261029T220031Z-apigatewayv2-mutating-operations-answer-the-modeled-http-code.md`.

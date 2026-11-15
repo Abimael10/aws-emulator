@@ -128,6 +128,60 @@ pub(crate) async fn rest_endpoint(
     rest_api_id
 }
 
+/// Create one `MOCK` integration of the api `api_id` and answer the `IntegrationId` the
+/// service minted for it.
+///
+/// A route of a WEBSOCKET api serves a frame only through its target, so a deployment of
+/// such an api is refused while one of its routes names none: a suite that deploys a
+/// WebSocket api wires its routes to an integration, and `MOCK` is the one that invokes
+/// nothing ("for integrating the route or method request with API Gateway as a 'loopback'
+/// endpoint").
+pub(crate) async fn mock_integration(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+) -> String {
+    let (status, created) = call(
+        emulator,
+        "POST",
+        &format!("/v2/apis/{api_id}/integrations"),
+        Some(json!({ "integrationType": "MOCK" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from CreateIntegration, got {status} {created}"
+    );
+    as_str(&created, "integrationId")
+}
+
+/// The `Target` a route of the api `api_id` has to be created with for a deployment of that
+/// api to be accepted, or `None` when its routes need none.
+///
+/// A WEBSOCKET api serves a frame only through the target of the route that matched it, so
+/// `CreateDeployment` refuses to publish one of its routes that names none; an HTTP api's
+/// route is deployed with no integration attached and answers the request that matches it at
+/// the data plane. Answers the `integrations/{IntegrationId}` form a route's `Target` takes,
+/// over a [`mock_integration`] of that api.
+pub(crate) async fn deployable_target(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+) -> Option<String> {
+    let (status, api) = call(emulator, "GET", &format!("/v2/apis/{api_id}"), None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from GetApi, got {status} {api}"
+    );
+    if as_str(&api, "protocolType") != "WEBSOCKET" {
+        return None;
+    }
+    Some(format!(
+        "integrations/{}",
+        mock_integration(emulator, case, api_id).await
+    ))
+}
+
 /// Send one request, signed for [`REGION`], and return `(status, parsed body)`. An
 /// empty body parses to `Value::Null`, which is how a 204 is asserted.
 pub(crate) async fn call(

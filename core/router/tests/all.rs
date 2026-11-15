@@ -1919,3 +1919,24 @@ mod cloudformation_cloudfront_published_edge_address;
 // service crate's own, belongs in that suite's own module header, where it is read beside the
 // test it explains; a note about THIS file belongs in `all/appended_notes.rs`.
 #![allow(clippy::doc_lazy_continuation)]
+// Single integration-test target for the router: the DECLARATION LIST, and nothing else.
+// EVERY comment in this file is an ORDINARY one, this header included, and that is
+// keep producing — is `E0753` and compiles no suite of this target. With no inner doc
+// comment anywhere in the file, no merge of two landings can put one past the first item,
+// because there is no such line to copy; `all/all_rs_carries_no_inner_doc_comment.rs` pins
+// exactly that.
+// The list below holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file
+// under `tests/all/`, sorted by name, and no other line: a landing inserts its two lines in
+// one place and has no prose to duplicate, re-word or mistype. `tests/all.rs` is a
+// test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING (`tests/<name>.rs`),
+// which the layout check refuses; the `#[path]` is what points each declaration into
+// `tests/all/`. Declare each suite exactly ONCE: a second `mod` for one name is `E0428` and
+// fails every suite in this target.
+// test it explains. The notes earlier landings appended to this file live in
+// `all/appended_notes.rs` and `all/appended_notes_tail.rs`, and these suites check the rules
+// above rather than restating them: `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs`.
+// A suite's own module doc may wrap a list item without the indentation
+// `clippy::doc_lazy_continuation` asks for, so the lint is allowed for this whole test
+// target here. An inner ATTRIBUTE, like an inner doc comment, is legal only before the first
+// item, which is why it stands in this header rather than in the list below.

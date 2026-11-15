@@ -209,6 +209,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A deployment FREEZES the api's routes for a stage to serve, and a WEBSOCKET api
+        // serves a frame ONLY through the target of the route that matched it — there is no
+        // other backend path for a message — so a route of such an api that names no target
+        // could never be served, and the deployment that would publish it is refused.
+        // Weighed before anything is minted, so a refused deployment leaves the api's
+        // deployments and stages exactly as they were, and it names the route that cannot be
+        // served, by the id this service minted for it and the key it carries
+        // (`crate::state::undefined_route_target_message`). An HTTP api is not held to it:
+        // API Gateway deploys a route of one that names no integration and answers the
+        // request that matches it at the data plane.
+        if api.protocol_type == crate::state::WEBSOCKET_PROTOCOL_TYPE {
+            if let Some((route_id, route_key)) = api
+                .routes
+                .values()
+                .find(|route| route.target.as_deref().unwrap_or_default().is_empty())
+                .map(|route| (route.route_id.clone(), route.route_key.clone()))
+            {
+                return Err(CreateDeploymentErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::undefined_route_target_message(
+                            &route_id,
+                            &route_key,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
         // Bound the growth a caller drives: every call mints a NEW deployment, so
         // without a bound a loop of them grows this store without end.
         // `TooManyRequestsException` is the modelled error for "a limit has been

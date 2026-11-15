@@ -208,6 +208,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The route key is the api's data-plane MATCH key, so it is written in the grammar
+        // the api's protocol routes on — and stored in the form that grammar matches,
+        // whatever case the request wrote the method half in (`crate::state::route_key`).
+        // Weighed FIRST of the key's rules and BEFORE the key is compared with the api's
+        // existing ones, so a key that could never match is refused rather than stored, and
+        // a key that differs from a stored one only in the case of its method is recognised
+        // as the duplicate it is.
+        if let Err(message) = crate::state::validate_route_key(&api.protocol_type, &input.route_key)
+        {
+            return Err(bad_request(&message));
+        }
+        let route_key = crate::state::normalized_route_key(&api.protocol_type, &input.route_key);
+
         // Each of these members is documented "Supported only for WebSocket APIs" on
         // `CreateRoute`, so a route of an api of any other protocol cannot carry one.
         // Checked BEFORE anything is written, so a refused create leaves the api's
@@ -257,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // written, so a refused create leaves the api's routes exactly as they were.
         if let Err(message) = crate::state::route_request_parameters::validate_route_request_parameters(
             &api.protocol_type,
-            &input.route_key,
+            &route_key,
             input
                 .request_parameters
                 .as_ref()
@@ -269,16 +282,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A route key identifies the route within its api, so one api cannot carry two
         // routes with the same key. The sentence is the one every writer of a route key
         // shares (`crate::state::duplicate_identity`).
-        if api
-            .routes
-            .values()
-            .any(|route| route.route_key == input.route_key)
-        {
+        if api.routes.values().any(|route| route.route_key == route_key) {
             return Err(CreateRouteErrorModeled::ConflictException(ConflictException {
                 message: Some(
-                    crate::state::duplicate_identity::route_key_in_use_message(
-                        &input.route_key,
-                    ),
+                    crate::state::duplicate_identity::route_key_in_use_message(&route_key),
                 ),
             })
             .into());
@@ -291,7 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request", which is `ConflictException`, the same error a duplicate key
         // takes.
         if let Err(message) = crate::state::validate_route_key_variables(
-            &input.route_key,
+            &route_key,
             api.routes.values().map(|route| route.route_key.as_str()),
         ) {
             return Err(CreateRouteErrorModeled::ConflictException(ConflictException {
@@ -354,7 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = crate::state::Route {
             route_id: route_id.clone(),
-            route_key: input.route_key,
+            route_key,
             target: input.target,
             authorization_type,
             authorizer_id: input.authorizer_id,

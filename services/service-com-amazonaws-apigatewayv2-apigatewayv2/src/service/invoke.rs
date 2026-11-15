@@ -203,8 +203,10 @@ use crate::state::{
 /// "the default route" of an HTTP api, the one reached when no route key matches the
 /// request, and `Route$ApiGatewayManaged` names it ("the $default route is managed by API
 /// Gateway") — a reserved key of the protocol rather than a value the model enumerates
-/// (`RouteKey` targets the unconstrained `SelectionKey`).
-const DEFAULT_ROUTE_KEY: &str = "$default";
+/// (`RouteKey` targets the unconstrained `SelectionKey`). Re-exported from
+/// `crate::state::route_key`, where every writer of a route key reads it, so the key this
+/// matcher falls back to and the key the control plane accepts cannot drift.
+use crate::state::DEFAULT_ROUTE_KEY;
 
 /// The verb-independent catch-all a route key may name instead of a method: `ANY /{proxy+}`
 /// is the key AWS's own quick-create and SAM templates write, and it matches every verb.

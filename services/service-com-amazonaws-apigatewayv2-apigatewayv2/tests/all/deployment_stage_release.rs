@@ -29,7 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -99,9 +99,9 @@ fn rows() -> Vec<Row> {
             description: Some("the duplex data plane"),
         },
         Row {
-            case: "a WebSocket api with a single $connect route and no integration",
+            case: "a WebSocket api with a single $connect route",
             api: websocket_api("connect-only-api"),
-            integration: None,
+            integration: Some(lambda_proxy("connect-only-handler")),
             routes: &["$connect"],
             stage_name: "production".to_string(),
             description: None,
@@ -501,14 +501,16 @@ async fn only_the_named_stage_moves_and_every_release_mints_its_own_deployment()
     );
 }
 
-/// How long to wait so the release lands in a LATER second than the stage's creation.
-/// The service reports its instants at whole-second granularity, so only a wait past a
-/// second boundary makes the move of `LastUpdatedDate` observable on the wire.
+/// How long one look of the release poll below waits before asking again. Inside the poll
+/// loop, so what the test waits for is the CONDITION and not a fixed span.
 ///
 /// A BLOCKING wait on purpose: this workspace's `tokio` carries only the `macros`/`rt`
-/// features, so there is no `tokio::time` to await, and one test spending a second is
-/// cheaper than giving every suite a timer.
-const SECOND_BOUNDARY_WAIT: Duration = Duration::from_millis(1_100);
+/// features, so there is no `tokio::time` to await.
+const RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A generous deadline for that poll, so a loaded host still reaches the later second the
+/// move of `LastUpdatedDate` becomes observable in.
+const RELEASE_DEADLINE: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn a_release_moves_the_stage_s_last_updated_date_past_its_creation() {
@@ -516,7 +518,8 @@ async fn a_release_moves_the_stage_s_last_updated_date_past_its_creation() {
     let case = "a stage released to a deployment a second later";
 
     let api_id = create_api(&emulator, case, &websocket_api("clock-api")).await;
-    create_routes(&emulator, case, &api_id, &["$connect"], None).await;
+    let target = create_integration(&emulator, case, &api_id, &lambda_proxy("clock-handler")).await;
+    create_routes(&emulator, case, &api_id, &["$connect"], Some(&target)).await;
     let stage = create_stage(&emulator, case, &api_id, "dev").await;
     assert_eq!(
         stage.get("lastUpdatedDate"),
@@ -524,11 +527,26 @@ async fn a_release_moves_the_stage_s_last_updated_date_past_its_creation() {
         "case {case:?}: nothing has rewritten the stage yet, got {stage}"
     );
 
-    sleep(SECOND_BOUNDARY_WAIT);
-
-    let deployment =
-        create_deployment(&emulator, case, &api_id, json!({ "stageName": "dev" })).await;
-    let released = get_stage(&emulator, case, &api_id, "dev").await;
+    // The service reports its instants at whole-second granularity, so the move of
+    // `LastUpdatedDate` is observable only once a release lands in a LATER second than the
+    // stage's creation. Release until one does, rather than waiting a fixed span for that
+    // second to arrive: each release is a deployment of its own, and the one that lands in
+    // the later second is the one the assertions below read.
+    let started = Instant::now();
+    let (deployment, released) = loop {
+        let deployment =
+            create_deployment(&emulator, case, &api_id, json!({ "stageName": "dev" })).await;
+        let released = get_stage(&emulator, case, &api_id, "dev").await;
+        if instant(case, &released, "lastUpdatedDate") > instant(case, &released, "createdDate") {
+            break (deployment, released);
+        }
+        assert!(
+            started.elapsed() < RELEASE_DEADLINE,
+            "case {case:?}: expected a release in a later second than the stage's creation \
+             within {RELEASE_DEADLINE:?}, got {released}"
+        );
+        sleep(RELEASE_POLL_INTERVAL);
+    };
     let created_at = instant(case, &released, "createdDate");
     let updated_at = instant(case, &released, "lastUpdatedDate");
     assert!(
