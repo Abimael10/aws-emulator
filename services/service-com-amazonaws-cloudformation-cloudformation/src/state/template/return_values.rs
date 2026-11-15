@@ -808,6 +808,12 @@ pub(super) const COMPOSITE_IDENTITY_SEPARATOR: &str = "|";
 /// * `AWS::ACMPCA::Permission` is `<CertificateAuthorityArn>|<Principal>`, the pair
 ///   `DeletePermission` takes and `ListPermissions` reports a grant under.
 ///
+/// A type whose resource is a sub-resource its owning API addresses by SEVERAL values is the
+/// same case: an `AWS::Glue::TableOptimizer` is
+/// `<CatalogId>|<DatabaseName>|<TableName>|<Type>`, the four `CreateTableOptimizer`,
+/// `GetTableOptimizer` and `DeleteTableOptimizer` each take to address one optimizer, and the
+/// type declares no name of its own.
+///
 /// Because the identity IS the pair, a declaration that re-points either side of it names a
 /// DIFFERENT resource: the deployment replaces the one the stack has
 /// ([`super::provisioning::is_same_resource`]) and the new `Ref` names the new pair, and the
@@ -828,6 +834,7 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
         EKS_ACCESS_ENTRY => &["ClusterName", "PrincipalArn"],
         COGNITO_IDENTITY_POOL_PRINCIPAL_TAG => &["IdentityPoolId", "IdentityProviderName"],
         ACMPCA_PERMISSION => &["CertificateAuthorityArn", "Principal"],
+        GLUE_TABLE_OPTIMIZER => &["CatalogId", "DatabaseName", "TableName", "Type"],
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_FORM | AMPLIFYUIBUILDER_THEME => {
             AMPLIFYUIBUILDER_ATTRIBUTES
         }
@@ -964,6 +971,15 @@ pub const GRAFANA_WORKSPACE: &str = "AWS::Grafana::Workspace";
 pub const GLUE_DATABASE: &str = "AWS::Glue::Database";
 pub const GLUE_TABLE: &str = "AWS::Glue::Table";
 pub const GLUE_CRAWLER: &str = "AWS::Glue::Crawler";
+
+/// The OPTIMIZER of one of those tables (the same `cloudFormationName: Glue`). This is a
+/// type `super::provisioner` creates in AWS Glue itself, and it declares no name of its own:
+/// an optimizer is a resource OF a table, which `CreateTableOptimizer`,
+/// `GetTableOptimizer` and `DeleteTableOptimizer` each address by the catalog, the database,
+/// the table and the optimizer's own type together — so the four properties that name it ARE
+/// its identity ([`composite_identity_properties`]), and the physical id of one is those
+/// values joined, which is what `Ref` of the type returns.
+pub const GLUE_TABLE_OPTIMIZER: &str = "AWS::Glue::TableOptimizer";
 
 /// An Amazon GuardDuty detector's resource type (the GuardDuty model:
 /// `cloudFormationName: GuardDuty`). This is a type `super::provisioning` creates in

@@ -85,7 +85,7 @@ use super::template::{
     ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION, ACMPCA_PERMISSION, AMPLIFYUIBUILDER_COMPONENT,
     AMPLIFYUIBUILDER_FORM, AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, APIGATEWAY_ACCOUNT,
     APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, BRAKET_SPENDING_LIMIT,
-    CUSTOMER_PROFILES_DOMAIN, MWAA_ENVIRONMENT,
+    CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER, MWAA_ENVIRONMENT,
 };
 
 /// The namespace Amazon Web Services' own resource types live under: a type spelled with
@@ -576,6 +576,10 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Glue::Schema",
     "AWS::Glue::SecurityConfiguration",
     "AWS::Glue::Table",
+    // The optimizer of one of those tables, created in AWS Glue itself
+    // (`super::provisioner`): the compaction, retention or orphan-file-deletion optimizer a
+    // template declares on an open-table-format table.
+    GLUE_TABLE_OPTIMIZER,
     "AWS::Glue::Trigger",
     "AWS::Glue::Workflow",
     // Amazon Managed Grafana — the type a workspace is declared as

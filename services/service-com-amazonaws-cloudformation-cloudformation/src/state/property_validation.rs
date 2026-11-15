@@ -108,6 +108,25 @@ pub struct ConstrainedProperty {
     pub admitted: &'static [&'static str],
 }
 
+impl ConstrainedProperty {
+    /// Whether this row's property ADMITS the value `declared` states for it.
+    ///
+    /// The one reading of a published value set, so the pre-deployment stage here and the
+    /// resource provider's own model validation ([`super::provisioning`]'s
+    /// `model_validation`) decide membership identically and can differ only in what they do
+    /// about it — one refuses the stack operation, the other fails the resource.
+    ///
+    /// A value that is not TEXT is admitted: it is no value of a published set either way (an
+    /// expression this service left unevaluated, a structure the author wrote where the
+    /// schema states a string), and what it fails is a constraint neither stage judges, so it
+    /// is left to the service that owns the resource.
+    pub fn admits(&self, declared: &Value) -> bool {
+        declared
+            .as_str()
+            .is_none_or(|declared| self.admitted.contains(&declared))
+    }
+}
+
 /// The properties this stage knows a published value set for.
 ///
 /// Source for each row: the resource type's entry in the "AWS resource and property types
@@ -464,18 +483,16 @@ fn missing_required_property(resource: &StoredResource) -> Option<PropertyFailur
 /// admit ([`CONSTRAINED_PROPERTIES`]); `None` when every value this stage can judge is
 /// admitted.
 ///
-/// A value that is not text (an expression this service left unevaluated) is no value of a
-/// published set either way and is left to the owning service.
+/// Membership is [`ConstrainedProperty::admits`], which is also what the resource provider's
+/// own model validation asks of the same rows — including its reading of a value that is not
+/// text (an expression this service left unevaluated), which is left to the owning service.
 fn inadmissible_value(resource: &StoredResource) -> Option<PropertyFailure> {
     CONSTRAINED_PROPERTIES
         .iter()
         .filter(|constrained| constrained.resource_type == resource.resource_type)
         .find_map(|constrained| {
-            let value = resource
-                .properties
-                .get(constrained.property)
-                .and_then(Value::as_str)?;
-            if constrained.admitted.contains(&value) {
+            let declared = resource.properties.get(constrained.property)?;
+            if constrained.admits(declared) {
                 return None;
             }
             Some(PropertyFailure {

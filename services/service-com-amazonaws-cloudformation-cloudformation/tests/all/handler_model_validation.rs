@@ -178,10 +178,21 @@ fn model_validation_message(member: &str) -> String {
 /// The whole reason, with `token` as the request token: what a client reads off the failed
 /// resource's event.
 fn expected_reason(member: &str, token: &str) -> String {
+    quoted(&model_validation_message(member), token)
+}
+
+/// The sentence the schema validator states for a property whose value is outside the SET its
+/// type's schema publishes, at the location of that property in the validated document.
+fn model_validation_enum_message(property: &str) -> String {
     format!(
-        "{QUOTED_PREFIX}{}{QUOTED_SUFFIX}{token}, HandlerErrorCode: {INVALID_REQUEST})",
-        model_validation_message(member)
+        "Model validation failed (#/{property}: failed validation constraint for keyword [enum])"
     )
+}
+
+/// One provider message in the envelope CloudFormation quotes it in, with `token` as this
+/// resource request's own.
+fn quoted(message: &str, token: &str) -> String {
+    format!("{QUOTED_PREFIX}{message}{QUOTED_SUFFIX}{token}, HandlerErrorCode: {INVALID_REQUEST})")
 }
 
 /// The request token a served reason carries, read back out of it — the value is this
@@ -250,6 +261,80 @@ async fn a_declaration_missing_a_required_property_fails_with_the_validators_sen
             "case {case:?}: expected the request token to be a uuid, got {token:?}"
         );
         let expected = expected_reason(row.missing, &token);
+        assert_eq!(
+            reason, expected,
+            "case {case:?}: expected the reason {expected:?}, got {reason:?}"
+        );
+    }
+}
+
+/// RULE: the SAME provider validation judges a property whose value its type's schema
+/// constrains to a published SET — a declared value outside that set fails THAT resource with
+/// the validator's own sentence for the constraint that failed, at the LOCATION of that
+/// property (`Model validation failed (#/<property>: failed validation constraint for keyword
+/// [enum])`), in the same handler envelope and under the same `HandlerErrorCode`.
+///
+/// Why it matters for the same reason the rule above does: the value is one no resource of the
+/// type could ever have, so the provider refuses it rather than the template being refused as
+/// malformed, and a client classifying the failure reads the property's location off the
+/// reason.
+///
+/// The rows are values of one such property, differing along HOW each misses the set: a value
+/// of no published spelling at all, a published value in the wrong case, the empty string, and
+/// two published values run together. Every value the set DOES publish passes this stage and is
+/// deployed, which the router's own cross-service suite asserts
+/// (`cloudformation_provisions_glue_table_optimizers.rs`).
+#[tokio::test]
+async fn a_value_outside_the_published_set_fails_with_the_validators_enum_sentence() {
+    let router = router();
+    // The type under test and the property whose values its schema publishes: an AWS Glue
+    // table optimizer's `Type`, whose set is that service's own `TableOptimizerType`.
+    let resource_type = "AWS::Glue::TableOptimizer";
+    let property = "Type";
+    let logical_id = "Optimizer";
+    // (case, the value the declaration states for the property).
+    let rows: [(&str, &str); 4] = [
+        ("a value of no published spelling", "vacuum"),
+        ("a published value in the wrong case", "COMPACTION"),
+        ("the empty string", ""),
+        ("two published values run together", "compaction,retention"),
+    ];
+
+    for (index, (case, declared)) in rows.into_iter().enumerate() {
+        let stack = format!("model-validation-optimizer-{index}");
+        let template = json!({"Resources": {logical_id: {
+            "Type": resource_type,
+            "Properties": {
+                "CatalogId": ACCOUNT_ID,
+                "DatabaseName": "lakehouse",
+                "TableName": "orders",
+                property: declared,
+                "TableOptimizerConfiguration": {
+                    "RoleArn": "arn:aws:iam::000000000000:role/glue-table-optimizer",
+                    "Enabled": true,
+                },
+            },
+        }}})
+        .to_string();
+        let (code, created) = create_stack(&router, &stack, &template, &[]).await;
+        assert_eq!(
+            code, 200,
+            "case {case:?}: CreateStack must be accepted — the refusal is the resource's — got \
+             {code} {created}"
+        );
+
+        let described = poll_to_terminal(&router, case, &stack).await;
+        assert_eq!(
+            xml_text(&described, "StackStatus").as_deref(),
+            Some(status::ROLLBACK_COMPLETE),
+            "case {case:?}: expected the failed create to be rolled back, got {described}"
+        );
+
+        let reason =
+            resource_event_reason(&router, &stack, logical_id, resource_status::CREATE_FAILED)
+                .await;
+        let token = served_token(case, &reason);
+        let expected = quoted(&model_validation_enum_message(property), &token);
         assert_eq!(
             reason, expected,
             "case {case:?}: expected the reason {expected:?}, got {reason:?}"

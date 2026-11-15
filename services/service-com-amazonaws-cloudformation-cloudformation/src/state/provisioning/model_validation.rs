@@ -41,12 +41,27 @@
 //! the service that owns it, which is the authority on everything this stage is not. A
 //! declaration this stage passes is still provisioned and still judged there.
 //!
-//! Only PRESENCE is judged, because presence is what a schema's `required` states. A property
-//! the document carries whose VALUE the type does not admit — the empty string where the
-//! schema states a length, a value outside a published set — is a different failure of the
-//! same validation, reported where that value is read.
+//! Only PRESENCE is judged by the first of the two catalogues here, because presence is what
+//! a schema's `required` states. A property the document carries whose VALUE the type does not
+//! admit is a different failure of the same validation, and the one form of it this stage
+//! judges is a property whose value the schema constrains to a published SET
+//! ([`ENUMERATED_PROPERTIES`]): a declared value outside that set — membership being the rows'
+//! own [`crate::state::property_validation::ConstrainedProperty::admits`] — fails the resource
+//! at the LOCATION of that property, with the validator's own sentence for the constraint that
+//! failed ([`enum_reason`]) — so a value no resource of the type could ever have is refused by
+//! the provider rather than sent to the owning service or admitted as the template's business.
+//! A value outside a length or a pattern the schema states is the same class of failure and is
+//! left where that value is read, as the rest of this stage's partiality is.
+//!
+//! Both of those questions are asked a second time, of other types, by the PRE-DEPLOYMENT
+//! stage ([`crate::state::property_validation`]), which refuses the OPERATION rather than
+//! failing the resource. The two stages carry their own disjoint catalogues for that reason:
+//! which stage judges a given type's property decides whether a client's `CreateStack` is
+//! refused outright or its stack rolls back carrying the resource's failure.
 
 use ::serde_json::Value;
+
+use crate::state::property_validation::ConstrainedProperty;
 
 use super::Refusal;
 
@@ -75,6 +90,21 @@ pub(super) const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
     RequiredProperties {
         resource_type: super::appsync_domain_names::APPSYNC_DOMAIN_NAME_API_ASSOCIATION,
         required: &["ApiId", "DomainName"],
+    },
+    // `AWS::Glue::TableOptimizer`: an optimizer is a resource OF a catalog table, so every
+    // member `CreateTableOptimizer` declares required — the catalog, the database and the
+    // table that identify it, the type of optimizer it is, and the configuration it runs
+    // under — is published "Required: Yes" and the type declares no name CloudFormation could
+    // generate.
+    RequiredProperties {
+        resource_type: crate::state::template::GLUE_TABLE_OPTIMIZER,
+        required: &[
+            "CatalogId",
+            "DatabaseName",
+            "TableName",
+            "TableOptimizerConfiguration",
+            "Type",
+        ],
     },
     // `AWS::IoT::Authorizer`: the authorizer IS the function that authorizes, so
     // `AuthorizerFunctionArn` is published "Required: Yes" and is the member
@@ -122,6 +152,37 @@ pub(super) const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
     },
 ];
 
+/// The properties whose value this stage judges against a published set.
+///
+/// A row is the same shape the PRE-DEPLOYMENT stage's own value catalogue carries
+/// ([`crate::state::property_validation::ConstrainedProperty`], whose rows are read here
+/// rather than redeclared), and the two lists are deliberately DISJOINT, because a row's
+/// stage decides what a client sees: a row THERE fails the stack OPERATION before anything is
+/// created (and is turned off by `DisableValidation`), while a row HERE fails the RESOURCE,
+/// with the provider's own sentence on its failed event and the stack rolled back. Which stage
+/// judges a given property is a fact about the service, so it is read off the recorded
+/// behaviour of that type rather than chosen.
+///
+/// Like [`REQUIRED_PROPERTIES`] above, this is a catalogue grown one row at a time and
+/// deliberately PARTIAL: a property no row names is left to the owning service, which is the
+/// authority on every value this stage does not judge. A row belongs here where the SET is a
+/// fact of the type rather than of one request — the owning API's own enumeration, which the
+/// type's schema publishes as that property's `enum` — so that a value outside it can never
+/// name a resource the service would make.
+pub(super) const ENUMERATED_PROPERTIES: &[ConstrainedProperty] = &[
+    // `AWS::Glue::TableOptimizer$Type` is which optimizer of the table the resource is, and
+    // AWS Glue enumerates them: `smithy_query(query="shape", shape="TableOptimizerType")` is
+    // `compaction | retention | orphan_file_deletion`, which is the set that type's schema
+    // publishes for the property. Any other value names no optimizer that service could
+    // register, and it is this stage that judges it: a stack declaring one is ADMITTED and the
+    // optimizer's own resource is what fails.
+    ConstrainedProperty {
+        resource_type: crate::state::template::GLUE_TABLE_OPTIMIZER,
+        property: "Type",
+        admitted: &["compaction", "retention", "orphan_file_deletion"],
+    },
+];
+
 /// The LOCATION a failure about a property of the type itself is reported at: the root of the
 /// document the provider validated, which is the resource's own property document.
 const ROOT: &str = "#";
@@ -133,17 +194,50 @@ const MODEL_VALIDATION_CODE: &str = "InvalidRequest";
 
 /// `Some(refusal)` where the property document `properties` of a resource of `resource_type`
 /// does not carry a property this stage judges required ([`REQUIRED_PROPERTIES`]) — the first
-/// such property in the order the type's reference publishes them; `None` for a type with no
-/// row and for a document carrying every property its row names.
+/// such property in the order the type's reference publishes them — or carries one whose value
+/// is outside the set its schema publishes ([`ENUMERATED_PROPERTIES`]); `None` for a type with
+/// no row and for a document this stage finds nothing wrong with.
+///
+/// PRESENCE is judged before VALUE, because a property that is not there has no value to
+/// judge.
 ///
 /// A document that is not an object at all (a declaration with no `Properties` member) carries
 /// no property, so it is reported for the first one its row names.
 pub(super) fn refusal(resource_type: &str, properties: &Value) -> Option<Refusal> {
-    let missing = missing_required_property(resource_type, properties)?;
+    if let Some(missing) = missing_required_property(resource_type, properties) {
+        return Some(Refusal {
+            code: MODEL_VALIDATION_CODE.to_string(),
+            message: reason(missing),
+        });
+    }
+    let outside = property_outside_published_set(resource_type, properties)?;
     Some(Refusal {
         code: MODEL_VALIDATION_CODE.to_string(),
-        message: reason(missing),
+        message: enum_reason(outside),
     })
+}
+
+/// The first property of `resource_type` whose declared value is outside the set its schema
+/// publishes for it ([`ENUMERATED_PROPERTIES`]); `None` where every such property the document
+/// carries states one of those values, and for a property the document does not carry at all —
+/// a value that is not there is the required-property question above, not this one.
+///
+/// Membership is the rows' own [`ConstrainedProperty::admits`], the one reading of a published
+/// value set in this crate, so this stage and the pre-deployment one cannot drift apart about
+/// which values a property has.
+fn property_outside_published_set(
+    resource_type: &str,
+    properties: &Value,
+) -> Option<&'static str> {
+    ENUMERATED_PROPERTIES
+        .iter()
+        .filter(|row| row.resource_type == resource_type)
+        .find(|row| {
+            properties
+                .get(row.property)
+                .is_some_and(|declared| !row.admits(declared))
+        })
+        .map(|row| row.property)
 }
 
 /// The first property of `resource_type` this stage judges required that `properties` does not
@@ -165,6 +259,17 @@ fn missing_required_property(resource_type: &str, properties: &Value) -> Option<
 /// the location in the validated document the failure is about and the member that is missing.
 pub(super) fn reason(member: &str) -> String {
     format!("Model validation failed ({ROOT}: required key [{member}] not found)")
+}
+
+/// How a resource provider's model validation reports a property whose declared value is
+/// outside the set its type's schema publishes: the schema validator's own sentence, around
+/// the LOCATION of that property in the validated document and the name of the constraint that
+/// failed — the same sentence shape as [`reason`], whose fixed text is the validator's.
+pub(super) fn enum_reason(property: &str) -> String {
+    format!(
+        "Model validation failed ({ROOT}/{property}: failed validation constraint for keyword \
+         [enum])"
+    )
 }
 
 #[cfg(test)]
@@ -249,6 +354,143 @@ mod tests {
             "Model validation failed (#: required key [RoleArn] not found)",
             "expected the schema validator's own wording"
         );
+        assert_eq!(
+            enum_reason("Type"),
+            "Model validation failed (#/Type: failed validation constraint for keyword [enum])",
+            "expected the schema validator's own wording for the failed constraint"
+        );
+    }
+
+    /// RULE: a property whose value its type's schema constrains to a published set is refused
+    /// for any value outside that set, at the location of THAT property — while every value the
+    /// set carries passes this stage.
+    ///
+    /// The rows span the set itself (each published value), values outside it (a near miss, a
+    /// value of a neighbouring enum, the wrong case, the empty string), a value that is not a
+    /// string at all, a property the declaration leaves out (which is the required-property
+    /// question, not this one) and a type this stage holds no enumerated row for.
+    #[test]
+    fn a_value_outside_the_published_set_is_refused_naming_that_property() {
+        let optimizer = crate::state::template::GLUE_TABLE_OPTIMIZER;
+        /// The members the Glue optimizer rows carry beside the one under test, so the
+        /// required-property stage passes and the VALUE is what each row judges.
+        fn declared(optimizer_type: Value) -> Value {
+            ::serde_json::json!({
+                "CatalogId": "000000000000",
+                "DatabaseName": "lake",
+                "TableName": "orders",
+                "TableOptimizerConfiguration": {"RoleArn": "arn", "Enabled": true},
+                "Type": optimizer_type,
+            })
+        }
+        let mut cases: Vec<(String, &str, Value, Option<&str>)> = Vec::new();
+        // Every value the published set carries passes, including the two the issue did not
+        // cite.
+        for published in ["compaction", "retention", "orphan_file_deletion"] {
+            cases.push((
+                format!("the published value {published:?}"),
+                optimizer,
+                declared(Value::String(published.to_string())),
+                None,
+            ));
+        }
+        for outside in [
+            "compact",
+            "COMPACTION",
+            "Compaction",
+            "snapshot_retention",
+            "",
+        ] {
+            cases.push((
+                format!("the value {outside:?}, which the set does not carry"),
+                optimizer,
+                declared(Value::String(outside.to_string())),
+                Some("Type"),
+            ));
+        }
+        cases.push((
+            "a value that is not a string at all".to_string(),
+            optimizer,
+            declared(::serde_json::json!({"Fn::Join": []})),
+            // No value of a published set either way, and what it fails is a constraint
+            // neither validation stage judges, so it is left to the owning service
+            // ([`ConstrainedProperty::admits`]).
+            None,
+        ));
+        cases.push((
+            "a type this stage holds no enumerated row for".to_string(),
+            "AWS::SNS::Topic",
+            ::serde_json::json!({"Type": "not-an-optimizer"}),
+            None,
+        ));
+        for (case, resource_type, properties, outside) in cases {
+            let refused = refusal(resource_type, &properties);
+            assert_eq!(
+                refused.as_ref().map(|refusal| refusal.message.clone()),
+                outside.map(enum_reason),
+                "case {case:?}: expected the failure for {outside:?}, got {refused:?}"
+            );
+        }
+    }
+
+    /// A declaration that leaves an enumerated property OUT is reported for the missing
+    /// property rather than for the set: presence is judged before value.
+    #[test]
+    fn an_absent_enumerated_property_is_reported_as_missing() {
+        let refused = refusal(
+            crate::state::template::GLUE_TABLE_OPTIMIZER,
+            &::serde_json::json!({
+                "CatalogId": "000000000000",
+                "DatabaseName": "lake",
+                "TableName": "orders",
+                "TableOptimizerConfiguration": {"RoleArn": "arn"},
+            }),
+        );
+        assert_eq!(
+            refused.as_ref().map(|refusal| refusal.message.clone()),
+            Some(reason("Type")),
+            "case \"an optimizer declaring no type\": expected the missing-property sentence, \
+             got {refused:?}"
+        );
+    }
+
+    /// Every enumerated row names a type once per property and publishes a non-empty set of
+    /// values: a row with no values could never admit anything. A row this stage carries must
+    /// not be one the PRE-DEPLOYMENT stage carries too — the two judge different stages, so a
+    /// property in both would be refused there and never reach here.
+    #[test]
+    fn every_enumerated_row_publishes_a_set_this_stage_alone_judges() {
+        for row in ENUMERATED_PROPERTIES {
+            assert!(
+                !row.admitted.is_empty(),
+                "case {:?}: expected the row to publish values for {:?}",
+                row.resource_type,
+                row.property
+            );
+            let rows = ENUMERATED_PROPERTIES
+                .iter()
+                .filter(|other| {
+                    other.resource_type == row.resource_type && other.property == row.property
+                })
+                .count();
+            assert_eq!(
+                rows, 1,
+                "case {:?}: expected one row per type and property, got {rows}",
+                row.resource_type
+            );
+            assert!(
+                !crate::state::property_validation::CONSTRAINED_PROPERTIES
+                    .iter()
+                    .any(|other| {
+                        other.resource_type == row.resource_type
+                            && other.property == row.property
+                    }),
+                "case {:?}: expected {:?} to be judged by one stage only, the \
+                 pre-deployment catalogue carries it too",
+                row.resource_type,
+                row.property
+            );
+        }
     }
 
     /// Every row names a type once, and no row is empty: a type whose row names no property

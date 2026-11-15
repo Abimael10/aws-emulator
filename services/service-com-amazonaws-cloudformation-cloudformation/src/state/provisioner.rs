@@ -498,7 +498,8 @@ use super::template::{
     EMR_CLUSTER, EVENTS_EVENT_BUS, EVENTS_EVENT_BUS_POLICY, EVENTS_RULE,
     FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
-    ELASTIC_BEANSTALK_ENVIRONMENT, GLUE_CRAWLER, GLUE_DATABASE, GLUE_TABLE, GRAFANA_WORKSPACE,
+    ELASTIC_BEANSTALK_ENVIRONMENT, GLUE_CRAWLER, GLUE_DATABASE, GLUE_TABLE,
+    GLUE_TABLE_OPTIMIZER, GRAFANA_WORKSPACE,
     GUARDDUTY_DETECTOR, GUARDDUTY_IP_SET,
     IAM_ACCESS_KEY,
     KINESIS_STREAM,
@@ -782,6 +783,12 @@ pub(super) enum Provisioner {
     /// `AWS::Glue::Crawler`: a crawler of that same catalog, which `CreateCrawler` creates
     /// under the name the declaration states and `DeleteCrawler` deletes.
     GlueCrawler,
+    /// `AWS::Glue::TableOptimizer`: the compaction, retention or orphan-file-deletion
+    /// optimizer OF one of those tables, which `CreateTableOptimizer` registers and
+    /// `DeleteTableOptimizer` removes — addressed by the four values that service keys an
+    /// optimizer by (the catalog, the database, the table and the optimizer's own type),
+    /// which the declaration carries and which are this resource's physical id.
+    GlueTableOptimizer,
     GrafanaWorkspace,
     GuardDutyDetector,
     /// `AWS::GuardDuty::IPSet`: a trusted IP list of one of those detectors, which
@@ -1159,6 +1166,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         GLUE_DATABASE => Some(Provisioner::GlueDatabase),
         GLUE_TABLE => Some(Provisioner::GlueTable),
         GLUE_CRAWLER => Some(Provisioner::GlueCrawler),
+        GLUE_TABLE_OPTIMIZER => Some(Provisioner::GlueTableOptimizer),
         GRAFANA_WORKSPACE => Some(Provisioner::GrafanaWorkspace),
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
         GUARDDUTY_IP_SET => Some(Provisioner::GuardDutyIpSet),
@@ -1473,6 +1481,13 @@ impl Provisioner {
             // A crawler IS taggable: its `Tags` property is the tag MAP `CreateCrawler`'s
             // own `Tags` member takes, so it carries the stack's tags beside its own.
             Self::GlueCrawler => create_glue_crawler(ctx, region, resource, propagated).await,
+            // An optimizer publishes no `Tags` property either: it is a resource OF a table
+            // rather than one AWS Glue holds tags on, so no tags are propagated to one and
+            // the declared document is the create's request with its configuration re-cased
+            // to the members that call takes.
+            Self::GlueTableOptimizer => {
+                create_glue_table_optimizer(ctx, region, resource).await
+            }
             // `AWS::Grafana::Workspace` publishes no `Tags` property either, so the type
             // is not taggable and no stack tags are propagated to it.
             Self::GrafanaWorkspace => create_workspace(ctx, region, resource).await,
@@ -3208,6 +3223,12 @@ impl Provisioner {
             Self::GlueDatabase => delete_glue_database(ctx, region, resource).await,
             Self::GlueTable => delete_glue_table(ctx, region, resource).await,
             Self::GlueCrawler => delete_glue_crawler(ctx, region, physical_resource_id).await,
+            // An optimizer is addressed by the four values that service keys one by, which
+            // the resource's own declaration carries — so the delete takes the whole record
+            // rather than the id.
+            Self::GlueTableOptimizer => {
+                delete_glue_table_optimizer(ctx, region, resource).await
+            }
             Self::GrafanaWorkspace => {
                 delete_workspace(ctx, region, physical_resource_id).await
             }
@@ -3783,6 +3804,9 @@ impl Provisioner {
             Self::GlueDatabase => describe_glue_database(ctx, region, resource).await,
             Self::GlueTable => describe_glue_table(ctx, region, resource).await,
             Self::GlueCrawler => describe_glue_crawler(ctx, region, physical_resource_id).await,
+            Self::GlueTableOptimizer => {
+                describe_glue_table_optimizer(ctx, region, resource).await
+            }
             Self::GrafanaWorkspace => {
                 describe_workspace(ctx, region, physical_resource_id).await
             }
@@ -4218,6 +4242,10 @@ mod mwaa_environments;
 /// `AWS::CustomerProfiles::Domain` declares, created in the service that owns it so a client's
 /// own reads and the domain's data plane resolve the name the stack publishes.
 mod customer_profiles_domains;
+/// The AWS Glue TABLE OPTIMIZER arms: the optimizer an `AWS::Glue::TableOptimizer` declares
+/// on one of the Data Catalog tables [`platform_services`] creates, which that service keys
+/// by the catalog, the database, the table and the optimizer's own type together.
+mod glue_table_optimizers;
 mod data_and_storage;
 mod iam_identities;
 mod application_services;
@@ -4292,6 +4320,7 @@ use amplify_ui_builder::*;
 use amplify_apps::*;
 use mwaa_environments::*;
 use customer_profiles_domains::*;
+use glue_table_optimizers::*;
 use iam_identities::*;
 use data_and_storage::*;
 

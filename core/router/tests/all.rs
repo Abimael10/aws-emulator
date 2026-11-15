@@ -2187,3 +2187,17 @@ mod ses_configuration_set_cursor_shared_across_v1_and_v2;
 // suite. `all/all_rs_declares_each_suite_once.rs`,
 // inner doc comment in the file at all, no merge of two landings can put one past the first
 // The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
+// name. The list holds those pairs and no other line, so two branches landing at once
+// past the declarations is `E0753` and compiles no suite of this target at all. With none
+// Four suites of this target pin that shape rather than restating it here:
+// `all/all_rs_declares_each_suite_once.rs` (a name declared twice is `E0428`),
+// `all/all_rs_is_a_canonical_declaration_list.rs` (pairs, sorted, nothing else) and
+// `all/declaration_roots_are_canonical_and_complete.rs`. Each failure compiles no suite at
+// all, which is why nothing but a declaration goes below.
+// of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above
+// each `mod` is what points the declaration into `tests/all/`. What a suite covers, and
+// stated in that suite's own module header, where it is read beside the test it explains;
+// `all/appended_notes.rs` and `all/appended_notes_tail.rs` keep the notes landings had
+// appended to this file.
+#[path = "all/cloudformation_provisions_glue_table_optimizers.rs"]
+mod cloudformation_provisions_glue_table_optimizers;
