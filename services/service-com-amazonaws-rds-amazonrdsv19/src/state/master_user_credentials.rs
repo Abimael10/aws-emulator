@@ -7,9 +7,11 @@
 //! exists. The secret belongs to the resource it was minted FOR, and two things follow
 //! from that:
 //!
-//! * it goes WITH that resource — `DeleteDBInstance` deletes the secret the instance it is
-//!   deleting owns, so nothing of it outlives the database whose credential it holds
-//!   ([`owned_master_user_secret`]);
+//! * it goes WITH that resource — the delete of the resource that owns the secret deletes
+//!   the secret too (`DeleteDBInstance` for an instance's, `DeleteDBCluster` for a
+//!   cluster's, `DeleteTenantDatabase` for a tenant database's), so nothing of it outlives
+//!   the database whose credential it holds ([`owned_master_user_secret`] and its two
+//!   siblings here);
 //! * a resource that merely INHERITS another's master credential — a read replica of it,
 //!   an instance restored from a snapshot of it — owns none, so it stores and reports no
 //!   `MasterUserSecret`, and deleting it deletes nothing (the rule is written on
@@ -28,6 +30,32 @@ use super::*;
 /// inherited another instance's credential: neither owns a secret, so neither delete
 /// deletes one.
 pub fn owned_master_user_secret(record: &DbInstanceRecord) -> Option<String> {
+    record
+        .master_user_secret
+        .as_ref()
+        .map(|secret| secret.secret_arn.clone())
+}
+
+/// The managed master user secret the DB CLUSTER `record` OWNS, as the ARN a delete of
+/// that cluster hands to Secrets Manager.
+///
+/// The cluster's counterpart of [`owned_master_user_secret`], and the same rule: `None`
+/// for a cluster whose master user password the caller supplied and for one that inherited
+/// another cluster's credential (restored from a snapshot, replicating from another
+/// cluster), neither of which stores a `MasterUserSecret` of its own.
+pub fn cluster_owned_master_user_secret(record: &DbClusterRecord) -> Option<String> {
+    record
+        .master_user_secret
+        .as_ref()
+        .map(|secret| secret.secret_arn.clone())
+}
+
+/// The managed master user secret the TENANT DATABASE `record` OWNS, as the ARN a delete
+/// of that tenant database hands to Secrets Manager.
+///
+/// The tenant database's counterpart of [`owned_master_user_secret`]; `None` for one whose
+/// master user password the request carried, which stores no `MasterUserSecret`.
+pub fn tenant_database_owned_master_user_secret(record: &TenantDatabaseRecord) -> Option<String> {
     record
         .master_user_secret
         .as_ref()

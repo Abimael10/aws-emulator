@@ -275,6 +275,8 @@ mod managed_master_user_password;
 mod managed_master_user_secret;
 #[path = "all/managed_secret_direct_write_refusal.rs"]
 mod managed_secret_direct_write_refusal;
+#[path = "all/managed_secret_reaped_with_its_owner.rs"]
+mod managed_secret_reaped_with_its_owner;
 #[path = "all/managed_secret_service_ownership.rs"]
 mod managed_secret_service_ownership;
 #[path = "all/management_event_recording.rs"]

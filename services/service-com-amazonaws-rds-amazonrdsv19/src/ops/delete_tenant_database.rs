@@ -195,6 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(DeleteTenantDatabaseError::internal_failure)?,
             None => None,
         };
+        // What this call ANSWERS with and what it leaves for Secrets Manager, computed
+        // under the store's one guard — which is RELEASED with this block, because the
+        // secret below is another service's resource, reached over the emulator's own
+        // in-process callback, and this service's lock may not be held across that call.
+        let (tenant_database, managed_secret) = {
         let mut store = state.lock();
         store.settle_due_transitions(&region);
 
@@ -353,8 +358,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owes its removal: the next read within the span sees `deleting`, and every read
         // after it is a `TenantDatabaseNotFoundFault`.
         tenant.begin_deletion();
+        // The secret RDS manages for the tenant database's master user password, if it has
+        // one: it is the tenant database's own, so it goes with it (deleted below, with the
+        // store unlocked) — see
+        // [`crate::state::tenant_database_owned_master_user_secret`].
+        let managed_secret = crate::state::tenant_database_owned_master_user_secret(tenant);
+
+        (tenant.to_wire(deletion_protection), managed_secret)
+        };
+        // The delete is accepted, so the Secrets Manager secret RDS manages for this tenant
+        // database's master user password is deleted with it: that secret exists for this
+        // tenant database alone, and one left behind would hold the credential of a
+        // database nothing can reach. "This operation can't be canceled or reverted after
+        // it begins", so it is not undone when the secret cannot be deleted: that failure
+        // is recorded and the tenant database still goes
+        // ([`crate::state::release_orphaned_master_user_secret`]).
+        if let Some(secret_arn) = managed_secret {
+            crate::state::release_orphaned_master_user_secret(
+                &*self.engine,
+                ctx,
+                &region,
+                &crate::state::db_instance_arn(&region, &identifier),
+                &secret_arn,
+            )
+            .await;
+        }
         Ok(DeleteTenantDatabaseOutput {
-            tenant_database: Some(tenant.to_wire(deletion_protection)),
+            tenant_database: Some(tenant_database),
         })
     }
 }

@@ -9,7 +9,10 @@
 //! The records, the transient statuses and the clock that removes the record live in
 //! [`crate::state`], shared with `CreateDBCluster` and `DescribeDBClusters`; the final
 //! snapshot is written into the same store `CreateDBClusterSnapshot` writes, so
-//! `DescribeDBClusterSnapshots` reports it once the cluster is gone.
+//! `DescribeDBClusterSnapshots` reports it once the cluster is gone. The Secrets Manager
+//! secret RDS manages for the cluster's master user password goes with the cluster, as it
+//! does with every other resource RDS manages one for
+//! ([`crate::state::cluster_owned_master_user_secret`]).
 //!
 //! ## Shape of an operation
 //!
@@ -227,6 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::captured_data_bytes(final_snapshot_storage.as_ref())
                 .await
                 .map_err(DeleteDBClusterError::internal_failure)?;
+        // What this call ANSWERS with and what it leaves for Secrets Manager, computed
+        // under the store's one guard — which is RELEASED with this block, because the
+        // secrets below are another service's resources, reached over the emulator's own
+        // in-process callback, and this service's lock may not be held across that call.
+        let (db_cluster, managed_secret, member_secrets) = {
         let mut store = state.lock();
         store.settle_due_transitions(&region);
 
@@ -256,6 +264,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let multi_az_cluster = crate::state::is_multi_az_db_cluster(&record.engine);
         let global_cluster_identifier = record.global_cluster_identifier.clone();
         let resource_id = record.resource_id.clone();
+        // The secret RDS manages for the cluster's master user password, if it has one: it
+        // is the cluster's own, so it goes with the cluster (deleted below, with the store
+        // unlocked) — see [`crate::state::cluster_owned_master_user_secret`].
+        let managed_secret = crate::state::cluster_owned_master_user_secret(record);
 
         // `SkipFinalSnapshot`: "If you set this value to false or don't specify it, RDS
         // creates a DB cluster snapshot before it deletes the DB cluster … If
@@ -481,17 +493,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let answered = if final_snapshot { accepted } else { found };
         // A Multi-AZ DB cluster's members are terminated with it, as the operation
         // documents; each reports `deleting` and is removed by the same clock.
+        //
+        // A member terminated here is a DB instance this call deletes, so the secret RDS
+        // manages for ITS master user password goes with it too, exactly as it does when
+        // `DeleteDBInstance` deletes that instance on its own: `(owner ARN, secret ARN)`
+        // for each, deleted below with the store unlocked.
+        let mut member_secrets: Vec<(String, String)> = Vec::new();
         for member in &live_members {
             let terminated = store
                 .db_instances
                 .get_mut(&(region.clone(), member.clone()))
                 .map(|instance| {
                     instance.begin_deletion();
-                    instance.arn()
+                    (
+                        instance.arn(),
+                        crate::state::owned_master_user_secret(instance),
+                    )
                 });
             // A member terminated with the cluster is a DB instance this service just
             // deleted, so it records the event of its own source type.
-            if let Some(member_arn) = terminated {
+            if let Some((member_arn, member_secret)) = terminated {
+                if let Some(secret_arn) = member_secret {
+                    member_secrets.push((member_arn.clone(), secret_arn));
+                }
                 store.record_event(
                     &region,
                     crate::state::events::DB_INSTANCE_DELETED,
@@ -541,6 +565,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // taken second, the order its doc fixes.
         if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
             directory.lock().forget(&resource_id);
+        }
+
+        (db_cluster, managed_secret, member_secrets)
+        };
+
+        // The delete is accepted, so the Secrets Manager secrets RDS manages for the master
+        // user passwords of the resources it retires are deleted with them: such a secret
+        // exists for its one resource alone, and one left behind would hold the credential
+        // of a database nothing can reach — a client polling for the managed secret to go
+        // would wait for ever, and a cluster re-created under the same identifier would
+        // collide with the name the stale secret still occupies. The delete of the cluster
+        // "can't be canceled or reverted after it begins", so it is not undone when a secret
+        // cannot be deleted: that failure is recorded and the cluster still goes
+        // ([`crate::state::release_orphaned_master_user_secret`]).
+        if let Some(secret_arn) = managed_secret {
+            crate::state::release_orphaned_master_user_secret(
+                &*self.engine,
+                ctx,
+                &region,
+                &crate::state::db_cluster_arn(&region, &identifier),
+                &secret_arn,
+            )
+            .await;
+        }
+        for (member_arn, secret_arn) in member_secrets {
+            crate::state::release_orphaned_master_user_secret(
+                &*self.engine,
+                ctx,
+                &region,
+                &member_arn,
+                &secret_arn,
+            )
+            .await;
         }
 
         // `DeleteAutomatedBackups` "specifies whether to remove automated backups
