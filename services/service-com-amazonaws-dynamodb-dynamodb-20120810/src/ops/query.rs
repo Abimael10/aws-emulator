@@ -1234,19 +1234,12 @@ impl KeyCondition {
                     return Err(unsupported_key_condition());
                 }
                 if hashes[at].is_some() {
-                    return Err(crate::state::RequestError::Validation(format!(
-                        "Invalid key condition: the partition key {} is constrained \
-                         more than once",
-                        comparison.attribute
-                    )));
+                    return Err(one_condition_per_key());
                 }
                 hashes[at] = encoded.into_iter().next();
             } else if let Some(at) = at_range {
                 if ranges[at].is_some() {
-                    return Err(crate::state::RequestError::Validation(format!(
-                        "Invalid key condition: the sort key {} is constrained more than once",
-                        comparison.attribute
-                    )));
+                    return Err(one_condition_per_key());
                 }
                 ranges[at] = Some(RangeConstraint {
                     operator: comparison.operator,
@@ -1750,11 +1743,10 @@ fn tokenize(expression: &str) -> Result<Vec<Token>, crate::state::RequestError> 
         }
     }
     if tokens.is_empty() {
-        return Err(crate::state::lexical_syntax_error(
-            KEY_CONDITION_MEMBER,
-            &bytes,
-            bytes.len(),
-        ));
+        // A member carrying nothing — or nothing but whitespace — states no condition at
+        // all, which is the fact AWS reports rather than a token there is none of. The one
+        // wording every expression member of this service states for it.
+        return Err(crate::state::expression_is_empty(KEY_CONDITION_MEMBER));
     }
     Ok(tokens)
 }
@@ -1778,8 +1770,19 @@ fn token_text(token: &Token) -> String {
     }
 }
 
+/// Which characters make up a bare NAME of a key condition: the same alphabet every
+/// other expression grammar of this service reads a written-out attribute name over
+/// ([`crate::state::is_expression_word_char`] is that rule's one statement), because a
+/// name outside it is reachable only through `ExpressionAttributeNames` — "To prevent
+/// special characters in an attribute name from being misinterpreted in an expression".
+///
+/// A `.` is NOT one of them: a key condition compares the key ATTRIBUTES of the schema it
+/// reads (`Query$KeyConditionExpression` spells each of its forms over an attribute name),
+/// and the member's grammar has no document paths at all — so a dotted name is text this
+/// grammar cannot read and is refused as the key-condition defect it is, rather than bound
+/// to an attribute of that name and reported as a key schema element the condition missed.
 fn is_identifier_char(character: char) -> bool {
-    character.is_ascii_alphanumeric() || character == '_' || character == '.' || character == '-'
+    crate::state::is_expression_word_char(character)
 }
 
 /// The operator words a DynamoDB expression has that a KEY condition does not take.
@@ -1818,6 +1821,23 @@ fn too_many_query_conditions(
         "The number of query conditions ({conditions}) exceeds the number of key attributes \
          defined in the schema ({key_attributes})"
     ))
+}
+
+/// The refusal for a key condition that states two clauses about ONE key attribute.
+///
+/// A key condition selects a contiguous run of one index's order — "you must provide the
+/// name of the partition key attribute and a single value for that attribute ...
+/// Optionally, you can provide a sort key attribute and use a comparison operator to refine
+/// the search results" (`Query$KeyConditionExpression`) — so one attribute carries one
+/// clause, whichever half of the key it is. AWS's sentence is FIXED: it names the member's
+/// rule and neither the attribute nor the clauses, so a client matching it recognises the
+/// defect whichever key the condition doubled.
+fn one_condition_per_key() -> crate::state::RequestError {
+    crate::state::RequestError::Validation(
+        "Invalid KeyConditionExpression: KeyConditionExpressions must only contain one \
+         condition per key"
+            .to_string(),
+    )
 }
 
 /// AWS's fixed text for a key condition whose SHAPE the member does not take — a
@@ -1863,6 +1883,11 @@ fn parse_key_condition_expression(
     names: Option<&std::collections::HashMap<String, String>>,
     values: Option<&std::collections::HashMap<String, AttributeValue>>,
 ) -> Result<Vec<Comparison>, crate::state::RequestError> {
+    // A key of either substitution table that is no substitution TOKEN defines nothing
+    // this condition could dereference, so that defect is settled before the condition
+    // that would dereference one is read
+    // ([`crate::state::Substitutions::check_keys_are_tokens`]).
+    crate::state::Substitutions::new(names, values).check_keys_are_tokens()?;
     let tokens = tokenize(expression)?;
     let mut parser = Parser {
         tokens: &tokens,
@@ -1897,6 +1922,11 @@ fn parse_key_condition_expression(
     if let Some(defect) = first_operand_defect(&comparisons) {
         return Err(defect.refusal());
     }
+    // A `BETWEEN` whose bounds the request stated the wrong way round selects nothing
+    // whatever the table holds, which is the request's own mistake: held to the one
+    // statement of that rule every member a `BETWEEN` can be written in shares
+    // ([`crate::state::check_between_bounds`]).
+    check_between_bounds(&comparisons)?;
     // A reserved word written out as a name is refused once the expression has PARSED:
     // in an expression the grammar cannot read, a keyword is not yet an attribute name
     // at all, so the parse defect is what such a request earns. The rule itself is the
@@ -1906,6 +1936,27 @@ fn parse_key_condition_expression(
         crate::state::check_reserved_attribute_name(KEY_CONDITION_MEMBER, word)?;
     }
     Ok(comparisons)
+}
+
+/// Hold every `BETWEEN` of a key condition to the order its two bounds have to be in.
+///
+/// Both bounds are operands the request stated, so the rule is settled before any table is
+/// resolved, in the one wording this service states it in
+/// ([`crate::state::check_between_bounds`]).
+fn check_between_bounds(comparisons: &[Comparison]) -> Result<(), crate::state::RequestError> {
+    for comparison in comparisons {
+        if comparison.operator != Operator::Between {
+            continue;
+        }
+        let (Some(low), Some(high)) = (
+            comparison.operands.first().and_then(Operand::defined),
+            comparison.operands.get(1).and_then(Operand::defined),
+        ) else {
+            continue;
+        };
+        crate::state::check_between_bounds(KEY_CONDITION_MEMBER, low, high)?;
+    }
+    Ok(())
 }
 
 /// Recursive-descent parser over the tokens of one key condition expression.

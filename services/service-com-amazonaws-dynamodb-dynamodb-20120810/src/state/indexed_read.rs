@@ -222,6 +222,10 @@ pub fn requested_projection(
     attributes_to_get: Option<&[String]>,
     names: Option<&HashMap<String, String>>,
 ) -> Result<Option<Vec<DocumentPath>>, RequestError> {
+    // A key of the substitution table that is no substitution TOKEN defines nothing an
+    // expression could dereference, so that defect is settled before the projection that
+    // would dereference one is read ([`Substitutions::check_keys_are_tokens`]).
+    Substitutions::new(names, None).check_keys_are_tokens()?;
     let legacy = attributes_to_get.filter(|names| !names.is_empty());
     // Whichever member the request stated its projection through is the member its
     // refusals name: a caller that sent no `ProjectionExpression` at all is told about

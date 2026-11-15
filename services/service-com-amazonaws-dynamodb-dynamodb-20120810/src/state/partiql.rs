@@ -238,19 +238,13 @@ fn unrecognized_function(name: &str, at: Position) -> RequestError {
 /// function that takes one — the functions that read an attribute of the item
 /// (`attribute_exists`, `size`, …) read a PATH, not a value.
 fn requires_document_path(operator_or_function: &str) -> RequestError {
-    RequestError::Validation(format!(
-        "Operator or function requires a document path; operator or function: \
-         {operator_or_function}"
-    ))
+    RequestError::Validation(document_path_required_clause(operator_or_function))
 }
 
 /// How a call carrying the wrong number of operands is refused, naming what was
 /// called and how many operands the call carried.
 fn incorrect_operand_count(operator_or_function: &str, operands: usize) -> RequestError {
-    RequestError::Validation(format!(
-        "Incorrect number of operands for operator or function; operator or function: \
-         {operator_or_function}, number of operands: {operands}"
-    ))
+    RequestError::Validation(operand_count_clause(operator_or_function, operands))
 }
 
 /// How an `INSERT` whose `INTO` clause carries an index qualifier is refused: the

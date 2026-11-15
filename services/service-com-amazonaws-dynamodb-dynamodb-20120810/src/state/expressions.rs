@@ -101,6 +101,16 @@ impl CompareOp {
             Self::GreaterOrEqual => ">=",
         }
     }
+
+    /// Whether this comparison ORDERS its two operands rather than only asking whether
+    /// they denote the same value.
+    ///
+    /// DynamoDB documents an order for the three scalar types alone, so only these
+    /// comparisons hold their operands to it ([`check_orderable_operand`]); equality is
+    /// defined between values of every type.
+    fn orders(self) -> bool {
+        !matches!(self, Self::Equal | Self::NotEqual)
+    }
 }
 
 /// One lexical token of a DynamoDB expression.
@@ -133,7 +143,11 @@ pub enum ExprToken {
 /// expression, or a keyword. A name outside this set is reachable only through
 /// `ExpressionAttributeNames`, which is what that member is for ("To prevent special
 /// characters in an attribute name from being misinterpreted in an expression").
-fn is_expression_word_char(character: char) -> bool {
+///
+/// One alphabet for every expression grammar of this service, the
+/// `KeyConditionExpression` one the `Query` handler reads included, so a name a request
+/// has to alias is the same name in all of them.
+pub fn is_expression_word_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_'
 }
 
@@ -226,6 +240,116 @@ pub fn undefined_name(member: &str, alias: &str) -> RequestError {
 /// carried it.
 pub fn undefined_value(member: &str, placeholder: &str) -> RequestError {
     invalid_expression_member(member, &undefined_value_clause(placeholder))
+}
+
+/// The refusal for an expression member that carries no expression at all: AWS names the
+/// member and states that fact, rather than pointing at a token there is none of.
+///
+/// One wording for every expression member of this service, whichever grammar reads it —
+/// a member holding nothing (or nothing but whitespace) states no expression, which is a
+/// different fact from one whose text a parser stopped inside.
+pub fn expression_is_empty(member: &str) -> RequestError {
+    invalid_expression_member(member, "The expression can not be empty;")
+}
+
+/// The refusal for an operand position a function reads an item LOCATION through, given
+/// anything other than a document path: AWS names the function and that it takes a path.
+///
+/// The functions that read an attribute of the item — `attribute_exists`,
+/// `attribute_type`, `begins_with`, `contains`, `size`, `if_not_exists` — take a PATH
+/// first ("attribute_exists (path)" and the rest of the `ConditionExpression` function
+/// reference spell it), so a `:placeholder` written there names no location at all. Worded
+/// the same way the statement surface words that defect.
+fn requires_document_path(member: &str, operator_or_function: &str) -> RequestError {
+    invalid_expression_member(member, &document_path_required_clause(operator_or_function))
+}
+
+/// That defect's CLAUSE, stated once for every surface of this service that reads a call:
+/// the expression members below state it behind the member that carried the expression, and
+/// the statement surface states it on its own ([`super::partiql`]), so the sentence cannot
+/// drift between the two.
+pub(super) fn document_path_required_clause(operator_or_function: &str) -> String {
+    format!(
+        "Operator or function requires a document path; operator or function: \
+         {operator_or_function}"
+    )
+}
+
+/// The refusal for a call carrying a number of operands its function does not take: AWS
+/// names the function and how many operands the call carried, both read off the request.
+///
+/// The arity is a fact of the call's own TEXT, so it is settled where the expression is
+/// read rather than reported as the position the grammar stopped at.
+fn incorrect_operand_count(
+    member: &str,
+    operator_or_function: &str,
+    operands: usize,
+) -> RequestError {
+    invalid_expression_member(
+        member,
+        &operand_count_clause(operator_or_function, operands),
+    )
+}
+
+/// That defect's CLAUSE, stated once for both surfaces, like the one above.
+pub(super) fn operand_count_clause(operator_or_function: &str, operands: usize) -> String {
+    format!(
+        "Incorrect number of operands for operator or function; operator or function: \
+         {operator_or_function}, number of operands: {operands}"
+    )
+}
+
+/// One attribute value as a refusal about an OPERAND echoes it: its type tag and the text
+/// it carries, in the shape this family of messages states an operand in.
+/// Only the three types DynamoDB ORDERS can reach this — the two bounds of a `BETWEEN`
+/// are held to those before they are compared ([`check_orderable_operand`]) — so a
+/// collection carries no text of its own here.
+fn rendered_operand(value: &AttributeValue) -> String {
+    let text = match value {
+        AttributeValue::S(text) | AttributeValue::N(text) => text.clone(),
+        AttributeValue::B(bytes) => ::aws_smithy_types::base64::encode(bytes),
+        _ => String::new(),
+    };
+    format!("AttributeValue: {{{}:{text}}}", attribute_value_type(value))
+}
+
+/// The refusal for a `BETWEEN` whose two bounds the request stated the wrong way round.
+///
+/// "BETWEEN — ... true if a is greater than or equal to b, and less than or equal to c"
+/// (the `ConditionExpression` comparator reference): a lower bound above the upper one
+/// selects nothing whatever the item holds, so it is the request's mistake and not an
+/// unmet condition. AWS echoes both bounds as the operands they are.
+fn between_bounds_out_of_order(
+    member: &str,
+    low: &AttributeValue,
+    high: &AttributeValue,
+) -> RequestError {
+    invalid_expression_member(
+        member,
+        &format!(
+            "The BETWEEN operator requires upper bound to be greater than or equal to lower \
+             bound; lower bound operand: {}, upper bound operand: {}",
+            rendered_operand(low),
+            rendered_operand(high)
+        ),
+    )
+}
+
+/// Hold one `BETWEEN`'s bounds to that order, where the request stated both of them as
+/// LITERALS — a bound read from the item is known only once the item is read.
+///
+/// The one statement of that rule, for every member a `BETWEEN` can be written in: the
+/// condition and filter grammars this module parses, and the `KeyConditionExpression`
+/// grammar the `Query` handler parses.
+pub fn check_between_bounds(
+    member: &str,
+    low: &AttributeValue,
+    high: &AttributeValue,
+) -> Result<(), RequestError> {
+    if compare_values(low, high) == Some(Ordering::Greater) {
+        return Err(between_bounds_out_of_order(member, low, high));
+    }
+    Ok(())
 }
 
 /// How a refusal names the position past the last token of an expression.
@@ -616,10 +740,7 @@ pub fn tokenize_expression_spanned(
         // An expression member carrying nothing but whitespace states no expression at
         // all, which is a different fact from one whose text the parser stopped inside:
         // AWS says the member is empty rather than pointing at a token.
-        return Err(invalid_expression_member(
-            member,
-            "The expression can not be empty;",
-        ));
+        return Err(expression_is_empty(member));
     }
     Ok(TokenizedExpression {
         tokens,
@@ -689,6 +810,7 @@ impl<'a> Substitutions<'a> {
         &self,
         expressions: &[(&str, Option<&str>)],
     ) -> Result<(), RequestError> {
+        self.check_table_keys()?;
         self.check_an_expression_was_sent(expressions)?;
         self.check_tables_not_empty()?;
         let mut names: BTreeSet<String> = BTreeSet::new();
@@ -780,6 +902,35 @@ impl<'a> Substitutions<'a> {
         Ok(())
     }
 
+    /// Every KEY a substitution table defines must BE a substitution token.
+    ///
+    /// Each table is read by the SPELLING of its keys — `ExpressionAttributeNames` holds
+    /// "one or more substitution tokens for attribute names in an expression" and its keys
+    /// "must begin with a `#`", and `ExpressionAttributeValues` the same for values with a
+    /// `:` — so a key spelled any other way is a token no expression can write, and it is
+    /// refused as the invalid key of that member it is. That is its OWN defect: collapsing
+    /// it onto the unused-entry sentence would tell a caller to drop an entry whose
+    /// spelling is the mistake, and collapsing it onto the undefined-token sentence would
+    /// point at the expression instead of at the table.
+    ///
+    /// Asked FIRST, before what the table could be substituted into
+    /// ([`Substitutions::check_an_expression_was_sent`]) and before any expression is read:
+    /// a key that is no token names nothing whichever expressions the request carried. The
+    /// NAMES table is reported first, which is the order the two tables are checked in
+    /// throughout.
+    fn check_table_keys(&self) -> Result<(), RequestError> {
+        self.check_keys_are_tokens()
+    }
+
+    /// The same check, for a reader that reads an expression BEFORE it holds the request's
+    /// tables to its expressions ([`Substitutions::check_all_referenced`]): a key that is
+    /// no token defines nothing, so it is settled before the expression that would
+    /// dereference one is read.
+    pub fn check_keys_are_tokens(&self) -> Result<(), RequestError> {
+        check_substitution_keys(NAMES_MEMBER, self.names, NAME_TOKEN_PREFIX)?;
+        check_substitution_keys(VALUES_MEMBER, self.values, VALUE_TOKEN_PREFIX)
+    }
+
     /// A substitution table the request SENT must define something, and every name it
     /// defines must BE a name.
     ///
@@ -826,6 +977,47 @@ pub(super) fn only_with_expressions(enveloped: bool, member: &str) -> RequestErr
         enveloped,
         format!("{member} can only be specified when using expressions"),
     )
+}
+
+/// The member whose keys stand for attribute NAMES, and the character they are spelled
+/// with.
+const NAMES_MEMBER: &str = "ExpressionAttributeNames";
+const NAME_TOKEN_PREFIX: char = '#';
+
+/// The member whose keys stand for attribute VALUES, and the character they are spelled
+/// with.
+const VALUES_MEMBER: &str = "ExpressionAttributeValues";
+const VALUE_TOKEN_PREFIX: char = ':';
+
+/// Refuse one substitution table whose keys are not all spelled as the tokens an
+/// expression substitutes them into, naming the first such key in one stable order so the
+/// same request earns the same message.
+fn check_substitution_keys<V>(
+    member: &str,
+    table: Option<&HashMap<String, V>>,
+    prefix: char,
+) -> Result<(), RequestError> {
+    let mut invalid: Vec<&str> = table
+        .into_iter()
+        .flatten()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| !is_substitution_token(key, prefix))
+        .collect();
+    invalid.sort_unstable();
+    match invalid.first() {
+        Some(key) => Err(RequestError::Validation(format!(
+            "{member} contains invalid key: Syntax error; key: \"{key}\""
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Whether one key of a substitution table is spelled as the token an expression writes
+/// for it: the member's own prefix, and then a name over the alphabet every expression
+/// grammar of this service reads a token's name in ([`is_expression_word_char`]).
+fn is_substitution_token(key: &str, prefix: char) -> bool {
+    key.strip_prefix(prefix)
+        .is_some_and(|name| !name.is_empty() && name.chars().all(is_expression_word_char))
 }
 
 /// Whether this request names an expression member `substitutable` admits, with a value.
@@ -1892,6 +2084,10 @@ impl ParsedCondition {
         expression: &str,
         substitutions: Substitutions<'_>,
     ) -> Result<Self, RequestError> {
+        // A key of either substitution table that is no substitution TOKEN defines nothing
+        // this condition could dereference, so that defect is settled before the condition
+        // that would dereference one is read ([`Substitutions::check_keys_are_tokens`]).
+        substitutions.check_keys_are_tokens()?;
         let read = tokenize_expression_spanned(member, expression)?;
         let mut parser = ExprParser::over(member, &read, substitutions);
         let node = parser.disjunction()?;
@@ -2913,7 +3109,7 @@ impl<'a> ExprParser<'a> {
         }
         // `size (path)` is an OPERAND rather than a condition of its own, so it falls
         // through to the comparison below.
-        if let Some(name) = self.peek_call().filter(|name| name != "size") {
+        if let Some(name) = self.peek_call().filter(|name| name != SIZE_FUNCTION) {
             return self.condition_function(&name);
         }
         let left = self.operand()?;
@@ -2923,6 +3119,13 @@ impl<'a> ExprParser<'a> {
                 return Err(self.syntax());
             }
             let high = self.operand()?;
+            // `BETWEEN` orders its operands, so each literal one is held to the types
+            // DynamoDB orders, and the two bounds to the order the comparator requires —
+            // both facts of the REQUEST, settled before any item is read.
+            for operand in [&left, &low, &high] {
+                check_orderable_operand(self.member, BETWEEN_OPERATOR, operand)?;
+            }
+            check_between_operands(self.member, &low, &high)?;
             return Ok(ConditionNode::Between(left, low, high));
         }
         if self.eat_keyword("IN") {
@@ -2953,6 +3156,11 @@ impl<'a> ExprParser<'a> {
             ExprToken::Compare(operator) => {
                 self.at += 1;
                 let right = self.operand()?;
+                if operator.orders() {
+                    for operand in [&left, &right] {
+                        check_orderable_operand(self.member, operator.as_str(), operand)?;
+                    }
+                }
                 Ok(ConditionNode::Compare(left, operator, right))
             }
             _ => Err(self.syntax()),
@@ -2961,34 +3169,109 @@ impl<'a> ExprParser<'a> {
 
     /// One of the documented condition functions: `attribute_exists`,
     /// `attribute_not_exists`, `attribute_type`, `begins_with` and `contains`.
+    ///
+    /// The call is held to its documented SIGNATURE before any of it is read against an
+    /// item: the number of operands it carries ([`Self::check_operand_count`]) and the
+    /// kind each position takes ([`check_operand_kind`]) are facts of the expression's own
+    /// text, so a malformed call is refused naming the rule it broke rather than reported
+    /// as the grammar position the parse stopped at.
     fn condition_function(&mut self, name: &str) -> Result<ConditionNode, RequestError> {
+        let Some(signature) = condition_function_signature(name) else {
+            return Err(unknown_function(self.member, name));
+        };
         self.at += 2;
+        self.check_operand_count(name, signature.len())?;
         let node = match name {
-            "attribute_exists" => ConditionNode::Exists(self.path()?, true),
-            "attribute_not_exists" => ConditionNode::Exists(self.path()?, false),
+            "attribute_exists" => ConditionNode::Exists(self.function_path(name)?, true),
+            "attribute_not_exists" => ConditionNode::Exists(self.function_path(name)?, false),
             "attribute_type" => {
-                let path = self.path()?;
+                let path = self.function_path(name)?;
                 self.expect(&ExprToken::Comma)?;
-                let wanted = self.operand()?;
+                let wanted = self.function_operand(name, signature, 1)?;
                 check_attribute_type_name(self.member, &wanted)?;
                 ConditionNode::AttributeType(path, wanted)
             }
             "begins_with" => {
-                let value = self.operand()?;
+                let value = Operand::Path(self.function_path(name)?);
                 self.expect(&ExprToken::Comma)?;
-                let prefix = self.operand()?;
+                let prefix = self.function_operand(name, signature, 1)?;
                 check_begins_with_prefix(self.member, &prefix)?;
                 ConditionNode::BeginsWith(value, prefix)
             }
-            "contains" => {
-                let haystack = self.operand()?;
+            // The closed set above holds nothing else.
+            _ => {
+                let haystack = Operand::Path(self.function_path(name)?);
                 self.expect(&ExprToken::Comma)?;
-                ConditionNode::Contains(haystack, self.operand()?)
+                let needle = self.function_operand(name, signature, 1)?;
+                ConditionNode::Contains(haystack, needle)
             }
-            other => return Err(unknown_function(self.member, other)),
         };
         self.expect(&ExprToken::Close)?;
         Ok(node)
+    }
+
+    /// Hold the call the parse has just entered to the number of operands its function
+    /// takes.
+    fn check_operand_count(&self, function: &str, takes: usize) -> Result<(), RequestError> {
+        let supplied = self.operands_in_call();
+        if supplied == takes {
+            return Ok(());
+        }
+        Err(incorrect_operand_count(self.member, function, supplied))
+    }
+
+    /// How many operands the call the parse has just entered carries: one per `,` at this
+    /// call's own bracket depth plus one for the last, and none at all for a call that
+    /// closes straight away.
+    ///
+    /// Counted off the TOKENS rather than by parsing them, because the count belongs in
+    /// the refusal and a call this parser has already rejected is not read any further.
+    /// The walk is bounded by [`MAX_EXPRESSION_TOKENS`], like every other pass over an
+    /// expression's tokens, so what one request can ask this for is a constant of this
+    /// service rather than a function of its text.
+    fn operands_in_call(&self) -> usize {
+        let mut depth = 0usize;
+        let mut separators = 0usize;
+        let mut written = false;
+        for token in self.tokens.iter().skip(self.at) {
+            match token {
+                ExprToken::Open => {
+                    depth += 1;
+                    written = true;
+                }
+                ExprToken::Close if depth == 0 => break,
+                ExprToken::Close => depth -= 1,
+                ExprToken::Comma if depth == 0 => separators += 1,
+                _ => written = true,
+            }
+        }
+        if !written && separators == 0 {
+            return 0;
+        }
+        separators + 1
+    }
+
+    /// One operand position the signature declares as a document PATH: a `:placeholder`
+    /// written there names no location at all.
+    fn function_path(&mut self, function: &str) -> Result<DocumentPath, RequestError> {
+        if matches!(self.peek(), Some(ExprToken::Placeholder(_))) {
+            return Err(requires_document_path(self.member, function));
+        }
+        self.path()
+    }
+
+    /// One operand of a call, held to the kind the signature declares for that position.
+    fn function_operand(
+        &mut self,
+        function: &str,
+        signature: &[OperandKind],
+        at: usize,
+    ) -> Result<Operand, RequestError> {
+        let operand = self.operand()?;
+        if let Some(kind) = signature.get(at) {
+            check_operand_kind(self.member, function, *kind, &operand)?;
+        }
+        Ok(operand)
     }
 
     /// `operand := :value | size '(' path ')' | path`
@@ -2997,9 +3280,10 @@ impl<'a> ExprParser<'a> {
             self.at += 1;
             return Ok(Operand::Value(self.placeholder_value(&placeholder)?));
         }
-        if self.peek_call().as_deref() == Some("size") {
+        if self.peek_call().as_deref() == Some(SIZE_FUNCTION) {
             self.at += 2;
-            let path = self.path()?;
+            self.check_operand_count(SIZE_FUNCTION, 1)?;
+            let path = self.function_path(SIZE_FUNCTION)?;
             self.expect(&ExprToken::Close)?;
             return Ok(Operand::Size(path));
         }
@@ -3077,20 +3361,25 @@ impl<'a> ExprParser<'a> {
     ///              | list_append '(' set_operand ',' set_operand ')' | path`
     fn set_operand(&mut self) -> Result<SetOperand, RequestError> {
         if let Some(name) = self.peek_call() {
+            // The two functions a `SET` value may call, each held to its documented
+            // signature like every other call this service reads.
+            if !matches!(name.as_str(), "if_not_exists" | "list_append") {
+                return Err(unknown_function(self.member, &name));
+            }
             self.at += 2;
             self.descend()?;
+            self.check_operand_count(&name, 2)?;
             let operand = match name.as_str() {
                 "if_not_exists" => {
-                    let path = self.path()?;
+                    let path = self.function_path(&name)?;
                     self.expect(&ExprToken::Comma)?;
                     SetOperand::IfNotExists(path, Box::new(self.set_operand()?))
                 }
-                "list_append" => {
+                _ => {
                     let first = self.set_operand()?;
                     self.expect(&ExprToken::Comma)?;
                     SetOperand::ListAppend(Box::new(first), Box::new(self.set_operand()?))
                 }
-                other => return Err(unknown_function(self.member, other)),
             };
             self.depth -= 1;
             self.expect(&ExprToken::Close)?;

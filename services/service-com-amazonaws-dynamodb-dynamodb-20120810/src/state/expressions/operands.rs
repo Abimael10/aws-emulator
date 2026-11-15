@@ -17,6 +17,137 @@ pub(super) fn starts_with_digit(word: &str) -> bool {
     word.starts_with(|character: char| character.is_ascii_digit())
 }
 
+/// What ONE operand position of a function takes.
+///
+/// Every function of the expression languages declares each of its operands as one or the
+/// other, and the declaration is read off the documented signature rather than guessed
+/// from the operand: `attribute_exists (path)`, `begins_with (path, substr)`,
+/// `contains (path, operand)`, `attribute_type (path, type)`, `size (path)`,
+/// `if_not_exists (path, operand)` and `list_append (operand, operand)` (the
+/// `ConditionExpression` and `UpdateExpression` function references).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OperandKind {
+    /// A document path: the location in the item the function reads.
+    Path,
+    /// A value the request carried: a `:placeholder` standing for one.
+    Value,
+    /// Either — a value, or a location the value is read from.
+    Either,
+}
+
+/// The documented signature of one function the expression languages define, or `None`
+/// for an identifier that names no function of theirs.
+///
+/// The ONE place the arity and the operand kinds of these functions are stated, so the
+/// refusals a malformed call earns — the wrong NUMBER of operands
+/// ([`incorrect_operand_count`]), a value where a path belongs
+/// ([`requires_document_path`]) and a path where a value belongs
+/// ([`incorrect_operand_type`]) — are decided by the signature and not by where a
+/// recursive-descent parser happened to stop.
+pub(super) fn function_signature(name: &str) -> Option<&'static [OperandKind]> {
+    const PATH: &[OperandKind] = &[OperandKind::Path];
+    const PATH_VALUE: &[OperandKind] = &[OperandKind::Path, OperandKind::Value];
+    const PATH_EITHER: &[OperandKind] = &[OperandKind::Path, OperandKind::Either];
+    const EITHER_EITHER: &[OperandKind] = &[OperandKind::Either, OperandKind::Either];
+    match name {
+        "attribute_exists" | "attribute_not_exists" | "size" => Some(PATH),
+        "attribute_type" | "begins_with" | "contains" => Some(PATH_VALUE),
+        "if_not_exists" => Some(PATH_EITHER),
+        "list_append" => Some(EITHER_EITHER),
+        _ => None,
+    }
+}
+
+/// The functions a CONDITION may call, with their signatures: a closed set — "These
+/// function names are case-sensitive" and the `ConditionExpression` doc lists exactly
+/// these — so an identifier called like a function that is not one of them names no
+/// function of this grammar ([`unknown_function`]).
+pub(super) fn condition_function_signature(name: &str) -> Option<&'static [OperandKind]> {
+    match name {
+        "attribute_exists" | "attribute_not_exists" | "attribute_type" | "begins_with"
+        | "contains" => function_signature(name),
+        _ => None,
+    }
+}
+
+/// The function that reports the LENGTH of what a path addresses, which is an operand of
+/// a comparison rather than a condition of its own.
+pub(super) const SIZE_FUNCTION: &str = "size";
+
+/// The range comparator as an expression writes it, which is what its refusals name.
+pub(super) const BETWEEN_OPERATOR: &str = "BETWEEN";
+
+/// How a refusal names an operand that reads a LOCATION where the signature declares a
+/// value: the kind of operand it is, which is all the request states about it — what the
+/// location holds is known only once an item is read.
+const PATH_OPERAND_TYPE: &str = "PATH";
+
+/// Hold one operand to the kind its position declares, where the REQUEST settles it.
+///
+/// A `:placeholder` written where a path belongs names no location at all, and a path
+/// written where a value belongs carries none: both are facts of the expression's text, so
+/// both are refused as the expression is read rather than evaluated against an item.
+pub(super) fn check_operand_kind(
+    member: &str,
+    function: &str,
+    kind: OperandKind,
+    operand: &Operand,
+) -> Result<(), RequestError> {
+    match (kind, operand) {
+        (OperandKind::Value, Operand::Path(_) | Operand::Size(_)) => Err(incorrect_operand_type(
+            member,
+            function,
+            PATH_OPERAND_TYPE,
+        )),
+        (OperandKind::Path, Operand::Value(_)) => Err(requires_document_path(member, function)),
+        _ => Ok(()),
+    }
+}
+
+/// Hold one operand of an ORDERING comparison to the types DynamoDB orders, where the
+/// request stated that operand as a literal.
+///
+/// "For type Number, value comparisons are numeric. String value comparisons ... are
+/// based on ASCII character code values. For Binary, DynamoDB treats each byte ... as
+/// unsigned when it compares binary values" (the `AttributeValueList` doc) — and nothing
+/// for the other types, so a value of any of them cannot satisfy `<`, `<=`, `>`, `>=` or
+/// `BETWEEN` whatever the addressed item holds. That makes it the caller's mistake and not
+/// an unmet condition, refused when the expression is read; an operand that READS an
+/// attribute is left to the evaluation, which is the only place its type is known.
+pub(super) fn check_orderable_operand(
+    member: &str,
+    operator: &str,
+    operand: &Operand,
+) -> Result<(), RequestError> {
+    let Operand::Value(value) = operand else {
+        return Ok(());
+    };
+    if matches!(
+        value,
+        AttributeValue::S(_) | AttributeValue::N(_) | AttributeValue::B(_)
+    ) {
+        return Ok(());
+    }
+    Err(incorrect_operand_type(
+        member,
+        operator,
+        attribute_value_type(value),
+    ))
+}
+
+/// The two bounds of a `BETWEEN` the request stated as LITERALS, held to the order the
+/// comparator requires ([`check_between_bounds`]).
+pub(super) fn check_between_operands(
+    member: &str,
+    low: &Operand,
+    high: &Operand,
+) -> Result<(), RequestError> {
+    let (Operand::Value(low), Operand::Value(high)) = (low, high) else {
+        return Ok(());
+    };
+    check_between_bounds(member, low, high)
+}
+
 /// `begins_with`'s prefix operand is a PREFIX, so it is a string or binary value, and a
 /// literal of any other type is refused when the expression is read.
 ///

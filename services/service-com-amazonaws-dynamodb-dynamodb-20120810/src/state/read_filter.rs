@@ -65,6 +65,10 @@ impl<'a> ReadFilter<'a> {
         conditional_operator: Option<&'a str>,
         substitutions: Substitutions<'_>,
     ) -> Result<Self, RequestError> {
+        // A key of either substitution table that is no substitution TOKEN defines nothing
+        // this filter could dereference, so that defect is settled before the filter that
+        // would dereference one is read ([`Substitutions::check_keys_are_tokens`]).
+        substitutions.check_keys_are_tokens()?;
         let legacy = legacy.filter(|map| !map.is_empty());
         match (expression, legacy) {
             // One filter stated in both generations has already been refused

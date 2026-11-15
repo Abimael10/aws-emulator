@@ -1811,3 +1811,21 @@ mod default_vpc_internet_path_runs_ecs_tasks;
 // here; `all/appended_notes.rs`, `all/appended_notes_tail.rs`, `all/appended_header_notes.rs`
 // and `all/appended_prose.rs` are where the prose earlier landings appended to this file's
 // tail went.
+// `tests/all/<name>.rs` and insert its pair into the sorted list below; what that suite
+// covers, and why it drives the assembled router rather than one service crate, belongs in
+// its own module header, and a note about THIS file in `all/appended_notes.rs`.
+// EVERY comment here is an ordinary `//` one, this header included: a doc comment of the
+// enclosing module is legal only before the first item, so one appended past the declarations
+// compiles no suite of this target at all — and with none in the file, no merge of two
+// landings can leave one there. The same holds for an inner attribute, which is why the one
+// lint allowance this target carries stands in this header. A suite no `mod` names compiles
+// nowhere and its tests never run, and a suite declared twice is `E0428`, which fails every
+// suite here too. `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/every_suite_file_is_declared.rs` pin that shape, for this file and for every service
+// crate's `tests/all.rs`, so a note about any of it belongs there rather than here.
+// Some of the files below are shared harnesses or probes rather than suites; all of them are
+// declared, because a file no declaration names is compiled nowhere.
+// This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING under
+// `tests/`, which the layout check refuses: the `#[path]` above each `mod` is what points the
+// The lint allowed here is for the suite files this root compiles: a wrapped paragraph in one
+// of their module headers is a note rather than a build failure.
