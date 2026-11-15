@@ -61,7 +61,16 @@
 //! The refusals a HANDLER words — a schedule that is not there, a group being deleted, an
 //! expression that is not a schedule — are not here: they are built by the shared helpers in
 //! [`crate::state`] so every operation states them one way.
+//!
+//! ## And WHICH member of the body carries it
+//!
+//! The sentence is only half of the answer: a modelled error of this `restJson1` service
+//! carries its text under the member its model declares, `Message`, while the framework's own
+//! pre-handler renderer writes it into the synthetic member `message`. [`error_detail`] states
+//! that one fact, and [`StatedPerOperation`] applies it to every response it answers with, so
+//! a refusal and a handler's error report their text in the SAME member.
 
+mod error_detail;
 mod validation;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
@@ -199,12 +208,21 @@ where
             // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
             // below would make this future non-`Send`.
             let refused = stated_refusal::<O>(svc.definition().protocol(), req);
-            if let Some((violations, stated)) = refused {
-                return svc
-                    .definition()
-                    .refusal_response(ProtocolError::Invalid(violations), Some(stated), req);
-            }
-            self.operation.run(svc, req, ctx).await
+            // Rendered in its OWN statement, for the reason the read above gives: the
+            // definition is not `Sync`, so it may not be alive at the await below.
+            let rendered = refused.map(|(violations, stated)| {
+                svc.definition()
+                    .refusal_response(ProtocolError::Invalid(violations), Some(stated), req)
+            });
+            // EVERY answer this wrapper gives passes through the member rule, not only the
+            // refusal rendered just above: the framework's own walk refuses a request this
+            // collector cannot see in that same synthetic envelope, while a modelled error a
+            // handler serialized already carries the modelled member and is left untouched.
+            let answered = match rendered {
+                Some(resp) => resp,
+                None => self.operation.run(svc, req, ctx).await,
+            };
+            error_detail::with_modelled_message_member(answered)
         })
     }
 

@@ -1844,3 +1844,15 @@ mod cloudtrail_iam_credential_write_audit;
 // one name is `E0428` and fails every suite in this target.
 // explains; a note about THIS file belongs in `all/appended_notes.rs`. The suites
 // `all/every_suite_file_is_declared.rs` check the rules above rather than restating them.
+// this header appended past the declarations is `E0753` and compiles no suite of this
+// target — which is what had happened here, hundreds of times over. With no `//!` anywhere,
+// no merge of two landings can leave one past the first item.
+// name is `E0428` and fails every suite in this target. A suite file no `mod` here names is
+// compiled nowhere and its tests never run, and a suite left at the top level of `tests/`
+// fails the build. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve
+// to a SIBLING of this file, which the layout check refuses: the `#[path]` above each `mod`
+// The suites that pin those rules rather than restating them:
+// `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs`. What a suite covers, and why it
+// drives the assembled router rather than one service crate, belongs in that suite's own
+// module header; a note about THIS file belongs in `all/appended_notes.rs`.

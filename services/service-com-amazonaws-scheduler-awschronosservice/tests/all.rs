@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/dead_letter_delivery.rs"]
 mod dead_letter_delivery;
+#[path = "all/error_message_member.rs"]
+mod error_message_member;
 #[path = "all/flexible_time_window_messages.rs"]
 mod flexible_time_window_messages;
 #[path = "all/function_target_dead_letter.rs"]
