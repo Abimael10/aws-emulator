@@ -54,10 +54,8 @@ const EXPECTED_ENC: &str = "A256GCM";
 /// How many segments a JWE in compact serialization carries (RFC 7516 §7.1).
 const COMPACT_SEGMENTS: usize = 5;
 
-/// The one-time-password challenge of the choice-based flow, which is how the
-/// self-service `RespondToAuthChallenge` completes a sign-in here: its
-/// `NEW_PASSWORD_REQUIRED` branch is still a scaffold stub (HTTP 501), and that stub is
-/// its own issue.
+/// The one-time-password challenge of the choice-based flow, one of the two challenges
+/// the self-service `RespondToAuthChallenge` completes a sign-in from here.
 const EMAIL_OTP: &str = "EMAIL_OTP";
 
 /// One emulator with just this service mounted, beside the engine its state lives in: the

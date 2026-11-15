@@ -518,6 +518,9 @@ impl MfaSettingRequest<'_> {
 /// Why a submitted MFA preference is refused ([`User::set_mfa_preference`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MfaPreferenceRejection {
+    /// The request marks more than one factor as the user's preferred one, which
+    /// is a conflict within the request itself.
+    TwoPreferred,
     /// The `UserMFASettingList` setting the request asks to ACTIVATE while the
     /// user holds no delivery configuration for it.
     NoDeliveryConfig(String),
@@ -529,6 +532,11 @@ pub enum MfaPreferenceRejection {
 impl MfaPreferenceRejection {
     /// What the refusal reports.
     ///
+    /// A request marking two factors preferred reports the conflict and the one
+    /// preference a user can hold, and names neither factor: "only one factor can
+    /// be set as preferred" (`SetUserMFAPreference` in this service's model), so
+    /// what is refused is the pair of preferences rather than either factor.
+    ///
     /// An activation the user cannot receive reports what the user is missing:
     /// the software token is received through an authenticator the user has to
     /// REGISTER first — "users must register a TOTP authenticator before they
@@ -537,13 +545,13 @@ impl MfaPreferenceRejection {
     /// model) — so its refusal reports that registration, while a message
     /// factor's reports the delivery configuration its message would be sent
     /// with, naming the factor it asked for. A preference over a factor the
-    /// request leaves off reports that alone and names NO factor: "only one
-    /// factor can be set as preferred" (`SetUserMFAPreference` in this
-    /// service's model) and a factor that is off is not one a user prefers, so
-    /// the refusal is about the preference rather than about any one factor.
-    /// Nothing stored is disclosed either way.
+    /// request leaves off reports that alone and names NO factor, a factor that
+    /// is off not being one a user prefers, so the refusal is about the
+    /// preference rather than about any one factor. Nothing stored is disclosed
+    /// by any of them.
     pub fn message(&self) -> String {
         match self {
+            Self::TwoPreferred => TWO_PREFERRED_MFA_TYPES_MESSAGE.to_string(),
             Self::NoDeliveryConfig(setting) if setting == SOFTWARE_TOKEN_MFA_SETTING => {
                 "User has not verified software token mfa".to_string()
             }
@@ -554,6 +562,16 @@ impl MfaPreferenceRejection {
         }
     }
 }
+
+/// The sentence a request marking more than one MFA factor as the user's
+/// preferred one is refused with: "only one factor can be set as preferred"
+/// (`SetUserMFAPreference` in this service's model), so a request expressing two
+/// preferences expresses one the user cannot hold.
+///
+/// Entirely fixed text, with no part taken from the request: which two factors
+/// were marked does not change that only one preference can be held.
+pub const TWO_PREFERRED_MFA_TYPES_MESSAGE: &str =
+    "Two MFA types marked as preferred, only one is allowed.";
 
 /// Why a submitted `MFAOptionListType` configures no SMS MFA option
 /// ([`sms_mfa_options`]).

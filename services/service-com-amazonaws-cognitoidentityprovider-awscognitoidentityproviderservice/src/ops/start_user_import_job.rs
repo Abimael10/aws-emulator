@@ -233,10 +233,9 @@ fn refused(
     match refusal {
         crate::state::ImportRefusal::PoolNotFound => user_pool_not_found(&input.user_pool_id),
         crate::state::ImportRefusal::JobNotFound => job_not_found(&input.job_id),
-        crate::state::ImportRefusal::NotWaiting(status) => precondition_not_met(format!(
-            "User import job {} is in status {status} and cannot be started.",
-            input.job_id
-        )),
+        crate::state::ImportRefusal::NotWaiting(_) => precondition_not_met(
+            crate::state::job_not_in_created_state_message(&input.job_id),
+        ),
         crate::state::ImportRefusal::NoCsvUploaded => {
             precondition_not_met(crate::state::no_csv_uploaded_message(&input.job_id))
         }

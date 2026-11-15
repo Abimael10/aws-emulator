@@ -8,7 +8,10 @@
 //! addresses it (`EMAIL` is the `email` address, `SMS` the `phone_number`, the two
 //! values of `DeliveryMediumType` from
 //! `smithy_query(query="shape",shape="DeliveryMediumType,VerifiedAttributeType")`) —
-//! so the refusal comes at request validation, before any send is attempted.
+//! so the refusal comes at request validation, before any send is attempted. A
+//! `DesiredDeliveryMediums` entry is a request parameter, so its refusal names the
+//! attribute that was not provided; a code requested FOR an attribute names the
+//! registered destination the user does not have.
 //!
 //! RULE B (liveness): an operation that consumes a verification code compares the
 //! presented value only against a LIVE code. Where none is live — none was ever
@@ -78,10 +81,24 @@ const USERNAME_CLIENT_NOT_FOUND_MESSAGE: &str = "Username/client id combination 
 /// the request names.
 const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
 
-/// What a request asking for delivery over `medium` says when no `attribute`
-/// addresses it.
-fn no_address_message(medium: &str, attribute: &str) -> String {
-    format!("Cannot send the message by {medium}. No registered {attribute}")
+/// What a request for a verification code says when the user holds no value for
+/// the attribute it asked for: the KIND of destination that is not registered,
+/// which for `phone_number` is the number and for `email` the address itself.
+fn no_registered_destination(attribute: &str) -> String {
+    let destination = if attribute == "phone_number" {
+        "phone number"
+    } else {
+        attribute
+    };
+    format!("User does not have a valid registered {destination}")
+}
+
+/// What a request whose `DesiredDeliveryMediums` asks for `medium` says when no
+/// `attribute` addresses it: a desired medium is a request PARAMETER, so the
+/// refusal names the parameter that was not provided rather than a send that
+/// failed.
+fn unaddressed_medium_message(medium: &str, attribute: &str) -> String {
+    format!("No {attribute} provided but desired delivery medium was {medium}")
 }
 
 /// Whether a request carries a SigV4 credential scope.
@@ -516,7 +533,7 @@ async fn a_requested_delivery_medium_needs_the_attribute_that_addresses_it() {
                     "case {case:?}: expected a 400 InvalidParameterException, got {status} \
                      with {payload}"
                 );
-                let expected = no_address_message(medium, attribute);
+                let expected = unaddressed_medium_message(medium, attribute);
                 let message = error_message(&payload);
                 assert_eq!(
                     message, expected,
@@ -646,8 +663,8 @@ async fn an_attribute_with_no_stored_address_cannot_be_sent_a_code() {
                 "case {case:?}: expected a 400 InvalidParameterException, got {status} \
                  with {payload}"
             );
-            // The one wording the rule has, wherever a delivery has no address.
-            let expected = no_address_message(medium, attribute);
+            // The one wording a code request with no registered destination has.
+            let expected = no_registered_destination(attribute);
             let message = error_message(&payload);
             assert_eq!(
                 message, expected,

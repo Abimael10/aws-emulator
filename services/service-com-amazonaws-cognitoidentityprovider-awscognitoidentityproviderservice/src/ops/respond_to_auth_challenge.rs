@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RespondToAuthChallenge
-//! Answers the challenge an `InitiateAuth` left outstanding, for the challenge this
-//! emulator delivers a code for: the email one-time password.
+//! Answers the challenge an `InitiateAuth` left outstanding, for the two challenges it
+//! starts with a session: the email one-time password, and the new password a user
+//! created with a temporary one owes.
 //!
-//! The `Session` names the stored challenge and the user it was started for, and the
-//! response is checked against the code that challenge DELIVERED: a wrong code is
-//! refused `CodeMismatchException`, a session whose window has closed
-//! `ExpiredCodeException`, and a code accepted once completes the sign-in — the
-//! session is spent, so the same code cannot sign in twice.
+//! The `Session` names the stored challenge and the user it was started for. An
+//! `EMAIL_OTP` response is checked against the code that challenge DELIVERED: a wrong
+//! code is refused `CodeMismatchException`, a session whose window has closed
+//! `ExpiredCodeException`. A `NEW_PASSWORD_REQUIRED` response carries the password the
+//! user chooses, which is stored as its permanent one against the same rule
+//! `AdminRespondToAuthChallenge` holds such a response to
+//! ([`crate::state::answer_new_password_challenge`]). A response accepted once completes
+//! the sign-in — the session is spent, so the same response cannot sign in twice.
 //!
 //! A pool whose `LambdaConfig` names a pre-token-generation function has that function
 //! gate the tokens the completed sign-in mints ([`crate::state::lambda_triggers`]).
@@ -487,6 +491,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
             if input.challenge_name != session.challenge_name {
                 return Err(invalid_challenge_state());
             }
+            // Which challenge the stored session is waiting on decides what the response
+            // has to carry: each is answered against the state its own challenge left.
+            // `NEW_PASSWORD_REQUIRED` carries the password the user chose and the
+            // attributes the challenge asked for, which the one rule BOTH response
+            // operations hold such a response to checks and stores
+            // ([`crate::state::answer_new_password_challenge`]): everything it would
+            // leave behind is computed from the stored user FIRST, so a response that
+            // does not satisfy the challenge writes nothing at all.
+            if session.challenge_name == NEW_PASSWORD_REQUIRED {
+                let username = crate::state::answer_new_password_challenge(
+                    guard,
+                    &user_pool_id,
+                    &session.username,
+                    &responses,
+                    now,
+                )
+                .map_err(challenge_refused)?;
+                // The challenge is answered, so the session is spent: the same response
+                // cannot complete a second sign-in.
+                guard.end_session(&session_token);
+                break 'answered Answered::Completed {
+                    user_pool_id,
+                    username,
+                    // "Called after the user is created by an admin. This flow is
+                    // invoked when the user has to change a temporary password" is this
+                    // generation's own documented trigger source, whichever operation
+                    // carried the response that answered the challenge.
+                    generation:
+                        crate::state::lambda_triggers::TokenGeneration::NewPasswordChallenge,
+                };
+            }
             // A response that names a user answers only the challenge of the user ITS OWN
             // session was started for.
             if let Some(named) = responses.get(USERNAME) {
@@ -529,6 +564,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
                 break 'answered Answered::Completed {
                     user_pool_id,
                     username,
+                    // "Called after user authentication flows have completed" is this
+                    // generation's own documented trigger source.
+                    generation: crate::state::lambda_triggers::TokenGeneration::Authentication,
                 };
             }
             if session.challenge_name == crate::state::MFA_SETUP_CHALLENGE {
@@ -543,6 +581,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
                 break 'answered Answered::Completed {
                     user_pool_id,
                     username,
+                    generation: crate::state::lambda_triggers::TokenGeneration::Authentication,
                 };
             }
             if session.challenge_name == crate::state::SELECT_MFA_TYPE_CHALLENGE {
@@ -615,11 +654,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
             )));
         };
 
-        let (user_pool_id, username) = match answered {
+        let (user_pool_id, username, generation) = match answered {
             Answered::Completed {
                 user_pool_id,
                 username,
-            } => (user_pool_id, username),
+                generation,
+            } => (user_pool_id, username, generation),
             Answered::Next {
                 user_pool_id,
                 output,
@@ -648,15 +688,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
         };
 
         // The challenge the sign-in asked for is answered, so the tokens it completes with
-        // are the next stage, and the pool's pre-token-generation trigger gates them:
-        // "called after user authentication flows have completed" is this generation's own
-        // documented trigger source.
+        // are the next stage, and the pool's pre-token-generation trigger gates them: the
+        // challenge that was answered is what names this generation's documented trigger
+        // source.
         let overrides = crate::state::lambda_triggers::fire_pre_token_generation(
             ctx,
             &state,
             &user_pool_id,
             &username,
-            crate::state::lambda_triggers::TokenGeneration::Authentication,
+            generation,
             caller,
             input.client_metadata.as_ref(),
         )
@@ -700,10 +740,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
 /// What answering the outstanding challenge left the sign-in at.
 enum Answered {
     /// The challenge is answered and the sign-in is COMPLETE, so the tokens are
-    /// what the caller gets.
+    /// what the caller gets — minted under the trigger source the challenge that
+    /// was answered names.
     Completed {
         user_pool_id: String,
         username: String,
+        generation: crate::state::lambda_triggers::TokenGeneration,
     },
     /// The answer satisfied one challenge and left the NEXT one outstanding, so
     /// the caller gets that challenge rather than tokens — beside the one-time
@@ -770,8 +812,14 @@ fn software_token_mfa_not_found() -> RespondToAuthChallengeError {
 /// "include a `DEVICE_KEY` for device authentication" (this service's model).
 const DEVICE_KEY: &str = "DEVICE_KEY";
 
-/// The `ChallengeResponses` entry naming the user a response is for.
-const USERNAME: &str = "USERNAME";
+/// The challenge a user that must change its password answers
+/// (`ChallengeNameType` in this service's model).
+const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
+
+/// The `ChallengeResponses` entry naming the user a response is for, read from
+/// the one place both response operations name it
+/// ([`crate::state::CHALLENGE_USERNAME`]).
+const USERNAME: &str = crate::state::CHALLENGE_USERNAME;
 
 /// The `ChallengeResponses` entry a response to a CONFIDENTIAL app client
 /// authenticates itself with: "a keyed-hash message authentication code (HMAC)
@@ -780,6 +828,52 @@ const USERNAME: &str = "USERNAME";
 /// the challenge-response operations carry in the response map rather than in an
 /// input member of their own.
 const SECRET_HASH: &str = "SECRET_HASH";
+
+/// What a response that does not answer the `NEW_PASSWORD_REQUIRED` challenge is
+/// reported as by THIS operation ([`crate::state::NewPasswordChallengeRefusal`]):
+/// the modelled error each refusal amounts to, carrying the one sentence the
+/// refusal words for it.
+fn challenge_refused(
+    refusal: crate::state::NewPasswordChallengeRefusal,
+) -> RespondToAuthChallengeError {
+    let message = refusal.message();
+    match refusal {
+        crate::state::NewPasswordChallengeRefusal::NewPasswordMissing
+        | crate::state::NewPasswordChallengeRefusal::UsernameMissing
+        | crate::state::NewPasswordChallengeRefusal::UnknownAttribute(_)
+        | crate::state::NewPasswordChallengeRefusal::RequiredAttributeUnset(_) => {
+            invalid_parameter(message)
+        }
+        crate::state::NewPasswordChallengeRefusal::SessionNotApplicable
+        | crate::state::NewPasswordChallengeRefusal::UserDisabled => not_authorized(&message),
+        crate::state::NewPasswordChallengeRefusal::PasswordRejected(_) => {
+            invalid_password(message)
+        }
+        crate::state::NewPasswordChallengeRefusal::UserNotFound => user_not_found(),
+        crate::state::NewPasswordChallengeRefusal::PasswordReused => password_reused(),
+    }
+}
+
+/// This operation's `InvalidPasswordException`: "this exception is thrown when
+/// Amazon Cognito encounters an invalid password" (this service's model), carrying
+/// the pool's own wording for the policy requirement the chosen password missed.
+fn invalid_password(message: String) -> RespondToAuthChallengeError {
+    RespondToAuthChallengeErrorModeled::InvalidPasswordException(InvalidPasswordException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's refusal of a password the pool's history policy restricts the
+/// user from reusing.
+fn password_reused() -> RespondToAuthChallengeError {
+    RespondToAuthChallengeErrorModeled::PasswordHistoryPolicyViolationException(
+        PasswordHistoryPolicyViolationException {
+            message: Some(crate::state::PASSWORD_REUSED_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
 
 /// What a gating trigger's failure is for THIS operation: the modelled error each outcome
 /// amounts to, carrying the message the invocation built.

@@ -59,10 +59,15 @@ mod token_validity;
 /// The software token a user sets up as a TOTP authenticator: the private key an
 /// association mints for it and the one-time password a registration presents.
 mod software_tokens;
+/// Answering the `NEW_PASSWORD_REQUIRED` challenge: the password a user chooses
+/// for it and the attributes it asked for, checked and stored in one place for
+/// both of the operations that carry such a response.
+mod new_password_challenge;
 /// The second factor a sign-in presents: which MFA challenge a user owes, what
 /// answers it, and what satisfying it leaves behind.
 mod mfa_challenge;
 pub use attributes::*;
+pub use new_password_challenge::*;
 pub use csv_header::*;
 pub use presented_tokens::*;
 pub use identity_providers::*;
@@ -1602,6 +1607,18 @@ pub const JOB_EXPIRY_SPAN: Duration = Duration::from_secs(24 * 60 * 60);
 /// unresolved job with the same sentence.
 pub fn import_job_not_found_message(job_id: &str) -> String {
     format!("The import job {job_id} does not exist")
+}
+
+/// The sentence `StartUserImportJob` answers for a job that is no longer waiting
+/// to be started: "the ID of a user import job that you previously created"
+/// (`StartUserImportJob.JobId`), so only a job still in the created state has an
+/// import to begin.
+///
+/// The variable part LEADS the sentence and is the `JobId` the REQUEST carried,
+/// followed by the fixed ` is not in the created state.`; the status the job is
+/// actually in does not appear.
+pub fn job_not_in_created_state_message(job_id: &str) -> String {
+    format!("{job_id} is not in the created state.")
 }
 
 /// The sentence `StopUserImportJob` answers for a job that is not running:
@@ -3756,23 +3773,55 @@ where
     })
 }
 
-/// The message an `InvalidParameterException` carries for a request that asks
-/// for delivery over `medium` where no `attribute` addresses it
-/// ([`undeliverable_medium`]).
+/// The message an `InvalidParameterException` carries for a request that asks a
+/// verification code to be SENT to an attribute the user holds no value for.
 ///
-/// The refusal reports the medium the request asked for and the attribute that
-/// medium needs — both of them values the caller submitted or the model names —
-/// so it says what to send instead and discloses nothing stored.
+/// A code "is sent to the attribute's value" and the attributes one can be sent
+/// to are the two a `DeliveryMediumType` addresses ([`DELIVERY_MEDIUM_ATTRIBUTES`]),
+/// so a user holding no value for the attribute asked for has no registered
+/// destination at all — which is what the refusal reports, naming the KIND of
+/// destination that is missing and nothing the request or the store carries.
 ///
-/// Amazon Cognito states this condition as two clauses, the message it could not
-/// send and the registration it has no record of, and closes neither with a
-/// period: a resend with nothing to send to answers "Cannot resend codes. No
-/// registered/verified email or phone_number" (the sentence
-/// `ResendConfirmationCode` already carries in this crate). This is that
-/// sentence for ONE medium and the ONE attribute addressing it, so a caller
-/// matching the family matches both.
-pub fn undeliverable_medium_message(medium: &str, attribute: &str) -> String {
-    format!("Cannot send the message by {medium}. No registered {attribute}")
+/// The fixed text is `User does not have a valid registered `, with no trailing
+/// period, closed by the destination the attribute is ([`registered_destination`]).
+pub fn no_registered_destination_message(attribute: &str) -> String {
+    format!(
+        "User does not have a valid registered {}",
+        registered_destination(attribute)
+    )
+}
+
+/// What a user REGISTERS when it holds a value for `attribute`, in the words a
+/// refusal names it by: an address for the attribute an email is mailed to and a
+/// number for the one a text message is sent to
+/// ([`DELIVERY_MEDIUM_ATTRIBUTES`]). An attribute no message is addressed to is
+/// named as the attribute itself, there being no destination it is.
+fn registered_destination(attribute: &str) -> &str {
+    match attribute {
+        "email" => "email",
+        "phone_number" => "phone number",
+        other => other,
+    }
+}
+
+/// The message an `InvalidParameterException` carries for a request whose
+/// `DesiredDeliveryMediums` asks for a medium no address the create carries or
+/// the pool holds can reach ([`undeliverable_medium`]).
+///
+/// A desired delivery medium is a REQUEST PARAMETER — "specify `EMAIL` if email
+/// will be used to send the welcome message. Specify `SMS` if the phone number
+/// will be used" (`AdminCreateUser.DesiredDeliveryMediums` in this service's
+/// model) — so the refusal is worded against the request: the attribute whose
+/// value the asked-for medium needs was not provided. Nothing was sent, so the
+/// sentence states the missing parameter rather than a delivery that failed, as
+/// the sentences of the operations that DO attempt one do
+/// (`ResendConfirmationCode` and `ForgotPassword`, each carrying its own).
+///
+/// The fixed text is `No `, ` provided but desired delivery medium was `, with
+/// no trailing period; the variable parts are the attribute that medium is
+/// addressed by and the medium the request asked for, both named by the model.
+pub fn desired_delivery_medium_unaddressed_message(medium: &str, attribute: &str) -> String {
+    format!("No {attribute} provided but desired delivery medium was {medium}")
 }
 
 /// What one submitted attribute does to a stored user

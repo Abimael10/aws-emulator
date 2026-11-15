@@ -412,16 +412,32 @@ impl User {
     ///
     /// "Only one factor can be set as preferred" (`SetUserMFAPreference` in this
     /// service's model), so the preference a request expresses replaces the one
-    /// the user held; and a factor that is not activated is not one the user
-    /// prefers, so deactivating the preferred factor, or submitting it as no
-    /// longer preferred, leaves the user with no preference at all.
+    /// the user held, and a request expressing TWO of them is refused for that
+    /// conflict before any factor's own availability is looked at; and a factor
+    /// that is not activated is not one the user prefers, so deactivating the
+    /// preferred factor, or submitting it as no longer preferred, leaves the user
+    /// with no preference at all.
     pub fn set_mfa_preference(
         &mut self,
         requested: &[MfaSettingRequest<'_>],
         now: SystemTime,
     ) -> Result<(), MfaPreferenceRejection> {
+        // "Only one factor can be set as preferred" (`SetUserMFAPreference` in
+        // this service's model), so a request marking two of them preferred
+        // conflicts with ITSELF: it is judged before anything the user holds or
+        // any one factor is looked at, and reported as that conflict, whichever
+        // factors carry it and whatever the pool has configured for them.
+        if requested
+            .iter()
+            .filter(|setting| setting.preferred)
+            .take(2)
+            .count()
+            > 1
+        {
+            return Err(MfaPreferenceRejection::TwoPreferred);
+        }
         // A factor the request does not ACTIVATE is not one it can also make
-        // preferred, whatever the user holds for it, so that is judged first and
+        // preferred, whatever the user holds for it, so that is judged next and
         // reported as the preference it refuses.
         if requested
             .iter()

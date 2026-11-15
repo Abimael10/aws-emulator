@@ -219,6 +219,8 @@ mod public_user_not_found_message;
 mod refresh_token_form;
 #[path = "all/refusal_reports_the_broken_rule.rs"]
 mod refusal_reports_the_broken_rule;
+#[path = "all/refused_request_wording.rs"]
+mod refused_request_wording;
 #[path = "all/request_validation_gates.rs"]
 mod request_validation_gates;
 #[path = "all/resend_confirmation_code.rs"]

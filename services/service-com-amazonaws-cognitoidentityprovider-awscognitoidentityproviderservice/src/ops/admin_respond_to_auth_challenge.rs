@@ -604,104 +604,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                 )));
             }
 
-            // `NEW_PASSWORD_REQUIRED`: "ChallengeResponses": {"NEW_PASSWORD":
-            // "[new_password]", "USERNAME": "[username]"}, plus
-            // `"userAttributes.[attribute_name]": "[attribute_value]"` for the
-            // attributes the challenge asked for (`ChallengeResponses` in this
-            // service's model).
-            let new_password = responses
-                .get(NEW_PASSWORD)
-                .cloned()
-                .ok_or_else(missing_new_password)?;
-            // "All challenges require USERNAME" (`ChallengeResponses` in this
-            // service's model), so a response that names no user answers none.
-            if !responses.contains_key(USERNAME) {
-                return Err(missing_parameter(USERNAME));
-            }
-            let requested: ::std::collections::BTreeMap<String, String> = responses
-                .iter()
-                .filter_map(|(key, value)| {
-                    key.strip_prefix(USER_ATTRIBUTES_PREFIX)
-                        .map(|name| (name.to_string(), value.clone()))
-                })
-                .collect();
-
-            let pool = guard
-                .pool_mut(&input.user_pool_id)
-                .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-            if let Some(message) = pool.check_password(
-                &new_password,
-                crate::state::PasswordPolicyWording::AnswersChallenge,
-            ) {
-                return Err(invalid_password(message));
-            }
-            let requested_names: Vec<String> = requested.keys().cloned().collect();
-            if let Some(unknown) = pool.unknown_attribute(&requested_names) {
-                return Err(invalid_parameter(format!(
-                    "Invalid attributes given, {unknown} is not a valid attribute of this \
-                     user pool"
-                )));
-            }
-
-            // Everything the response would leave behind is computed from the stored
-            // user FIRST, so a response that does not satisfy the challenge writes
-            // nothing at all.
-            let stored = pool.user(&session.username).ok_or_else(user_not_found)?;
-            if !stored.enabled {
-                return Err(not_authorized("User is disabled."));
-            }
-            // The challenge stands only while the stored user still owes a password
-            // change; a password set in the meantime leaves the session stale.
-            if !matches!(
-                stored.status,
-                crate::state::UserStatus::ForceChangePassword
-                    | crate::state::UserStatus::ResetRequired
-            ) {
-                return Err(invalid_session());
-            }
-            // A password this pool's policy restricts the user from reusing is
-            // refused before anything is written, as on every other path where
-            // the user itself chooses the password it will sign in with.
-            if pool.restricts_password_reuse(stored, &new_password) {
-                return Err(password_reused());
-            }
-            let username = stored.username.clone();
-            let mut attributes = stored.attributes.clone();
-            for (name, value) in requested {
-                // "In a NEW_PASSWORD_REQUIRED challenge response, you can't modify a
-                // required attribute that already has a value", and
-                // `SchemaAttributeType.Mutable` decides whether any other stored
-                // value may change at all — so an entry for either writes only the
-                // value the user does not have yet.
-                if attributes.contains_key(&name)
-                    && (pool.attribute_required(&name) || !pool.attribute_mutable(&name))
-                {
-                    continue;
-                }
-                // An empty value is no value of the attribute, so it is stored for
-                // nobody and takes a held value away
-                // (`crate::state::stored_text`); a required attribute left without
-                // one then leaves the challenge unanswered below.
-                match crate::state::stored_text(Some(value)) {
-                    Some(value) => attributes.insert(name, value),
-                    None => attributes.remove(&name),
-                };
-            }
-            // The challenge asks for every required attribute the user has no value
-            // for, so one still unset leaves it unanswered.
-            if let Some(missing) = pool.unset_required_attributes(&attributes).first() {
-                return Err(invalid_parameter(format!(
-                    "Invalid attributes given, {missing} is missing"
-                )));
-            }
-
-            let user = pool.user_mut(&username).ok_or_else(user_not_found)?;
-            user.attributes = attributes;
-            // The challenge is answered, so the password the user signs in with from
-            // now on is the one it just chose, and it owes no further change; the one
-            // it replaces joins this user's password history.
-            user.set_password(new_password, true, now);
-            user.status = crate::state::UserStatus::Confirmed;
+            // `NEW_PASSWORD_REQUIRED` carries the password the user chose and the
+            // attributes the challenge asked for, which the one rule BOTH response
+            // operations hold such a response to checks and stores
+            // ([`crate::state::answer_new_password_challenge`]): everything it
+            // would leave behind is computed from the stored user first, so a
+            // response that does not satisfy the challenge writes nothing at all.
+            let username = crate::state::answer_new_password_challenge(
+                guard,
+                &input.user_pool_id,
+                &session.username,
+                &responses,
+                now,
+            )
+            .map_err(challenge_refused)?;
 
             // The session answered its challenge, so it is spent.
             guard.end_session(&session_token);
@@ -844,12 +760,10 @@ const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
 /// "include a `DEVICE_KEY` for device authentication" (this service's model).
 const DEVICE_KEY: &str = "DEVICE_KEY";
 
-/// The `ChallengeResponses` entry a `NEW_PASSWORD_REQUIRED` response carries the
-/// chosen password in.
-const NEW_PASSWORD: &str = "NEW_PASSWORD";
-
-/// The `ChallengeResponses` entry naming the user a response is for.
-const USERNAME: &str = "USERNAME";
+/// The `ChallengeResponses` entry naming the user a response is for, read from
+/// the one place both response operations name it
+/// ([`crate::state::CHALLENGE_USERNAME`]).
+const USERNAME: &str = crate::state::CHALLENGE_USERNAME;
 
 /// The `ChallengeResponses` entry a response to a CONFIDENTIAL app client
 /// authenticates itself with: "a keyed-hash message authentication code (HMAC)
@@ -859,11 +773,30 @@ const USERNAME: &str = "USERNAME";
 /// input member of their own.
 const SECRET_HASH: &str = "SECRET_HASH";
 
-/// The `ChallengeResponses` key prefix an attribute value is submitted under:
-/// `"userAttributes.[attribute_name]": "[attribute_value]"`. The challenge that
-/// ASKS for those attributes names them under the same prefix, so both sides read
-/// it from the one place.
-const USER_ATTRIBUTES_PREFIX: &str = crate::state::USER_ATTRIBUTES_PREFIX;
+/// What a response that does not answer the `NEW_PASSWORD_REQUIRED` challenge is
+/// reported as by THIS operation ([`crate::state::NewPasswordChallengeRefusal`]):
+/// the modelled error each refusal amounts to, carrying the one sentence the
+/// refusal words for it.
+fn challenge_refused(
+    refusal: crate::state::NewPasswordChallengeRefusal,
+) -> AdminRespondToAuthChallengeError {
+    let message = refusal.message();
+    match refusal {
+        crate::state::NewPasswordChallengeRefusal::NewPasswordMissing
+        | crate::state::NewPasswordChallengeRefusal::UsernameMissing
+        | crate::state::NewPasswordChallengeRefusal::UnknownAttribute(_)
+        | crate::state::NewPasswordChallengeRefusal::RequiredAttributeUnset(_) => {
+            invalid_parameter(message)
+        }
+        crate::state::NewPasswordChallengeRefusal::SessionNotApplicable
+        | crate::state::NewPasswordChallengeRefusal::UserDisabled => not_authorized(&message),
+        crate::state::NewPasswordChallengeRefusal::PasswordRejected(_) => {
+            invalid_password(message)
+        }
+        crate::state::NewPasswordChallengeRefusal::UserNotFound => user_not_found(),
+        crate::state::NewPasswordChallengeRefusal::PasswordReused => password_reused(),
+    }
+}
 
 /// What a gating trigger's failure is for THIS operation: the modelled error each outcome
 /// amounts to, carrying the message the invocation built.
@@ -965,20 +898,6 @@ fn not_authorized(message: &str) -> AdminRespondToAuthChallengeError {
 /// request did not carry.
 fn missing_parameter(parameter: &str) -> AdminRespondToAuthChallengeError {
     invalid_parameter(format!("Missing required parameter {parameter}"))
-}
-
-/// The refusal for a `NEW_PASSWORD_REQUIRED` response that carries no
-/// `NEW_PASSWORD` entry.
-///
-/// The challenge is answered by the entries of its response map, so a map that
-/// is missing the one the new password travels in is reported as the other
-/// refusals of that map are — "Invalid attributes given, …" — naming the KEY
-/// the password has to be given under rather than an input member of the
-/// request.
-fn missing_new_password() -> AdminRespondToAuthChallengeError {
-    invalid_parameter(format!(
-        "Invalid attributes given, new password should be given with key {NEW_PASSWORD}"
-    ))
 }
 
 /// This operation's `InvalidPasswordException`, carrying `message`.

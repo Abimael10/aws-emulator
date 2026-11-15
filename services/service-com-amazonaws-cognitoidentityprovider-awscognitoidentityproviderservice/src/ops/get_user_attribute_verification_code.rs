@@ -245,18 +245,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // rule `UpdateUserAttributes` reports a pending value's delivery by). The
             // refusal states the permitted set and quotes nothing the request asked for.
             let attribute_name = input.attribute_name.clone();
-            let Some(medium) = crate::state::delivery_medium(&attribute_name) else {
+            if crate::state::delivery_medium(&attribute_name).is_none() {
                 return Err(invalid_parameter(
                     crate::state::UNVERIFIABLE_ATTRIBUTE_MESSAGE.to_string(),
                 ));
-            };
+            }
             // The destination is the attribute's STORED value, so a user holding no value
-            // for it has nowhere for a code to be sent — the same refusal, in the one
-            // wording of `crate::state::undeliverable_medium_message`, that every request
-            // asking for a delivery it holds no address for earns.
+            // for it has no registered destination a code could be sent to, which is what
+            // the refusal reports ([`crate::state::no_registered_destination_message`]).
             let Some(destination) = user.destination_of(&attribute_name) else {
                 return Err(invalid_parameter(
-                    crate::state::undeliverable_medium_message(medium, &attribute_name),
+                    crate::state::no_registered_destination_message(&attribute_name),
                 ));
             };
 

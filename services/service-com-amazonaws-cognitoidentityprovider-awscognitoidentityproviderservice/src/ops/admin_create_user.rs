@@ -519,7 +519,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
                 });
             if let Some((medium, attribute)) = undeliverable {
                 return Err(invalid_parameter(
-                    crate::state::undeliverable_medium_message(medium, attribute),
+                    crate::state::desired_delivery_medium_unaddressed_message(medium, attribute),
                 ));
             }
         }
