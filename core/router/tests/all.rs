@@ -7256,3 +7256,10 @@ mod events_lambda_target_permission_granted_after_the_rule;
 //! comment may stand in this file: past the first item one is `E0753` and compiles no
 //! suite of this target, so a note further down must be an ordinary comment — better
 //! still, add a declaration rather than a note about one.
+//! ROOT, so a bare `mod` resolves to a SIBLING of this file (`tests/<name>.rs`), which the
+//! layout check refuses: the `#[path]` above each `mod` is what points it into `tests/all/`.
+//! is `E0753`. Either fails every suite in this target, so what goes below is a
+//! DECLARATION — never a note about one, and never a copy of these lines; what a suite
+//! covers, and why it belongs to this cross-service target rather than to one service
+//! crate, is stated in that suite's own module doc, where it is read beside the test.
+//! belongs there rather than here.

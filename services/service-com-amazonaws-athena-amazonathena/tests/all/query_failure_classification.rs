@@ -314,6 +314,21 @@ async fn glue_table(router: &MultiServiceRouter, table: &str) -> Option<Value> {
     (status == 200).then(|| answer["Table"].clone())
 }
 
+/// A declared `LOCATION` as the catalog records it: the path it names without the
+/// separator that closed it, which a location whose whole path IS that separator (the root
+/// of the store it addresses) keeps — dropping it there would name the store itself.
+fn recorded_location(location: &str) -> String {
+    match location.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('/') {
+            Some((authority, path)) => {
+                format!("{scheme}://{authority}/{}", path.trim_end_matches('/'))
+            }
+            None => location.to_string(),
+        },
+        None => location.trim_end_matches('/').to_string(),
+    }
+}
+
 /// One row of the LOCATION table: a location a `CREATE EXTERNAL TABLE` declares, and
 /// whether it denotes a file rather than the folder a table's data lives under.
 struct LocationCase {
@@ -466,7 +481,7 @@ async fn an_external_table_location_has_to_denote_a_folder() {
             });
             assert_eq!(
                 table["StorageDescriptor"]["Location"].as_str(),
-                Some(case.location.trim_end_matches('/')),
+                Some(recorded_location(case.location).as_str()),
                 "case {:?}: the registered location is the declared prefix, got {table:?}",
                 case.case
             );

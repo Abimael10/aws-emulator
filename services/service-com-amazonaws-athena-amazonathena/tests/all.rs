@@ -35,6 +35,9 @@ mod engine_run_bound;
 #[path = "all/harness.rs"]
 mod harness;
 
+#[path = "all/hive_location_recording.rs"]
+mod hive_location_recording;
+
 #[path = "all/hive_table_registration.rs"]
 mod hive_table_registration;
 

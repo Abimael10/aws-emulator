@@ -320,7 +320,8 @@ pub fn show_databases(
 /// ([`DDL_TABLE_OWNER`]), its parameters carry [`EXTERNAL_PROPERTY`] beside every
 /// declared table property, and its storage descriptor carries the declared columns, the
 /// location with no trailing separator — a location names a PREFIX, and the catalog
-/// records the prefix itself rather than the separator that followed it — and the SerDe
+/// records the prefix itself rather than the separator that followed it, unless that
+/// separator is the whole path ([`trimmed_location`]) — and the SerDe
 /// the statement named or the default one for delimited text.
 ///
 /// Everything a Hive registration materialises beyond what the statement declared is
@@ -514,11 +515,37 @@ fn glue_column(column: &DeclaredColumn) -> GlueColumn {
     }
 }
 
-/// A `LOCATION` as the catalog records it: the prefix itself, without the separator that
-/// closed it.
+/// A `LOCATION` as the catalog records it: the PATH the statement declared, without the
+/// separator that closed it — a location names a prefix, and the catalog records the prefix
+/// itself rather than the separator that followed it.
+///
+/// What is dropped is a separator INSIDE the path: a location that names the ROOT of the
+/// store it addresses (`s3://<bucket>/`) has nothing but that separator for a path, and
+/// dropping it there would leave the store itself rather than a place inside it, so the
+/// root keeps it. Which is how the Hadoop path a Hive metastore client writes normalises:
+/// every trailing separator of a path goes, the one that IS the path stays.
 fn trimmed_location(location: &str) -> String {
-    location.trim_end_matches('/').to_string()
+    let (root, path) = location.split_at(path_start(location));
+    format!("{root}{}", path.trim_end_matches('/'))
 }
+
+/// Where the PATH of `location` begins: just past the separator that opens it, so the
+/// separator a path hangs off is never part of the path itself.
+///
+/// A location with a scheme has its path under the authority that follows the scheme
+/// (`s3://<bucket>/<key>`), so the search for that separator starts after the authority;
+/// one written with no scheme at all is a path from its first character.
+fn path_start(location: &str) -> usize {
+    let after_scheme = location
+        .find(SCHEME_SEPARATOR)
+        .map_or(0, |at| at + SCHEME_SEPARATOR.len());
+    location[after_scheme..]
+        .find('/')
+        .map_or(location.len(), |at| after_scheme + at + 1)
+}
+
+/// What separates a location's scheme from the authority its path hangs off.
+const SCHEME_SEPARATOR: &str = "://";
 
 /// Register the view a `CREATE [OR REPLACE] VIEW` defines in the Data Catalog.
 ///
