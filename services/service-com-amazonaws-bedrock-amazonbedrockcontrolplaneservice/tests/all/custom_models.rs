@@ -34,7 +34,9 @@
 
 use serde_json::{json, Value};
 
-use crate::support::{date_time_seconds, emulator, label, Emulator, Reply, ACCOUNT, REGION};
+use crate::support::{
+    date_time_seconds, emulator, label, wall_clock_seconds, Emulator, Reply, ACCOUNT, REGION,
+};
 
 // ---------------------------------------------------------------------------------------
 // Values the model admits for the members these rows carry.
@@ -439,7 +441,25 @@ async fn a_listing_reports_the_stored_custom_models() {
     for name in first_group {
         arns.push(mint(&emu, name, s3_body(name)).await);
     }
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    // A creation-time bound separates the two groups below, so the second group has to be
+    // created strictly after the first. The wait is for the CONDITION that makes that true —
+    // the clock the service stamps a record with has moved past the instant it stamped the
+    // first group's last model — rather than for a fixed span, which would make the outcome
+    // depend on how fast the host runs.
+    let stamped = instant(
+        "the first group's last create",
+        &listed("the first group", &list(&emu, "").await)[first_group.len() - 1],
+        "creationTime",
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while wall_clock_seconds() <= stamped {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the clock must move past the instant {stamped} the first group was stamped with \
+             before the second group is created"
+        );
+        tokio::task::yield_now().await;
+    }
     for name in second_group {
         arns.push(mint(&emu, name, package_body(name)).await);
     }
@@ -522,7 +542,7 @@ async fn a_listing_reports_the_stored_custom_models() {
                 "baseModelArnEquals={}",
                 label(&foundation_model_arn(
                     REGION,
-                    "amazon.titan-text-lite-v1"
+                    "meta.llama3-70b-instruct-v1:0"
                 ))
             ),
             Vec::new(),

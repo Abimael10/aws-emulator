@@ -511,12 +511,12 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
     let emu = emulator();
     let reply = list(&emu, REGION, "").await;
     let spanned = [
-        "amazon.nova-canvas-v1:0",
+        "luma.ray-v2:0",
         "amazon.nova-pro-v1:0",
         "amazon.titan-embed-text-v2:0",
         "amazon.titan-embed-image-v1",
-        "amazon.titan-text-lite-v1",
-        "ai21.jamba-1-5-mini-v1:0",
+        "cohere.command-text-v14",
+        "amazon.nova-micro-v1:0",
         "mistral.mixtral-8x7b-instruct-v0:1",
         "moonshotai.kimi-k2.5",
     ];

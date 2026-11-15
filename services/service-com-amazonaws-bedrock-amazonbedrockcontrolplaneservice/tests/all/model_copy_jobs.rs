@@ -377,7 +377,7 @@ async fn a_source_whose_base_model_is_not_published_is_refused_naming_it() {
     // The rows differ along what the rule generalises over: a fabricated `provider.model`
     // segment, a fabricated one carrying the `:`-separated version qualifiers a base model
     // id may end with, a segment naming a model the published catalog DOES carry
-    // (`anthropic.claude-3-haiku-20240307-v1:0` is a row of
+    // (`amazon.nova-pro-v1:0` is a row of
     // `ListFoundationModels`), and the `imported` segment, which names a model customized
     // from no base model at all.
     let rows: [(&str, &str, bool); 4] = [
@@ -389,7 +389,7 @@ async fn a_source_whose_base_model_is_not_published_is_refused_naming_it() {
         ),
         (
             "a base model the published catalog carries",
-            "anthropic.claude-3-haiku-20240307-v1:0",
+            "amazon.nova-pro-v1:0",
             false,
         ),
         ("the imported segment, which has no base model", IMPORTED_BASE, false),

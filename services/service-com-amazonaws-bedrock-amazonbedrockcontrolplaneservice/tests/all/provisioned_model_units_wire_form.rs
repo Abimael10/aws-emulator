@@ -28,8 +28,8 @@ use crate::support::{emulator, foundation_model_arn, label, Emulator, Reply, REG
 /// whose `inferenceTypesSupported` carries `PROVISIONED`, which `ListFoundationModels`
 /// reports).
 const PROVISIONABLE_MODELS: &[&str] = &[
-    "amazon.titan-text-lite-v1",
-    "anthropic.claude-3-haiku-20240307-v1:0",
+    "amazon.nova-pro-v1:0",
+    "amazon.titan-embed-text-v2:0",
     "cohere.command-text-v14",
     "meta.llama3-70b-instruct-v1:0",
 ];

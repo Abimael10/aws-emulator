@@ -109,9 +109,6 @@ pub(super) const ON_DEMAND_AND_PROVISIONED: &[&str] = &["ON_DEMAND", "PROVISIONE
 pub(super) const NO_CUSTOMIZATION: &[&str] = &[];
 /// `ModelCustomization` — a model that can be fine-tuned on labelled data.
 pub(super) const FINE_TUNING: &[&str] = &["FINE_TUNING"];
-/// `ModelCustomization` — a model that accepts both fine-tuning and continued
-/// pre-training.
-pub(super) const FINE_TUNING_AND_PRE_TRAINING: &[&str] = &["FINE_TUNING", "CONTINUED_PRE_TRAINING"];
 /// `ModelCustomization` — a model that accepts both fine-tuning and distillation.
 pub(super) const FINE_TUNING_AND_DISTILLATION: &[&str] = &["FINE_TUNING", "DISTILLATION"];
 
@@ -290,8 +287,9 @@ pub(super) const fn customizable(
 /// page publishes is left out of the row rather than invented (`publicExtendedAccessTime`
 /// is such an instant, so no row carries one).
 ///
-/// Every value of each member a caller can filter on is carried by a row, so a filter on
-/// any of them narrows the catalog rather than emptying it.
+/// Every value of each member a caller can filter on is carried by a row — except the
+/// customization AWS offered only for models that are past their end of life, which no
+/// offered row carries — so a filter on one of them narrows the catalog to the rows that do.
 ///
 /// A row whose published attributes differ from the three kinds below — a model a
 /// customization job accepts, or a deprecated one — is written out member by member; every
@@ -299,21 +297,6 @@ pub(super) const fn customizable(
 /// those three kinds, wrapped in [`also_provisioned`] where AWS sells reserved capacity for
 /// the model too.
 pub const FOUNDATION_MODELS: &[FoundationModel] = &[
-    FoundationModel {
-        model_id: "ai21.jamba-1-5-mini-v1:0",
-        model_name: "Jamba 1.5 Mini",
-        provider_name: "AI21 Labs",
-        model_family: "Jamba 1.5",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND,
-        features_supported: BATCH_ONLY,
-        lifecycle_status: LIFECYCLE_ACTIVE,
-        start_of_life_time: "2024-08-22T00:00:00Z",
-        legacy_window: None,
-    },
     // Amazon Nova — the Nova 2 generation, offered on demand.
     text_model(
         "amazon.nova-2-5-sonic",
@@ -342,21 +325,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         CACHING_ONLY,
         "2025-12-03T00:00:00Z",
     ),
-    FoundationModel {
-        model_id: "amazon.nova-canvas-v1:0",
-        model_name: "Nova Canvas",
-        provider_name: "Amazon",
-        model_family: "Nova",
-        input_modalities: IN_TEXT_AND_IMAGE,
-        output_modalities: OUT_IMAGE,
-        response_streaming_supported: false,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND,
-        features_supported: NO_FEATURES,
-        lifecycle_status: LIFECYCLE_ACTIVE,
-        start_of_life_time: "2024-12-03T00:00:00Z",
-        legacy_window: None,
-    },
     FoundationModel {
         model_id: "amazon.nova-lite-v1:0",
         model_name: "Nova Lite",
@@ -484,148 +452,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-04-30T00:00:00Z",
-        legacy_window: None,
-    },
-    FoundationModel {
-        model_id: "amazon.titan-image-generator-v1",
-        model_name: "Titan Image Gen G1",
-        provider_name: "Amazon",
-        model_family: "Titan",
-        input_modalities: IN_TEXT_AND_IMAGE,
-        output_modalities: OUT_IMAGE,
-        response_streaming_supported: false,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: NO_FEATURES,
-        lifecycle_status: LIFECYCLE_ACTIVE,
-        start_of_life_time: "2023-11-29T00:00:00Z",
-        legacy_window: None,
-    },
-    // The same model under the version-qualified id a customization names.
-    customizable(
-        also_provisioned(image_model(
-            "amazon.titan-image-generator-v1:0",
-            "Titan Image Gen G1",
-            "Amazon",
-            "Titan",
-            IN_TEXT_AND_IMAGE,
-            NO_FEATURES,
-            "2023-11-29T00:00:00Z",
-        )),
-        FINE_TUNING,
-    ),
-    FoundationModel {
-        model_id: "amazon.titan-text-lite-v1",
-        model_name: "Titan Text Lite",
-        provider_name: "Amazon",
-        model_family: "Titan",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_ONLY,
-        lifecycle_status: LIFECYCLE_LEGACY,
-        start_of_life_time: "2023-09-28T00:00:00Z",
-        legacy_window: Some(LegacyWindow {
-            entered_at: "2025-04-30T00:00:00Z",
-            end_of_life_at: "2027-04-30T00:00:00Z",
-        }),
-    },
-    // The same model under the training-qualified id a customization names: the version and
-    // the context length, which is how Amazon Bedrock publishes a customizable Titan text
-    // variant.
-    FoundationModel {
-        model_id: "amazon.titan-text-lite-v1:0:4k",
-        model_name: "Titan Text Lite",
-        provider_name: "Amazon",
-        model_family: "Titan",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: FINE_TUNING_AND_PRE_TRAINING,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_ONLY,
-        lifecycle_status: LIFECYCLE_LEGACY,
-        start_of_life_time: "2023-09-28T00:00:00Z",
-        legacy_window: Some(LegacyWindow {
-            entered_at: "2025-04-30T00:00:00Z",
-            end_of_life_at: "2027-04-30T00:00:00Z",
-        }),
-    },
-    FoundationModel {
-        model_id: "amazon.titan-text-premier-v1:0",
-        model_name: "Titan Text Premier",
-        provider_name: "Amazon",
-        model_family: "Titan",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: FINE_TUNING,
-        inference_types_supported: ON_DEMAND,
-        features_supported: BATCH_ONLY,
-        lifecycle_status: LIFECYCLE_ACTIVE,
-        start_of_life_time: "2024-04-30T00:00:00Z",
-        legacy_window: None,
-    },
-    FoundationModel {
-        model_id: "anthropic.claude-3-5-sonnet-20240620-v1:0",
-        model_name: "Claude 3.5 Sonnet",
-        provider_name: "Anthropic",
-        model_family: "Claude 3.5",
-        input_modalities: IN_TEXT_AND_IMAGE,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_AND_ROUTING,
-        lifecycle_status: LIFECYCLE_ACTIVE,
-        start_of_life_time: "2024-06-20T00:00:00Z",
-        legacy_window: None,
-    },
-    FoundationModel {
-        model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0",
-        model_name: "Claude 3.5 Sonnet",
-        provider_name: "Anthropic",
-        model_family: "Claude 3.5",
-        input_modalities: IN_TEXT_AND_IMAGE,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_AND_ROUTING,
-        lifecycle_status: LIFECYCLE_ACTIVE,
-        start_of_life_time: "2024-10-22T00:00:00Z",
-        legacy_window: None,
-    },
-    FoundationModel {
-        model_id: "anthropic.claude-3-haiku-20240307-v1:0",
-        model_name: "Claude 3 Haiku",
-        provider_name: "Anthropic",
-        model_family: "Claude 3",
-        input_modalities: IN_TEXT_AND_IMAGE,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: FINE_TUNING,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_AND_ROUTING,
-        lifecycle_status: LIFECYCLE_ACTIVE,
-        start_of_life_time: "2024-03-13T00:00:00Z",
-        legacy_window: None,
-    },
-    FoundationModel {
-        model_id: "anthropic.claude-3-sonnet-20240229-v1:0",
-        model_name: "Claude 3 Sonnet",
-        provider_name: "Anthropic",
-        model_family: "Claude 3",
-        input_modalities: IN_TEXT_AND_IMAGE,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_ONLY,
-        lifecycle_status: LIFECYCLE_ACTIVE,
-        start_of_life_time: "2024-03-04T00:00:00Z",
         legacy_window: None,
     },
     // Anthropic Claude — the Claude 4 and Claude 5 generations, each row under the line
@@ -1760,7 +1586,7 @@ impl FoundationModelCatalog {
 
     /// What a `ModelIdentifier` naming a BASE model names: a model this account's catalog
     /// offers, a model this service still recognises and offers no longer
-    /// ([`RETIRED_FOUNDATION_MODELS`]), or no model at all.
+    /// ([`is_past_end_of_life`]), or no model at all.
     ///
     /// Both spellings the member admits are read — the bare model id and the model's
     /// `foundation-model` ARN ([`base_model_id_of`]) — and the id is resolved the way a base
@@ -1777,7 +1603,7 @@ impl FoundationModelCatalog {
         if let Some(model) = self.qualified_model(base_model_id) {
             return BaseModelIdentity::Offered(model);
         }
-        if RETIRED_FOUNDATION_MODELS.contains(&base_model_id) {
+        if is_past_end_of_life(base_model_id) {
             return BaseModelIdentity::Retired;
         }
         BaseModelIdentity::Unknown
@@ -1831,7 +1657,8 @@ pub enum BaseModelIdentity<'a> {
 
 /// The base model ids this service still RECOGNISES although it offers the model no longer:
 /// the ids AWS publishes as past their end of life ("Model lifecycle" in the Amazon Bedrock
-/// User Guide).
+/// User Guide) and that no published routing resource names — the ones that are still named
+/// keep their whole published row instead ([`PAST_END_OF_LIFE_MODELS`]).
 ///
 /// A model past its end of life is OFFERED by nobody, which is why [`FOUNDATION_MODELS`]
 /// carries no row for one — no listing reports it and no read of the catalog resolves it.
@@ -1847,7 +1674,14 @@ pub const RETIRED_FOUNDATION_MODELS: &[&str] = &[
     "ai21.j2-jumbo-instruct",
     "ai21.j2-mid-v1",
     "ai21.j2-ultra-v1",
+    "ai21.jamba-1-5-mini-v1:0",
+    "amazon.nova-canvas-v1:0",
+    "amazon.titan-image-generator-v1",
+    "amazon.titan-image-generator-v1:0",
     "amazon.titan-text-express-v1",
+    "amazon.titan-text-lite-v1",
+    "amazon.titan-text-lite-v1:0:4k",
+    "amazon.titan-text-premier-v1:0",
     "anthropic.claude-instant-v1",
     "anthropic.claude-v1",
     "anthropic.claude-v2",
@@ -1856,6 +1690,171 @@ pub const RETIRED_FOUNDATION_MODELS: &[&str] = &[
     "meta.llama2-70b-chat-v1",
     "stability.stable-diffusion-xl-v0",
 ];
+
+/// The published rows of the models this service recognises and offers NO LONGER, which a
+/// routing resource Amazon Bedrock publishes still names.
+///
+/// A model past its end of life is offered by nobody, so [`FOUNDATION_MODELS`] carries no
+/// row for one and no listing reports it. The cross-region inference profile published over
+/// a model and the default prompt router that routes to that profile are published
+/// resources in their OWN right, though: AWS goes on publishing them once the model behind
+/// them stops being offered, and each of them reports that model's own brand and the day it
+/// launched. Those are published facts of the MODEL, so a row stays here for the catalogues
+/// built over the models to read ([`published_row`]) instead of being copied into each of
+/// them — and only while such a resource names the model, because a row nothing names is a
+/// row no surface reports.
+///
+/// The id itself resolves exactly as any other past its end of life
+/// ([`is_past_end_of_life`]): the model is offered under nothing, so no listing reports it
+/// and every operation that resolves a base model refuses it with the end-of-life reason.
+pub const PAST_END_OF_LIFE_MODELS: &[FoundationModel] = &[
+    // The Anthropic Claude 3 and Claude 3.5 generations: offered no longer, and still the
+    // models the published cross-region profiles of their line route to — one of them the
+    // model the published Anthropic prompt router falls back to through such a profile.
+    FoundationModel {
+        model_id: "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        model_name: "Claude 3.5 Sonnet",
+        provider_name: "Anthropic",
+        model_family: "Claude 3.5",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_AND_ROUTING,
+        lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2024-06-20T00:00:00Z",
+        legacy_window: None,
+    },
+    FoundationModel {
+        model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        model_name: "Claude 3.5 Sonnet",
+        provider_name: "Anthropic",
+        model_family: "Claude 3.5",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_AND_ROUTING,
+        lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2024-10-22T00:00:00Z",
+        legacy_window: None,
+    },
+    FoundationModel {
+        model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+        model_name: "Claude 3 Haiku",
+        provider_name: "Anthropic",
+        model_family: "Claude 3",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_AND_ROUTING,
+        lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2024-03-13T00:00:00Z",
+        legacy_window: None,
+    },
+    FoundationModel {
+        model_id: "anthropic.claude-3-sonnet-20240229-v1:0",
+        model_name: "Claude 3 Sonnet",
+        provider_name: "Anthropic",
+        model_family: "Claude 3",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
+        lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2024-03-04T00:00:00Z",
+        legacy_window: None,
+    },
+    // The Meta Llama 3.2 generation: the vision models take an image beside text, the small
+    // ones text alone, and a cross-region profile is published over each of them.
+    FoundationModel {
+        model_id: "meta.llama3-2-11b-instruct-v1:0",
+        model_name: "Llama 3.2 11B Instruct",
+        provider_name: "Meta",
+        model_family: "Llama 3.2",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
+        lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2024-09-25T00:00:00Z",
+        legacy_window: None,
+    },
+    FoundationModel {
+        model_id: "meta.llama3-2-1b-instruct-v1:0",
+        model_name: "Llama 3.2 1B Instruct",
+        provider_name: "Meta",
+        model_family: "Llama 3.2",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
+        lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2024-09-25T00:00:00Z",
+        legacy_window: None,
+    },
+    FoundationModel {
+        model_id: "meta.llama3-2-3b-instruct-v1:0",
+        model_name: "Llama 3.2 3B Instruct",
+        provider_name: "Meta",
+        model_family: "Llama 3.2",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
+        lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2024-09-25T00:00:00Z",
+        legacy_window: None,
+    },
+    FoundationModel {
+        model_id: "meta.llama3-2-90b-instruct-v1:0",
+        model_name: "Llama 3.2 90B Instruct",
+        provider_name: "Meta",
+        model_family: "Llama 3.2",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
+        lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2024-09-25T00:00:00Z",
+        legacy_window: None,
+    },
+];
+
+/// The published row of a model offered no longer, or `None` when this service recognises no
+/// such model or carries no row for it ([`PAST_END_OF_LIFE_MODELS`]).
+#[must_use]
+pub fn past_end_of_life_model(model_id: &str) -> Option<&'static FoundationModel> {
+    PAST_END_OF_LIFE_MODELS
+        .iter()
+        .find(|model| model.model_id == model_id)
+}
+
+/// Whether `base_model_id` names a model this service recognises and offers no longer.
+///
+/// One reading for one question, because a model is past its end of life whether or not a
+/// published routing resource still names it: the ids of the models nothing names
+/// ([`RETIRED_FOUNDATION_MODELS`]) and the rows of the ones something does
+/// ([`PAST_END_OF_LIFE_MODELS`]) are two records of the same lifecycle state.
+#[must_use]
+pub fn is_past_end_of_life(base_model_id: &str) -> bool {
+    RETIRED_FOUNDATION_MODELS.contains(&base_model_id)
+        || past_end_of_life_model(base_model_id).is_some()
+}
 
 /// The `foundation-model` ARN of `model_id` in `region`:
 /// `arn:aws:bedrock:<region>::foundation-model/<modelId>`.
@@ -2416,16 +2415,28 @@ pub(super) fn published_instant(published: &str) -> Option<::aws_smithy_types::D
         .ok()
 }
 
-/// The published row `model_id` names, read off [`FOUNDATION_MODELS`] itself.
+/// The published row `model_id` names, read off the catalogues of published models: the
+/// models this service offers ([`FOUNDATION_MODELS`]) and the ones it offers no longer whose
+/// published routing resources still name them ([`PAST_END_OF_LIFE_MODELS`]).
 ///
-/// The catalog is published data, so a row is the same for every account and reachable
-/// without a store: this is what the catalogues built OVER the models — the cross-region
-/// inference profiles and the default prompt routers — read a target model's published
-/// attributes from, rather than carrying a second copy of them. `None` for an id the
-/// catalog offers no model under, which is what makes a target model nothing can be
-/// published for visible instead of invented.
+/// A row here is NOT a statement that the model is offered — that question is
+/// [`offered_model`]. The catalog is published data, so a row is the same for every account
+/// and reachable without a store: this is what the catalogues built OVER the models — the
+/// cross-region inference profiles and the default prompt routers — read a target model's
+/// published attributes from, rather than carrying a second copy of them, and those resources
+/// outlive the offering of the model they name. `None` for an id no row is published under,
+/// which is what makes a target model nothing can be published for visible instead of
+/// invented.
 #[must_use]
-pub fn catalogued_model(model_id: &str) -> Option<&'static FoundationModel> {
+pub fn published_row(model_id: &str) -> Option<&'static FoundationModel> {
+    offered_model(model_id).or_else(|| past_end_of_life_model(model_id))
+}
+
+/// The row of the model `model_id` names if this service OFFERS it: a row of
+/// [`FOUNDATION_MODELS`] and of nothing else, so a caller asking whether a model may back a
+/// request is never answered with the row of one past its end of life.
+#[must_use]
+pub fn offered_model(model_id: &str) -> Option<&'static FoundationModel> {
     FOUNDATION_MODELS
         .iter()
         .find(|model| model.model_id == model_id)
@@ -2640,7 +2651,7 @@ pub fn foundation_model_not_found(identifier: &str) -> String {
 /// inference plane makes for the same member, read here off the published catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnofferedFoundationModel {
-    /// A model past its end of life ([`RETIRED_FOUNDATION_MODELS`]).
+    /// A model past its end of life ([`is_past_end_of_life`]).
     PastEndOfLife,
     /// A `foundation-model` ARN of this service's namespace naming no model.
     MissingArn,
@@ -2673,7 +2684,7 @@ impl UnofferedFoundationModel {
 /// split exists once.
 #[must_use]
 pub fn unoffered_foundation_model(identifier: &str) -> UnofferedFoundationModel {
-    if RETIRED_FOUNDATION_MODELS.contains(&base_model_id_of(identifier)) {
+    if is_past_end_of_life(base_model_id_of(identifier)) {
         return UnofferedFoundationModel::PastEndOfLife;
     }
     match unresolved_model(identifier, &[FOUNDATION_MODEL_RESOURCE_TYPE]) {

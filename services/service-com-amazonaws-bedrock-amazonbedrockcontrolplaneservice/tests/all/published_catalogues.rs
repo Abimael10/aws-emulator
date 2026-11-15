@@ -30,6 +30,7 @@
 //! assumes.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::support::{emulator, label, profile_model_id, Emulator, Reply, ACCOUNT, REGION};
 
@@ -288,10 +289,18 @@ async fn the_default_listing_reports_the_published_routers_of_the_region() {
                      ListInferenceProfiles reports, which carries {profiles:?}"
                 );
                 let model_id = profile_model_id(&model_arn);
+                // A published profile OUTLIVES the offering of its model, and a router goes
+                // on naming such a profile, so a target's model is one the published
+                // catalogues carry a row for: one the listing offers, or one it offers no
+                // longer.
+                let carried = catalog.contains(&model_id)
+                    || bedrock::state::PAST_END_OF_LIFE_MODELS
+                        .iter()
+                        .any(|model| model.model_id == model_id);
                 assert!(
-                    catalog.contains(&model_id),
-                    "case {case:?}: the target model {model_id:?} must be one \
-                     ListFoundationModels reports, which carries {catalog:?}"
+                    carried,
+                    "case {case:?}: the target model {model_id:?} must be one the published \
+                     catalogues carry, and ListFoundationModels carries {catalog:?}"
                 );
             }
 
@@ -505,10 +514,15 @@ async fn an_application_profile_is_created_from_a_published_profile_and_tagged()
     let emu = emulator();
     let listed = list_profiles(&emu, REGION, &format!("type={SYSTEM_DEFINED}")).await;
     let published = rows(&listed, "inferenceProfileSummaries");
+    // A profile over a model the catalogue still OFFERS: a published profile outlives the
+    // offering of its own model, and a profile of a model offered no longer is no source to
+    // build an application profile out of, because nothing may be invoked through it.
+    let offered = published_model_ids(&emu, REGION).await;
     let source = text(
         published
-            .first()
-            .expect("the published catalogue carries at least one profile"),
+            .iter()
+            .find(|row| offered.contains(&profile_model_id(&text(row, "inferenceProfileArn"))))
+            .expect("the published catalogue carries a profile over a model still offered"),
         "inferenceProfileArn",
     );
 

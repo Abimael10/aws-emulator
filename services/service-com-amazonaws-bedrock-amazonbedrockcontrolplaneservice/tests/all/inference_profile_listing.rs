@@ -45,7 +45,7 @@ use crate::support::{
 
 /// Base model ids this emulator's published catalog carries (the `modelId`s
 /// `ListFoundationModels` answers with).
-const CATALOG_MODEL: &str = "anthropic.claude-3-haiku-20240307-v1:0";
+const CATALOG_MODEL: &str = "amazon.nova-lite-v1:0";
 const OTHER_CATALOG_MODEL: &str = "amazon.nova-pro-v1:0";
 
 /// `MaxResults` is `@range(min: 1, max: 1000)`
@@ -168,6 +168,26 @@ const CROSS_REGION_MODELS: &[(&str, &str, &[&str])] = &[
         LLAMA_3_1_REGIONS,
     ),
     (
+        "meta.llama3-2-11b-instruct-v1:0",
+        "Meta Llama 3.2 11B Instruct",
+        LLAMA_3_2_REGIONS,
+    ),
+    (
+        "meta.llama3-2-1b-instruct-v1:0",
+        "Meta Llama 3.2 1B Instruct",
+        LLAMA_3_2_REGIONS,
+    ),
+    (
+        "meta.llama3-2-3b-instruct-v1:0",
+        "Meta Llama 3.2 3B Instruct",
+        LLAMA_3_2_REGIONS,
+    ),
+    (
+        "meta.llama3-2-90b-instruct-v1:0",
+        "Meta Llama 3.2 90B Instruct",
+        LLAMA_3_2_REGIONS,
+    ),
+    (
         "meta.llama3-3-70b-instruct-v1:0",
         "Meta Llama 3.3 70B",
         &["us-east-1", "us-east-2", "us-west-2"],
@@ -202,6 +222,10 @@ const LLAMA_3_1_REGIONS: &[&str] = &[
     "us-east-2",
     "us-west-2",
 ];
+
+/// The regions the Meta Llama 3.2 generation is offered in: the two US regions that hold a
+/// copy of those models, which is what each profile published over one of them routes to.
+const LLAMA_3_2_REGIONS: &[&str] = &["us-east-1", "us-west-2"];
 
 /// How many regions of a geography must hold a model for a profile to be published there:
 /// routing across one region is not cross-region routing.

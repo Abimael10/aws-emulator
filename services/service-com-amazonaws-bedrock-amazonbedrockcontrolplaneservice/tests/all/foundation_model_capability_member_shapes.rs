@@ -96,11 +96,12 @@ const CASES: &[Case] = &[
         images: PUBLISHED_IMAGE_FORMATS,
     },
     Case {
-        model_id: "anthropic.claude-3-haiku-20240307-v1:0",
-        note: "batch inference and routing published, and reserved capacity sold for it",
+        model_id: "anthropic.claude-haiku-4-5-20251001-v1:0",
+        note: "every feature's table lists it, on demand only, document input published for \
+               its provider line",
         batch_inference: true,
-        provisioned_throughput: true,
-        reasoning: false,
+        provisioned_throughput: false,
+        reasoning: true,
         documents: Some(&["pdf"]),
         images: PUBLISHED_IMAGE_FORMATS,
     },

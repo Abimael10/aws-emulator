@@ -31,6 +31,7 @@
 //! here asserts a recorded instant: what is asserted is the RULE each member follows.
 
 use serde_json::Value;
+use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::support::{
     date_time_seconds, emulator, label, profile_model_id, Emulator, Reply, ACCOUNT, REGION,
@@ -118,8 +119,14 @@ fn text(row: &Value, member: &str) -> String {
         .to_string()
 }
 
-/// `(modelId, modelFamily)` for every model `ListFoundationModels` reports in `region` —
-/// the catalogue a router's targets are checked against, rather than a second copy of it.
+/// `(modelId, modelFamily)` for every model `ListFoundationModels` reports in `region`,
+/// beside the published rows the catalogues keep for the models they name and the listing
+/// offers no longer (`crate::state`'s `PAST_END_OF_LIFE_MODELS`) — the catalogue a router's
+/// targets are checked against, rather than a second copy of it.
+///
+/// A router routes through a published cross-region profile, and such a profile OUTLIVES the
+/// offering of its model: AWS goes on publishing it, and the router goes on naming it, once
+/// the model behind it is past its end of life.
 async fn model_families(emu: &Emulator, region: &str) -> Vec<(String, String)> {
     let listed = emu
         .call_in_region(region, "GET", "/foundation-models", None)
@@ -132,6 +139,16 @@ async fn model_families(emu: &Emulator, region: &str) -> Vec<(String, String)> {
     rows(region, &listed, "modelSummaries")
         .iter()
         .map(|row| (text(row, "modelId"), text(row, "modelFamily")))
+        .chain(
+            bedrock::state::PAST_END_OF_LIFE_MODELS
+                .iter()
+                .map(|model| {
+                    (
+                        model.model_id.to_string(),
+                        model.model_family.to_string(),
+                    )
+                }),
+        )
         .collect()
 }
 
@@ -311,12 +328,13 @@ async fn every_router_target_is_a_published_inference_profile_of_the_region() {
                      {:?}",
                     read.body
                 );
-                // And the model behind that profile is one this control plane publishes.
+                // And the model behind that profile is one this control plane publishes a
+                // row for — offered, or offered no longer and still named by this profile.
                 let model_id = profile_model_id(target);
                 assert!(
                     families.iter().any(|(id, _)| *id == model_id),
-                    "case {case:?}: the routed model {model_id:?} must be one \
-                     ListFoundationModels reports"
+                    "case {case:?}: the routed model {model_id:?} must be one the published \
+                     catalogues carry"
                 );
             }
 

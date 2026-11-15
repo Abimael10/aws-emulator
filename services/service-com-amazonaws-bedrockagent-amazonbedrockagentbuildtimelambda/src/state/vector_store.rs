@@ -139,7 +139,7 @@ pub fn unsupported_embedding_model(
     let arn = configuration.embedding_model_arn.as_str();
     let model_id = embedding_model_id(arn)?;
     let model =
-        ::service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::catalogued_model(
+        ::service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::offered_model(
             model_id,
         )?;
     (!model

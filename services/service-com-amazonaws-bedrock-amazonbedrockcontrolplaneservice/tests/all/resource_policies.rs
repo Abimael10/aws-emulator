@@ -120,12 +120,12 @@ pub(crate) async fn prompt_router_arn(emu: &Emulator, name: &str) -> String {
                 "models": [{
                     "modelArn":
                         "arn:aws:bedrock:us-west-2::foundation-model/\
-                         anthropic.claude-3-haiku-20240307-v1:0",
+                         amazon.nova-pro-v1:0",
                 }],
                 "fallbackModel": {
                     "modelArn":
                         "arn:aws:bedrock:us-west-2::foundation-model/\
-                         anthropic.claude-3-sonnet-20240229-v1:0",
+                         amazon.nova-lite-v1:0",
                 },
                 "routingCriteria": { "responseQualityDifference": 5.0 },
             })),
@@ -148,7 +148,7 @@ pub(crate) async fn provisioned_model_arn(emu: &Emulator, name: &str) -> String 
             "/provisioned-model-throughput",
             Some(json!({
                 "provisionedModelName": name,
-                "modelId": "amazon.titan-text-lite-v1",
+                "modelId": "meta.llama3-70b-instruct-v1:0",
                 "modelUnits": 1,
                 "commitmentDuration": "OneMonth",
             })),

@@ -285,7 +285,9 @@ pub const INFERENCE_PROFILE_GEOGRAPHIES: &[InferenceProfileGeography] = &[
 /// geography — two models of one geography are offered in different subsets of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossRegionModel {
-    /// The `modelId` of the base model, a row of [`FOUNDATION_MODELS`].
+    /// The `modelId` of the base model, a row of the published catalogues
+    /// ([`published_row`]): a model this control plane offers, or one it offers no longer
+    /// whose profile AWS goes on publishing ([`PAST_END_OF_LIFE_MODELS`]).
     pub model_id: &'static str,
     /// Every region the model is offered in, in region order.
     ///
@@ -301,9 +303,12 @@ pub struct CrossRegionModel {
 ///
 /// The models AWS lists as supported for cross-region inference on "Supported Regions and
 /// models for inference profiles", with the regions that page publishes each model in,
-/// restricted to the ids [`FOUNDATION_MODELS`] carries so no published profile routes to a
-/// model this control plane does not offer — an id with no row publishes no profile rather
-/// than one naming a model nothing serves. A SUBSET of what AWS offers, spanning three
+/// restricted to the ids a published row is carried for ([`published_row`]) so no
+/// published profile routes to a model this service knows nothing about — an id with no row
+/// publishes no profile rather than one naming a model nothing describes. A profile OUTLIVES
+/// the offering of its model: AWS publishes one over a model past its end of life as readily
+/// as over one it still offers, so a row here may name either ([`PAST_END_OF_LIFE_MODELS`]).
+/// A SUBSET of what AWS offers, spanning three
 /// providers and models offered in one geography as well as in all of them, and CLOSED
 /// under [`DEFAULT_PROMPT_ROUTERS`]: every model a published router routes between has a
 /// profile here, because that profile is what the router reports as its target.
@@ -395,10 +400,30 @@ pub const CROSS_REGION_MODELS: &[CrossRegionModel] = &[
         regions: LLAMA_3_1_REGIONS,
     },
     CrossRegionModel {
+        model_id: "meta.llama3-2-11b-instruct-v1:0",
+        regions: LLAMA_3_2_REGIONS,
+    },
+    CrossRegionModel {
+        model_id: "meta.llama3-2-1b-instruct-v1:0",
+        regions: LLAMA_3_2_REGIONS,
+    },
+    CrossRegionModel {
+        model_id: "meta.llama3-2-3b-instruct-v1:0",
+        regions: LLAMA_3_2_REGIONS,
+    },
+    CrossRegionModel {
+        model_id: "meta.llama3-2-90b-instruct-v1:0",
+        regions: LLAMA_3_2_REGIONS,
+    },
+    CrossRegionModel {
         model_id: "meta.llama3-3-70b-instruct-v1:0",
         regions: &["us-east-1", "us-east-2", "us-west-2"],
     },
 ];
+
+/// The regions the Meta Llama 3.2 models are offered in: the two US regions that hold a
+/// copy of them, which is what the profile published over each one routes to.
+const LLAMA_3_2_REGIONS: &[&str] = &["us-east-1", "us-west-2"];
 
 /// The regions the Amazon Nova text models are offered in: every region of every geography
 /// this catalog carries.
@@ -594,7 +619,7 @@ pub fn system_defined_inference_profiles(region: &str) -> Vec<InferenceProfileSu
     let mut profiles: Vec<InferenceProfileSummary> = CROSS_REGION_MODELS
         .iter()
         .filter_map(|published| {
-            let model = catalogued_model(published.model_id)?;
+            let model = published_row(published.model_id)?;
             let routed = cross_region_routed_regions(geography, published);
             if routed.len() < MIN_CROSS_REGION_ROUTED_REGIONS {
                 return None;

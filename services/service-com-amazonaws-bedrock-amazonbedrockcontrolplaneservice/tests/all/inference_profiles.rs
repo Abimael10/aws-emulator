@@ -39,7 +39,7 @@ use crate::support::{emulator, label, Emulator, Reply, ACCOUNT, REGION};
 /// Base model ids this emulator's published catalog carries
 /// (`crate::foundation_models` reports them; the ids are the `modelId`s
 /// `ListFoundationModels` answers with).
-const CATALOG_MODEL: &str = "anthropic.claude-3-haiku-20240307-v1:0";
+const CATALOG_MODEL: &str = "amazon.nova-pro-v1:0";
 const OTHER_CATALOG_MODEL: &str = "amazon.nova-pro-v1:0";
 
 /// A base model id the published catalog does NOT carry, which the real service does: the

@@ -107,6 +107,8 @@ mod foundation_model_capability_projection;
 mod foundation_model_capability_records;
 #[path = "all/foundation_model_catalogue_resolution.rs"]
 mod foundation_model_catalogue_resolution;
+#[path = "all/foundation_model_end_of_life_offering.rs"]
+mod foundation_model_end_of_life_offering;
 #[path = "all/foundation_models.rs"]
 mod foundation_models;
 #[path = "all/get_foundation_model.rs"]

@@ -335,14 +335,14 @@ async fn an_embedding_model_that_produces_no_embedding_is_refused() {
         ModelRow {
             case: "another provider's text-generation model",
             embedding_model:
-                "arn:aws:bedrock:eu-west-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+                "arn:aws:bedrock:eu-west-1::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0"
                     .to_string(),
             accepted: false,
         },
         ModelRow {
             case: "an image-generation model",
             embedding_model:
-                "arn:aws:bedrock:eu-west-1::foundation-model/amazon.titan-image-generator-v1"
+                "arn:aws:bedrock:eu-west-1::foundation-model/stability.stable-diffusion-xl-v1"
                     .to_string(),
             accepted: false,
         },

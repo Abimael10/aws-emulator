@@ -44,8 +44,8 @@ use crate::tagging::{given_guardrail, list_tags, listed, tag, tag_list, MAX_TAGS
 /// Base model ids this account's published catalog carries (`ListFoundationModels` reports
 /// them), used as the target and the fallback of the prompt router and as the source of the
 /// application inference profile these rows tag.
-const ROUTED_MODEL: &str = "anthropic.claude-3-haiku-20240307-v1:0";
-const ROUTED_FALLBACK_MODEL: &str = "anthropic.claude-3-sonnet-20240229-v1:0";
+const ROUTED_MODEL: &str = "amazon.nova-pro-v1:0";
+const ROUTED_FALLBACK_MODEL: &str = "amazon.nova-lite-v1:0";
 
 /// `count` distinct tags whose keys start at `start`, as the owned pairs a listing is
 /// compared against: these rows build batches at an OFFSET — the keys a resource does not

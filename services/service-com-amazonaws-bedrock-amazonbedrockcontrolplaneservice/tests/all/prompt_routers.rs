@@ -46,8 +46,8 @@ use crate::support::{emulator, error_code, label, Emulator, ACCOUNT, REGION};
 /// `PromptRouterTargetModelArn`, whose pattern admits
 /// `arn:aws:bedrock:<region>::foundation-model/<vendor>.<model>[:<n>]`).
 const MODEL_ARNS: &[&str] = &[
-    "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
-    "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0",
+    "arn:aws:bedrock:us-west-2::foundation-model/amazon.nova-pro-v1:0",
+    "arn:aws:bedrock:us-west-2::foundation-model/amazon.nova-lite-v1:0",
     "arn:aws:bedrock:us-west-2::foundation-model/meta.llama3-1-8b-instruct-v1:0",
     "arn:aws:bedrock:us-west-2::foundation-model/amazon.nova-lite-v1:0",
 ];

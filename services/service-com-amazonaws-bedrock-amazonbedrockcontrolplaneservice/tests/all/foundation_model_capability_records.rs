@@ -131,10 +131,10 @@ async fn a_capability_is_reported_as_the_record_that_names_what_is_supported() {
     // whether it is available or deprecated.
     let cases = [
         "amazon.nova-pro-v1:0",
-        "amazon.titan-text-lite-v1",
-        "amazon.titan-text-premier-v1:0",
-        "anthropic.claude-3-5-sonnet-20241022-v2:0",
-        "anthropic.claude-3-haiku-20240307-v1:0",
+        "amazon.nova-2-lite-v1:0",
+        "amazon.nova-micro-v1:0",
+        "cohere.command-light-text-v14",
+        "meta.llama3-70b-instruct-v1:0",
         "cohere.command-text-v14",
         "meta.llama3-1-8b-instruct-v1:0",
         "moonshotai.kimi-k2.5",
@@ -328,7 +328,7 @@ async fn a_model_that_answers_no_turn_of_a_conversation_carries_no_capability_me
         "amazon.titan-embed-text-v1",
         "cohere.embed-english-v3",
         "cohere.rerank-v3-5:0",
-        "amazon.titan-image-generator-v1",
+        "stability.stable-diffusion-xl-v1",
         "stability.stable-image-ultra-v1:1",
     ];
 

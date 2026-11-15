@@ -249,7 +249,7 @@ async fn the_offer_type_narrows_the_listing_to_offers_of_that_type() {
     let emulator = emulator();
     // A third-party model: the one that has an offer to narrow at all. Its id is a
     // published row of this service's own catalog.
-    const MODEL_ID: &str = "anthropic.claude-3-haiku-20240307-v1:0";
+    const MODEL_ID: &str = "anthropic.claude-sonnet-4-20250514-v1:0";
     let all = reported(&offers(&emulator, MODEL_ID, None).await);
     assert!(
         !all.is_empty(),
@@ -301,7 +301,7 @@ async fn an_id_that_names_no_agreement_bearing_model_is_refused_as_invalid() {
     // The qualified form `BedrockModelId`'s pattern admits — the published id with the
     // `:`-separated qualifiers AWS appends to it — names the same model, so it answers the
     // offers of that model.
-    let qualified = offers(&emulator, "anthropic.claude-3-haiku-20240307-v1:0:200k", None).await;
+    let qualified = offers(&emulator, "anthropic.claude-sonnet-4-20250514-v1:0:200k", None).await;
     assert_eq!(
         qualified.status, 200,
         "case a qualified model id: must name the same published model, got {} {:?}",

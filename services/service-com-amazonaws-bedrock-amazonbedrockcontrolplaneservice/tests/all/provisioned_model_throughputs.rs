@@ -60,8 +60,8 @@ use crate::support::{date_time_seconds, emulator, label, Emulator, Reply, ACCOUN
 /// (`service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::FOUNDATION_MODELS`,
 /// which `ListFoundationModels` reports).
 const PROVISIONABLE_MODELS: &[&str] = &[
-    "amazon.titan-text-lite-v1",
-    "anthropic.claude-3-haiku-20240307-v1:0",
+    "amazon.nova-pro-v1:0",
+    "amazon.titan-embed-text-v2:0",
     "cohere.command-text-v14",
     "meta.llama3-70b-instruct-v1:0",
 ];
@@ -71,18 +71,18 @@ const PROVISIONABLE_MODELS: &[&str] = &[
 /// model-unit quota, which is granted at zero, so it is refused for want of model units
 /// whichever of these models it names.
 const NO_COMMITMENT_MODELS: &[&str] = &[
-    "amazon.titan-text-lite-v1",
+    "amazon.nova-micro-v1:0",
     "cohere.command-text-v14",
     "cohere.command-light-text-v14",
-    "amazon.titan-image-generator-v1",
+    "stability.stable-diffusion-xl-v1",
 ];
 
 /// Base models the same catalog offers ON DEMAND ONLY, so no Provisioned Throughput can be
 /// bought over them.
 const ON_DEMAND_ONLY_MODELS: &[&str] = &[
-    "amazon.nova-canvas-v1:0",
-    "amazon.titan-text-premier-v1:0",
-    "ai21.jamba-1-5-mini-v1:0",
+    "luma.ray-v2:0",
+    "amazon.nova-2-lite-v1:0",
+    "amazon.rerank-v1:0",
     "meta.llama3-1-8b-instruct-v1:0",
 ];
 
@@ -698,7 +698,7 @@ async fn a_model_the_catalog_does_not_offer_for_provisioning_is_refused() {
         ),
         (
             "a custom model ARN this account holds no model for",
-            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:custom-model/amazon.titan-text-lite-v1/abcdefghijkl"),
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:custom-model/meta.llama3-70b-instruct-v1:0/abcdefghijkl"),
             404,
             "ResourceNotFoundException",
             CUSTOM_MODEL_NOT_FOUND.to_string(),

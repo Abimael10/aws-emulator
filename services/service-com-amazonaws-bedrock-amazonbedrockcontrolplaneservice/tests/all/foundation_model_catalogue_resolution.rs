@@ -650,7 +650,7 @@ async fn offers(emu: &Emulator, model_id: &str) -> Vec<Value> {
             None,
         )
         .await;
-    let offered_under_agreement = bedrock::state::catalogued_model(model_id)
+    let offered_under_agreement = bedrock::state::offered_model(model_id)
         .is_some_and(bedrock::state::model_offered_under_agreement);
     if !offered_under_agreement {
         assert_eq!(

@@ -17,8 +17,12 @@
 //!    region set.
 //! 3. **Its `createdAt` and `updatedAt` are one instant**, no earlier than the day the
 //!    model it routes to launched — which `GetFoundationModel` reports as
-//!    `modelLifecycle.startOfLifeTime` — and no earlier than the day Amazon Bedrock began
-//!    publishing cross-region profiles, because a profile predates neither.
+//!    `modelLifecycle.startOfLifeTime` while the model is offered, and which the row the
+//!    published catalogues keep for it carries once it is not — and no earlier than the day
+//!    Amazon Bedrock began publishing cross-region profiles, because a profile predates
+//!    neither. A published profile OUTLIVES the offering of its model: AWS goes on
+//!    publishing it once the model is past its end of life, so a read of that model reports
+//!    it missing while the profile goes on being listed.
 //! 4. **A published prompt router's description names its model LINE**, at line level: no
 //!    version qualifier, so the description carries no digit, while the `modelFamily` the
 //!    fallback model is reported under is a generation OF that line.
@@ -35,8 +39,17 @@
 //! cited.
 
 use serde_json::Value;
+use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::support::{emulator, foundation_model_arn, label, Emulator, Reply, ACCOUNT, REGION};
+
+/// Whether the published catalog OFFERS `model_id` — as against publishing a routing
+/// resource over it once it is offered no longer.
+fn is_offered(model_id: &str) -> bool {
+    bedrock::state::FOUNDATION_MODELS
+        .iter()
+        .any(|model| model.model_id == model_id)
+}
 
 /// The day Amazon Bedrock began publishing cross-region inference profiles: the lower
 /// bound of every published profile's instants, as `crate::state`'s
@@ -221,12 +234,15 @@ async fn a_published_profile_reports_and_describes_the_regions_it_routes_to() {
                      base model in the region it routes to"
                 );
                 // Backed, not merely well-spelled: the control plane offers that model in
-                // the region the member names.
+                // the region the member names — or, for a profile that outlived the
+                // offering of its model, reports the model missing there while going on
+                // publishing the profile.
                 let read = get_model(&emu, routed_region, &model_id).await;
+                let expected_status = if is_offered(&model_id) { 200 } else { 404 };
                 assert_eq!(
-                    read.status, 200,
+                    read.status, expected_status,
                     "case {case:?}: the model the profile routes to must be offered in \
-                     {routed_region}, got {} {:?}",
+                     {routed_region} while it is offered at all, got {} {:?}",
                     read.status, read.body
                 );
             }
@@ -326,9 +342,27 @@ async fn a_published_profile_came_into_being_with_its_model_or_with_the_capabili
                  instants agree, got {summary:?}"
             );
 
-            // The launch the control plane itself reports for the model behind the profile.
+            // The launch the control plane itself reports for the model behind the profile,
+            // read through `GetFoundationModel` while the model is offered. A profile over a
+            // model offered no longer has outlived that read, so for it the bound that still
+            // holds is the day the capability itself began being published.
             let model_id = profile_model_id(&profile_id);
             let read = get_model(&emu, region, &model_id).await;
+            if !is_offered(&model_id) {
+                assert_eq!(
+                    read.status, 404,
+                    "case {case:?}: the model behind this profile is offered no longer, so a \
+                     read of it must report it missing, got {} {:?}",
+                    read.status, read.body
+                );
+                assert!(
+                    created.as_str() >= PROFILES_PUBLISHED_AT,
+                    "case {case:?}: a profile predates the capability it belongs to by \
+                     nothing, so its instant is no earlier than {PROFILES_PUBLISHED_AT}, got \
+                     {created:?}"
+                );
+                continue;
+            }
             let launched = read
                 .get("modelDetails")
                 .get("modelLifecycle")
@@ -468,15 +502,38 @@ async fn a_published_router_names_its_line_and_reports_one_instant_at_millisecon
                 .unwrap_or_default(),
         );
         let read = get_model(&emu, REGION, &model_id).await;
+        let line = text(summary, "description")
+            .strip_prefix("Routes requests among models in the ")
+            .and_then(|rest| rest.strip_suffix(" family"))
+            .unwrap_or_default()
+            .to_string();
+        if !is_offered(&model_id) {
+            // A router goes on routing to the profile published over a model offered no
+            // longer, so this one's family is reported by no read: the line it names is
+            // checked against the model's own id instead, which carries the line ahead of
+            // its generation.
+            assert_eq!(
+                read.status, 404,
+                "case {arn:?}: the fallback model {model_id:?} is offered no longer, so a read \
+                 of it must report it missing, got {} {:?}",
+                read.status, read.body
+            );
+            let line_in_id = line.to_lowercase().replace(' ', "");
+            let model_half = model_id
+                .split_once('.')
+                .map(|(_, half)| half.to_string())
+                .unwrap_or_default();
+            assert!(
+                model_half.starts_with(&line_in_id),
+                "case {arn:?}: the fallback model {model_id:?} must be a generation of the \
+                 {line:?} line the router names"
+            );
+            continue;
+        }
         let family = read
             .get("modelDetails")
             .get("modelFamily")
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let line = text(summary, "description")
-            .strip_prefix("Routes requests among models in the ")
-            .and_then(|rest| rest.strip_suffix(" family"))
             .unwrap_or_default()
             .to_string();
         assert!(

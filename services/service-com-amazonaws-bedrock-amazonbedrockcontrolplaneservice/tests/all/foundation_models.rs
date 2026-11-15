@@ -559,11 +559,22 @@ fn the_catalog_spans_every_value_a_caller_can_filter_on() {
                 .iter()
                 .filter(|model| carried(model, value))
                 .count();
-            assert!(
-                count > 0,
-                "case {member:?}={value:?}: no catalog row carries this value, so a filter on it \
-                 asserts nothing"
+            // A value AWS publishes for no model it still offers is carried by no row: the
+            // models continued pre-training was offered for are past their end of life, so
+            // the catalog offers none, and a filter on it narrows the listing to no model
+            // rather than to a row the catalog invents.
+            let offered_for_no_model = (member, *value) == ("byCustomizationType", CONTINUED_PRE_TRAINING);
+            assert_eq!(
+                count == 0,
+                offered_for_no_model,
+                "case {member:?}={value:?}: expected the rows carrying this value to be \
+                 {}, got {count}",
+                if offered_for_no_model { "none" } else { "some" }
             );
         }
     }
 }
+
+/// `ModelCustomization` — the customization AWS offered for the Amazon Titan text models,
+/// which are past their end of life, so the catalog offers no model for it.
+const CONTINUED_PRE_TRAINING: &str = "CONTINUED_PRE_TRAINING";

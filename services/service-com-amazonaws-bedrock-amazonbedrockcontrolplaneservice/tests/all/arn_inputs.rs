@@ -296,7 +296,7 @@ fn cases() -> Vec<Case> {
                 "/model-customization-jobs/{}",
                 label(&customization_job_arn(
                     "us-east-1",
-                    "amazon.titan-text-lite-v1/abcdef012345"
+                    "meta.llama3-70b-instruct-v1:0/abcdef012345"
                 ))
             ),
             body: None,
@@ -467,7 +467,7 @@ fn cases() -> Vec<Case> {
             body: Some(json!({
                 "sourceModelArn": custom_model_arn(
                     "us-east-1",
-                    "anthropic.claude-3-haiku-20240307-v1:0/abcdef123456",
+                    "amazon.nova-pro-v1:0/abcdef123456",
                 ),
                 "targetModelName": "copied-model",
             })),

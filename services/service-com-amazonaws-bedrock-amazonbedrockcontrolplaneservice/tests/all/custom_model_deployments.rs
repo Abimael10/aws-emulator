@@ -54,10 +54,10 @@ use crate::support::{emulator, label, Emulator, Reply, ACCOUNT, REGION};
 /// qualifiers `CustomModelArn`'s pattern admits after the model id
 /// (`([:][a-z0-9-]{1,63}){0,2}`), which name a variant of the same published model.
 const CATALOG_BASE_MODELS: &[&str] = &[
-    "amazon.titan-text-lite-v1",
+    "meta.llama3-70b-instruct-v1:0",
     "cohere.command-text-v14",
     "amazon.nova-lite-v1:0",
-    "amazon.titan-text-lite-v1:0:4k",
+    "cohere.command-text-v14:7:4k",
 ];
 
 /// The base-model segment `CustomModelArn` admits for a model that was IMPORTED rather than
@@ -371,10 +371,10 @@ async fn a_base_model_the_catalog_does_not_carry_is_refused() {
     let rows: Vec<(&str, &str)> = vec![
         ("a provider the catalog does not publish", "sim2real-noexist.v1"),
         ("a model that provider does not publish", "amazon.titan-not-a-model"),
-        ("a near miss on a catalog id", "amazon.titan-text-lite-v1x"),
+        ("a near miss on a catalog id", "amazon.nova-lite-v1:0x"),
         (
             "a catalog id cut at a non-qualifier boundary",
-            "amazon.titan-text-lite-v",
+            "amazon.nova-lite-v",
         ),
         ("a qualifier on a model that does not exist", "cohere.command-nope-v1:0"),
     ];
