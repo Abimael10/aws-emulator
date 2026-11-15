@@ -287,6 +287,8 @@ mod request_condition_context;
 mod reserved_tag_key_wording;
 #[path = "all/resource_tag_condition_context.rs"]
 mod resource_tag_condition_context;
+#[path = "all/role_absence_after_release.rs"]
+mod role_absence_after_release;
 #[path = "all/role_attached_policies.rs"]
 mod role_attached_policies;
 #[path = "all/role_boundary_removal.rs"]
