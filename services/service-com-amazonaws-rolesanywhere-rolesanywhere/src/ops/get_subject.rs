@@ -136,23 +136,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A subject is addressed by its own id and its refusal carries no Region-derived
+        // text, so nothing on this path reads the request's metadata.
+        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let store = state.lock();
 
         // An id no stored subject carries — no credential request has ever been served for
         // that identity, so nothing recorded it — is a 404, never a canned success. The
-        // refusal reports the subject by the ARN the id names in this request's Region, the
-        // wording this service words an ARN-keyed miss with.
+        // refusal this service answers a subject miss with carries NO explanatory text: the
+        // error class alone is the whole body's content, so `message` is left off the wire
+        // rather than filled with a sentence naming an audit record that does not exist.
         let record = store.subjects.get(&input.subject_id).ok_or_else(|| {
-            GetSubjectErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::arn_not_found_message(
-                    &crate::state::subject_arn(
-                        &crate::state::request_region(ctx.parts()),
-                        &input.subject_id,
-                    ),
-                )),
-            })
+            GetSubjectErrorModeled::ResourceNotFoundException(crate::state::subject_not_found())
         })?;
 
         Ok(GetSubjectOutput {

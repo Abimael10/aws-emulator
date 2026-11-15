@@ -23,7 +23,9 @@
 
 use std::time::SystemTime;
 
-use crate::ops::types::{CredentialSummary, InstanceProperty, SubjectDetail};
+use crate::ops::types::{
+    CredentialSummary, InstanceProperty, ResourceNotFoundException, SubjectDetail,
+};
 
 /// The most subjects this emulator holds at once.
 ///
@@ -72,9 +74,24 @@ impl SubjectRecord {
     }
 }
 
+/// The refusal an operation that addresses a subject by its `subjectId` answers when no
+/// record carries that id.
+///
+/// `ResourceNotFoundException$message` is OPTIONAL
+/// (`smithy_query(query="shape", shape="ResourceNotFoundException")`), and the refusal this
+/// service is recorded answering a subject miss with carries no value for it: the error
+/// class, which travels in the response's error-type header, is all of it. So the member is
+/// left off the wire here rather than filled with a sentence — in particular rather than
+/// with the ARN-keyed wording [`crate::state::arn_not_found_message`] words a profile or
+/// CRL miss with, which would also disclose a composed ARN for an audit record that was
+/// never written.
+pub fn subject_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException { message: None }
+}
+
 /// The ARN of the subject this id names, in the Region the request was served in: the ARN
-/// the record that minted it carries, so a refusal naming a subject that is not stored
-/// words the SAME ARN the read of a stored one answers with.
+/// the record that minted it carries, so the read of a stored subject answers with the ARN
+/// the request that minted it composed.
 pub fn subject_arn(region: &str, subject_id: &str) -> String {
     ::engine::emulator_arn(
         crate::state::ARN_NAMESPACE,

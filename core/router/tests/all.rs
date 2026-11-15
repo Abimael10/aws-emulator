@@ -1899,3 +1899,11 @@ mod cloudtrail_iam_credential_write_audit;
 // above each `mod` is what points it into `tests/all/`.
 // `all/every_suite_file_is_declared.rs` check those rules rather than restating them.
 // explains; a note about THIS file belongs in `all/appended_notes.rs`.
+// Single integration-test target for the router: this header, then one
+// sorted by name, and no other line.
+// lands past the declarations is `E0753` and compiles no suite of this target. With none
+// Put a new suite at `tests/all/<name>.rs` and insert its pair into the sorted list below.
+// resolves to a SIBLING of this file, which the layout check refuses: the `#[path]` is what
+// explains; a note about THIS file belongs in `all/appended_notes.rs`, declared below like
+// any other module. `all/all_rs_declares_each_suite_once.rs`,
+// there rather than leaving a note here.
