@@ -44,7 +44,7 @@ use ec2::state::{
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{error_code, error_message, filters, indexed, member};
+use super::ec2_query::{elements, error_code, error_message, filters, indexed, member};
 use super::wire::{child, child_text, document, is_long_id, param, set_items};
 
 /// The Region every call here is signed for. An internet gateway carries no Region member,
@@ -207,6 +207,53 @@ async fn all_ids(router: &MultiServiceRouter, case: &str) -> Vec<String> {
     described_ids(case, &body)
 }
 
+/// The gateways the account ALREADY holds before this suite creates any: the one its default
+/// VPC comes with — "we create ... an internet gateway and connect it to your default VPC"
+/// (Amazon VPC User Guide, "Default VPCs") — which is a gateway of the account like any
+/// other, so every unfiltered report carries it beside the ones created here.
+async fn ambient_ids(router: &MultiServiceRouter) -> Vec<String> {
+    all_ids(router, "the gateways the account already holds").await
+}
+
+/// `ambient` and `created` as one expectation, in `InternetGatewayId` order — which is the
+/// order every report of this operation is in.
+fn estate(ambient: &[String], created: &[String]) -> Vec<String> {
+    let mut ids: Vec<String> = ambient.iter().chain(created).cloned().collect();
+    ids.sort();
+    ids
+}
+
+/// The account's default VPC, and the internet gateway attached to it.
+async fn default_vpc_and_its_gateway(router: &MultiServiceRouter) -> (String, String) {
+    let (status, body) = super::ec2_query::call(
+        router,
+        REGION,
+        "DescribeVpcs",
+        &filters(&[("isDefault", &["true"])]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the account holds a default VPC, got {status} with body {body}"
+    );
+    let vpc_id = elements(&body, "vpcId")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("the account holds a default VPC, got {body}"));
+    let (status, body) = describe(router, &filters(&[("attachment.vpc-id", &[vpc_id.as_str()])])).await;
+    assert_eq!(
+        status, 200,
+        "the default VPC's gateway reads back, got {status} with body {body}"
+    );
+    let reported = described_ids("the default VPC's gateway", &body);
+    assert_eq!(
+        reported.len(),
+        1,
+        "the account's default VPC comes with one internet gateway, got {reported:?}"
+    );
+    (vpc_id, reported.into_iter().next().unwrap_or_default())
+}
+
 /// One row of the create table: the tags a request assigns to the gateway it creates.
 #[derive(Debug, Clone)]
 struct GatewayCase {
@@ -271,6 +318,7 @@ fn borrowed(row: &GatewayCase) -> Vec<(&str, &str)> {
 async fn a_created_gateway_is_read_back_exactly_as_it_was_created() {
     let (router, _engine) = super::ec2_query::emulator();
     let account = engine::emulator_account_id().to_string();
+    let ambient = ambient_ids(&router).await;
 
     let mut created: Vec<String> = Vec::new();
     for row in gateway_cases() {
@@ -320,9 +368,9 @@ async fn a_created_gateway_is_read_back_exactly_as_it_was_created() {
     }
 
     // RULE 2: every one of them is reported, in `InternetGatewayId` order — which the ids
-    // this store mints are also created in, so the table's order is the report's order.
-    let mut expected = created.clone();
-    expected.sort();
+    // this store mints are also created in, so the table's order is the report's order; the
+    // gateway the account's default VPC comes with is reported beside them.
+    let expected = estate(&ambient, &created);
     assert_eq!(
         all_ids(&router, "every created gateway").await,
         expected,
@@ -335,6 +383,7 @@ async fn a_created_gateway_is_read_back_exactly_as_it_was_created() {
 #[tokio::test]
 async fn two_identical_creates_mint_two_gateways() {
     let (router, _engine) = super::ec2_query::emulator();
+    let ambient = ambient_ids(&router).await;
 
     let first = create_gateway_id(&router, "the first create", &[("Name", "twin")]).await;
     let second = create_gateway_id(&router, "the repeat", &[("Name", "twin")]).await;
@@ -344,8 +393,7 @@ async fn two_identical_creates_mint_two_gateways() {
     );
 
     let reported = all_ids(&router, "both gateways").await;
-    let mut expected = vec![first, second];
-    expected.sort();
+    let expected = estate(&ambient, &[first, second]);
     assert_eq!(
         reported, expected,
         "expected both gateways reported in id order, got {reported:?}"
@@ -358,28 +406,36 @@ async fn two_identical_creates_mint_two_gateways() {
 #[tokio::test]
 async fn an_id_list_narrows_the_report_and_an_unknown_id_is_refused() {
     let (router, _engine) = super::ec2_query::emulator();
+    let ambient = ambient_ids(&router).await;
 
     let first = create_gateway_id(&router, "the first gateway", &[("Name", "first")]).await;
     let second = create_gateway_id(&router, "the second gateway", &[("Name", "second")]).await;
     let third = create_gateway_id(&router, "the third gateway", &[]).await;
 
     // (case, the ids asked for, the ids expected back)
-    let selections: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
-        ("no id at all reports the whole store", Vec::new(), vec![
-            first.as_str(),
-            second.as_str(),
-            third.as_str(),
-        ]),
-        ("one id", vec![second.as_str()], vec![second.as_str()]),
+    let selections: Vec<(&str, Vec<&str>, Vec<String>)> = vec![
+        (
+            "no id at all reports the whole store",
+            Vec::new(),
+            estate(
+                &ambient,
+                &[first.clone(), second.clone(), third.clone()],
+            ),
+        ),
+        (
+            "one id",
+            vec![second.as_str()],
+            vec![second.clone()],
+        ),
         (
             "two of the three, asked for in the other order",
             vec![third.as_str(), first.as_str()],
-            vec![first.as_str(), third.as_str()],
+            vec![first.clone(), third.clone()],
         ),
         (
             "the same id twice is still one row",
             vec![first.as_str(), first.as_str()],
-            vec![first.as_str()],
+            vec![first.clone()],
         ),
     ];
     for (case, asked, expected) in selections {
@@ -390,7 +446,7 @@ async fn an_id_list_narrows_the_report_and_an_unknown_id_is_refused() {
         );
         assert_eq!(
             described_ids(case, &body),
-            super::ec2_query::owned(&expected),
+            expected,
             "case {case:?}: expected exactly {expected:?}, got body {body}"
         );
     }
@@ -430,6 +486,10 @@ type FilterCase<'a> = (&'a str, Vec<(&'a str, Vec<&'a str>)>, Vec<&'a str>);
 async fn every_documented_filter_selects_on_its_member() {
     let (router, _engine) = super::ec2_query::emulator();
     let account = engine::emulator_account_id().to_string();
+    // The account's own default VPC and the gateway attached to it: the one attachment this
+    // account holds before the suite creates anything, which is what the `attachment.…`
+    // filters below select.
+    let (default_vpc, default_gateway) = default_vpc_and_its_gateway(&router).await;
 
     let alpha = create_gateway_id(
         &router,
@@ -458,7 +518,16 @@ async fn every_documented_filter_selects_on_its_member() {
         (
             "owner-id names the account every gateway belongs to",
             vec![("owner-id", vec![account.as_str()])],
-            vec![alpha.as_str(), beta.as_str(), untagged.as_str()],
+            {
+                let mut ids = vec![
+                    default_gateway.as_str(),
+                    alpha.as_str(),
+                    beta.as_str(),
+                    untagged.as_str(),
+                ];
+                ids.sort_unstable();
+                ids
+            },
         ),
         (
             "owner-id of another account selects nothing",
@@ -501,16 +570,22 @@ async fn every_documented_filter_selects_on_its_member() {
             vec![("tag-key", Vec::new())],
             Vec::new(),
         ),
-        // "Present only if a VPC is attached": nothing here is attached, so an
-        // `attachment.…` filter selects nothing whatever value it names.
+        // "Present only if a VPC is attached": nothing this suite created is attached, so an
+        // `attachment.…` filter selects exactly the gateway the account's DEFAULT VPC comes
+        // with — and nothing at all for a value no attachment carries.
         (
-            "attachment.state while no VPC is attached",
+            "attachment.state names the one attachment the account holds",
             vec![("attachment.state", vec!["available"])],
-            Vec::new(),
+            vec![default_gateway.as_str()],
         ),
         (
-            "attachment.vpc-id while no VPC is attached",
-            vec![("attachment.vpc-id", vec!["vpc-00000000000000001"])],
+            "attachment.vpc-id names the default VPC the account's gateway attaches",
+            vec![("attachment.vpc-id", vec![default_vpc.as_str()])],
+            vec![default_gateway.as_str()],
+        ),
+        (
+            "attachment.vpc-id of a VPC no gateway attaches",
+            vec![("attachment.vpc-id", vec!["vpc-09999999999999999"])],
             Vec::new(),
         ),
     ];
@@ -558,10 +633,11 @@ async fn every_documented_filter_selects_on_its_member() {
 #[tokio::test]
 async fn the_report_pages_in_id_order() {
     let (router, _engine) = super::ec2_query::emulator();
+    let ambient = ambient_ids(&router).await;
 
-    let mut ids: Vec<String> = Vec::new();
+    let mut created: Vec<String> = Vec::new();
     for index in 0..7 {
-        ids.push(
+        created.push(
             create_gateway_id(
                 &router,
                 "a gateway to page over",
@@ -570,7 +646,9 @@ async fn the_report_pages_in_id_order() {
             .await,
         );
     }
-    ids.sort();
+    // The whole estate the report pages over: the created gateways and the one the account's
+    // default VPC comes with.
+    let ids = estate(&ambient, &created);
 
     // The smallest page the model admits (`DescribeInternetGatewaysMaxResults`, range
     // 5..1000), walked to the end: the last page carries no token.
@@ -606,9 +684,11 @@ async fn the_report_pages_in_id_order() {
         }
     }
     assert_eq!(
-        pages, 2,
-        "expected {} gateways to take two pages of {page_size}, took {pages}",
-        ids.len()
+        pages,
+        ids.len().div_ceil(page_size),
+        "expected {} gateways to take {} page(s) of {page_size}, took {pages}",
+        ids.len(),
+        ids.len().div_ceil(page_size)
     );
     assert_eq!(
         seen, ids,
@@ -652,7 +732,9 @@ async fn the_report_pages_in_id_order() {
 #[tokio::test]
 async fn a_dry_run_changes_nothing() {
     let (router, _engine) = super::ec2_query::emulator();
+    let ambient = ambient_ids(&router).await;
     let before = create_gateway_id(&router, "the stored gateway", &[("Name", "kept")]).await;
+    let held = estate(&ambient, &[before]);
 
     // (case, the extra request fields of the create)
     let dry_runs: Vec<(&str, Vec<(String, String)>)> = vec![
@@ -679,7 +761,7 @@ async fn a_dry_run_changes_nothing() {
         );
         assert_eq!(
             all_ids(&router, case).await,
-            vec![before.clone()],
+            held,
             "case {case:?}: a dry run must store nothing"
         );
     }
@@ -697,7 +779,7 @@ async fn a_dry_run_changes_nothing() {
     );
     assert_eq!(
         all_ids(&router, "after the dry-run describe").await,
-        vec![before],
+        held,
         "a dry-run describe must leave the store as it was"
     );
 }
@@ -707,6 +789,7 @@ async fn a_dry_run_changes_nothing() {
 #[tokio::test]
 async fn a_tag_specification_for_another_resource_type_is_refused() {
     let (router, _engine) = super::ec2_query::emulator();
+    let ambient = ambient_ids(&router).await;
 
     for other in ["vpc", "network-acl", "subnet"] {
         let params = vec![
@@ -729,8 +812,9 @@ async fn a_tag_specification_for_another_resource_type_is_refused() {
             format!("'{other}' is not a valid resource type for tagging on CreateInternetGateway"),
             "case {other:?}: expected the wording naming the type and the action, got body {body}"
         );
-        assert!(
-            all_ids(&router, other).await.is_empty(),
+        assert_eq!(
+            all_ids(&router, other).await,
+            ambient,
             "case {other:?}: a refused create must store nothing"
         );
     }
@@ -833,6 +917,7 @@ fn refused_tag_cases() -> Vec<RefusedTagCase> {
 #[tokio::test]
 async fn a_tag_payload_past_a_published_bound_is_refused_and_stores_nothing() {
     let (router, _engine) = super::ec2_query::emulator();
+    let ambient = ambient_ids(&router).await;
 
     for row in refused_tag_cases() {
         let case = row.case;
@@ -852,10 +937,10 @@ async fn a_tag_payload_past_a_published_bound_is_refused_and_stores_nothing() {
             row.message,
             "case {case:?}: expected the wording naming what the request broke, got body {body}"
         );
-        assert!(
-            all_ids(&router, case).await.is_empty(),
-            "case {case:?}: a refused create must store nothing, got {:?}",
-            all_ids(&router, case).await
+        let held = all_ids(&router, case).await;
+        assert_eq!(
+            held, ambient,
+            "case {case:?}: a refused create must store nothing, got {held:?}"
         );
     }
 }

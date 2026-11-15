@@ -111,8 +111,16 @@ fn next_token(body: &str) -> Option<String> {
 /// is attached to, and how the tag plane cuts across that.
 #[derive(Debug)]
 struct Estate {
-    /// Every gateway the account holds, in `InternetGatewayId` order.
+    /// Every gateway the account holds, in `InternetGatewayId` order: the ones created here
+    /// and the one the account's default VPC comes with.
     all: Vec<String>,
+    /// The gateways the account ALREADY held before this suite created any — "we create ...
+    /// an internet gateway and connect it to your default VPC" (Amazon VPC User Guide,
+    /// "Default VPCs") — which carry none of this suite's tags and are attached to that VPC.
+    ambient: Vec<String>,
+    /// The gateways this suite created, in `InternetGatewayId` order: the ones carrying its
+    /// `Index` and `Group` tags.
+    created: Vec<String>,
     /// Each attached gateway as `(vpc_id, internet_gateway_id)`, in attach order.
     attached: Vec<(String, String)>,
     /// The gateways tagged `Group=a`, in `InternetGatewayId` order.
@@ -129,7 +137,11 @@ struct Estate {
 /// different subsets rather than the same one asked for twice.
 async fn build_estate(router: &MultiServiceRouter) -> Estate {
     let case = "the estate";
-    let mut all = Vec::new();
+    // What the account already holds: the gateway of its default VPC, which every unfiltered
+    // report carries beside the ones below.
+    let ambient = reported_ids(case, &ok(case, router, "DescribeInternetGateways", &[]).await);
+    let mut all = ambient.clone();
+    let mut created = Vec::new();
     let mut attached = Vec::new();
     let mut group_a = Vec::new();
     let mut group_b = Vec::new();
@@ -177,14 +189,18 @@ async fn build_estate(router: &MultiServiceRouter) -> Estate {
             attached.push((vpc_id, internet_gateway_id.clone()));
         }
 
+        created.push(internet_gateway_id.clone());
         all.push(internet_gateway_id);
     }
 
     all.sort();
+    created.sort();
     group_a.sort();
     group_b.sort();
     Estate {
         all,
+        ambient,
+        created,
         attached,
         group_a,
         group_b,
@@ -264,14 +280,20 @@ fn selections(estate: &Estate) -> Vec<Selection> {
             estate.group_b.clone(),
         ),
         row(
-            "tag-key names a key every gateway carries",
+            "tag-key names a key every created gateway carries",
             filters(&[("tag-key", &["Index"])]),
-            estate.all.clone(),
+            estate.created.clone(),
         ),
         row(
             "attachment.state selects every attached gateway",
             filters(&[("attachment.state", &["available"])]),
-            sorted(estate.attached.iter().map(|(_, id)| id.clone())),
+            sorted(
+                estate
+                    .attached
+                    .iter()
+                    .map(|(_, id)| id.clone())
+                    .chain(estate.ambient.iter().cloned()),
+            ),
         ),
         row(
             "attachment.vpc-id selects the one gateway of that VPC",

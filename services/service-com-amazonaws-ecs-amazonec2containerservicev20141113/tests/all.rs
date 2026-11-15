@@ -75,6 +75,8 @@ mod daemon_task_definitions;
 mod daemons;
 #[path = "all/default_capacity_provider_strategy_placement.rs"]
 mod default_capacity_provider_strategy_placement;
+#[path = "all/default_network_alb_service.rs"]
+mod default_network_alb_service;
 #[path = "all/delete_attributes.rs"]
 mod delete_attributes;
 #[path = "all/deployment_circuit_breaker.rs"]

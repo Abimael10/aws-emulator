@@ -132,12 +132,19 @@ async fn refused_for_its_state(case: &str, router: &MultiServiceRouter, family: 
     );
 }
 
-/// An id of the same form as `id` that names no resource of the account: the last character
-/// of a minted id, changed.
+/// An id of the same form as `id` that names no resource of the account: a HIGH-ORDER digit
+/// of a minted id, changed — the counter this store mints ids from cannot reach a value
+/// carrying one, so the result names nothing however many resources the account already
+/// holds.
 fn unknown_like(id: &str) -> String {
-    let (head, last) = id.split_at(id.len() - 1);
-    let replacement = if last == "f" { "0" } else { "f" };
-    format!("{head}{replacement}")
+    let Some((prefix, digits)) = id
+        .split_once('-')
+        .filter(|(_, digits)| !digits.is_empty())
+    else {
+        return format!("{id}f");
+    };
+    let replacement = if digits.starts_with('f') { '0' } else { 'f' };
+    format!("{prefix}-{replacement}{}", &digits[1..])
 }
 
 /// The subnet ids the account holds, read over the wire rather than out of the store.

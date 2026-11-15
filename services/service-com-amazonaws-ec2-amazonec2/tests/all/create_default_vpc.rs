@@ -22,7 +22,7 @@
 //! [`super::default_network_per_region`]'s subject; this suite is what CREATING one does.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ec2::state::{
     is_catalog_region, ComAmazonawsEc2Amazonec2State as Ec2State, AVAILABILITY_ZONES_PER_REGION,
@@ -50,11 +50,11 @@ const REGION_OUTSIDE_THE_CATALOG: &str = "zz-nowhere-1";
 /// part: it says only that the account already has one where it asked.
 const ALREADY_EXISTS_MESSAGE: &str = "A Default VPC already exists for this account in this region.";
 
-/// Long enough past [`ec2::state::TRANSITION_DELAY`] that the move the clock owes a created
-/// VPC is due, without depending on the exact span.
-fn past_the_transition() -> Duration {
-    ec2::state::TRANSITION_DELAY + Duration::from_millis(400)
-}
+/// How long a row waits for the move the clock owes a created VPC, and how often it looks
+/// again. Generous beside [`ec2::state::TRANSITION_DELAY`], so a loaded machine cannot fail a
+/// row the emulator satisfies, and nothing here depends on the exact span.
+const READY_DEADLINE: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// One `action` call signed for `region`, as its HTTP status and XML body.
 async fn call(
@@ -113,9 +113,28 @@ async fn subnets_of(case: &str, router: &MultiServiceRouter, region: &str, vpc_i
     elements(&body, "subnetId")
 }
 
-/// Delete the whole default network `region` holds — its default subnets first, because "you
-/// must detach or delete all gateways and resources that are associated with the VPC before
-/// you can delete it" (`DeleteVpc`) — and answer the `VpcId` that was deleted.
+/// The internet gateway ids `DescribeInternetGateways` reports as attached to `vpc_id`.
+async fn gateways_of(
+    case: &str,
+    router: &MultiServiceRouter,
+    region: &str,
+    vpc_id: &str,
+) -> Vec<String> {
+    let body = ok(
+        case,
+        router,
+        region,
+        "DescribeInternetGateways",
+        &filters(&[("attachment.vpc-id", &[vpc_id])]),
+    )
+    .await;
+    elements(&body, "internetGatewayId")
+}
+
+/// Delete the whole default network `region` holds — its default subnets first, then the
+/// internet gateway it comes with, because "you must detach or delete all gateways and
+/// resources that are associated with the VPC before you can delete it" (`DeleteVpc`) — and
+/// answer the `VpcId` that was deleted.
 ///
 /// The state a caller that "deleted your previous default VPC" is in, reached the way that
 /// caller reaches it: over the wire, through the operations that do it.
@@ -138,6 +157,27 @@ async fn delete_the_default_network(
             region,
             "DeleteSubnet",
             &[param("SubnetId", &subnet_id)],
+        )
+        .await;
+    }
+    for internet_gateway_id in gateways_of(case, router, region, &vpc_id).await {
+        let _ = ok(
+            case,
+            router,
+            region,
+            "DetachInternetGateway",
+            &[
+                param("InternetGatewayId", &internet_gateway_id),
+                param("VpcId", &vpc_id),
+            ],
+        )
+        .await;
+        let _ = ok(
+            case,
+            router,
+            region,
+            "DeleteInternetGateway",
+            &[param("InternetGatewayId", &internet_gateway_id)],
         )
         .await;
     }
@@ -398,6 +438,34 @@ async fn create_default_vpc_creates_the_regions_network_after_the_previous_one_w
             "case {case:?}: expected the default group of {vpc_id}, got {groups}"
         );
 
+        // And the internet path a default VPC comes with: AWS creates "an internet gateway
+        // and connect[s] it to your default VPC" and "a main route table for your default VPC
+        // with a route that sends all traffic destined for the internet to the internet
+        // gateway" (Amazon VPC User Guide, "Default VPCs"), which is what makes those
+        // public-IP-on-launch subnets public ones.
+        let gateways = gateways_of(case, &router, region, &vpc_id).await;
+        assert_eq!(
+            gateways.len(),
+            1,
+            "case {case:?}: expected one internet gateway attached to {vpc_id}, got \
+             {gateways:?}"
+        );
+        let tables = ok(
+            case,
+            &router,
+            region,
+            "DescribeRouteTables",
+            &filters(&[("vpc-id", &[vpc_id.as_str()])]),
+        )
+        .await;
+        assert!(
+            tables.contains("<destinationCidrBlock>0.0.0.0/0</destinationCidrBlock>")
+                && tables.contains(&format!("<gatewayId>{}</gatewayId>", gateways[0])),
+            "case {case:?}: expected the main route table to send 0.0.0.0/0 to {}, got \
+             {tables}",
+            gateways[0]
+        );
+
         // The Region now falls back on the VPC that was just created: a group created
         // without a `VpcId` lands in it — "the ID of the VPC. Required for a nondefault VPC"
         // (`CreateSecurityGroup$VpcId`).
@@ -445,24 +513,32 @@ async fn create_default_vpc_creates_the_regions_network_after_the_previous_one_w
         created.push((region, vpc_id));
     }
 
-    // The move the clock owes every created VPC: `available` one TRANSITION_DELAY after the
-    // create, whether or not anybody called in between. Waited out once for the whole table.
-    tokio::time::sleep(past_the_transition()).await;
+    // The move the clock owes every created VPC: `available`, one TRANSITION_DELAY after the
+    // create, whether or not anybody called in between. POLLED for rather than slept through,
+    // so the row waits for the condition instead of for a span of the host's clock; the
+    // deadline is only here so a failure is a failure rather than a hang.
     for (region, vpc_id) in &created {
-        let body = ok(
-            region,
-            &router,
-            region,
-            "DescribeVpcs",
-            &indexed("VpcId", &[vpc_id.as_str()]),
-        )
-        .await;
-        assert_eq!(
-            member(region, &body, "state"),
-            "available",
-            "case {region:?}: one TRANSITION_DELAY after the create the VPC must be \
-             available, got {body}"
-        );
+        let deadline = Instant::now() + READY_DEADLINE;
+        loop {
+            let body = ok(
+                region,
+                &router,
+                region,
+                "DescribeVpcs",
+                &indexed("VpcId", &[vpc_id.as_str()]),
+            )
+            .await;
+            let state = member(region, &body, "state");
+            if state == "available" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {region:?}: the clock owes the created VPC its move to available, it is \
+                 still {state:?}: {body}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 }
 

@@ -839,6 +839,78 @@ impl ComAmazonawsEc2Amazonec2State {
         Some(route_table)
     }
 
+    /// The MAIN route table of the VPC `vpc_id` — "your VPC automatically comes with a main
+    /// route table", the one a subnet with no association of its own uses — read off the
+    /// implicit association that table carries ([`Self::insert_route_table`]), which is the
+    /// same member [`Self::route_table_is_main`] asks about, so the two cannot disagree about
+    /// which table is the main one.
+    ///
+    /// `None` for a VPC the store holds no table of, which is a VPC whose create found the
+    /// route-table ceiling already reached.
+    pub fn main_route_table_of_vpc(&self, vpc_id: &str) -> Option<String> {
+        self.route_tables
+            .iter()
+            .find(|(_, route_table)| {
+                route_table.vpc_id.as_deref() == Some(vpc_id)
+                    && route_table
+                        .associations
+                        .iter()
+                        .flatten()
+                        .any(|association| association.main == Some(true))
+            })
+            .map(|(route_table_id, _)| route_table_id.clone())
+    }
+
+    /// Give the DEFAULT VPC `vpc_id` the internet path it comes with, and answer the
+    /// `InternetGatewayId` of the gateway that path leads through.
+    ///
+    /// A default VPC is reachable from the internet the moment the account has it: AWS creates
+    /// "an internet gateway and connect[s] it to your default VPC" and "a main route table for
+    /// your default VPC with a route that sends all traffic destined for the internet to the
+    /// internet gateway" (Amazon VPC User Guide, "Default VPCs") — which, together with the
+    /// `MapPublicIpOnLaunch` its default subnets carry ([`Self::insert_default_subnets`]), is
+    /// what makes a default subnet a PUBLIC subnet. So this is part of what a default VPC IS,
+    /// and it is written by the one writer of such a VPC
+    /// ([`Self::insert_default_network`]) — never by a caller, who has to create both for a
+    /// VPC of their own ("to use an internet gateway, your subnet's route table must contain a
+    /// route that directs internet-bound traffic to the internet gateway", same guide).
+    ///
+    /// The route is the one a `CreateRoute` would have added, so it is reported with that
+    /// origin ([`ROUTE_ORIGIN_CREATE_ROUTE`]) beside the local route the table came with, and
+    /// it is `active` because the gateway it points at is attached to this very VPC.
+    ///
+    /// `None`, with nothing written, when the store has no room for the gateway or holds no
+    /// main route table for the VPC — the terms every other part of the default network is
+    /// written on: the network is then as complete as the store allows rather than claiming a
+    /// path that leads nowhere.
+    pub fn insert_default_internet_path(&mut self, vpc_id: &str) -> Option<String> {
+        let route_table_id = self.main_route_table_of_vpc(vpc_id)?;
+        let internet_gateway_id = self.insert_internet_gateway(Vec::new())?;
+        let attached = self.attach_internet_gateway(&internet_gateway_id, vpc_id);
+        let routed = self.insert_route(
+            &route_table_id,
+            RouteSpec {
+                // The default route matches every address outside the VPC, which is every
+                // IPv4 address as a CIDR block ([`super::ALL_IPV4_ADDRESSES`]) — the one
+                // spelling of that block this crate keeps.
+                destination_cidr_block: Some(super::ALL_IPV4_ADDRESSES.to_string()),
+                destination_ipv6_cidr_block: None,
+                destination_prefix_list_id: None,
+                target: RouteTarget::Gateway(internet_gateway_id.clone()),
+                origin: ROUTE_ORIGIN_CREATE_ROUTE,
+            },
+        );
+        // Either half refusing leaves a path that leads nowhere — a gateway nothing routes
+        // to, or a route to a gateway that attaches no VPC — so the gateway is given back and
+        // nothing is claimed, which is the contract this answers `None` on.
+        if !attached || !routed {
+            self.remove_internet_gateway(&internet_gateway_id);
+            self.remove_route(&route_table_id, super::ALL_IPV4_ADDRESSES);
+            return None;
+        }
+        Some(internet_gateway_id)
+    }
+
     /// Whether the route table `route_table_id` is the MAIN table of its VPC — "your VPC
     /// automatically comes with a main route table" — which is what the table's own implicit
     /// association records ([`Self::insert_route_table`]).

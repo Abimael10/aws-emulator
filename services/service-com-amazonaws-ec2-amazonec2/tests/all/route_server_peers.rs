@@ -1696,7 +1696,16 @@ async fn delete_route_server_peer_refuses_an_id_that_names_nothing() {
         ),
         (
             "the stored peer's id with one character changed",
-            format!("{}0", &peer_id[..peer_id.len() - 1]),
+            {
+                // A HIGH-ORDER digit of the minted id, changed: the counter this store mints
+                // ids from cannot reach a value carrying one, so this names no peer of the
+                // account whatever the stored id happens to end in.
+                let (prefix, digits) = peer_id
+                    .split_once('-')
+                    .expect("a minted id is <prefix>-<hex digits>");
+                let replacement = if digits.starts_with('f') { '0' } else { 'f' };
+                format!("{prefix}-{replacement}{}", &digits[1..])
+            },
         ),
     ];
 

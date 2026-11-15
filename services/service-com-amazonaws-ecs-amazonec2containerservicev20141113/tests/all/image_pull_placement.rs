@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    create_cluster, ec2, ec2_element, ecr, emulator_with_ec2, list, ok, string, ACCOUNT,
+    create_cluster, ec2, ec2_element, ec2_form, ecr, emulator_with_ec2, list, ok, string, ACCOUNT,
     AWSVPC_START, SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
@@ -608,6 +608,88 @@ async fn a_task_is_stopped_when_its_placement_cannot_reach_the_image_registry() 
             );
         } else {
             assert_failed_to_start(&task, &image, case);
+        }
+    }
+}
+
+/// One DEFAULT subnet of the account's own default VPC, read through Amazon EC2's own API.
+///
+/// Nothing is created here: "when you create an AWS account, we create a default VPC for you
+/// in each AWS Region", with "a default subnet in each Availability Zone" (Amazon VPC User
+/// Guide, "Default VPCs"), so this is the placement a caller that created no network of its
+/// own launches into.
+async fn default_subnet(router: &MultiServiceRouter, case: &str) -> String {
+    let vpcs = ec2_form(
+        router,
+        "DescribeVpcs",
+        &[("Filter.1.Name", "isDefault"), ("Filter.1.Value.1", "true")],
+        case,
+    )
+    .await;
+    let vpc = ec2_element(&vpcs, "vpcId", case);
+    let subnets = ec2_form(
+        router,
+        "DescribeSubnets",
+        &[
+            ("Filter.1.Name", "vpc-id"),
+            ("Filter.1.Value.1", &vpc),
+            ("Filter.2.Name", "default-for-az"),
+            ("Filter.2.Value.1", "true"),
+        ],
+        case,
+    )
+    .await;
+    ec2_element(&subnets, "subnetId", case)
+}
+
+/// The rule one level along: the account's DEFAULT VPC comes with the path a placement in it
+/// needs, so a task launched into one of its default subnets WITH a public address fetches an
+/// image held in a public registry and runs, while one given no public address still cannot —
+/// "if you don't specify an IP address ... the task won't have access to the internet".
+///
+/// The rows differ in `assignPublicIp`, which is what an internet gateway's route carries
+/// traffic for; the subnet is the account's own, created by nothing in this suite.
+#[tokio::test]
+async fn a_task_in_a_default_subnet_fetches_a_public_image_over_the_default_gateway() {
+    let router = emulator_with_ec2();
+    create_cluster(&router, CLUSTER, "default-vpc").await;
+    register(&router, "defaultvpcfamily", PUBLIC_IMAGE, "default-vpc").await;
+    let subnet_id = default_subnet(&router, "default-vpc").await;
+
+    // (case, assignPublicIp, whether the image can be fetched from there)
+    let rows: [(&str, &str, bool); 2] = [
+        ("a default subnet with a public address", "ENABLED", true),
+        ("a default subnet with no public address", "DISABLED", false),
+    ];
+
+    let mut launched = Vec::new();
+    for (case, assign_public_ip, fetchable) in rows {
+        let task_arn = run(
+            &router,
+            "defaultvpcfamily",
+            &subnet_id,
+            assign_public_ip,
+            case,
+        )
+        .await;
+        launched.push((case, task_arn, fetchable));
+    }
+
+    for (case, task_arn, fetchable) in launched {
+        let task = settled(&router, &task_arn, case).await;
+        if fetchable {
+            assert_eq!(
+                string(&task, "lastStatus", case),
+                RUNNING,
+                "case {case:?}: expected a task placed in a default subnet to reach \
+                 {RUNNING}, got {task}"
+            );
+            assert!(
+                task["stopCode"].is_null(),
+                "case {case:?}: expected no stopCode on a running task, got {task}"
+            );
+        } else {
+            assert_failed_to_start(&task, PUBLIC_IMAGE, case);
         }
     }
 }

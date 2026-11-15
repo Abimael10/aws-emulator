@@ -1030,7 +1030,10 @@
 //!
 //! [`ComAmazonawsEc2Amazonec2State::ensure_default_network`] is the ONE place it is
 //! materialised — a default VPC at [`DEFAULT_VPC_CIDR_BLOCK`], one default subnet per zone
-//! of that Region, and that VPC's default security group — and it is idempotent per
+//! of that Region, that VPC's default security group, and the internet gateway AWS attaches
+//! to a default VPC with the default route to it in its main route table
+//! ([`ComAmazonawsEc2Amazonec2State::insert_default_internet_path`]) — and it is idempotent
+//! per
 //! Region: the Region's `VpcId` is recorded, so the second call in a Region answers the
 //! same ids instead of seeding a second copy of the same network. The store itself is per
 //! ACCOUNT, not per Region (a `Vpc` carries no Region member, so nothing in `DescribeVpcs`
@@ -1844,13 +1847,17 @@
 //! attached to no VPC, an attachment being what `AttachInternetGateway` records on it later.
 //! The store's own primitives live in the [`internet_gateways`] module.
 //!
-//! Nothing here gives the ambient default network of a Region the internet gateway AWS
-//! attaches to a default VPC, so an unfiltered `DescribeInternetGateways` on an account that
-//! created none reports an empty set where AWS reports that one: the gateway AWS gives a
-//! default VPC is an ATTACHED one, and the attachment seam it needs is
-//! `AttachInternetGateway`, which is still a scaffold (`src/ops/attach_internet_gateway.rs`
-//! carries the stub marker). Seeding it here would write an attachment no implemented
-//! operation owns, so it belongs with that operation rather than with this store.
+//! The ambient default network of a Region DOES come with the internet gateway AWS attaches
+//! to a default VPC, and with the route that sends internet-bound traffic to it — "we create
+//! ... an internet gateway and connect it to your default VPC" and "a main route table for
+//! your default VPC with a route that sends all traffic destined for the internet to the
+//! internet gateway" (Amazon VPC User Guide, "Default VPCs") — written by
+//! [`ComAmazonawsEc2Amazonec2State::insert_default_internet_path`] through the same
+//! attachment seam `AttachInternetGateway` writes
+//! ([`ComAmazonawsEc2Amazonec2State::attach_internet_gateway`]). So an unfiltered
+//! `DescribeInternetGateways` on an account that created none reports that one gateway,
+//! which is what AWS reports, and a workload placed in a default subnet has the path off the
+//! VPC that makes such a subnet a PUBLIC one.
 //!
 //! ## Infrastructure Performance metric subscriptions
 //!

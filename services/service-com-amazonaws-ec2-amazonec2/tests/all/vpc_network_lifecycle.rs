@@ -1081,7 +1081,8 @@ async fn delete_security_group_removes_a_created_group_and_refuses_the_default_o
 /// — once nothing is.
 ///
 /// The rows differ in WHAT holds the VPC: a subnet, a security group the caller created,
-/// both at once, the default VPC's own seeded subnets, and nothing at all.
+/// both at once, the default VPC's own seeded subnets, the internet gateway that VPC comes
+/// with, and nothing at all.
 #[tokio::test]
 async fn delete_vpc_refuses_while_anything_is_associated_with_it() {
     let router = emulator();
@@ -1162,7 +1163,9 @@ async fn delete_vpc_refuses_while_anything_is_associated_with_it() {
     );
 
     // Row 5: the default VPC a fresh account already has is held by its own seeded
-    // subnets, and deletes once they are gone.
+    // subnets AND by the internet gateway it comes with, and deletes once both are gone —
+    // "you must detach or delete all gateways and resources that are associated with the
+    // VPC before you can delete it" (`DeleteVpc`).
     let case = "the default VPC";
     let default_vpc = {
         let body = ok(
@@ -1195,6 +1198,29 @@ async fn delete_vpc_refuses_while_anything_is_associated_with_it() {
         )
         .await;
     }
+    // The gateway the default VPC comes with holds it exactly as any attached gateway holds
+    // its VPC, so the delete is refused until it is detached.
+    let default_gateway = {
+        let body = ok(
+            case,
+            &router,
+            "DescribeInternetGateways",
+            &filters(&[("attachment.vpc-id", &[default_vpc.as_str()])]),
+        )
+        .await;
+        member(case, &body, "internetGatewayId")
+    };
+    expect_dependency_violation(case, &router, &default_vpc, &default_gateway).await;
+    ok(
+        case,
+        &router,
+        "DetachInternetGateway",
+        &[
+            param("InternetGatewayId", &default_gateway),
+            param("VpcId", &default_vpc),
+        ],
+    )
+    .await;
     ok(case, &router, "DeleteVpc", &[param("VpcId", &default_vpc)]).await;
 
     // And a VPC id no VPC of the account has.

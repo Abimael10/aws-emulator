@@ -1255,12 +1255,13 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// "When you create an AWS account, we create a default VPC for you in each AWS
     /// Region", and "when we create a default VPC, we create a default subnet in each
-    /// Availability Zone in the Region" together with the VPC's default security group
-    /// (Amazon VPC User Guide, "Default VPCs"). So the network exists in whichever Region
-    /// the account is calling in, and this is the one place it is materialised: a default
-    /// VPC at [`DEFAULT_VPC_CIDR_BLOCK`], one default subnet per zone of THAT Region
-    /// ([`Self::insert_default_subnets`], over [`availability_zones_in_region`]) and
-    /// [`Self::insert_default_security_group`].
+    /// Availability Zone in the Region" together with the VPC's default security group, an
+    /// internet gateway attached to the VPC and a main route table that sends all
+    /// internet-bound traffic to it (Amazon VPC User Guide, "Default VPCs"). So the network
+    /// exists in whichever Region the account is calling in, and this is the one place it is
+    /// materialised: a default VPC at [`DEFAULT_VPC_CIDR_BLOCK`], one default subnet per zone
+    /// of THAT Region ([`Self::insert_default_subnets`], over [`availability_zones_in_region`]),
+    /// [`Self::insert_default_security_group`] and [`Self::insert_default_internet_path`].
     ///
     /// IDEMPOTENT per Region: the Region's entry is recorded, so a second call answers the
     /// ids already there rather than seeding a second copy — which is what lets a reporting
@@ -1354,8 +1355,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// Availability Zone in the Region" together with the VPC's default security group
     /// (Amazon VPC User Guide, "Default VPCs") — a VPC at [`DEFAULT_VPC_CIDR_BLOCK`] with
     /// `IsDefault` set, one default subnet per zone of THAT Region
-    /// ([`Self::insert_default_subnets`], over [`availability_zones_in_region`]) and
-    /// [`Self::insert_default_security_group`]. Only the state the VPC is answered in
+    /// ([`Self::insert_default_subnets`], over [`availability_zones_in_region`]),
+    /// [`Self::insert_default_security_group`] and the internet path AWS gives such a VPC
+    /// ([`Self::insert_default_internet_path`]). Only the state the VPC is answered in
     /// differs between the two callers, which is why it is a parameter.
     ///
     /// `None` when nothing was written: `region` is not a Region of the catalog
@@ -1382,6 +1384,11 @@ impl ComAmazonawsEc2Amazonec2State {
         );
         self.insert_default_subnets(&vpc_id, DEFAULT_VPC_CIDR_BLOCK, region);
         self.insert_default_security_group(&vpc_id, region);
+        // And the INTERNET PATH a default VPC comes with: the gateway AWS attaches to it and
+        // the default route to that gateway in its main route table
+        // ([`Self::insert_default_internet_path`]), which is what makes its default subnets
+        // public ones a workload reaches the internet from.
+        self.insert_default_internet_path(&vpc_id);
         self.default_vpc_ids
             .insert(region.to_string(), vpc_id.clone());
         Some(vpc_id)
@@ -1393,12 +1400,14 @@ impl ComAmazonawsEc2Amazonec2State {
     /// asked before anything is written so a store at a ceiling writes nothing rather than a
     /// partial network a recorded index would then make permanent: the VPC count, room for a
     /// subnet in EVERY zone of the Region, the Region's default DHCP option set (which
-    /// [`Self::insert_vpc`] mints) and its bytes, and the group the VPC comes with.
+    /// [`Self::insert_vpc`] mints) and its bytes, the group the VPC comes with, and the
+    /// internet gateway it is attached to.
     pub fn has_default_network_room(&self, region: &str) -> bool {
         self.has_vpc_capacity()
             && self.has_subnet_capacity_for(availability_zones_in_region(region).len())
             && self.has_dhcp_option_set_capacity(region)
             && self.has_security_group_capacity()
+            && self.has_internet_gateway_capacity()
             && !self.would_exceed_stored_bytes(self.unheld_default_dhcp_options_bytes(region))
     }
 

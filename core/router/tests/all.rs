@@ -1672,3 +1672,15 @@ mod zz_probe_whole_emulator;
 // The lint allowed below is for the suite files this root compiles: a wrapped paragraph in one
 // of their module headers is then a note rather than a build failure. An inner attribute, like
 // an inner doc comment, is legal only before the first item, so it stands here.
+// Single integration-test target for the router: the CANONICAL DECLARATION LIST of every
+// cross-service suite under `tests/all/`, and nothing else. Below this header the file holds
+// one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
+// line — so two branches landing at once insert two lines in two places and have no prose to
+// duplicate, re-word or mistype. EVERY comment here is an ORDINARY `//` one, and the inner
+// attribute below stands ahead of the first declaration: an inner doc comment and an inner
+// attribute are legal only before the first item, so one appended past the list compiles no
+// suite of this target at all. What a suite covers belongs in that suite's own module header;
+// a note about THIS file belongs in `all/appended_notes.rs`. The `all_rs_*` suites,
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin all of it.
+#[path = "all/default_vpc_internet_path_runs_ecs_tasks.rs"]
+mod default_vpc_internet_path_runs_ecs_tasks;

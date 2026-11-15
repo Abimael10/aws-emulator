@@ -516,6 +516,37 @@ async fn the_attribute_follows_the_default_vpc_through_a_delete_and_a_create() {
              {body}"
         );
     }
+    // And so does the internet gateway a default VPC comes with: "you must detach or delete
+    // all gateways ... that are associated with the VPC before you can delete it".
+    let (status, body) = call_in(
+        &router,
+        region,
+        "DescribeInternetGateways",
+        &filters(&[("attachment.vpc-id", &[first.as_str()])]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 reading the gateway of {first}, got {status} with \
+         body {body}"
+    );
+    for internet_gateway_id in super::ec2_query::elements(&body, "internetGatewayId") {
+        let (status, body) = call_in(
+            &router,
+            region,
+            "DetachInternetGateway",
+            &[
+                param("InternetGatewayId", &internet_gateway_id),
+                param("VpcId", &first),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 detaching {internet_gateway_id}, got {status} \
+             with body {body}"
+        );
+    }
     let (status, body) = call_in(&router, region, "DeleteVpc", &[param("VpcId", &first)]).await;
     assert_eq!(
         status, 200,
