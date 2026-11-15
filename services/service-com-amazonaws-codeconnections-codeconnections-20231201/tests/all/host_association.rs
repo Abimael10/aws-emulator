@@ -494,10 +494,12 @@ async fn a_connection_resolves_a_host_that_exists() {
 }
 
 /// Only an ARN naming no host is refused, and it is refused the same way wherever it
-/// is named: the modeled `ResourceNotFoundException` (404) from `CreateConnection`, from
+/// is named: the modeled `ResourceNotFoundException` from `CreateConnection`, from
 /// `GetHost` and from `ListConnections`' filter, because the host it names is ABSENT —
-/// `ResourceUnavailableException` (400) is this service's "the host is there but is not
-/// usable" signal. Rows are host-ARN-shaped values the modeled pattern admits —
+/// `ResourceUnavailableException` is this service's "the host is there but is not
+/// usable" signal. Both arrive with the client status of this service's RPC protocol
+/// (400) and are told apart by the error shape named in the body. Rows are
+/// host-ARN-shaped values the modeled pattern admits —
 /// `^arn:aws(-[\w]+)*:(codestar-connections|codeconnections):.+:[0-9]{12}:host\/.+$` —
 /// that this store does not hold.
 #[tokio::test]
@@ -559,8 +561,8 @@ async fn a_host_arn_that_names_no_host_is_refused_wherever_it_is_named() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {label:?}: expected 404 from CreateConnection, got {status} {body}"
+            status, 400,
+            "case {label:?}: expected 400 from CreateConnection, got {status} {body}"
         );
         assert!(
             body["__type"]
@@ -576,8 +578,8 @@ async fn a_host_arn_that_names_no_host_is_refused_wherever_it_is_named() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {label:?}: expected 404 from GetHost, got {status} {body}"
+            status, 400,
+            "case {label:?}: expected 400 from GetHost, got {status} {body}"
         );
         assert!(
             body["__type"]
@@ -589,7 +591,7 @@ async fn a_host_arn_that_names_no_host_is_refused_wherever_it_is_named() {
         // The same rule where the ARN is a FILTER rather than the addressed resource:
         // `ListConnections` resolves `HostArnFilter` against the host store too, and
         // refuses one that names no host with the same `ResourceNotFoundException`
-        // (404) rather than reporting an empty page.
+        // rather than reporting an empty page.
         let (status, body) = call(
             &router,
             "ListConnections",
@@ -597,8 +599,8 @@ async fn a_host_arn_that_names_no_host_is_refused_wherever_it_is_named() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {label:?}: expected 404 from ListConnections, got {status} {body}"
+            status, 400,
+            "case {label:?}: expected 400 from ListConnections, got {status} {body}"
         );
         assert!(
             body["__type"]
@@ -665,8 +667,8 @@ async fn a_connection_arn_does_not_resolve_as_a_host() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case host-arn-to-GetConnection: expected 404, got {status} {body}"
+        status, 400,
+        "case host-arn-to-GetConnection: expected 400, got {status} {body}"
     );
     assert!(
         body["__type"]

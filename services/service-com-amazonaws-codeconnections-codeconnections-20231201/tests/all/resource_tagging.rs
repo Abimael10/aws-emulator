@@ -9,9 +9,11 @@
 //! not is appended, every other tag is left alone) and `UntagResource` removes exactly
 //! the keys it names and leaves the rest; both are addressed by resource ARN, so an ARN
 //! resolving to no resource this account holds is refused with the modeled
-//! `ResourceNotFoundException` (404), and `TagResource` is refused with the modeled
-//! `LimitExceededException` (429) when the tags it would LEAVE on the resource exceed the
-//! per-resource limit, with nothing written.
+//! `ResourceNotFoundException`, and `TagResource` is refused with the modeled
+//! `LimitExceededException` when the tags it would LEAVE on the resource exceed the
+//! per-resource limit, with nothing written. Both refusals arrive with the client status
+//! of this service's RPC protocol (400) and are told apart by the error shape named in
+//! the body.
 //!
 //! The rule holds for every resource kind this service persists and reports tags for — a
 //! connection, a host and a repository link — so every table below is driven across all
@@ -454,7 +456,7 @@ fn kind_slug(kind: Kind) -> &'static str {
 
 /// `TagResource` is held to the per-resource tag limit, judged on what the call would
 /// LEAVE on the resource: a resource at the limit still accepts new values for the keys
-/// it carries, a call that would push it past the limit is refused 429
+/// it carries, a call that would push it past the limit is refused with
 /// `LimitExceededException`, and the refused call writes nothing.
 #[tokio::test]
 async fn tag_resource_refuses_what_would_exceed_the_per_resource_tag_limit() {
@@ -520,8 +522,8 @@ async fn tag_resource_refuses_what_would_exceed_the_per_resource_tag_limit() {
         )
         .await;
         assert_eq!(
-            status, 429,
-            "case {label:?}: expected 429 past the tag limit, got {status} {body}"
+            status, 400,
+            "case {label:?}: expected 400 past the tag limit, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -556,8 +558,8 @@ async fn tag_resource_refuses_what_would_exceed_the_per_resource_tag_limit() {
     )
     .await;
     assert_eq!(
-        status, 429,
-        "case one batch past the limit: expected 429, got {status} {body}"
+        status, 400,
+        "case one batch past the limit: expected 400, got {status} {body}"
     );
     assert_eq!(
         error_code(&body),
@@ -613,7 +615,7 @@ fn unresolvable_arns() -> Vec<AbsentArn> {
 }
 
 /// Both writers of the tagging surface refuse an ARN that resolves to no resource with
-/// the modeled `ResourceNotFoundException` (404) — in the wording the reader of that
+/// the modeled `ResourceNotFoundException` — in the wording the reader of that
 /// resource kind answers, where one addresses the kind by ARN.
 #[tokio::test]
 async fn the_tagging_writers_refuse_an_arn_naming_no_resource() {
@@ -637,8 +639,8 @@ async fn the_tagging_writers_refuse_an_arn_naming_no_resource() {
         for (operation, body) in requests {
             let (status, got) = call(&router, operation, body).await;
             assert_eq!(
-                status, 404,
-                "case {label:?}/{operation}: expected 404, got {status} {got}"
+                status, 400,
+                "case {label:?}/{operation}: expected 400, got {status} {got}"
             );
             assert_eq!(
                 error_code(&got),
@@ -659,8 +661,8 @@ async fn the_tagging_writers_refuse_an_arn_naming_no_resource() {
                 )
                 .await;
                 assert_eq!(
-                    reader_status, 404,
-                    "case {label:?}: expected 404 from {reader_operation}, got {reader_status} {reader_body}"
+                    reader_status, 400,
+                    "case {label:?}: expected 400 from {reader_operation}, got {reader_status} {reader_body}"
                 );
                 let reader_message = reader_body["Message"]
                     .as_str()

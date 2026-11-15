@@ -69,6 +69,13 @@ const REPOSITORY_NAME_MAX_LEN: usize = 128;
 /// The fields of the service-framework tail, in the order the framework writes them.
 const TAIL_FIELDS: &[&str] = &["Service", "Status Code", "Error Code", "Request ID", "Proxy"];
 
+/// The HTTP status every modelled client error of this service arrives with: the
+/// client-error status of the RPC protocol it speaks, which is NOT the `@httpError` the
+/// error shape records and NOT the status the framework tail STATES inside the message.
+/// `modeled_error_wire_status.rs` asserts that rule on its own; here it is the status
+/// each refusal below is read at.
+const CLIENT_ERROR_STATUS: u16 = 400;
+
 /// The emulator's canonical account id — the account every refusal of this service
 /// reports the lookup as having been made in.
 fn account() -> &'static str {
@@ -166,18 +173,22 @@ fn split_framework_tail(case: &str, message: &str) -> FrameworkTail {
 /// Assert one refusal of the Git-sync surface: the HTTP status, the wire error code, the
 /// template body, and the tail's own status and exception name. Returns the tail's
 /// request id, so a caller can assert two refusals name two different requests.
+///
+/// `expect_tail_status` is the status the MESSAGE's tail states — a field of the recorded
+/// text, which is the `@httpError` of the error shape — while the response itself carries
+/// [`CLIENT_ERROR_STATUS`]. The two are deliberately different values.
 fn assert_tailed_refusal(
     case: &str,
     status: u16,
     body: &serde_json::Value,
-    expect_status: u16,
+    expect_tail_status: u16,
     expect_wire_code: &str,
     expect_body: &str,
     expect_tail_code: &str,
 ) -> String {
     assert_eq!(
-        status, expect_status,
-        "case {case:?}: expected HTTP {expect_status}, got {status} {body}"
+        status, CLIENT_ERROR_STATUS,
+        "case {case:?}: expected HTTP {CLIENT_ERROR_STATUS}, got {status} {body}"
     );
     assert_eq!(
         error_code(body),
@@ -193,8 +204,8 @@ fn assert_tailed_refusal(
     );
     assert_eq!(
         tail.status_code,
-        expect_status.to_string(),
-        "case {case:?}: the tail must state the answered status, got {message:?}"
+        expect_tail_status.to_string(),
+        "case {case:?}: the tail must state {expect_tail_status}, got {message:?}"
     );
     assert_eq!(
         tail.error_code, expect_tail_code,
@@ -392,7 +403,7 @@ async fn an_unresolvable_connection_arn_is_refused_with_the_services_fixed_sente
             &format!("GetConnection: {label}"),
             status,
             &body,
-            404,
+            CLIENT_ERROR_STATUS,
             "ResourceNotFoundException",
             CONNECTION_NOT_FOUND_MESSAGE,
             arn,
@@ -406,8 +417,9 @@ async fn an_unresolvable_connection_arn_is_refused_with_the_services_fixed_sente
         .await;
         let case = format!("ListTagsForResource: {label}");
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404 for an ARN that resolves to nothing, got {status} {body}"
+            status, CLIENT_ERROR_STATUS,
+            "case {case:?}: expected HTTP {CLIENT_ERROR_STATUS} for an ARN that resolves to \
+             nothing, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -434,7 +446,7 @@ async fn an_unresolvable_connection_arn_is_refused_with_the_services_fixed_sente
             &format!("DeleteConnection: {label}"),
             status,
             &body,
-            404,
+            CLIENT_ERROR_STATUS,
             "ResourceNotFoundException",
             CONNECTION_NOT_FOUND_MESSAGE,
             arn,
@@ -1069,8 +1081,9 @@ async fn a_tag_request_past_the_cap_is_refused_with_the_surfaces_fixed_sentence(
             )
             .await;
             assert_eq!(
-                status, 429,
-                "case {case:?}: expected 429 past the tag cap, got {status} {body}"
+                status, CLIENT_ERROR_STATUS,
+                "case {case:?}: expected HTTP {CLIENT_ERROR_STATUS} past the tag cap, \
+                 got {status} {body}"
             );
             assert_eq!(
                 error_code(&body),
@@ -1135,9 +1148,9 @@ async fn an_unknown_sync_blocker_id_is_refused_with_the_surfaces_fixed_sentence(
             )
             .await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected 404 for a blocker id that resolves to nothing, \
-                 got {status} {body}"
+                status, CLIENT_ERROR_STATUS,
+                "case {case:?}: expected HTTP {CLIENT_ERROR_STATUS} for a blocker id that \
+                 resolves to nothing, got {status} {body}"
             );
             assert_eq!(
                 error_code(&body),

@@ -33,6 +33,8 @@ mod list_repository_links;
 mod list_repository_sync_definitions;
 #[path = "all/list_sync_configurations.rs"]
 mod list_sync_configurations;
+#[path = "all/modeled_error_wire_status.rs"]
+mod modeled_error_wire_status;
 #[path = "all/modeled_input_refusals.rs"]
 mod modeled_input_refusals;
 #[path = "all/refusal_messages.rs"]

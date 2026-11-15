@@ -876,13 +876,15 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// not its signing name (`codeconnections`) or its shape id.
 const FRAMEWORK_TAIL_SERVICE: &str = "CodeConnections";
 
-/// The HTTP status a refusal is answered with and the exception the framework names for
-/// it in the tail — one pair per refusal family, so the status the tail states can never
-/// drift from the status the response carries.
+/// The status the framework tail STATES and the exception it names for the refusal —
+/// one pair per refusal family, so neither half can be written without the other.
 ///
 /// Each status is the `httpError` the model declares for the error the refusal is
 /// answered with (`smithy_query(query="shape", shape="ResourceNotFoundException")` 404,
 /// `ResourceAlreadyExistsException` 409, `SyncConfigurationStillExistsException` 409).
+/// It is a field of the MESSAGE TEXT and not the status of the response: the response
+/// carries the status this service's RPC protocol answers a client error with
+/// ([`crate::scaffolded::wire_status`]), which is 400 for every one of these families.
 type FrameworkTailFacts = (u16, &'static str);
 
 /// A resource the request named that this account holds none of: 404, as the model's
@@ -965,27 +967,24 @@ pub fn host_not_found_message(host_arn: &str) -> String {
 pub const HOST_STATUSES_BLOCKING_DELETE: &[&str] = &["VPC_CONFIG_INITIALIZING", "VPC_CONFIG_DELETING"];
 
 /// What `DeleteHost` answers for a host whose connections have not been deleted first:
-/// the rule it broke, naming the host ARN the caller already has and how many
-/// connections still reference it.
+/// the recorded sentence of that precondition, naming the host ARN the caller already
+/// has.
 ///
-/// `DeleteHost`'s documentation states the precondition ("Before you delete a host, all
-/// connections associated to the host must be deleted") but no recorded template for the
-/// refusal is known, so — exactly like [`resource_not_found_message`] — the sentence
-/// states the rule and the values the request and the store already hold rather than
-/// borrowing another case's wording. The CODE (`ResourceUnavailableException`, 400) is
-/// the requirement: it is this service's "the host is there but is not usable" signal,
-/// and the only refusal `DeleteHost` models besides the 404 for an ARN naming nothing.
-pub fn host_has_connections_message(host_arn: &str, connections: usize) -> String {
-    format!(
-        "The host cannot be deleted while connections are associated with it. \
-         Delete the {connections} connection(s) associated with the host and try again: {host_arn}"
-    )
+/// The template is the service's own fixed text with the host ARN from the request
+/// interpolated into it; it states no COUNT, so how many connections still reference the
+/// host is not part of the message. The CODE is `ResourceUnavailableException` — this
+/// service's "the host is there but is not usable" signal, and the only refusal
+/// `DeleteHost` models besides the absence of the ARN.
+pub fn host_has_connections_message(host_arn: &str) -> String {
+    format!("There exist connections for host {host_arn}, host cannot be deleted")
 }
 
 /// What `DeleteHost` answers for a host in a status it cannot be deleted from
 /// ([`HOST_STATUSES_BLOCKING_DELETE`]): the rule it broke, naming the status the host is
-/// in and the ARN the caller already has. Worded for the same reason as
-/// [`host_has_connections_message`], and carrying the same modelled code.
+/// in and the ARN the caller already has. No recorded template for this precondition is
+/// known — unlike [`host_has_connections_message`], whose text is the recorded one — so
+/// the sentence states the rule and the values the request and the store already hold
+/// rather than borrowing another case's wording. It carries the same modelled code.
 pub fn host_not_deletable_in_status_message(host_arn: &str, status: &str) -> String {
     format!(
         "The host cannot be deleted while it is in the {status} state. \

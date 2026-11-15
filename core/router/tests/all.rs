@@ -2597,3 +2597,6 @@ mod cloudformation_stackset_failed_instance_events;
 // the test it explains and cannot collide with a concurrent landing.
 #[path = "all/autoscaling_plans_delete_withdraws_its_registration.rs"]
 mod autoscaling_plans_delete_withdraws_its_registration;
+// indentation `clippy::doc_lazy_continuation` asks of a doc list item, and the header below
+// still carries some of them; the lint is allowed here so such a paragraph is a note rather
+// than a build failure.

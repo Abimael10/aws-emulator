@@ -191,14 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Before you delete a host, all connections associated to the host must be
         // deleted": a host a connection still references cannot go, or every such
         // connection would report a `HostArn` no reader can resolve.
-        let associated = store.connections_on_host(&input.host_arn);
-        if associated > 0 {
+        if store.connections_on_host(&input.host_arn) > 0 {
             return Err(DeleteHostErrorModeled::ResourceUnavailableException(
                 ResourceUnavailableException {
-                    message: Some(crate::state::host_has_connections_message(
-                        &input.host_arn,
-                        associated,
-                    )),
+                    message: Some(crate::state::host_has_connections_message(&input.host_arn)),
                 },
             )
             .into());

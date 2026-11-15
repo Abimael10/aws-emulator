@@ -747,7 +747,7 @@ async fn every_target_prefix_form_reaches_the_operation() {
         );
 
         // A second operation, so the rule is not one operation's special case: an ARN
-        // naming no connection is this service's modeled 404 either way.
+        // naming no connection is this service's modeled absence refusal either way.
         let (status, body) = call_with_target(
             &router,
             &format!("{prefix}.GetConnection"),
@@ -760,8 +760,8 @@ async fn every_target_prefix_form_reaches_the_operation() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {prefix:?}/GetConnection: expected 404 for an unknown ARN, got {status} {body}"
+            status, 400,
+            "case {prefix:?}/GetConnection: expected 400 for an unknown ARN, got {status} {body}"
         );
 
         // And a target whose last segment names no modeled operation stays refused.

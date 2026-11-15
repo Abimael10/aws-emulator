@@ -313,9 +313,10 @@ async fn a_repository_link_round_trips_from_create_to_get() {
 }
 
 /// Registering the same (connection, owner, repository) triple twice is refused with
-/// the modeled `ResourceAlreadyExistsException` (409), and a link on a connection the
-/// store does not hold is refused with the modeled `InvalidInputException` (400) — one
-/// row per table case, so the refusal is not keyed to one shape of input.
+/// the modeled `ResourceAlreadyExistsException`, and a link on a connection the
+/// store does not hold is refused with the modeled `InvalidInputException` — one
+/// row per table case, so the refusal is not keyed to one shape of input. Both arrive
+/// with this service's client-error status and are told apart by the shape in the body.
 #[tokio::test]
 async fn a_repository_link_is_refused_for_a_duplicate_or_an_unresolvable_connection() {
     let router = router();
@@ -330,8 +331,8 @@ async fn a_repository_link_is_refused_for_a_duplicate_or_an_unresolvable_connect
         )
         .await;
         assert_eq!(
-            status, 409,
-            "case {:?}: expected 409 for a duplicate link, got {status} {body}",
+            status, 400,
+            "case {:?}: expected 400 for a duplicate link, got {status} {body}",
             case.label
         );
         assert_eq!(
@@ -739,8 +740,8 @@ async fn a_sync_configuration_round_trips_and_updates_only_what_it_names() {
         )
         .await;
         assert_eq!(
-            status, 409,
-            "case {:?}: expected 409 for a duplicate configuration, got {status} {duplicate}",
+            status, 400,
+            "case {:?}: expected 400 for a duplicate configuration, got {status} {duplicate}",
             case.label
         );
         assert_eq!(
@@ -965,7 +966,7 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
 
     for id in ABSENT_LINK_IDS {
         // `GetRepositoryLink`: the link is the resource, so a missing one is the
-        // modeled ResourceNotFoundException (404).
+        // modeled ResourceNotFoundException.
         let (status, body) = call(
             &router,
             "GetRepositoryLink",
@@ -973,8 +974,8 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {id:?}: expected 404 from GetRepositoryLink, got {status} {body}"
+            status, 400,
+            "case {id:?}: expected 400 from GetRepositoryLink, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -982,7 +983,7 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
             "case {id:?}: expected ResourceNotFoundException, got {body}"
         );
 
-        // `UpdateRepositoryLink`: same resource, same modeled 404.
+        // `UpdateRepositoryLink`: same resource, same modeled error.
         let (status, body) = call(
             &router,
             "UpdateRepositoryLink",
@@ -990,8 +991,8 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {id:?}: expected 404 from UpdateRepositoryLink, got {status} {body}"
+            status, 400,
+            "case {id:?}: expected 400 from UpdateRepositoryLink, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -1000,8 +1001,8 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
         );
 
         // `GetRepositorySyncStatus`: an id naming no link makes the INPUT invalid, so
-        // the modeled InvalidInputException (400) — a different code for a different
-        // refusal.
+        // the modeled InvalidInputException — a different code for a different
+        // refusal, at the same status.
         let (status, body) = call(
             &router,
             "GetRepositorySyncStatus",
@@ -1049,7 +1050,7 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
 
     for name in ABSENT_RESOURCE_NAMES {
         // `GetSyncConfiguration`: nothing configured for the pair is the modeled
-        // ResourceNotFoundException (404).
+        // ResourceNotFoundException.
         let (status, body) = call(
             &router,
             "GetSyncConfiguration",
@@ -1057,8 +1058,8 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {name:?}: expected 404 from GetSyncConfiguration, got {status} {body}"
+            status, 400,
+            "case {name:?}: expected 400 from GetSyncConfiguration, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -1067,7 +1068,7 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
         );
 
         // `UpdateSyncConfiguration`: the same missing pair is the modeled
-        // InvalidInputException (400) — the operation's own code.
+        // InvalidInputException — the operation's own code.
         let (status, body) = call(
             &router,
             "UpdateSyncConfiguration",
@@ -1089,7 +1090,7 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
         );
 
         // `UpdateSyncBlocker`: the BLOCKER ID is resolved first, so an unknown blocker
-        // surfaces SyncBlockerDoesNotExistException (404) even though this resource has
+        // surfaces SyncBlockerDoesNotExistException even though this resource has
         // no sync configuration either.
         let (status, body) = call(
             &router,
@@ -1103,8 +1104,8 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {name:?}: expected 404 from UpdateSyncBlocker, got {status} {body}"
+            status, 400,
+            "case {name:?}: expected 400 from UpdateSyncBlocker, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -1128,8 +1129,8 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {blocker_id:?}: expected 404 from UpdateSyncBlocker, got {status} {body}"
+            status, 400,
+            "case {blocker_id:?}: expected 400 from UpdateSyncBlocker, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -1139,7 +1140,7 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
     }
 
     // And a repository link that IS there still reports no sync attempt: nothing in
-    // this emulator performs a Git sync, so the modeled ResourceNotFoundException (404)
+    // this emulator performs a Git sync, so the modeled ResourceNotFoundException
     // is the answer — never a synthesised status for work nothing ran.
     for branch in ["main", "release/1.0", "b"] {
         let (status, body) = call(
@@ -1153,8 +1154,8 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {branch:?}: expected 404 from GetRepositorySyncStatus, got {status} {body}"
+            status, 400,
+            "case {branch:?}: expected 400 from GetRepositorySyncStatus, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -1170,7 +1171,8 @@ async fn an_unresolvable_resource_is_refused_with_the_operations_modeled_error()
 
 /// `DeleteSyncConfiguration` models no not-found error, so deleting a
 /// `(SyncType, ResourceName)` pair that holds nothing succeeds and removes nothing:
-/// the delete is idempotent, and `GetSyncConfiguration` reports 404 both before the
+/// the delete is idempotent, and `GetSyncConfiguration` reports the modeled
+/// `ResourceNotFoundException` both before the
 /// create and after the delete.
 #[tokio::test]
 async fn deleting_a_sync_configuration_is_idempotent() {
@@ -1183,11 +1185,11 @@ async fn deleting_a_sync_configuration_is_idempotent() {
         });
         let get = delete.clone();
 
-        // Before anything is created: the read is a 404 and the delete is a success.
+        // Before anything is created: the read is refused and the delete is a success.
         let (status, body) = call(&router, "GetSyncConfiguration", get.clone()).await;
         assert_eq!(
-            status, 404,
-            "case {:?}: expected 404 before the create, got {status} {body}",
+            status, 400,
+            "case {:?}: expected 400 before the create, got {status} {body}",
             case.label
         );
         assert_eq!(
@@ -1240,8 +1242,8 @@ async fn deleting_a_sync_configuration_is_idempotent() {
             );
             let (status, body) = call(&router, "GetSyncConfiguration", get.clone()).await;
             assert_eq!(
-                status, 404,
-                "case {:?}: expected 404 after delete attempt {attempt}, got {status} {body}",
+                status, 400,
+                "case {:?}: expected 400 after delete attempt {attempt}, got {status} {body}",
                 case.label
             );
             assert_eq!(
@@ -1374,7 +1376,7 @@ async fn resolving_a_sync_blocker_records_the_reason_and_the_instant() {
         )
         .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {id:?}: a blocker of another resource must not resolve, got {status} {body}"
         );
         assert_eq!(

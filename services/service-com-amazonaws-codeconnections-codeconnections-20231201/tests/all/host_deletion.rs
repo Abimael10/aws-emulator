@@ -6,12 +6,14 @@
 //! THE RULE these tests assert, over tables rather than over one recorded request: a
 //! delete of a resource this service addresses by ARN removes exactly that stored row —
 //! so every later reader reports it ABSENT and its ARN is never resolved again — and
-//! otherwise refuses, with the modeled `ResourceNotFoundException` (404) when the ARN
-//! resolves to no such resource and the modeled `ResourceUnavailableException` (400) when
+//! otherwise refuses, with the modeled `ResourceNotFoundException` when the ARN
+//! resolves to no such resource and the modeled `ResourceUnavailableException` when
 //! the resource IS there but a documented precondition of its deletion does not hold
 //! (`DeleteHost`: "Before you delete a host, all connections associated to the host must
 //! be deleted"; "A host cannot be deleted if it is in the VPC_CONFIG_INITIALIZING or
-//! VPC_CONFIG_DELETING state"). A refused delete persists nothing.
+//! VPC_CONFIG_DELETING state"). A refused delete persists nothing. Both refusals arrive
+//! with the client status of this service's RPC protocol (400) and are told apart by the
+//! error shape named in the body.
 //!
 //! Every request goes through the real `MultiServiceRouter` dispatch, reusing
 //! `connection_lifecycle`'s and `host_association`'s helpers, so these tests exercise the
@@ -47,6 +49,15 @@ const HOST_STATUS_VALUES: &[&str] = &[
 /// deleted if it is in the VPC_CONFIG_INITIALIZING or VPC_CONFIG_DELETING state."
 const STATUSES_BLOCKING_DELETE: &[&str] = &["VPC_CONFIG_INITIALIZING", "VPC_CONFIG_DELETING"];
 
+/// The sentence `DeleteHost` answers for a host whose connections have not been deleted
+/// first, written out as the LITERAL the recorded service returns rather than read off
+/// the implementation's own constant, so rewording that constant fails this suite. It
+/// names the host ARN from the request and states no COUNT — which is why the rows below
+/// assert the same sentence for one, two and three associated connections.
+fn host_has_connections_message(host_arn: &str) -> String {
+    format!("There exist connections for host {host_arn}, host cannot be deleted")
+}
+
 /// The message a refused response carries.
 fn refusal_message(case: &str, body: &serde_json::Value) -> String {
     body["Message"]
@@ -81,8 +92,8 @@ fn assert_deleted(case: &str, status: u16, body: &serde_json::Value) {
 /// word it.
 fn assert_absent(case: &str, status: u16, body: &serde_json::Value, host_arn: &str) {
     assert_eq!(
-        status, 404,
-        "case {case:?}: expected 404 for a host ARN that resolves to nothing, got {status} {body}"
+        status, 400,
+        "case {case:?}: expected 400 for a host ARN that resolves to nothing, got {status} {body}"
     );
     assert_eq!(
         error_code(body),
@@ -336,9 +347,11 @@ async fn a_host_with_associated_connections_is_refused_until_they_are_gone() {
             let step = format!("{label}: {} still associated", connections.len() - index);
             let (status, body) = delete_host(&router, &host).await;
             assert_unavailable(&step, status, &body);
-            assert!(
-                refusal_message(&step, &body).contains(&host),
-                "case {step:?}: the refusal names the host it refused, got {body}"
+            assert_eq!(
+                refusal_message(&step, &body),
+                host_has_connections_message(&host),
+                "case {step:?}: expected the precondition's fixed sentence naming the host, \
+                 got {body}"
             );
 
             // Nothing was removed: the host is still reported, and so is every

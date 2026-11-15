@@ -205,7 +205,9 @@ fn assert_link_arn(case: &str, arn: &str, id: &str) {
     );
 }
 
-/// Assert a response is the modeled error `expected_type` at `expected_status`.
+/// Assert a response is the modeled error `expected_type` at `expected_status` — which
+/// for a modeled CLIENT error of this service is the client status of its RPC protocol,
+/// 400, whatever `@httpError` the shape records.
 fn assert_error(case: &str, expected_status: u16, expected_type: &str, got: (u16, serde_json::Value)) {
     let (status, body) = got;
     assert_eq!(
@@ -297,7 +299,7 @@ async fn both_target_prefix_forms_route_to_the_same_operation() {
         );
         assert_error(
             prefix,
-            404,
+            400,
             "ResourceNotFoundException",
             call_with_target(
                 &router,
@@ -449,7 +451,7 @@ async fn a_repository_link_round_trips_and_its_delete_removes_it() {
         // And the row is gone: no reader resolves the id or its ARN any more.
         assert_error(
             case.label,
-            404,
+            400,
             "ResourceNotFoundException",
             call(
                 &router,
@@ -460,7 +462,7 @@ async fn a_repository_link_round_trips_and_its_delete_removes_it() {
         );
         assert_error(
             case.label,
-            404,
+            400,
             "ResourceNotFoundException",
             call(
                 &router,
@@ -557,7 +559,7 @@ async fn deleting_an_id_that_names_no_link_is_an_idempotent_no_op() {
         // The id still names nothing: the no-op created no resource either.
         assert_error(
             label,
-            404,
+            400,
             "ResourceNotFoundException",
             call(
                 &router,
@@ -633,7 +635,7 @@ async fn deleting_one_link_leaves_every_other_link_resolvable() {
                 serde_json::json!({ "RepositoryLinkId": id }),
             )
             .await;
-            let expected = if index == target { 404 } else { 200 };
+            let expected = if index == target { 400 } else { 200 };
             assert_eq!(
                 status, expected,
                 "case target={target}, link {index}: expected HTTP {expected} from GetRepositoryLink, got {status} {got}"
@@ -778,7 +780,8 @@ async fn a_link_reports_its_connections_provider_and_refuses_an_unresolvable_con
 }
 
 /// A link a sync configuration still references cannot be deleted: the delete is
-/// refused with the modeled `SyncConfigurationStillExistsException` (409) and removes
+/// refused with the modeled `SyncConfigurationStillExistsException` (HTTP 400, the shape
+/// named in the body) and removes
 /// nothing, and it succeeds once the configuration that referenced it is gone. Rows
 /// differ in how many configurations reference the link and in which of them is removed
 /// first, because the refusal holds while ANY reference is left.
@@ -839,7 +842,7 @@ async fn a_link_a_sync_configuration_references_cannot_be_deleted() {
             let left = references - removed;
             assert_error(
                 &format!("references={references}, {left} left"),
-                409,
+                400,
                 "SyncConfigurationStillExistsException",
                 call(
                     &router,
@@ -885,7 +888,7 @@ async fn a_link_a_sync_configuration_references_cannot_be_deleted() {
         );
         assert_error(
             &format!("references={references}, after delete"),
-            404,
+            400,
             "ResourceNotFoundException",
             call(
                 &router,
@@ -899,7 +902,8 @@ async fn a_link_a_sync_configuration_references_cannot_be_deleted() {
 
 /// A repository link IS the association of one connection with one repository, so a
 /// second create for the same connection, owner and repository is refused with the
-/// modeled `ResourceAlreadyExistsException` (409) — and the association is free again
+/// modeled `ResourceAlreadyExistsException` (HTTP 400, the shape named in the body) —
+/// and the association is free again
 /// once the link is deleted.
 #[tokio::test]
 async fn one_link_per_connection_and_repository() {
@@ -916,7 +920,7 @@ async fn one_link_per_connection_and_repository() {
 
         assert_error(
             case.label,
-            409,
+            400,
             "ResourceAlreadyExistsException",
             call(
                 &router,

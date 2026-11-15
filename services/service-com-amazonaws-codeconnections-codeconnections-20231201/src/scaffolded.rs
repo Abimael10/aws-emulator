@@ -183,7 +183,10 @@ impl SerializableStruct for ValidationException {
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status
+    /// [`wire_status`] gives it — this service's own, since the HTTP bindings its
+    /// model carries are inert on its wire protocol — and with the error shape's
+    /// name as the wire error code.
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -220,6 +223,44 @@ impl<E> Scaffolded<E> {
     /// SERVICE models that this OPERATION does not list.
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
+    }
+}
+
+/// The status this service puts on every client error: the client-error status of the
+/// RPC protocol it speaks. The error shape travels in the body's `__type`, not in the
+/// status line.
+const CLIENT_ERROR_STATUS: u16 = 400;
+
+/// The HTTP status THIS service answers with for a modeled error whose status in the
+/// model is `modeled`.
+///
+/// CodeConnections speaks `awsJson1_0` (`smithy_query(query="service_info")`: protocols
+/// `awsJson1_0`, `rpcv2Cbor`), RPC protocols on which no operation of this model carries
+/// an HTTP binding at all — `@httpError` describes a REST shape this service does not
+/// serve. On the wire a modeled CLIENT error therefore arrives with that protocol's
+/// client status, 400, and is identified only by the error shape's name in the body's
+/// `__type` (and `x-amzn-errortype`). The per-shape `@httpError` values the model records
+/// for the client errors — 404 on `ResourceNotFoundException` and
+/// `SyncBlockerDoesNotExistException`, 409 on `ResourceAlreadyExistsException`,
+/// `ConcurrentModificationException`, `ConflictException`,
+/// `ConditionalCheckFailedException`, `SyncConfigurationStillExistsException` and
+/// `UpdateOutOfSyncException`, 429 on `LimitExceededException` and
+/// `ThrottlingException`, 403 on `AccessDeniedException` — are not statuses this service
+/// emits, and a client that classifies by status would otherwise read a plain client
+/// fault as a missing route, a denied call or a rate limit.
+///
+/// A SERVER error keeps the status the model gives it (`InternalServerException` and
+/// `RetryLatestCommitFailedException` are `@httpError 503`): a 5xx is exactly what an SDK
+/// retry classifier must see, and the protocol's server status is a 5xx too.
+///
+/// The whole service's mapping lives here, deliberately in one place — on the one error
+/// channel every operation of this crate returns through — because a per-operation copy
+/// is what lets two operations disagree about one status.
+pub fn wire_status(modeled: u16) -> u16 {
+    if (400..500).contains(&modeled) {
+        CLIENT_ERROR_STATUS
+    } else {
+        modeled
     }
 }
 
@@ -278,15 +319,18 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         }
     }
 
-    /// 501 for the scaffold signal.
+    /// 501 for the scaffold signal, [`wire_status`] for a modeled error.
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
-    /// retryable, so a client would retry an operation that can never succeed.
+    /// retryable, so a client would retry an operation that can never succeed. The
+    /// scaffold signal and the synthetic `ValidationException` are not modeled errors of
+    /// this service, so neither goes through [`wire_status`] — both already answer the
+    /// status this protocol states them with.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
-            Self::ValidationException(_) => 400,
+            Self::Modeled(e) => wire_status(e.http_status()),
+            Self::ValidationException(_) => CLIENT_ERROR_STATUS,
         }
     }
 

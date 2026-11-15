@@ -4,7 +4,8 @@
 //! not there.
 //!
 //! THE RULE: an update addressed at a resource by ARN resolves that ARN in state FIRST —
-//! an ARN resolving to no host is the modelled `ResourceNotFoundException` (404) stating
+//! an ARN resolving to no host is the modelled `ResourceNotFoundException` (HTTP 400 on
+//! this service's RPC protocol, the shape named in the body) stating
 //! the one sentence every host-addressed call of this service answers for an absent host,
 //! and nothing is written — and otherwise applies EVERY member the request carries and
 //! only those, leaving a member the request omits exactly as it was. The empty output
@@ -184,9 +185,9 @@ async fn update_host_writes_every_member_the_request_names_and_only_those() {
     }
 }
 
-/// An `UpdateHost` addressed at an ARN that resolves to no host is refused 404
-/// `ResourceNotFoundException` with the service's fixed sentence naming the ARN from the
-/// request, and writes nothing.
+/// An `UpdateHost` addressed at an ARN that resolves to no host is refused with the
+/// modelled `ResourceNotFoundException` — HTTP 400, the shape named in the body — stating
+/// the service's fixed sentence naming the ARN from the request, and writes nothing.
 ///
 /// Rows are the ways an ARN the modelled `HostArn` pattern admits can resolve to nothing:
 /// an id this store never minted, the ARN of a host that was DELETED (the recorded unit's
@@ -241,8 +242,8 @@ async fn update_host_refuses_an_arn_that_resolves_to_no_host() {
             let case = format!("{label} / {}", update.label);
             let (status, body) = call(&router, "UpdateHost", update_body(&update, arn)).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected 404 for an ARN that resolves to no host, got {status} {body}"
+                status, 400,
+                "case {case:?}: expected 400 for an ARN that resolves to no host, got {status} {body}"
             );
             assert_eq!(
                 error_code(&body),
@@ -276,7 +277,7 @@ async fn update_host_refuses_an_arn_that_resolves_to_no_host() {
     )
     .await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "the deleted host must stay deleted, got {status} {body}"
     );
 }

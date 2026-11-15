@@ -5,14 +5,17 @@
 //! Two rules, each asserted over a table rather than over one recorded request.
 //!
 //! RULE 1 — an identifier that resolves to no resource this service holds is reported
-//! with the modeled `ResourceNotFoundException` (HTTP 404), wherever that identifier is
+//! with the modeled `ResourceNotFoundException`, wherever that identifier is
 //! named: as the addressed resource (`GetHost`, `GetConnection`), as a reference another
 //! resource is created against (`CreateConnection`'s `HostArn`), or as a filter
 //! (`ListConnections`' `HostArnFilter`). `GetHost` and `CreateConnection` also model
-//! `ResourceUnavailableException` (HTTP 400), which is the "the resource IS there but is
-//! not usable" signal and never the answer for absence — a client branching on 404
-//! (create-if-missing, cleanup that tolerates a 404) must not see a 400 for a resource
-//! that simply does not exist.
+//! `ResourceUnavailableException`, which is the "the resource IS there but is
+//! not usable" signal and never the answer for absence — a client branching on absence
+//! (create-if-missing, cleanup that tolerates it) must not see the unavailable signal for
+//! a resource that simply does not exist. Both refusals arrive with the client status of
+//! this service's RPC protocol (HTTP 400, asserted on its own in
+//! `modeled_error_wire_status.rs`), so the error SHAPE named in the body is what tells
+//! them apart.
 //!
 //! RULE 2 — `GetResourceSyncStatus` REPORTS the sync state this service has recorded
 //! for the `(ResourceName, SyncType)` pair: a pair it has recorded none for succeeds
@@ -102,12 +105,13 @@ fn unresolvable_host_arns(live_id: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Assert one answer is the modeled `ResourceNotFoundException` at HTTP 404, carrying a
-/// message that names the identifier that resolved to nothing.
+/// Assert one answer is the modeled `ResourceNotFoundException` at this service's
+/// client-error status, carrying a message that names the identifier that resolved to
+/// nothing.
 fn assert_not_found(case: &str, needle: &str, status: u16, body: &serde_json::Value) {
     assert_eq!(
-        status, 404,
-        "case {case:?}: expected 404 for an absent resource, got {status} {body}"
+        status, 400,
+        "case {case:?}: expected 400 for an absent resource, got {status} {body}"
     );
     assert_eq!(
         error_code(body),
@@ -126,8 +130,8 @@ fn assert_not_found(case: &str, needle: &str, status: u16, body: &serde_json::Va
 
 /// RULE 1, over every form of unresolvable host ARN and every place a host ARN is
 /// named: `GetHost` (the addressed resource), `CreateConnection` (a reference) and
-/// `ListConnections` (a filter) all answer 404 `ResourceNotFoundException`, and never
-/// the 400 `ResourceUnavailableException` that belongs to a host which exists but is
+/// `ListConnections` (a filter) all answer `ResourceNotFoundException`, and never
+/// the `ResourceUnavailableException` that belongs to a host which exists but is
 /// unusable.
 #[tokio::test]
 async fn a_host_arn_that_resolves_to_nothing_is_reported_as_not_found() {

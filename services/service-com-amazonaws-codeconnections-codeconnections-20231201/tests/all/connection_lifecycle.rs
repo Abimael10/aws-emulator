@@ -353,8 +353,8 @@ async fn a_connection_round_trips_from_create_to_delete() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "GetConnection after delete: expected 404, got {status} {gone}"
+        status, 400,
+        "GetConnection after delete: expected 400, got {status} {gone}"
     );
     assert!(
         gone["__type"]
@@ -600,7 +600,7 @@ async fn list_filters_select_from_the_stored_set() {
     );
 
     // … and a host filter naming a host the store does not hold is refused with the
-    // modeled `ResourceNotFoundException` (404), not reported as an empty page.
+    // modeled `ResourceNotFoundException`, not reported as an empty page.
     let (status, body) = call(
         &router,
         "ListConnections",
@@ -608,8 +608,8 @@ async fn list_filters_select_from_the_stored_set() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "HostArnFilter naming no host: expected 404, got {status} {body}"
+        status, 400,
+        "HostArnFilter naming no host: expected 400, got {status} {body}"
     );
     assert!(
         body["__type"]
@@ -619,7 +619,7 @@ async fn list_filters_select_from_the_stored_set() {
     );
 }
 
-/// An ARN no connection has is `ResourceNotFoundException` (404) from every operation
+/// An ARN no connection has is `ResourceNotFoundException` from every operation
 /// that resolves one — one row per such operation and its ARN member.
 #[tokio::test]
 async fn an_unknown_arn_is_not_found_everywhere() {
@@ -643,8 +643,8 @@ async fn an_unknown_arn_is_not_found_everywhere() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {operation}: expected 404 for an unknown ARN, got {status} {body}"
+            status, 400,
+            "case {operation}: expected 400 for an unknown ARN, got {status} {body}"
         );
         assert!(
             body["__type"]
@@ -679,8 +679,8 @@ async fn a_connection_name_is_unique_within_the_account() {
         )
         .await;
         assert_eq!(
-            status, 409,
-            "case {provider:?}: expected 409 for a duplicate name, got {status} {body}"
+            status, 400,
+            "case {provider:?}: expected 400 for a duplicate name, got {status} {body}"
         );
         assert!(
             body["__type"]
@@ -711,7 +711,7 @@ async fn a_connection_name_is_unique_within_the_account() {
 }
 
 /// A `HostArn` names a host resource. This suite mints no host, so the create is
-/// refused with the modeled `ResourceNotFoundException` (404) rather than storing
+/// refused with the modeled `ResourceNotFoundException` rather than storing
 /// a connection that points at a resource that is not there.
 #[tokio::test]
 async fn a_host_arn_that_names_no_host_is_refused() {
@@ -727,8 +727,8 @@ async fn a_host_arn_that_names_no_host_is_refused() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "HostArn: expected 404 for a host that does not exist, got {status} {body}"
+        status, 400,
+        "HostArn: expected 400 for a host that does not exist, got {status} {body}"
     );
     assert!(
         body["__type"]
@@ -867,7 +867,7 @@ async fn a_page_never_exceeds_the_server_side_maximum() {
 }
 
 /// The store is bounded: past `MAX_CONNECTIONS` a create is refused with the modeled
-/// `LimitExceededException` (429), and deleting one frees the slot again.
+/// `LimitExceededException`, and deleting one frees the slot again.
 #[tokio::test]
 async fn creating_past_the_store_bound_is_refused() {
     let router = router();
@@ -886,8 +886,8 @@ async fn creating_past_the_store_bound_is_refused() {
     )
     .await;
     assert_eq!(
-        status, 429,
-        "case at-bound: expected 429 past {MAX_CONNECTIONS} connections, got {status} {body}"
+        status, 400,
+        "case at-bound: expected 400 past {MAX_CONNECTIONS} connections, got {status} {body}"
     );
     assert!(
         body["__type"]
@@ -906,8 +906,8 @@ async fn creating_past_the_store_bound_is_refused() {
     )
     .await;
     assert_eq!(
-        status, 409,
-        "case at-bound duplicate name: expected 409, got {status} {body}"
+        status, 400,
+        "case at-bound duplicate name: expected 400, got {status} {body}"
     );
     assert!(
         body["__type"]
