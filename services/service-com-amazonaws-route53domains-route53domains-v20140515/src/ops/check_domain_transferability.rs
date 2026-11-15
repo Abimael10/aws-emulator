@@ -5,9 +5,9 @@
 //! told apart by WHERE the name's registration lives: a transfer in moves an EXISTING
 //! registration from another registrar, so a name this account already holds is
 //! `DOMAIN_IN_OWN_ACCOUNT` and every other name is `UNTRANSFERABLE` — a name no registry
-//! holds has no registration to move, and a third party's registration moves only on
-//! that registrant's authorization. Every answer carries the `Message` explaining it and
-//! the standard transfer price of the name's TLD.
+//! holds has no registration to move, and a registration outside this account is locked
+//! at the registry. Every answer carries the `Message` explaining it and the standard
+//! transfer price of the name's TLD.
 //!
 //! This operation is a pure read: it never writes.
 //!

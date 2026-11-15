@@ -11,8 +11,10 @@
 //!   `DOMAIN_IN_OWN_ACCOUNT` ("The domain already exists in the current Amazon Web
 //!   Services account") and every other name is `UNTRANSFERABLE` ("The domain name can't
 //!   be transferred to Route 53") — a name no registry holds has no registration to
-//!   move, and a third party's registration moves only on that registrant's
-//!   authorization;
+//!   move, and a registration outside this account is locked at the registry;
+//! * the explanation of a name outside this account names that registry lock and the
+//!   action that clears it, as fixed text with the requested name as its only variable
+//!   part;
 //! * so a name `CheckDomainAvailability` reports `AVAILABLE` is never transferable, and
 //!   the two operations read one record: availability says WHETHER the name is
 //!   registered, transferability says WHERE;
@@ -149,12 +151,18 @@ fn not_registered_message(name: &str) -> String {
     format!("The domain {name} isn't registered. Register the domain first and then try again.")
 }
 
-/// The explanation a name another registrant holds is answered with.
+/// The fixed text in front of the requested name in the explanation of a registration
+/// this account does not hold: the transfer is blocked by the registry's lock on the
+/// registration, and clearing that lock is what a transfer in requires.
+const LOCKED_PREFIX: &str = "The domain ";
+/// The fixed text after the requested name in that same explanation.
+const LOCKED_SUFFIX: &str =
+    " is locked at the registry. Unlock the domain at the registry and try again.";
+
+/// The explanation a name registered outside this account is answered with: the two
+/// fixed parts with the requested name, and nothing else, between them.
 fn held_elsewhere_message(name: &str) -> String {
-    format!(
-        "The domain {name} is registered with another registrant. Ask the current registrant to \
-         authorize the transfer and then try again."
-    )
+    format!("{LOCKED_PREFIX}{name}{LOCKED_SUFFIX}")
 }
 
 /// The explanation a name this account holds is answered with.
@@ -191,7 +199,7 @@ async fn a_name_no_registry_holds_is_untransferable() {
 }
 
 // ---------------------------------------------------------------------------
-// The rule: a registration another registrant holds moves only on their authorization
+// The rule: a registration outside this account is locked at the registry
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -240,6 +248,58 @@ async fn a_name_another_registrant_holds_is_untransferable_and_says_so() {
             body["Message"].as_str(),
             Some(not_registered_message(name).as_str()),
             "case {name:?}: a name nobody holds is answered for being unregistered, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_explanation_of_a_name_outside_this_account_is_one_sentence_about_the_registry_lock() {
+    // The rule is that the sentence is FIXED text with the requested name as its one
+    // variable part, so each row's message must be exactly the two fixed parts with that
+    // row's name between them — and dropping the name out of each message must leave
+    // every row with the identical remainder. Rows span the seeded registry's labels and
+    // suffixes, including names no issue or fixture cites (`apple.net`, `wikipedia.org`,
+    // `bbc.co.uk`), several TLDs, and a request in mixed case.
+    //
+    // Source of the names: the third-party registrations this registry is seeded with
+    // (`seeded_registrations` in `src/state/registry.rs`).
+    let held = [
+        "apple.net",
+        "wikipedia.org",
+        "bbc.co.uk",
+        "github.com",
+        "openai.com",
+        "icann.org",
+        "google.de",
+        "NetFlix.COM",
+    ];
+    let emulator = Emulator::new();
+
+    for name in held {
+        let lower = name.to_lowercase();
+        let body = check(&emulator, name).await;
+        let message = body["Message"].as_str().unwrap_or_default().to_string();
+
+        assert_eq!(
+            transferable(&body),
+            "UNTRANSFERABLE",
+            "case {name:?}: a registration outside this account cannot move in, got {body}"
+        );
+        assert_eq!(
+            message,
+            held_elsewhere_message(&lower),
+            "case {name:?}: expected the registry-lock explanation, got {message:?}"
+        );
+        // The remediation the sentence states is clearing the lock at the registry, and
+        // the name appears exactly once, unquoted, in lower case.
+        assert_eq!(
+            message.replacen(&lower, "<name>", 1),
+            format!("{LOCKED_PREFIX}<name>{LOCKED_SUFFIX}"),
+            "case {name:?}: the fixed text must be the same for every name, got {message:?}"
+        );
+        assert!(
+            !message.contains(name) || name == lower,
+            "case {name:?}: the name is reported lower-cased, got {message:?}"
         );
     }
 }

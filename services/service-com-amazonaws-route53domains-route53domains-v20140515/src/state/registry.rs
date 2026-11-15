@@ -159,14 +159,14 @@ pub fn standard_transfer_price(tld: &str) -> PriceWithCurrency {
 /// Services account, which this emulator has no notion of — a name it holds for somebody
 /// else is held OUTSIDE Route 53. Nor is a name ever `TRANSFERABLE`: the only
 /// registrations this registry holds are this account's own, which are here already, and
-/// third parties', which move only on the authorization of the registrant who holds them
-/// (the `AuthCode` the losing registrar issues), and this registrar has no way to obtain
-/// one.
+/// those outside it, which the registry keeps transfer-locked, and this registrar cannot
+/// clear a lock on a registration it does not hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transferability {
     /// The calling account already holds the name.
     DomainInOwnAccount,
-    /// Another registrant holds it, outside this registrar.
+    /// A registration outside this account holds the name, and the registry's transfer
+    /// lock on it is not cleared, so there is nothing this registrar can move in.
     HeldElsewhere,
     /// No registry holds the name, so there is no registration to move at all.
     NotRegistered,
@@ -183,16 +183,22 @@ impl Transferability {
 
     /// The explanation `CheckDomainTransferabilityResponse`'s `Message` carries, which
     /// the member's own documentation returns "for when a domain can't be transferred" —
-    /// so every answer here carries one, each naming the requested domain and what the
-    /// caller would have to do about it.
+    /// so every answer here carries one, each naming the requested domain and the action
+    /// that would unblock the transfer.
+    ///
+    /// A registration outside this account is blocked by the REGISTRY's transfer lock
+    /// (`clientTransferProhibited`), not by who holds it: clearing that lock is what a
+    /// transfer in actually requires, so that is the action the explanation names. The
+    /// name is the requested `DomainName`, resolved (and so lower-cased) by
+    /// [`crate::state::resolve_domain_name`], and is the sentence's only variable part.
     pub fn message(self, name: &str) -> String {
         match self {
             Self::DomainInOwnAccount => {
                 format!("The domain {name} already exists in the current Amazon Web Services account.")
             }
             Self::HeldElsewhere => format!(
-                "The domain {name} is registered with another registrant. Ask the current \
-                 registrant to authorize the transfer and then try again."
+                "The domain {name} is locked at the registry. Unlock the domain at the registry \
+                 and try again."
             ),
             Self::NotRegistered => format!(
                 "The domain {name} isn't registered. Register the domain first and then try again."
