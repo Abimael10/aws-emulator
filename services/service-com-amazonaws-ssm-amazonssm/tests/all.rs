@@ -65,6 +65,8 @@ mod hybrid_activation_role;
 mod hybrid_activations;
 #[path = "all/identity_document_in_the_guest.rs"]
 mod identity_document_in_the_guest;
+#[path = "all/instance_association_status.rs"]
+mod instance_association_status;
 #[path = "all/instance_properties.rs"]
 mod instance_properties;
 #[path = "all/just_in_time_node_access.rs"]

@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AlarmConfiguration, Association, AssociationDescription, AssociationOverview,
-    InstanceAssociationOutputLocation, Target, TargetLocation,
+    InstanceAssociationOutputLocation, InstanceAssociationStatusInfo, Target, TargetLocation,
     ASSOCIATION_FILTER_KEY_VALUES,
 };
 
@@ -699,6 +699,73 @@ impl AssociationRecord {
     pub fn latest_description(&self, now: SystemTime) -> Option<AssociationDescription> {
         self.description_of(ASSOCIATION_VERSION_LATEST, now)
     }
+
+    /// The run of this association that was dispatched to the node `instance_id`, or `None`
+    /// when its latest run never reached that node.
+    ///
+    /// A run holds the nodes its targets selected at the instant it STARTED
+    /// ([`AssociationRunRecord`]), so a node registered after the dispatch is not one this
+    /// run reached.
+    pub fn run_on_node(&self, instance_id: &str) -> Option<&AssociationRunRecord> {
+        self.last_run
+            .as_ref()
+            .filter(|run| run.nodes.iter().any(|node| node == instance_id))
+    }
+
+    /// The modelled `InstanceAssociationStatusInfo` of this association ON one managed node,
+    /// as of `now`: how far the run it was dispatched to that node has got.
+    ///
+    /// The identity members are read where [`AssociationRecord::to_association`] reads them —
+    /// the association's own id and document name, and the version in force for the document
+    /// version, the association version and the association name — so a status report and a
+    /// listing never disagree about what a node is applying.
+    ///
+    /// The EXECUTION is the run that reached this node: "the date the association ran"
+    /// (`InstanceAssociationStatusInfo$ExecutionDate`) is the instant it was dispatched, it
+    /// has finished once the clock says so ([`ASSOCIATION_EXECUTION_DELAY`]) and until then
+    /// it is still being worked through. An association no run has reached this node for has
+    /// no execution at all, so it reports the status of an association nothing has run and no
+    /// date.
+    ///
+    /// The members only the SSM Agent in the node's guest reports — the summary of what it
+    /// ran, the error code it failed with and the URL of the output it uploaded — are unset,
+    /// because nothing has uploaded output or reported a failure for this run.
+    pub fn to_instance_association_status_info(
+        &self,
+        instance_id: &str,
+        now: SystemTime,
+    ) -> InstanceAssociationStatusInfo {
+        let version = self.latest();
+        let run = self.run_on_node(instance_id);
+        let finished = run.is_some_and(|run| run.has_finished(now));
+        InstanceAssociationStatusInfo {
+            association_id: Some(self.association_id.clone()),
+            name: Some(self.name.clone()),
+            document_version: version.and_then(|version| version.document_version.clone()),
+            association_version: Some(self.latest_version().to_string()),
+            instance_id: Some(instance_id.to_string()),
+            execution_date: run.map(|run| ::aws_smithy_types::DateTime::from(run.started_at)),
+            status: Some(
+                if finished {
+                    ASSOCIATION_STATUS_SUCCESS
+                } else {
+                    ASSOCIATION_STATUS_PENDING
+                }
+                .to_string(),
+            ),
+            detailed_status: run.map(|_| {
+                if finished {
+                    ASSOCIATION_DETAILED_STATUS_SUCCESS.to_string()
+                } else {
+                    ASSOCIATION_DETAILED_STATUS_IN_PROGRESS.to_string()
+                }
+            }),
+            execution_summary: None,
+            error_code: None,
+            output_url: None,
+            association_name: version.and_then(|version| version.association_name.clone()),
+        }
+    }
 }
 
 impl ComAmazonawsSsmAmazonssmState {
@@ -812,6 +879,29 @@ impl ComAmazonawsSsmAmazonssmState {
             nodes.extend(selected.into_iter().map(str::to_string));
         }
         nodes.into_iter().collect()
+    }
+
+    /// Whether `record` applies to the managed node `instance_id`.
+    ///
+    /// An association applies to a node when it was created FOR that node — "the managed
+    /// node ID" a create named through the deprecated `InstanceId` member, which is an
+    /// identity the association keeps rather than criteria resolved per run — when State
+    /// Manager has dispatched it there (its latest run reached that node,
+    /// [`AssociationRecord::run_on_node`]), or when the node is one its targets select now
+    /// ([`ComAmazonawsSsmAmazonssmState::association_run_nodes`]). The last two are what make
+    /// an association created before a node registered one that node applies, even though no
+    /// run of it has reached the node yet.
+    pub fn association_applies_to_node(
+        &self,
+        record: &AssociationRecord,
+        instance_id: &str,
+    ) -> bool {
+        record.instance_id.as_deref() == Some(instance_id)
+            || record.run_on_node(instance_id).is_some()
+            || self
+                .association_run_nodes(record)
+                .iter()
+                .any(|node| node == instance_id)
     }
 }
 

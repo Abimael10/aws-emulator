@@ -8,7 +8,7 @@
 //!
 //! Almost all of that sentence is the framework's own, and deliberately so: the envelope,
 //! the member paths, the requirement clauses and the value each clause quotes are rendered
-//! by `aws_smithy_schema_server`, the one writer of that sentence. Three things about a
+//! by `aws_smithy_schema_server`, the one writer of that sentence. Four things about a
 //! refusal of this service are NOT the framework's, and are stated here as rules over every
 //! operation rather than as cases keyed on one recorded request:
 //!
@@ -46,7 +46,14 @@
 //!    value outside an enumerated type, an absent member and a number above its maximum are
 //!    all stated without a value.
 //!
-//! The fourth difference is not a wording rule but a reading one: the value a clause
+//! 4. WHICH CONSTRAINTS of a member a refusal states, and WHICH EXPRESSION a
+//!    regular-expression clause names. A clause names the expression the live service
+//!    validates with, which for an already-anchored alternation is the alternation without
+//!    the outer anchors the model wraps it in ([`without_redundant_anchors`]), and a value
+//!    outside SEVERAL constraints of one member is stated against each of them
+//!    ([`as_stated_clauses`]) rather than against the first.
+//!
+//! The fifth difference is not a wording rule but a reading one: the value a clause
 //! stated at a COLLECTION member quotes is the collection the caller submitted, which no
 //! violation carries — the framework's walk has only its size (`<n> items`), which is not a
 //! value any caller sent. The collection comes from the echo the shared walk collects
@@ -57,7 +64,10 @@
 //! statement of the restoring rule. Nothing else about a clause is restored: a value the
 //! framework WITHHELD stays withheld, whatever the echo holds.
 
-use ::aws_smithy_schema_server::constraints::Violation;
+use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+use crate::state::{
+    MANAGED_NODE_ID_MAX_LENGTH, MANAGED_NODE_ID_MIN_LENGTH, MANAGED_NODE_ID_PATTERN,
+};
 use ::service_common::validation::SubmittedEcho;
 use ::service_common::validation_message::{
     in_hashed_enum_order, in_stated_enum_order, quoting_the_submitted_collection,
@@ -254,9 +264,88 @@ fn states_no_value(operation: Option<&str>) -> bool {
     operation.is_some_and(|operation| VALUELESS_OPERATIONS.contains(&operation))
 }
 
+/// The regular expression a refusal of this service states for a member whose modelled
+/// `@pattern` is an ALREADY ANCHORED alternation wrapped in a second pair of anchors.
+///
+/// A refusal states the expression the live service validates with, and this model wraps that
+/// expression in `^…$` whether or not it is anchored already: the managed-node id pattern is
+/// checked in as `^(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)$`, two self-anchored branches inside a
+/// redundant outer pair, and a refusal of it names the alternation itself — the expression
+/// `crate::state::MANAGED_NODE_ID_PATTERN` reports for a node id read out of a FILTER, so one
+/// caller is told one expression wherever the id travelled.
+///
+/// Both halves of that reading are the shared ones, called rather than restated: dropping the
+/// model's whole-value pair is `service_common::validation::unanchored`, and whether what is
+/// left pins the ends of each of its own branches — the discriminator that makes the dropped
+/// pair redundant — is `service_common::validation::anchors_its_own_ends`. This states which
+/// of that module's renderings this service's dialect is: the drop happens exactly where the
+/// branches anchor themselves, which is the one case the outer pair adds nothing to, and
+/// every other pattern is stated as the model writes it.
+///
+/// `None` when there is nothing redundant to drop, which keeps the framework's own rendering.
+fn without_redundant_anchors(pattern: &str) -> Option<String> {
+    let inner = ::service_common::validation::unanchored(pattern);
+    (inner != pattern && ::service_common::validation::anchors_its_own_ends(&inner))
+        .then_some(inner)
+}
+
+/// Whether `violation` is a value that is not a managed-node id: it broke the `@pattern` of
+/// this service's `InstanceId` shape ([`without_redundant_anchors`],
+/// `crate::state::MANAGED_NODE_ID_PATTERN`) at a scalar member, rather than inside a
+/// collection — a clause stated at a collection member aggregates its element's constraints
+/// instead of stating one of them.
+fn is_not_a_managed_node_id(violation: &Violation) -> bool {
+    if violation.path.contains('.') {
+        return false;
+    }
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => {
+            without_redundant_anchors(pattern).as_deref() == Some(MANAGED_NODE_ID_PATTERN)
+        }
+        _ => false,
+    }
+}
+
+/// The clauses a refusal states for one violation: usually the one it is, and for a value
+/// that is not a managed-node id, one clause per constraint of that shape the value is
+/// outside of.
+///
+/// The `InstanceId` shape carries a LENGTH beside its pattern in the live service — at least
+/// [`MANAGED_NODE_ID_MIN_LENGTH`] and at most [`MANAGED_NODE_ID_MAX_LENGTH`] characters — and
+/// a refusal states every constraint of a member the value broke rather than the first of
+/// them, in the order the service lists that shape's constraints: the maximum length, the
+/// minimum length, then the pattern. A value whose length a response does not carry (a member
+/// whose value is withheld) is stated against the pattern alone, because the length clauses
+/// are about a value this refusal does not have.
+fn as_stated_clauses(violation: Violation) -> Vec<Violation> {
+    if !is_not_a_managed_node_id(&violation) {
+        return vec![violation];
+    }
+    let length = violation
+        .value
+        .as_deref()
+        .map(|value| i64::try_from(value.chars().count()).unwrap_or(i64::MAX));
+    let mut clauses = Vec::new();
+    let mut broken = |kind: ViolationKind| {
+        clauses.push(Violation {
+            kind,
+            ..violation.clone()
+        });
+    };
+    if length.is_some_and(|length| length > MANAGED_NODE_ID_MAX_LENGTH) {
+        broken(ViolationKind::MaxLength(MANAGED_NODE_ID_MAX_LENGTH));
+    }
+    if length.is_some_and(|length| length < MANAGED_NODE_ID_MIN_LENGTH) {
+        broken(ViolationKind::MinLength(MANAGED_NODE_ID_MIN_LENGTH));
+    }
+    clauses.push(violation);
+    clauses
+}
+
 /// `violation` as this service states it: the accepted value set in place of the declared
-/// one (rule 2), listed in this service's order (rule 1), with the value half dropped where
-/// the operation states none (rule 3).
+/// one (rule 2), listed in this service's order (rule 1), a regular expression as the service
+/// validates with it ([`without_redundant_anchors`]), and the value half dropped where the
+/// operation states none (rule 3).
 ///
 /// The CLAUSE is still the framework's — only what goes into it moves — so the member path,
 /// the requirement's wording and the punctuation around them keep coming from the one place
@@ -264,7 +353,12 @@ fn states_no_value(operation: Option<&str>) -> bool {
 /// whose value a response does not carry, rather than a second sentence spelled here.
 fn stated(violation: &Violation, valueless: bool) -> Violation {
     let accepted = in_stated_enum_order(violation, ACCEPTED_VALUE_SETS);
-    let listed = in_hashed_enum_order(&accepted);
+    let mut listed = in_hashed_enum_order(&accepted);
+    if let ViolationKind::Pattern(pattern) = &listed.kind {
+        if let Some(stated) = without_redundant_anchors(pattern) {
+            listed.kind = ViolationKind::Pattern(stated);
+        }
+    }
     if valueless {
         return Violation {
             value: None,
@@ -289,7 +383,9 @@ pub(super) fn validation_refusal(
     let valueless = states_no_value(operation);
     let stated: Vec<Violation> = violations
         .iter()
-        .map(|violation| stated(violation, valueless))
+        .cloned()
+        .flat_map(as_stated_clauses)
+        .map(|violation| stated(&violation, valueless))
         .collect();
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_string(),
@@ -618,6 +714,125 @@ mod tests {
         assert_eq!(
             stated, expected,
             "case a page size and a session state: expected {expected:?}, got {stated:?}"
+        );
+    }
+
+    /// RULE 4, the expression half: a clause names the expression the service validates with,
+    /// which for an alternation whose branches anchor themselves is that alternation without
+    /// the outer anchors the model wraps it in — and every other pattern is the model's own.
+    #[test]
+    fn a_pattern_clause_names_the_expression_the_service_validates_with() {
+        // (case, the modelled pattern a violation carries, the expression the clause names)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "the managed-node id alternation, anchored twice",
+                r"^(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)$",
+                MANAGED_NODE_ID_PATTERN,
+            ),
+            (
+                "a single branch whose anchors ARE the outer pair",
+                r"^i-\w{8}$",
+                r"^i-\w{8}$",
+            ),
+            (
+                "an unanchored expression",
+                r"[a-f0-9]{8}",
+                r"[a-f0-9]{8}",
+            ),
+            (
+                "an anchored group that is not an alternation of anchored branches",
+                r"^(arn:aws:ssm:.*)$",
+                r"^(arn:aws:ssm:.*)$",
+            ),
+            (
+                "an alternation one of whose branches does not anchor itself",
+                r"^(^a$)|(b$)$",
+                r"^(^a$)|(b$)$",
+            ),
+        ];
+        for (case, modelled, expected) in cases {
+            let broken = violation(
+                "documentVersion",
+                ViolationKind::Pattern((*modelled).to_string()),
+                Some("not-a-version"),
+            );
+            let stated = message(std::slice::from_ref(&broken));
+            let expected = format!(
+                "1 validation error detected: Value 'not-a-version' at 'documentVersion' failed \
+                 to satisfy constraint: Member must satisfy regular expression pattern: \
+                 {expected}"
+            );
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected {expected:?}, got {stated:?}"
+            );
+        }
+    }
+
+    /// RULE 4, the constraint half: a value that is not a managed-node id is stated against
+    /// every constraint of that shape it broke — its length as well as its pattern — in the
+    /// order the service lists them, and a value inside a COLLECTION keeps the single clause
+    /// its aggregated form carries.
+    #[test]
+    fn a_value_that_is_not_a_node_id_is_stated_against_every_constraint_it_broke() {
+        let pattern =
+            || ViolationKind::Pattern(r"^(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)$".to_string());
+        let clause = |value: &str, requirement: &str| {
+            format!("Value '{value}' at 'instanceId' failed to satisfy constraint: {requirement}")
+        };
+        let shape = format!(
+            "Member must satisfy regular expression pattern: {MANAGED_NODE_ID_PATTERN}"
+        );
+
+        // (case, the value refused, the clauses the refusal states, in order)
+        let too_short = "i-zzz";
+        let right_length = "i-zzzzzzzzzz";
+        let too_long = "not-a-valid-instance-id";
+        let cases: Vec<(&str, &str, Vec<String>)> = vec![
+            (
+                "shorter than the shape's minimum",
+                too_short,
+                vec![
+                    clause(too_short, "Member must have length greater than or equal to 10"),
+                    clause(too_short, &shape),
+                ],
+            ),
+            (
+                "within the length but outside the pattern",
+                right_length,
+                vec![clause(right_length, &shape)],
+            ),
+            (
+                "longer than the shape's maximum",
+                too_long,
+                vec![
+                    clause(too_long, "Member must have length less than or equal to 20"),
+                    clause(too_long, &shape),
+                ],
+            ),
+        ];
+        for (case, value, clauses) in cases {
+            let stated = message(&[violation("instanceId", pattern(), Some(value))]);
+            let count = clauses.len();
+            let expected = if count == 1 {
+                format!("1 validation error detected: {}", clauses[0])
+            } else {
+                format!("{count} validation errors detected: {}", clauses.join("; "))
+            };
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected {expected:?}, got {stated:?}"
+            );
+        }
+
+        // The same value inside a collection: one clause, as the collection's aggregated form
+        // states it, rather than this shape's constraints one by one.
+        let in_a_list = violation("instanceIds.1.member", pattern(), Some(too_short));
+        let stated = message(std::slice::from_ref(&in_a_list));
+        assert!(
+            stated.starts_with("1 validation error detected:"),
+            "case \"a node id inside a collection\": expected the one clause the collection \
+             states, got {stated:?}"
         );
     }
 

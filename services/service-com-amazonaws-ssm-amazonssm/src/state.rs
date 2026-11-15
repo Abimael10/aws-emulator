@@ -4252,6 +4252,28 @@ pub fn managed_node_id_is_well_formed(id: &str) -> bool {
 /// same expression by hand.
 pub const MANAGED_NODE_ID_PATTERN: &str = r"(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)";
 
+/// The shortest a managed-node id can be, as a refusal reports the constraint.
+///
+/// The `InstanceId` shape carries a LENGTH beside its pattern in the live service, which
+/// this checkout's model does not declare: a value shorter than this is refused for the
+/// length as well as for the pattern, and a refusal states both.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-wire-aws-v1`, fixtures
+/// `ssm-vscan-traj-inventory-entries-type-and-id-mistakes` and
+/// `ssm-vscan-traj-patch-and-compliance-read-mistakes`): an `InstanceId` of `i-zzz` is
+/// refused "2 validation errors detected: … Member must have length greater than or equal
+/// to 10; … Member must satisfy regular expression pattern: …", and the aggregated clause a
+/// LIST of them carries lists both bounds beside the pattern ("Member must have length less
+/// than or equal to 20, Member must have length greater than or equal to 10, …"). The bounds
+/// are reported, never enforced: which values the shape ADMITS is the modelled `@pattern`
+/// alone, which the framework's own walk decides before any wording is chosen.
+pub const MANAGED_NODE_ID_MIN_LENGTH: i64 = 10;
+
+/// The longest a managed-node id can be, the other half of that length — the longest id the
+/// pattern admits is `mi-` and 17 characters, which is exactly this many. Recorded in the
+/// same place as [`MANAGED_NODE_ID_MIN_LENGTH`], and reported the same way.
+pub const MANAGED_NODE_ID_MAX_LENGTH: i64 = 20;
+
 /// The input member a managed-node id fills, as a refusal names it. The `InstanceId`
 /// shape is ONE identifier space across this service, so a value that is not one of its
 /// ids is reported at that member whichever filter or list carried it.
