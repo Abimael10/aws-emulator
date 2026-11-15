@@ -4,11 +4,10 @@
 //! service's alphabet whose symbols spell a value above the range this service
 //! mints identifiers from.
 //!
-//! RULE under test: an identifier is 26 characters of the base32 alphabet
-//! (`tests/all/identifier_format_refusal.rs` pins that half, which every route
-//! requires), and 26 such symbols carry 130 bits while a minted identifier
-//! occupies 128 of them — so the alphabet admits strings above every value this
-//! service could have minted. Whether that range is a PRECONDITION is stated per
+//! RULE under test: an identifier of this service's own minted form is 26
+//! characters of the base32 alphabet it is rendered with, and 26 such symbols
+//! carry 130 bits while a minted identifier occupies 128 of them — so the alphabet
+//! admits strings above every value this service could have minted. Whether that range is a PRECONDITION is stated per
 //! operation, not by the model: `ClusterId` and `StreamId` carry one `@pattern`
 //! each and every one of these operations models both `ValidationException` (400)
 //! and `ResourceNotFoundException` (404) (`smithy_query(query="digest")`), so the
@@ -35,10 +34,9 @@
 //! `tests/all/harness.rs`, this crate's one test client.
 
 use crate::harness::Dsql;
-use crate::identifier_format_refusal::{refused_as_input, the_store_is_untouched};
 use crate::resource_identifier_absence::{
-    reported_absent, routes, AboveTheMintedRange, IdCase, Route, IDENTIFIER_LEN,
-    IDENTIFIER_SYMBOLS, LEADING_SYMBOL_MAX,
+    refused_as_input, reported_absent, routes, the_store_is_untouched, AboveTheMintedRange, IdCase,
+    Route, IDENTIFIER_LEN, IDENTIFIER_SYMBOLS, LEADING_SYMBOL_MAX,
 };
 
 /// Identifiers written in the alphabet whose symbols spell a value above the

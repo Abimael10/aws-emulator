@@ -50,14 +50,14 @@
 //! against this account's IAM on the same terms
 //! ([`unresolved_policy_principal`], over the principals
 //! [`policy_principals`] reads out of it), because a document one entry point would
-//! refuse as granting to nobody cannot be reachable through the other. The check that a cluster or stream identifier is an
-//! identifier of this service at all ([`is_resource_identifier`], refused by
-//! [`validate_cluster_identifier`] / [`validate_stream_identifier`]) lives here on
-//! the same terms: eleven routes carry such an identifier, and all of them have to
-//! refuse one value the same way. The narrower check the three operations that
-//! state the minted value range as a precondition add
-//! ([`validate_minted_cluster_identifier`]) is built from that same predicate, so
-//! the two cannot disagree about the alphabet.
+//! refuse as granting to nobody cannot be reachable through the other. A cluster
+//! or stream identifier's whole FORM is the `@pattern` its shape declares, which
+//! the boundary constraint walk decides before any handler runs, so no operation
+//! adds a narrower form of its own and every value inside that pattern is resolved
+//! against the store. The one precondition beyond the pattern — the minted value
+//! RANGE three cluster-addressed operations state as their own
+//! ([`validate_minted_cluster_identifier`]) — lives here so those three cannot
+//! word it differently.
 //!
 //! The tagging operations address a resource by a caller-supplied `resourceArn`
 //! rather than by identifier, so the read of that ARN ([`parse_resource_arn`]), the
@@ -1808,44 +1808,22 @@ fn kms_key_arn(region: &str, kms_encryption_key: &str) -> String {
 /// (`smithy_query(query="shape", shape="ClusterId,StreamId")`).
 pub const RESOURCE_ID_LEN: usize = 26;
 
-/// Whether `value` is an identifier of this service at all: 26 symbols of the
-/// base32 alphabet every cluster and stream identifier Aurora DSQL issues is
-/// written in ([`CROCKFORD_SYMBOLS`], the alphabet [`new_resource_identifier`]
-/// renders with).
-///
-/// `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$` is the OUTER form — the
-/// boundary constraint walk refuses every value outside it before a handler runs
-/// (`crate::service::validation`) — and it is wider than the alphabet, which
-/// leaves out the four letters that read as other symbols or as nothing (`i` and
-/// `l` read as `1`, `o` as `0`, and `u` is left out of the encoding altogether).
-/// A value inside the pattern that uses one of those letters is written in no
-/// alphabet this service's identifiers use, names no resource, and is refused as
-/// INPUT ([`validate_cluster_identifier`] / [`validate_stream_identifier`]) by
-/// every operation that carries an identifier.
-///
-/// The alphabet is all this asks. 26 symbols carry 130 bits while the values this
-/// service mints occupy 128 of them, so the alphabet admits strings above every
-/// value it could have minted; such a string is an identifier no resource of this
-/// account uses, reported as [`cluster_not_found`] or [`stream_not_found`] —
-/// except on the few operations that state the narrower range as a precondition
-/// of their own ([`renders_a_minted_identifier`], reached through
-/// [`validate_minted_cluster_identifier`]).
-pub fn is_resource_identifier(value: &str) -> bool {
-    value.len() == RESOURCE_ID_LEN
-        && value
-            .bytes()
-            .all(|symbol| CROCKFORD_SYMBOLS.contains(&symbol))
-}
-
 /// Whether `value` is inside the value range this service MINTS an identifier
-/// from: 26 symbols of the alphabet carry 130 bits, and a minted identifier
-/// renders the 128 bits [`new_resource_identifier`] builds, so the leading symbol
-/// is what decides it.
+/// from: a minted identifier is 26 symbols of [`CROCKFORD_SYMBOLS`] rendering the
+/// 128 bits [`new_resource_identifier`] builds, while 26 such symbols carry 130
+/// bits, so both the alphabet and the leading symbol decide it.
 ///
-/// Narrower than [`is_resource_identifier`], and asked only where the range is
-/// part of what a caller has to send ([`validate_minted_cluster_identifier`]) or
-/// where this service is reading back something it issued itself
-/// ([`decode_pagination_cursor`]).
+/// Narrower than `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$`, which is the
+/// FORM an identifier has to be in and all the form asks: the pattern admits the
+/// four letters the encoding leaves out (`i` and `l` read as `1`, `o` as `0`, and
+/// `u` is left out of the encoding altogether) and strings above every value this
+/// service could have minted, and a value inside the pattern is an identifier this
+/// account simply does not hold — reported as [`cluster_not_found`] or
+/// [`stream_not_found`] by every operation that resolves one.
+///
+/// So this is asked only where the range is part of what a caller has to send
+/// ([`validate_minted_cluster_identifier`]) or where this service is reading back
+/// something it issued itself ([`decode_pagination_cursor`]).
 ///
 /// Decided by the ROUND TRIP through the renderer this service mints with, so the
 /// range is spelled in exactly one place: a value is inside it when it decodes to
@@ -2118,7 +2096,7 @@ pub fn new_resource_identifier() -> String {
 /// digits plus the letters with `i`, `l`, `o` and `u` left out.
 ///
 /// The alphabet an identifier of this service is both WRITTEN and READ in
-/// ([`crockford_base32`] renders with it, [`is_resource_identifier`] recognises a
+/// ([`crockford_base32`] renders with it, [`decode_resource_identifier`] reads a
 /// value by it), so the two cannot disagree about which letters are symbols.
 const CROCKFORD_SYMBOLS: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
@@ -2296,67 +2274,38 @@ pub fn invalid_resource_arn(member: &str, value: &str) -> ValidationException {
 /// GetVpcEndpointServiceName")`: `identifier`).
 pub const IDENTIFIER_MEMBER: &str = "identifier";
 
-/// The member a cluster identifier arrives in on the operations addressed at a
-/// cluster's STREAMS, which carry the stream's own identifier beside it
-/// (`smithy_query(query="operation", operation="CreateStream,ListStreams,GetStream,
-/// DeleteStream")`: `clusterIdentifier`).
-pub const CLUSTER_IDENTIFIER_MEMBER: &str = "clusterIdentifier";
-
-/// The member a stream identifier arrives in (`smithy_query(query="operation",
-/// operation="GetStream,DeleteStream")`: `streamIdentifier`).
-pub const STREAM_IDENTIFIER_MEMBER: &str = "streamIdentifier";
-
 /// The form an identifier of this service has to be in, as a refusal of a value
-/// that is not in it states it: 26 characters of the base32 alphabet
-/// ([`is_resource_identifier`]).
+/// that is not in it states it: 26 characters of the base32 alphabet a minted
+/// identifier is rendered with ([`renders_a_minted_identifier`]).
 const IDENTIFIER_FORMAT: &str = "a valid base32-encoded 26-character string";
 
-/// Check a CLUSTER identifier a request carried, before anything is looked up:
-/// the identifier has to be written in the alphabet an identifier of this service
-/// is rendered in ([`is_resource_identifier`]).
-///
-/// `member` is the input member the value arrived in ([`IDENTIFIER_MEMBER`] on the
-/// cluster-addressed operations, [`CLUSTER_IDENTIFIER_MEMBER`] on the
-/// stream-addressed ones), so the refusal names what the caller has to fix and
-/// quotes the value it rejected, which is how a caller tells a malformed
-/// identifier from a cluster that is gone.
-///
-/// Every operation that carries a cluster identifier calls this, so one value is
-/// refused identically whichever route it arrives on. The three that state the
-/// narrower minted RANGE as a precondition of their own go through
-/// [`validate_minted_cluster_identifier`], which is this check and then the range.
-pub fn validate_cluster_identifier(member: &str, value: &str) -> Result<(), ValidationException> {
-    if is_resource_identifier(value) {
-        return Ok(());
-    }
-    Err(invalid_cluster_identifier(member, value))
-}
-
 /// Check a CLUSTER identifier on an operation that states the minted value RANGE
-/// as a precondition too: the value has to be written in the alphabet AND be one
-/// the minting range covers ([`renders_a_minted_identifier`]), or the call is
-/// refused before the cluster is looked up.
+/// as a precondition of its own: the value has to be one the minting range covers
+/// ([`renders_a_minted_identifier`]), or the call is refused before the cluster is
+/// looked up.
 ///
-/// Which operations those are is not something the model says — `ClusterId`
-/// carries one `@pattern` and every cluster-addressed operation models both
-/// `ValidationException` and `ResourceNotFoundException` — so it is read off the
-/// wire behaviour recorded for each one: `GetCluster`, `DeleteCluster` and
-/// `GetClusterPolicy` answer a value above the range with this refusal (recorded
-/// in `dsql-cluster-error-paths` steps task#1 and task#2 and in
-/// `dsql-request-validation-error-surface` step task#5), while the other
-/// cluster-addressed operations resolve every value of the alphabet against the
-/// store and report an absent cluster ([`cluster_not_found`], recorded in
-/// `dsql-missing-cluster-error-surface` steps task#1 to task#5). The precondition
-/// is about the VALUE and not about the request that carried it, so each of those
-/// three applies it to every value it is sent.
+/// This is the ONLY check an identifier meets beyond its shape's `@pattern`, and
+/// only these operations state it. Which ones they are is not something the model
+/// says — `ClusterId` carries one `@pattern` and every cluster-addressed operation
+/// models both `ValidationException` and `ResourceNotFoundException` — so it is
+/// read off the wire behaviour recorded for each one: `GetCluster`,
+/// `DeleteCluster` and `GetClusterPolicy` answer a value outside the range with
+/// this refusal (recorded in `dsql-cluster-error-paths` steps task#1 and task#2
+/// and in `dsql-request-validation-error-surface` step task#5), while every other
+/// identifier-addressed operation resolves each value of the pattern against the
+/// store and reports an absent resource ([`cluster_not_found`] /
+/// [`stream_not_found`], recorded in `dsql-missing-cluster-error-surface` steps
+/// task#1 to task#5 and in `dsql-cluster-subresource-guards` steps task#4 and
+/// task#5). The precondition is about the VALUE and not about the request that
+/// carried it, so each of those three applies it to every value it is sent.
 ///
-/// The refusal is worded exactly as [`validate_cluster_identifier`] words one, so
-/// a caller cannot tell which half of the form a value failed.
+/// `member` is the input member the value arrived in ([`IDENTIFIER_MEMBER`] on
+/// every operation that states this precondition), so the refusal names what the
+/// caller has to fix and quotes the value it rejected.
 pub fn validate_minted_cluster_identifier(
     member: &str,
     value: &str,
 ) -> Result<(), ValidationException> {
-    validate_cluster_identifier(member, value)?;
     if renders_a_minted_identifier(value) {
         return Ok(());
     }
@@ -2379,25 +2328,6 @@ fn invalid_cluster_identifier(member: &str, value: &str) -> ValidationException 
             message: format!("Member must be {IDENTIFIER_FORMAT}"),
         }]),
     }
-}
-
-/// Check a STREAM identifier a request carried, before anything is looked up, on
-/// the same terms as [`validate_cluster_identifier`].
-///
-/// The sentence Aurora DSQL words this case with names the offending member and
-/// the form it had to be in, and does not echo the rejected value.
-pub fn validate_stream_identifier(member: &str, value: &str) -> Result<(), ValidationException> {
-    if is_resource_identifier(value) {
-        return Ok(());
-    }
-    Err(ValidationException {
-        message: unreadable_member_message(member, &format!("the format '{IDENTIFIER_FORMAT}'")),
-        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message: format!("Member must be {IDENTIFIER_FORMAT}"),
-        }]),
-    })
 }
 
 /// The prefix that marks a tag key as belonging to AWS rather than to the caller.

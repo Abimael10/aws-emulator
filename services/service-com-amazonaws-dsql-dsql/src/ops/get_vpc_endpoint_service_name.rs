@@ -149,21 +149,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The identifier's outer FORM is `ClusterId`'s `^[a-z0-9]{26}$`, already
-        // decided by the boundary constraint walk, but that pattern is wider than
-        // the base32 alphabet an identifier of this service is written in: a
-        // value using a letter that alphabet leaves out names no cluster and is
-        // refused as input, so the lookup below decides only whether a
-        // well-formed identifier is held.
-        if let Err(invalid) = crate::state::validate_cluster_identifier(
-            crate::state::IDENTIFIER_MEMBER,
-            &input.identifier,
-        ) {
-            return Err(
-                GetVpcEndpointServiceNameErrorModeled::ValidationException(invalid).into(),
-            );
-        }
-
+        // The identifier's whole FORM is `ClusterId`'s `^[a-z0-9]{26}$`, which the
+        // boundary constraint walk decides before this handler runs, so every value
+        // that reaches here is a well-formed identifier and the lookup below
+        // decides only whether this account holds the cluster it names.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetVpcEndpointServiceNameErrorModeled::InternalServerException(

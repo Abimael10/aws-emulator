@@ -12,8 +12,8 @@
 //! the service's own modelled `ValidationException`, whose `@required` `reason` is
 //! filled and whose `fieldList` names the member the value arrived in — before any
 //! state is read, and never as a report that some resource is absent. A value
-//! INSIDE the pattern using a letter the identifier alphabet leaves out is refused
-//! the same way, which `tests/all/identifier_format_refusal.rs` pins.
+//! INSIDE the pattern is an identifier whatever letters it uses, which
+//! `tests/all/identifier_pattern_is_the_whole_form.rs` pins.
 //!
 //! The value table spans the ways a URI label can fall outside the pattern: the
 //! wrong case, the wrong length (under, over, and far under) and a character the

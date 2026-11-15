@@ -165,11 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The identifier's outer FORM is `ClusterId`'s `^[a-z0-9]{26}$`, already
         // decided by the boundary constraint walk, but that pattern is wider than
         // the form THIS operation states: it reads the identifier against the
-        // alphabet an identifier of this service is written in AND against the
-        // value range one is minted from, and refuses a value outside either
-        // BEFORE any lookup, so a caller can tell a malformed identifier from a
-        // cluster that is gone. The cluster-addressed operations that state no
-        // range precondition call `validate_cluster_identifier` instead.
+        // value range one is minted from, and refuses a value outside it BEFORE
+        // any lookup, so a caller can tell a malformed identifier from a cluster
+        // that is gone. The identifier-addressed operations that state no range
+        // precondition resolve every value of the pattern against the store.
         if let Err(invalid) = crate::state::validate_minted_cluster_identifier(
             crate::state::IDENTIFIER_MEMBER,
             &input.identifier,

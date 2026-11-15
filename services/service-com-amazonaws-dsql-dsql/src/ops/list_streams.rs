@@ -154,19 +154,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The cluster identifier's outer FORM is `ClusterId`'s `^[a-z0-9]{26}$`,
-        // already decided by the boundary constraint walk, but that pattern is
-        // wider than the base32 alphabet an identifier of this service is written
-        // in: a value using a letter that alphabet leaves out names no cluster
-        // and is refused as input — before the cursor below, whose walk is the
-        // walk over THIS cluster's streams.
-        if let Err(invalid) = crate::state::validate_cluster_identifier(
-            crate::state::CLUSTER_IDENTIFIER_MEMBER,
-            &input.cluster_identifier,
-        ) {
-            return Err(ListStreamsErrorModeled::ValidationException(invalid).into());
-        }
-
+        // The cluster identifier's whole FORM is `ClusterId`'s `^[a-z0-9]{26}$`,
+        // which the boundary constraint walk decides before this handler runs, so
+        // every value that reaches here is a well-formed identifier: the cursor
+        // below is read for the walk over THIS cluster's streams, and the lookup
+        // after it decides whether this account holds that cluster at all.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListStreamsErrorModeled::InternalServerException(
                 InternalServerException {

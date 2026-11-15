@@ -157,25 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Each identifier's outer FORM is the `^[a-z0-9]{26}$` `ClusterId` and
-        // `StreamId` declare, already decided by the boundary constraint walk, but
-        // that pattern is wider than the base32 alphabet an identifier of this
-        // service is written in: a value using a letter that alphabet leaves out
-        // names no resource and is refused as input BEFORE any lookup, each member
-        // with the sentence its own kind of identifier is refused with.
-        if let Err(invalid) = crate::state::validate_cluster_identifier(
-            crate::state::CLUSTER_IDENTIFIER_MEMBER,
-            &input.cluster_identifier,
-        ) {
-            return Err(GetStreamErrorModeled::ValidationException(invalid).into());
-        }
-        if let Err(invalid) = crate::state::validate_stream_identifier(
-            crate::state::STREAM_IDENTIFIER_MEMBER,
-            &input.stream_identifier,
-        ) {
-            return Err(GetStreamErrorModeled::ValidationException(invalid).into());
-        }
-
+        // Each identifier's whole FORM is the `^[a-z0-9]{26}$` `ClusterId` and
+        // `StreamId` declare, which the boundary constraint walk decides before
+        // this handler runs, so every value that reaches here is a well-formed
+        // identifier and the only question left is whether the store holds it:
+        // the lookups below answer an identifier it does not hold as the absent
+        // resource rather than as a malformed request.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetStreamErrorModeled::InternalServerException(
                 InternalServerException {

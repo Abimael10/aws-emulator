@@ -236,19 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateStreamErrorModeled::AccessDeniedException(denial).into());
         }
 
-        // The cluster identifier's outer FORM is `ClusterId`'s `^[a-z0-9]{26}$`,
-        // already decided by the boundary constraint walk, but that pattern is
-        // wider than the base32 alphabet an identifier of this service is written
-        // in: a value using a letter that alphabet leaves out names no cluster
-        // and is refused as input, with the rest of the request's values and
-        // before anything is read or minted.
-        if let Err(invalid) = crate::state::validate_cluster_identifier(
-            crate::state::CLUSTER_IDENTIFIER_MEMBER,
-            &input.cluster_identifier,
-        ) {
-            return Err(CreateStreamErrorModeled::ValidationException(invalid).into());
-        }
-
+        // The cluster identifier's whole FORM is `ClusterId`'s `^[a-z0-9]{26}$`,
+        // which the boundary constraint walk decides before this handler runs, so
+        // every value that reaches here is a well-formed identifier and the lookup
+        // below decides only whether this account holds the cluster it names.
+        //
         // The `tags` a create carries are written exactly as `TagResource` writes
         // them, so they are held to the same rule: a key under the prefix AWS
         // reserves for its own tags is not the caller's to write, and the request is

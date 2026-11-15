@@ -3,25 +3,25 @@
 //! What an identifier-addressed operation answers for an identifier the account
 //! does not hold, and what it answers for a value that is no identifier at all.
 //!
-//! RULE under test: an identifier of this service is 26 characters of the base32
-//! alphabet every cluster and stream identifier is rendered with, and every value
-//! inside the range this service mints from is resolved AGAINST THE STORE on every
-//! route — an identifier the account does not hold is the modelled
+//! RULE under test: an identifier of this service is any value inside the
+//! `@pattern` its shape declares, and every one of them is resolved AGAINST THE
+//! STORE on every route — an identifier the account does not hold is the modelled
 //! `ResourceNotFoundException`, HTTP 404 with the wire code
 //! `ResourceNotFoundException` and all three of its `@required` members filled:
 //! `message` naming the ARN the call addressed, `resourceId` the identifier the
 //! request carried, and `resourceType` the type of the resource the lookup stopped
 //! at. Nothing about which value the store holds may be refused, because a value
 //! of that form is well formed whether or not this service ever issued that
-//! particular one. The complements are pinned beside this suite, over this suite's
-//! route table: a value outside `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$`
+//! particular one. This suite's own rows are of the form this service MINTS an
+//! identifier in; the complements are pinned beside it, over this suite's route
+//! table: a value outside `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$`
 //! (`smithy_query(query="shape", shape="ClusterId,StreamId")`) is refused at the
-//! boundary (`tests/all/malformed_resource_identifier.rs`), one inside that pattern
-//! using a letter the alphabet leaves out is refused as input on every route
-//! (`tests/all/identifier_format_refusal.rs`), and one written in the alphabet but
-//! ABOVE the minted range is answered per operation — refused by the three that
-//! state that range as a precondition, an absent resource on the rest
-//! (`tests/all/identifier_value_range.rs`).
+//! boundary (`tests/all/malformed_resource_identifier.rs`), one inside that
+//! pattern that the service's own encoding alphabet does not spell is an
+//! identifier all the same (`tests/all/identifier_pattern_is_the_whole_form.rs`),
+//! and one written in the alphabet but ABOVE the minted range is answered per
+//! operation — refused by the three that state that range as a precondition, an
+//! absent resource on the rest (`tests/all/identifier_value_range.rs`).
 //!
 //! The identifier table spans what the form generalises over — which symbols the
 //! value uses and where, across the range this service's own minting scheme draws
@@ -29,6 +29,11 @@
 //! table spans every operation that carries such an identifier in its URI, so the
 //! rule is asserted on the member each one binds rather than on one reader, and on
 //! the nested stream route as well as the cluster ones.
+//!
+//! The two assertion helpers both halves share live here beside that table:
+//! [`reported_absent`] for the modelled 404, and [`refused_as_input`] for the
+//! modelled 400 the three operations that state the minted value RANGE answer a
+//! value outside it with.
 //!
 //! Every case drives the real request path through the `Dsql` harness in
 //! `tests/all/harness.rs`, this crate's one test client.
@@ -295,6 +300,120 @@ pub fn routes() -> Vec<Route> {
 pub struct IdCase {
     pub name: String,
     pub value: String,
+}
+
+/// A value written in the identifier alphabet, inside the minted range, which a
+/// suite that breaks the form in exactly one way starts from: [`IDENTIFIER_LEN`]
+/// symbols of [`IDENTIFIER_SYMBOLS`] whose leading symbol keeps the value inside
+/// [`LEADING_SYMBOL_MAX`].
+pub fn value_in_the_alphabet() -> String {
+    let tail: String = IDENTIFIER_SYMBOLS
+        .chars()
+        .skip(1)
+        .take(IDENTIFIER_LEN - 1)
+        .collect();
+    format!("0{tail}")
+}
+
+/// The sentence a cluster identifier outside the form an operation states is
+/// refused with: it names the member and quotes the value it rejected.
+///
+/// There is no stream wording to spell beside it: the only operations that state a
+/// form beyond `^[a-z0-9]{26}$` are three addressed at a CLUSTER by `identifier`,
+/// and every operation that carries a stream identifier resolves each value of
+/// the pattern against the store.
+pub fn expected_refusal_sentence(member: &str, value: &str) -> String {
+    format!(
+        "Invalid input '{member}: {value}'. The cluster identifier format is invalid. \
+         Provide a valid cluster identifier and try again."
+    )
+}
+
+/// Assert that `route` refuses `case` as INPUT: HTTP 400 with the service's own
+/// modelled `ValidationException` — its `@required` `reason` filled, its
+/// `fieldList` naming the member the value arrived in, the sentence
+/// [`expected_refusal_sentence`] words, and no resource named at all.
+///
+/// The one place that body is spelled, so every suite that asserts a refused
+/// identifier over this route table asserts the same thing.
+pub async fn refused_as_input(dsql: &Dsql, route: &Route, live: &str, case: &IdCase) {
+    let (method, path, body) = (route.request)(&case.value, live);
+    let answer = dsql.call(method, &path, body).await;
+    let name = format!("{} on {}", case.name, route.operation);
+
+    assert_eq!(
+        route.class,
+        Class::Cluster,
+        "case {name}: only a cluster-addressed operation states a form beyond the \
+         modelled pattern"
+    );
+    assert_eq!(
+        answer.status, 400,
+        "case {name}: a value outside the form this route states must answer 400, got {} {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error.as_deref(),
+        Some("ValidationException"),
+        "case {name}: the refusal must be a ValidationException, got {:?}",
+        answer.error
+    );
+    assert!(
+        !answer.str("reason").is_empty(),
+        "case {name}: ValidationException models reason as @required, got {:?}",
+        answer.body
+    );
+    let field_list = answer.get("fieldList");
+    let fields = field_list.as_array().map(Vec::as_slice).unwrap_or_default();
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.get("name").and_then(Value::as_str) == Some(route.member)),
+        "case {name}: the refusal must name {:?} in fieldList, got {field_list:?}",
+        route.member
+    );
+    let expected = expected_refusal_sentence(route.member, &case.value);
+    assert_eq!(
+        answer.message(),
+        expected,
+        "case {name}: expected {expected:?}, got {:?}",
+        answer.message()
+    );
+    assert_eq!(
+        answer.get("resourceId"),
+        Value::Null,
+        "case {name}: a refusal of the request names no resource, got {:?}",
+        answer.body
+    );
+}
+
+/// Assert that nothing any refused or not-found call addressed was created,
+/// removed or changed: `live` is still the only cluster, still readable, still
+/// without a policy and still holding no stream.
+pub async fn the_store_is_untouched(dsql: &Dsql, live: &str) {
+    let read = dsql.get(live).await;
+    assert_eq!(
+        read.status, 200,
+        "the live cluster must be untouched by every refusal, got {} {:?}",
+        read.status, read.body
+    );
+    let clusters = dsql.list("").await.get("clusters");
+    assert_eq!(
+        clusters.as_array().map(Vec::len),
+        Some(1),
+        "no refused request may have created a cluster, got {clusters:?}"
+    );
+    assert_eq!(
+        dsql.get_policy(live).await.status,
+        404,
+        "no refused request may have attached a policy"
+    );
+    let streams = dsql.list_streams(live, "").await.get("streams");
+    assert_eq!(
+        streams.as_array().map(Vec::len),
+        Some(0),
+        "no refused request may have created a stream, got {streams:?}"
+    );
 }
 
 /// Identifiers of this service's own MINTED form that no call ever created: every
