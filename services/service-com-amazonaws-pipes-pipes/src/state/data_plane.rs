@@ -43,9 +43,12 @@
 //!   `Invoke` takes one payload which can be the array itself, so the same batch becomes
 //!   ONE invocation carrying every event, which is what makes the source's `BatchSize` the
 //!   count of invocations a backlog comes to. A function target is invoked synchronously or
-//!   asynchronously as its `InvocationType` says ([`deliver_batch`]); an EventBridge event
-//!   bus takes up to ten events per `PutEvents`, each as one entry under the members its
-//!   `PipeTargetEventBridgeEventBusParameters` configure ([`event_bus`]). A target
+//!   asynchronously as its `InvocationType` says ([`deliver_batch`]); a Step Functions state
+//!   machine's execution likewise takes one `input`, which is the batch itself, started
+//!   synchronously or asynchronously as its own `InvocationType` says ([`state_machine`]);
+//!   an EventBridge event bus takes up to ten events per `PutEvents`, each as one entry
+//!   under the members its `PipeTargetEventBridgeEventBusParameters` configure
+//!   ([`event_bus`]). A target
 //!   parameter's value is used as configured unless it is a JSON path into the event
 //!   (`$.…`), which is resolved against each event delivered, so the value can be the
 //!   record's own.
@@ -148,6 +151,7 @@ use crate::ops::types::PipeTargetParameters;
 mod dead_letter;
 mod event_bus;
 mod kinesis_source;
+mod state_machine;
 
 /// How long the poller waits before looking at an idle source again. Short enough that
 /// a record sent to the source is moved promptly, long enough not to spin.
@@ -2835,11 +2839,13 @@ fn enrichment_events(returned: &[u8], arn: &str) -> Result<Vec<Value>, CallFailu
 /// receives one call per event and never one message holding the array; `Invoke` takes one
 /// payload, which is the batch itself, so a function target receives ONE call carrying
 /// every event — which is what makes the source's `BatchSize` the count of invocations a
-/// backlog comes to.
+/// backlog comes to — and a state machine's `input` is one payload the same way, so that
+/// target receives one execution carrying every event.
 ///
 /// A target whose call ANSWERS the caller a document of its own is the one that can report:
 /// a function invoked synchronously answers what it returned, which is read as the report of
-/// the records it did not process ([`::service_common::batch_item_failures`]). Every other
+/// the records it did not process ([`::service_common::batch_item_failures`]), and a state
+/// machine run synchronously answers its output the same way. Every other
 /// delivery says nothing about the records, so its batch counts as wholly processed — an
 /// Amazon SQS `SendMessage` answers nothing about the event it took, and an asynchronous
 /// invocation has only been accepted at the point it answers.
@@ -2955,6 +2961,14 @@ async fn deliver_batch(
                 answer.payload.as_ref().map(::aws_sdk_lambda::primitives::Blob::as_ref),
                 records,
             ))
+        }
+        Target::StateMachine(machine) => {
+            // `StartExecution` takes ONE `input`, which is the batch itself, so a state
+            // machine target receives one execution carrying every event
+            // ([`state_machine::start`]). What that start reports about the records is the
+            // invocation type's: an asynchronous start has only accepted the input, a
+            // synchronous run answers the workflow's own output.
+            state_machine::start(callback, clients, machine, payloads, records).await
         }
     }
 }
@@ -3334,6 +3348,9 @@ enum Target {
         /// `FIRE_AND_FORGET` to its `Event`.
         synchronous: bool,
     },
+    /// A Step Functions state machine: ONE execution started with the whole batch as its
+    /// input ([`state_machine`]).
+    StateMachine(state_machine::Machine),
 }
 
 impl Target {
@@ -3344,6 +3361,7 @@ impl Target {
             Self::Queue { .. } => SEND_MESSAGE_ACTION,
             Self::EventBus(_) => event_bus::PUT_EVENTS_ACTION,
             Self::Function { .. } => INVOKE_FUNCTION_ACTION,
+            Self::StateMachine(machine) => machine.delivery_action(),
         }
     }
 }
@@ -3638,10 +3656,17 @@ fn resolve_target(
                 .and_then(|parameters| parameters.invocation_type.as_deref())
                 .is_none_or(|configured| configured != FIRE_AND_FORGET_INVOCATION),
         }),
+        (STATES_NAMESPACE, STATE_MACHINE_RESOURCE) => {
+            Ok(Target::StateMachine(state_machine::resolve(
+                arn,
+                parsed.region,
+                parameters.and_then(|p| p.step_function_state_machine_parameters.as_ref()),
+            )))
+        }
         (vendor, _) => Err(format!(
             "its Target names a {vendor} resource, and only an Amazon SQS queue, an \
-             EventBridge event bus or a Lambda function target is delivered to by this \
-             emulator"
+             EventBridge event bus, a Lambda function or a Step Functions state machine \
+             target is delivered to by this emulator"
         )),
     }
 }

@@ -73,6 +73,8 @@ mod pipe_refusal_bodies;
 mod pipe_reported_configuration;
 #[path = "all/pipe_source_checkout.rs"]
 mod pipe_source_checkout;
+#[path = "all/pipe_state_machine_target.rs"]
+mod pipe_state_machine_target;
 #[path = "all/pipe_state_reason.rs"]
 mod pipe_state_reason;
 #[path = "all/pipe_tagging.rs"]
