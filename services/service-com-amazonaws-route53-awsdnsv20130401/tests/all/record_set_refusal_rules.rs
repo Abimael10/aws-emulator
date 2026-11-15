@@ -195,13 +195,12 @@ async fn a_simple_record_set_is_refused_where_a_routing_group_already_answers() 
             let case = format!("{label} ({action})");
             let refused = submit(&router, &zone_id, &change(action, &simple)).await;
             assert_refusal(&case, &refused, "InvalidChangeBatch", &expected);
-            // "Each error message indicates one error in the change batch":
-            // one refused change, one entry.
+            // The problem is reported ONCE: the bracketed flat message asserted
+            // above is the whole report, with no `messages` entries beside it.
             let entries = refused.all("messages/member");
-            assert_eq!(
-                entries.len(),
-                1,
-                "case {case:?}: expected one message entry, got {entries:?}"
+            assert!(
+                entries.is_empty(),
+                "case {case:?}: expected no `messages` entries, got {entries:?}"
             );
         }
 

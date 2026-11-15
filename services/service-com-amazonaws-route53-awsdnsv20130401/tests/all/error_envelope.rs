@@ -15,9 +15,9 @@
 //!   (`HostedZoneAlreadyExists`) and a zone that still holds records of the caller's
 //!   (`HostedZoneNotEmpty`) — carry that constant text, naming no server-generated id
 //!   and echoing no request value;
-//! * `InvalidChangeBatch` names every refused change, one entry per change in the
-//!   modelled `messages` list, each naming the record set by `name=`/`type=`, with the
-//!   flat `message` the list rendered as a list.
+//! * `InvalidChangeBatch` names every refused change ONCE, in the flat `message`
+//!   rendered as a bracketed list, each entry naming the record set by
+//!   `name=`/`type=`, and the modelled `messages` list left off the wire.
 //!
 //! The harness (`router`, `call`, `Reply`) and the request builders come from
 //! `hosted_zone_records`, so these suites drive the service through the same router a
@@ -609,12 +609,12 @@ async fn a_non_empty_zone_is_refused_in_awss_constant_wording() {
 
 #[tokio::test]
 async fn an_invalid_change_batch_names_every_refused_change() {
-    // The rule: `InvalidChangeBatch` carries a `messages` LIST with one entry per
-    // refused change — "Each error message indicates one error in the change batch" —
-    // each naming the record set the change was about by `name=` and `type=`, and the
-    // flat `message` is that list rendered as a list. The rows differ in how many
-    // changes are refused, in the record names and types they name, and in the action
-    // that was refused.
+    // The rule: `InvalidChangeBatch` reports each refused change ONCE — the problem
+    // list rendered into the flat `message` as a bracketed, comma-separated list, each
+    // entry naming the record set the change was about by `name=` and `type=`, and the
+    // modelled `messages` list left unset rather than repeating the same problems. The
+    // rows differ in how many changes are refused, in the record names and types they
+    // name, and in the action that was refused.
     let existing: [RecordRow; 3] = [
         RecordRow {
             name: "www.example.com",
@@ -724,19 +724,22 @@ async fn an_invalid_change_batch_names_every_refused_change() {
                 )
             })
             .collect();
-        let reported = reply.all("messages/member");
-        assert_eq!(
-            reported, expected,
-            "case {case:?}: expected one entry per refused change in AWS's form, got {:?} in {}",
-            reported, reply.body
-        );
-
-        // The flat member an SDK surfaces is the same list, rendered as a list.
         assert_eq!(
             reply.first("Error/Message"),
             Some(format!("[{}]", expected.join(", ")).as_str()),
-            "case {case:?}: the flat message must render the list, got {:?}",
-            reply.first("Error/Message")
+            "case {case:?}: the flat message must render the whole problem list, got {:?} in {}",
+            reply.first("Error/Message"),
+            reply.body
+        );
+
+        // And it is the ONLY place the problems are reported: the modelled list member
+        // is not on the wire, so nothing counts a refused change twice.
+        let reported = reply.all("messages/member");
+        assert!(
+            reported.is_empty(),
+            "case {case:?}: expected no `messages` entries beside the flat message, got \
+             {reported:?} in {}",
+            reply.body
         );
 
         // Nothing internal to the handler leaks into the entries: no action tuple and

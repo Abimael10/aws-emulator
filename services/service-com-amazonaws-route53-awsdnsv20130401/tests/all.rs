@@ -27,6 +27,9 @@ mod cidr_collection_refusal_bodies;
 // collection's locations — what it reports, how it pages and what it refuses.
 #[path = "all/cidr_location_listing.rs"]
 mod cidr_location_listing;
+// How many times one refused change is reported in a change-batch refusal body.
+#[path = "all/change_batch_problem_reporting.rs"]
+mod change_batch_problem_reporting;
 #[path = "all/delegation_set_deletion.rs"]
 mod delegation_set_deletion;
 #[path = "all/delegation_set_limits.rs"]

@@ -129,17 +129,18 @@ const CHANGE_ACTION_UPSERT: &str = "UPSERT";
 
 /// An `InvalidChangeBatch` naming one problem per refused change.
 ///
-/// The shape carries both a `messages` LIST — "This exception contains a list of
-/// messages that might contain one or more error messages. Each error message
-/// indicates one error in the change batch" — and the single `message` an SDK
-/// surfaces, so both are filled from the same list: `messages` holds one entry
-/// per refused change, and `message` is that list rendered as a list, in
-/// brackets, so a caller that reads only the flat member still sees every entry
-/// and can tell one from several.
+/// The shape models two members that could carry the same problems — the single
+/// `message` an SDK surfaces and a `messages` LIST — but a refusal reports each
+/// problem ONCE: the whole problem list is rendered into `message`, as a list in
+/// one pair of brackets and comma-separated, so a caller that reads only the
+/// flat member still sees every entry and can tell one problem from several. The
+/// list member is left unset, because the service does not put the same problems
+/// in a second member: a client that read both would count every refused change
+/// twice.
 fn invalid_change_batch(problems: Vec<String>) -> InvalidChangeBatch {
     InvalidChangeBatch {
         message: Some(format!("[{}]", problems.join(", "))),
-        messages: Some(problems),
+        messages: None,
     }
 }
 
@@ -566,20 +567,31 @@ fn is_quoted_character_strings(value: &str) -> bool {
     strings > 0
 }
 
-/// Why this DELETE does not name the record set it is deleting, if it does not.
+/// What a DELETE that does not restate the stored record set's values is
+/// refused with.
 ///
 /// "To delete a resource record set, you must specify all the same values that
-/// you specified when you created it", so a DELETE naming different record data,
-/// a different TTL or a different alias target than the stored record set is not
-/// a delete of that record set at all.
-fn delete_mismatch(stored: &ResourceRecordSet, named: &ResourceRecordSet) -> Option<&'static str> {
+/// you specified when you created it": the values a DELETE restates are the
+/// record set it names, so failing to restate them is ONE failure however many
+/// of them differ, and it is reported as one sentence about the values —
+/// never a sentence per member of the record set.
+const DELETE_VALUES_MISMATCH: &str = "the values provided do not match the current values";
+
+/// Whether this DELETE restates the record set the zone holds, and so names it.
+///
+/// The record data, the TTL and the alias target are all values the create
+/// specified, so a DELETE naming different record data, a different TTL or a
+/// different alias target is not a delete of that record set at all. Which of
+/// them differs does not change the refusal: the caller's remedy is the same,
+/// to restate the record set as it stands.
+fn delete_names_stored(stored: &ResourceRecordSet, named: &ResourceRecordSet) -> bool {
     if sorted_values(named) != sorted_values(stored) {
-        return Some("the values provided do not match the current values");
+        return false;
     }
     if named.ttl != stored.ttl {
-        return Some("the TTL provided does not match the current TTL");
+        return false;
     }
-    let alias_matches = match (&named.alias_target, &stored.alias_target) {
+    match (&named.alias_target, &stored.alias_target) {
         (None, None) => true,
         (Some(named), Some(stored)) => {
             named.hosted_zone_id == stored.hosted_zone_id
@@ -588,11 +600,7 @@ fn delete_mismatch(stored: &ResourceRecordSet, named: &ResourceRecordSet) -> Opt
                 && named.evaluate_target_health == stored.evaluate_target_health
         }
         _ => false,
-    };
-    if !alias_matches {
-        return Some("the alias target provided does not match the current alias target");
     }
-    None
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -860,14 +868,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // DELETE has to carry the record's data, and it has to be
                     // the data the zone holds.
                     Some(stored) => {
-                        if let Some(reason) = delete_mismatch(stored, &record) {
-                            problems.push(format!(
-                                "Tried to delete resource record set {} but {reason}",
-                                change_label(&record)
-                            ));
-                        } else {
+                        if delete_names_stored(stored, &record) {
                             record_count -= 1;
                             staged.insert(key, None);
+                        } else {
+                            problems.push(format!(
+                                "Tried to delete resource record set {} but \
+                                 {DELETE_VALUES_MISMATCH}",
+                                change_label(&record)
+                            ));
                         }
                     }
                 },

@@ -2683,3 +2683,15 @@ mod autoscaling_plans_delete_withdraws_its_registration;
 //! suite covers, and why it drives the assembled router rather than one service crate, is
 //! stated in that suite's own module header; `all/appended_notes.rs` keeps the notes earlier
 //! landings had appended here.
+// name. The list holds those pairs and NO other line, so two branches landing at once insert
+// two lines in two places and have no prose to duplicate, re-word or mistype.
+// EVERY comment in this file is an ORDINARY one, this header included, and that is deliberate:
+// an inner doc comment (`//!`) is legal only before the first item, so one that lands past the
+// of two landings can put one past the first item.
+// Declare each suite exactly ONCE: this is one crate root, so a second `mod` for the same name
+// is `E0428` and fails every suite in this target. A suite file no `mod` here names is
+// compiled nowhere and its tests never run, and a suite left at the top level of `tests/`
+// fails the build. `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve
+// to a SIBLING of this file, which the layout check refuses: the `#[path]` is what points each
+// Three suites pin the rules above rather than restating them:
+// own module header; a note about this file itself belongs in `all/appended_notes.rs`.

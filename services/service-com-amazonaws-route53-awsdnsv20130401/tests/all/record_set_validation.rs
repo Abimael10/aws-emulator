@@ -427,12 +427,12 @@ async fn record_data_is_parsed_against_the_syntax_of_its_type() {
                     &canonical,
                 )
                 .await;
-                // "Each error message indicates one error in the change batch":
-                // one offending change, one entry.
-                assert_eq!(
-                    reply.all("messages/member").len(),
-                    1,
-                    "case {:?}: expected one reported problem, got {}",
+                // The problem is reported ONCE: the flat message asserted above
+                // is the whole report, and the modelled list member is not on
+                // the wire beside it.
+                assert!(
+                    reply.all("messages/member").is_empty(),
+                    "case {:?}: expected no `messages` entries beside the flat message, got {}",
                     case.label,
                     reply.body
                 );

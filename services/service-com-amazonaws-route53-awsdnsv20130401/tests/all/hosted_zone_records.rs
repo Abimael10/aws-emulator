@@ -1036,16 +1036,29 @@ async fn an_invalid_change_batch_reports_a_bounded_number_of_problems() {
             reply.status,
             reply.body.chars().take(400).collect::<String>()
         );
-        // The framework's error envelope renders a list error member as
-        // `<messages><member>…`, so that is the path to count.
-        let messages = reply.all("messages/member");
-        let expected = bad_changes.min(MAX_REPORTED) + usize::from(bad_changes > MAX_REPORTED);
+        // The problems are reported ONCE, in the flat `message` rendered as one
+        // bracketed list, so that is where they are counted.
+        let message = reply.first("Error/Message").unwrap_or_default();
+        let reported = message.matches("Tried to delete").count();
+        let expected = bad_changes.min(MAX_REPORTED);
         assert_eq!(
-            messages.len(),
-            expected,
-            "case {bad_changes} bad changes: expected {expected} reported messages, got \
-             {messages:?} in {}",
-            reply.body.chars().take(600).collect::<String>()
+            reported, expected,
+            "case {bad_changes} bad changes: expected {expected} reported problems, got \
+             {reported} in {}",
+            message.chars().take(600).collect::<String>()
+        );
+        assert_eq!(
+            message.contains("further problems not reported"),
+            bad_changes > MAX_REPORTED,
+            "case {bad_changes} bad changes: the suppressed count must be reported only past \
+             the cap, got {}",
+            message.chars().take(600).collect::<String>()
+        );
+        // The modelled list member stays off the wire, so nothing is counted twice.
+        let listed = reply.all("messages/member");
+        assert!(
+            listed.is_empty(),
+            "case {bad_changes} bad changes: expected no `messages` entries, got {listed:?}"
         );
     }
 }
