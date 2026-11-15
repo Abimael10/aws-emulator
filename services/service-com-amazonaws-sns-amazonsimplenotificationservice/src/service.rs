@@ -407,11 +407,16 @@ impl ErasedOperation for SigningCertificate {
         })
     }
 
-    /// `None`, so this request is authenticated exactly as the modelled operations are: the
-    /// URL a notification carries is signed ([`crate::state::notification_signature`]), so a
-    /// caller that fetches it sends a request this emulator verifies like any other.
+    /// `Some(&[])` — served to a caller presenting NO credential, because the document it
+    /// answers is the PUBLIC half of this service's signing key: a subscriber verifying a
+    /// delivered message fetches this URL as the plain `https` address the message named
+    /// ("Retrieve the certificate … and extract the public key from it", Amazon SNS
+    /// Developer Guide, "Verifying the signatures of Amazon SNS messages"), which is a fetch
+    /// that carries no AWS credential at all. Nothing about the caller decides what this
+    /// answers, and nothing private is in it — the private half is never read outside
+    /// [`crate::state::notification_signature`].
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
-        None
+        Some(&[])
     }
 }
 
@@ -453,6 +458,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
+        // A fetch of the SIGNING CERTIFICATE this service publishes is this service's, when
+        // it is the fetch that document exists for: the URL a delivered message carries is
+        // handed to a SUBSCRIBER ([`crate::state::notification_signature`]), which follows it
+        // with NO credential of its own — so neither a credential scope nor the host names
+        // this service for the router, and the request would be claimed by nobody. The claim
+        // is narrowed to exactly that request: this service's own published document path
+        // (which no modelled operation of this API binds), presenting no credential, and
+        // addressed to the emulator's own endpoint — the one authority of the two
+        // `certificate_url` announces that names no service of its own. A credentialled
+        // request, and one addressed to this service's own host, are claimed by the routing
+        // below as every other request of this API is.
+        if crate::state::notification_signature::addresses_certificate(
+            parts.method.as_str(),
+            &parts.uri.to_string(),
+        ) && parts.headers.get(::http::header::AUTHORIZATION).is_none()
+            && ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(parts)
+                .is_some()
+        {
+            return true;
+        }
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.

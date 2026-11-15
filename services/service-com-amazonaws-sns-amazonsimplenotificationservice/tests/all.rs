@@ -92,6 +92,9 @@ mod filter_policy_relaxation;
 #[path = "all/filter_policy_wildcard_operator.rs"]
 mod filter_policy_wildcard_operator;
 
+#[path = "all/function_event_message_attributes.rs"]
+mod function_event_message_attributes;
+
 #[path = "all/https_subscription_delivery.rs"]
 mod https_subscription_delivery;
 
@@ -201,6 +204,9 @@ mod set_platform_application_attributes;
 
 #[path = "all/set_subscription_attributes.rs"]
 mod set_subscription_attributes;
+
+#[path = "all/signing_certificate_address.rs"]
+mod signing_certificate_address;
 
 #[path = "all/sms_attribute_read_filter_names.rs"]
 mod sms_attribute_read_filter_names;

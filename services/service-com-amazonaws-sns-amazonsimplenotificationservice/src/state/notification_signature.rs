@@ -162,8 +162,18 @@ impl Signer {
         ctx: &smithy_server_runtime::OperationContext<'_>,
         topic: Option<&TopicRecord>,
     ) -> Self {
+        // The certificate is published on the SNS endpoint of the REGION the signed message
+        // belongs to — the topic's own, which is what its ARN names — and on the Region this
+        // request addressed for a replay of a topic that is no longer there.
+        let region = topic
+            .map(|topic| topic.arn.as_str())
+            .and_then(|arn| {
+                ::service_common::arn::region_of(arn, super::authorization::ARN_NAMESPACE)
+            })
+            .map(str::to_string)
+            .unwrap_or_else(|| super::request_region(ctx.parts()));
         Self {
-            certificate_url: certificate_url(ctx),
+            certificate_url: certificate_url(ctx, &region),
             version: signature_version(topic),
             signed: ::std::cell::RefCell::new(None),
         }
@@ -266,25 +276,47 @@ fn canonical_string(
     canonical
 }
 
-/// Where the signing certificate is published for the caller of the request `ctx` is
-/// serving: the path the certificate is served at on this emulator, signed so that fetching
-/// it reaches this emulator and nothing else.
+/// Where the signing certificate is published for the request `ctx` is serving, for a message
+/// of `region`: an `https` URL whose path is the certificate's own file name
+/// ([`SigningKey::certificate_path`]), on the address a SUBSCRIBER of this emulator can fetch
+/// it at.
 ///
-/// `None` when this process has no key — there is then no certificate to publish — or when
-/// the URL cannot be signed, in which case a URL is withheld rather than one being delivered
-/// that leads nowhere.
-fn certificate_url(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+/// A subscriber VERIFIES a delivered message by fetching this URL and checking the signature
+/// with the certificate it answers — "Retrieve the certificate … and extract the public key
+/// from it" (Amazon SNS Developer Guide, "Verifying the signatures of Amazon SNS messages") —
+/// so the URL has to lead back to this emulator, and the address is chosen the way every
+/// other endpoint this emulator announces for a client to reach is:
+///
+/// * the authority the request REACHED this emulator at
+///   ([`::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts`]), for a
+///   client that resolves nothing else — which is the client a subscriber of this emulator
+///   is;
+/// * else the authority this process is SERVED at
+///   ([`::service_common::data_plane_addressing::served_endpoint_authority`]), so a message
+///   delivered on an in-process call of another service still names an address its own caller
+///   can reach;
+/// * else Amazon SNS's own endpoint host of the message's Region, the form AWS publishes the
+///   certificate at, for a caller that resolves AWS's own names — the same last resort the
+///   `SubscribeURL` and `UnsubscribeURL` of these documents name that endpoint by.
+///
+/// Whichever it is, the host names this service, so a fetch of the URL is claimed by it and
+/// served the document ([`addresses_certificate`]).
+///
+/// `None` when this process has no key — there is then no certificate to publish — so a URL
+/// is withheld rather than one being delivered that leads nowhere.
+fn certificate_url(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> Option<String> {
     let path = signing_key()?.certificate_path();
-    let request = ::smithy_server_runtime::SignedUrlRequest::new(
-        ::http::Method::GET,
-        ctx.identity().signing_name(),
-        &path,
-    );
-    let signed = ctx
-        .url_signer()
-        .sign(request, ::smithy_server_runtime::MAX_SIGNED_URL_EXPIRY)
-        .ok()?;
-    Some(signed.as_str().to_string())
+    let authority = ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(
+        ctx.parts(),
+    )
+    .or_else(|| {
+        ::service_common::data_plane_addressing::served_endpoint_authority(ctx.endpoint().as_str())
+    })
+    .unwrap_or_else(|| format!("sns.{region}.amazonaws.com"));
+    Some(format!("https://{authority}{path}"))
 }
 
 /// Whether `method` and `uri` address the signing certificate this service publishes, so
@@ -304,10 +336,16 @@ pub fn published_certificate(uri: &str) -> Option<&'static str> {
     (key.certificate_path() == path_of(uri)).then_some(key.certificate_pem.as_str())
 }
 
-/// The path part of `uri`, which is what names the document: a URL that leads here carries
-/// the signature it was signed with in its query.
+/// The path part of `uri`, which is what names the document.
+///
+/// Read through the ONE shared reader of a request URI
+/// ([`::service_common::request_path`]): the URI a service is handed arrives in the origin
+/// form from a client on a socket and in the ABSOLUTE form from a caller that was given an
+/// endpoint — which is how a subscriber verifying a message fetches this document, through
+/// its own HTTP client over the address the message named — so the path has to be read the
+/// same way out of both.
 fn path_of(uri: &str) -> &str {
-    uri.split('?').next().unwrap_or(uri)
+    ::service_common::request_path(uri)
 }
 
 /// Generate this process's signing key NOW, so no request pays for it.

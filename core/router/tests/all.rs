@@ -2552,3 +2552,7 @@ mod bedrock_agent_ingestion_populates_its_aoss_index;
 // declaration into `tests/all/`. The `all_rs_*` suites,
 // `all/declaration_roots_are_canonical_and_complete.rs` pin all of it, for this file and for
 // every service crate's `tests/all.rs`, so check there rather than leaving a note here.
+// comment, like an inner attribute, is legal only before the first item, so one appended past
+// inner doc comment and no inner attribute in the file at all, no landing can put one past the
+// name is `E0428` and fails every suite in this target too — and declare every file the
+// directory holds, which this crate's `build.rs` requires.

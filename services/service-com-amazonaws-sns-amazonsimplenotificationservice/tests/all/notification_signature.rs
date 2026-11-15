@@ -30,7 +30,7 @@ use super::sqs_subscription_delivery::{
 
 /// The members of a delivered `Notification` that are signed, in the order the canonical
 /// string carries them (Developer Guide, "Verifying the signatures of Amazon SNS messages").
-const SIGNED_MEMBERS: &[&str] = &[
+pub(crate) const SIGNED_MEMBERS: &[&str] = &[
     "Message",
     "MessageId",
     "Subject",
@@ -51,7 +51,11 @@ struct Row {
 }
 
 /// The canonical string a subscriber rebuilds from the notification it received.
-fn canonical_string(envelope: &Value) -> String {
+///
+/// `pub(crate)`: the suite that pins WHERE the certificate is published verifies a document
+/// against it through this one definition rather than a second copy
+/// (`signing_certificate_address.rs`).
+pub(crate) fn canonical_string(envelope: &Value) -> String {
     let mut canonical = String::new();
     for member in SIGNED_MEMBERS {
         let Some(value) = envelope.get(*member).and_then(Value::as_str) else {
@@ -68,7 +72,14 @@ fn canonical_string(envelope: &Value) -> String {
 /// Whether `signature` is the signature of `signed` under the public key of the certificate
 /// `certificate_pem`, with the digest `version` selects — the check the documented
 /// verification pattern performs.
-fn verifies(certificate_pem: &str, version: &str, signed: &str, signature: &[u8]) -> bool {
+///
+/// `pub(crate)` for the same reason [`canonical_string`] is.
+pub(crate) fn verifies(
+    certificate_pem: &str,
+    version: &str,
+    signed: &str,
+    signature: &[u8],
+) -> bool {
     let certificate = x509_cert::Certificate::from_pem(certificate_pem)
         .unwrap_or_else(|error| panic!("the published certificate must parse: {error}"));
     let public_key = certificate

@@ -508,9 +508,20 @@ fn records_envelope(
     signer: &state::notification_signature::Signer,
 ) -> String {
     let mut notification = super::notification_members(published, body);
+    notification.insert(
+        MESSAGE_ATTRIBUTES_MEMBER.to_string(),
+        event_message_attributes(published),
+    );
+    // A function's record carries the SUBJECT member whether or not the message has one: a
+    // publish that set none delivers it as `null` rather than leaving it out, so a handler
+    // reads the member off every record — the same reading the attribute map above is always
+    // present for. The JSON envelope a queue or a URL subscriber receives leaves an absent
+    // subject out instead ([`super::notification_members`]), which is the difference between
+    // the two shapes; the member is not part of the signed canonical string either way,
+    // because only the members a message CARRIES are signed.
     notification
-        .entry(MESSAGE_ATTRIBUTES_MEMBER)
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        .entry(SUBJECT_MEMBER)
+        .or_insert(serde_json::Value::Null);
     if let Some(url) = super::unsubscribe_url(&published.topic_arn, subscription_arn) {
         notification.insert(
             UNSUBSCRIBE_URL_MEMBER.to_string(),
@@ -566,3 +577,51 @@ const UNSUBSCRIBE_URL_MEMBER: &str = "UnsubscribeUrl";
 
 /// The member the published message's attributes are carried under.
 const MESSAGE_ATTRIBUTES_MEMBER: &str = "MessageAttributes";
+
+/// The member a record carries the published message's subject under.
+const SUBJECT_MEMBER: &str = "Subject";
+
+/// The two `Type`s an attribute of a FUNCTION's event record is reported under.
+const STRING_ATTRIBUTE_TYPE: &str = "String";
+const BINARY_ATTRIBUTE_TYPE: &str = "Binary";
+
+/// The attributes of `published` as a function's event record carries them: one
+/// `{"Type": …, "Value": …}` per attribute, and an empty object for a message published with
+/// none — the member is always there, so a handler reads it off every record.
+///
+/// `Type` here names the FORM the published value arrived in rather than the `DataType` the
+/// API declared for it: an attribute published as BYTES (`MessageAttributeValue$BinaryValue`)
+/// is reported [`BINARY_ATTRIBUTE_TYPE`] with the base64 of those bytes as its value, and one
+/// published as TEXT (`MessageAttributeValue$StringValue`) is reported
+/// [`STRING_ATTRIBUTE_TYPE`] with that text, whatever label its `DataType` carried — so a
+/// `Number` attribute reaches a function as a `String` carrying its decimal text, as does a
+/// custom-labelled one. That is the shape of a function's event record and it differs from
+/// the JSON envelope a queue or a URL receives, which carries the declared `DataType`
+/// verbatim ([`super::notification_members`]); the record's own member set is what a handler
+/// switching on `Sns.MessageAttributes[…]["Type"]` reads.
+fn event_message_attributes(published: &PublishedMessage) -> serde_json::Value {
+    let mut attributes: Vec<(&String, &crate::ops::types::MessageAttributeValue)> =
+        published.message_attributes.iter().collect();
+    attributes.sort_by(|left, right| left.0.cmp(right.0));
+    let rendered: serde_json::Map<String, serde_json::Value> = attributes
+        .into_iter()
+        .map(|(name, value)| {
+            let (kind, text) = match (value.string_value.as_deref(), value.binary_value.as_deref())
+            {
+                (Some(text), _) => (STRING_ATTRIBUTE_TYPE, Some(text.to_string())),
+                (None, Some(bytes)) => (
+                    BINARY_ATTRIBUTE_TYPE,
+                    Some(::aws_smithy_types::base64::encode(bytes)),
+                ),
+                (None, None) => (STRING_ATTRIBUTE_TYPE, None),
+            };
+            let mut attribute = serde_json::Map::new();
+            attribute.insert("Type".to_string(), serde_json::Value::from(kind));
+            if let Some(text) = text {
+                attribute.insert("Value".to_string(), serde_json::Value::from(text));
+            }
+            (name.clone(), serde_json::Value::Object(attribute))
+        })
+        .collect();
+    serde_json::Value::Object(rendered)
+}
