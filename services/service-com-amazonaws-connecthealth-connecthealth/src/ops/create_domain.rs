@@ -459,10 +459,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_fingerprint: fingerprint,
             created_at: now,
             subscriptions: ::std::collections::BTreeMap::new(),
-            // A freshly created domain has had no patient insights job started in it,
-            // and so has no client token bound to one either.
+            // A freshly created domain has had no patient insights job started in it.
             patient_insights_jobs: ::std::collections::BTreeMap::new(),
-            patient_insights_job_ids_by_client_token: ::std::collections::BTreeMap::new(),
         };
 
         // Tags go to the one ARN-keyed tag store, so `GetDomain` and

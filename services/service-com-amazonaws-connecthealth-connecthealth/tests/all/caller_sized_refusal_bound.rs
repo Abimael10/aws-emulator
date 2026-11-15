@@ -11,13 +11,13 @@
 //! never by the caller, whether or not the member that carried the value declares a
 //! modelled bound.
 //!
-//! The rows differ along what the rule generalises over: WHICH member carries the value
-//! (the `resourceArn` label of all three tagging operations, and the `clientToken` body
-//! member of `StartPatientInsightsJob`), which refusal names it (404
-//! `ResourceNotFoundException` and 409 `ConflictException`), the SIZE of the value (an
+//! The rows differ along what the rule generalises over: the SIZE of the value (an
 //! ordinary one, one byte short of the ceiling, exactly the ceiling, one byte past it, and
-//! far past it) and its FORM (ASCII, and multi-byte characters, which may not be cut
-//! mid-character).
+//! far past it) and WHICH operation is addressed by it (the reader, the writer and the
+//! remover of a resource's tags, which must all bound one ARN the same way). The value
+//! travels in a URI label, so these rows are ASCII; the multi-byte FORM of the rule — a
+//! value that may not be cut mid-character — is asserted on the rendering itself, in
+//! `service::error_detail`'s own tests.
 //!
 //! Sources for every bound written by hand here:
 //!
@@ -25,20 +25,15 @@
 //!   — `resourceArn` is an `@httpLabel` targeting the prelude `String`: required, and
 //!   bounded by neither `@length` nor `@pattern`, so nothing below the service bounds what
 //!   a refusal naming it would echo.
-//! * `smithy_query(query="operation",operation="StartPatientInsightsJob",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`
-//!   — `clientToken` targets `NonEmptyString`, which carries a `@pattern` and no
-//!   `@length`: the second member of this service a refusal echoes with no modelled
-//!   ceiling behind it.
 //!
-//! The harness (`Emulator`, `error_code`, `string_at`), the routes and the minimal job
-//! body are the sibling suites': one way of driving this service, not two.
+//! The harness (`Emulator`, `error_code`, `string_at`) and the routes are the sibling
+//! suites': one way of driving this service, not two.
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_connecthealth_connecthealth::service::error_detail::MAX_ECHOED_VALUE_LEN;
 
 use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
-use crate::patient_insights_job_lifecycle::{minimal_body, start_path};
 use crate::resource_tag_removal::untag_path;
 use crate::resource_tagging::tags_path;
 
@@ -112,9 +107,6 @@ fn names_the_value_bounded(case: &str, message: &str, value: &str) {
 /// One `resourceArn` per size the rule distinguishes, none of them naming a resource this
 /// service holds: a well-formed ARN of ordinary length, then ARNs padded in the resource
 /// field to each side of the ceiling and far past it.
-///
-/// ASCII only, because these travel in a URI label; the multi-byte rows ride on
-/// `clientToken`, a body member, in the test below.
 fn arns_around_the_ceiling() -> Vec<(String, String)> {
     let prefix = "arn:aws:health-agent:us-west-2:000000000000:domain/dom-";
     let pad = |total: usize| -> String {
@@ -198,79 +190,4 @@ async fn the_arn_not_found_refusal_is_sized_by_the_service() {
         format!("Resource not found: {unheld}"),
         "an ARN of ordinary length must be named exactly as before, got {refused}"
     );
-}
-
-#[tokio::test]
-async fn the_idempotency_conflict_is_sized_by_the_service() {
-    let emulator = Emulator::new("eu-central-1");
-    let domain_id = string_at(
-        &emulator.create_domain(&json!({ "name": "clinic-tokens" })).await,
-        "domainId",
-    );
-
-    // One row per size and form the rule distinguishes. `clientToken` rides in the body,
-    // so a multi-byte token reaches the handler as sent — which is the case a cut on a
-    // byte index rather than a character boundary would break.
-    let tokens: Vec<(&str, String)> = vec![
-        ("a token of ordinary length", "token-7781".to_string()),
-        (
-            "exactly the ceiling",
-            "t".repeat(MAX_ECHOED_VALUE_LEN),
-        ),
-        (
-            "one byte past the ceiling",
-            "t".repeat(MAX_ECHOED_VALUE_LEN + 1),
-        ),
-        (
-            "far past the ceiling",
-            "t".repeat(64 * MAX_ECHOED_VALUE_LEN),
-        ),
-        // Two-byte and three-byte characters: well past a ceiling counted in bytes, and
-        // with no character boundary at the ceiling itself.
-        (
-            "multi-byte characters",
-            "é".repeat(MAX_ECHOED_VALUE_LEN),
-        ),
-        (
-            "a character straddling the ceiling",
-            format!("{}{}", "t".repeat(MAX_ECHOED_VALUE_LEN - 1), "日".repeat(8)),
-        ),
-    ];
-
-    for (case, token) in &tokens {
-        // The token bound to one job's parameters...
-        let mut first = minimal_body();
-        first["clientToken"] = json!(token);
-        let (status, started) = emulator
-            .send("POST", &start_path(&domain_id), Some(&first))
-            .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: the first start must be accepted, got {status} with {started}"
-        );
-        let job_id = string_at(&started, "jobId");
-
-        // ...then presented again with different parameters, which is the conflict that
-        // names the token back.
-        let mut conflicting = first.clone();
-        conflicting["patientContext"] = json!({ "patientId": "patient-9000" });
-        let (status, refused) = emulator
-            .send("POST", &start_path(&domain_id), Some(&conflicting))
-            .await;
-        assert_eq!(
-            (status, error_code(&refused).as_str()),
-            (409, "ConflictException"),
-            "case {case:?}: expected 409 ConflictException, got {status} with a {}-byte body",
-            refused.to_string().len()
-        );
-        let stated = message(case, &refused);
-        names_the_value_bounded(case, &stated, token);
-        // The job the first call stored is still what the sentence reports the token
-        // against, so bounding the echo did not cost the caller the fact it needs.
-        assert!(
-            stated.contains(&job_id),
-            "case {case:?}: the conflict must name the job the token is bound to, \
-             got {stated:?}"
-        );
-    }
 }

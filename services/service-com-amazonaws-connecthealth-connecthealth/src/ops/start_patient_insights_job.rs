@@ -94,19 +94,29 @@
 //! transitions from there (`crate::state::PATIENT_INSIGHTS_JOB_STEP_SPAN`), so a caller
 //! reading straight after this call still sees `SUBMITTED`.
 //!
-//! An accepted job runs to completion: one span after it is picked up it reaches the
-//! modelled terminal success status and reports where its output went — the location
-//! derived from the `s3OutputPath` this start persisted and the job's own id
-//! (`crate::state::patient_insights_output_uri`). Nothing of the insights themselves is
-//! invented: the response carries the output LOCATION the job was configured with, never
-//! insights content, and every member around it is read out of the stored record — the
-//! identifiers, the timestamps, the status transitions and the idempotency of
-//! `clientToken`.
+//! An accepted job runs to completion: the read that finds its completion due stores its
+//! output object where the job reports it before it answers (`crate::state::insights_run`),
+//! so a caller polling the job to completion finds that object. What it carries is bounded
+//! by what this emulator can establish — it runs no clinical summarisation model, so the
+//! document names the patient and the kind of summary asked for and STATES that no insights
+//! were generated, which the job also reports in `statusDetails`. Every member around it is
+//! read out of the stored record — the identifiers, the timestamps and the status
+//! transitions.
 //!
-//! `clientToken` is an `@idempotencyToken`: a retry carrying a token this domain has
-//! already bound to a job answers with THAT job rather than starting a second one, and
-//! the same token presented with different job parameters is the modelled
-//! `ConflictException`.
+//! The patient the request names is RESOLVED against the FHIR server
+//! `inputDataConfig.fhirServer.fhirEndpoint` names before the job is accepted: that
+//! server holds the patient data the job runs on, so an id it holds no patient under is
+//! the modelled `ValidationException` with that refusal's own fixed sentence
+//! (`crate::state::PATIENT_NOT_IN_DATASTORE_MESSAGE`), and an endpoint resolving to no
+//! data store at all is the same error with
+//! `crate::state::DATASTORE_NOT_FOUND_MESSAGE`. Nothing is written on either path, so a
+//! repeat of such a request is refused identically.
+//!
+//! `clientToken` is an `@idempotencyToken`, which is a rule about how an SDK FILLS the
+//! member rather than a promise that the service deduplicates on it: RECORDED behaviour
+//! is that a second start carrying a token already used — with byte-identical parameters
+//! or not — is accepted and starts a SECOND, independent job with its own `jobId` and
+//! `jobArn`, and is neither refused nor answered with the first job.
 //!
 //! This operation is served by the patient-insights RUNTIME endpoint (`hostPrefix
 //! runtime.`), whose front door states two refusals in its own words rather than the
@@ -216,57 +226,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
-        let mut store = state.lock();
-        // The one preamble every handler shares, before anything is resolved or written:
-        // everything the CLOCK already made due — the purge of a domain whose DELETING
-        // span has elapsed, and the transition of every job whose next status has fallen
-        // due.
-        store.materialise_due(now);
+        // Everything the request is judged against before anything is written, under ONE
+        // hold of this service's store — which is released at the end of this block, so it
+        // is not held across the call into the service that serves the FHIR endpoint
+        // below.
+        {
+            let mut store = state.lock();
+            // The one preamble every handler shares, before anything is resolved or
+            // written: everything the CLOCK already made due — the purge of a domain whose
+            // DELETING span has elapsed, and the transition of every job whose next status
+            // has fallen due.
+            store.materialise_due(now);
 
-        // The domain is AUTHORIZED before anything about the request itself is judged and
-        // before anything is written: this operation is served by the patient-insights
-        // runtime endpoint, whose front door resolves the `domainId` the request addresses
-        // and refuses a caller it cannot resolve one for — an id no domain of this account
-        // is held under, a domain of another Region, or one already on its way out — with
-        // its own authorization failure rather than with a statement about the resource.
-        // The sentence is FIXED
-        // (`crate::service::error_detail::DOMAIN_NOT_AUTHORIZED_MESSAGE`): it names
-        // nothing read off the request, so probing ids through this endpoint tells a
-        // caller nothing about which ones exist. The modelled 404 stays what a resource
-        // addressed INSIDE a domain that does resolve is answered with
-        // (`GetPatientInsightsJob`).
-        let Some(domain) = store.live_domain(&region, &input.domain_id) else {
-            return Err(StartPatientInsightsJobErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: Some(
-                        crate::service::error_detail::DOMAIN_NOT_AUTHORIZED_MESSAGE.to_string(),
-                    ),
-                },
-            )
-            .into());
-        };
+            // The domain is AUTHORIZED before anything about the request itself is judged
+            // and before anything is written: this operation is served by the
+            // patient-insights runtime endpoint, whose front door resolves the `domainId`
+            // the request addresses and refuses a caller it cannot resolve one for — an id
+            // no domain of this account is held under, a domain of another Region, or one
+            // already on its way out — with its own authorization failure rather than with
+            // a statement about the resource. The sentence is FIXED
+            // (`crate::service::error_detail::DOMAIN_NOT_AUTHORIZED_MESSAGE`): it names
+            // nothing read off the request, so probing ids through this endpoint tells a
+            // caller nothing about which ones exist. The modelled 404 stays what a resource
+            // addressed INSIDE a domain that does resolve is answered with
+            // (`GetPatientInsightsJob`).
+            let Some(domain) = store.live_domain(&region, &input.domain_id) else {
+                return Err(StartPatientInsightsJobErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(
+                            crate::service::error_detail::DOMAIN_NOT_AUTHORIZED_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
 
-        // With the domain authorized, the request's own values are judged — the output
-        // location against the rules its shape declares
-        // (`crate::state::output_location_within_shape`), which this handler enforces
-        // rather than the boundary walk (`skip_validation` on `OutputDataConfig`) because
-        // this endpoint states a refusal of the request with ONE fixed sentence instead of
-        // the control plane's per-member clause. Nothing has been written yet, so a
-        // request refused here leaves no job and no token binding behind, and an identical
-        // retry is refused again rather than answered idempotently.
-        if !crate::state::output_location_within_shape(&input.output_data_config.s3_output_path) {
-            return Err(StartPatientInsightsJobErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        crate::service::error_detail::REQUEST_VALIDATION_FAILED_MESSAGE.to_string(),
-                    ),
-                },
-            )
-            .into());
+            // With the domain authorized, the request's own values are judged — the output
+            // location against the rules its shape declares
+            // (`crate::state::output_location_within_shape`), which this handler enforces
+            // rather than the boundary walk (`skip_validation` on `OutputDataConfig`)
+            // because this endpoint states a refusal of the request with ONE fixed sentence
+            // instead of the control plane's per-member clause. Nothing has been written
+            // yet, so a request refused here leaves no job behind, and an identical retry
+            // is refused again.
+            if !crate::state::output_location_within_shape(
+                &input.output_data_config.s3_output_path,
+            ) {
+                return Err(StartPatientInsightsJobErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::service::error_detail::REQUEST_VALIDATION_FAILED_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            // Bound the store BEFORE minting, so a refused request advances nothing. The
+            // refusal is stated in one place (`job_ceiling_reached` below), so the two
+            // comparisons this handler makes — here and again under the minting lock —
+            // cannot word it differently.
+            if domain.patient_insights_jobs.len()
+                >= crate::state::MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN
+            {
+                return Err(job_ceiling_reached(&input.domain_id));
+            }
         }
 
-        // The parameters this request asks a job to run with, and their digest: what a
-        // repeated `clientToken` is compared against.
+        // The patient the request names is RESOLVED against the FHIR server the request
+        // names, before the job is accepted: that server holds the patient data the job
+        // would run on, so an id it holds no patient under describes a job with no input
+        // (see `crate::state::insights_run`). The refusal is stateless — nothing has been
+        // written — so a second attempt against the same unresolvable id is refused
+        // identically. A server that answers NOTHING about the patient establishes
+        // nothing, and the submission is accepted rather than refused on a question
+        // nobody answered.
+        if let Some(server) = input.input_data_config.fhir_server.as_ref() {
+            let refusal = match crate::state::resolve_patient(
+                ctx,
+                &region,
+                &server.fhir_endpoint,
+                &input.patient_context.patient_id,
+            )
+            .await
+            {
+                crate::state::PatientResolution::Absent => {
+                    Some(crate::state::PATIENT_NOT_IN_DATASTORE_MESSAGE)
+                }
+                crate::state::PatientResolution::NoDatastore => {
+                    Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE)
+                }
+                crate::state::PatientResolution::Held
+                | crate::state::PatientResolution::Unanswered => None,
+            };
+            if let Some(message) = refusal {
+                return Err(StartPatientInsightsJobErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The parameters this request asks a job to run with.
         let spec = crate::state::PatientInsightsJobSpec {
             patient_context: input.patient_context,
             insights_context: input.insights_context,
@@ -275,71 +340,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input_data_config: input.input_data_config,
             output_data_config: input.output_data_config,
         };
-        let fingerprint = spec.fingerprint();
 
-        // `clientToken` is an `@idempotencyToken`: the token identifies the REQUEST, so
-        // a retry of the same request must not start a second job. A token this domain
-        // already bound to a job answers with that job; the same token presented with
-        // different parameters is a conflict, since the assumption the first call was
-        // made under no longer holds.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) = domain
-                .patient_insights_job_ids_by_client_token
-                .get(token)
-                .and_then(|job_id| domain.patient_insights_jobs.get(job_id))
-            {
-                if existing.spec.fingerprint() != fingerprint {
-                    return Err(StartPatientInsightsJobErrorModeled::ConflictException(
-                        ConflictException {
-                            // `clientToken` targets `NonEmptyString`, which carries a
-                            // `@pattern` and no `@length`, so the token is named through
-                            // the one bounded echo this service echoes a request value
-                            // through: a caller-sized token cannot size the conflict it is
-                            // answered with. The job id beside it is this service's own.
-                            message: Some(format!(
-                                "Idempotent parameter mismatch: clientToken {} was already \
-                                 used to start job {} with different parameters",
-                                crate::service::error_detail::echoed(token),
-                                existing.job_id
-                            )),
-                        },
-                    )
-                    .into());
-                }
-                // The idempotent replay: the job the first call created, read back out
-                // of the store.
-                return Ok(StartPatientInsightsJobOutput {
-                    job_arn: existing.arn.clone(),
-                    job_id: existing.job_id.clone(),
-                    creation_time: Some(crate::state::to_timestamp(existing.created_at)),
-                });
-            }
-        }
-
-        // Bound the store BEFORE minting, so a refused request advances nothing. This
-        // operation models no `ServiceQuotaExceededException`
-        // (`smithy_query(query="operation",operation="StartPatientInsightsJob")` lists
-        // AccessDenied / Conflict / InternalServer / ResourceNotFound / Throttling /
-        // Validation), so the refusal goes out as the modelled client-input error, with
-        // the count it names.
-        if domain.patient_insights_jobs.len() >= crate::state::MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN
+        let mut store = state.lock();
+        // The ceiling is compared again under this lock, because the resolution above was
+        // made without it: the count a start is bounded by is the one that holds when the
+        // record is written.
+        if store
+            .live_domain(&region, &input.domain_id)
+            .is_some_and(|domain| {
+                domain.patient_insights_jobs.len()
+                    >= crate::state::MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN
+            })
         {
-            return Err(StartPatientInsightsJobErrorModeled::ValidationException(
-                crate::state::invalid_request(format!(
-                    "domain {} already holds the maximum of {} patient insights jobs",
-                    input.domain_id,
-                    crate::state::MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN
-                )),
-            )
-            .into());
+            return Err(job_ceiling_reached(&input.domain_id));
         }
-
         let job_id = store.mint_patient_insights_job_id(&input.domain_id);
         let Some(domain) = store.live_domain_mut(&region, &input.domain_id) else {
             // The same authorization failure the resolution above answers, for the same
-            // reason: the domain was resolved under this one lock, so this cannot be
-            // reached — and if it ever were, a caller may not learn from this endpoint
-            // whether the id names anything.
+            // reason: a caller may not learn from this endpoint whether an id names
+            // anything, which is as true of a domain deleted while the patient was being
+            // resolved as of one that never existed.
             return Err(StartPatientInsightsJobErrorModeled::AccessDeniedException(
                 AccessDeniedException {
                     message: Some(
@@ -349,7 +369,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let job = crate::state::PatientInsightsJob {
+        let mut job = crate::state::PatientInsightsJob {
             job_id: job_id.clone(),
             domain_id: domain.domain_id.clone(),
             arn: crate::state::patient_insights_job_arn(&domain.arn, &job_id),
@@ -361,16 +381,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has run yet, so there is no output location to report: the
             // terminal success transition is what fills this member.
             insights_output: None,
+            // Nothing is delivered until the completion falls due; where it goes is
+            // derived below from the location this job will report.
+            output_delivery: None,
             created_at: now,
             updated_at: now,
             next_transition_at: Some(now + crate::state::PATIENT_INSIGHTS_JOB_STEP_SPAN),
             spec,
         };
-        if let Some(token) = input.client_token {
-            domain
-                .patient_insights_job_ids_by_client_token
-                .insert(token, job_id.clone());
-        }
+        // Where this job's output object goes, derived from the location the job itself
+        // reports (`crate::state::PatientInsightsJob::output_location`) through the
+        // workspace's one reading of an `s3://` URI — so the object lands at exactly the
+        // key `insightsOutput.uri` names. A configured location naming no object address
+        // leaves nothing to deliver.
+        job.output_delivery = ::service_common::s3_uri::object_address(&job.output_location().uri)
+            .map(|(bucket, key)| crate::state::InsightsDelivery {
+                region: region.clone(),
+                bucket,
+                key,
+                state: crate::state::DeliveryState::Owed,
+            });
         // `or_insert` hands back the record it STORED, so every field rendered below is
         // read out of the store rather than echoed from the request.
         let stored = domain.patient_insights_jobs.entry(job_id).or_insert(job);
@@ -380,4 +410,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: Some(crate::state::to_timestamp(stored.created_at)),
         })
     }
+}
+
+/// The refusal a start past the per-domain job ceiling earns, stated once so the two
+/// places this handler compares that ceiling cannot word it differently.
+///
+/// This operation models no `ServiceQuotaExceededException`
+/// (`smithy_query(query="operation",operation="StartPatientInsightsJob")` lists
+/// AccessDenied / Conflict / InternalServer / ResourceNotFound / Throttling / Validation),
+/// so the refusal goes out as the modelled client-input error, naming the count it
+/// enforced.
+fn job_ceiling_reached(domain_id: &str) -> StartPatientInsightsJobError {
+    StartPatientInsightsJobErrorModeled::ValidationException(crate::state::invalid_request(
+        format!(
+            "domain {domain_id} already holds the maximum of {} patient insights jobs",
+            crate::state::MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN
+        ),
+    ))
+    .into()
 }

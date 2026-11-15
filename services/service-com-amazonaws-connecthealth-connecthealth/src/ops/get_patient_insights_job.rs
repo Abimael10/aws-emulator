@@ -94,11 +94,17 @@
 //! Nothing is echoed from the request but the two identifiers the record was resolved
 //! against.
 //!
-//! The one thing it writes is what the CLOCK already made due, through the single
-//! preamble every handler in this crate runs (`materialise_due`): a domain whose
-//! `DELETING` span has elapsed is purged, and a job whose next status transition has
-//! fallen due is moved on. Both were owed at this instant whether or not anybody called,
-//! so reading changes nothing a later caller would not have seen anyway.
+//! The one thing it writes is what the CLOCK already made due: through the single
+//! preamble every handler in this crate runs (`materialise_due`), a domain whose
+//! `DELETING` span has elapsed is purged and a job whose next status transition has
+//! fallen due is moved on; and through `crate::state::deliver_job_output`, a job whose
+//! completion has fallen due writes its output object into the location its start
+//! configured and reaches the terminal status that delivery settles. Each was owed at
+//! this instant whether or not anybody called, so reading changes nothing a later caller
+//! would not have seen anyway — and the read that finds the delivery owed makes it before
+//! it answers, so a caller polling a job to completion finds the object the job names.
+//! (A second read arriving while the first still holds that delivery is answered the
+//! status the clock applied, whose object the first read is in the middle of writing.)
 //!
 //! A `domainId` that names no live domain, and a `jobId` that names no job under it, are
 //! both the modelled `ResourceNotFoundException`: a job started in one domain is not
@@ -199,12 +205,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
-        let mut store = state.lock();
-        // A reporting operation, so the one write is the preamble every handler shares:
-        // everything the CLOCK already made due, which for this reader is the purge of a
-        // domain whose DELETING span has elapsed and the transition of a job whose next
-        // status has fallen due.
-        store.materialise_due(now);
+        // A reporting operation, so the one write is what the CLOCK already made due. One
+        // half of that is the shared preamble (the purge of a domain whose DELETING span
+        // has elapsed, and each job's next status transition); the other is the DELIVERY a
+        // job whose completion has fallen due owes — the summary object it writes where it
+        // reports it (`crate::state::deliver_job_output`). Both were owed at this instant
+        // whether or not anybody polled, and making the delivery is what puts the object in
+        // place before this read reports the job terminal. The store is not held across
+        // it.
+        state.lock().materialise_due(now);
+        crate::state::deliver_job_output(
+            &*self.engine,
+            ctx.callback(),
+            &region,
+            &input.domain_id,
+            &input.job_id,
+        )
+        .await;
+
+        let store = state.lock();
 
         // One miss, one answer. The domain and the job are resolved as a single scoped
         // chain, so a job started in one domain cannot be read through another: the

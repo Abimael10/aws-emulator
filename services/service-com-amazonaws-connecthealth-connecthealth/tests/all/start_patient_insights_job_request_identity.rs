@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The identity of a `StartPatientInsightsJob` REQUEST: how the token that identifies a
-//! request is told from the same token presented with DIFFERENT job parameters.
+//! The identity of a `StartPatientInsightsJob` JOB: every accepted start is a job of its
+//! own, whatever `clientToken` it carries and whether or not the parameters beside it have
+//! been submitted before.
 //!
 //! Every case drives the service the way a client does — a signed restJson1 request
 //! through the router's own dispatch — and asserts the RULE rather than one recorded
-//! body: two parameter sets the model admits as different are different requests, so a
-//! `clientToken` already bound to a job started with one of them answers the modelled
-//! `ConflictException` when it is presented with the other, and only a request carrying
-//! the very same parameters replays the first job.
+//! body: `clientToken` is an `@idempotencyToken`, which is a rule about how an SDK FILLS
+//! that member rather than a promise that the service deduplicates on it, so a token
+//! already used starts a second, independent job with its own `jobId` and `jobArn`, and
+//! what each job reads back is the parameter set ITS OWN start supplied.
 //!
-//! The rows generalise over what makes two parameter sets different where the digest
-//! previously could not see it: whether an optional member was supplied at all, whether
+//! The rows generalise over everything that can make two parameter sets differ, and over
+//! the same set submitted twice: whether an optional member was supplied at all, whether
 //! the list it carries is empty, how many elements it carries, in which order, and which
 //! section of `inputDataConfig` a value sits in. The empty list is one of the values the
 //! member admits: `S3Sources` declares `@length {max: 10}` and no minimum
@@ -21,7 +22,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
+use crate::domain_subscription_lifecycle::{string_at, Emulator};
 use crate::patient_insights_job_lifecycle::{get_job, minimal_body, start_path};
 use crate::patient_insights_job_terminal_output::domain_of;
 
@@ -124,13 +125,15 @@ fn differing_pairs() -> Vec<(String, Value, Value)> {
 }
 
 #[tokio::test]
-async fn a_token_bound_to_one_parameter_set_refuses_every_other_one() {
+async fn one_token_presented_with_either_spelling_starts_a_job_for_each() {
     let emulator = Emulator::new("us-west-2");
     let domain_id = domain_of(&emulator, "clinic-request-identity").await;
 
+    let mut minted: BTreeSet<String> = BTreeSet::new();
     for (index, (case, left, right)) in differing_pairs().into_iter().enumerate() {
         // Each ORDER on its own token, so neither spelling is privileged: whichever of
-        // the two started the job, the other one is a conflict against it.
+        // the two started the first job, the other one starts a job of its own under the
+        // same token.
         for (order, first, second) in [
             (0, left.clone(), right.clone()),
             (1, right.clone(), left.clone()),
@@ -153,8 +156,13 @@ async fn a_token_bound_to_one_parameter_set_refuses_every_other_one() {
                 "case {case:?}: the first start must answer 200, got {status} with {started}"
             );
             let job_id = string_at(&started, "jobId");
+            assert!(
+                minted.insert(job_id.clone()),
+                "case {case:?}: every accepted start must mint its own job, got the \
+                 reused {job_id:?}"
+            );
 
-            let (status, refused) = emulator
+            let (status, again) = emulator
                 .send(
                     "POST",
                     &start_path(&domain_id),
@@ -162,43 +170,43 @@ async fn a_token_bound_to_one_parameter_set_refuses_every_other_one() {
                 )
                 .await;
             assert_eq!(
-                status, 409,
-                "case {case:?}: the same token with different parameters must answer 409, \
-                 got {status} with {refused}"
+                status, 200,
+                "case {case:?}: the same token with different parameters must answer 200, \
+                 got {status} with {again}"
             );
-            assert_eq!(
-                error_code(&refused),
-                "ConflictException",
-                "case {case:?}: got {refused}"
-            );
-            let detail = string_at(&refused, "message");
+            let second_job = string_at(&again, "jobId");
             assert!(
-                detail.contains(&token) && detail.contains(&job_id),
-                "case {case:?}: the detail must name the token and the job it is bound to \
-                 ({token}, {job_id}), got {detail:?}"
+                minted.insert(second_job.clone()),
+                "case {case:?}: a start repeating a token must mint its own job, got the \
+                 reused {second_job:?}"
             );
 
-            // The refused request changed nothing: the job the first call created still
-            // reports the parameters IT was started with.
-            let fetched = get_job(&emulator, case, &domain_id, &job_id).await;
-            assert_eq!(
-                fetched.get("inputDataConfig").cloned().unwrap_or(Value::Null),
-                first,
-                "case {case:?}: the stored job must still carry the parameters it was \
-                 started with, got {fetched}"
-            );
+            // Each job reads back with the parameter set ITS OWN start supplied, so the
+            // second start neither replayed nor overwrote the first.
+            for (which, job, expected) in [
+                ("the first job", &job_id, &first),
+                ("the second job", &second_job, &second),
+            ] {
+                let fetched = get_job(&emulator, case, &domain_id, job).await;
+                assert_eq!(
+                    fetched.get("inputDataConfig").cloned().unwrap_or(Value::Null),
+                    *expected,
+                    "case {case:?}: {which} must carry the parameters it was started \
+                     with, got {fetched}"
+                );
+            }
         }
     }
 }
 
 #[tokio::test]
-async fn a_retry_of_the_very_same_parameters_replays_the_first_job() {
+async fn the_same_parameters_presented_again_start_another_job() {
     let emulator = Emulator::new("eu-west-1");
     let domain_id = domain_of(&emulator, "clinic-request-replay").await;
 
     // Every spelling the table names, each presented three times under one token of its
-    // own: a repeat is a repeat, so the second and third calls answer the first job
-    // rather than minting another or refusing it.
+    // own: a repeat is still a submission, so the second and third calls each start a job
+    // of their own, and every one of them reads back with the parameters it was given.
     let mut configs: Vec<(String, Value)> = Vec::new();
     for (case, left, right) in differing_pairs() {
         configs.push((format!("{case} (first spelling)"), left));
@@ -210,44 +218,32 @@ async fn a_retry_of_the_very_same_parameters_replays_the_first_job() {
         let case = case.as_str();
         let token = format!("replay-{index}");
         let body = body_with(&config, &token);
-        let (status, first) = emulator
-            .send("POST", &start_path(&domain_id), Some(&body))
-            .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: the first start must answer 200, got {status} with {first}"
-        );
-        let job_id = string_at(&first, "jobId");
-        assert!(
-            minted.insert(job_id.clone()),
-            "case {case:?}: every distinct token must start its own job, got the reused \
-             {job_id:?}"
-        );
-
-        for attempt in ["second call", "third call"] {
-            let (status, retried) = emulator
+        for attempt in ["first call", "second call", "third call"] {
+            let (status, started) = emulator
                 .send("POST", &start_path(&domain_id), Some(&body))
                 .await;
             assert_eq!(
                 status, 200,
-                "case {case:?} / {attempt}: a retry of the same request must answer 200, \
-                 got {status} with {retried}"
+                "case {case:?} / {attempt}: a start must answer 200, got {status} with \
+                 {started}"
             );
+            let job_id = string_at(&started, "jobId");
+            assert!(
+                minted.insert(job_id.clone()),
+                "case {case:?} / {attempt}: every accepted start must mint its own job, \
+                 got the reused {job_id:?}"
+            );
+
+            // What the start persisted is what the reader projects: an absent member stays
+            // absent and a supplied empty list reads back as an empty list, which is what
+            // makes the two spellings observably different records.
+            let fetched = get_job(&emulator, case, &domain_id, &job_id).await;
             assert_eq!(
-                retried, first,
-                "case {case:?} / {attempt}: a retry must answer the first job, got {retried}"
+                fetched.get("inputDataConfig").cloned().unwrap_or(Value::Null),
+                config,
+                "case {case:?} / {attempt}: inputDataConfig must read back exactly as it \
+                 was persisted, got {fetched}"
             );
         }
-
-        // What the start persisted is what the reader projects: an absent member stays
-        // absent and a supplied empty list reads back as an empty list, which is what
-        // makes the two spellings observably different records.
-        let fetched = get_job(&emulator, case, &domain_id, &job_id).await;
-        assert_eq!(
-            fetched.get("inputDataConfig").cloned().unwrap_or(Value::Null),
-            config,
-            "case {case:?}: inputDataConfig must read back exactly as it was persisted, \
-             got {fetched}"
-        );
     }
 }

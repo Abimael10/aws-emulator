@@ -1,5 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: below this header the file holds one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
+// line. Add a suite by putting it at `tests/all/<name>.rs` and inserting its pair into the
+// sorted list — nothing beside it. What a suite covers, and why it drives the assembled
+// router rather than one service crate, belongs in that suite's own module header, where it
+// is read with the test it explains.
+//
+// This is the one file in the target whose breakage compiles no suite at all, so suites of
+// the target pin the shape above: a name declared twice is `E0428`, an inner doc comment past
+// the first item is `E0753`, the list is pairs-sorted-and-nothing-else, and every file under
+// `tests/all/` is declared. Every comment here is an ordinary `//` one, this header included,
+// so no merge of two landings can leave a doc comment past the first item.
+//
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of
+// this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each
+// declaration is what points it into `tests/all/`. Some of the files below are shared
+// harnesses or probes rather than suites; all are declared, because a file no declaration
+// names is compiled nowhere.
 // Single integration-test target for the router: the DECLARATION LIST, and nothing else.
 //
 // Put a new suite at `tests/all/<name>.rs` and insert its
@@ -82,6 +100,8 @@ mod apigatewayv2_websocket_deploy_then_connections;
 mod appconfig_signing_name_routing;
 #[path = "all/appended_notes.rs"]
 mod appended_notes;
+#[path = "all/appended_notes_tail.rs"]
+mod appended_notes_tail;
 #[path = "all/applicationinsights_resource_group_admission.rs"]
 mod applicationinsights_resource_group_admission;
 #[path = "all/appstream_app_block_builder_role_trust.rs"]

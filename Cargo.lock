@@ -12308,6 +12308,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-s3",
  "aws-smithy-eventstream 0.60.21",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
@@ -12315,12 +12316,16 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "percent-encoding",
  "regex",
  "serde_json",
+ "service-com-amazonaws-healthlake-healthlake",
+ "service-com-amazonaws-s3-amazons3",
  "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

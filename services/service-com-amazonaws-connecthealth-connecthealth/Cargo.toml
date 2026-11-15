@@ -37,9 +37,30 @@ regex = "1.13"
 # `StartMedicalScribeListeningSession` arrives as those frames, and the shared seam reads
 # only the response direction.
 aws-smithy-eventstream = "0.60"
+# The in-process Amazon S3 client a completed patient insights job writes its summary
+# object through (built once in `service-common::s3_client`): only the types the write
+# itself takes are named here. The emulator supplies the transport, so the SDK's own HTTPS
+# stack is left out and this client can reach nothing off this process.
+aws-sdk-s3 = { version = "1", default-features = false }
+# Reads the `fhirEndpoint` URL a `StartPatientInsightsJob` names with a maintained URL
+# parser rather than splitting a caller-supplied URI by hand
+# (`src/state/insights_run.rs`).
+url = "2"
+# Percent-encodes the patient identifier a FHIR interaction addresses, so no value a
+# caller supplies can carry a separator of the URI it sits in.
+percent-encoding = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The object store a completed patient insights job writes its summary into, and the FHIR
+# data store its patient is resolved against: both are mounted BESIDE this service on one
+# engine in the patient-insights suite, exactly as the assembled router mounts them, so
+# what the job read and what it wrote are answered by the services that OWN them.
+# DEV-ONLY: this crate depends on no other service's crate outside its tests.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+service-com-amazonaws-healthlake-healthlake = { workspace = true }
 
 [lints]
 workspace = true

@@ -21,6 +21,12 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+/// What a patient insights job's run does outside this service: resolving the patient the
+/// request names against the FHIR server it names, and writing the insights document the
+/// finished job reports into the object store the request configured.
+mod insights_run;
+pub use insights_run::*;
+
 use crate::ops::types::{
     CreateSubscriptionOutput, CreateSubscriptionRecord, CreateWebAppConfiguration,
     EncryptionContext, InputDataConfig, InsightsContext, InsightsOutput,
@@ -401,11 +407,6 @@ pub struct Domain {
     /// than in a map beside the registry, so a job is scoped to its own domain and goes
     /// away with it.
     pub patient_insights_jobs: BTreeMap<String, PatientInsightsJob>,
-    /// The `jobId` each `clientToken` a `StartPatientInsightsJob` carried is bound to, so
-    /// a retried start with the same token resolves to the job the first one created
-    /// instead of starting a second. Scoped to the domain, as the job it names is, and
-    /// bounded with it: an entry is written only when a job is created.
-    pub patient_insights_job_ids_by_client_token: BTreeMap<String, String>,
 }
 
 impl Domain {
@@ -536,54 +537,6 @@ pub struct PatientInsightsJobSpec {
     pub output_data_config: OutputDataConfig,
 }
 
-impl PatientInsightsJobSpec {
-    /// A digest of every parameter, so a repeated `clientToken` can be told from a token
-    /// reused for DIFFERENT parameters without keeping a second copy of the request
-    /// around.
-    ///
-    /// Every value is length-prefixed before it is folded in, so two different parameter
-    /// sets cannot collide by running their text together, and an optional member
-    /// contributes a part whether or not it was supplied — an omitted one a part of its
-    /// own, so omitting a member and supplying it are different requests even when what
-    /// was supplied is empty. A variable-length section folds in its element count ahead
-    /// of the elements, so the sections cannot be read into one another.
-    pub fn fingerprint(&self) -> String {
-        let mut parts: Vec<String> = vec![
-            self.patient_context.patient_id.clone(),
-            self.patient_context.date_of_birth.clone().unwrap_or_default(),
-            self.patient_context.pronouns.clone().unwrap_or_default(),
-            self.insights_context.insights_type.clone(),
-            self.encounter_context.encounter_reason.clone(),
-            self.user_context.role.clone(),
-            self.user_context.user_id.clone(),
-            self.user_context.specialty.clone().unwrap_or_default(),
-            self.output_data_config.s3_output_path.clone(),
-        ];
-        match &self.input_data_config.fhir_server {
-            Some(server) => {
-                parts.push("fhirServer".to_string());
-                parts.push(server.fhir_endpoint.clone());
-                parts.push(server.oauth_token.clone().unwrap_or_default());
-            }
-            None => parts.push(String::new()),
-        }
-        match &self.input_data_config.s3_sources {
-            Some(sources) => {
-                parts.push("s3Sources".to_string());
-                // The element count goes in AHEAD of the elements, so a list and a
-                // longer list that starts with it are different requests and this
-                // section cannot be read into whatever follows it.
-                parts.push(sources.len().to_string());
-                for source in sources {
-                    parts.push(source.uri.clone());
-                }
-            }
-            None => parts.push(String::new()),
-        }
-        fingerprint_of(parts.iter().map(String::as_str))
-    }
-}
-
 /// The digest of a sequence of request values — the ONE place this crate turns the
 /// parameters a request carried into the identity of that request, so no two operations
 /// tell a repeat from a different request by different rules.
@@ -675,8 +628,31 @@ pub struct PatientInsightsJob {
     /// When the next status transition the clock owes becomes due; `None` once the job is
     /// in a terminal status and owes none.
     pub next_transition_at: Option<SystemTime>,
+    /// The delivery this job's completion makes — the output object it writes into the
+    /// location the start configured — or `None` for a job with no output location to
+    /// write to. The terminal status moves WITH that delivery
+    /// ([`InsightsDelivery`], [`deliver_job_output`]), so no read reports a job
+    /// successful before its output object is where the job says it is.
+    pub output_delivery: Option<InsightsDelivery>,
     /// The parameters the start persisted, reported back by the reader.
     pub spec: PatientInsightsJobSpec,
+}
+
+impl PatientInsightsJob {
+    /// Where this job's output goes: the location derived from the output path the start
+    /// persisted and this job's own id ([`patient_insights_output_uri`]).
+    ///
+    /// The ONE derivation of that location, so the member the reader answers with, the key
+    /// the completion writes the object at and the location a test asserts cannot drift
+    /// apart.
+    pub fn output_location(&self) -> InsightsOutput {
+        InsightsOutput {
+            uri: patient_insights_output_uri(
+                &self.spec.output_data_config.s3_output_path,
+                &self.job_id,
+            ),
+        }
+    }
 }
 
 impl PatientInsightsJob {
@@ -689,11 +665,15 @@ impl PatientInsightsJob {
     /// rather than the instant somebody happened to look, so the record reads the same
     /// however late the first read comes.
     ///
-    /// Completing is what fills [`Self::insights_output`]: the location is derived from
-    /// the output path the start persisted and this job's own id
-    /// ([`patient_insights_output_uri`]), so the member the reader answers with is read
-    /// out of the record rather than recomputed per read. Nothing is reported about the
-    /// status of a job that did what it was asked, so `statusDetails` stays as it was.
+    /// Completing is what fills [`Self::insights_output`]: the location is this job's own
+    /// ([`Self::output_location`]), so the member the reader answers with is read out of
+    /// the record rather than recomputed per read. It is also what leaves the job's
+    /// DELIVERY due — the output object it writes at exactly that location
+    /// ([`deliver_job_output`], which the job's own reader makes before it answers, so a
+    /// caller polling the job to completion finds that object). A delivery the object
+    /// store refuses takes the job to `FAILED`, and one it takes leaves the job stating in
+    /// `statusDetails` what that object does not carry
+    /// ([`PatientInsightsJob::settle_delivery`]).
     fn apply_due_transitions(&mut self, now: SystemTime) {
         while let Some(due) = self.next_transition_at.filter(|due| *due <= now) {
             match self.status {
@@ -703,12 +683,7 @@ impl PatientInsightsJob {
                 }
                 JobStatus::InProgress => {
                     self.status = JobStatus::Succeeded;
-                    self.insights_output = Some(InsightsOutput {
-                        uri: patient_insights_output_uri(
-                            &self.spec.output_data_config.s3_output_path,
-                            &self.job_id,
-                        ),
-                    });
+                    self.insights_output = Some(self.output_location());
                     self.next_transition_at = None;
                 }
                 // A terminal status owes nothing; a due instant left on one is dropped

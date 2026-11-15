@@ -19,9 +19,10 @@
 //! 3. The STATUS a get reports is the one the clock has moved the job to — never zero
 //!    milliseconds after the start, and terminal once it is terminal; a job that ran to
 //!    completion reports its output location under the path the start configured.
-//! 4. `clientToken` is an `@idempotencyToken`: a retry resolves to the job the first
-//!    call created, and the same token with different parameters is the modelled
-//!    `ConflictException`.
+//! 4. `clientToken` is an `@idempotencyToken`, which is a rule about how an SDK FILLS
+//!    that member and not a promise that the service deduplicates on it: every accepted
+//!    start mints its own job, whatever token it carries and however many times that
+//!    token has been presented before.
 //! 5. Every value of the modelled `JobStatus` enum is projected out of state, including
 //!    the ones this emulator's own lifecycle does not reach.
 //!
@@ -167,6 +168,57 @@ async fn domain_of(emulator: &Emulator, name: &str) -> String {
         &emulator.create_domain(&json!({ "name": name })).await,
         "domainId",
     )
+}
+
+/// How long a poll of a job's status keeps looking: many times over the spans
+/// [`PATIENT_INSIGHTS_JOB_STEP_SPAN`] owes a job, so a loaded host has room while a fast
+/// one never waits at all.
+pub(crate) const JOB_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Look at a job through its own reader until `reached` holds of the `jobStatus` it
+/// reports, and answer that reading — or fail once [`JOB_POLL_DEADLINE`] has passed.
+///
+/// The CONDITION is what is waited for, never an interval: a transition is owed at an
+/// instant, so looking again is how a caller observes it, and a fixed wait would make the
+/// outcome depend on how fast the host runs.
+///
+/// `pub(crate)` so every suite of this target waits for a job the one way.
+pub(crate) async fn poll_until(
+    emulator: &Emulator,
+    case: &str,
+    domain_id: &str,
+    job_id: &str,
+    reached: fn(&str) -> bool,
+) -> Value {
+    let deadline = std::time::Instant::now() + JOB_POLL_DEADLINE;
+    loop {
+        let fetched = get_job(emulator, case, domain_id, job_id).await;
+        if reached(&string_at(&fetched, "jobStatus")) {
+            return fetched;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the job never reached the status this row waits for within \
+             {JOB_POLL_DEADLINE:?}, last read {fetched}"
+        );
+        ::tokio::task::yield_now().await;
+    }
+}
+
+/// Whether `status` is one of the modelled TERMINAL job statuses — what a job that has run
+/// to its end reports (`JobStatus`: `SUCCEEDED`, `FAILED`).
+pub(crate) fn is_terminal(status: &str) -> bool {
+    status == "SUCCEEDED" || status == "FAILED"
+}
+
+/// Look at a job until it reports a terminal status.
+pub(crate) async fn poll_until_terminal(
+    emulator: &Emulator,
+    case: &str,
+    domain_id: &str,
+    job_id: &str,
+) -> Value {
+    poll_until(emulator, case, domain_id, job_id, is_terminal).await
 }
 
 /// The rows a start is driven with: one per shape of request the model allows, so the
@@ -485,120 +537,79 @@ async fn a_job_is_readable_only_under_its_own_domain() {
 }
 
 #[tokio::test]
-async fn a_client_token_makes_a_start_idempotent_and_a_changed_request_a_conflict() {
+async fn every_accepted_start_mints_its_own_job_whatever_token_it_carries() {
     let emulator = Emulator::new("us-east-1");
-    let domain_id = domain_of(&emulator, "clinic-idempotent").await;
-
-    // One token, one job: the retry resolves to the job the first call created.
-    let token = "token-retry";
-    let mut body = minimal_body();
-    body["clientToken"] = json!(token);
-    let first = start_job(&emulator, "first call", &domain_id, &body).await;
-    for attempt in ["second call", "third call"] {
-        let retried = start_job(&emulator, attempt, &domain_id, &body).await;
-        assert_eq!(
-            retried, first,
-            "case {attempt:?}: a retry of the same token must answer the first job, got {retried}"
-        );
-    }
-
-    // The same token with DIFFERENT parameters is a conflict — one row per member a
-    // request can differ in.
-    let changes: Vec<(&str, Value)> = vec![
-        ("a different patientId", json!({ "patientId": "patient-9999" })),
-        ("an added dateOfBirth", json!({ "patientId": "patient-0001", "dateOfBirth": "2000-01-31" })),
-    ];
-    for (case, patient_context) in changes {
-        let mut changed = body.clone();
-        changed["patientContext"] = patient_context;
-        let (status, refused) = emulator
-            .send("POST", &start_path(&domain_id), Some(&changed))
-            .await;
-        assert_eq!(
-            status, 409,
-            "case {case:?}: a reused token with changed parameters must answer 409, \
-             got {status} with {refused}"
-        );
-        assert_eq!(
-            error_code(&refused),
-            "ConflictException",
-            "case {case:?}: got {refused}"
-        );
-    }
-    for (case, member_name, value) in [
-        (
-            "a different encounterReason",
-            "encounterContext",
-            json!({ "encounterReason": "Follow up visit" }),
-        ),
-        (
-            "a different userId",
-            "userContext",
-            json!({ "role": "CLINICIAN", "userId": "clinician-9999" }),
-        ),
-        (
-            "an added specialty",
-            "userContext",
-            json!({ "role": "CLINICIAN", "userId": "clinician-0001", "specialty": "PRIMARY_CARE" }),
-        ),
-        (
-            "a different input source",
-            "inputDataConfig",
-            json!({ "fhirServer": { "fhirEndpoint": "https://fhir.example.org/r4" } }),
-        ),
-        (
-            "an extra input source",
-            "inputDataConfig",
-            json!({ "s3Sources": s3_sources(2) }),
-        ),
-        (
-            "a different output path",
-            "outputDataConfig",
-            json!({ "s3OutputPath": "s3://clinic-output/elsewhere/" }),
-        ),
-    ] {
-        let mut changed = body.clone();
-        changed[member_name] = value;
-        let (status, refused) = emulator
-            .send("POST", &start_path(&domain_id), Some(&changed))
-            .await;
-        assert_eq!(
-            status, 409,
-            "case {case:?}: a reused token with changed parameters must answer 409, \
-             got {status} with {refused}"
-        );
-        assert_eq!(
-            error_code(&refused),
-            "ConflictException",
-            "case {case:?}: got {refused}"
-        );
-    }
-
-    // A different token, and no token at all, each start their own job.
-    let mut fresh_token = minimal_body();
-    fresh_token["clientToken"] = json!("token-another");
-    let mut ids: BTreeSet<String> = BTreeSet::new();
-    ids.insert(string_at(&first, "jobId"));
-    for (case, request) in [
-        ("another token", fresh_token),
-        ("no token at all", minimal_body()),
-        ("no token at all, again", minimal_body()),
-    ] {
-        let started = start_job(&emulator, case, &domain_id, &request).await;
-        assert!(
-            ids.insert(string_at(&started, "jobId")),
-            "case {case:?}: a start that is not an idempotent retry must create a new job, \
-             got {started}"
-        );
-    }
-
-    // The token is scoped to its domain: the same token in another domain starts a job
-    // there rather than resolving the first one.
+    let domain_id = domain_of(&emulator, "clinic-tokens").await;
     let elsewhere = domain_of(&emulator, "clinic-elsewhere").await;
-    let started = start_job(&emulator, "the same token elsewhere", &elsewhere, &body).await;
-    assert!(
-        ids.insert(string_at(&started, "jobId")),
-        "a client token must be scoped to its own domain, got {started}"
+
+    // One token, presented repeatedly with a byte-identical body, then with changed
+    // parameters, beside a body carrying no token at all: the rows differ along whether a
+    // token is carried, whether it has been presented before, whether the parameters
+    // beside it changed, and which domain the start is addressed to.
+    let token = "token-repeated";
+    let mut repeated = minimal_body();
+    repeated["clientToken"] = json!(token);
+    let mut changed = repeated.clone();
+    changed["patientContext"] = json!({ "patientId": "patient-9999" });
+    let mut other_token = minimal_body();
+    other_token["clientToken"] = json!("token-another");
+
+    let rows: Vec<(&str, &str, Value)> = vec![
+        ("a fresh token", domain_id.as_str(), repeated.clone()),
+        ("the same token again", domain_id.as_str(), repeated.clone()),
+        (
+            "the same token a third time",
+            domain_id.as_str(),
+            repeated.clone(),
+        ),
+        (
+            "the same token with changed parameters",
+            domain_id.as_str(),
+            changed,
+        ),
+        ("another token", domain_id.as_str(), other_token),
+        ("no token at all", domain_id.as_str(), minimal_body()),
+        (
+            "no token at all, again",
+            domain_id.as_str(),
+            minimal_body(),
+        ),
+        (
+            "the same token in another domain",
+            elsewhere.as_str(),
+            repeated.clone(),
+        ),
+    ];
+
+    let mut minted: BTreeSet<String> = BTreeSet::new();
+    for (case, domain, body) in &rows {
+        let started = start_job(&emulator, case, domain, body).await;
+        let job_id = string_at(&started, "jobId");
+        assert!(
+            minted.insert(job_id.clone()),
+            "case {case:?}: every accepted start must mint its own job, got the reused \
+             {job_id:?}"
+        );
+        // And the job it minted is the one it reports: the record reads back with the
+        // parameters THIS call supplied, not an earlier call's.
+        let fetched = get_job(&emulator, case, domain, &job_id).await;
+        assert_eq!(
+            member(case, &fetched, "patientContext"),
+            body["patientContext"],
+            "case {case:?}: the job must carry the parameters this start supplied, \
+             got {fetched}"
+        );
+        assert_eq!(
+            string_at(&fetched, "jobArn"),
+            string_at(&started, "jobArn"),
+            "case {case:?}: the stored job must report the ARN the start answered, \
+             got {fetched}"
+        );
+    }
+    assert_eq!(
+        minted.len(),
+        rows.len(),
+        "every row must have started a job of its own, got {minted:?}"
     );
 }
 
@@ -635,6 +646,8 @@ fn seed_job(
         updated_at: now,
         // Seeded in the status under test, so no transition is owed.
         next_transition_at: None,
+        // Nothing is owed outside this service for a record seeded in its final status.
+        output_delivery: None,
         spec: PatientInsightsJobSpec {
             patient_context: PatientInsightsPatientContext {
                 patient_id: "patient-seeded".to_string(),

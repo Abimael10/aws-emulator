@@ -19,10 +19,9 @@
 //! 2. A START whose `outputDataConfig.s3OutputPath` falls outside the rules its own shape
 //!    declares is the modelled 400 `ValidationException` with that endpoint's fixed
 //!    request-validation sentence (`state::error_detail::REQUEST_VALIDATION_FAILED_MESSAGE`),
-//!    and it PERSISTS nothing: no job, and no binding of the `clientToken` it carried, so
-//!    an identical retry is refused again rather than answered idempotently and a later
-//!    valid request may still use that token. A path the shape DOES allow is accepted at
-//!    the same time, so the rule is not asserted only on its refusing side.
+//!    and it PERSISTS nothing: no job, so an identical retry is refused again rather than
+//!    answered with one. A path the shape DOES allow is accepted at the same time, so the
+//!    rule is not asserted only on its refusing side.
 //! 3. A `jobId` that resolves to no job under a domain that DOES resolve stays the
 //!    modelled 404 `ResourceNotFoundException`, and names the job by the ARN this service
 //!    would hold it under: `Job <jobArn> does not exist.`
@@ -111,9 +110,9 @@ fn unallocated_domain_id(prefix: &str, filler: char, len: usize) -> String {
     id
 }
 
-/// Every job record and `clientToken` binding this service holds, read straight out of
-/// the shared engine — the only way to assert that a refused start persisted NOTHING,
-/// since this service models no operation that lists jobs.
+/// Every job record this service holds, read straight out of the shared engine — the only
+/// way to assert that a refused start persisted NOTHING, since this service models no
+/// operation that lists jobs.
 fn stored_jobs(emulator: &Emulator) -> BTreeSet<String> {
     let store = state::service_state(&**emulator.engine()).expect("this service's own store");
     let store = store.lock();
@@ -129,9 +128,6 @@ fn stored_jobs(emulator: &Emulator) -> BTreeSet<String> {
                 "job {}/{job_id} arn={} created={created}ns",
                 domain.domain_id, job.arn
             ));
-        }
-        for (token, job_id) in &domain.patient_insights_job_ids_by_client_token {
-            lines.insert(format!("token {}/{token} -> {job_id}", domain.domain_id));
         }
     }
     lines
@@ -280,7 +276,7 @@ async fn a_start_whose_domain_does_not_resolve_is_refused_by_the_endpoints_autho
 }
 
 /// A `StartPatientInsightsJob` body whose output location is `s3_output_path`, carrying
-/// `client_token` so what a refusal bound (or did not bind) can be asserted.
+/// `client_token` so a refusal is asserted for a request that carries that member too.
 fn body_with_output(s3_output_path: &str, client_token: &str) -> Value {
     let mut body = minimal_body();
     body["outputDataConfig"] = json!({ "s3OutputPath": s3_output_path });
@@ -390,13 +386,13 @@ async fn an_output_location_outside_its_shape_is_refused_and_persists_nothing() 
         let after = stored_jobs(&emulator);
         assert_eq!(
             after, before,
-            "case {case:?}: a refused start must persist no job and no token binding, \
-             expected {before:?}, got {after:?}"
+            "case {case:?}: a refused start must persist no job, expected {before:?}, \
+             got {after:?}"
         );
     }
 
-    // The token the refusals carried was never bound, so a VALID request presenting it is
-    // a new job rather than an idempotent replay of something that was refused.
+    // The refusals above persisted nothing, so a VALID request presenting the token they
+    // carried is simply a new job.
     let (status, started) = emulator
         .send(
             "POST",

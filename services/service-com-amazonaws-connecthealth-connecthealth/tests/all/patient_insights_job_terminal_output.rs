@@ -34,7 +34,9 @@ use service_com_amazonaws_connecthealth_connecthealth::state::{
 };
 
 use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
-use crate::patient_insights_job_lifecycle::{get_job, minimal_body, start_path};
+use crate::patient_insights_job_lifecycle::{
+    get_job, minimal_body, poll_until_terminal, start_path,
+};
 
 /// `S3Uri`'s pattern: `^s3://[a-z0-9][\.\-a-z0-9]{1,61}[a-z0-9](/.*)?$` — so a bucket
 /// field of 3..63 characters, of lowercase letters and digits, which dots and hyphens
@@ -159,9 +161,10 @@ async fn a_completed_job_reports_its_output_under_the_configured_path() {
     let emulator = Emulator::new("us-west-2");
     let domain_id = domain_of(&emulator, "clinic-terminal-output").await;
 
-    // Two jobs per row, started before anything is read: the clock is what moves them,
-    // so one wait covers the whole table, and the pair is what shows the location is per
-    // JOB rather than per configured path.
+    // Two jobs per row, started before anything is read: the clock is what moves them, and
+    // the pair is what shows the location is per JOB rather than per configured path. Each
+    // is then waited for by LOOKING at it until it is terminal, never by sleeping for the
+    // spans it owes.
     let rows = output_path_rows();
     let mut started: Vec<(String, String, Vec<String>)> = Vec::new();
     for (case, path) in &rows {
@@ -181,13 +184,11 @@ async fn a_completed_job_reports_its_output_under_the_configured_path() {
         started.push((case.clone(), path.clone(), ids));
     }
 
-    std::thread::sleep(past_both_spans());
-
     let mut reported: BTreeSet<String> = BTreeSet::new();
     for (case, path, ids) in &started {
         let mut uris: Vec<String> = Vec::new();
         for job_id in ids {
-            let fetched = get_job(&emulator, case, &domain_id, job_id).await;
+            let fetched = poll_until_terminal(&emulator, case, &domain_id, job_id).await;
             assert_eq!(
                 string_at(&fetched, "jobStatus"),
                 "SUCCEEDED",
@@ -244,11 +245,15 @@ async fn a_completed_job_reports_its_output_under_the_configured_path() {
                 "case {case:?}: a terminal job must read the same every time, got {again}"
             );
 
-            // Nothing is said about the status of a job that did what it was asked.
+            // Nothing answered the output write in this assembly — it mounts no object
+            // store — so the delivery the job's completion owes is still owed and there is
+            // nothing to report about its status. The suite that DOES mount one
+            // (`patient_insights_job_output_delivery`) is where the stored object and the
+            // detail a made delivery states are asserted.
             assert!(
                 fetched.get("statusDetails").is_none(),
-                "case {case:?}: a job that ran to completion has no status detail, \
-                 got {fetched}"
+                "case {case:?}: a job whose output write nothing answered has no status \
+                 detail, got {fetched}"
             );
             if room {
                 assert!(

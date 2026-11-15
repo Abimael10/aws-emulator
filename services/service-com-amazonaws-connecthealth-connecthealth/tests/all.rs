@@ -53,6 +53,8 @@ mod pagination_token_issuance;
 mod pagination_token_spelling;
 #[path = "all/patient_insights_job_lifecycle.rs"]
 mod patient_insights_job_lifecycle;
+#[path = "all/patient_insights_job_output_delivery.rs"]
+mod patient_insights_job_output_delivery;
 #[path = "all/patient_insights_job_terminal_output.rs"]
 mod patient_insights_job_terminal_output;
 #[path = "all/patient_insights_output_uri_character_bound.rs"]

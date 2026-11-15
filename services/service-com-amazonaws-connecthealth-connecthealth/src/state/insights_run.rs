@@ -1,0 +1,656 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! What a patient insights job's RUN does OUTSIDE this service: it resolves the patient
+//! the request names against the FHIR server the request names, and it writes the
+//! insights document the finished job reports into the object store the request
+//! configured.
+//!
+//! # Why a job reaches outside at all
+//!
+//! `StartPatientInsightsJob` takes `inputDataConfig.fhirServer.fhirEndpoint` — "FHIR
+//! server endpoint URL for accessing patient data" — and
+//! `patientContext.patientId`, "unique identifier of the patient"
+//! (`smithy_query(query="shape",shape="FHIRServer,PatientInsightsPatientContext",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`).
+//! The patient data a job runs on is therefore held by THAT server, not by this service,
+//! and a job for a patient the server does not hold has no input: RECORDED behaviour is
+//! that such a submission is refused synchronously, with the fixed sentence
+//! [`PATIENT_NOT_IN_DATASTORE_MESSAGE`], and that the refusal registers nothing — a
+//! second attempt against the same unseeded id is refused identically.
+//!
+//! `outputDataConfig.s3OutputPath` is "S3 URI where the insights output will be stored",
+//! and `GetPatientInsightsJob` reports `insightsOutput.uri` once the job has run. So the
+//! completion of a job is not the status field alone: RECORDED behaviour is that the
+//! object at that URI EXISTS once the job reports the terminal success status. The job's
+//! completion therefore leaves a DELIVERY due ([`InsightsDelivery`]), which the job's own
+//! reader makes before it reports ([`deliver_job_output`]) — so the read that finds the
+//! delivery owed writes the object before it answers, and a delivery the object store
+//! REFUSES takes the job to the modelled failure status instead. The guarantee is that
+//! reader's: a SECOND read arriving while the first still holds the claim is answered the
+//! terminal status the clock already applied, whose object the holder of the claim is in
+//! the middle of writing. One read of a job polled to completion therefore finds its
+//! object; two concurrent reads of the same instant may not.
+//!
+//! What that object CARRIES is bounded by what this emulator can establish. The insights
+//! themselves are the product of a clinical summarisation model, and this emulator runs
+//! none, so the document carries the members this service derives — which patient the job
+//! ran for and which kind of summary was asked for — and its one narrative STATES that no
+//! insights were generated ([`INSIGHTS_NOT_GENERATED_NARRATIVE`]), which the job also
+//! reports in `statusDetails`. Nothing here composes prose that would read like a summary
+//! no model wrote.
+//!
+//! # How it reaches them
+//!
+//! Both hops are the in-process callback into this same emulator
+//! ([`smithy_server_runtime::OperationContext::callback`]): no socket is opened, no name
+//! is resolved and nothing outside this process is reachable. The FHIR read is addressed
+//! to THIS emulator's own base URL ([`smithy_server_runtime::OperationContext::endpoint`])
+//! followed by the PATH of the endpoint the request named — a caller-supplied authority is
+//! never dialled and never selects what answers — and it is signed for the data store
+//! service that serves a FHIR endpoint here, through the workspace's one in-process signer
+//! ([`service_common::in_process_sigv4`]). The object write goes through the workspace's
+//! one Amazon S3 client construction ([`service_common::s3_client`]).
+//!
+//! # What an answer establishes
+//!
+//! Only what the server ANSWERED. A FHIR server that answers that it holds no such
+//! patient is a refusal of the submission; a server that answers nothing at all — no FHIR
+//! endpoint is mounted in this assembly, or the endpoint the request named is not one this
+//! emulator serves — establishes NOTHING about the patient, so the submission is accepted
+//! rather than refused on a question nobody answered. The same reading applies to the
+//! write ([`service_common::s3_object_read`] states it for reads): an object store that
+//! ANSWERS a refusal is a job that could not store its work product, and a call nothing
+//! answered leaves the transition the clock owed standing.
+
+use std::time::{Duration, Instant};
+
+use smithy_server_runtime::{EmbeddedEmulator, OperationContext};
+
+use super::{
+    service_state, ComAmazonawsConnecthealthConnecthealthState, JobStatus, PatientInsightsJob,
+};
+
+/// The FHIR resource type a patient is held as, which is the type a patient id is
+/// resolved against (FHIR R4 `Patient`).
+const PATIENT_RESOURCE_TYPE: &str = "Patient";
+
+/// The FHIR search parameter a patient's business identifier is searched by (FHIR R4
+/// `Patient.identifier`), used when the id the request carried is not the resource's own
+/// logical id.
+const IDENTIFIER_SEARCH_PARAMETER: &str = "identifier";
+
+/// The SigV4 signing name of the service that serves a FHIR data store endpoint in this
+/// emulator — the service whose own API hands a client the endpoint a request then names
+/// here. The call is signed for it because the emulator verifies every request signature.
+const FHIR_SIGNING_NAME: &str = "healthlake";
+
+/// The media type a FHIR JSON representation travels as (FHIR R4 §2.2 "Content Types"),
+/// which is what a FHIR server answers and what a FHIR client asks for.
+const FHIR_JSON_CONTENT_TYPE: &str = "application/fhir+json";
+
+/// The member a FHIR resource names its own type in, which is how an answer is told apart
+/// from a response something other than a FHIR server wrote.
+const FHIR_RESOURCE_TYPE_MEMBER: &str = "resourceType";
+
+/// The FHIR resource a search answers with (FHIR R4 §3.1.1: a `searchset` Bundle).
+const FHIR_BUNDLE: &str = "Bundle";
+
+/// The FHIR resource a failure is stated as (FHIR R4 §2.4 `OperationOutcome`).
+const FHIR_OPERATION_OUTCOME: &str = "OperationOutcome";
+
+/// The member a `searchset` Bundle states its number of matches in (FHIR R4
+/// `Bundle.total`).
+const FHIR_BUNDLE_TOTAL_MEMBER: &str = "total";
+
+/// The sentence a submission naming a patient the FHIR server does not hold is refused
+/// with.
+///
+/// RECORDED behaviour: the WHOLE sentence is fixed — nothing of the request is
+/// interpolated, which also keeps the `@sensitive` `patientId` out of the response
+/// answering it.
+pub const PATIENT_NOT_IN_DATASTORE_MESSAGE: &str = "Patient could not be found in datastore.";
+
+/// The sentence a submission naming a FHIR endpoint that resolves to no data store is
+/// refused with.
+///
+/// RECORDED behaviour, and the sibling of [`PATIENT_NOT_IN_DATASTORE_MESSAGE`]: the
+/// endpoint member must name a data store that exists, and one that does not is refused
+/// with this fixed text rather than with a statement about the patient, which nothing
+/// could have been resolved against.
+pub const DATASTORE_NOT_FOUND_MESSAGE: &str = "HealthLake datastore not found";
+
+/// The most bytes of a FHIR answer this service reads.
+///
+/// The answer comes from another service of this emulator rather than from a caller, but
+/// it is still a body this process buffers, so the read is bounded: a Patient resource and
+/// a one-page search Bundle are orders of magnitude smaller.
+const MAX_FHIR_ANSWER_BYTES: usize = 1 << 20;
+
+/// How many matches the identifier search asks for: enough to establish that the data
+/// store holds the patient, which is the only question asked of it.
+const PATIENT_SEARCH_PAGE_SIZE: u32 = 1;
+
+/// How long a CLAIMED delivery may be outstanding before another read may claim it again.
+///
+/// CHOSEN, and a liveness bound rather than a timeout on the work: the claim is made under
+/// the state lock and reported back by the claimant, so a claimant that never reports back
+/// — the read it was made on was dropped — would otherwise leave the job short of its
+/// terminal status forever. It is measured on the MONOTONIC clock the claim is stamped
+/// with, so a reclaim cannot race a claimant that is still working, not even across a
+/// wall-clock jump.
+const DELIVERY_RECLAIM_AFTER: Duration = Duration::from_secs(10);
+
+/// What a patient insights job's output delivery still owes, and where it goes.
+///
+/// Derived once, when the job is accepted, from the output location the request configured
+/// and the job's own id, so the object lands at exactly the key `insightsOutput.uri`
+/// reports.
+#[derive(Debug, Clone)]
+pub struct InsightsDelivery {
+    /// The Region the object store is addressed in: the Region the start was signed for.
+    pub region: String,
+    /// The bucket the summary object is written into.
+    pub bucket: String,
+    /// The key it is written at — the key the reported `insightsOutput.uri` names.
+    pub key: String,
+    /// How far this delivery has got.
+    pub state: DeliveryState,
+}
+
+/// How far one job's output delivery has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryState {
+    /// Nothing has been written yet, and no caller holds the work.
+    Owed,
+    /// A caller claimed the work at this (monotonic) instant and has not reported back.
+    InFlight(Instant),
+    /// The delivery was made, successfully or not; the job's terminal status states which.
+    Done,
+}
+
+/// What asking the FHIR server about a patient established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatientResolution {
+    /// The server holds the patient.
+    Held,
+    /// The server answered that it holds no such patient.
+    Absent,
+    /// The server answered that the endpoint resolves to no data store at all.
+    NoDatastore,
+    /// Nothing answered: the endpoint the request named is not one this emulator serves,
+    /// or no FHIR server is mounted to ask. Nothing is established about the patient.
+    Unanswered,
+}
+
+/// Resolve `patient_id` against the FHIR server `fhir_endpoint` names, through this
+/// emulator's own in-process transport.
+///
+/// Two FHIR interactions, in the order a client resolves a patient by an id that may be
+/// either kind of identifier: the `read` of `Patient/{id}` (the id as the resource's own
+/// logical id), and, when that holds nothing, the type-level `search` on
+/// `Patient?identifier=` (the id as the patient's business identifier). A `search` that
+/// the server answers at all is also what tells an endpoint resolving to no data store
+/// from one whose data store simply holds no such patient.
+pub async fn resolve_patient(
+    ctx: &OperationContext<'_>,
+    region: &str,
+    fhir_endpoint: &str,
+    patient_id: &str,
+) -> PatientResolution {
+    let Some(base) = fhir_base(ctx, fhir_endpoint) else {
+        return PatientResolution::Unanswered;
+    };
+    let read = fhir_get(
+        ctx,
+        region,
+        &format!("{base}{PATIENT_RESOURCE_TYPE}/{}", uri_component(patient_id)),
+    )
+    .await;
+    match read {
+        FhirAnswer::Served(_) => return PatientResolution::Held,
+        FhirAnswer::Unanswered => return PatientResolution::Unanswered,
+        // A FHIR failure is not the end of the question: the id may be the patient's
+        // business identifier rather than the resource's logical id, which is the search
+        // below, and the same search is what distinguishes an absent data store.
+        FhirAnswer::Refused(_) => {}
+    }
+    let searched = fhir_get(
+        ctx,
+        region,
+        &format!(
+            "{base}{PATIENT_RESOURCE_TYPE}?{IDENTIFIER_SEARCH_PARAMETER}={}&_count={PATIENT_SEARCH_PAGE_SIZE}",
+            uri_component(patient_id)
+        ),
+    )
+    .await;
+    match searched {
+        FhirAnswer::Served(bundle) => match holds_a_match(&bundle) {
+            true => PatientResolution::Held,
+            false => PatientResolution::Absent,
+        },
+        // A type-level search is an interaction every FHIR server serves, so the server
+        // answering it with NOT FOUND is about the path it was sent to rather than about
+        // the search: the endpoint names no data store. Any OTHER failure of the search —
+        // a parameter the server does not support, a refusal to answer it, a fault — says
+        // nothing about whether the data store exists OR whether it holds the patient, so
+        // it establishes nothing and the submission is accepted.
+        FhirAnswer::Refused(status) if status == FHIR_NOT_FOUND_STATUS => {
+            PatientResolution::NoDatastore
+        }
+        FhirAnswer::Refused(_) | FhirAnswer::Unanswered => PatientResolution::Unanswered,
+    }
+}
+
+/// What ONE FHIR interaction answered.
+enum FhirAnswer {
+    /// A FHIR server served a FHIR resource, and this is it.
+    Served(::serde_json::Value),
+    /// A FHIR server stated a failure (an `OperationOutcome`), with the status it carried:
+    /// what that failure MEANS is the status's, so the reader of an answer keeps it.
+    Refused(u16),
+    /// Nothing that speaks FHIR answered at all.
+    Unanswered,
+}
+
+/// The status a FHIR server answers for a path or a resource it holds nothing at (FHIR R4
+/// §3.1.0.3: `404 Not Found` for "unknown resource"), which is the one failure of a
+/// type-level search that is about the ENDPOINT rather than about the search.
+const FHIR_NOT_FOUND_STATUS: u16 = 404;
+
+/// The base URL one FHIR interaction is addressed at: THIS emulator's own base, followed
+/// by the PATH of the endpoint the request named, ending in exactly one separator.
+///
+/// The authority a caller supplied is deliberately dropped: the hop is in-process, so what
+/// answers is decided by this emulator's routing and never by a host in the request, and
+/// nothing can be dialled. `None` for a member that is not a URL at all.
+fn fhir_base(ctx: &OperationContext<'_>, fhir_endpoint: &str) -> Option<String> {
+    let endpoint = ::url::Url::parse(fhir_endpoint.trim()).ok()?;
+    let path = endpoint.path().trim_end_matches('/').to_string();
+    let here = ctx.endpoint();
+    Some(format!("{}{path}/", here.as_str().trim_end_matches('/')))
+}
+
+/// Send one signed FHIR `GET` to `url` over the in-process callback and read what it
+/// answered.
+async fn fhir_get(ctx: &OperationContext<'_>, region: &str, url: &str) -> FhirAnswer {
+    use ::aws_smithy_runtime_api::client::http::HttpConnector;
+
+    let host = ::url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string));
+    let mut builder = ::http::Request::builder()
+        .method("GET")
+        .uri(url)
+        .header("accept", FHIR_JSON_CONTENT_TYPE);
+    if let Some(host) = host.as_deref() {
+        builder = builder.header("host", host);
+    }
+    let Ok(mut request) = builder.body(Vec::new()) else {
+        return FhirAnswer::Unanswered;
+    };
+    // The emulator verifies every request signature, so this call carries one too: the
+    // credential the framework hands this service, signed through the workspace's one
+    // in-process signer, under the signing name a FHIR data store endpoint is served on.
+    if ::service_common::in_process_sigv4::sign_in_process_request(
+        &mut request,
+        FHIR_SIGNING_NAME,
+        region,
+        ctx,
+    )
+    .await
+    .is_err()
+    {
+        return FhirAnswer::Unanswered;
+    }
+    let (parts, body) = request.into_parts();
+    let request = ::http::Request::from_parts(
+        parts,
+        ::aws_smithy_types::body::SdkBody::from(::bytes::Bytes::from(body)),
+    );
+    let Ok(request) = ::aws_smithy_runtime_api::http::Request::try_from(request) else {
+        return FhirAnswer::Unanswered;
+    };
+    let connector = ctx.callback().http_connector();
+    let Ok(answer) = HttpConnector::call(&connector, request).await else {
+        return FhirAnswer::Unanswered;
+    };
+    let status = answer.status().as_u16();
+    let served = answer.status().is_success();
+    let Some(bytes) = answer.body().bytes() else {
+        return FhirAnswer::Unanswered;
+    };
+    if bytes.len() > MAX_FHIR_ANSWER_BYTES {
+        return FhirAnswer::Unanswered;
+    }
+    // A call the front door refused reached no service at all, so it establishes nothing —
+    // told from an addressed service's own answer by the workspace's one reading of that
+    // refusal.
+    if ::service_common::in_process_refusal::is_transport_refusal(bytes) {
+        return FhirAnswer::Unanswered;
+    }
+    let Ok(document) = ::serde_json::from_slice::<::serde_json::Value>(bytes) else {
+        return FhirAnswer::Unanswered;
+    };
+    // Only a FHIR document is an answer about the patient: a body written by anything
+    // other than a FHIR server establishes nothing.
+    let resource_type = document
+        .get(FHIR_RESOURCE_TYPE_MEMBER)
+        .and_then(::serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    match (served, resource_type.as_str()) {
+        (false, FHIR_OPERATION_OUTCOME) => FhirAnswer::Refused(status),
+        (true, PATIENT_RESOURCE_TYPE | FHIR_BUNDLE) => FhirAnswer::Served(document),
+        _ => FhirAnswer::Unanswered,
+    }
+}
+
+/// Whether a `searchset` Bundle reports a match.
+///
+/// `Bundle.total` is "the total number of matches" and `Bundle.entry[]` carries the
+/// matches this page holds, so a Bundle that states no match and carries no entry is the
+/// server saying it holds none.
+fn holds_a_match(bundle: &::serde_json::Value) -> bool {
+    let total = bundle
+        .get(FHIR_BUNDLE_TOTAL_MEMBER)
+        .and_then(::serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let entries = bundle
+        .get("entry")
+        .and_then(::serde_json::Value::as_array)
+        .map(|entries| entries.len())
+        .unwrap_or_default();
+    total > 0 || entries > 0
+}
+
+/// One path segment or query value, percent-encoded so every character a modelled
+/// identifier may carry addresses the resource it names instead of changing the URI it
+/// sits in. The server percent-decodes each segment and each value it reads, so an encoded
+/// value arrives as it was sent.
+fn uri_component(value: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(value, URI_COMPONENT).to_string()
+}
+
+/// The characters that travel as themselves in a path segment or a query value: RFC 3986's
+/// unreserved set. Everything else is escaped, so no value can carry a separator of the
+/// URI it sits in.
+const URI_COMPONENT: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Make the output delivery the job `job_id` under `domain_id` owes, when the clock has
+/// completed it and nobody else holds the work.
+///
+/// Called by the job's own reader before it reports: the delivery was owed from the
+/// instant the job's completion fell due, whether or not anybody polled, and making it
+/// here is what keeps the object in place by the time a read reports the job terminal. A
+/// job that owes no delivery, has had it made, or whose delivery is held by another caller
+/// is left exactly as it was found.
+pub async fn deliver_job_output<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    callback: &EmbeddedEmulator,
+    region: &str,
+    domain_id: &str,
+    job_id: &str,
+) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    // The guard is released before anything is written, so this service's store is never
+    // held across a call into another service's.
+    let claimed = {
+        let mut store = state.lock();
+        claim(&mut store, region, domain_id, job_id)
+    };
+    let Some(claim) = claimed else {
+        return;
+    };
+    let stored = write_summary(callback, &claim).await;
+    let mut store = state.lock();
+    if let Some(job) = store
+        .live_domain_mut(region, domain_id)
+        .and_then(|domain| domain.patient_insights_jobs.get_mut(job_id))
+    {
+        job.settle_delivery(stored);
+    }
+}
+
+/// One claimed delivery: where the object goes and what it carries.
+struct ClaimedDelivery {
+    /// The Region the object store is addressed in.
+    region: String,
+    /// The bucket the object is written into.
+    bucket: String,
+    /// The key it is written at.
+    key: String,
+    /// The summary document's bytes, built from the job's own stored record.
+    document: Vec<u8>,
+}
+
+/// Claim the delivery of the job named, or `None` when it owes none, when it has already
+/// been made, or when another caller holds a claim on it that is not stale.
+///
+/// The claim is the write that makes a delivery exactly once: it moves the job's delivery
+/// to [`DeliveryState::InFlight`] under the state lock, so only one caller is ever handed
+/// the work and a poll in flight is not duplicated by the next one.
+fn claim(
+    store: &mut ComAmazonawsConnecthealthConnecthealthState,
+    region: &str,
+    domain_id: &str,
+    job_id: &str,
+) -> Option<ClaimedDelivery> {
+    let job = store
+        .live_domain_mut(region, domain_id)?
+        .patient_insights_jobs
+        .get_mut(job_id)?;
+    if !job.delivery_is_due() {
+        return None;
+    }
+    let document = summary_document(job);
+    let delivery = job.output_delivery.as_mut()?;
+    delivery.state = DeliveryState::InFlight(Instant::now());
+    Some(ClaimedDelivery {
+        region: delivery.region.clone(),
+        bucket: delivery.bucket.clone(),
+        key: delivery.key.clone(),
+        document,
+    })
+}
+
+/// The media type the summary document is stored with: it is a JSON document, and a client
+/// reads it straight off the location the job reports.
+const SUMMARY_CONTENT_TYPE: &str = "application/json";
+
+/// Write the summary object of one claimed delivery, and report whether the object store
+/// took it.
+///
+/// `Some(true)` when the store took the object, `Some(false)` when it ANSWERED a refusal —
+/// the bucket does not exist, or the write is not permitted — which is a job that could not
+/// store its work product. `None` when nothing answered the write at all: no object store
+/// is mounted in this assembly, so nothing is established and the job keeps the transition
+/// the clock owed it.
+async fn write_summary(callback: &EmbeddedEmulator, claim: &ClaimedDelivery) -> Option<bool> {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let written = ::service_common::s3_client::s3_client(callback, &claim.region)
+        .put_object()
+        .bucket(&claim.bucket)
+        .key(&claim.key)
+        .content_type(SUMMARY_CONTENT_TYPE)
+        .body(::aws_sdk_s3::primitives::ByteStream::from(
+            claim.document.clone(),
+        ))
+        .send()
+        .await;
+    match written {
+        Ok(_) => Some(true),
+        Err(error) => match error.code() {
+            // The store ANSWERED: this job's output could not be stored where it was
+            // configured to go.
+            Some(code) => {
+                ::tracing::warn!(
+                    bucket = %claim.bucket,
+                    code = %code,
+                    "a patient insights job's output was refused by the emulator's Amazon S3"
+                );
+                Some(false)
+            }
+            // Nothing answered the write — the same reading
+            // `service_common::s3_object_read` gives a read nothing answered.
+            None => {
+                ::tracing::warn!(
+                    bucket = %claim.bucket,
+                    "nothing answered a patient insights job's output write: this emulator \
+                     has no Amazon S3 to store it in"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// The `SummaryType` the summary document states for the `insightsType` a job was started
+/// with.
+///
+/// `InsightsType` declares one value, `PRE_VISIT`
+/// (`smithy_query(query="shape",shape="InsightsType",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`),
+/// and the summary document states that kind of summary in the words a reader of the
+/// document sees — RECORDED behaviour: `Pre-visit`. A value the model may add later is
+/// stated as it was asked for rather than silently as a pre-visit summary.
+fn summary_type(insights_type: &str) -> String {
+    match insights_type {
+        "PRE_VISIT" => "Pre-visit".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The document a completed job stores at the location it reports.
+///
+/// What this emulator can establish about a patient insights job is WHICH patient it ran
+/// for, WHICH kind of summary was asked for, and that its output object is where the job
+/// says it is. The INSIGHTS themselves are the product of a clinical summarisation model,
+/// and this emulator runs none: there is no engine here that reads a patient's record and
+/// writes a clinical narrative about it. So the document carries only members this service
+/// DERIVES — `TotalCount` (this job is about the one patient it was started for),
+/// `PatientId` (the id the start resolved) and `SummaryType` (from the modelled
+/// `insightsType`) — and its one narrative STATES that no insights were generated
+/// ([`INSIGHTS_NOT_GENERATED_NARRATIVE`]) rather than composing prose that would read like
+/// a summary nothing produced. The same statement is what the job reports in
+/// `statusDetails`, so a caller polling the job meets it without fetching the object.
+///
+/// The member names are RECORDED: `TotalCount`, `PatientSummaries[].PatientSummary` with
+/// `PatientId`, `SummaryType` and `Sections[].ClinicalNarrative[].Text`.
+fn summary_document(job: &PatientInsightsJob) -> Vec<u8> {
+    let spec = &job.spec;
+    let document = ::serde_json::json!({
+        "TotalCount": 1,
+        "PatientSummaries": [
+            {
+                "PatientSummary": {
+                    "PatientId": spec.patient_context.patient_id,
+                    "SummaryType": summary_type(&spec.insights_context.insights_type),
+                    "Sections": [
+                        {
+                            "SectionName": INSIGHTS_NOT_GENERATED_SECTION,
+                            "ClinicalNarrative": [
+                                { "Text": INSIGHTS_NOT_GENERATED_NARRATIVE }
+                            ],
+                        }
+                    ],
+                }
+            }
+        ],
+    });
+    // A document this service built from values it holds, so it serializes.
+    ::serde_json::to_vec(&document).unwrap_or_default()
+}
+
+/// The section the stored document carries in place of generated insights.
+pub const INSIGHTS_NOT_GENERATED_SECTION: &str = "InsightsNotGenerated";
+
+/// The one narrative the stored document carries: a statement that the insights a real
+/// summarisation model would have written were not generated here.
+///
+/// FIXED text that names nothing of the request and nothing of the patient's record: a
+/// reader of this document is told there is no summary in it, rather than handed prose
+/// assembled from the job's own inputs, which would read like a summary no model produced.
+pub const INSIGHTS_NOT_GENERATED_NARRATIVE: &str =
+    "No clinical narrative was generated: this emulator runs no clinical summarisation \
+     model, so a patient insights job stores the identity of its summary and no insights \
+     content.";
+
+/// What a job that stored its output reports about its status: the same statement its
+/// stored document carries, so a caller that polls the job learns the generation gap
+/// without fetching the object.
+///
+/// `statusDetails` is "information about the status of a job" and targets `NonEmptyString`
+/// (`smithy_query(query="operation",operation="GetPatientInsightsJob",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`),
+/// so the text is this service's own and names nothing read off the request.
+pub const INSIGHTS_NOT_GENERATED_DETAIL: &str = INSIGHTS_NOT_GENERATED_NARRATIVE;
+
+impl PatientInsightsJob {
+    /// Whether this job still owes the delivery its completion makes.
+    ///
+    /// A job owes it from the instant the clock completed it — the terminal transition is
+    /// what leaves the delivery due — until the delivery has been made. One another caller
+    /// claimed is not due either, until that claim is stale ([`DELIVERY_RECLAIM_AFTER`]),
+    /// which is how a claimant that never reported back leaves the object deliverable
+    /// instead of never written.
+    pub(super) fn delivery_is_due(&self) -> bool {
+        self.status == JobStatus::Succeeded
+            && self
+                .output_delivery
+                .as_ref()
+                .is_some_and(|delivery| match delivery.state {
+                    DeliveryState::Owed => true,
+                    DeliveryState::InFlight(claimed_at) => {
+                        claimed_at.elapsed() >= DELIVERY_RECLAIM_AFTER
+                    }
+                    DeliveryState::Done => false,
+                })
+    }
+
+    /// Record what this delivery established about the job's output object.
+    ///
+    /// A delivery whose object the store TOOK is MADE: the object is now where the job says
+    /// it is, the terminal success status the clock already applied stands, and
+    /// `statusDetails` states what that object does not carry
+    /// ([`INSIGHTS_NOT_GENERATED_DETAIL`]), so a caller polling the job learns that this
+    /// emulator generated no insights without fetching it. One the store REFUSED makes the
+    /// job `FAILED` and clears the output location: a job whose output object is not where
+    /// it would report it did not succeed.
+    ///
+    /// One NOTHING answered establishes nothing about the write, so it is left OWED rather
+    /// than marked made: the next read of this job makes it, which is what keeps the object
+    /// in place for an assembly where an object store is mounted later.
+    ///
+    /// The last-changed instant is NOT moved: it is the instant the job's transition fell
+    /// due, so the record reads the same however late the read that made the delivery came.
+    pub(super) fn settle_delivery(&mut self, stored: Option<bool>) {
+        let Some(stored) = stored else {
+            if let Some(delivery) = self.output_delivery.as_mut() {
+                delivery.state = DeliveryState::Owed;
+            }
+            return;
+        };
+        if let Some(delivery) = self.output_delivery.as_mut() {
+            delivery.state = DeliveryState::Done;
+        }
+        if stored {
+            self.status_details = Some(INSIGHTS_NOT_GENERATED_DETAIL.to_string());
+            return;
+        }
+        self.status = JobStatus::Failed;
+        self.status_details = Some(OUTPUT_NOT_STORED_DETAIL.to_string());
+        self.insights_output = None;
+    }
+}
+
+/// What a job whose output could not be stored reports about its status.
+///
+/// `statusDetails` is "information about the status of a job" and targets `NonEmptyString`
+/// (`smithy_query(query="operation",operation="GetPatientInsightsJob",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`),
+/// so the text is this service's own; it names nothing read off the request.
+pub const OUTPUT_NOT_STORED_DETAIL: &str =
+    "The insights output could not be written to the configured output location.";
