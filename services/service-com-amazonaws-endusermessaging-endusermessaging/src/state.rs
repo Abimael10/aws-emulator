@@ -5,6 +5,10 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The one-time passcode verifications the send/validate pair owns.
+mod verifications;
+pub use verifications::*;
+
 /// The service's own ARN namespace / sigv4 signing name, as the Smithy model's
 /// `aws.api#service` trait declares it (`arnNamespace`/`endpointPrefix`
 /// `end-user-messaging`).
@@ -123,6 +127,11 @@ pub struct ComAmazonawsEndusermessagingEndusermessagingState {
     /// `BTreeMap` so `ListNotifyCodeConfigurations` pages in a stable, resumable
     /// order. Bounded by [`MAX_NOTIFY_CODE_CONFIGURATIONS`].
     pub notify_code_configurations: BTreeMap<String, NotifyCodeConfigurationRecord>,
+    /// Every one-time passcode verification in flight, keyed by
+    /// `verificationId`. A `BTreeMap` so a scan over the verifications of one
+    /// recipient is in a stable order. Bounded by [`MAX_VERIFICATIONS`], and
+    /// pruned of elapsed validity windows by [`Self::expire_verifications`].
+    pub verifications: BTreeMap<String, Verification>,
     /// `CreateBrandProfile` idempotency: `clientToken` -> `brandProfileId`.
     /// Bounded by [`MAX_CREATE_TOKENS`]; write it through
     /// [`Self::record_create_token`], never directly.

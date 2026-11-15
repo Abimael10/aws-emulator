@@ -17,5 +17,7 @@ mod brand_profile_lifecycle;
 mod brand_profile_refusal_bodies;
 #[path = "all/notify_code_configuration_lifecycle.rs"]
 mod notify_code_configuration_lifecycle;
+#[path = "all/notify_code_verification_lifecycle.rs"]
+mod notify_code_verification_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

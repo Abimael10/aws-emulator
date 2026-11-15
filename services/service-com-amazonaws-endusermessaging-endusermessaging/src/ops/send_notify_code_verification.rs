@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendNotifyCodeVerification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendNotifyCodeVerification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendNotifyCodeVerification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: generates a one-time passcode under the resolved passcode policy
+//! and persists the verification that `ValidateNotifyCodeVerification` decides on.
+//! The verification records live in [`crate::state`]; this is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +184,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendNotifyCodeVerification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendNotifyCodeVerificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendNotifyCodeVerification"))
+        // Nothing this operation reports is addressed by region, so the request
+        // metadata is not read; the store comes from the engine held on `self`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SendNotifyCodeVerificationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise the expiries the clock already made due, so the ceiling below
+        // counts only passcodes still inside their validity window.
+        store.expire_verifications(now);
+
+        // `notifyCodeConfiguration` takes an id or an ARN; a value that names no
+        // stored configuration is this operation's `ResourceNotFoundException`.
+        let configuration_id = match input.notify_code_configuration.as_deref() {
+            None => None,
+            Some(id_or_arn) => {
+                let Some(id) = store
+                    .resolve_notify_code_configuration_id(id_or_arn)
+                    .map(str::to_string)
+                else {
+                    return Err(
+                        SendNotifyCodeVerificationErrorModeled::ResourceNotFoundException(
+                            crate::state::notify_code_configuration_not_found(id_or_arn),
+                        )
+                        .into(),
+                    );
+                };
+                Some(id)
+            }
+        };
+
+        // `notifyCodeConfiguration` documents the one combination of members that
+        // cannot hold together: with no configuration to take the template and the
+        // channel parameters from, the request has to supply them itself.
+        if configuration_id.is_none() && input.override_channel_parameters.is_none() {
+            return Err(SendNotifyCodeVerificationErrorModeled::ValidationException(
+                ValidationException {
+                    message: "A request that does not specify notifyCodeConfiguration must \
+                              supply overrideChannelParameters."
+                        .to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "overrideChannelParameters".to_string(),
+                        message: "Member must not be null when notifyCodeConfiguration is \
+                                  not specified."
+                            .to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: once it is full of live verifications a further send
+        // is refused with this operation's `ServiceQuotaExceededException` rather
+        // than growing the emulator's heap. A send that supersedes the passcode
+        // already in flight for the same recipient and `referenceId` replaces one
+        // record with another, so it does not grow the store and is not refused.
+        let supersedes = store
+            .verification_in_flight(&input.destination_identity, input.reference_id.as_deref())
+            .is_some();
+        if !supersedes && store.verifications.len() >= crate::state::MAX_VERIFICATIONS {
+            return Err(
+                SendNotifyCodeVerificationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The maximum number of verifications in progress ({}) has already been reached.",
+                            crate::state::MAX_VERIFICATIONS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The policy is captured HERE — the request's overrides over the referenced
+        // configuration's parameters over this service's defaults — and stored on the
+        // verification, so a later update to the configuration does not reach a
+        // verification already in progress.
+        let configured = configuration_id
+            .as_deref()
+            .and_then(|id| store.notify_code_configurations.get(id))
+            .and_then(|record| record.code_configuration_parameters.clone());
+        let policy = crate::state::CodePolicy::resolve(
+            input.override_code_configuration_parameters.as_ref(),
+            configured.as_ref(),
+        );
+
+        let code = policy.draw_code();
+        let expires_at = policy.expires_at(now);
+        let id = store.mint_verification_id();
+        let message_id = store.mint_message_id();
+        store.record_verification(crate::state::Verification {
+            id: id.clone(),
+            message_id: message_id.clone(),
+            destination_identity: input.destination_identity,
+            reference_id: input.reference_id,
+            code,
+            channel: input.channel,
+            origination_identity: input.origination_identity,
+            notify_code_configuration_id: configuration_id,
+            configuration_set_name: input.configuration_set_name,
+            context: input.context.unwrap_or_default().into_iter().collect(),
+            policy,
+            created_at: now,
+            expires_at,
+            attempts: 0,
+        });
+
+        Ok(SendNotifyCodeVerificationOutput {
+            verification_id: id,
+            message_id,
+        })
     }
 }

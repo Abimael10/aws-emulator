@@ -24,6 +24,9 @@ tracing = { workspace = true }
 # Opaque pagination tokens: hex-encodes the continuation key so the token stays
 # inside `NextToken`'s modelled pattern whatever a resource id contains.
 hex = { workspace = true }
+# Draws the characters of a one-time passcode uniformly from the character set the
+# resolved code type names.
+rand = "0.9"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
