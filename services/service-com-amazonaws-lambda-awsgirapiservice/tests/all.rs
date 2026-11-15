@@ -624,7 +624,7 @@ mod invocation_logs;
 // `invocation_run_capacity`, `layer_region_scope` and `update_window_outlasts_its_call` are
 // NOT re-declared here: each is already declared in the sorted span above, and a second
 // `mod` for one file is a redefinition (and `clippy::duplicate_mod`) that stops this target
-// compiling. Check a suite is not already declared before appending it to this tail.
+// compiling. Check a suite is not declared already before declaring it below.
 #[path = "all/handler_eventbridge_publication.rs"]
 mod handler_eventbridge_publication;
 #[path = "all/sqs_event_source_record_attributes.rs"]
