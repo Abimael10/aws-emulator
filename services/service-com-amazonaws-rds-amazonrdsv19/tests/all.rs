@@ -325,6 +325,8 @@ mod parameter_refusal_codes;
 mod pending_modified_values;
 #[path = "all/postgres_rds_namespace_parameters.rs"]
 mod postgres_rds_namespace_parameters;
+#[path = "all/provisioned_network_snapshot_export.rs"]
+mod provisioned_network_snapshot_export;
 #[path = "all/published_catalog_creates.rs"]
 mod published_catalog_creates;
 #[path = "all/published_parameter_descriptions.rs"]

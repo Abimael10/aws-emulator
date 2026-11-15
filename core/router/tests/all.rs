@@ -2114,3 +2114,15 @@ mod zz_probe_whole_emulator;
 // The lint allowed below is for the suite files this root compiles, whose wrapped header
 // paragraphs are prose rather than doc list items. An inner attribute is legal only before the
 // first item, so it stands here rather than in the list.
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair into the sorted list below. The list
+// holds those pairs and no other line, and NOTHING is appended past the last pair, so two
+// deliberate: an inner doc comment (`//!`) and an inner attribute (`#![...]`) are legal only
+// before the first item, so one that lands past the declarations is `E0753` and compiles no
+// suite of this target — which is what concurrent landings appending notes here kept
+// producing. With none anywhere in the file, no merge of two landings can leave one past the
+// first item; a note about THIS file belongs in `all/appended_notes.rs`,
+// `all/appended_header_notes.rs` or `all/appended_prose.rs`, each declared below like any
+// other suite.
+// fails every suite in this target. `tests/all.rs` is a test-target CRATE ROOT, so a bare
+// `all/every_suite_file_is_declared.rs` pin these rules, for this file and for every service
+// crate's `tests/all.rs`, so check there rather than leaving a note here. What a suite
