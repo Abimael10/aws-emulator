@@ -1403,3 +1403,18 @@ mod zz_probe_whole_emulator;
 // crate's `tests/all.rs`, so check there rather than leaving a note here;
 // `all/appended_header_notes.rs`, `all/appended_notes.rs`, `all/appended_notes_tail.rs` and
 // `all/appended_prose.rs` keep what the notes landings had appended to this file.
+// duplicate, re-word or mistype. What a suite covers belongs in that suite's OWN module
+// header, and a note about THIS file belongs in `all/appended_notes.rs`, declared below like
+// any other file.
+// compiles no suite of this target at all. A suite file no `mod` names is compiled nowhere, a
+// name declared twice is `E0428`, and a suite left at the top level of `tests/` fails the
+// build. This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
+// it, which the layout check refuses: the `#[path]` above each `mod` is what points it into
+// `tests/all/`. The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
+// `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs`,
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` pin all of that
+// rather than restate it.
+// doc list item; the lint is allowed here so a header line is a header line rather than a build
+// failure. An inner attribute, like an inner doc comment, is legal only before the first item,
+// so it stands here rather than in the list.

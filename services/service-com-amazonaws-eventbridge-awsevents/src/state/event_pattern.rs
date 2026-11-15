@@ -16,9 +16,24 @@ use ::serde_json::{Map, Value};
 /// The comparison operators `numeric` admits.
 const NUMERIC_OPERATORS: [&str; 5] = ["=", "<", "<=", ">", ">="];
 
+/// The match type that compares without regard to case, and the one
+/// `prefix` and `suffix` accept nested under themselves to fold their own
+/// comparison.
+const IGNORE_CASE: &str = "equals-ignore-case";
+
+/// The match types that compare one END of a leaf against a string.
+const AFFIX_OPERATORS: [&str; 2] = ["prefix", "suffix"];
+
+/// How a refusal names the affix match types NEGATED by `anything-but`.
+///
+/// Both forms are read there by one reader, so the reason it states names the
+/// PAIR it accepts rather than the form that was written
+/// ([`validate_negated_operator`]).
+const NEGATED_AFFIX: &str = "prefix/suffix";
+
 /// The operators that take a single string and may also appear nested
 /// inside `anything-but`.
-const STRING_OPERATORS: [&str; 4] = ["prefix", "suffix", "equals-ignore-case", "wildcard"];
+const STRING_OPERATORS: [&str; 4] = ["prefix", "suffix", IGNORE_CASE, "wildcard"];
 
 /// How deeply a pattern may nest objects.
 ///
@@ -53,6 +68,31 @@ const EMPTY_OBJECT: &str = "Empty objects are not allowed";
 /// boolean and nothing else; this is the reason EventBridge gives for any
 /// other argument.
 const EXISTS_NOT_BOOLEAN: &str = "exists match pattern must be either true or false.";
+
+/// What the argument of a match type that compares TEXT must be, as the
+/// reason for any other argument states it ([`argument_type_fault`]).
+const A_STRING: &str = "a string";
+
+/// The reason a match type handed an argument of a type it does not take is
+/// refused for: that match type's name, then what its pattern must be.
+///
+/// EventBridge words this refusal for the MATCH TYPE and nothing else — the
+/// reason names no member and no field path, and enumerates no alternative
+/// form, because the location clause the message carries
+/// ([`Refusal::message`]) already points into the submitted pattern at the
+/// argument that is wrong. `exists` is refused in the same shape
+/// ([`EXISTS_NOT_BOOLEAN`]).
+///
+/// The sentences the service itself states are the ones for a match type that
+/// compares TEXT ([`A_STRING`]), for the affix pair `anything-but` negates
+/// ([`NEGATED_AFFIX`]) and for `exists`. The rest — what `cidr`,
+/// `anything-but` and `numeric` require — are this module's own reading of the
+/// same shape, worded for each match type's argument, and the two
+/// `anything-but` ones name the forms it takes because no single type names
+/// them.
+fn argument_type_fault(operator: &str, must_be: &str) -> String {
+    format!("{operator} match pattern must be {must_be}")
+}
 
 /// A `numeric` range whose bounds admit no number at all: the reason
 /// EventBridge gives for it, in the service's own wording.
@@ -131,9 +171,10 @@ const PATTERN_TOO_LONG: &str = "Event pattern is too long.";
 /// What comes back is the WHOLE message of the `InvalidEventPatternException`
 /// a caller answers with: the opening ([`INVALID_PATTERN`]), the reason, and
 /// the source location the reader had reached in the submitted text
-/// ([`Refusal::message`]). A reason the service words for the offending
-/// CONSTRUCT carries that wording and no field path; one this module words
-/// for itself names the field path, so a caller can find what to change.
+/// ([`Refusal::message`]). The reason is worded for the CONSTRUCT at fault —
+/// the match type, or the member as the pattern spells it — and carries no
+/// field path of this module's own making, since the location clause is what
+/// points a caller at the text to change.
 pub fn parse(pattern: &str) -> Result<Map<String, Value>, String> {
     parse_as(pattern, Validator::Compiler)
 }
@@ -317,13 +358,15 @@ enum Read {
     Whole,
 }
 
-/// Where one step of the validation is: the dotted field path the reasons
-/// this module words itself name, and the steps that find the same node in
-/// the submitted text.
+/// Where one step of the validation is: the steps that find this node in the
+/// submitted text.
+///
+/// A node is only ever a POSITION, never a name a reason states: the reasons
+/// this module words name the construct at fault — a match type, or a member
+/// as the pattern spells it — and the location clause the message carries
+/// ([`Refusal::message`]) is what points at the text.
 #[derive(Debug, Clone)]
 struct At {
-    /// The dotted path of event fields this node sits under.
-    field: String,
     /// The steps from the pattern's root to this node.
     steps: Vec<Step>,
 }
@@ -331,32 +374,13 @@ struct At {
 impl At {
     /// The pattern as a whole.
     fn root() -> Self {
-        Self {
-            field: String::new(),
-            steps: Vec::new(),
-        }
+        Self { steps: Vec::new() }
     }
 
-    /// The value of `key`, which names a FIELD of the event: the dotted
-    /// field path grows with it.
-    fn field(&self, key: &str) -> Self {
-        let field = if self.field.is_empty() {
-            key.to_string()
-        } else {
-            format!("{}.{key}", self.field)
-        };
-        Self {
-            field,
-            steps: self.then(Step::Key(key.to_string())),
-        }
-    }
-
-    /// The value of `key` of this node where `key` is NOT a field of the
-    /// event — an operator and its argument — so the field path stays the
-    /// one the operator was found under.
+    /// The value of the member named `key`, whether that member names a field
+    /// of the event or a match type and its argument.
     fn key(&self, key: &str) -> Self {
         Self {
-            field: self.field.clone(),
             steps: self.then(Step::Key(key.to_string())),
         }
     }
@@ -364,7 +388,6 @@ impl At {
     /// The value of the member this node writes at `nth`.
     fn nth_key(&self, nth: usize) -> Self {
         Self {
-            field: self.field.clone(),
             steps: self.then(Step::KeyAt(nth)),
         }
     }
@@ -372,7 +395,6 @@ impl At {
     /// The member of this list at `index`.
     fn index(&self, index: usize) -> Self {
         Self {
-            field: self.field.clone(),
             steps: self.then(Step::Index(index)),
         }
     }
@@ -632,13 +654,12 @@ fn validate_object(
         ));
     }
     for (key, spec) in pattern {
-        let at = at.field(key);
-        let field = at.field.clone();
+        let at = at.key(key);
         if key == "$or" {
             let Some(branches) = spec.as_array() else {
                 return Err(at.refuse(
                     Read::Opening,
-                    format!("\"{field}\" must be an array of patterns"),
+                    format!("\"{key}\" must be an array of patterns"),
                 ));
             };
             if branches.is_empty() {
@@ -659,7 +680,9 @@ fn validate_object(
                     Validator::Compiler => branches
                         .iter()
                         .enumerate()
-                        .try_for_each(|(index, term)| validate_term(term, &at.index(index)))?,
+                        .try_for_each(|(index, term)| {
+                            validate_term(term, key, &at.index(index))
+                        })?,
                 }
                 continue;
             }
@@ -668,7 +691,7 @@ fn validate_object(
                 let Some(object) = branch.as_object() else {
                     return Err(at.refuse(
                         Read::Opening,
-                        format!("every branch of {field} must be a pattern object"),
+                        format!("every branch of \"{key}\" must be a pattern object"),
                     ));
                 };
                 if object.is_empty() {
@@ -684,7 +707,7 @@ fn validate_object(
                     return Err(at.refuse(Read::Whole, EMPTY_ARRAY));
                 }
                 for (index, term) in terms.iter().enumerate() {
-                    validate_term(term, &at.index(index))?;
+                    validate_term(term, key, &at.index(index))?;
                 }
             }
             Value::Object(child) => {
@@ -695,9 +718,7 @@ fn validate_object(
             }
             _ => {
                 // The reader names the MEMBER whose value is neither, as it
-                // is spelled in the pattern — not the dotted field path it
-                // sits under, which is this module's own way of naming a
-                // field and belongs only to the reasons it words itself.
+                // is spelled in the pattern.
                 return Err(at.refuse(
                     Read::Opening,
                     format!("\"{key}\" must be an object or an array"),
@@ -708,13 +729,14 @@ fn validate_object(
     Ok(())
 }
 
-/// One match term: a literal value, or a single-key operator object. `at`
-/// locates the term itself in the submitted text.
+/// One match term: a literal value, or a single-key operator object. `member`
+/// is the member whose term list this term belongs to, as the pattern spells
+/// it, and `at` locates the term itself in the submitted text.
 ///
 /// A term object is a MATCH EXPRESSION, which names one match type: an
 /// object carrying several keys names several ([`ONE_KEY_ONLY`]) and one
 /// carrying none names no match type at all ([`EMPTY_OBJECT`]).
-fn validate_term(term: &Value, at: &At) -> Result<(), Refusal> {
+fn validate_term(term: &Value, member: &str, at: &At) -> Result<(), Refusal> {
     match term {
         Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => Ok(()),
         Value::Object(map) if map.len() == 1 => {
@@ -731,27 +753,24 @@ fn validate_term(term: &Value, at: &At) -> Result<(), Refusal> {
         Value::Object(_) => Err(at.nth_key(1).refuse(Read::Entered, ONE_KEY_ONLY)),
         _ => Err(at.refuse(
             Read::Opening,
-            format!(
-                "\"{}\" admits literal values and single-operator objects only",
-                at.field
-            ),
+            format!("\"{member}\" admits literal values and single-operator objects only"),
         )),
     }
 }
 
 /// The argument an operator takes. `at` locates that ARGUMENT in the
-/// submitted text and carries the field path the reasons this module words
-/// itself name.
+/// submitted text.
+///
+/// A match type handed an argument whose TYPE it does not take is refused
+/// with that match type's own sentence — its name, then what its pattern
+/// must be ([`argument_type_fault`]) — and no field path: the location
+/// clause the message carries ([`Refusal::message`]) is what points at the
+/// argument, and the sentence `exists` is refused with
+/// ([`EXISTS_NOT_BOOLEAN`]) is worded the same way.
 fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Refusal> {
-    let field = at.field.clone();
     // A type the operator does not take is decided from the argument's
     // opening token alone, which is as much of it as the reader had read.
-    let bad = |what: &str| {
-        Err(at.refuse(
-            Read::Opening,
-            format!("{field}: {operator} takes {what}"),
-        ))
-    };
+    let bad = |what: &str| Err(at.refuse(Read::Opening, argument_type_fault(operator, what)));
     match operator {
         "exists" => {
             if argument.is_boolean() {
@@ -760,26 +779,22 @@ fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Re
                 Err(at.refuse(Read::Opening, EXISTS_NOT_BOOLEAN))
             }
         }
+        // These compare a string against a string, so a string is what the
+        // match pattern must be — either written out or nested under the
+        // case-folding match type, whose own argument is a string too.
         "prefix" | "suffix" => match argument {
             Value::String(_) => Ok(()),
-            Value::Object(map) if map.len() == 1 => {
-                let (nested, nested_argument) = map
-                    .iter()
-                    .next()
-                    .expect("a single-entry map has a first entry");
-                if nested == "equals-ignore-case" && nested_argument.is_string() {
-                    Ok(())
-                } else {
-                    bad("a string, or {\"equals-ignore-case\": \"<string>\"}")
-                }
-            }
-            _ => bad("a string, or {\"equals-ignore-case\": \"<string>\"}"),
+            Value::Object(map) if map.len() == 1 => match map.get(IGNORE_CASE) {
+                Some(nested) => validate_operator(IGNORE_CASE, nested, &at.key(IGNORE_CASE)),
+                None => bad(A_STRING),
+            },
+            _ => bad(A_STRING),
         },
         "equals-ignore-case" => {
             if argument.is_string() {
                 Ok(())
             } else {
-                bad("a string")
+                bad(A_STRING)
             }
         }
         // A wildcard value is a string whose `*` stands for any run of
@@ -789,7 +804,7 @@ fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Re
             // read before the refusal.
             Some(text) => wildcard_violation(text)
                 .map_or(Ok(()), |reason| Err(at.refuse(Read::Whole, reason))),
-            None => bad("a string"),
+            None => bad(A_STRING),
         },
         "cidr" => match argument.as_str().map(parse_cidr) {
             Some(Ok(_)) => Ok(()),
@@ -838,10 +853,10 @@ fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Re
                 match nested_argument {
                     Value::Array(arguments) if !arguments.is_empty() => {
                         arguments.iter().enumerate().try_for_each(|(index, one)| {
-                            validate_operator(nested, one, &nested_at.index(index))
+                            validate_negated_operator(nested, one, &nested_at.index(index))
                         })
                     }
-                    one => validate_operator(nested, one, &nested_at),
+                    one => validate_negated_operator(nested, one, &nested_at),
                 }
             }
             _ => bad("a value, a list of values, or one nested string operator"),
@@ -919,6 +934,29 @@ fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Re
             format!("Unrecognized match type {operator}"),
         )),
     }
+}
+
+/// The argument of a string match type NEGATED by `anything-but`.
+///
+/// The two affix match types are read there by ONE reader, which words the
+/// type its argument must have for the pair of forms it accepts rather than
+/// for the one that was written ([`NEGATED_AFFIX`]); every other negated
+/// match type is read as it is anywhere else and states its own sentence.
+///
+/// Only an argument whose own TYPE is wrong is worded for the pair: a nested
+/// match expression is read as it is anywhere else, so what the affix forms
+/// admit nested under them is admitted here too and the reader and the
+/// matcher go on agreeing — and a nested expression naming something else is
+/// refused by the match type that was written, which is the reader that
+/// entered it.
+fn validate_negated_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Refusal> {
+    if AFFIX_OPERATORS.contains(&operator) && !argument.is_string() && !argument.is_object() {
+        return Err(at.refuse(
+            Read::Opening,
+            argument_type_fault(NEGATED_AFFIX, A_STRING),
+        ));
+    }
+    validate_operator(operator, argument, at)
 }
 
 /// A pattern value as the refusal spells it back: a string as its own text,

@@ -252,18 +252,18 @@ fn location_rows() -> Vec<Row> {
         },
         // A mask as wide as the address family: read by the ADDRESS parser, so
         // the reason stands alone (see the table below). Text that is no block
-        // at all is this operator's own argument check, which is placed like
-        // every other one.
+        // at all is this operator's own argument check, worded for the MATCH
+        // TYPE and placed like every other one.
         Row {
             case: "a cidr operand that names no block at all",
             pattern: r#"{"detail": {"ip": [{"cidr": "10.0.0.0/notanumber"}]}}"#,
-            reason: "detail.ip: cidr takes an IPv4 or IPv6 CIDR block",
+            reason: "cidr match pattern must be an IPv4 or IPv6 CIDR block",
             read: r#"{"detail": {"ip": [{"cidr": ""#,
         },
         Row {
             case: "a cidr operand that is not even text",
             pattern: r#"{"detail": {"ip": [{"cidr": 10}]}}"#,
-            reason: "detail.ip: cidr takes an IPv4 or IPv6 CIDR block",
+            reason: "cidr match pattern must be an IPv4 or IPv6 CIDR block",
             read: r#"{"detail": {"ip": [{"cidr": 10"#,
         },
         // Two wildcard characters in a row, read out of the value's text.
