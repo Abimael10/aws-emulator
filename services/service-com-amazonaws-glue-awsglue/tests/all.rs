@@ -73,6 +73,8 @@ mod catalog_resources;
 mod catalog_structure;
 #[path = "all/catalogs.rs"]
 mod catalogs;
+#[path = "all/cfn_deployed_job_state_rule_to_sqs.rs"]
+mod cfn_deployed_job_state_rule_to_sqs;
 #[path = "all/classifiers.rs"]
 mod classifiers;
 #[path = "all/column_statistics_computation.rs"]

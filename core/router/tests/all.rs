@@ -1,5 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: the declaration list, and nothing else.
+//
+// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
+// suite file under `tests/all/`, sorted by name, and no other line. Put a new suite at
+// `tests/all/<name>.rs` and insert its pair in order; what a suite covers, and why it drives
+// the assembled router rather than one service crate, belongs in that suite's own module
+// header, where it is read beside the test it explains.
+// EVERY comment in this file is an ordinary `//` one, this header included, and that is
+// deliberate: an inner doc comment (`//!`) is legal only before the first item, so one that
+// lands past the declarations is `E0753` and compiles no suite of this target. With no inner
+// doc comment anywhere, no merge of two landings can put one past the first item.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of
+// this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` is what points
+// each declaration into `tests/all/`. A suite no `mod` here names is compiled nowhere and its
+// tests never run, and a suite declared twice is `E0428` — either fails this whole target.
+// `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs`,
+// `all/declaration_roots_are_canonical_and_complete.rs` and
+// `all/every_suite_file_is_declared.rs` pin those rules, so check there rather than leaving a
+// note here; `all/appended_notes.rs` records what the notes landings had appended to this file
+// said.
 // Single integration-test target for the router: below this header the file holds one
 // `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite, sorted by name, and no other
 // line. Add a suite by putting it at `tests/all/<name>.rs` and inserting its pair into the

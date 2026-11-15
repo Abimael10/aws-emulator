@@ -129,6 +129,16 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # it which permissions the caller holds. It depends on this crate (a grant names a Data
 # Catalog resource), so it is a dev-dependency here and never a dependency.
 service-com-amazonaws-lakeformation-awslakeformation = { workspace = true }
+# CloudFormation, mounted beside Glue on one engine in the suite that deploys a whole job-run
+# event pipeline from ONE template (`tests/all/cfn_deployed_job_state_rule_to_sqs.rs`): the
+# stack creates the bucket, the role, the job, the queues, the queue policies and the rule
+# through each owning service's own API, so the deployment has to be served here.
+service-com-amazonaws-cloudformation-cloudformation = { workspace = true }
+# The CloudFormation and Amazon SQS clients that suite deploys the stack and reads the
+# delivered envelope with, over the in-process callback into this same emulator (no network
+# client feature is enabled: the transport is the emulator's own).
+aws-sdk-cloudformation = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [lints]
 workspace = true
