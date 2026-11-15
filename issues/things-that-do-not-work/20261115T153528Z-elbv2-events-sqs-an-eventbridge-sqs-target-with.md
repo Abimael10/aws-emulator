@@ -1,0 +1,56 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: elbv2__events__sqs.xsvc-elbv2-1-unpermitted-queue-target-routes-event-to-dead-letter-queue
+Issue-Key: elbv2__events__sqs.xsvc-elbv2-1-unpermitted-queue-target-routes-event-to-dead-letter-queue|run#21|AssertionError|assert attrs.get("ERROR_CODE") == "NO_PERMISSIONS", (
+Issue-Commit: 9a872f07e3e8f69bfc85e32d4f6796006c307340
+
+# elbv2__events__sqs: an EventBridge SQS target with no queue policy dead-letters with ERROR_CODE='NO_RESOURCE' paired with a 403 AccessDenied ERROR_MESSAGE — an incoherent code/message pair that matches neither AWS class
+
+> _Note: this issue was identified against the code base at commit `9a872f07e3e8f69bfc85e32d4f6796006c307340`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+PutTargets
+
+## Description
+One net-new root cause, grounded in one failing check (listed by the suite under `elbv2__events__sqs`).
+
+Cause 1 of 1: when an EventBridge rule target is an SQS queue whose resource policy grants events.amazonaws.com nothing, the dead-letter copy EventBridge writes to the target's DeadLetterConfig queue is stamped with the message attribute ERROR_CODE='NO_RESOURCE' while its sibling ERROR_MESSAGE attribute is a 403 AccessDenied sentence. The two attributes contradict each other and the pair cannot be produced by AWS under either of AWS's two classes. Failing check: elbv2__events__sqs.xsvc-elbv2-1-unpermitted-queue-target-routes-event-to-dead-letter-queue.
+
+AWS: recorded behavior only — EventBridge's dead-letter message attributes are not modelled. Smithy (eventbridge): Target.DeadLetterConfig is documented only as "The DeadLetterConfig that defines the target queue to send dead-letter queue events to"; no shape enumerates ERROR_CODE's values, so the tokens come from recorded behavior. The recording behind this check shows that an SQS target whose queue exists but authorizes events.amazonaws.com for nothing is dead-lettered with ERROR_CODE='NO_PERMISSIONS' — a fixed enumerated token, with nothing in it taken from the request — alongside RULE_ARN and TARGET_ARN naming the rule and the target of the failed delivery (values from state) and a body that is the original event verbatim (same `source` and `detail-type`). The pairing rule AWS follows in every recording of this family is that ERROR_CODE and ERROR_MESSAGE agree: ERROR_CODE='NO_PERMISSIONS' goes with the authorization refusal sentence (HTTP 403, error code AccessDenied), and ERROR_CODE='NO_RESOURCE' goes with SQS's own not-found refusal, 'The specified queue does not exist or you do not have access to it. (Service: AmazonSQS; Status Code: 400; Error Code: AWS.SimpleQueueService.NonExistentQueue; Request ID: <id>; Proxy: null)' — all fixed text with the Request ID the only per-call part.
+
+Emulator: the dead letter arrives on the DLQ with the correct TARGET_ARN and RULE_ARN (both asserted and matched before the failure), but it carries ERROR_CODE='NO_RESOURCE' together with ERROR_MESSAGE='User: events.amazonaws.com is not authorized to perform: sqs:sendmessage on resource: <target queue ARN> because no resource-based policy allows the sqs:sendmessage action (Service: AmazonSQS; Status Code: 403; Error Code: AccessDenied; Request ID: <id>; Proxy: null)'. That message is the authorization-refusal sentence (403 / AccessDenied, with the action token lower-cased to 'sqs:sendmessage'), so the emulator has classified an authorization failure as a missing-resource failure: the code says the queue is not there, the message says the queue is there and refused the principal. Under either of AWS's two classes this pair is wrong — the code must be 'NO_PERMISSIONS' to match the 403 AccessDenied message it emits, or the message must be SQS's 400 AWS.SimpleQueueService.NonExistentQueue sentence to match the 'NO_RESOURCE' code it emits. The check stops on ERROR_CODE, so the emulator's handling of the no-leak assertion on the unpermitted queue and of the post-repair redelivery leg were not reached in this run.
+
+NOTE for the fixer — this is a classifier that has been flipped once already and must not simply be flipped back globally. Two open issues cover the OPPOSITE direction of the same classifier from other checks and do NOT carry this check's replay key: 20261111T033241Z-events-eventbridge-sqs-target-dead-letters-misclassify-an-unauthorized.md and 20261114T222509Z-events-a-cloudformation-deployed-eventbridge-sqs-target-with.md both ask for ERROR_CODE='NO_RESOURCE' with SQS's 400 NonExistentQueue ERROR_MESSAGE for a policy-less SQS target. The emulator today satisfies their ERROR_CODE and not their ERROR_MESSAGE, and fails this check's ERROR_CODE. The defect this issue reports is the incoherent pair, and it is closable without choosing a side only by making ERROR_CODE and ERROR_MESSAGE agree; whichever refusal the SQS SendMessage path is made to return for an unauthorized send must be the one the classifier reads, so a 403 AccessDenied refusal yields NO_PERMISSIONS and a 400 AWS.SimpleQueueService.NonExistentQueue refusal yields NO_RESOURCE and its fixed sentence. This check's scenario differs from the three in those issues in that the event is a CloudTrail-derived 'AWS API Call via CloudTrail' envelope on the default bus (source aws.elasticloadbalancing, eventName CreateTargetGroup) with RetryPolicy MaximumRetryAttempts=0 and a permitted sibling target on the same rule, so if the two directions are genuinely scenario-dependent the discriminator is in those inputs, not in the queue-policy evaluation.
+
+Why: a client that triages, routes, alarms on or re-drives from the EventBridge dead-letter taxonomy is given a class that disagrees with the message in the same envelope. A consumer branching on ERROR_CODE='NO_PERMISSIONS' to point an operator at the missing AWS::SQS::QueuePolicy — the commonest EventBridge→SQS misconfiguration — never fires, while a consumer branching on ERROR_CODE='NO_RESOURCE' to delete a stale target or stop re-driving acts on a queue that in fact exists and is one SetQueueAttributes away from working. Anything that greps ERROR_MESSAGE for SQS's NonExistentQueue sentence to confirm the NO_RESOURCE class finds the opposite sentence.
+
+Fix: EventBridge's target-delivery failure classifier that fills the dead-letter ERROR_CODE/ERROR_MESSAGE message attributes, together with the SQS SendMessage authorization refusal it consumes — the two attributes must be filled from one refusal, so they can never name different classes.
+
+Traces: elbv2__events__sqs.xsvc-elbv2-1-unpermitted-queue-target-routes-event-to-dead-letter-queue.
+
+## Evidence
+elbv2__events__sqs.xsvc-elbv2-1-unpermitted-queue-target-routes-event-to-dead-letter-queue (check line 353):
+  assert attrs.get("ERROR_CODE") == "NO_PERMISSIONS", (
+  AssertionError: DLQ ERROR_CODE: expected 'NO_PERMISSIONS', actual 'NO_RESOURCE' (all: {'TARGET_ARN': 'arn:aws:sqs:us-west-2:<acct>:<noperm queue>', 'RULE_ARN': 'arn:aws:events:us-west-2:<acct>:rule/<rule>', 'ERROR_CODE': 'NO_RESOURCE', 'ERROR_MESSAGE': 'User: events.amazonaws.com is not authorized to perform: sqs:sendmessage on resource: arn:aws:sqs:us-west-2:<acct>:<noperm queue> because no resource-based policy allows the sqs:sendmessage action (Service: AmazonSQS; Status Code: 403; Error Code: AccessDenied; Request ID: <id>; Proxy: null)'})
+
+Expected vs actual, per dead-letter message attribute (ReceiveMessage on the DeadLetterConfig queue with MessageAttributeNames=['All']):
+  expected ERROR_CODE    = "NO_PERMISSIONS"   (fixed enumerated token; nothing in it comes from the request)
+  actual   ERROR_CODE    = "NO_RESOURCE"
+  ERROR_MESSAGE (emulator) = the authorization-refusal sentence: fixed text 'User: events.amazonaws.com is not authorized to perform: sqs:SendMessage on resource: <queue ARN> because no resource-based policy allows the sqs:SendMessage action (Service: AmazonSQS; Status Code: 403; Error Code: AccessDenied; Request ID: <id>; Proxy: null)', with the queue ARN taken from state and the Request ID per-call; the emulator additionally lower-cases the action token to 'sqs:sendmessage' in both places. This 403/AccessDenied sentence is the NO_PERMISSIONS-class message and contradicts the NO_RESOURCE code emitted beside it. The NO_RESOURCE-class message AWS pairs with that code is instead 'The specified queue does not exist or you do not have access to it. (Service: AmazonSQS; Status Code: 400; Error Code: AWS.SimpleQueueService.NonExistentQueue; Request ID: <id>; Proxy: null)'.
+  TARGET_ARN / RULE_ARN: matched (per-run values; the requirement is only that they name the unpermitted target and the rule of the failed delivery).
+
+Everything before the ERROR_CODE attribute matched: the CloudTrail→EventBridge channel was proven live with an unrelated sqs:TagQueue control event, elbv2 CreateTargetGroup was delivered to the rule's PERMITTED sibling target, and a dead-letter copy of the same CreateTargetGroup envelope reached the DeadLetterConfig queue with the correct TARGET_ARN and RULE_ARN.
+
+## Steps to Reproduce
+1. Create a single-region CloudTrail trail logging management events to an S3 bucket and StartLogging; confirm GetTrailStatus IsLogging is true.
+2. CreateQueue three times: a target queue left with NO resource policy, a dead-letter queue, and a permitted sibling queue. SetQueueAttributes a Policy allowing Principal {Service: events.amazonaws.com} sqs:SendMessage (Condition ArnEquals aws:SourceArn = the rule ARN) on the DLQ and on the permitted queue only. Leave the target queue with no policy.
+3. PutRule on the default bus with EventPattern {"source":["aws.elasticloadbalancing"],"detail-type":["AWS API Call via CloudTrail"],"detail":{"eventSource":["elasticloadbalancing.amazonaws.com"],"eventName":["CreateTargetGroup"]}}, State ENABLED.
+4. PutTargets with two targets: {Id:'noperm', Arn: the policy-less queue, DeadLetterConfig {Arn: the DLQ}, RetryPolicy {MaximumRetryAttempts: 0, MaximumEventAgeInSeconds: 60}} and {Id:'permitted', Arn: the permitted queue}. FailedEntryCount must be 0.
+5. Call elbv2 CreateTargetGroup (Protocol HTTP, Port 80, TargetType instance, in a throwaway VPC) to produce the CloudTrail-derived event.
+6. ReceiveMessage on the permitted sibling queue — the CreateTargetGroup envelope arrives (matches today).
+7. ReceiveMessage on the DLQ with MessageAttributeNames=['All'].
+   Expected: one dead letter whose body is the original event (source aws.elasticloadbalancing, detail-type 'AWS API Call via CloudTrail'), with TARGET_ARN = the policy-less queue, RULE_ARN = the rule, ERROR_CODE = 'NO_PERMISSIONS', and an ERROR_MESSAGE in the same class as that code.
+   Emulator: ERROR_CODE = 'NO_RESOURCE' alongside the 403 AccessDenied ERROR_MESSAGE — a code and message naming two different classes.
+8. ReceiveMessage on the policy-less target queue — it must hold nothing.
+9. SetQueueAttributes to grant the target queue events.amazonaws.com sqs:SendMessage for this rule and re-issue CreateTargetGroup — the same queue must now receive the event, proving it existed and was addressed correctly all along and that only the missing permission suppressed delivery.
