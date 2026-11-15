@@ -61,6 +61,8 @@ mod delivery_destination_policies;
 mod delivery_destination_policy_reads;
 #[path = "all/delivery_destination_policy_removal.rs"]
 mod delivery_destination_policy_removal;
+#[path = "all/delivery_destination_policy_round_trip.rs"]
+mod delivery_destination_policy_round_trip;
 #[path = "all/delivery_destinations.rs"]
 mod delivery_destinations;
 #[path = "all/delivery_effective_configuration.rs"]

@@ -2513,3 +2513,10 @@ mod declaration_roots_keep_inner_attributes_ahead_of_the_first_item;
 // the top level of `tests/` fails the build; and a suite declared twice is `E0428`. This file
 // is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it, which the
 // `all/declaration_roots_are_canonical_and_complete.rs` check these rules, for this file and
+// past the declarations compiles no suite of this target. With none anywhere in the file, no
+// merge of two landings can leave one past the first item.
+// nowhere and its tests never run, and a suite declared twice is `E0428` — each fails every
+// suite in this target, which is why five suites pin the shape above rather than restating
+// it here: `all/all_rs_carries_no_inner_doc_comment.rs`,
+// the test it explains; `all/appended_notes.rs` keeps the notes earlier landings had
+// appended here.
