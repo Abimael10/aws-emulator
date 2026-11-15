@@ -7,7 +7,11 @@
 //!
 //! * cancelling a stored deployment moves it to the `CANCELED` terminal status its own
 //!   reader reports, and asking again for a status it already has changes nothing — the
-//!   operation names the end state, not a step; and
+//!   operation names the end state, not a step;
+//! * the cancel moves that deployment's status member and NOTHING else about it, through
+//!   every reader of the one record, whatever the deployment targets, whether it carries a
+//!   name or a parent target, and whichever revision of its target it is; and it moves the
+//!   deployment its id names and no other; and
 //! * a `deploymentId` this service holds no deployment for is refused `404`
 //!   `ResourceNotFoundException` with one fixed sentence that reports no value of the
 //!   request, whichever operation was asked and whatever the id looked like.
@@ -101,6 +105,13 @@ fn error_code(body: &Value) -> String {
 /// An IoT thing ARN, which is what a deployment targets.
 fn thing_target(name: &str) -> String {
     format!("arn:aws:iot:{REGION}:{ACCOUNT}:thing/{name}")
+}
+
+/// An IoT thing-GROUP ARN: the other target form a deployment may name
+/// (`smithy_query(query="shape",shape="TargetARN")`, whose pattern admits `thing/` and
+/// `thinggroup/`).
+fn thing_group_target(name: &str) -> String {
+    format!("arn:aws:iot:{REGION}:{ACCOUNT}:thinggroup/{name}")
 }
 
 /// `CreateDeployment` for `target`; answers the new deployment's id.
@@ -289,6 +300,285 @@ async fn a_deployment_id_naming_nothing_is_refused_the_same_way_everywhere() {
         (200, STATUS_CANCELED),
         "the cancelled deployment must still be readable, got {status} {body}"
     );
+}
+
+/// `CreateDeployment` for a whole request body; answers the new deployment's id.
+///
+/// Beside [`create_deployment`], which deploys to a target and names nothing else: a row
+/// below differs from another in the members its create carries, so the body is the row's.
+async fn create_deployment_from(router: &MultiServiceRouter, request: &Value) -> String {
+    let body = serde_json::to_vec(request).expect("a serializable request body");
+    let (status, created) = call(router, "POST", "/greengrass/v2/deployments", body).await;
+    assert_eq!(
+        status, 201,
+        "CreateDeployment {request} must answer 201, got {status} {created}"
+    );
+    let id = text(&created, "deploymentId");
+    assert!(
+        !id.is_empty(),
+        "CreateDeployment must answer a deployment id, got {created}"
+    );
+    id
+}
+
+/// `ListDeployments` with `query` appended to its path: the other reader of the record a
+/// cancel writes.
+async fn list_deployments(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
+    call(
+        router,
+        "GET",
+        &format!("/greengrass/v2/deployments?{query}"),
+        Vec::new(),
+    )
+    .await
+}
+
+/// An ARN as a client percent-encodes it into a query string.
+fn encoded_arn(arn: &str) -> String {
+    arn.replace(':', "%3A").replace('/', "%2F")
+}
+
+/// The status the listing of `target`'s whole history reports for `deployment_id`, or
+/// `None` when that listing does not report the deployment at all.
+async fn listed_status(
+    router: &MultiServiceRouter,
+    target: &str,
+    deployment_id: &str,
+) -> Option<String> {
+    let query = format!("historyFilter=ALL&targetArn={}", encoded_arn(target));
+    let (status, body) = list_deployments(router, &query).await;
+    assert_eq!(
+        status, 200,
+        "ListDeployments {query:?} must answer 200, got {status} {body}"
+    );
+    body.get("deployments")
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| text(entry, "deploymentId") == deployment_id)
+                .map(|entry| text(entry, "deploymentStatus"))
+        })
+}
+
+/// `GetDeployment` on `deployment_id`, which must be served.
+async fn read_deployment(router: &MultiServiceRouter, case: &str, deployment_id: &str) -> Value {
+    let (status, body) = get_deployment(router, deployment_id).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: GetDeployment {deployment_id:?} must answer 200, got {status} {body}"
+    );
+    assert!(
+        body.is_object(),
+        "case {case}: GetDeployment must answer a JSON object, got {body}"
+    );
+    body
+}
+
+/// `body` with its reported status replaced by `status`: the record a cancel is allowed to
+/// leave behind, which is the record it found with that ONE member moved.
+fn with_status(body: &Value, status: &str) -> Value {
+    let mut moved = body
+        .as_object()
+        .expect("a GetDeployment body is a JSON object")
+        .clone();
+    moved.insert(
+        "deploymentStatus".to_string(),
+        Value::String(status.to_string()),
+    );
+    Value::Object(moved)
+}
+
+/// One deployment to cancel: the request that creates it, how many revisions of its target
+/// precede it, and how many times the cancel is repeated on it.
+struct Row {
+    case: &'static str,
+    request: Value,
+    earlier_revisions: usize,
+    repeats: usize,
+}
+
+/// The rows: every target form and deployment shape a create accepts, each cancelled a
+/// different number of times.
+fn rows() -> Vec<Row> {
+    vec![
+        Row {
+            case: "a thing target, cancelled once",
+            request: json!({ "targetArn": thing_target("CoreAlpha") }),
+            earlier_revisions: 0,
+            repeats: 1,
+        },
+        Row {
+            case: "a thing-group target, cancelled twice",
+            request: json!({ "targetArn": thing_group_target("FleetBeta") }),
+            earlier_revisions: 0,
+            repeats: 2,
+        },
+        Row {
+            case: "a named deployment, cancelled three times",
+            request: json!({
+                "targetArn": thing_target("CoreGamma"),
+                "deploymentName": "nightly-rollout",
+            }),
+            earlier_revisions: 0,
+            repeats: 3,
+        },
+        Row {
+            case: "a subdeployment under a parent thing group",
+            request: json!({
+                "targetArn": thing_target("CoreDelta"),
+                "parentTargetArn": thing_group_target("ParentFleet"),
+            }),
+            earlier_revisions: 0,
+            repeats: 1,
+        },
+        Row {
+            case: "the third revision of a thing group's deployment",
+            request: json!({ "targetArn": thing_group_target("RevisedFleet") }),
+            earlier_revisions: 2,
+            repeats: 2,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn cancelling_is_terminal_and_moves_only_the_status() {
+    let router = emulator();
+
+    // The message every successful cancel communicates: the rule is that the outcome is
+    // reported the same way for every row, so the first row's answer is what the rest are
+    // held to rather than a literal written here.
+    let mut reported_message: Option<String> = None;
+
+    for row in rows() {
+        let target = text(&row.request, "targetArn");
+        for revision in 1..=row.earlier_revisions {
+            let superseded = create_deployment(&router, &target).await;
+            assert!(
+                !superseded.is_empty(),
+                "case {:?}: revision {revision} of {target} must be created",
+                row.case
+            );
+        }
+        let id = create_deployment_from(&router, &row.request).await;
+
+        // Before the cancel: the deployment is being applied.
+        let before = read_deployment(&router, row.case, &id).await;
+        assert_eq!(
+            text(&before, "deploymentStatus"),
+            STATUS_ACTIVE,
+            "case {:?}: a fresh deployment must be {STATUS_ACTIVE}, got {before}",
+            row.case
+        );
+
+        for attempt in 1..=row.repeats {
+            let (status, answer) = cancel(&router, &id).await;
+            assert_eq!(
+                status, 200,
+                "case {:?} cancel attempt {attempt}: expected 200, got {status} {answer}",
+                row.case
+            );
+            let message = text(&answer, "message");
+            assert!(
+                !message.is_empty(),
+                "case {:?} cancel attempt {attempt}: the answer must communicate the \
+                 outcome, got {answer}",
+                row.case
+            );
+            match &reported_message {
+                Some(first) => assert_eq!(
+                    &message, first,
+                    "case {:?} cancel attempt {attempt}: every successful cancel must \
+                     report the outcome the same way ({first:?}), got {message:?}",
+                    row.case
+                ),
+                None => reported_message = Some(message),
+            }
+
+            // The deployment's own reader: the terminal status, and the SAME record
+            // otherwise — the cancel moves one member and invents nothing.
+            let after = read_deployment(&router, row.case, &id).await;
+            assert_eq!(
+                after,
+                with_status(&before, STATUS_CANCELED),
+                "case {:?} cancel attempt {attempt}: expected the stored deployment with \
+                 only its status moved to {STATUS_CANCELED}, got {after}",
+                row.case
+            );
+
+            // The listing reads the same record, so it reports the same status.
+            let listed = listed_status(&router, &target, &id).await;
+            assert_eq!(
+                listed.as_deref(),
+                Some(STATUS_CANCELED),
+                "case {:?} cancel attempt {attempt}: the listing of {target} must report \
+                 the cancelled deployment as {STATUS_CANCELED}, got {listed:?}",
+                row.case
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_moves_the_deployment_its_id_names_and_no_other() {
+    let router = emulator();
+
+    // A fleet of deployments spanning both target forms, with one target carrying two
+    // revisions, so the cancelled deployment has neighbours of every kind around it —
+    // including the superseded revision of another target, which no row cancels.
+    let mut ids: Vec<String> = Vec::new();
+    for target in [
+        thing_target("CoreOne"),
+        thing_group_target("FleetOne"),
+        thing_group_target("FleetTwo"),
+        thing_group_target("FleetTwo"),
+        thing_target("CoreTwo"),
+    ] {
+        ids.push(create_deployment(&router, &target).await);
+    }
+
+    // What every deployment reads back as before any cancel, which is what each one not yet
+    // cancelled must still read back after every row below.
+    let mut before: Vec<(String, Value)> = Vec::new();
+    for id in &ids {
+        before.push((id.clone(), read_deployment(&router, "the fleet", id).await));
+    }
+
+    // One row per deployment that is the latest revision of its target — the deployment a
+    // caller cancels — cancelling one more of them each time.
+    let to_cancel: Vec<String> = before
+        .iter()
+        .filter(|(_, recorded)| recorded.get("isLatestForTarget") == Some(&Value::Bool(true)))
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert!(
+        to_cancel.len() > 1,
+        "the fleet must hold several latest-for-target deployments, got {to_cancel:?}"
+    );
+
+    let mut cancelled: Vec<String> = Vec::new();
+    for id in &to_cancel {
+        let (status, answer) = cancel(&router, id).await;
+        assert_eq!(
+            status, 200,
+            "case cancelling {id:?}: expected 200, got {status} {answer}"
+        );
+        cancelled.push(id.clone());
+
+        for (index, (other, recorded)) in before.iter().enumerate() {
+            let now = read_deployment(&router, "the fleet", other).await;
+            let expected = if cancelled.contains(other) {
+                with_status(recorded, STATUS_CANCELED)
+            } else {
+                recorded.clone()
+            };
+            assert_eq!(
+                now, expected,
+                "case cancelling {id:?}, reading deployment {index}: expected {expected}, \
+                 got {now}"
+            );
+        }
+    }
 }
 
 /// `id` with its last character replaced by a different one, which yields an id of the

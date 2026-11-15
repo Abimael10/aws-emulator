@@ -31,6 +31,8 @@ mod connectivity_info_request_contract;
 mod core_device_data_plane_authorization;
 #[path = "all/core_device_fleet.rs"]
 mod core_device_fleet;
+#[path = "all/deployment_cancel_terminal_status.rs"]
+mod deployment_cancel_terminal_status;
 #[path = "all/deployment_cancellation.rs"]
 mod deployment_cancellation;
 #[path = "all/deployment_history_and_tag_removal.rs"]
