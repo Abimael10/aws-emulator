@@ -28,7 +28,7 @@ const ACCOUNT: &str = "000000000000";
 
 /// The emulator front door with only this service mounted, over ONE shared engine —
 /// exactly how `core/router` assembles it.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -37,7 +37,12 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Dispatch one signed request and return its status and parsed JSON body.
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Vec<u8>) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method(method)
         .uri(format!("https://greengrass.{REGION}.amazonaws.com{path}"))
@@ -63,7 +68,7 @@ async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Vec<u
     (status, value)
 }
 
-async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> (u16, Value) {
     let bytes = serde_json::to_vec(body).expect("a serializable request body");
     call(router, "POST", path, bytes).await
 }
@@ -97,12 +102,12 @@ async fn resolve(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     (status, value)
 }
 
-async fn get(router: &MultiServiceRouter, path: &str) -> (u16, Value) {
+pub(crate) async fn get(router: &MultiServiceRouter, path: &str) -> (u16, Value) {
     call(router, "GET", path, Vec::new()).await
 }
 
 /// Publish one component version from a recipe document.
-async fn publish(router: &MultiServiceRouter, recipe: &str) -> (u16, Value) {
+pub(crate) async fn publish(router: &MultiServiceRouter, recipe: &str) -> (u16, Value) {
     post(
         router,
         "/greengrass/v2/createComponentVersion",
@@ -113,7 +118,7 @@ async fn publish(router: &MultiServiceRouter, recipe: &str) -> (u16, Value) {
 
 /// A minimal YAML recipe for `name`@`version`. The three keys are the ones the IoT
 /// Greengrass component recipe reference requires.
-fn recipe(name: &str, version: &str) -> String {
+pub(crate) fn recipe(name: &str, version: &str) -> String {
     format!(
         "RecipeFormatVersion: '2020-01-25'\nComponentName: {name}\nComponentVersion: {version}\n"
     )
@@ -144,22 +149,22 @@ fn recipe_member(document: &str, key: &str) -> Option<String> {
 }
 
 /// The name-level component ARN this emulator mints for `name`.
-fn component_arn(name: &str) -> String {
+pub(crate) fn component_arn(name: &str) -> String {
     format!("arn:aws:greengrass:{REGION}:{ACCOUNT}:components:{name}")
 }
 
 /// The component-version ARN this emulator mints for `name`@`version`.
-fn version_arn(name: &str, version: &str) -> String {
+pub(crate) fn version_arn(name: &str, version: &str) -> String {
     format!("{}:versions:{version}", component_arn(name))
 }
 
 /// Percent-encode the colons in an ARN, the way an AWS SDK encodes an `@httpLabel`.
-fn label(arn: &str) -> String {
+pub(crate) fn label(arn: &str) -> String {
     arn.replace(':', "%3A")
 }
 
 /// The wire error code of a `restJson1` error body.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -167,7 +172,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// A string member of a JSON object, or the empty string when absent.
-fn text(value: &Value, key: &str) -> String {
+pub(crate) fn text(value: &Value, key: &str) -> String {
     value
         .get(key)
         .and_then(Value::as_str)
@@ -176,7 +181,7 @@ fn text(value: &Value, key: &str) -> String {
 }
 
 /// The array member `key` of a JSON object, or an empty vector when absent.
-fn array(value: &Value, key: &str) -> Vec<Value> {
+pub(crate) fn array(value: &Value, key: &str) -> Vec<Value> {
     value
         .get(key)
         .and_then(Value::as_array)
@@ -186,7 +191,7 @@ fn array(value: &Value, key: &str) -> Vec<Value> {
 
 /// The `componentVersion` of every entry of a `componentVersions` list, in the order the
 /// response carries them.
-fn listed_versions(body: &Value) -> Vec<String> {
+pub(crate) fn listed_versions(body: &Value) -> Vec<String> {
     array(body, "componentVersions")
         .iter()
         .map(|entry| text(entry, "componentVersion"))

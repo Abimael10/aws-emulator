@@ -17,6 +17,8 @@ mod client_device_disassociation;
 mod component_publish_and_deploy;
 #[path = "all/component_state_recipe_and_deployment_reads.rs"]
 mod component_state_recipe_and_deployment_reads;
+#[path = "all/component_version_listing_is_a_pure_report.rs"]
+mod component_version_listing_is_a_pure_report;
 #[path = "all/component_versions_and_resolution.rs"]
 mod component_versions_and_resolution;
 #[path = "all/concurrent_deployment_creates.rs"]

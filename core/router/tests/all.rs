@@ -2183,3 +2183,15 @@ mod zz_probe_whole_emulator;
 // attribute, like an inner doc comment, is legal only ahead of the first item, so the one
 // below stands with this header.
 // explains; a note about this file itself belongs in `all/appended_notes.rs`. The suites
+// This file holds the license line above, this header, and then one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under `tests/all/`, sorted by
+// name, with no other line. Put a new suite at `tests/all/<name>.rs` and insert its pair where
+// its name sorts to: a landing then has one place to insert and no prose to duplicate,
+// EVERY comment here is an ordinary one, this header included, and that is deliberate: an
+// inner doc comment is legal only before the first item, so one appended past the declarations
+// compiles no suite of this target at all. A second pair for one name is `E0428`, and a suite
+// file no pair names is compiled nowhere.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a sibling of this
+// file, which the layout check refuses: the `#[path]` above each `mod` is what points it into
+// `tests/all/`.
+// belongs in that suite's own module header; a note about this file belongs in
