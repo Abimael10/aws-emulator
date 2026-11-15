@@ -887,7 +887,16 @@ fn launch_from_template(
             availability_zone_id: None,
         }),
         security_groups: Some(groups),
-        block_device_mappings: None,
+        // "The block device mapping" (`RequestLaunchTemplateData$BlockDeviceMappings`) a
+        // version carries applies to every launch made from it, so a pool of this template
+        // boots the volume that version describes — read through the one conversion of a
+        // version's entries ([`crate::state::template_block_device_mapping`]).
+        block_device_mappings: data.block_device_mappings.as_ref().map(|mappings| {
+            mappings
+                .iter()
+                .map(crate::state::template_block_device_mapping)
+                .collect()
+        }),
         iam_instance_profile: None,
         network_interfaces: None,
     }

@@ -266,10 +266,15 @@ pub struct LaunchOverrides<'a> {
 /// takes.
 ///
 /// The members this emulator's launch path models are carried onto the instance; the ones it
-/// does not — block device mappings, network interface specifications and an IAM instance
-/// profile — are left off rather than copied onto an instance nothing would apply them to.
-/// Nothing a caller set is lost by that: a fleet that names one of those override members is
-/// refused rather than answered with an instance that does not carry it.
+/// does not — network interface specifications and an IAM instance profile — are left off
+/// rather than copied onto an instance nothing would apply them to. Nothing a caller set is
+/// lost by that: a fleet that names one of those override members is refused rather than
+/// answered with an instance that does not carry it.
+///
+/// "The block device mapping" (`RequestLaunchTemplateData$BlockDeviceMappings`) a version
+/// carries IS applied, read through the one conversion of a version's entries
+/// ([`template_block_device_mapping`]): the placement's root volume is the one that version
+/// describes, exactly as it is for a launch naming the version.
 pub fn launch_from_template_data(
     data: &RequestLaunchTemplateData,
     over: &LaunchOverrides<'_>,
@@ -332,7 +337,15 @@ pub fn launch_from_template_data(
             availability_zone_id: None,
         }),
         security_groups: Some(groups),
-        block_device_mappings: None,
+        // The version's own entries, so the volume a pool's instance boots is the one the
+        // version describes; the root device they resolve to is read where every launch of
+        // this crate reads it ([`ComAmazonawsEc2Amazonec2State::launch_root_block_device`]).
+        block_device_mappings: data.block_device_mappings.as_ref().map(|mappings| {
+            mappings
+                .iter()
+                .map(template_block_device_mapping)
+                .collect()
+        }),
         iam_instance_profile: None,
         network_interfaces: None,
     }
@@ -495,10 +508,17 @@ impl ComAmazonawsEc2Amazonec2State {
             // Hibernation is `InstanceInterruptionBehavior`'s business for a Spot Instance,
             // and a launch specification carries no hibernation member.
             hibernation_configured: false,
-            // A launch specification's block device mappings are refused by the paths that
-            // read one ("`RequestSpotInstances` with a block device mapping"), so no launch
-            // reaching here overrides its AMI's root device.
-            root_block_device: None,
+            // "The block device mapping, which defines the EBS volumes and instance store
+            // volumes to attach to the instance at launch": the root device this launch
+            // creates its volume from is the AMI's own with the specification's entry for
+            // that device overlaid, read through the ONE resolution of it.
+            root_block_device: self
+                .launch_root_block_device(
+                    launch.image_id.as_deref(),
+                    launch.block_device_mappings.as_deref().unwrap_or_default(),
+                    spec.region,
+                )
+                .map(|(_, ebs)| ebs),
             disable_api_termination: false,
             tags: spec.tags,
             client_token: None,

@@ -350,7 +350,11 @@ pub struct SpotInstanceRequestRecord {
 /// that launch's own charge: the instance carries no caller-chosen member its request does
 /// not — and the one member it can hold that the request did not name, the zone the service
 /// picks when the request named none, is a name out of the Region's own zone set rather
-/// than anything a caller sized.
+/// than anything a caller sized. The block device mappings the specification carries are
+/// charged here too, every caller-chosen string on each of them
+/// ([`super::block_device_mapping_bytes`]): the record RETAINS the mappings, and the instance a
+/// fulfillment launches retains the root block device they resolve to
+/// ([`ComAmazonawsEc2Amazonec2State::launch_root_block_device`]).
 pub fn spot_instance_request_payload_bytes(
     view: &SpotInstanceRequest,
     client_token: Option<&str>,
@@ -372,6 +376,14 @@ pub fn spot_instance_request_payload_bytes(
                     + group.group_name.as_ref().map_or(0, String::len)
             })
             .sum()
+    });
+    let mapping_bytes: usize = launch.map_or(0, |launch| {
+        launch
+            .block_device_mappings
+            .iter()
+            .flatten()
+            .map(super::block_device_mapping_bytes)
+            .fold(0usize, usize::saturating_add)
     });
     launch
         .and_then(|launch| launch.user_data.as_ref())
@@ -397,6 +409,7 @@ pub fn spot_instance_request_payload_bytes(
                 .map_or(0, String::len),
         )
         .saturating_add(group_bytes)
+        .saturating_add(mapping_bytes)
         .saturating_add(placement_bytes)
         .saturating_add(tag_list_bytes(view.tags.as_deref().unwrap_or_default()))
         .saturating_add(view.launch_group.as_ref().map_or(0, String::len))

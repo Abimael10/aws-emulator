@@ -59,6 +59,8 @@ mod launch_source_instance_profile;
 mod launch_template_instance_profiles;
 #[path = "all/launch_template_option_sets.rs"]
 mod launch_template_option_sets;
+#[path = "all/launch_template_root_volume.rs"]
+mod launch_template_root_volume;
 #[path = "all/launch_template_security_group_vpc.rs"]
 mod launch_template_security_group_vpc;
 #[path = "all/launch_template_specifications.rs"]

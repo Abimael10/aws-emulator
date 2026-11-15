@@ -32,6 +32,12 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query::{call, element, elements, error_code, error_message, filters, indexed};
 use super::wire::{child, child_text, document, Param};
+// The fleet type whose capacity is placed in the CALL, named by the service's own statement
+// of that `FleetType` value rather than written out here, beside the state a published AMI's
+// id is read from.
+use service_com_amazonaws_ec2_amazonec2::state::{
+    ComAmazonawsEc2Amazonec2State as Ec2State, FLEET_TYPE_INSTANT,
+};
 
 /// The Region every call of this suite is signed for.
 const REGION: &str = "us-west-2";
@@ -392,6 +398,147 @@ async fn the_root_volume_is_created_from_the_launchs_own_mapping() {
         }
         // The device the volume is attached at is the AMI's root device whatever the launch
         // said, so an entry never moves the root device.
+        let attached = ok(
+            &router,
+            case,
+            "DescribeVolumes",
+            &filters(&[("attachment.instance-id", &[instance_id.as_str()])]),
+        )
+        .await;
+        assert_eq!(
+            element(&attached, "device").as_deref(),
+            Some(root_device.as_str()),
+            "case {case:?}: the volume must be attached at the AMI's root device, got \
+             {attached}"
+        );
+    }
+}
+
+/// One row of the fleet table: the Amazon EBS members the version's root mapping declares,
+/// and the `size` and `volumeType` the placement's volume is then due (`None` where the row
+/// leaves the member to the AMI's own).
+struct FleetRow {
+    case: &'static str,
+    members: Vec<(&'static str, &'static str)>,
+    size: &'static str,
+    volume_type: Option<&'static str>,
+}
+
+/// RULE 1 through the OTHER launch path that is handed a launch-template version rather than
+/// a request's own `BlockDeviceMappings`: an EC2 Fleet placing its target capacity.
+///
+/// "Any parameters that you specify override the same parameters in the launch template"
+/// (`FleetLaunchTemplateConfigRequest$Overrides`), so everything else about a pool's launch —
+/// its block device mapping among it — is the version's, and the volume the fleet's instance
+/// boots is the one that version describes. The rows differ in which Amazon EBS members the
+/// version declares and in the type they name.
+#[tokio::test]
+async fn an_ec2_fleet_places_the_root_volume_its_version_describes() {
+    let (router, _engine) = super::ec2_query::emulator();
+    // A fleet is admitted only over an AMI the account can SEE, so its version names one of
+    // the published catalog — read out of the service's own state rather than invented here —
+    // and the device a mapping is matched at is that image's own root device.
+    let image_id = Ec2State::default()
+        .images
+        .keys()
+        .next()
+        .cloned()
+        .expect("a fresh account must publish at least one image");
+    let root_device = root_device_of_a_launch(&router, "the probe launch", &image_id).await;
+    // (the case, the Amazon EBS members the version declares, the size then due, and the
+    // volume type when the row names one — `None` leaves it to the AMI's own)
+    let rows = vec![
+        FleetRow {
+            case: "a version that sizes its root device",
+            members: vec![("VolumeSize", "90")],
+            size: "90",
+            volume_type: None,
+        },
+        FleetRow {
+            case: "a version that sizes and types its root device",
+            members: vec![("VolumeSize", "45"), ("VolumeType", "gp2")],
+            size: "45",
+            volume_type: Some("gp2"),
+        },
+    ];
+
+    for (index, row) in rows.into_iter().enumerate() {
+        let FleetRow {
+            case,
+            members,
+            size,
+            volume_type,
+        } = row;
+        let template = format!("fleet-root-{index}");
+        let mut created = vec![
+            p("LaunchTemplateName", &template),
+            p("LaunchTemplateData.ImageId", &image_id),
+            p("LaunchTemplateData.InstanceType", "t3.micro"),
+            p(
+                "LaunchTemplateData.BlockDeviceMapping.1.DeviceName",
+                &root_device,
+            ),
+        ];
+        for (member, value) in &members {
+            created.push(p(
+                &format!("LaunchTemplateData.BlockDeviceMapping.1.Ebs.{member}"),
+                value,
+            ));
+        }
+        let body = ok(&router, case, "CreateLaunchTemplate", &created).await;
+        let template_id = element(&body, "launchTemplateId")
+            .unwrap_or_else(|| panic!("case {case:?}: no launchTemplateId in {body}"));
+
+        // An `instant` fleet launches its capacity in the call and reports the instances it
+        // launched, which is how a client reaches them.
+        let placed = ok(
+            &router,
+            case,
+            "CreateFleet",
+            &[
+                p(
+                    "LaunchTemplateConfigs.1.LaunchTemplateSpecification.LaunchTemplateId",
+                    &template_id,
+                ),
+                p("Type", FLEET_TYPE_INSTANT),
+                p("TargetCapacitySpecification.TotalTargetCapacity", "1"),
+                p("TargetCapacitySpecification.OnDemandTargetCapacity", "1"),
+            ],
+        )
+        .await;
+        // The ids are the ITEMS of a set element — `<instanceIds><item>i-…</item></instanceIds>`,
+        // as ec2Query renders a list — so they are read with the parser rather than by name.
+        let parsed = document(case, &placed);
+        let instance_id = parsed
+            .descendants()
+            .filter(|node| node.is_element() && node.tag_name().name() == "instanceIds")
+            .flat_map(|set| {
+                set.children()
+                    .filter(|node| node.is_element() && node.tag_name().name() == "item")
+                    .map(|node| node.text().unwrap_or_default().to_string())
+                    .collect::<Vec<String>>()
+            })
+            .next()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the instant fleet must report its instance: {placed}")
+            });
+        let volume = root_volume_of(&router, case, &instance_id).await;
+
+        assert_eq!(
+            member_of(&volume, "size").as_deref(),
+            Some(size),
+            "case {case:?}: the fleet's instance must boot the volume its version describes \
+             (size {size}), got {volume:?}"
+        );
+        if let Some(volume_type) = volume_type {
+            assert_eq!(
+                member_of(&volume, "volumeType").as_deref(),
+                Some(volume_type),
+                "case {case:?}: expected volumeType={volume_type}, got {volume:?}"
+            );
+        }
+        // The device the volume is attached at is the AMI's root device, which a mapping
+        // never moves.
         let attached = ok(
             &router,
             case,

@@ -1362,8 +1362,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// elastic graphics and inference accelerators ("Amazon Elastic Graphics reached end of life
 /// on January 8, 2024", "Amazon Elastic Inference is no longer available"). A template whose
 /// version names the block device mappings of its instance is read through
-/// [`template_block_device_mapping`] and one that names its network interfaces through
-/// [`template_primary_interface`].
+/// [`crate::state::template_block_device_mapping`] and one that names its network interfaces
+/// through [`template_primary_interface`].
 fn launch_overlaid_with_template(
     request: RunInstancesInput,
     data: &RequestLaunchTemplateData,
@@ -1457,7 +1457,7 @@ fn launch_overlaid_with_template(
         merged.block_device_mappings = data.block_device_mappings.as_ref().map(|mappings| {
             mappings
                 .iter()
-                .map(template_block_device_mapping)
+                .map(crate::state::template_block_device_mapping)
                 .collect::<Vec<BlockDeviceMapping>>()
         });
     }
@@ -1676,40 +1676,6 @@ fn template_placement(placement: &LaunchTemplatePlacementRequest) -> Placement {
         tenancy: placement.tenancy.clone(),
         spread_domain: placement.spread_domain.clone(),
         host_resource_group_arn: placement.host_resource_group_arn.clone(),
-    }
-}
-
-/// The `BlockDeviceMapping` a launch template version's block device mapping describes.
-///
-/// Member by member rather than a conversion written once, for the reason
-/// [`template_placement`] is: the two shapes differ only in the name of the shape, so nothing
-/// a template says about a device is dropped on the way into the launch, and a member added
-/// to either shape later shows up here as a compile error rather than as a silently dropped
-/// setting. The two members an `EbsBlockDevice` carries that a template's own request shape
-/// does not — the Outpost and the Availability Zone a device is restored in — are left unset
-/// for the same reason: a template says nothing about them.
-fn template_block_device_mapping(
-    mapping: &LaunchTemplateBlockDeviceMappingRequest,
-) -> BlockDeviceMapping {
-    BlockDeviceMapping {
-        device_name: mapping.device_name.clone(),
-        virtual_name: mapping.virtual_name.clone(),
-        no_device: mapping.no_device.clone(),
-        ebs: mapping.ebs.as_ref().map(|ebs| EbsBlockDevice {
-            delete_on_termination: ebs.delete_on_termination,
-            iops: ebs.iops,
-            snapshot_id: ebs.snapshot_id.clone(),
-            volume_size: ebs.volume_size,
-            volume_type: ebs.volume_type.clone(),
-            kms_key_id: ebs.kms_key_id.clone(),
-            throughput: ebs.throughput,
-            outpost_arn: None,
-            availability_zone: None,
-            encrypted: ebs.encrypted,
-            volume_initialization_rate: ebs.volume_initialization_rate,
-            availability_zone_id: None,
-            ebs_card_index: ebs.ebs_card_index,
-        }),
     }
 }
 

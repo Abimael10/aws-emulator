@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use ::service_com_amazonaws_ec2_amazonec2::ops::types::{
-    IamInstanceProfile, IamInstanceProfileSpecification, RequestLaunchTemplateData,
+    EbsBlockDevice, IamInstanceProfile, IamInstanceProfileSpecification, RequestLaunchTemplateData,
 };
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 
@@ -112,6 +112,14 @@ struct LaunchParameters {
     /// `LaunchTemplateHibernationOptionsRequest$Configured`, which the instance reports
     /// under `Instance$HibernationOptions`.
     hibernation_configured: bool,
+    /// The EBS root block device every instance of this launch is created with: the AMI's
+    /// own root device with the entry the launch source's `BlockDeviceMappings` carries for
+    /// that device overlaid, resolved by Amazon EC2 itself
+    /// ([`ec2::ComAmazonawsEc2Amazonec2State::launch_template_root_block_device`]) so the
+    /// volume an instance of this group boots is the volume a launch naming the same version
+    /// boots. `None` for a launch source that names no mapping to apply, whose instances are
+    /// created with their AMI's own root device.
+    root_block_device: Option<EbsBlockDevice>,
 }
 
 /// Launch `request.count` instances for the group and answer the ones Amazon EC2
@@ -245,10 +253,14 @@ pub fn launch<Eng: Send + Sync + 'static>(
             sriov_net_support: None,
             ena_support: None,
             hibernation_configured: parameters.hibernation_configured,
-            // This launch names no block device mapping of its own, so the instance's root
-            // device is the one its AMI carries (Amazon EC2 applies the Region's EBS
-            // encryption default to it where that is on).
-            root_block_device: None,
+            // The root volume the launch source's `BlockDeviceMappings` describe, as Amazon
+            // EC2 resolved it against the AMI this launch settled on ([`launch_parameters`]):
+            // every member of the mapping's EBS settings reaches the volume the store mints
+            // for this instance, with the AMI's own answering the ones the source left out. A
+            // source that names no mapping leaves this unset, so the instance's root device is
+            // the one its AMI carries (Amazon EC2 applies the Region's EBS encryption default
+            // to it where that is on).
+            root_block_device: parameters.root_block_device.clone(),
             disable_api_termination: parameters.disable_api_termination,
             tags: tags.clone(),
             // No client token: this launch is not a caller's request to replay.
@@ -515,6 +527,9 @@ fn launch_parameters(
             detail: ec2::InstanceDetail::default(),
             disable_api_termination: false,
             hibernation_configured: false,
+            // For the same reason: no group launches from a launch configuration, and an
+            // instance of one would be created with its AMI's own root device.
+            root_block_device: None,
         };
     }
 
@@ -533,6 +548,17 @@ fn launch_parameters(
     let image_id = override_entry
         .and_then(|entry| entry.image_id.clone())
         .or_else(|| data.as_ref().and_then(|data| data.image_id.clone()));
+    // "The block device mapping" (`RequestLaunchTemplateData$BlockDeviceMappings`) a version
+    // carries applies to every launch made from it, so the root volume an instance of this
+    // group boots is the one that version describes: Amazon EC2's own reading of the
+    // version's mappings against the AMI this launch settled on, which is the same reading a
+    // launch naming the version goes through.
+    let root_block_device = data
+        .as_ref()
+        .and_then(|data| {
+            store.launch_template_root_block_device(data, image_id.as_deref(), request.region)
+        })
+        .map(|(_, ebs)| ebs);
     LaunchParameters {
         // The option sets the launch-template version declares, resolved by Amazon EC2
         // itself against the account's own IMDS defaults and the AMI this launch settled
@@ -584,6 +610,7 @@ fn launch_parameters(
             .and_then(|data| data.monitoring.as_ref())
             .and_then(|monitoring| monitoring.enabled)
             .unwrap_or(false),
+        root_block_device,
     }
 }
 

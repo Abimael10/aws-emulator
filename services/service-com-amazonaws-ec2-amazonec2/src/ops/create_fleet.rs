@@ -1430,19 +1430,34 @@ fn requested_payload_bytes(
     instance_tags: &::std::collections::BTreeMap<String, String>,
     pools: &[crate::state::FleetPoolPlacement],
 ) -> usize {
-    use crate::state::{STORED_RECORD_OVERHEAD_BYTES, tag_bytes, tag_list_bytes};
+    use crate::state::{
+        STORED_RECORD_OVERHEAD_BYTES, block_device_mapping_bytes, tag_bytes, tag_list_bytes,
+    };
 
     let text = |value: Option<&String>| value.map_or(0, String::len);
     let instance_bytes = tag_bytes(instance_tags);
     let pool_bytes = pools
         .iter()
         .map(|pool| {
+            // Every instance of this pool retains the root block device its launch resolves
+            // ([`crate::state::ComAmazonawsEc2Amazonec2State::launch_root_block_device`]), and
+            // the pool's own launch specification retains the whole mapping the version
+            // carries — every caller-chosen string on it charged through the ONE definition of
+            // that charge, so a fleet cannot retain bytes its ceiling did not see.
+            let mapping_bytes = pool
+                .launch
+                .block_device_mappings
+                .iter()
+                .flatten()
+                .map(block_device_mapping_bytes)
+                .fold(0usize, usize::saturating_add);
             let per_instance = STORED_RECORD_OVERHEAD_BYTES
                 .saturating_add(text(pool.launch.image_id.as_ref()))
                 .saturating_add(text(pool.launch.instance_type.as_ref()))
                 .saturating_add(text(pool.launch.key_name.as_ref()))
                 .saturating_add(text(pool.launch.subnet_id.as_ref()))
                 .saturating_add(text(pool.launch.user_data.as_ref()))
+                .saturating_add(mapping_bytes)
                 .saturating_add(instance_bytes);
             pool.view
                 .payload_bytes()

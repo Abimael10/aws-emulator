@@ -2212,7 +2212,9 @@ pub use fast_snapshot_restores::*;
 /// root block device mapping as the launch's own mappings override it — the methods that
 /// resolve that device and mint the volume, in a module of its own.
 mod launched_root_volumes;
-pub use launched_root_volumes::root_block_device_bytes;
+pub use launched_root_volumes::{
+    block_device_mapping_bytes, root_block_device_bytes, template_block_device_mapping,
+};
 
 /// The PRIMARY network interface a LAUNCH creates for the instance it stores, in the subnet
 /// the launch places it in — one method on the state, in a module of its own, beside the

@@ -21,7 +21,10 @@
 
 use std::time::{Instant, SystemTime};
 
-use crate::ops::types::{AttachVolumeOutput, BlockDeviceMapping, EbsBlockDevice};
+use crate::ops::types::{
+    AttachVolumeOutput, BlockDeviceMapping, EbsBlockDevice,
+    LaunchTemplateBlockDeviceMappingRequest, RequestLaunchTemplateData,
+};
 
 use super::{
     ComAmazonawsEc2Amazonec2State, DEFAULT_GP3_IOPS, DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE,
@@ -156,6 +159,37 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         };
         Some((device_name, self.encrypted_by_default_in(ebs, region)))
+    }
+
+    /// The root block device the launch of an instance from the launch-template version
+    /// `data` creates, as [`Self::launch_root_block_device`] resolves it from the mappings
+    /// that version carries.
+    ///
+    /// "The block device mapping" (`RequestLaunchTemplateData$BlockDeviceMappings`) a
+    /// template holds applies to EVERY launch made from that version, whoever makes it — a
+    /// launch naming the version or a service launching on the account's behalf — so the
+    /// volume an instance of that version boots is the same volume either way. The ONE
+    /// reading of a version's mappings for a launch path that is handed a version rather
+    /// than a request's own `BlockDeviceMappings`, so no such path can apply part of a
+    /// mapping or none of it.
+    ///
+    /// `image_id` is the AMI the launch SETTLED on, which may be the version's own or an
+    /// override of it, because the device name a mapping is matched at is that image's root
+    /// device. `None` for a version whose launch creates no root volume at all, for the
+    /// reasons [`Self::launched_root_device`] gives.
+    pub fn launch_template_root_block_device(
+        &self,
+        data: &RequestLaunchTemplateData,
+        image_id: Option<&str>,
+        region: &str,
+    ) -> Option<(String, EbsBlockDevice)> {
+        let mappings: Vec<BlockDeviceMapping> = data
+            .block_device_mappings
+            .iter()
+            .flatten()
+            .map(template_block_device_mapping)
+            .collect();
+        self.launch_root_block_device(image_id, &mappings, region)
     }
 
     /// `ebs` as the Region's own EBS encryption setting leaves it: encrypted whenever `region`
@@ -344,6 +378,43 @@ fn default_root_device() -> (String, EbsBlockDevice) {
     )
 }
 
+/// The [`BlockDeviceMapping`] a launch template version's block device mapping describes.
+///
+/// Member by member rather than a conversion written once, because the two shapes differ
+/// only in the name of the shape: nothing a template says about a device is dropped on the
+/// way into the launch, and a member added to either shape later shows up here as a compile
+/// error rather than as a silently dropped setting. The two members an [`EbsBlockDevice`]
+/// carries that a template's own request shape does not — the Outpost and the Availability
+/// Zone a device is restored in — are left unset for the same reason: a template says
+/// nothing about them.
+///
+/// The ONE conversion of it, so every launch path handed a launch-template version reads
+/// that version's mappings the same way.
+pub fn template_block_device_mapping(
+    mapping: &LaunchTemplateBlockDeviceMappingRequest,
+) -> BlockDeviceMapping {
+    BlockDeviceMapping {
+        device_name: mapping.device_name.clone(),
+        virtual_name: mapping.virtual_name.clone(),
+        no_device: mapping.no_device.clone(),
+        ebs: mapping.ebs.as_ref().map(|ebs| EbsBlockDevice {
+            delete_on_termination: ebs.delete_on_termination,
+            iops: ebs.iops,
+            snapshot_id: ebs.snapshot_id.clone(),
+            volume_size: ebs.volume_size,
+            volume_type: ebs.volume_type.clone(),
+            kms_key_id: ebs.kms_key_id.clone(),
+            throughput: ebs.throughput,
+            outpost_arn: None,
+            availability_zone: None,
+            encrypted: ebs.encrypted,
+            volume_initialization_rate: ebs.volume_initialization_rate,
+            availability_zone_id: None,
+            ebs_card_index: ebs.ebs_card_index,
+        }),
+    }
+}
+
 /// The bytes one launch's resolved root block device holds: the strings on it.
 ///
 /// Every other member of an [`EbsBlockDevice`] is a number or a flag, so it is fixed-size.
@@ -365,4 +436,23 @@ pub fn root_block_device_bytes(root_block_device: Option<&EbsBlockDevice>) -> us
         .saturating_add(ebs.outpost_arn.as_ref().map_or(0, String::len))
         .saturating_add(ebs.availability_zone.as_ref().map_or(0, String::len))
         .saturating_add(ebs.availability_zone_id.as_ref().map_or(0, String::len))
+}
+
+/// The bytes one stored `BlockDeviceMapping` holds: the strings ON the mapping — the device it
+/// names, the instance store volume it maps and the `NoDevice` marker — plus the strings of the
+/// Amazon EBS device it carries ([`root_block_device_bytes`]).
+///
+/// Every one of them is caller-chosen, and a launch path that RETAINS a mapping (a fleet pool's
+/// launch specification, and the Spot Instance request a pool is placed through) retains all of
+/// them, so the charge is over the mapping as stored rather than over its EBS half alone. The
+/// ONE definition of it: the paths that store a mapping ask exactly this before the write, so
+/// the bytes those records hold are the bytes their ceiling saw.
+pub fn block_device_mapping_bytes(mapping: &BlockDeviceMapping) -> usize {
+    mapping
+        .device_name
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(mapping.virtual_name.as_ref().map_or(0, String::len))
+        .saturating_add(mapping.no_device.as_ref().map_or(0, String::len))
+        .saturating_add(root_block_device_bytes(mapping.ebs.as_ref()))
 }

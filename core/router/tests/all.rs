@@ -1842,3 +1842,10 @@ mod zz_probe_whole_emulator;
 // suites `all/all_rs_carries_no_inner_doc_comment.rs`,
 // `all/every_suite_file_is_declared.rs` check the rules above — for this file and for every
 // service crate's `tests/all.rs` — so check there rather than leaving a note here.
+// suite and no other line, so two branches landing at once insert two lines in two places
+// and have no prose to duplicate, re-word or mistype. What a suite covers, and why it drives
+// lands past the declarations is `E0753` and compiles no suite of this target at all. With
+// none anywhere in the file, no merge of two landings can leave one there.
+// Five suites pin the rules above rather than restating them here:
+// `all/declaration_roots_are_canonical_and_complete.rs`, each for this file and for every
+// service crate's own `tests/all.rs`. `tests/all.rs` is a test-target CRATE ROOT, so a bare
