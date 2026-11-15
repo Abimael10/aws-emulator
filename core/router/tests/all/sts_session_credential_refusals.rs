@@ -50,7 +50,7 @@ use crate::query_wire::{element, elements, form_encode};
 const REGION: &str = "us-east-1";
 
 /// The account id every ARN this emulator mints carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The long-term key every emulator publishes, which is the account's own credential: what
 /// the roles, users and buckets here are created with.
@@ -62,17 +62,17 @@ const UNICODE_KEY: &str = "café/日本語/Zürich-résumé.txt";
 
 /// Its ASCII sibling in the same bucket, which a `Deny` naming only the key above leaves
 /// readable.
-const ASCII_KEY: &str = "plain/other.txt";
+pub(crate) const ASCII_KEY: &str = "plain/other.txt";
 
 /// The bytes every object here is written with.
-const OBJECT_BODY: &str = "the object bytes";
+pub(crate) const OBJECT_BODY: &str = "the object bytes";
 
 /// The IAM action an object read is authorized under, as a refusal names it.
-const GET_OBJECT: &str = "s3:GetObject";
+pub(crate) const GET_OBJECT: &str = "s3:GetObject";
 
 /// The three services this suite exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -151,7 +151,7 @@ async fn iam(
 }
 
 /// One STS call, presenting `access_key_id`.
-async fn sts(
+pub(crate) async fn sts(
     router: &MultiServiceRouter,
     access_key_id: &str,
     action: &str,
@@ -161,7 +161,7 @@ async fn sts(
 }
 
 /// One S3 request, presented as signed by `access_key_id`, addressed PATH-STYLE.
-async fn s3(
+pub(crate) async fn s3(
     router: &MultiServiceRouter,
     access_key_id: &str,
     method: &str,
@@ -222,13 +222,13 @@ fn json_escaped(text: &str) -> String {
 }
 
 /// The error code of an S3 refusal.
-fn code_of(body: &str) -> String {
+pub(crate) fn code_of(body: &str) -> String {
     element(body, "Code")
 }
 
 /// The message of an S3 refusal, with the serializer's escaping undone — the quotes around
 /// the resource ARN travel as `&quot;`.
-fn message_of(body: &str) -> String {
+pub(crate) fn message_of(body: &str) -> String {
     elements(body, "Message")
         .into_iter()
         .next()
@@ -244,18 +244,18 @@ fn trust_policy() -> String {
 
 /// The ARN of the object `key` in `bucket`, which is the resource a read of it is decided
 /// over and the one a refusal quotes.
-fn object_arn(bucket: &str, key: &str) -> String {
+pub(crate) fn object_arn(bucket: &str, key: &str) -> String {
     format!("arn:aws:s3:::{bucket}/{key}")
 }
 
 /// The ARN the account holds `role_name` under, which is what `aws:PrincipalArn` answers for
 /// a session of it.
-fn role_arn(role_name: &str) -> String {
+pub(crate) fn role_arn(role_name: &str) -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/{role_name}")
 }
 
 /// Create `bucket` and write both objects into it, as the account's own credential.
-async fn seed_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
+pub(crate) async fn seed_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
     let (status, body) = s3(router, AMBIENT_KEY, "PUT", &format!("/{bucket}"), "").await;
     assert_eq!(
         status, 200,
@@ -278,7 +278,7 @@ async fn seed_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
 }
 
 /// Read `key` of `bucket` as `access_key_id`.
-async fn get_object(
+pub(crate) async fn get_object(
     router: &MultiServiceRouter,
     access_key_id: &str,
     bucket: &str,
@@ -295,7 +295,11 @@ async fn get_object(
 }
 
 /// Create `role_name` with the trust policy above.
-async fn create_role(router: &MultiServiceRouter, case: &str, role_name: &str) -> String {
+pub(crate) async fn create_role(
+    router: &MultiServiceRouter,
+    case: &str,
+    role_name: &str,
+) -> String {
     let (status, body) = iam(
         router,
         "CreateRole",
@@ -313,7 +317,7 @@ async fn create_role(router: &MultiServiceRouter, case: &str, role_name: &str) -
 }
 
 /// Embed `document` in `role_name` under `policy_name`.
-async fn put_role_policy(
+pub(crate) async fn put_role_policy(
     router: &MultiServiceRouter,
     case: &str,
     role_name: &str,
@@ -338,7 +342,7 @@ async fn put_role_policy(
 
 /// Assume `role_name`, passing `session_policy` as the inline session policy where a case
 /// names one, and answer the access key id of the session STS minted.
-async fn assume_role(
+pub(crate) async fn assume_role(
     router: &MultiServiceRouter,
     case: &str,
     role_name: &str,
@@ -362,13 +366,13 @@ async fn assume_role(
 
 /// The assumed-role session ARN `AssumeRole` reports for `role_name`, which is what a
 /// refusal names as the principal.
-fn session_arn(role_name: &str) -> String {
+pub(crate) fn session_arn(role_name: &str) -> String {
     format!("arn:aws:sts::{ACCOUNT}:assumed-role/{role_name}/diagnosis")
 }
 
 /// Create an IAM user holding `document` inline, mint it a long-term access key, and answer
 /// the key's id.
-async fn user_with_key(
+pub(crate) async fn user_with_key(
     router: &MultiServiceRouter,
     case: &str,
     user_name: &str,
@@ -402,7 +406,7 @@ async fn user_with_key(
 }
 
 /// One policy document stating `statements`.
-fn document(statements: &[String]) -> String {
+pub(crate) fn document(statements: &[String]) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
         statements.join(",")
@@ -411,7 +415,12 @@ fn document(statements: &[String]) -> String {
 
 /// One statement: `effect` on `action` over `resource`, carrying `condition` where a case
 /// names one.
-fn statement(effect: &str, action: &str, resource: &str, condition: Option<&str>) -> String {
+pub(crate) fn statement(
+    effect: &str,
+    action: &str,
+    resource: &str,
+    condition: Option<&str>,
+) -> String {
     let clause = condition.map_or(String::new(), |condition| {
         format!(r#","Condition":{condition}"#)
     });
@@ -426,13 +435,18 @@ const IDENTITY_DENY: &str = "with an explicit deny in an identity-based policy";
 const SESSION_DENY: &str = "with an explicit deny in a session policy";
 
 /// The no-grant form, which names the action it found no `Allow` of.
-fn no_grant(action: &str) -> String {
+pub(crate) fn no_grant(action: &str) -> String {
     format!("because no identity-based policy allows the {action} action")
 }
 
 /// The refusal sentence AWS words for `principal` asking for `action` on `resource`, with
 /// `reason` as its diagnosis.
-fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -> String {
+pub(crate) fn not_authorized(
+    principal: &str,
+    action: &str,
+    resource: &str,
+    reason: &str,
+) -> String {
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: \"{resource}\" \
          {reason}"

@@ -1436,3 +1436,5 @@ mod apigateway_cognito_authorizer_spares_the_proxy_lambda;
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod <name>;` would resolve to a
 // SIBLING of this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]`
 // above each declaration is what points it into `tests/all/`.
+#[path = "all/sts_session_context_keys.rs"]
+mod sts_session_context_keys;
