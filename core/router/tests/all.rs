@@ -1469,3 +1469,7 @@ mod sts_session_context_keys;
 // `all/declaration_roots_end_with_their_last_declaration.rs` and
 #[path = "all/declaration_roots_end_with_their_last_declaration.rs"]
 mod declaration_roots_end_with_their_last_declaration;
+#[path = "all/cloudformation_rds_credential_rotation_estate.rs"]
+mod cloudformation_rds_credential_rotation_estate;
+#[path = "all/lambda_handler_reaches_amazon_rds.rs"]
+mod lambda_handler_reaches_amazon_rds;

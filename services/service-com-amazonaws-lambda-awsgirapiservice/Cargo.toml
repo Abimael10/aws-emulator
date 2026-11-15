@@ -160,6 +160,12 @@ aws-sdk-sns = { version = "1", default-features = false }
 # — is the shape that needs it. Only the generated client is needed: the emulator supplies
 # the transport.
 aws-sdk-sts = { version = "1", default-features = false }
+# Amazon RDS's model declares `awsQuery` as well, so a handler's `boto3.client("rds")` call
+# is built, signed and parsed by this client (`state::execution::aws_rds`), over the same
+# in-process callback. A credential-rotation function that puts the new master password in
+# force on the DB instance the secret belongs to (`ModifyDBInstance`) is the shape that needs
+# it. Only the generated client is needed: the emulator supplies the transport.
+aws-sdk-rds = { version = "1", default-features = false }
 # A function whose environment variables are encrypted with a customer managed key can
 # only be invoked while that key can decrypt them, and the key's state belongs to the key
 # service: it is asked over the same in-process callback

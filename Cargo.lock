@@ -15731,6 +15731,7 @@ dependencies = [
  "aws-sdk-kinesis",
  "aws-sdk-kms",
  "aws-sdk-lambda",
+ "aws-sdk-rds",
  "aws-sdk-s3",
  "aws-sdk-sns",
  "aws-sdk-sqs",

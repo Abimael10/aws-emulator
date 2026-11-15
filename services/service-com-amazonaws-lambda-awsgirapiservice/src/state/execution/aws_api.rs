@@ -175,6 +175,10 @@ pub enum Protocol {
     /// assumes another role through, built by the client this crate holds for it
     /// ([`super::aws_sts`]).
     StsQuery,
+    /// Amazon RDS's `awsQuery`: the same binding, for the service a handler reads a database
+    /// through and puts a new master credential in force on, built by the client this crate
+    /// holds for it ([`super::aws_rds`]).
+    RdsQuery,
 }
 
 impl Api {
@@ -193,7 +197,8 @@ impl Api {
             | Protocol::S3Rest
             | Protocol::CloudFrontRest
             | Protocol::SnsQuery
-            | Protocol::StsQuery => "application/json".to_string(),
+            | Protocol::StsQuery
+            | Protocol::RdsQuery => "application/json".to_string(),
         }
     }
 }
@@ -592,6 +597,32 @@ pub const APIS: &[Api] = &[
         model: None,
         protocol: Protocol::RestJson(&XRAY),
         answer_model: Some(&XRAY_ANSWERS),
+    },
+    // `services/service-com-amazonaws-rds-amazonrdsv19/smithy-model/
+    // com-amazonaws-rds-amazonrdsv19.json`: awsQuery, sigv4Name `rds`, endpointPrefix `rds`,
+    // sdkId `RDS`. Its operations carry their input as the parameters of a form-encoded
+    // `Action` and answer an XML document rather than a JSON one, so the request is built by
+    // [`super::aws_rds`].
+    //
+    // The DATABASE ITSELF is what a handler holding a database credential acts on: the
+    // rotation function Secrets Manager invokes puts the new master password in force with
+    // `ModifyDBInstance` (or `ModifyDBCluster`) on the instance the secret belongs to, and
+    // reads that instance back to find the address and the status it reports — so a handler
+    // that cannot reach this service cannot carry out the one step a credential rotation
+    // exists for.
+    Api {
+        sdk_token: "rds",
+        signing_name: "rds",
+        endpoint_prefix: "rds",
+        // As the two services above whose requests their own client binds: the one question
+        // this seam would ask of Amazon RDS's model is how a request to it is bound, and that
+        // is the client's ([`super::aws_rds`]), so the model itself is not embedded here.
+        model: None,
+        protocol: Protocol::RdsQuery,
+        // The answer of such a call is read by that client out of the XML the service sent,
+        // and the document this seam hands the guest is built from the output members it
+        // reported ([`super::aws_rds`]); none of them carries bytes.
+        answer_model: None,
     },
     // `services/service-com-amazonaws-rdsdata-rdsdataservice/smithy-model/
     // com-amazonaws-rdsdata-rdsdataservice.json`: restJson1, sigv4Name `rds-data`,
@@ -1746,6 +1777,16 @@ impl AwsAccess {
                 )
                 .await
             }
+            Protocol::RdsQuery => {
+                super::aws_rds::call(
+                    &self.callback,
+                    self.identity.as_ref(),
+                    region,
+                    operation,
+                    body,
+                )
+                .await
+            }
         }
     }
 
@@ -1999,7 +2040,11 @@ async fn sent(
         // CloudFront's by the one [`super::aws_cloudfront`] holds and Amazon SNS's by the one
         // [`super::aws_sns`] holds, which is where a call to each is dispatched
         // ([`AwsAccess::dispatched`]): no request to them is built here.
-        Protocol::S3Rest | Protocol::CloudFrontRest | Protocol::SnsQuery | Protocol::StsQuery => {
+        Protocol::S3Rest
+        | Protocol::CloudFrontRest
+        | Protocol::SnsQuery
+        | Protocol::StsQuery
+        | Protocol::RdsQuery => {
             return Err(Sent::NotMade(format!(
                 "{} binds its requests with its own protocol rather than with a JSON one",
                 api.sdk_token
@@ -2385,6 +2430,12 @@ mod tests {
                     api.signing_name, "sts",
                     "case {:?}: expected the token service's own signing name on its protocol \
                      entry",
+                    api.sdk_token
+                ),
+                // Amazon RDS's `awsQuery`, the same way, in `super::super::aws_rds`.
+                super::Protocol::RdsQuery => assert_eq!(
+                    api.signing_name, "rds",
+                    "case {:?}: expected Amazon RDS's own signing name on its protocol entry",
                     api.sdk_token
                 ),
             }
