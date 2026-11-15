@@ -353,6 +353,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lock held ([`bus_key_refusals`]).
         let mut bus_keys: ::std::collections::BTreeMap<String, Option<String>> =
             ::std::collections::BTreeMap::new();
+        // The LOG CONFIGURATION of each bus these entries name, read here with the
+        // rest of that bus's configuration: it decides which records the bus writes
+        // about the events it ingests, and those records are written with no lock
+        // held (see [`crate::state::bus_logs`]).
+        let mut bus_log_configs: ::std::collections::BTreeMap<String, Option<LogConfig>> =
+            ::std::collections::BTreeMap::new();
         {
             let mut store = state.lock();
             // What the clock already owed every archive is settled first, so an
@@ -364,19 +370,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     continue;
                 };
                 if !routing.contains_key(&accepted.bus) {
-                    let compiled = store.bus(&region, &accepted.bus).map(|bus| {
+                    // ONE lookup of the bus for everything this pass reads off it:
+                    // its rules, the key it encrypts events with and the logging it
+                    // is configured for.
+                    let bus = store.bus(&region, &accepted.bus);
+                    let compiled = bus.map(|bus| {
                         bus.rules
                             .values()
                             .filter_map(|rule| CompiledRule::of(rule, &store))
                             .collect::<Vec<_>>()
                     });
+                    let bus_key = bus.and_then(|bus| bus.kms_key_identifier.clone());
+                    let log_config = bus.and_then(|bus| bus.log_config.clone());
                     routing.insert(accepted.bus.clone(), compiled);
-                    bus_keys.insert(
-                        accepted.bus.clone(),
-                        store
-                            .bus(&region, &accepted.bus)
-                            .and_then(|bus| bus.kms_key_identifier.clone()),
-                    );
+                    bus_keys.insert(accepted.bus.clone(), bus_key);
+                    bus_log_configs.insert(accepted.bus.clone(), log_config);
                     archiving.insert(
                         accepted.bus.clone(),
                         store
@@ -423,6 +431,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What each archive of the entry's bus captured, appended to the archives
         // in the next pass under the lock.
         let mut captures: Vec<Capture> = Vec::new();
+        // The records the log configuration of each entry's bus owes about the
+        // event it ingested, delivered once this pass has released the store (see
+        // [`crate::state::bus_logs`]).
+        let mut bus_log_records: Vec<crate::state::bus_logs::BusLogRecord> = Vec::new();
         let mut failed = 0usize;
         for slot in screened {
             let accepted = match slot {
@@ -441,6 +453,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 failed += 1;
                 entries.push(refused(KMS_ENCRYPTION_EXCEPTION, message.clone()));
                 continue;
+            }
+            // The event is now INGESTED, so the bus's own log configuration owes a
+            // record about it: the ingestion is what the record reports, and it
+            // happened whatever the routing below makes of the event — an event no
+            // rule matched, and one on a bus this account does not hold, were
+            // ingested just as much as one that reached a target.
+            if let Some(record) = crate::state::bus_logs::ingest_record(
+                bus_log_configs
+                    .get(&accepted.bus)
+                    .and_then(Option::as_ref),
+                &region,
+                &crate::state::bus_logs::IngestedEvent {
+                    bus: &accepted.bus,
+                    event_id: &accepted.event_id,
+                    caller_account_id: crate::state::account_id(),
+                    source: accepted.source.as_deref(),
+                    detail_type: accepted.detail_type.as_deref(),
+                    detail: accepted.detail.as_deref(),
+                },
+                now,
+            ) {
+                bus_log_records.push(record);
             }
             // An entry naming a bus this account does not hold is still
             // INGESTED: the destination is not a property of the entry, and
@@ -683,6 +717,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store.record_invocation(invocation);
             }
         }
+
+        // PASS 7 — with no lock held, write what the bus's own log configuration
+        // owes about each event it ingested into the log group of every vended-log
+        // delivery that carries this bus's logs. A bus that configures no logging,
+        // and one no delivery names, writes nothing.
+        crate::state::bus_logs::deliver(&*self.engine, ctx, &bus_log_records).await;
 
         Ok(PutEventsOutput {
             failed_entry_count: i32::try_from(failed).unwrap_or(i32::MAX),

@@ -2483,6 +2483,11 @@ mod store;
 /// `InvocationRateLimitPerSecond` rather than invoked as fast as events match.
 pub mod api_destination_pacing;
 
+/// What a bus whose `LogConfig` asks for logging WRITES about the events it
+/// handles, and the CloudWatch Logs log groups a vended-log delivery of that bus
+/// carries those records into.
+pub mod bus_logs;
+
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

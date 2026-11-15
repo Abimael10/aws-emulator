@@ -1463,3 +1463,22 @@ mod apigateway_custom_domain_dns_alias;
 // item, so it stands here rather than in the list.
 #[path = "all/cloudformation_provisions_bedrock_flows.rs"]
 mod cloudformation_provisions_bedrock_flows;
+// cross-service suite under `tests/all/`, and nothing else. Past this header the file holds
+// one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
+// name, and no other line — no prose between the pairs, no blank line, and nothing after the
+// last pair. Two branches landing at once then insert two lines in two places and have no
+// prose to duplicate, re-word or mistype.
+// Put a new suite at `tests/all/<name>.rs` and insert its pair where its name sorts to. What
+// that suite covers, and why it drives the assembled router rather than one service crate,
+// and compiles no suite of this target at all — and with none anywhere in the file, no
+// appended, re-typed or merged copy of one of its lines can be one. A suite file no `mod`
+// here names is compiled nowhere, a suite left at the top level of `tests/` fails the build,
+// and a second `mod` for one name is `E0428`.
+// probes rather than suites; all are declared, because a file no declaration names is
+// compiled nowhere.
+// The `all/all_rs_*` suites, `all/declaration_roots_*` and
+// `all/every_suite_file_is_declared.rs` check every rule above, for this file and for every
+// service crate's own `tests/all.rs`, so check there rather than leaving a note here.
+// `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the
+// whole target. An inner attribute, like an inner doc comment, is legal only before the first
+// item, so it stands here rather than in the list below.

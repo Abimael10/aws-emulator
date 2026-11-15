@@ -94,6 +94,11 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # OWN store (the one `DisableKey`/`EnableKey` write) rather than keeping a second
 # copy of a key's state.
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# The vended-log DELIVERY a bus's own log records travel: which deliveries carry
+# one bus's logs, and into which log group, are CloudWatch Logs' own records, so
+# the bus-logging path asks that service's store over the shared engine
+# (`state::bus_logs`) instead of tracking a pipeline a second time here.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # A rule target that is a Glue WORKFLOW is delivered to by counting the event
 # against that workflow's EVENT trigger in the Glue store of this same shared
 # engine (`ops::put_events`). Glue serves no API for that ingress — the action a
@@ -132,10 +137,6 @@ service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }
-# A rule target that is a CloudWatch Logs log group is asserted where a client
-# reads one: the log events that service's own `FilterLogEvents` reports, and the
-# resource policy on the group that decides whether the write happens at all.
-service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # A publication a RUNNING Lambda handler makes is judged against the policies in
 # force on the function's execution role, so the authorization suite that spans
 # that path mounts Lambda and the token service beside EventBridge on one engine:
